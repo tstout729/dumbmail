@@ -9,7 +9,9 @@ export function safeNextPath(next: string | null): string {
   if (!next || !next.startsWith("/")) return "/";
   try {
     const url = new URL(next, window.location.origin);
-    return url.origin === window.location.origin ? url.pathname + url.search + url.hash : "/";
+    if (url.origin !== window.location.origin) return "/";
+    // Collapse leading slashes so a path like "//evil.com" can't become a protocol-relative URL.
+    return url.pathname.replace(/^[/\\]+/, "/") + url.search + url.hash;
   } catch {
     return "/";
   }
