@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter var", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* One accent: deep evergreen. */
+  --color-accent-50: #eefaf3;
+  --color-accent-100: #d5f2e1;
+  --color-accent-200: #ade3c6;
+  --color-accent-300: #78cda4;
+  --color-accent-400: #43b07f;
+  --color-accent-500: #219464;
+  --color-accent-600: #147650;
+  --color-accent-700: #115f42;
+  --color-accent-800: #0f4c36;
+  --color-accent-900: #0c3f2d;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv11", "ss01";
+  }
+  body {
+    @apply bg-zinc-50 text-zinc-900 text-sm;
+  }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent-500;
+  }
+  ::selection {
+    @apply bg-accent-100;
+  }
+}
+
+@keyframes pl-shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+
+.pl-skeleton {
+  background: linear-gradient(90deg, #f0f0f2 25%, #e6e6ea 37%, #f0f0f2 63%);
+  background-size: 800px 100%;
+  animation: pl-shimmer 1.3s linear infinite;
+}
+
+@keyframes pl-pop {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.pl-pop { animation: pl-pop 140ms ease-out; }
+
+@keyframes pl-slide {
+  from { transform: translateX(16px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.pl-slide { animation: pl-slide 160ms ease-out; }
