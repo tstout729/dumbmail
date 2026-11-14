@@ -236,17 +236,24 @@ pub fn context(account: &Account, profile: Option<&Profile>, event: Option<&Valu
                 root.insert(k.clone(), v.clone());
             }
         }
-        root.insert("first_name".into(), json!(p.first_name));
-        root.insert("last_name".into(), json!(p.last_name));
-        root.insert("email".into(), json!(p.email));
-        root.insert("phone_number".into(), json!(p.phone_number));
-        root.insert(
-            "person".into(),
-            json!({
-                "id": p.id, "email": p.email, "phone_number": p.phone_number, "external_id": p.external_id,
-                "first_name": p.first_name, "last_name": p.last_name, "properties": p.properties,
-            }),
-        );
+        // Leave empty fields out entirely so `{{ first_name|default('there') }}` falls back.
+        let mut person = Map::new();
+        person.insert("id".into(), json!(p.id));
+        person.insert("properties".into(), p.properties.clone());
+        for (k, v) in [("first_name", &p.first_name), ("last_name", &p.last_name), ("email", &p.email), ("phone_number", &p.phone_number), ("external_id", &p.external_id)] {
+            match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(val) => {
+                    person.insert(k.into(), json!(val));
+                    if k != "external_id" {
+                        root.insert(k.into(), json!(val));
+                    }
+                }
+                None => {
+                    root.remove(k);
+                }
+            }
+        }
+        root.insert("person".into(), Value::Object(person));
     } else {
         root.insert("person".into(), json!({"properties": {}}));
     }
@@ -429,6 +436,18 @@ mod tests {
         assert!(out.html.contains("https://pl.test/u/x"), "unsubscribe link stays untracked");
         assert!(out.html.contains("1 Main St"));
         assert!(out.text.contains("Shop: https://shop.example.com/?a=1&b=2"));
+    }
+
+    #[test]
+    fn missing_names_fall_back_to_default() {
+        let acct = account();
+        let profile = Profile {
+            id: Uuid::nil(), account_id: Uuid::nil(), email: Some("a@b.co".into()), phone_number: None, external_id: None,
+            first_name: None, last_name: Some("".into()), properties: json!({}), email_consent: "subscribed".into(), sms_consent: "never_subscribed".into(),
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), last_event_at: None,
+        };
+        let ctx = context(&acct, Some(&profile), None, "#");
+        assert_eq!(render_str("Hi {{ first_name|default('there') }} {{ person.last_name|default('') }}", &ctx, false).unwrap().trim(), "Hi there");
     }
 
     #[test]
