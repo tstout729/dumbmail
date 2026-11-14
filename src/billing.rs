@@ -294,8 +294,6 @@ pub async fn checkout(state: &AppState, account_id: Uuid, amount_usd: f64) -> Ap
     let base = state.cfg.public_url();
     let form: Vec<(String, String)> = vec![
         ("mode".into(), "payment".into()),
-        // Cards only: they can be saved for auto-recharge (wallets like Apple Pay still appear).
-        ("payment_method_types[0]".into(), "card".into()),
         ("customer".into(), customer),
         ("client_reference_id".into(), account_id.to_string()),
         ("line_items[0][quantity]".into(), "1".into()),
