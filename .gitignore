@@ -1,0 +1,9 @@
+/target
+.env
+.env.*
+!.env.example
+web/node_modules
+web/dist/*
+!web/dist/.placeholder.html
+*.log
+.DS_Store

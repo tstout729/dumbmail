@@ -1,0 +1,234 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::FromRow;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Account {
+    pub id: Uuid,
+    pub public_key: String,
+    pub name: String,
+    pub website: Option<String>,
+    pub from_name: Option<String>,
+    pub from_email: Option<String>,
+    pub reply_to: Option<String>,
+    pub sms_from: Option<String>,
+    pub timezone: String,
+    pub address: Option<String>,
+    pub brand_color: String,
+    pub logo_url: Option<String>,
+    pub plan: String,
+    pub onboarding: Value,
+    #[serde(skip)]
+    pub sending_domain: Option<String>,
+    #[serde(skip)]
+    pub sending_domain_status: String,
+    #[serde(skip)]
+    pub sending_domain_records: Value,
+    pub conversion_metric: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct User {
+    pub id: Uuid,
+    pub email: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Profile {
+    pub id: Uuid,
+    #[serde(skip_serializing)]
+    #[serde(default)]
+    pub account_id: Uuid,
+    pub email: Option<String>,
+    pub phone_number: Option<String>,
+    pub external_id: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub properties: Value,
+    pub email_consent: String,
+    pub sms_consent: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_event_at: Option<DateTime<Utc>>,
+}
+
+pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at";
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct List {
+    pub id: Uuid,
+    pub name: String,
+    pub double_opt_in: bool,
+    pub member_count: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Segment {
+    pub id: Uuid,
+    pub name: String,
+    pub definition: Value,
+    pub member_count: i32,
+    pub refreshed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Template {
+    pub id: Uuid,
+    pub name: String,
+    pub channel: String,
+    pub content: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct CampaignRow {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub name: String,
+    pub channel: String,
+    pub status: String,
+    pub audience: Value,
+    pub content: Value,
+    pub send_at: Option<DateTime<Utc>>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct FlowRow {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub trigger: Value,
+    pub definition: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct FormRow {
+    pub id: Uuid,
+    #[serde(skip)]
+    pub account_id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub kind: String,
+    pub list_id: Option<Uuid>,
+    pub config: Value,
+    pub views: i64,
+    pub submits: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct EventRow {
+    pub id: Uuid,
+    pub metric: String,
+    pub profile_id: Uuid,
+    pub properties: Value,
+    pub value: Option<f64>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Aggregated delivery and engagement numbers for a campaign, flow or flow node.
+#[derive(Debug, Clone, Default, Serialize, FromRow)]
+pub struct MessageStats {
+    pub recipients: i64,
+    pub delivered: i64,
+    pub bounced: i64,
+    pub failed: i64,
+    pub unique_opens: i64,
+    pub unique_clicks: i64,
+    pub unsubscribes: i64,
+    pub complaints: i64,
+    #[sqlx(skip)]
+    pub open_rate: f64,
+    #[sqlx(skip)]
+    pub click_rate: f64,
+    #[sqlx(default)]
+    pub orders: i64,
+    #[sqlx(default)]
+    pub revenue: f64,
+}
+
+impl MessageStats {
+    pub fn finish(mut self) -> Self {
+        let base = self.delivered.max(1) as f64;
+        if self.delivered > 0 {
+            self.open_rate = self.unique_opens as f64 / base;
+            self.click_rate = self.unique_clicks as f64 / base;
+        }
+        self
+    }
+}
+
+/// SQL aggregate producing the MessageStats columns over a `messages m` relation.
+pub const STATS_SELECT: &str = "count(*)::bigint AS recipients,
+    count(*) FILTER (WHERE m.status IN ('sent','delivered') OR m.opened_at IS NOT NULL)::bigint AS delivered,
+    count(*) FILTER (WHERE m.status = 'bounced')::bigint AS bounced,
+    count(*) FILTER (WHERE m.status = 'failed')::bigint AS failed,
+    count(m.opened_at)::bigint AS unique_opens,
+    count(m.clicked_at)::bigint AS unique_clicks,
+    count(m.unsubscribed_at)::bigint AS unsubscribes,
+    count(*) FILTER (WHERE m.status = 'complained')::bigint AS complaints";
+
+pub fn normalize_email(e: &str) -> Option<String> {
+    let e = e.trim().to_lowercase();
+    let (local, domain) = e.split_once('@')?;
+    if local.is_empty() || !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') || e.contains(' ') {
+        return None;
+    }
+    Some(e)
+}
+
+/// Normalize to E.164. Ten-digit numbers are treated as US/Canada.
+pub fn normalize_phone(p: &str) -> Option<String> {
+    let trimmed = p.trim();
+    let plus = trimmed.starts_with('+');
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    let e164 = if plus {
+        format!("+{digits}")
+    } else if digits.len() == 10 {
+        format!("+1{digits}")
+    } else if digits.len() == 11 && digits.starts_with('1') {
+        format!("+{digits}")
+    } else {
+        return None;
+    };
+    if (8..=16).contains(&e164.len()) {
+        Some(e164)
+    } else {
+        None
+    }
+}
+
+pub fn valid_consent(s: &str) -> bool {
+    matches!(s, "subscribed" | "unsubscribed" | "never_subscribed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes() {
+        assert_eq!(normalize_email(" Ann@Example.COM ").as_deref(), Some("ann@example.com"));
+        assert!(normalize_email("nope").is_none());
+        assert!(normalize_email("a@b").is_none());
+        assert_eq!(normalize_phone("(503) 555-0100").as_deref(), Some("+15035550100"));
+        assert_eq!(normalize_phone("+44 20 7946 0958").as_deref(), Some("+442079460958"));
+        assert!(normalize_phone("123").is_none());
+    }
+}
