@@ -217,3 +217,143 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 - `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
 - `GET /healthz`.
+
+## v0.2 additions: pay-as-you-go billing, phone numbers, domains, website snippet
+
+### Billing (hosted service; self-hosted installs return `mode: "self_hosted"` and never charge)
+
+Money is prepaid credit. Each email or SMS segment sent is charged from the balance at cost plus markup.
+Every account gets `free_emails_per_month` free emails each calendar month. SMS has no free allowance.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/billing` | – | `Billing` (replaces the v0.1 shape) |
+| POST | `/api/billing/checkout` | `{amount: number}` (USD, 10–5000) | `{url}`: redirect the browser to Stripe Checkout; it returns to `/settings/billing?topup=success` or `?topup=cancelled` |
+| PATCH | `/api/billing/auto-recharge` | `{enabled: boolean, threshold: number, amount: number}` | `Billing` |
+
+```ts
+type Billing = {
+  mode: "hosted" | "self_hosted";
+  balance: number;                        // USD
+  free_emails_per_month: number; emails_this_month: number; free_emails_remaining: number;
+  sms_this_month: number;
+  prices: { email_per_1000: number; sms_per_segment: number; mms_per_message: number; phone_number_monthly: number }; // USD
+  auto_recharge: { enabled: boolean; threshold: number; amount: number };
+  has_payment_method: boolean;            // true after a Checkout top-up saved a card
+  stripe_enabled: boolean;                // false when the server has no Stripe key (show "contact us")
+  usage: { date: string; kind: "email" | "sms" | "mms" | "number"; quantity: number; amount: number }[]; // last 30 days, daily
+  ledger: { id: string; kind: string; description: string; amount: number; created_at: string }[];      // newest 50; credits positive
+  limits: { profiles: number | null };
+};
+```
+
+Sending with an empty balance fails with error code `limit_reached` (HTTP 402) and a message saying how much credit is needed.
+
+### Phone numbers and SMS
+
+There are two ways to send texts:
+- **platform**: claim a number through Postlark. Toll-free numbers can send once carriers approve a toll-free verification, which is free and usually takes 1–5 business days. Texts are billed per segment.
+- **byo**: connect your own Telnyx or Twilio account and number. Postlark adds no fees; you pay your provider directly.
+
+| Method | Path | Body / query | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/phone-numbers` | – | `{data: PhoneNumber[], sms: SmsSetup}` |
+| GET | `/api/phone-numbers/available` | `?type=toll_free\|local&area_code=503` | `{data: {phone_number, type, region: string \| null, monthly_price}[]}` |
+| POST | `/api/phone-numbers` | `{phone_number}` | `PhoneNumber` (claims it, charges the first month, sets it as the account's SMS number) |
+| DELETE | `/api/phone-numbers/:id` | – | `{ok: true}` (releases the number) |
+| POST | `/api/phone-numbers/:id/verification` | `TollFreeVerification` | `PhoneNumber` |
+| POST | `/api/sms/connect` | `{provider: "telnyx", api_key, phone_number, messaging_profile_id?}` or `{provider: "twilio", account_sid, auth_token, phone_number}` | `{data, sms}` (credentials are checked with the provider before saving, and stored encrypted) |
+| DELETE | `/api/sms/connect` | – | `{data, sms}` (back to platform mode) |
+
+```ts
+type PhoneNumber = {
+  id: string; phone_number: string; type: "toll_free" | "local"; source: "purchased" | "connected";
+  provider: "telnyx" | "twilio";
+  status: "active" | "needs_verification" | "verification_pending" | "verified" | "rejected" | "released";
+  verification_note: string | null;  // carrier feedback when rejected
+  monthly_price: number;             // 0 for connected numbers
+  created_at: string;
+};
+type SmsSetup = {
+  mode: "platform" | "byo";
+  provider: string;                  // provider that will send: telnyx | twilio | log
+  from_number: string | null;        // the account's active sending number
+  can_send: boolean;                 // number exists and is verified (or connected)
+  inbound_webhook_url: string;       // BYO: paste into the provider's messaging webhook so STOP replies are recorded
+  platform_available: boolean;       // server has a platform Telnyx key (else only BYO)
+};
+type TollFreeVerification = {
+  business_name: string; website: string; address1: string; address2?: string; city: string; state: string; zip: string;
+  contact_first_name: string; contact_last_name: string; contact_email: string; contact_phone: string;
+  use_case: "Marketing" | "Mixed" | "Account Notifications" | "Customer Care" | "Delivery Notifications";
+  use_case_summary: string; sample_message: string;
+  opt_in_description: string;   // how people opt in, e.g. "Checkbox on our website sign-up form"
+  opt_in_image_url: string;     // screenshot/URL of the opt-in, e.g. the hosted form page
+  monthly_volume: "10" | "100" | "1,000" | "10,000" | "100,000";
+};
+```
+
+In hosted mode `PATCH /api/account {sms_from}` only accepts one of the account's own numbers.
+
+### Domains
+
+`GET /api/account/sending` gains a `link_domain` field, and each DNS record gains `purpose`:
+
+```ts
+type Sending = {
+  email: {
+    provider: string; domain: string | null; from_email: string | null;
+    status: "not_started" | "pending" | "verified" | "failed";
+    mail_from_domain: string | null;
+    dns_records: DnsRecord[];
+  };
+  sms: { provider: string; from_number: string | null; status: string };
+  link_domain: { domain: string | null; status: "not_started" | "pending" | "active" | "failed"; dns_records: DnsRecord[]; url: string | null };
+};
+type DnsRecord = {
+  type: "CNAME" | "TXT" | "MX"; name: string; value: string; priority?: number;
+  purpose: "dkim" | "spf" | "mail_from" | "dmarc" | "link" | "verification";
+  status: "verified" | "pending" | "missing" | "recommended";
+  found?: string | null;  // what public DNS returned, to help debug typos
+};
+```
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/api/account/domain` | `{domain}` | `Sending` (DKIM + custom MAIL FROM `send.<domain>` for SPF/DMARC alignment) |
+| POST | `/api/account/domain/verify` | – | `Sending` (re-checks public DNS per record and with the provider) |
+| DELETE | `/api/account/domain` | – | `Sending` |
+| POST | `/api/account/link-domain` | `{domain}` (e.g. `links.brand.com`) | `Sending` (branded tracking links, unsubscribe pages and hosted forms) |
+| POST | `/api/account/link-domain/verify` | – | `Sending` |
+| DELETE | `/api/account/link-domain` | – | `Sending` |
+
+### Website snippet
+
+One script tag goes in the site's `<head>` or footer:
+`<script async src="{origin}/onsite.js?k={public_key}"></script>`
+
+The script:
+- tracks "Active on Site" once per visit;
+- identifies people who arrive from a tracked email or SMS link;
+- shows live popup and flyout forms using each form's targeting rules;
+- renders embedded forms in any `<div data-postlark-form="FORM_ID"></div>`;
+- exposes `postlark.identify({email})` and `postlark.track(metric, properties, value)`. Calls queued before the script loads are kept.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/website` | – | `{snippet, public_key, installed: boolean, last_seen_at: string \| null, last_seen_url: string \| null}` |
+| POST | `/api/website/check` | `{url}` | `{found: boolean, message: string}` (fetches the page server-side and looks for the snippet) |
+
+Forms gain `config.targeting`; every field is optional:
+
+```ts
+type Targeting = {
+  trigger: "delay" | "scroll" | "exit_intent";   // default "delay" (uses config.delay_seconds)
+  scroll_percent?: number;                       // for "scroll", default 40
+  devices?: "all" | "desktop" | "mobile";         // default "all"
+  url_contains?: string[];                       // show only on pages whose URL contains one of these
+  url_excludes?: string[];                       // never show on these
+  frequency_days?: number;                       // after someone closes it, wait this long (default 7)
+  hide_for_subscribers?: boolean;                // default true: skip people already identified on this browser
+};
+```
