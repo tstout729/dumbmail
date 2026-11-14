@@ -61,6 +61,7 @@ impl Harness {
             railway_project_id: None,
             railway_environment_id: None,
             railway_service_id: None,
+            admin_token: Some("test-admin-token-0123456789abcdef0123".into()),
         };
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
@@ -661,5 +662,12 @@ async fn billing_numbers_onsite_and_domains() {
     let (s, _, _) = h.raw("GET", "/healthz", &[("host", "links.acme-test-domain.example")], "").await;
     assert_eq!(s, StatusCode::OK);
     h.ok("DELETE", "/api/account/link-domain", None).await;
+
+    // Operator credit endpoint.
+    let body = json!({"email": "owner@acme.test", "amount": 5}).to_string();
+    let (s, _, _) = h.raw("POST", "/admin/credit", &[("authorization", "Bearer wrong-token-0123456789abcdef01234567"), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _, out) = h.raw("POST", "/admin/credit", &[("authorization", "Bearer test-admin-token-0123456789abcdef0123"), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
     h.cleanup().await;
 }

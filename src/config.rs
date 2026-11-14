@@ -95,6 +95,10 @@ pub struct Config {
     #[arg(long, env = "RAILWAY_SERVICE_ID")]
     pub railway_service_id: Option<String>,
 
+    /// Operator token for /admin endpoints (32+ characters). Unset disables them.
+    #[arg(long, env = "ADMIN_TOKEN", hide_env_values = true)]
+    pub admin_token: Option<String>,
+
     /// Serve cookies with the Secure flag (turn on behind HTTPS).
     #[arg(long, env = "SECURE_COOKIES", default_value_t = false)]
     pub secure_cookies: bool,
