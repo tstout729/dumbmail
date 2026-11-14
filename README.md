@@ -2,7 +2,15 @@
 
 Open-source email and SMS marketing: campaigns, automated flows, live segments, sign-up forms, revenue attribution and a full MCP server, in one Rust binary with Postgres.
 
-It covers the core of what Klaviyo does at a fraction of the cost. Email goes out through Amazon SES at $0.10 per 1,000. Texts go through Telnyx at about $0.004 per segment plus carrier fees, or through Twilio.
+It covers the core of what Klaviyo does at a fraction of the cost. Self-host it for free, or use the hosted service and pay only for what you send. There's no monthly plan and no per-contact fee:
+
+| | Hosted Postlark | Klaviyo |
+| --- | --- | --- |
+| Email | $0.20 per 1,000 (first 3,000 a month free) | about $150/mo for 10,000 contacts |
+| SMS (US, carrier fees included) | $0.0099 per segment | about $0.009–0.012 per message, plus a monthly plan |
+| Texting number | $2.20 a month, or connect your own Telnyx/Twilio account at no markup | included in a plan |
+
+Email goes out through Amazon SES and texts through Telnyx (or your own Telnyx or Twilio account).
 
 ## What's in it
 
@@ -15,7 +23,11 @@ It covers the core of what Klaviyo does at a fraction of the cost. Email goes ou
 - **Deliverability.** SES domain authentication (DKIM records shown in the app). Hard bounces and spam complaints suppress the address permanently.
 - **Sign-up forms.** Popups, flyouts, embedded forms and hosted pages, with an optional SMS consent checkbox. Installing one takes a single `<script>` tag.
 - **Analytics.** Revenue attributed to campaigns and flows (last email open or click within 5 days, or SMS click within 24 hours), open, click, unsubscribe and bounce rates, a daily series in your time zone, and a metric explorer with group-by.
-- **MCP server.** 45 tools, 3 prompts and 3 reference docs, so Claude, ChatGPT or Cursor can build segments, write and preview emails, create flows, send tests, pull reports and run campaigns. Anything that reaches real people requires `confirm: true` and returns a dry run first.
+- **Custom domains.** Sending domains get DKIM, a custom MAIL FROM (so SPF and DMARC align) and DMARC, with each DNS record checked live and shown with what DNS actually returns. A branded link domain (e.g. `links.yourbrand.com`) moves tracking links, unsubscribe pages and hosted forms onto your domain, and the TLS certificate is issued automatically.
+- **Phone numbers.** Claim a toll-free number in a couple of clicks (the carrier verification form is built in), or connect your own Telnyx or Twilio number. Your credentials are stored encrypted and STOP replies still sync.
+- **One snippet for any website.** Paste one `<script>` tag in your site's header or footer (guides for Shopify, WordPress, Squarespace, Wix, Webflow, GTM, Framer and Next.js). It tracks visits, recognizes people who arrive from your emails and texts, and shows your popups, flyouts and embedded forms. Targeting covers delay, scroll depth, exit intent, page URL, device and frequency. The dashboard shows when the snippet is live on your site.
+- **Pay-as-you-go billing.** Prepaid credit through Stripe Checkout, optional auto-recharge, per-message charges at cost plus markup, a free monthly email allowance and a usage ledger. It's turned off entirely when self-hosted.
+- **MCP server.** 52 tools, 3 prompts and 3 reference docs, so Claude, ChatGPT or Cursor can build segments, write and preview emails, create flows, send tests, pull reports and run campaigns. Anything that reaches real people requires `confirm: true` and returns a dry run first.
 
 ## Run it
 
@@ -38,7 +50,15 @@ DATABASE_URL=postgres://localhost/postlark cargo run --release -- serve
 1. In SES, verify your domain from **Settings → Sending** in Postlark. It creates the identity and shows the DKIM CNAME records to add.
 2. Ask AWS to move the account out of the SES sandbox.
 3. Create a configuration set with an event destination for Bounce, Complaint and Delivery that publishes to an SNS topic. Subscribe `https://YOUR_HOST/webhooks/ses/WEBHOOK_SECRET` over HTTPS (Postlark confirms the subscription automatically).
-4. Set `EMAIL_PROVIDER=ses`, `SES_CONFIGURATION_SET`, `AWS_REGION` and credentials (or use an instance role).
+4. Set `EMAIL_PROVIDER=ses`, `SES_CONFIGURATION_SET`, `AWS_REGION` and credentials (or use an instance role). The IAM user needs `ses:SendRawEmail`, `ses:CreateEmailIdentity`, `ses:GetEmailIdentity`, `ses:DeleteEmailIdentity` and `ses:PutEmailIdentityMailFromAttributes`.
+
+### Hosted billing (Stripe)
+
+Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stripe webhook at `https://YOUR_HOST/webhooks/stripe` with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `payment_intent.succeeded`. Prices are set with `PRICE_EMAIL_PER_1000`, `PRICE_SMS_SEGMENT`, `PRICE_MMS`, `PRICE_NUMBER_MONTHLY` and `FREE_EMAILS_PER_MONTH`. Operators can adjust a balance with `postlark admin-credit --email owner@brand.com --amount 25`.
+
+### Branded link domains
+
+On Railway, set `RAILWAY_API_TOKEN` to a project token (Railway provides the project, environment and service ids itself), and customer domains plus their certificates are created through Railway's API. Self-hosters point each customer's CNAME at `PUBLIC_URL`'s host and terminate TLS in their proxy (Caddy's on-demand TLS works well).
 
 ### SMS (Telnyx or Twilio)
 
@@ -79,7 +99,7 @@ curl https://YOUR_HOST/api/events -H "Authorization: Bearer pl_sk_..." -H "conte
        "properties": {"items": ["Wool scarf"]}}'
 ```
 
-Browser tracking: `<script async src="https://YOUR_HOST/client/postlark.js?k=PUBLIC_KEY"></script>`, then `postlark.identify({email})` and `postlark.track("Viewed Product", {...})`.
+Website: `<script async src="https://YOUR_HOST/onsite.js?k=PUBLIC_KEY"></script>` in the header or footer. Then use `postlark.identify({email})` and `postlark.track("Viewed Product", {...}, value)`. Embed a form with `<div data-postlark-form="FORM_ID"></div>`.
 
 ## Development
 

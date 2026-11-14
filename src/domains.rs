@@ -209,8 +209,7 @@ async fn railway_gql(state: &AppState, token: &str, query: &str, vars: Value) ->
     let res = state
         .http
         .post("https://backboard.railway.com/graphql/v2")
-        .bearer_auth(token)
-        // Project tokens use this header; account tokens use the bearer. Sending both is harmless.
+        // A project token scoped to this Railway project and environment.
         .header("Project-Access-Token", token)
         .json(&json!({"query": query, "variables": vars}))
         .send()
@@ -223,7 +222,7 @@ async fn railway_gql(state: &AppState, token: &str, query: &str, vars: Value) ->
     Ok(v["data"].clone())
 }
 
-const DOMAIN_FIELDS: &str = "id domain status { verified certificateStatus dnsRecords { recordType hostlabel fqdn requiredValue currentValue status purpose } verificationDnsHost verificationToken }";
+const DOMAIN_FIELDS: &str = "id domain status { verified certificateStatus dnsRecords { recordType hostlabel fqdn zone requiredValue currentValue status purpose } verificationDnsHost verificationToken }";
 
 fn railway_records(d: &Value) -> (Vec<Value>, bool) {
     let st = &d["status"];
@@ -243,10 +242,14 @@ fn railway_records(d: &Value) -> (Vec<Value>, bool) {
         .collect();
     if let (Some(host), Some(token)) = (st["verificationDnsHost"].as_str(), st["verificationToken"].as_str()) {
         if !host.is_empty() && !token.is_empty() {
-            out.push(json!({"type": "TXT", "name": host, "value": token, "purpose": "verification", "status": if st["verified"] == true { "verified" } else { "pending" }, "found": null}));
+            // Railway gives the host relative to the DNS zone; show the full name.
+            let zone = st["dnsRecords"][0]["zone"].as_str().unwrap_or("");
+            let name = if zone.is_empty() || host.ends_with(zone) { host.to_string() } else { format!("{host}.{zone}") };
+            out.push(json!({"type": "TXT", "name": name, "value": token, "purpose": "verification", "status": if st["verified"] == true { "verified" } else { "pending" }, "found": null}));
         }
     }
-    let active = st["verified"] != false && st["certificateStatus"].as_str().is_some_and(|c| c.contains("VALID") || c.contains("ISSUED"));
+    let cert = st["certificateStatus"].as_str().unwrap_or("");
+    let active = st["verified"] == true && (cert.ends_with("_VALID") || cert.ends_with("_ISSUED"));
     (out, active)
 }
 
