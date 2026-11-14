@@ -1,0 +1,30 @@
+# Self-host Postlark: `cp .env.example .env`, edit it, then `docker compose up -d`.
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postlark
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postlark}
+      POSTGRES_DB: postlark
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postlark"]
+      interval: 5s
+      retries: 10
+
+  postlark:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://postlark:${POSTGRES_PASSWORD:-postlark}@postgres:5432/postlark
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
