@@ -1,9 +1,9 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState } from "react";
-import { useBlocker, useNavigate, useParams } from "react-router";
-import { ExternalLink, Monitor, Smartphone, Trash2, X } from "lucide-react";
-import type { Form, FormConfig, FormField, FormKind } from "../../api";
-import { useDeleteForm, useForm, useLists, useUpdateForm } from "../../api";
+import { Link, useBlocker, useNavigate, useParams } from "react-router";
+import { CheckCircle2, CircleDashed, ExternalLink, Monitor, Smartphone, Trash2, X } from "lucide-react";
+import type { Form, FormConfig, FormDevices, FormField, FormKind, FormTrigger, Targeting } from "../../api";
+import { useDeleteForm, useForm, useLists, useUpdateForm, useWebsite } from "../../api";
 import {
   Button,
   Card,
@@ -14,6 +14,7 @@ import {
   CopyField,
   Field,
   Input,
+  Notice,
   Page,
   PageHeader,
   Segmented,
@@ -21,10 +22,11 @@ import {
   Skeleton,
   StatusBadge,
   Tabs,
+  TagInput,
   Textarea,
   cx,
 } from "../../components/ui";
-import { formatNumber, formatPercent } from "../../lib/format";
+import { formatNumber, formatPercent, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { formKinds } from "./FormsPage";
 
@@ -91,9 +93,7 @@ function FormEditor({ form }: { form: Form }) {
       },
     );
 
-  const origin = window.location.origin;
-  const snippet = `<script async src="${origin}/f/${form.id}/embed.js"></script>`;
-  const hosted = `${origin}/f/${form.id}`;
+  const hosted = `${window.location.origin}/f/${form.id}`;
 
   return (
     <Page wide>
@@ -162,13 +162,9 @@ function FormEditor({ form }: { form: Form }) {
                     ))}
                   </Select>
                 </Field>
-                {current.kind === "popup" || current.kind === "flyout" ? (
-                  <Field label="Show after (seconds)">
-                    <Input type="number" min={0} value={c.delay_seconds ?? 0} onChange={(e) => setConfig({ delay_seconds: Math.max(0, Number(e.target.value) || 0) })} className="w-28" />
-                  </Field>
-                ) : null}
               </div>
             </Card>
+            {current.kind === "popup" || current.kind === "flyout" ? <TargetingCard config={c} onChange={setConfig} /> : null}
             <Card title="Content">
               <div className="space-y-3">
                 <Field label="Headline">
@@ -216,23 +212,7 @@ function FormEditor({ form }: { form: Form }) {
           <FormPreview kind={current.kind} config={c} />
         </div>
       ) : (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Card title="Embed on your site">
-            <p className="mb-3 text-sm text-zinc-600">
-              Paste this before the closing <code className="rounded bg-zinc-100 px-1 text-xs">&lt;/body&gt;</code> tag on every page.
-              {current.kind === "embed" ? " The form renders where the script tag sits." : " It shows the form as a " + current.kind + "."}
-            </p>
-            <CodeBlock code={snippet} label="HTML" />
-            {form.status !== "live" ? <p className="mt-3 text-xs text-amber-700">The form is a draft. Publish it before it shows on your site.</p> : null}
-          </Card>
-          <Card title="Hosted sign-up page">
-            <p className="mb-3 text-sm text-zinc-600">Share this link anywhere: bio links, QR codes, receipts.</p>
-            <CopyField value={hosted} />
-            <a href={hosted} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-accent-700 hover:underline">
-              Open page <ExternalLink className="size-3.5" />
-            </a>
-          </Card>
-        </div>
+        <InstallPanel form={form} kind={current.kind} hosted={hosted} />
       )}
       {confirmDelete ? (
         <ConfirmDialog
@@ -256,6 +236,128 @@ function FormEditor({ form }: { form: Form }) {
         />
       ) : null}
     </Page>
+  );
+}
+
+const triggerLabels: Record<FormTrigger, string> = {
+  delay: "After a delay",
+  scroll: "After they scroll down the page",
+  exit_intent: "When they're about to leave",
+};
+
+const toInt = (v: string, min: number, max = Number.MAX_SAFE_INTEGER) => Math.min(max, Math.max(min, Math.round(Number(v) || 0)));
+
+function TargetingCard({ config, onChange }: { config: FormConfig; onChange: (patch: Partial<FormConfig>) => void }) {
+  const t = config.targeting ?? {};
+  const set = (patch: Partial<Targeting>) => onChange({ targeting: { ...t, ...patch } });
+  const trigger = t.trigger ?? "delay";
+  const tags = (v: string[]) => (v.length ? v : undefined);
+  return (
+    <Card title="Targeting">
+      <div className="space-y-3">
+        <Field label="Show it">
+          <Select value={trigger} onChange={(e) => set({ trigger: e.target.value as FormTrigger })}>
+            {(Object.keys(triggerLabels) as FormTrigger[]).map((k) => (
+              <option key={k} value={k}>
+                {triggerLabels[k]}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        {trigger === "delay" ? (
+          <Field label="Seconds after the page loads">
+            <Input type="number" min={0} value={config.delay_seconds ?? 0} onChange={(e) => onChange({ delay_seconds: toInt(e.target.value, 0) })} className="w-28" />
+          </Field>
+        ) : trigger === "scroll" ? (
+          <Field label="Percent of the page scrolled">
+            <Input type="number" min={1} max={100} value={t.scroll_percent ?? 40} onChange={(e) => set({ scroll_percent: toInt(e.target.value, 1, 100) })} className="w-28" />
+          </Field>
+        ) : (
+          <p className="text-xs text-zinc-500">Shows when the cursor heads for the tabs or back button. This needs a mouse, so it works on desktop.</p>
+        )}
+        <div className="space-y-1">
+          <div className="text-xs font-medium text-zinc-700">Devices</div>
+          <Segmented
+            value={t.devices ?? "all"}
+            onChange={(devices: FormDevices) => set({ devices })}
+            options={[
+              { value: "all", label: "All" },
+              { value: "desktop", label: <><Monitor className="size-3.5" /> Desktop</> },
+              { value: "mobile", label: <><Smartphone className="size-3.5" /> Mobile</> },
+            ]}
+          />
+        </div>
+        <Field label="Only on pages whose URL contains" hint="Press Enter after each. Leave empty to show on every page.">
+          <TagInput value={t.url_contains ?? []} onChange={(v) => set({ url_contains: tags(v) })} placeholder="/products" />
+        </Field>
+        <Field label="Never on pages whose URL contains">
+          <TagInput value={t.url_excludes ?? []} onChange={(v) => set({ url_excludes: tags(v) })} placeholder="/checkout" />
+        </Field>
+        <Field label="After someone closes it, wait" hint="Days before it shows to them again.">
+          <div className="flex items-center gap-2">
+            <Input type="number" min={0} value={t.frequency_days ?? 7} onChange={(e) => set({ frequency_days: toInt(e.target.value, 0) })} className="w-28" />
+            <span className="text-sm text-zinc-600">days</span>
+          </div>
+        </Field>
+        <Checkbox
+          label="Hide from people who already subscribed"
+          description="Skips visitors this browser already knows, e.g. from a past sign-up or an email click."
+          checked={t.hide_for_subscribers ?? true}
+          onChange={(e) => set({ hide_for_subscribers: e.target.checked })}
+        />
+      </div>
+    </Card>
+  );
+}
+
+function InstallPanel({ form, kind, hosted }: { form: Form; kind: FormKind; hosted: string }) {
+  const website = useWebsite();
+  const installed = website.data?.installed ?? false;
+  const snippetStatus = website.isPending ? null : installed ? (
+    <Notice tone="green" icon={<CheckCircle2 />} title="Website snippet installed">
+      Last seen {formatRelative(website.data?.last_seen_at)}.
+    </Notice>
+  ) : (
+    <Notice tone="amber" icon={<CircleDashed />} title="Website snippet not detected yet">
+      <Link to="/settings/website" className="font-medium underline">
+        Add the snippet to your site
+      </Link>{" "}
+      once and every form can show there.
+    </Notice>
+  );
+  return (
+    <div className="grid gap-4 lg:grid-cols-2">
+      {kind === "page" ? null : (
+        <Card title="Show it on your site">
+          <div className="space-y-3">
+            {kind === "embed" ? (
+              <>
+                <p className="text-sm text-zinc-600">Put this where the form should appear. It renders there once the website snippet is installed.</p>
+                <CodeBlock code={`<div data-postlark-form="${form.id}"></div>`} label="HTML" />
+              </>
+            ) : (
+              <p className="text-sm text-zinc-600">
+                Nothing to paste for this form. Once the{" "}
+                <Link to="/settings/website" className="font-medium text-accent-700 hover:underline">
+                  website snippet
+                </Link>{" "}
+                is installed, this {kind} appears on its own, following the targeting rules on the Design tab.
+              </p>
+            )}
+            {snippetStatus}
+            {form.status !== "live" ? <p className="text-xs text-amber-700">The form is a draft. Publish it before it shows on your site.</p> : null}
+          </div>
+        </Card>
+      )}
+      <Card title="Hosted sign-up page">
+        <p className="mb-3 text-sm text-zinc-600">Share this link anywhere: bio links, QR codes, receipts.</p>
+        <CopyField value={hosted} />
+        <a href={hosted} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-accent-700 hover:underline">
+          Open page <ExternalLink className="size-3.5" />
+        </a>
+        {kind === "page" && form.status !== "live" ? <p className="mt-3 text-xs text-amber-700">The form is a draft. Publish it before sharing the link.</p> : null}
+      </Card>
+    </div>
   );
 }
 

@@ -52,6 +52,11 @@ fn platform_key(state: &AppState) -> Option<&str> {
     state.cfg.telnyx_api_key.as_deref()
 }
 
+/// Fake number inventory for local development only (log SMS provider on a local URL).
+fn dev_inventory(state: &AppState) -> bool {
+    state.sms.name() == "log" && ["http://localhost", "http://127.0.0.1", "https://pl.test"].iter().any(|p| state.cfg.public_url().starts_with(p))
+}
+
 pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Vec<PhoneNumberRow>> {
     Ok(sqlx::query_as("SELECT * FROM phone_numbers WHERE account_id = $1 AND status <> 'released' ORDER BY created_at DESC")
         .bind(account_id)
@@ -105,7 +110,7 @@ pub async fn sms_setup_json(state: &AppState, account_id: Uuid) -> AppResult<Val
         "from_number": from,
         "can_send": can_send,
         "inbound_webhook_url": format!("{}/webhooks/{hook_provider}/{}", state.cfg.public_url(), token.unwrap_or_default()),
-        "platform_available": platform_key(state).is_some() || !state.cfg.hosted && state.sms.name() == "log",
+        "platform_available": platform_key(state).is_some() || dev_inventory(state),
     }))
 }
 
@@ -137,10 +142,16 @@ pub async fn available(state: &AppState, kind: &str, area_code: Option<&str>) ->
         return Err(AppError::bad("local numbers need 10DLC brand registration; claim a toll-free number, or connect your own Telnyx or Twilio account to use a local number"));
     }
     let Some(key) = platform_key(state) else {
-        if state.sms.name() == "log" {
+        if dev_inventory(state) {
             // Dev mode: fake inventory so the flow can be tried end to end.
             let prefix = if kind == "toll_free" { "+1833555".to_string() } else { format!("+1{}555", area_code.unwrap_or("503")) };
-            let data: Vec<Value> = (1..=5).map(|i| json!({"phone_number": format!("{prefix}{:04}", 100 + i), "type": kind, "region": null, "monthly_price": price})).collect();
+            let taken: Vec<String> = sqlx::query_scalar("SELECT phone_number FROM phone_numbers WHERE status <> 'released'").fetch_all(&state.db).await?;
+            let data: Vec<Value> = (1..=200)
+                .map(|i| format!("{prefix}{:04}", 100 + i))
+                .filter(|n| !taken.contains(n))
+                .take(5)
+                .map(|n| json!({"phone_number": n, "type": kind, "region": null, "monthly_price": price}))
+                .collect();
             return Ok(json!({"data": data}));
         }
         return Err(AppError::bad("claiming numbers isn't available on this server; connect your own Telnyx or Twilio account instead"));
@@ -181,7 +192,7 @@ pub async fn claim(state: &AppState, account_id: Uuid, phone: &str) -> AppResult
             let order = telnyx(state, key, reqwest::Method::POST, "number_orders", Some(body)).await?;
             order["data"]["id"].as_str().map(String::from)
         }
-        None if state.sms.name() == "log" => Some(format!("dev-{}", Uuid::now_v7())),
+        None if dev_inventory(state) => Some(format!("dev-{}", Uuid::now_v7())),
         None => return Err(AppError::bad("claiming numbers isn't available on this server")),
     };
     // Toll-free numbers must pass carrier verification before they can text; local numbers are usable

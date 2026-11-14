@@ -1,17 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
 import { keys } from "./keys";
-import type { Account, AccountPatch, ApiKey, Billing, CreatedApiKey, SendingStatus, Session } from "./types";
+import type { Account, AccountPatch, ApiKey, CreatedApiKey, Sending, Session } from "./types";
 
 export const accountApi = {
   update: (patch: AccountPatch) => api<Account>("PATCH", "/api/account", patch),
-  sending: () => api<SendingStatus>("GET", "/api/account/sending"),
-  setDomain: (domain: string) => api<SendingStatus>("POST", "/api/account/domain", { domain }),
-  verifyDomain: () => api<SendingStatus>("POST", "/api/account/domain/verify"),
+  sending: () => api<Sending>("GET", "/api/account/sending"),
+  setDomain: (domain: string) => api<Sending>("POST", "/api/account/domain", { domain }),
+  verifyDomain: () => api<Sending>("POST", "/api/account/domain/verify"),
+  removeDomain: () => api<Sending>("DELETE", "/api/account/domain"),
+  setLinkDomain: (domain: string) => api<Sending>("POST", "/api/account/link-domain", { domain }),
+  verifyLinkDomain: () => api<Sending>("POST", "/api/account/link-domain/verify"),
+  removeLinkDomain: () => api<Sending>("DELETE", "/api/account/link-domain"),
   apiKeys: () => api<{ data: ApiKey[] }>("GET", "/api/api-keys"),
   createApiKey: (name: string) => api<CreatedApiKey>("POST", "/api/api-keys", { name }),
   revokeApiKey: (id: string) => api<{ ok: true }>("DELETE", `/api/api-keys/${id}`),
-  billing: () => api<Billing>("GET", "/api/billing"),
 };
 
 export function useUpdateAccount() {
@@ -47,21 +50,18 @@ export function useSending() {
   return useQuery({ queryKey: keys.sending, queryFn: accountApi.sending });
 }
 
-export function useSetDomain() {
+/** Every domain endpoint returns the full `Sending` shape, so each mutation just replaces the cache. */
+function useSendingMutation<V>(mutationFn: (vars: V) => Promise<Sending>) {
   const qc = useQueryClient();
-  return useMutation({
-    mutationFn: accountApi.setDomain,
-    onSuccess: (data) => qc.setQueryData(keys.sending, data),
-  });
+  return useMutation({ mutationFn, onSuccess: (data) => qc.setQueryData(keys.sending, data) });
 }
 
-export function useVerifyDomain() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: accountApi.verifyDomain,
-    onSuccess: (data) => qc.setQueryData(keys.sending, data),
-  });
-}
+export const useSetDomain = () => useSendingMutation<string>(accountApi.setDomain);
+export const useVerifyDomain = () => useSendingMutation<void>(accountApi.verifyDomain);
+export const useRemoveDomain = () => useSendingMutation<void>(accountApi.removeDomain);
+export const useSetLinkDomain = () => useSendingMutation<string>(accountApi.setLinkDomain);
+export const useVerifyLinkDomain = () => useSendingMutation<void>(accountApi.verifyLinkDomain);
+export const useRemoveLinkDomain = () => useSendingMutation<void>(accountApi.removeLinkDomain);
 
 export function useApiKeys() {
   return useQuery({ queryKey: keys.apiKeys, queryFn: accountApi.apiKeys, select: (r) => r.data });
@@ -90,8 +90,4 @@ export function useRevokeApiKey() {
     },
     onSettled: () => qc.invalidateQueries({ queryKey: keys.apiKeys }),
   });
-}
-
-export function useBilling() {
-  return useQuery({ queryKey: keys.billing, queryFn: accountApi.billing });
 }

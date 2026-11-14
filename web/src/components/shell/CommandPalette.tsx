@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import { createPortal } from "react-dom";
 import { ArrowRight, CornerDownLeft, Plus, Search } from "lucide-react";
 import { cx } from "../ui";
-import { bottomNav, mainNav } from "./nav";
+import { bottomNav, mainNav, settingsNav } from "./nav";
 import { useCampaigns, useFlows, useSegments, useLists } from "../../api";
 
 type Command = { id: string; label: string; hint?: string; group: string; to: string; icon?: "create" | "go" };
@@ -23,8 +23,10 @@ const pageCommands: Command[] = [
     g.items.map((i) => ({ id: `go-${i.to}`, label: i.label, hint: g.label, group: "Go to", to: i.to, icon: "go" as const })),
   ),
   ...bottomNav.map((i) => ({ id: `go-${i.to}`, label: i.label, group: "Go to", to: i.to, icon: "go" as const })),
-  { id: "go-sending", label: "Sending domain", hint: "Settings", group: "Go to", to: "/settings?tab=sending", icon: "go" },
-  { id: "go-billing", label: "Billing & usage", hint: "Settings", group: "Go to", to: "/settings?tab=billing", icon: "go" },
+  // Developers is already in bottomNav.
+  ...settingsNav
+    .filter((t) => t.to !== "/settings/developers")
+    .map((t) => ({ id: `settings-${t.to}`, label: t.title, hint: "Settings", group: "Go to", to: t.to, icon: "go" as const })),
 ];
 
 export function CommandPalette({ onClose }: { onClose: () => void }) {

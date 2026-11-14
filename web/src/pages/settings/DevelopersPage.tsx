@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { Link } from "react-router";
 import { AlertTriangle, KeyRound, Plus, Trash2 } from "lucide-react";
 import type { ApiKey, CreatedApiKey } from "../../api";
 import { useApiKeys, useCreateApiKey, useRevokeApiKey, useSession } from "../../api";
@@ -14,8 +15,6 @@ import {
   IconButton,
   Input,
   Modal,
-  Page,
-  PageHeader,
   Segmented,
   SkeletonRows,
   Table,
@@ -34,7 +33,6 @@ const mcpAbilities = [
 ];
 
 export function DevelopersPage() {
-  const { account } = useSession();
   const origin = window.location.origin;
   const [client, setClient] = useState<"code" | "desktop" | "cursor">("code");
 
@@ -50,7 +48,6 @@ export function DevelopersPage() {
     },
   };
 
-  const snippet = `<script async src="${origin}/client/postlark.js?k=${account.public_key}"></script>`;
   const curl = `curl -X POST ${origin}/api/events \\
   -H "Authorization: Bearer <key>" \\
   -H "Content-Type: application/json" \\
@@ -63,9 +60,15 @@ export function DevelopersPage() {
   }'`;
 
   return (
-    <Page>
-      <PageHeader title="Developers" description="API keys, the MCP server for AI agents, and site tracking." />
-      <div className="space-y-6">
+    <div className="space-y-4">
+      <p className="text-sm text-zinc-500">
+        API keys, the MCP server for AI agents, and server-side events. The website snippet is under{" "}
+        <Link to="/settings/website" className="font-medium text-accent-700 hover:underline">
+          Website
+        </Link>
+        .
+      </p>
+      <div className="space-y-4">
         <ApiKeysCard />
         <Card title="MCP server">
           <p className="mb-3 text-sm text-zinc-600">
@@ -96,17 +99,6 @@ export function DevelopersPage() {
             </ul>
           </div>
         </Card>
-        <Card title="Website tracking">
-          <p className="mb-3 text-sm text-zinc-600">
-            Add this to every page of your site to track visits and identify people who sign up. It uses your public key, which is safe to expose.
-          </p>
-          <CodeBlock code={snippet} label="HTML" />
-          <div className="mt-3">
-            <Field label="Public key">
-              <CopyField value={account.public_key} />
-            </Field>
-          </div>
-        </Card>
         <Card title="Send events from your server">
           <p className="mb-3 text-sm text-zinc-600">
             Server-side events (orders, sign-ups, anything) trigger flows and power segments. Use <code className="rounded bg-zinc-100 px-1 text-xs">unique_id</code> to make retries safe.
@@ -114,7 +106,7 @@ export function DevelopersPage() {
           <CodeBlock code={curl} label="curl" />
         </Card>
       </div>
-    </Page>
+    </div>
   );
 }
 

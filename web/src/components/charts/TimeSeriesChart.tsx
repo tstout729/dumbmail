@@ -16,9 +16,11 @@ type Props = {
   loading?: boolean;
   xFormat?: (v: string) => string;
   stacked?: boolean;
+  /** Allow fractional Y ticks, e.g. for small dollar amounts. */
+  allowDecimals?: boolean;
 };
 
-export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocaleString(), height = 240, loading, xFormat, stacked }: Props) {
+export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocaleString(), height = 240, loading, xFormat, stacked, allowDecimals = false }: Props) {
   if (loading)
     return (
       <div style={{ height }}>
@@ -56,7 +58,7 @@ export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocale
             tickLine={false}
             axisLine={false}
             width={56}
-            allowDecimals={false}
+            allowDecimals={allowDecimals}
           />
           <Tooltip
             cursor={{ stroke: "#a1a1aa", strokeDasharray: "3 3" }}

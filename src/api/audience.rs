@@ -216,9 +216,22 @@ pub struct ImportBody {
     pub sms_consent: Option<String>,
 }
 
-pub async fn import(state: &AppState, account_id: Uuid, b: ImportBody) -> AppResult<Value> {
-    if let Some(l) = b.list_id {
-        core::list_belongs(&state.db, account_id, l).await?;
+pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> AppResult<Value> {
+    match b.list_id {
+        Some(l) => core::list_belongs(&state.db, account_id, l).await?,
+        // No list chosen: keep imports together so the first campaign has an obvious audience.
+        None => {
+            let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM lists WHERE account_id = $1 AND name = 'All contacts' LIMIT 1").bind(account_id).fetch_optional(&state.db).await?;
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = Uuid::now_v7();
+                    sqlx::query("INSERT INTO lists (id, account_id, name) VALUES ($1, $2, 'All contacts')").bind(id).bind(account_id).execute(&state.db).await?;
+                    id
+                }
+            };
+            b.list_id = Some(id);
+        }
     }
     if b.csv.len() > 50 * 1024 * 1024 {
         return Err(AppError::bad("CSV is larger than 50 MB; split it into smaller files"));

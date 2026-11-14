@@ -6,7 +6,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 const backend = "http://127.0.0.1:7311";
 // Anchored patterns: a plain "/f" prefix would also swallow client routes like /flows and /forms.
-const proxied = ["api", "client", "t", "u", "f", "mcp", "webhooks", "healthz"].map((p) => `^/${p}(/|$|\\?)`);
+const proxied = ["api", "client", "t", "u", "f", "mcp", "webhooks", "healthz", "onsite\\.js"].map((p) => `^/${p}(/|$|\\?)`);
 
 // The repo tracks dist/.placeholder.html so the Rust embed compiles before the UI is built;
 // emptyOutDir wipes it, so write it back after each build.

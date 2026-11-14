@@ -779,7 +779,8 @@ pub async fn from_blueprint(db: &PgPool, account_id: Uuid, key: &str, name: Opti
         .ok_or_else(|| AppError::bad(format!("unknown blueprint {key:?}")))?;
     let mut trigger = bp["trigger"].clone();
     if trigger["list_id"] == "{list}" {
-        let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM lists WHERE account_id = $1 ORDER BY (name = 'Newsletter') DESC, created_at LIMIT 1")
+        // Starter flows get their own sign-up list, so imported contacts don't all get a welcome series.
+        let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM lists WHERE account_id = $1 AND name = 'Newsletter' LIMIT 1")
             .bind(account_id)
             .fetch_optional(db)
             .await?;

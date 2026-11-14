@@ -113,14 +113,46 @@ const statusTones: Record<string, Tone> = {
   subscribed: "green",
   unsubscribed: "red",
   never_subscribed: "gray",
+  // DNS records, domains and phone numbers (v0.2)
+  missing: "red",
+  recommended: "blue",
+  active: "green",
+  needs_verification: "amber",
+  verification_pending: "blue",
+  rejected: "red",
+  released: "gray",
 };
 
-export function StatusBadge({ status }: { status: string }) {
-  const label = status.replace(/_/g, " ");
+/** `label` overrides the text derived from the status key (e.g. "Needs verification"). */
+export function StatusBadge({ status, label }: { status: string; label?: string }) {
+  const text = label ?? status.replace(/_/g, " ");
   return (
     <Badge tone={statusTones[status] ?? "gray"} dot>
-      {label.charAt(0).toUpperCase() + label.slice(1)}
+      {text.charAt(0).toUpperCase() + text.slice(1)}
     </Badge>
+  );
+}
+
+type NoticeTone = "green" | "amber" | "red" | "blue" | "gray";
+
+const noticeTones: Record<NoticeTone, string> = {
+  green: "border-accent-200 bg-accent-50 text-accent-900",
+  amber: "border-amber-200 bg-amber-50 text-amber-900",
+  red: "border-red-200 bg-red-50 text-red-800",
+  blue: "border-sky-200 bg-sky-50 text-sky-900",
+  gray: "border-zinc-200 bg-zinc-50 text-zinc-800",
+};
+
+/** A full-width status line: icon, bold title and optional detail. */
+export function Notice({ tone, icon, title, children }: { tone: NoticeTone; icon?: ReactNode; title: ReactNode; children?: ReactNode }) {
+  return (
+    <div className={cx("flex items-start gap-2.5 rounded-lg border px-3.5 py-2.5 text-sm", noticeTones[tone])} role="status">
+      {icon ? <span className="mt-0.5 shrink-0 [&>svg]:size-4">{icon}</span> : null}
+      <div className="min-w-0">
+        <div className="font-medium">{title}</div>
+        {children ? <div className="mt-0.5 opacity-90">{children}</div> : null}
+      </div>
+    </div>
   );
 }
 

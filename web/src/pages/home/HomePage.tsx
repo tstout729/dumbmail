@@ -1,6 +1,6 @@
 import { Link, useSearchParams } from "react-router";
 import { ArrowRight, Check, Circle, X } from "lucide-react";
-import { useOverview, useSending, useSession, useUpdateAccount } from "../../api";
+import { useOverview, useSending, useSession, useUpdateAccount, useWebsite } from "../../api";
 import { KpiRow, RevenueChart, SendsChart } from "../../components/analytics/OverviewParts";
 import { RangePicker, parseRange } from "../../components/charts/RangePicker";
 import { Card, EmptyState, IconButton, Page, PageHeader, Skeleton, StatusBadge, cx } from "../../components/ui";
@@ -9,12 +9,14 @@ import { formatCurrency, formatDate, formatNumber, formatPercent } from "../../l
 function SetupChecklist() {
   const { account } = useSession();
   const sending = useSending();
+  const website = useWebsite();
   const update = useUpdateAccount();
   const o = account.onboarding;
   const items = [
     { done: o.brand, label: "Add your brand details", detail: "Website, colors and mailing address", to: "/settings" },
-    { done: o.sender || Boolean(account.from_email), label: "Choose a sender email", detail: "The address your emails come from", to: "/settings?tab=sending" },
-    { done: sending.data?.email.status === "verified", label: "Verify your sending domain", detail: "Add DNS records so you land in the inbox", to: "/settings?tab=sending" },
+    { done: o.sender || Boolean(account.from_email), label: "Choose a sender email", detail: "The address your emails come from", to: "/settings/sending" },
+    { done: sending.data?.email.status === "verified", label: "Verify your sending domain", detail: "Add DNS records so you land in the inbox", to: "/settings/domains" },
+    { done: website.data?.installed ?? false, label: "Add the snippet to your website", detail: "Tracks visitors and shows your sign-up forms", to: "/settings/website" },
     { done: o.contacts, label: "Import contacts", detail: "Paste or upload a CSV", to: "/audience/profiles?import=1" },
     { done: o.first_flow, label: "Turn on your first flow", detail: "A welcome series is a great start", to: "/flows?create=1" },
   ];

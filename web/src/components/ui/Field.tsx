@@ -1,5 +1,6 @@
-import { createContext, useContext, useId, type ComponentProps, type InputHTMLAttributes, type ReactNode } from "react";
+import { createContext, useContext, useId, useState, type ComponentProps, type InputHTMLAttributes, type ReactNode } from "react";
 import { cx } from "./cx";
+import { X } from "lucide-react";
 
 const control =
   "block rounded-md border border-zinc-300 bg-white px-2.5 text-sm text-zinc-900 placeholder:text-zinc-400 shadow-xs transition-colors hover:border-zinc-400 focus:border-accent-600 focus:outline-none focus:ring-2 focus:ring-accent-600/20 disabled:bg-zinc-50 disabled:text-zinc-500";
@@ -139,6 +140,63 @@ export function ColorInput({ value, onChange }: { value: string; onChange: (valu
         aria-label="Pick color"
       />
       <Input value={value} onChange={(e) => onChange(e.target.value)} className="font-mono w-28" />
+    </div>
+  );
+}
+
+type TagInputProps = {
+  value: string[];
+  onChange: (value: string[]) => void;
+  placeholder?: string;
+  "aria-label"?: string;
+};
+
+/** Free-text chips: Enter, comma or blur adds the typed value; Backspace on an empty input removes the last one. */
+export function TagInput({ value, onChange, placeholder, "aria-label": ariaLabel }: TagInputProps) {
+  const fieldId = useContext(FieldIdContext);
+  const [text, setText] = useState("");
+  const commit = () => {
+    const tag = text.trim().replace(/,$/, "").trim();
+    setText("");
+    if (tag && !value.includes(tag)) onChange([...value, tag]);
+  };
+  return (
+    <div
+      className={cx(
+        control,
+        "flex min-h-8.5 w-full flex-wrap items-center gap-1 py-1 focus-within:border-accent-600 focus-within:ring-2 focus-within:ring-accent-600/20",
+      )}
+    >
+      {value.map((tag) => (
+        <span key={tag} className="inline-flex items-center gap-0.5 rounded bg-zinc-100 py-0.5 pl-1.5 pr-0.5 font-mono text-xs text-zinc-800">
+          {tag}
+          <button
+            type="button"
+            onClick={() => onChange(value.filter((t) => t !== tag))}
+            className="rounded p-0.5 text-zinc-400 hover:bg-zinc-200 hover:text-zinc-800"
+            aria-label={`Remove ${tag}`}
+          >
+            <X className="size-3" />
+          </button>
+        </span>
+      ))}
+      <input
+        id={fieldId}
+        aria-label={ariaLabel}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === ",") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Backspace" && text === "" && value.length > 0) {
+            onChange(value.slice(0, -1));
+          }
+        }}
+        onBlur={commit}
+        placeholder={value.length === 0 ? placeholder : undefined}
+        className="h-6 min-w-24 flex-1 bg-transparent text-sm outline-none placeholder:text-zinc-400"
+      />
     </div>
   );
 }

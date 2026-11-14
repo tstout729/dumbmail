@@ -1,4 +1,4 @@
-// Types mirror docs/API.md (v0.1 contract). Keep them in sync with that file.
+// Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed";
 
@@ -372,6 +372,21 @@ export type FormConfig = {
   delay_seconds?: number;
   brand_color?: string;
   image_url?: string;
+  targeting?: Targeting;
+};
+
+export type FormTrigger = "delay" | "scroll" | "exit_intent";
+export type FormDevices = "all" | "desktop" | "mobile";
+
+/** Popup and flyout display rules (v0.2). Every field is optional; defaults are noted. */
+export type Targeting = {
+  trigger?: FormTrigger; // default "delay" (uses config.delay_seconds)
+  scroll_percent?: number; // for "scroll", default 40
+  devices?: FormDevices; // default "all"
+  url_contains?: string[];
+  url_excludes?: string[];
+  frequency_days?: number; // default 7
+  hide_for_subscribers?: boolean; // default true
 };
 
 export type Form = {
@@ -451,22 +466,146 @@ export type AnalyticsOverview = {
   top_flows: { id: string; name: string; status: FlowStatus; recipients: number; revenue: number }[];
 };
 
-// ---- Sending, keys, billing ----
+// ---- Sending and domains ----
 
 export type DnsStatus = "not_started" | "pending" | "verified" | "failed";
+export type LinkDomainStatus = "not_started" | "pending" | "active" | "failed";
 
-export type DnsRecord = { type: string; name: string; value: string; status: string };
+export type DnsPurpose = "dkim" | "spf" | "mail_from" | "dmarc" | "link" | "verification";
+export type DnsRecordStatus = "verified" | "pending" | "missing" | "recommended";
 
-export type SendingStatus = {
-  email: { provider: string; domain: string | null; status: DnsStatus; dns_records: DnsRecord[] };
-  sms: { provider: string; from_number: string | null; status: string };
+export type DnsRecord = {
+  type: "CNAME" | "TXT" | "MX";
+  name: string;
+  value: string;
+  priority?: number;
+  purpose: DnsPurpose;
+  status: DnsRecordStatus;
+  found?: string | null; // what public DNS returned
 };
+
+export type Sending = {
+  email: {
+    provider: string;
+    domain: string | null;
+    from_email: string | null;
+    status: DnsStatus;
+    mail_from_domain: string | null;
+    dns_records: DnsRecord[];
+  };
+  sms: { provider: string; from_number: string | null; status: string };
+  link_domain: { domain: string | null; status: LinkDomainStatus; dns_records: DnsRecord[]; url: string | null };
+};
+
+// ---- API keys ----
 
 export type ApiKey = { id: string; name: string; prefix: string; created_at: string; last_used_at: string | null };
 export type CreatedApiKey = { id: string; name: string; prefix: string; key: string };
 
-export type Billing = {
-  plan: Plan;
-  limits: { profiles: number | null; emails_per_month: number | null; sms_per_month: number | null };
-  usage: { profiles: number; emails_this_month: number; sms_this_month: number };
+// ---- Billing (v0.2: prepaid credit) ----
+
+export type UsageKind = "email" | "sms" | "mms" | "number";
+
+export type BillingPrices = {
+  email_per_1000: number;
+  sms_per_segment: number;
+  mms_per_message: number;
+  phone_number_monthly: number;
 };
+
+export type AutoRecharge = { enabled: boolean; threshold: number; amount: number };
+
+export type LedgerEntry = { id: string; kind: string; description: string; amount: number; created_at: string };
+
+export type Billing = {
+  mode: "hosted" | "self_hosted";
+  balance: number;
+  free_emails_per_month: number;
+  emails_this_month: number;
+  free_emails_remaining: number;
+  sms_this_month: number;
+  prices: BillingPrices;
+  auto_recharge: AutoRecharge;
+  has_payment_method: boolean;
+  stripe_enabled: boolean;
+  usage: { date: string; kind: UsageKind; quantity: number; amount: number }[];
+  ledger: LedgerEntry[];
+  limits: { profiles: number | null };
+};
+
+// ---- Phone numbers and SMS ----
+
+export type PhoneNumberType = "toll_free" | "local";
+export type SmsProvider = "telnyx" | "twilio";
+
+export type PhoneNumberStatus =
+  | "active"
+  | "needs_verification"
+  | "verification_pending"
+  | "verified"
+  | "rejected"
+  | "released";
+
+export type PhoneNumber = {
+  id: string;
+  phone_number: string;
+  type: PhoneNumberType;
+  source: "purchased" | "connected";
+  provider: SmsProvider;
+  status: PhoneNumberStatus;
+  verification_note: string | null;
+  monthly_price: number;
+  created_at: string;
+};
+
+export type SmsSetup = {
+  mode: "platform" | "byo";
+  provider: string; // telnyx | twilio | log
+  from_number: string | null;
+  can_send: boolean;
+  inbound_webhook_url: string;
+  platform_available: boolean;
+};
+
+export type PhoneNumbersResponse = { data: PhoneNumber[]; sms: SmsSetup };
+
+export type AvailableNumber = { phone_number: string; type: PhoneNumberType; region: string | null; monthly_price: number };
+
+export type TollFreeUseCase = "Marketing" | "Mixed" | "Account Notifications" | "Customer Care" | "Delivery Notifications";
+export type MonthlyVolume = "10" | "100" | "1,000" | "10,000" | "100,000";
+
+export type TollFreeVerification = {
+  business_name: string;
+  website: string;
+  address1: string;
+  address2?: string;
+  city: string;
+  state: string;
+  zip: string;
+  contact_first_name: string;
+  contact_last_name: string;
+  contact_email: string;
+  contact_phone: string;
+  use_case: TollFreeUseCase;
+  use_case_summary: string;
+  sample_message: string;
+  opt_in_description: string;
+  opt_in_image_url: string;
+  monthly_volume: MonthlyVolume;
+};
+
+export type SmsConnectInput =
+  | { provider: "telnyx"; api_key: string; phone_number: string; messaging_profile_id?: string }
+  | { provider: "twilio"; account_sid: string; auth_token: string; phone_number: string };
+
+// ---- Website snippet ----
+
+export type WebsiteStatus = {
+  snippet: string;
+  public_key: string;
+  installed: boolean;
+  last_seen_at: string | null;
+  last_seen_url: string | null;
+};
+
+export type WebsiteCheck = { found: boolean; message: string };

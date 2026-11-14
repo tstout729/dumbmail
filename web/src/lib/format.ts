@@ -16,6 +16,13 @@ export function formatCurrency(n: number | null | undefined, cents = false): str
   return (cents ? currencyCentsFmt : currencyFmt).format(n ?? 0);
 }
 
+const priceFmt = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 });
+
+/** Unit prices can be fractions of a cent (e.g. $0.0079 per SMS segment). */
+export function formatPrice(n: number | null | undefined): string {
+  return priceFmt.format(n ?? 0);
+}
+
 /** Rates in the API are 0..1. */
 export function formatPercent(rate: number | null | undefined, digits = 1): string {
   return `${((rate ?? 0) * 100).toFixed(digits)}%`;
@@ -76,4 +83,11 @@ export function fullName(p: { first_name: string | null; last_name: string | nul
 
 export function pluralize(n: number, one: string, many = `${one}s`): string {
   return `${formatNumber(n)} ${n === 1 ? one : many}`;
+}
+
+/** "+15035550100" → "+1 (503) 555-0100"; other formats pass through. */
+export function formatPhone(e164: string | null | undefined): string {
+  if (!e164) return "—";
+  const m = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(e164);
+  return m ? `+1 (${m[1]}) ${m[2]}-${m[3]}` : e164;
 }

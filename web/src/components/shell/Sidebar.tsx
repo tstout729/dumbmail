@@ -1,4 +1,4 @@
-import { NavLink, useNavigate } from "react-router";
+import { NavLink, useLocation, useNavigate } from "react-router";
 import { ChevronsUpDown, LogOut, Search, Settings, X } from "lucide-react";
 import { useLogout, useSession } from "../../api";
 import { Kbd, Menu, cx } from "../ui";
@@ -7,6 +7,8 @@ import { bottomNav, mainNav, type NavItem } from "./nav";
 
 function NavEntry({ item, onNavigate }: { item: NavItem; onNavigate: () => void }) {
   const Icon = item.icon;
+  const { pathname } = useLocation();
+  const active = (routerActive: boolean) => (item.isActive ? item.isActive(pathname) : routerActive);
   return (
     <NavLink
       to={item.to}
@@ -15,16 +17,19 @@ function NavEntry({ item, onNavigate }: { item: NavItem; onNavigate: () => void 
       className={({ isActive }) =>
         cx(
           "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors",
-          isActive ? "bg-white text-zinc-950 shadow-xs ring-1 ring-zinc-200" : "text-zinc-600 hover:bg-zinc-200/60 hover:text-zinc-950",
+          active(isActive) ? "bg-white text-zinc-950 shadow-xs ring-1 ring-zinc-200" : "text-zinc-600 hover:bg-zinc-200/60 hover:text-zinc-950",
         )
       }
     >
-      {({ isActive }) => (
-        <>
-          <Icon className={cx("size-4", isActive ? "text-accent-700" : "text-zinc-400")} />
-          {item.label}
-        </>
-      )}
+      {({ isActive: routerActive }) => {
+        const isActive = active(routerActive);
+        return (
+          <>
+            <Icon className={cx("size-4", isActive ? "text-accent-700" : "text-zinc-400")} />
+            {item.label}
+          </>
+        );
+      }}
     </NavLink>
   );
 }

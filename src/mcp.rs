@@ -468,7 +468,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "list_forms" => {
             let rows: Vec<crate::models::FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(acct).fetch_all(&state.db).await?;
             let base = state.cfg.public_url();
-            Ok(json!({"forms": rows.iter().map(|f| json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "embed_snippet": format!("<script async src=\"{base}/f/{}/embed.js\"></script>", f.id)})).collect::<Vec<_>>()}))
+            Ok(json!({"forms": rows.iter().map(|f| json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-postlark-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
         }
         "create_form" => {
             let status = a["status"].as_str().map(String::from);
@@ -478,7 +478,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 None => f,
             };
             let base = state.cfg.public_url();
-            Ok(json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "embed_snippet": format!("<script async src=\"{base}/f/{}/embed.js\"></script>", f.id)}))
+            Ok(json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-postlark-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }}))
         }
         "update_form" => {
             let id = uuid_arg(&a, "id")?;

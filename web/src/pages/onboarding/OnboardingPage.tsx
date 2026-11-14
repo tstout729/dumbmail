@@ -108,7 +108,7 @@ function BrandStep({ save, saving, onSkip }: { save: (p: BrandPatch) => void; sa
       <StepHeader title="Your brand" description="Used in your emails, sign-up forms and footers. Change any of it later in Settings." />
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Website">
-          <Input name="website" type="url" placeholder="https://acme.com" defaultValue={account.website ?? ""} autoFocus />
+          <Input name="website" type="text" inputMode="url" autoComplete="url" placeholder="acme.com" defaultValue={account.website ?? ""} autoFocus />
         </Field>
         <Field label="Sender name" hint="Who your emails come from.">
           <Input name="from_name" placeholder={account.name} defaultValue={account.from_name ?? account.name} />
