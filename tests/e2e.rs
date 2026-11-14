@@ -620,7 +620,7 @@ async fn billing_numbers_onsite_and_domains() {
     let mail = h.state.email.sent().into_iter().find(|m| m.to == "p0@x.test" && !m.subject.starts_with("[Test]")).unwrap();
     let _ = mail; // campaign had no links; send one with a link
     let lc = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
-        "content": {"subject": "Link", "blocks": [{"type": "button", "text": "Shop", "href": "https://shop.example.com/new?x=1"}]}}))).await;
+        "content": {"subject": "Link", "blocks": [{"type": "button", "text": "Shop", "href": "https://acme.test/new?x=1"}]}}))).await;
     h.ok("POST", &format!("/api/campaigns/{}/send", lc["id"].as_str().unwrap()), None).await;
     h.drain().await;
     let mail = h.state.email.sent().into_iter().rev().find(|m| m.to == "p1@x.test").unwrap();
@@ -629,7 +629,7 @@ async fn billing_numbers_onsite_and_domains() {
     let (s, hd, _) = h.raw("GET", &click, &[], "").await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let loc = hd.get("location").unwrap().to_str().unwrap().to_string();
-    assert!(loc.starts_with("https://shop.example.com/new?x=1&_pl="), "{loc}");
+    assert!(loc.starts_with("https://acme.test/new?x=1&_pl="), "{loc}");
     let token = url::Url::parse(&loc).unwrap().query_pairs().find(|(k, _)| k == "_pl").unwrap().1.to_string();
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
         &json!({"metric": "Viewed Product", "profile": {"$token": token}, "properties": {"name": "Scarf"}}).to_string()).await;
@@ -648,6 +648,9 @@ async fn billing_numbers_onsite_and_domains() {
     assert!(recs.iter().any(|r| r["purpose"] == "dkim"));
     assert!(recs.iter().any(|r| r["purpose"] == "mail_from" && r["type"] == "MX" && r["name"] == "send.acme-test-domain.example"));
     assert!(recs.iter().any(|r| r["purpose"] == "dmarc"));
+    assert!(recs.iter().any(|r| r["purpose"] == "verification" && r["name"] == "_postlark.acme-test-domain.example"
+        && r["value"].as_str().unwrap().starts_with("postlark-verify=")));
+    assert_eq!(sd["email"]["status"], "pending", "not verified without the ownership record");
     assert_eq!(sd["email"]["mail_from_domain"], "send.acme-test-domain.example");
     let ld = h.ok("POST", "/api/account/link-domain", Some(json!({"domain": "links.acme-test-domain.example"}))).await;
     assert_eq!(ld["link_domain"]["domain"], "links.acme-test-domain.example");

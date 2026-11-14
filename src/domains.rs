@@ -55,6 +55,7 @@ pub async fn annotate(state: &AppState, records: &mut [Value]) {
             ("MX", _) => found.iter().any(|f| f.ends_with(&want)),
             ("TXT", "dmarc") => found.iter().any(|f| f.starts_with("v=dmarc1")),
             ("TXT", "spf") => found.iter().any(|f| f.starts_with("v=spf1") && f.contains("amazonses.com")),
+            ("TXT", _) => found.iter().any(|f| f.eq_ignore_ascii_case(&want)),
             _ => found.iter().any(|f| f == &want),
         };
         let shown = if kind == "TXT" && purpose == "dmarc" { found.iter().find(|f| f.starts_with("v=dmarc1")).cloned() } else { found.first().cloned() };
@@ -75,12 +76,19 @@ pub fn mail_from_for(domain: &str) -> String {
     format!("send.{domain}")
 }
 
-fn sending_records(state: &AppState, domain: &str, provider_records: &[crate::providers::DnsRecord]) -> Vec<Value> {
-    let mut out: Vec<Value> = provider_records
+/// Per-account proof that this account controls the domain (the email provider's identity is shared
+/// by every account that adds the same domain, so its "verified" status alone proves nothing).
+pub fn ownership_token(state: &AppState, account_id: Uuid, domain: &str) -> String {
+    let sig = crate::auth::sign(&state.cfg.secret_key, &format!("own:{account_id}:{domain}"));
+    format!("postlark-verify={}", sig.rsplit_once('.').map(|(_, s)| s).unwrap_or_default())
+}
+
+fn sending_records(state: &AppState, account_id: Uuid, domain: &str, provider_records: &[crate::providers::DnsRecord]) -> Vec<Value> {
+    let mut out: Vec<Value> = vec![rec("TXT", &format!("_postlark.{domain}"), &ownership_token(state, account_id, domain), "verification", None)];
+    out.extend(provider_records
         .iter()
         .filter(|r| r.kind == "CNAME")
-        .map(|r| rec("CNAME", &r.name, &r.value, "dkim", None))
-        .collect();
+        .map(|r| rec("CNAME", &r.name, &r.value, "dkim", None)));
     let mf = mail_from_for(domain);
     out.push(rec("MX", &mf, &format!("feedback-smtp.{}.amazonses.com", state.cfg.aws_region), "mail_from", Some(10)));
     out.push(rec("TXT", &mf, "v=spf1 include:amazonses.com ~all", "spf", None));
@@ -97,14 +105,33 @@ fn clean_domain(raw: &str) -> AppResult<String> {
     Ok(d)
 }
 
+/// Another account has already proven ownership of this domain, a parent or a subdomain of it.
+async fn verified_elsewhere(state: &AppState, account_id: Uuid, domain: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id <> $2 AND sending_domain_status = 'verified' AND sending_domain IS NOT NULL
+           AND (sending_domain = $1 OR $1 LIKE '%.' || sending_domain OR sending_domain LIKE '%.' || $1))",
+    )
+    .bind(domain)
+    .bind(account_id)
+    .fetch_one(&state.db)
+    .await?)
+}
+
 pub async fn set_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<()> {
     let domain = clean_domain(raw)?;
+    if verified_elsewhere(state, account_id, &domain).await? {
+        return Err(AppError::Conflict("that domain is already verified by another account".into()));
+    }
     let st = state.email.add_domain(&domain).await.map_err(|e| AppError::bad(format!("could not start domain setup: {e:#}")))?;
     let mf = mail_from_for(&domain);
-    if let Err(e) = state.email.set_mail_from(&domain, &mf).await {
-        tracing::warn!(domain = %domain, error = %e, "could not set custom MAIL FROM");
+    // Configure the shared provider identity only when no other account is using this domain.
+    let shared: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE sending_domain = $1 AND id <> $2)").bind(&domain).bind(account_id).fetch_one(&state.db).await?;
+    if !shared {
+        if let Err(e) = state.email.set_mail_from(&domain, &mf).await {
+            tracing::warn!(domain = %domain, error = %e, "could not set custom MAIL FROM");
+        }
     }
-    let mut records = sending_records(state, &domain, &st.records);
+    let mut records = sending_records(state, account_id, &domain, &st.records);
     annotate(state, &mut records).await;
     sqlx::query("UPDATE accounts SET sending_domain = $2, sending_domain_status = $3, sending_domain_records = $4, mail_from_domain = $5 WHERE id = $1")
         .bind(account_id)
@@ -121,14 +148,21 @@ pub async fn verify_sending_domain(state: &AppState, account_id: Uuid) -> AppRes
     let a = crate::campaigns::load_account(&state.db, account_id).await?;
     let domain = a.sending_domain.clone().ok_or_else(|| AppError::bad("add a sending domain first"))?;
     let st = state.email.domain_state(&domain).await.map_err(|e| AppError::bad(format!("could not check the domain: {e:#}")))?;
-    let mut records = sending_records(state, &domain, &st.records);
+    let mut records = sending_records(state, account_id, &domain, &st.records);
     annotate(state, &mut records).await;
-    // The log provider can't verify anything itself; trust public DNS for the DKIM records instead.
-    let status = if state.email.name() == "log" {
+    let owns = records.iter().any(|r| r["purpose"] == "verification" && r["status"] == "verified");
+    let dkim_ok = {
         let dkim: Vec<&Value> = records.iter().filter(|r| r["purpose"] == "dkim").collect();
-        if !dkim.is_empty() && dkim.iter().all(|r| r["status"] == "verified") { "verified".to_string() } else { st.status.clone() }
+        !dkim.is_empty() && dkim.iter().all(|r| r["status"] == "verified")
+    };
+    // Verified = this account proved ownership AND the provider (or, in dev, public DNS) accepts DKIM.
+    let provider_ok = if state.email.name() == "log" { dkim_ok } else { st.status == "verified" };
+    let status = if owns && provider_ok && !verified_elsewhere(state, account_id, &domain).await? {
+        "verified".to_string()
+    } else if st.status == "failed" {
+        "failed".to_string()
     } else {
-        st.status.clone()
+        "pending".to_string()
     };
     sqlx::query("UPDATE accounts SET sending_domain_status = $2, sending_domain_records = $3 WHERE id = $1")
         .bind(account_id)
@@ -221,9 +255,19 @@ pub async fn set_link_domain(state: &AppState, account_id: Uuid, raw: &str) -> A
     if domain == public_host(state) {
         return Err(AppError::bad("use a domain you own, like links.yourbrand.com"));
     }
-    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE link_domain = $1 AND id <> $2)").bind(&domain).bind(account_id).fetch_one(&state.db).await?;
-    if taken {
-        return Err(AppError::Conflict("that domain is already connected to another account".into()));
+    // Active domains are exclusive; an unfinished claim by someone else lapses after 48 hours.
+    let holder: Option<(Uuid, String, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as("SELECT id, link_domain_status, link_domain_set_at FROM accounts WHERE link_domain = $1 AND id <> $2 LIMIT 1")
+            .bind(&domain)
+            .bind(account_id)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some((other, status, set_at)) = holder {
+        let stale = set_at.is_none_or(|t| t < chrono::Utc::now() - chrono::Duration::hours(48));
+        if status == "active" || !stale {
+            return Err(AppError::Conflict("that domain is being connected by another account".into()));
+        }
+        remove_link_domain(state, other).await?;
     }
     remove_link_domain(state, account_id).await?;
     let (records, provider_id) = match railway(state) {
@@ -239,7 +283,7 @@ pub async fn set_link_domain(state: &AppState, account_id: Uuid, raw: &str) -> A
             (r, None)
         }
     };
-    sqlx::query("UPDATE accounts SET link_domain = $2, link_domain_status = 'pending', link_domain_records = $3, link_domain_provider_id = $4 WHERE id = $1")
+    sqlx::query("UPDATE accounts SET link_domain = $2, link_domain_status = 'pending', link_domain_records = $3, link_domain_provider_id = $4, link_domain_set_at = now() WHERE id = $1")
         .bind(account_id)
         .bind(&domain)
         .bind(Value::Array(records))

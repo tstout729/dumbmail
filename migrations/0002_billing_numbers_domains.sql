@@ -20,8 +20,10 @@ ALTER TABLE accounts
     ADD COLUMN onsite_last_seen_at timestamptz,
     ADD COLUMN onsite_last_url text;
 
-UPDATE accounts SET webhook_token = md5(random()::text || id::text) WHERE webhook_token IS NULL;
-CREATE UNIQUE INDEX accounts_link_domain_uq ON accounts (link_domain) WHERE link_domain IS NOT NULL;
+-- gen_random_uuid() draws from the server's CSPRNG; two of them give 244 random bits.
+UPDATE accounts SET webhook_token = replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '') WHERE webhook_token IS NULL;
+CREATE INDEX accounts_link_domain_idx ON accounts (link_domain) WHERE link_domain IS NOT NULL;
+CREATE UNIQUE INDEX accounts_link_domain_active_uq ON accounts (link_domain) WHERE link_domain_status = 'active';
 CREATE UNIQUE INDEX accounts_webhook_token_uq ON accounts (webhook_token) WHERE webhook_token IS NOT NULL;
 
 -- Credits (top-ups) are positive, charges negative. Message charges are rolled up per account, kind and day.
@@ -61,5 +63,6 @@ CREATE INDEX phone_numbers_account_idx ON phone_numbers (account_id);
 
 ALTER TABLE messages ADD COLUMN segments integer NOT NULL DEFAULT 1, ADD COLUMN cost_micros bigint NOT NULL DEFAULT 0;
 
-ALTER TABLE accounts ALTER COLUMN webhook_token SET DEFAULT md5(random()::text || clock_timestamp()::text);
+ALTER TABLE accounts ALTER COLUMN webhook_token SET DEFAULT replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', '');
+ALTER TABLE accounts ADD COLUMN link_domain_set_at timestamptz;
 ALTER TABLE accounts ADD COLUMN free_month text, ADD COLUMN free_emails_used integer NOT NULL DEFAULT 0;

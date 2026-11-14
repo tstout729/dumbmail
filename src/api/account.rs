@@ -407,6 +407,9 @@ struct AutoRechargeBody {
 }
 
 async fn auto_recharge(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AutoRechargeBody>) -> AppResult<Json<Value>> {
+    if ctx.via_api_key {
+        return Err(AppError::Forbidden("change auto-recharge from the dashboard".into()));
+    }
     crate::billing::set_auto_recharge(&state, ctx.account_id, b.enabled, b.threshold, b.amount).await?;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }

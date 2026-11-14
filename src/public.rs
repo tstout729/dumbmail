@@ -130,10 +130,12 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
             let _ = msg_event(&state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
         }
         if !m.is_test {
-            // Lets the onsite script recognize the person on the store's site.
-            if let Ok(mut dest) = url::Url::parse(&q.u) {
-                dest.query_pairs_mut().append_pair("_pl", &profile_token(&state, m.profile_id));
-                return Redirect::to(dest.as_str()).into_response();
+            // Lets the onsite script recognize the person on the brand's own site.
+            if let (Ok(mut dest), Some(account)) = (url::Url::parse(&q.u), account_for_msg(&state, &m).await) {
+                if is_own_site(&account, &dest) {
+                    dest.query_pairs_mut().append_pair("_pl", &profile_token(&state, m.account_id, m.profile_id));
+                    return Redirect::to(dest.as_str()).into_response();
+                }
             }
         }
     }
@@ -223,7 +225,7 @@ async fn cors_preflight() -> Response {
 
 fn public_profile(state: &AppState, account_id: Uuid, v: &Value) -> AppResult<ProfileInput> {
     let mut p = v.clone();
-    let token_id = v.get("$token").and_then(|t| t.as_str()).and_then(|t| profile_from_token(state, t));
+    let token_id = v.get("$token").and_then(|t| t.as_str()).and_then(|t| profile_from_token(state, account_id, t));
     if let Some(o) = p.as_object_mut() {
         // Browsers may not change consent or pick profiles by internal id.
         for k in ["email_consent", "sms_consent", "id", "$token"] {
@@ -231,11 +233,11 @@ fn public_profile(state: &AppState, account_id: Uuid, v: &Value) -> AppResult<Pr
         }
     }
     let mut input: ProfileInput = serde_json::from_value(p)?;
-    // A valid link token identifies the person even without an email (checked against this account below).
-    if let Some(id) = token_id {
+    // A valid link token identifies the person, but only when no other identifier is given:
+    // a token plus a new email must not let a browser rewrite that profile.
+    if let (Some(id), true) = (token_id, input.email.is_none() && input.phone_number.is_none() && input.external_id.is_none()) {
         input.id = Some(id);
     }
-    let _ = account_id;
     Ok(input)
 }
 
@@ -250,9 +252,8 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
             Some(id) => {
                 let owned: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE id = $1 AND account_id = $2").bind(id).bind(a.id).fetch_optional(&state.db).await?;
                 match owned {
-                    Some(_) if input.email.is_none() && input.phone_number.is_none() && input.external_id.is_none() => crate::api::audience::load_profile(&state, a.id, id).await?,
-                    Some(_) => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
-                    None => audience::upsert_profile_public(&state.db, a.id, &ProfileInput { id: None, ..input }).await?.profile,
+                    Some(_) => crate::api::audience::load_profile(&state, a.id, id).await?,
+                    None => return Err(AppError::bad("unknown visitor")),
                 }
             }
             None => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
@@ -329,12 +330,33 @@ async fn client_ping(State(state): State<AppState>, Query(q): Query<KeyQuery>, b
 }
 
 /// Signed token identifying a profile to the onsite script (added to tracked links as ?_pl=).
-pub fn profile_token(state: &AppState, profile_id: Uuid) -> String {
-    auth::sign(&state.cfg.secret_key, &format!("p{}", profile_id.simple()))
+/// Bound to the account and valid for 60 days.
+pub fn profile_token(state: &AppState, account_id: Uuid, profile_id: Uuid) -> String {
+    let exp = chrono::Utc::now().timestamp() / 86400 + 60;
+    auth::sign(&state.cfg.secret_key, &format!("p{}{}{exp:x}", profile_id.simple(), &account_id.simple().to_string()[..8]))
 }
 
-fn profile_from_token(state: &AppState, token: &str) -> Option<Uuid> {
-    auth::verify(&state.cfg.secret_key, token)?.strip_prefix('p').and_then(|h| Uuid::parse_str(h).ok())
+fn profile_from_token(state: &AppState, account_id: Uuid, token: &str) -> Option<Uuid> {
+    let payload = auth::verify(&state.cfg.secret_key, token)?;
+    let rest = payload.strip_prefix('p')?;
+    if rest.len() < 41 {
+        return None;
+    }
+    let (pid, tail) = rest.split_at(32);
+    let (acct, exp) = tail.split_at(8);
+    let exp = i64::from_str_radix(exp, 16).ok()?;
+    if acct != &account_id.simple().to_string()[..8] || exp < chrono::Utc::now().timestamp() / 86400 {
+        return None;
+    }
+    Uuid::parse_str(pid).ok()
+}
+
+/// Only add the identity token to links that go to the brand's own website.
+fn is_own_site(account: &Account, dest: &url::Url) -> bool {
+    let Some(host) = dest.host_str().map(|h| h.trim_start_matches("www.").to_lowercase()) else { return false };
+    let site = account.website.as_deref().and_then(|w| url::Url::parse(w).ok()).and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase()));
+    let candidates = [site, account.sending_domain.clone()];
+    candidates.iter().flatten().any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 // ---------- Forms ----------
@@ -573,11 +595,12 @@ async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str
     Ok(())
 }
 
-async fn sms_status(state: &AppState, provider_id: &str, delivered: bool) -> AppResult<()> {
+async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, delivered: bool) -> AppResult<()> {
     let status = if delivered { "delivered" } else { "failed" };
-    sqlx::query("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms'")
+    sqlx::query("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3)")
         .bind(provider_id)
         .bind(status)
+        .bind(scope)
         .execute(&state.db)
         .await?;
     Ok(())
@@ -594,7 +617,7 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
         "message.finalized" => {
             let st = p["to"][0]["status"].as_str().unwrap_or_default();
             if let Some(id) = p["id"].as_str() {
-                sms_status(&state, id, st == "delivered").await?;
+                sms_status(&state, scope, id, st == "delivered").await?;
             }
         }
         _ => {}
@@ -609,8 +632,8 @@ async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String
         inbound_sms(&state, scope, from, to, text).await?;
     } else if let (Some(sid), Some(st)) = (f.get("MessageSid"), f.get("MessageStatus")) {
         match st.as_str() {
-            "delivered" => sms_status(&state, sid, true).await?,
-            "failed" | "undelivered" => sms_status(&state, sid, false).await?,
+            "delivered" => sms_status(&state, scope, sid, true).await?,
+            "failed" | "undelivered" => sms_status(&state, scope, sid, false).await?,
             _ => {}
         }
     }

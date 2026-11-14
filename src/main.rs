@@ -28,6 +28,19 @@ enum Cmd {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Operator: add (or with a negative amount, remove) prepaid credit for the account a user owns.
+    AdminCredit {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        /// Email of a user on the account
+        #[arg(long)]
+        email: String,
+        /// Amount in USD
+        #[arg(long, allow_hyphen_values = true)]
+        amount: f64,
+        #[arg(long, default_value = "Credit added by Postlark")]
+        note: String,
+    },
     /// Bridge stdio MCP clients to a Postlark server's HTTP MCP endpoint.
     McpStdio {
         /// Server base URL, e.g. https://app.postlark.dev
@@ -56,6 +69,22 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::McpStdio { url, api_key } => mcp_stdio(&url, &api_key).await,
+        Cmd::AdminCredit { database_url, email, amount, note } => {
+            let db = PgPoolOptions::new().max_connections(2).connect(&database_url).await?;
+            let account: Option<(uuid::Uuid, String)> = sqlx::query_as(
+                "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id JOIN users u ON u.id = m.user_id WHERE u.email = $1 ORDER BY m.created_at LIMIT 1",
+            )
+            .bind(email.trim().to_lowercase())
+            .fetch_optional(&db)
+            .await?;
+            let (id, name) = account.ok_or_else(|| anyhow::anyhow!("no account for {email}"))?;
+            postlark::billing::post_entry(&db, id, "adjustment", postlark::billing::to_micros(amount), &note, &uuid::Uuid::now_v7().to_string())
+                .await
+                .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            let bal = postlark::billing::balance(&db, id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            println!("{name}: balance now ${:.4}", postlark::billing::to_usd(bal));
+            Ok(())
+        }
     }
 }
 
