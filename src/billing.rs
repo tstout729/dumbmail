@@ -1,0 +1,481 @@
+//! Pay-as-you-go billing for the hosted service: prepaid credit, per-message charges at cost plus
+//! markup, a free monthly email allowance, Stripe Checkout top-ups and automatic recharge.
+//! Self-hosted installs (HOSTED=false) never charge.
+
+use chrono::{Datelike, Utc};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+pub const MICROS: f64 = 1_000_000.0;
+
+pub fn to_micros(usd: f64) -> i64 {
+    (usd * MICROS).round() as i64
+}
+
+pub fn to_usd(micros: i64) -> f64 {
+    (micros as f64 / MICROS * 1_000_000.0).round() / 1_000_000.0
+}
+
+pub struct Prices {
+    pub email: i64,
+    pub sms_segment: i64,
+    pub mms: i64,
+    pub number_monthly: i64,
+}
+
+pub fn prices(state: &AppState) -> Prices {
+    let c = &state.cfg;
+    Prices {
+        email: to_micros(c.price_email_per_1000 / 1000.0),
+        sms_segment: to_micros(c.price_sms_segment),
+        mms: to_micros(c.price_mms),
+        number_monthly: to_micros(c.price_number_monthly),
+    }
+}
+
+/// Calendar month key ("2026-11") in the account's time zone.
+async fn month_key(db: &PgPool, account_id: Uuid) -> AppResult<String> {
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
+    let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
+    let now = Utc::now().with_timezone(&tz);
+    Ok(format!("{:04}-{:02}", now.year(), now.month()))
+}
+
+pub async fn balance(db: &PgPool, account_id: Uuid) -> AppResult<i64> {
+    Ok(sqlx::query_scalar("SELECT balance_micros FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?)
+}
+
+pub async fn free_emails_remaining(state: &AppState, account_id: Uuid) -> AppResult<i64> {
+    let month = month_key(&state.db, account_id).await?;
+    let (m, used): (Option<String>, i32) = sqlx::query_as("SELECT free_month, free_emails_used FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    let used = if m.as_deref() == Some(month.as_str()) { used as i64 } else { 0 };
+    Ok((state.cfg.free_emails_per_month - used).max(0))
+}
+
+/// Price of one message before sending (0 when free or self-hosted).
+pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: i64, mms: bool) -> AppResult<i64> {
+    if !state.cfg.hosted {
+        return Ok(0);
+    }
+    let p = prices(state);
+    Ok(match channel {
+        "email" => {
+            if free_emails_remaining(state, account_id).await? > 0 { 0 } else { p.email }
+        }
+        _ if mms => p.mms,
+        _ => p.sms_segment * segments.max(1),
+    })
+}
+
+/// Refuse a send the balance can't cover.
+pub async fn ensure_funds(state: &AppState, account_id: Uuid, needed: i64, what: &str) -> AppResult<()> {
+    if !state.cfg.hosted || needed <= 0 {
+        return Ok(());
+    }
+    let bal = balance(&state.db, account_id).await?;
+    if bal < needed {
+        return Err(AppError::LimitReached(format!(
+            "{what} costs ${:.2} but your balance is ${:.2}. Add credit in Settings → Billing.",
+            to_usd(needed),
+            to_usd(bal.max(0))
+        )));
+    }
+    Ok(())
+}
+
+/// Estimate a campaign's cost (free emails first) and check the balance covers it.
+pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, recipients: i64, segments: i64, mms: bool) -> AppResult<i64> {
+    if !state.cfg.hosted {
+        return Ok(0);
+    }
+    let p = prices(state);
+    let cost = if channel == "email" {
+        (recipients - free_emails_remaining(state, account_id).await?).max(0) * p.email
+    } else if mms {
+        recipients * p.mms
+    } else {
+        recipients * segments.max(1) * p.sms_segment
+    };
+    ensure_funds(state, account_id, cost, "This send").await?;
+    Ok(cost)
+}
+
+/// Record a sent message: use the free allowance for email, otherwise charge the balance.
+/// Returns the amount charged.
+pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, segments: i64, mms: bool) -> AppResult<i64> {
+    if !state.cfg.hosted {
+        return Ok(0);
+    }
+    let p = prices(state);
+    let (kind, qty, amount) = if channel == "email" {
+        let month = month_key(&state.db, account_id).await?;
+        let used: i32 = sqlx::query_scalar(
+            "UPDATE accounts SET free_emails_used = CASE WHEN free_month = $2 THEN free_emails_used + 1 ELSE 1 END, free_month = $2
+             WHERE id = $1 RETURNING free_emails_used",
+        )
+        .bind(account_id)
+        .bind(&month)
+        .fetch_one(&state.db)
+        .await?;
+        let free = used as i64 <= state.cfg.free_emails_per_month;
+        ("email", 1i64, if free { 0 } else { p.email })
+    } else if mms {
+        ("mms", 1, p.mms)
+    } else {
+        ("sms", segments.max(1), p.sms_segment * segments.max(1))
+    };
+    debit_usage(&state.db, account_id, kind, qty, amount).await?;
+    Ok(amount)
+}
+
+/// Debit the balance and roll the charge into today's usage row for this kind.
+pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, amount: i64) -> AppResult<()> {
+    let label = match kind {
+        "email" => "Emails sent",
+        "sms" => "SMS segments sent",
+        "mms" => "MMS sent",
+        _ => "Usage",
+    };
+    let mut tx = db.begin().await?;
+    sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO ledger (id, account_id, kind, day, quantity, amount_micros, description)
+         VALUES ($1, $2, $3, (now() AT TIME ZONE (SELECT timezone FROM accounts WHERE id = $2))::date, $4, $5, $6)
+         ON CONFLICT (account_id, kind, day) WHERE day IS NOT NULL
+         DO UPDATE SET quantity = ledger.quantity + EXCLUDED.quantity, amount_micros = ledger.amount_micros + EXCLUDED.amount_micros",
+    )
+    .bind(Uuid::now_v7())
+    .bind(account_id)
+    .bind(kind)
+    .bind(qty)
+    .bind(-amount)
+    .bind(label)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// One-off charge or credit with a unique reference (idempotent). Positive amount = credit.
+pub async fn post_entry(db: &PgPool, account_id: Uuid, kind: &str, amount: i64, description: &str, reference: &str) -> AppResult<bool> {
+    let mut tx = db.begin().await?;
+    let inserted: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO ledger (id, account_id, kind, quantity, amount_micros, description, reference) VALUES ($1, $2, $3, 1, $4, $5, $6)
+         ON CONFLICT (kind, reference) WHERE reference IS NOT NULL AND day IS NULL DO NOTHING RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(account_id)
+    .bind(kind)
+    .bind(amount)
+    .bind(description)
+    .bind(reference)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if inserted.is_none() {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE accounts SET balance_micros = balance_micros + $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub async fn billing_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+    let p = prices(state);
+    let row: (i64, bool, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT balance_micros, auto_recharge_enabled, auto_recharge_threshold_micros, auto_recharge_amount_micros, stripe_payment_method_id FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&state.db)
+    .await?;
+    let usage = crate::plans::usage(&state.db, account_id).await?;
+    let free_left = free_emails_remaining(state, account_id).await?;
+    let daily: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT to_char(day, 'YYYY-MM-DD'), kind, quantity, -amount_micros FROM ledger
+         WHERE account_id = $1 AND day IS NOT NULL AND day > current_date - 31 ORDER BY day",
+    )
+    .bind(account_id)
+    .fetch_all(&state.db)
+    .await?;
+    let ledger: Vec<(Uuid, String, String, i64, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, kind, CASE WHEN day IS NOT NULL THEN description || ' (' || quantity || ')' ELSE description END, amount_micros, created_at
+         FROM ledger WHERE account_id = $1 ORDER BY COALESCE(day::timestamptz, created_at) DESC, created_at DESC LIMIT 50",
+    )
+    .bind(account_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(json!({
+        "mode": if state.cfg.hosted { "hosted" } else { "self_hosted" },
+        "balance": to_usd(row.0),
+        "free_emails_per_month": state.cfg.free_emails_per_month,
+        "emails_this_month": usage.emails_this_month,
+        "free_emails_remaining": free_left,
+        "sms_this_month": usage.sms_this_month,
+        "prices": {
+            "email_per_1000": to_usd(p.email * 1000),
+            "sms_per_segment": to_usd(p.sms_segment),
+            "mms_per_message": to_usd(p.mms),
+            "phone_number_monthly": to_usd(p.number_monthly),
+        },
+        "auto_recharge": {"enabled": row.1, "threshold": to_usd(row.2), "amount": to_usd(row.3)},
+        "has_payment_method": row.4.is_some(),
+        "stripe_enabled": state.cfg.stripe_secret_key.is_some(),
+        "usage": daily.into_iter().map(|(d, k, q, a)| json!({"date": d, "kind": k, "quantity": q, "amount": to_usd(a)})).collect::<Vec<_>>(),
+        "ledger": ledger.into_iter().map(|(id, k, d, a, t)| json!({"id": id, "kind": k, "description": d, "amount": to_usd(a), "created_at": t})).collect::<Vec<_>>(),
+        "limits": {"profiles": Value::Null},
+    }))
+}
+
+// ---------- Stripe ----------
+
+fn stripe_key(state: &AppState) -> AppResult<&str> {
+    state.cfg.stripe_secret_key.as_deref().ok_or_else(|| AppError::bad("card payments aren't configured on this server"))
+}
+
+async fn stripe_post(state: &AppState, path: &str, form: &[(String, String)]) -> AppResult<Value> {
+    let key = stripe_key(state)?;
+    let res = state
+        .http
+        .post(format!("https://api.stripe.com/v1/{path}"))
+        .basic_auth(key, Some(""))
+        .form(form)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+    let status = res.status();
+    let v: Value = res.json().await.map_err(|e| AppError::Internal(e.into()))?;
+    if !status.is_success() {
+        let msg = v["error"]["message"].as_str().unwrap_or("Stripe request failed").to_string();
+        return Err(if status.is_client_error() { AppError::BadRequest(msg) } else { AppError::Internal(anyhow::anyhow!(msg)) });
+    }
+    Ok(v)
+}
+
+async fn stripe_get(state: &AppState, path: &str) -> AppResult<Value> {
+    let key = stripe_key(state)?;
+    let res = state.http.get(format!("https://api.stripe.com/v1/{path}")).basic_auth(key, Some("")).send().await.map_err(|e| AppError::Internal(e.into()))?;
+    res.json().await.map_err(|e| AppError::Internal(e.into()))
+}
+
+async fn ensure_customer(state: &AppState, account_id: Uuid) -> AppResult<String> {
+    let (existing, name): (Option<String>, String) = sqlx::query_as("SELECT stripe_customer_id, name FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    if let Some(c) = existing {
+        return Ok(c);
+    }
+    let email: Option<String> = sqlx::query_scalar("SELECT u.email FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 1")
+        .bind(account_id)
+        .fetch_optional(&state.db)
+        .await?;
+    let mut form = vec![("name".to_string(), name), ("metadata[account_id]".to_string(), account_id.to_string())];
+    if let Some(e) = email {
+        form.push(("email".into(), e));
+    }
+    let c = stripe_post(state, "customers", &form).await?;
+    let id = c["id"].as_str().unwrap_or_default().to_string();
+    sqlx::query("UPDATE accounts SET stripe_customer_id = $2 WHERE id = $1").bind(account_id).bind(&id).execute(&state.db).await?;
+    Ok(id)
+}
+
+/// Start a Stripe Checkout session for a credit top-up; the card is saved for auto-recharge.
+pub async fn checkout(state: &AppState, account_id: Uuid, amount_usd: f64) -> AppResult<String> {
+    if !state.cfg.hosted {
+        return Err(AppError::bad("self-hosted installs don't use billing"));
+    }
+    if !(10.0..=5000.0).contains(&amount_usd) {
+        return Err(AppError::bad("top-ups are between $10 and $5,000"));
+    }
+    let cents = (amount_usd * 100.0).round() as i64;
+    let customer = ensure_customer(state, account_id).await?;
+    let base = state.cfg.public_url();
+    let form: Vec<(String, String)> = vec![
+        ("mode".into(), "payment".into()),
+        ("customer".into(), customer),
+        ("client_reference_id".into(), account_id.to_string()),
+        ("line_items[0][quantity]".into(), "1".into()),
+        ("line_items[0][price_data][currency]".into(), "usd".into()),
+        ("line_items[0][price_data][unit_amount]".into(), cents.to_string()),
+        ("line_items[0][price_data][product_data][name]".into(), "Postlark credit".into()),
+        ("line_items[0][price_data][product_data][description]".into(), "Prepaid credit for emails and texts".into()),
+        ("payment_intent_data[setup_future_usage]".into(), "off_session".into()),
+        ("payment_intent_data[metadata][account_id]".into(), account_id.to_string()),
+        ("metadata[account_id]".into(), account_id.to_string()),
+        ("metadata[kind]".into(), "topup".into()),
+        ("success_url".into(), format!("{base}/settings/billing?topup=success")),
+        ("cancel_url".into(), format!("{base}/settings/billing?topup=cancelled")),
+    ];
+    let s = stripe_post(state, "checkout/sessions", &form).await?;
+    s["url"].as_str().map(String::from).ok_or_else(|| AppError::Internal(anyhow::anyhow!("Stripe returned no checkout url")))
+}
+
+/// Verify a Stripe-Signature header (t=...,v1=...) within a 5 minute tolerance.
+pub fn verify_stripe_signature(secret: &str, header: &str, body: &[u8], now: i64) -> bool {
+    let mut t = None;
+    let mut sigs = Vec::new();
+    for part in header.split(',') {
+        if let Some((k, v)) = part.trim().split_once('=') {
+            match k {
+                "t" => t = v.parse::<i64>().ok(),
+                "v1" => sigs.push(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let Some(t) = t else { return false };
+    if (now - t).abs() > 300 {
+        return false;
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(t.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let expected = hex::encode(mac.finalize().into_bytes());
+    sigs.iter().any(|s| s.len() == expected.len() && s.bytes().zip(expected.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0)
+}
+
+/// Apply a verified Stripe event. Credits are idempotent by Stripe object id.
+pub async fn handle_stripe_event(state: &AppState, ev: &Value) -> AppResult<()> {
+    let obj = &ev["data"]["object"];
+    match ev["type"].as_str().unwrap_or("") {
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            if obj["payment_status"] != "paid" || obj["metadata"]["kind"] != "topup" {
+                return Ok(());
+            }
+            let Some(account_id) = obj["metadata"]["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+            let cents = obj["amount_total"].as_i64().unwrap_or(0);
+            let session = obj["id"].as_str().unwrap_or_default();
+            post_entry(&state.db, account_id, "topup", cents * 10_000, &format!("Added credit (${:.2})", cents as f64 / 100.0), session).await?;
+            if let Some(pi) = obj["payment_intent"].as_str() {
+                let intent = stripe_get(state, &format!("payment_intents/{pi}")).await?;
+                if let Some(pm) = intent["payment_method"].as_str() {
+                    sqlx::query("UPDATE accounts SET stripe_payment_method_id = $2, stripe_customer_id = COALESCE(stripe_customer_id, $3), auto_recharge_failed_at = NULL WHERE id = $1")
+                        .bind(account_id)
+                        .bind(pm)
+                        .bind(obj["customer"].as_str())
+                        .execute(&state.db)
+                        .await?;
+                }
+            }
+        }
+        "payment_intent.succeeded" if obj["metadata"]["kind"] == "auto_recharge" => {
+            if let Some(account_id) = obj["metadata"]["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
+                let cents = obj["amount_received"].as_i64().unwrap_or(0);
+                post_entry(&state.db, account_id, "auto_recharge", cents * 10_000, &format!("Auto-recharge (${:.2})", cents as f64 / 100.0), obj["id"].as_str().unwrap_or_default()).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub async fn set_auto_recharge(state: &AppState, account_id: Uuid, enabled: bool, threshold: f64, amount: f64) -> AppResult<()> {
+    if !(0.0..=1000.0).contains(&threshold) || !(10.0..=1000.0).contains(&amount) {
+        return Err(AppError::bad("threshold must be $0–1,000 and recharge amount $10–1,000"));
+    }
+    if enabled {
+        let pm: Option<String> = sqlx::query_scalar("SELECT stripe_payment_method_id FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+        if pm.is_none() {
+            return Err(AppError::bad("add credit with a card once before turning on auto-recharge"));
+        }
+    }
+    sqlx::query("UPDATE accounts SET auto_recharge_enabled = $2, auto_recharge_threshold_micros = $3, auto_recharge_amount_micros = $4, auto_recharge_failed_at = NULL WHERE id = $1")
+        .bind(account_id)
+        .bind(enabled)
+        .bind(to_micros(threshold))
+        .bind(to_micros(amount))
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+/// Scheduler: charge saved cards for accounts below their auto-recharge threshold.
+pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
+    if !state.cfg.hosted || state.cfg.stripe_secret_key.is_none() {
+        return Ok(());
+    }
+    let due: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
+        "SELECT id, stripe_customer_id, stripe_payment_method_id, auto_recharge_amount_micros FROM accounts
+         WHERE auto_recharge_enabled AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
+           AND balance_micros < auto_recharge_threshold_micros
+           AND (auto_recharge_failed_at IS NULL OR auto_recharge_failed_at < now() - interval '1 day')
+         LIMIT 50",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (account_id, customer, pm, amount) in due {
+        let cents = amount / 10_000;
+        let form: Vec<(String, String)> = vec![
+            ("amount".into(), cents.to_string()),
+            ("currency".into(), "usd".into()),
+            ("customer".into(), customer),
+            ("payment_method".into(), pm),
+            ("off_session".into(), "true".into()),
+            ("confirm".into(), "true".into()),
+            ("description".into(), "Postlark auto-recharge".into()),
+            ("metadata[account_id]".into(), account_id.to_string()),
+            ("metadata[kind]".into(), "auto_recharge".into()),
+        ];
+        match stripe_post(state, "payment_intents", &form).await {
+            Ok(pi) if pi["status"] == "succeeded" => {
+                post_entry(&state.db, account_id, "auto_recharge", cents * 10_000, &format!("Auto-recharge (${:.2})", cents as f64 / 100.0), pi["id"].as_str().unwrap_or_default())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            }
+            other => {
+                tracing::warn!(account = %account_id, result = ?other.err().map(|e| e.public_message()), "auto-recharge did not succeed");
+                sqlx::query("UPDATE accounts SET auto_recharge_failed_at = now() WHERE id = $1").bind(account_id).execute(&state.db).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scheduler: monthly phone number rent.
+pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
+    let due: Vec<(Uuid, Uuid, String, i64)> = sqlx::query_as(
+        "SELECT id, account_id, phone_number, monthly_price_micros FROM phone_numbers
+         WHERE status <> 'released' AND monthly_price_micros > 0 AND next_charge_at <= now() LIMIT 200",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (id, account_id, number, price) in due {
+        let month = Utc::now().format("%Y-%m").to_string();
+        let reference = format!("{id}:{month}");
+        if state.cfg.hosted {
+            post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        }
+        sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month' WHERE id = $1").bind(id).execute(&state.db).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stripe_signatures() {
+        let body = br#"{"id":"evt_1"}"#;
+        let t = 1_700_000_000i64;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"whsec_test").unwrap();
+        mac.update(format!("{t}.").as_bytes());
+        mac.update(body);
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let header = format!("t={t},v1={sig}");
+        assert!(verify_stripe_signature("whsec_test", &header, body, t + 10));
+        assert!(!verify_stripe_signature("whsec_test", &header, body, t + 1000), "too old");
+        assert!(!verify_stripe_signature("whsec_other", &header, body, t));
+        assert!(!verify_stripe_signature("whsec_test", &header, b"{}", t));
+    }
+
+    #[test]
+    fn money() {
+        assert_eq!(to_micros(0.20 / 1000.0), 200);
+        assert_eq!(to_micros(0.0099), 9900);
+        assert_eq!(to_usd(2_200_000), 2.2);
+    }
+}

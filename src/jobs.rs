@@ -168,6 +168,13 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
             enqueue(&state.db, "segment_refresh", json!({"segment_id": s}), None).await?;
         }
     }
+    if tick.is_multiple_of(3) {
+        crate::billing::run_auto_recharge(state).await?;
+        crate::billing::charge_numbers(state).await?;
+    }
+    if tick.is_multiple_of(45) {
+        crate::phone::poll_verifications(state).await?;
+    }
     if tick.is_multiple_of(90) {
         crate::flows::date_triggers(state).await?;
     }

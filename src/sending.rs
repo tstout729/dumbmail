@@ -88,8 +88,8 @@ pub fn check_sender_domain_name(account: &Account, from_email: &str) -> Result<(
     if ok { Ok(()) } else { Err(format!("Verify {from_domain} in Settings → Sending before sending from {from_email}")) }
 }
 
-pub fn unsubscribe_url(state: &AppState, message_id: Uuid) -> String {
-    format!("{}/u/{}", state.cfg.public_url(), crate::auth::sign(&state.cfg.secret_key, &format!("u{}", message_id.simple())))
+pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) -> String {
+    format!("{}/u/{}", crate::domains::link_base(state, account), crate::auth::sign(&state.cfg.secret_key, &format!("u{}", message_id.simple())))
 }
 
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
@@ -126,10 +126,11 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
 
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
-    let unsub = unsubscribe_url(state, message_id);
+    let unsub = unsubscribe_url(state, spec.account, message_id);
     let ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
-        public_url: state.cfg.public_url(),
+        public_url: &link_base,
         secret: &state.cfg.secret_key,
         message_id,
         unsubscribe_url: unsub.clone(),
@@ -138,7 +139,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     // Render first so template errors never leave a half-sent message.
     enum Rendered {
         Email(OutgoingEmail),
-        Sms(OutgoingSms),
+        Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>),
     }
     let (subject, rendered) = if spec.channel == "email" {
         let content: EmailContent = serde_json::from_value(spec.content.clone())?;
@@ -165,18 +166,30 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         (Some(subject), Rendered::Email(email))
     } else {
         let content: SmsContent = serde_json::from_value(spec.content.clone())?;
-        let from = spec
-            .account
-            .sms_from
-            .clone()
-            .ok_or_else(|| AppError::bad("set an SMS sending number in Settings → SMS before sending texts"))?;
+        let (provider, from) = crate::phone::sender(state, spec.account.id).await?;
         let prior_sms: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = 'sms' AND status IN ('sent','delivered'))")
             .bind(p.id)
             .fetch_one(&state.db)
             .await?;
         let body = render::render_sms(spec.account, &content, &ctx, Some(&tracking), !prior_sms)?;
-        (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }))
+        (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider))
     };
+
+    // Pay-as-you-go: make sure the balance covers this message before it goes out.
+    let (segments, is_mms) = match &rendered {
+        Rendered::Sms(s, _) => (crate::providers::sms::segment_count(&s.body).1 as i64, s.media_url.is_some()),
+        Rendered::Email(_) => (1, false),
+    };
+    let price = crate::billing::quote(state, spec.account.id, spec.channel, segments, is_mms).await?;
+    if price > 0 && crate::billing::balance(&state.db, spec.account.id).await? < price {
+        if let Some(mid) = spec.message_id {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'insufficient credit' WHERE id = $1").bind(mid).execute(&state.db).await?;
+        }
+        if spec.is_test {
+            return Err(AppError::LimitReached("your balance is empty; add credit in Settings → Billing".into()));
+        }
+        return Ok(Outcome::Skipped("insufficient credit"));
+    }
 
     if spec.message_id.is_none() {
         sqlx::query(
@@ -209,16 +222,19 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             throttle("email", state.cfg.send_rate_per_sec).await;
             state.email.send(e).await
         }
-        Rendered::Sms(s) => {
+        Rendered::Sms(s, provider) => {
             throttle("sms", state.cfg.send_rate_per_sec).await;
-            state.sms.send(s).await
+            provider.send(s).await
         }
     };
     match result {
         Ok(provider_id) => {
-            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL WHERE id = $1")
+            let cost = crate::billing::charge_message(state, spec.account.id, spec.channel, segments, is_mms).await?;
+            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4 WHERE id = $1")
                 .bind(message_id)
                 .bind(&provider_id)
+                .bind(segments as i32)
+                .bind(cost)
                 .execute(&state.db)
                 .await?;
             if !spec.is_test {
@@ -289,7 +305,11 @@ mod tests {
             sending_domain_status: String::new(),
             sending_domain_records: json!([]),
             conversion_metric: "Placed Order".into(),
-            created_at: Utc::now(),
+            created_at: chrono::Utc::now(),
+            mail_from_domain: None,
+            link_domain: None,
+            link_domain_status: "not_started".into(),
+            link_domain_records: json!([]),
         }
     }
 }

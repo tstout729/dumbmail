@@ -220,6 +220,41 @@ pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::Socket
     Ok((host, addrs[0]))
 }
 
+/// Fetch a public web page (for checking a customer's site for the snippet): public IPs only,
+/// pinned DNS, a few redirects re-checked hop by hop, and at most 3 MB read.
+pub async fn fetch_public_page(raw: &str) -> AppResult<String> {
+    let mut url = raw.to_string();
+    for _ in 0..4 {
+        let (host, addr) = check_webhook_url(&url).await.map_err(|_| AppError::bad("enter a public website address"))?;
+        let client = reqwest::Client::builder()
+            .resolve(&host, addr)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (compatible; PostlarkSnippetCheck/0.2)")
+            .build()
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let res = client.get(&url).send().await.map_err(|e| AppError::bad(format!("couldn't load that page: {e}")))?;
+        if res.status().is_redirection() {
+            let loc = res.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default();
+            url = url::Url::parse(&url).and_then(|b| b.join(loc)).map(|u| u.to_string()).map_err(|_| AppError::bad("the page redirected somewhere invalid"))?;
+            continue;
+        }
+        if !res.status().is_success() {
+            return Err(AppError::bad(format!("that page returned HTTP {}", res.status().as_u16())));
+        }
+        let mut body = Vec::new();
+        let mut stream = res;
+        while let Some(chunk) = stream.chunk().await.map_err(|e| AppError::bad(format!("couldn't read that page: {e}")))? {
+            body.extend_from_slice(&chunk);
+            if body.len() > 3 * 1024 * 1024 {
+                break;
+            }
+        }
+        return Ok(String::from_utf8_lossy(&body).into_owned());
+    }
+    Err(AppError::bad("that page redirects too many times"))
+}
+
 async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
     let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let client = reqwest::Client::builder()

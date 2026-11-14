@@ -21,11 +21,22 @@ pub fn routes() -> Router<AppState> {
         .route("/api/me", get(me))
         .route("/api/account", axum::routing::patch(update_account))
         .route("/api/account/sending", get(sending))
-        .route("/api/account/domain", post(add_domain))
+        .route("/api/account/domain", post(add_domain).delete(remove_domain))
         .route("/api/account/domain/verify", post(verify_domain))
+        .route("/api/account/link-domain", post(add_link_domain).delete(remove_link_domain))
+        .route("/api/account/link-domain/verify", post(verify_link_domain))
         .route("/api/api-keys", get(list_keys).post(create_key))
         .route("/api/api-keys/{id}", delete(revoke_key))
         .route("/api/billing", get(billing))
+        .route("/api/billing/checkout", post(checkout))
+        .route("/api/billing/auto-recharge", axum::routing::patch(auto_recharge))
+        .route("/api/phone-numbers", get(numbers).post(claim_number))
+        .route("/api/phone-numbers/available", get(available_numbers))
+        .route("/api/phone-numbers/{id}", delete(release_number))
+        .route("/api/phone-numbers/{id}/verification", post(verify_number))
+        .route("/api/sms/connect", post(connect_sms).delete(disconnect_sms))
+        .route("/api/website", get(website))
+        .route("/api/website/check", post(check_website))
 }
 
 #[derive(Deserialize)]
@@ -194,6 +205,17 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
             Some(p) => Some(normalize_phone(&p).ok_or_else(|| AppError::bad("SMS number must be a phone number like +15035550100"))?),
             None => None,
         };
+        // On the hosted service you can only send from numbers you claimed or connected.
+        if let (true, Some(num)) = (state.cfg.hosted, &account.sms_from) {
+            let owned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM phone_numbers WHERE account_id = $1 AND phone_number = $2 AND status <> 'released')")
+                .bind(account_id)
+                .bind(num)
+                .fetch_one(&state.db)
+                .await?;
+            if !owned {
+                return Err(AppError::bad("claim or connect this number in Settings → SMS first"));
+            }
+        }
     }
     if let Some(tz) = b.timezone {
         tz.parse::<chrono_tz::Tz>().map_err(|_| AppError::bad("unknown time zone (use e.g. America/Los_Angeles)"))?;
@@ -251,25 +273,16 @@ async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
 }
 
 pub fn sending_json(state: &AppState, a: &Account) -> Value {
-    json!({
-        "email": {
-            "provider": state.email.name(),
-            "domain": a.sending_domain,
-            "status": a.sending_domain_status,
-            "dns_records": a.sending_domain_records,
-            "from_email": a.from_email,
-        },
-        "sms": {
-            "provider": state.sms.name(),
-            "from_number": a.sms_from,
-            "status": if a.sms_from.is_some() { "ready" } else { "not_started" },
-        }
-    })
+    crate::domains::sending_json(state, a)
+}
+
+async fn sending_now(state: &AppState, account_id: Uuid) -> AppResult<Json<Value>> {
+    let a = load_account(&state.db, account_id).await?;
+    Ok(Json(sending_json(state, &a)))
 }
 
 async fn sending(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let a = load_account(&state.db, ctx.account_id).await?;
-    Ok(Json(sending_json(&state, &a)))
+    sending_now(&state, ctx.account_id).await
 }
 
 #[derive(Deserialize)]
@@ -278,20 +291,8 @@ struct DomainBody {
 }
 
 pub async fn set_domain(state: &AppState, account_id: Uuid, domain: &str) -> AppResult<Value> {
-    let domain = domain.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_lowercase();
-    let valid = domain.contains('.') && domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') && domain.len() < 254;
-    if !valid {
-        return Err(AppError::bad("enter a domain like mail.yourbrand.com"));
-    }
-    let st = state.email.add_domain(&domain).await.map_err(|e| AppError::bad(format!("could not start domain setup: {e:#}")))?;
-    let a: Account = sqlx::query_as("UPDATE accounts SET sending_domain = $2, sending_domain_status = $3, sending_domain_records = $4 WHERE id = $1 RETURNING *")
-        .bind(account_id)
-        .bind(&domain)
-        .bind(&st.status)
-        .bind(serde_json::to_value(&st.records)?)
-        .fetch_one(&state.db)
-        .await?;
-    Ok(sending_json(state, &a))
+    crate::domains::set_sending_domain(state, account_id, domain).await?;
+    Ok(sending_now(state, account_id).await?.0)
 }
 
 async fn add_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
@@ -299,19 +300,28 @@ async fn add_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson
 }
 
 async fn verify_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let a = load_account(&state.db, ctx.account_id).await?;
-    let domain = a.sending_domain.clone().ok_or_else(|| AppError::bad("add a sending domain first"))?;
-    let st = state.email.domain_state(&domain).await.map_err(|e| AppError::bad(format!("could not check DNS: {e:#}")))?;
-    let a: Account = sqlx::query_as("UPDATE accounts SET sending_domain_status = $2, sending_domain_records = $3 WHERE id = $1 RETURNING *")
-        .bind(ctx.account_id)
-        .bind(&st.status)
-        .bind(serde_json::to_value(&st.records)?)
-        .fetch_one(&state.db)
-        .await?;
-    if st.status == "verified" {
-        sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"sender\": true}' WHERE id = $1").bind(ctx.account_id).execute(&state.db).await?;
-    }
-    Ok(Json(sending_json(&state, &a)))
+    crate::domains::verify_sending_domain(&state, ctx.account_id).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+async fn remove_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    crate::domains::remove_sending_domain(&state, ctx.account_id).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+async fn add_link_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
+    crate::domains::set_link_domain(&state, ctx.account_id, &b.domain).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+async fn verify_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    crate::domains::verify_link_domain(&state, ctx.account_id).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+async fn remove_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    crate::domains::remove_link_domain(&state, ctx.account_id).await?;
+    sending_now(&state, ctx.account_id).await
 }
 
 async fn list_keys(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -370,18 +380,115 @@ async fn revoke_key(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
 }
 
 pub async fn billing_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
-    let a = load_account(&state.db, account_id).await?;
-    let plan = if state.cfg.hosted { a.plan.clone() } else { "self_hosted".into() };
-    let limits = crate::plans::limits(&plan);
-    let usage = crate::plans::usage(&state.db, account_id).await?;
-    let cap = |v: i64| if v == i64::MAX { Value::Null } else { json!(v) };
-    Ok(json!({
-        "plan": plan,
-        "limits": {"profiles": cap(limits.profiles), "emails_per_month": cap(limits.emails_per_month), "sms_per_month": cap(limits.sms_per_month)},
-        "usage": usage,
-    }))
+    crate::billing::billing_json(state, account_id).await
 }
 
 async fn billing(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(billing_json(&state, ctx.account_id).await?))
+}
+
+#[derive(Deserialize)]
+struct CheckoutBody {
+    amount: f64,
+}
+
+async fn checkout(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<CheckoutBody>) -> AppResult<Json<Value>> {
+    if ctx.via_api_key {
+        return Err(AppError::Forbidden("add credit from the dashboard".into()));
+    }
+    Ok(Json(json!({"url": crate::billing::checkout(&state, ctx.account_id, b.amount).await?})))
+}
+
+#[derive(Deserialize)]
+struct AutoRechargeBody {
+    enabled: bool,
+    threshold: f64,
+    amount: f64,
+}
+
+async fn auto_recharge(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AutoRechargeBody>) -> AppResult<Json<Value>> {
+    crate::billing::set_auto_recharge(&state, ctx.account_id, b.enabled, b.threshold, b.amount).await?;
+    Ok(Json(billing_json(&state, ctx.account_id).await?))
+}
+
+pub async fn numbers_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+    let rows = crate::phone::list(state, account_id).await?;
+    Ok(json!({"data": rows.iter().map(crate::phone::row_json).collect::<Vec<_>>(), "sms": crate::phone::sms_setup_json(state, account_id).await?}))
+}
+
+async fn numbers(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    Ok(Json(numbers_json(&state, ctx.account_id).await?))
+}
+
+#[derive(Deserialize)]
+struct AvailableQuery {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    area_code: Option<String>,
+}
+
+async fn available_numbers(State(state): State<AppState>, ctx: Ctx, axum::extract::Query(q): axum::extract::Query<AvailableQuery>) -> AppResult<Json<Value>> {
+    let _ = ctx;
+    Ok(Json(crate::phone::available(&state, q.kind.as_deref().unwrap_or("toll_free"), q.area_code.as_deref()).await?))
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    phone_number: String,
+}
+
+async fn claim_number(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ClaimBody>) -> AppResult<Json<Value>> {
+    let row = crate::phone::claim(&state, ctx.account_id, &b.phone_number).await?;
+    Ok(Json(crate::phone::row_json(&row)))
+}
+
+async fn release_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    crate::phone::release(&state, ctx.account_id, id).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn verify_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<crate::phone::TollFreeVerification>) -> AppResult<Json<Value>> {
+    let row = crate::phone::submit_verification(&state, ctx.account_id, id, b).await?;
+    Ok(Json(crate::phone::row_json(&row)))
+}
+
+async fn connect_sms(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<crate::phone::ConnectBody>) -> AppResult<Json<Value>> {
+    crate::phone::connect(&state, ctx.account_id, b).await?;
+    Ok(Json(numbers_json(&state, ctx.account_id).await?))
+}
+
+async fn disconnect_sms(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    crate::phone::disconnect(&state, ctx.account_id).await?;
+    Ok(Json(numbers_json(&state, ctx.account_id).await?))
+}
+
+pub fn snippet(state: &AppState, public_key: &str) -> String {
+    format!("<script async src=\"{}/onsite.js?k={public_key}\"></script>", state.cfg.public_url())
+}
+
+async fn website(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    let (pk, seen, url): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+        sqlx::query_as("SELECT public_key, onsite_last_seen_at, onsite_last_url FROM accounts WHERE id = $1").bind(ctx.account_id).fetch_one(&state.db).await?;
+    Ok(Json(json!({"snippet": snippet(&state, &pk), "public_key": pk, "installed": seen.is_some(), "last_seen_at": seen, "last_seen_url": url})))
+}
+
+#[derive(Deserialize)]
+struct CheckBody {
+    url: String,
+}
+
+async fn check_website(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<CheckBody>) -> AppResult<Json<Value>> {
+    let pk: String = sqlx::query_scalar("SELECT public_key FROM accounts WHERE id = $1").bind(ctx.account_id).fetch_one(&state.db).await?;
+    let raw = if b.url.starts_with("http") { b.url.trim().to_string() } else { format!("https://{}", b.url.trim()) };
+    let html = crate::flows::fetch_public_page(&raw).await?;
+    let found = html.contains(&format!("k={pk}"));
+    let other = !found && (html.contains("/onsite.js?k=") || html.contains("/client/postlark.js?k="));
+    let message = if found {
+        "Found your snippet on that page.".to_string()
+    } else if other {
+        "Found a Postlark snippet, but with a different key. Copy the snippet from this page again.".to_string()
+    } else {
+        "Couldn't find the snippet in that page's HTML. If you just added it, publish your site and try again. Tag managers (like GTM) load it later, so we'll show Installed once a visitor's browser runs it.".to_string()
+    };
+    Ok(Json(json!({"found": found, "message": message})))
 }

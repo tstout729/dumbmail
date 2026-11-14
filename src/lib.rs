@@ -4,13 +4,17 @@
 pub mod api;
 pub mod audience;
 pub mod auth;
+pub mod billing;
 pub mod campaigns;
 pub mod config;
+pub mod crypto;
+pub mod domains;
 pub mod error;
 pub mod flows;
 pub mod jobs;
 pub mod mcp;
 pub mod models;
+pub mod phone;
 pub mod plans;
 pub mod providers;
 pub mod public;
@@ -28,12 +32,39 @@ pub use state::AppState;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Requests arriving on a customer's branded link domain may only reach public pages
+/// (tracking, unsubscribe, forms, the onsite script). Everything else goes to the main app.
+async fn link_domain_guard(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
+    let path = req.uri().path().to_string();
+    let public_ok = ["/t/", "/u/", "/f/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
+    if public_ok || host.is_empty() {
+        return next.run(req).await;
+    }
+    let is_link_domain: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE link_domain = $1)")
+        .bind(&host)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
+    if is_link_domain {
+        let target = format!("{}{}", state.cfg.public_url(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        return axum::response::Redirect::temporary(&target).into_response();
+    }
+    next.run(req).await
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
         .merge(public::routes())
         .merge(mcp::routes())
         .fallback(web::serve)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())

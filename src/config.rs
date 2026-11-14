@@ -60,6 +60,41 @@ pub struct Config {
     #[arg(long, env = "WORKERS", default_value_t = 4)]
     pub workers: usize,
 
+    /// Stripe secret key for credit top-ups (hosted billing).
+    #[arg(long, env = "STRIPE_SECRET_KEY", hide_env_values = true)]
+    pub stripe_secret_key: Option<String>,
+    /// Signing secret of the Stripe webhook pointed at {PUBLIC_URL}/webhooks/stripe.
+    #[arg(long, env = "STRIPE_WEBHOOK_SECRET", hide_env_values = true)]
+    pub stripe_webhook_secret: Option<String>,
+
+    /// Customer prices in USD (cost plus markup). Email: SES costs $0.10 per 1,000.
+    #[arg(long, env = "PRICE_EMAIL_PER_1000", default_value_t = 0.20)]
+    pub price_email_per_1000: f64,
+    /// SMS per segment, carrier fees included (Telnyx costs about $0.0083 all-in).
+    #[arg(long, env = "PRICE_SMS_SEGMENT", default_value_t = 0.0099)]
+    pub price_sms_segment: f64,
+    #[arg(long, env = "PRICE_MMS", default_value_t = 0.025)]
+    pub price_mms: f64,
+    /// Phone number per month (Telnyx charges $1.10).
+    #[arg(long, env = "PRICE_NUMBER_MONTHLY", default_value_t = 2.20)]
+    pub price_number_monthly: f64,
+    #[arg(long, env = "FREE_EMAILS_PER_MONTH", default_value_t = 3000)]
+    pub free_emails_per_month: i64,
+
+    /// AWS region used for SES (also determines the custom MAIL FROM MX host).
+    #[arg(long, env = "AWS_REGION", default_value = "us-east-1")]
+    pub aws_region: String,
+
+    /// Railway API token: lets customers add branded link domains with automatic TLS.
+    #[arg(long, env = "RAILWAY_API_TOKEN", hide_env_values = true)]
+    pub railway_api_token: Option<String>,
+    #[arg(long, env = "RAILWAY_PROJECT_ID")]
+    pub railway_project_id: Option<String>,
+    #[arg(long, env = "RAILWAY_ENVIRONMENT_ID")]
+    pub railway_environment_id: Option<String>,
+    #[arg(long, env = "RAILWAY_SERVICE_ID")]
+    pub railway_service_id: Option<String>,
+
     /// Serve cookies with the Secure flag (turn on behind HTTPS).
     #[arg(long, env = "SECURE_COOKIES", default_value_t = false)]
     pub secure_cookies: bool,

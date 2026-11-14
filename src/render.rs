@@ -400,6 +400,10 @@ mod tests {
             sending_domain_records: json!([]),
             conversion_metric: "Placed Order".into(),
             created_at: chrono::Utc::now(),
+            mail_from_domain: None,
+            link_domain: None,
+            link_domain_status: "not_started".into(),
+            link_domain_records: json!([]),
         }
     }
 

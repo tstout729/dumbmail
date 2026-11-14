@@ -28,6 +28,14 @@ pub struct Account {
     pub sending_domain_records: Value,
     pub conversion_metric: String,
     pub created_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub mail_from_domain: Option<String>,
+    #[serde(skip)]
+    pub link_domain: Option<String>,
+    #[serde(skip)]
+    pub link_domain_status: String,
+    #[serde(skip)]
+    pub link_domain_records: Value,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

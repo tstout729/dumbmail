@@ -21,7 +21,10 @@ pub fn routes() -> Router<AppState> {
         .route("/t/o/{token}", get(open_pixel))
         .route("/t/c/{token}", get(click))
         .route("/u/{token}", get(unsubscribe_page).post(unsubscribe_post))
-        .route("/client/postlark.js", get(client_js))
+        .route("/onsite.js", get(onsite_js))
+        .route("/client/postlark.js", get(onsite_js))
+        .route("/client/forms", get(client_forms))
+        .route("/client/ping", post(client_ping).options(cors_preflight))
         .route("/client/events", post(client_event).options(cors_preflight))
         .route("/client/subscribe", post(client_subscribe).options(cors_preflight))
         .route("/client/forms/{id}/view", post(form_view).options(cors_preflight))
@@ -30,6 +33,7 @@ pub fn routes() -> Router<AppState> {
         .route("/webhooks/ses/{secret}", post(ses_webhook))
         .route("/webhooks/telnyx/{secret}", post(telnyx_webhook))
         .route("/webhooks/twilio/{secret}", post(twilio_webhook))
+        .route("/webhooks/stripe", post(stripe_webhook))
         .route("/healthz", get(|| async { "ok" }))
 }
 
@@ -125,6 +129,13 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
         if matches!(first, Ok(Some(_))) && m.channel == "email" {
             let _ = msg_event(&state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
         }
+        if !m.is_test {
+            // Lets the onsite script recognize the person on the store's site.
+            if let Ok(mut dest) = url::Url::parse(&q.u) {
+                dest.query_pairs_mut().append_pair("_pl", &profile_token(&state, m.profile_id));
+                return Redirect::to(dest.as_str()).into_response();
+            }
+        }
     }
     Redirect::to(&q.u).into_response()
 }
@@ -210,15 +221,22 @@ async fn cors_preflight() -> Response {
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
-fn public_profile(v: &Value) -> AppResult<ProfileInput> {
+fn public_profile(state: &AppState, account_id: Uuid, v: &Value) -> AppResult<ProfileInput> {
     let mut p = v.clone();
+    let token_id = v.get("$token").and_then(|t| t.as_str()).and_then(|t| profile_from_token(state, t));
     if let Some(o) = p.as_object_mut() {
         // Browsers may not change consent or pick profiles by internal id.
-        for k in ["email_consent", "sms_consent", "id"] {
+        for k in ["email_consent", "sms_consent", "id", "$token"] {
             o.remove(k);
         }
     }
-    Ok(serde_json::from_value(p)?)
+    let mut input: ProfileInput = serde_json::from_value(p)?;
+    // A valid link token identifies the person even without an email (checked against this account below).
+    if let Some(id) = token_id {
+        input.id = Some(id);
+    }
+    let _ = account_id;
+    Ok(input)
 }
 
 async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, body: Bytes) -> Response {
@@ -226,8 +244,19 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
-        let input = public_profile(&b["profile"])?;
-        let p = audience::upsert_profile_public(&state.db, a.id, &input).await?.profile;
+        let input = public_profile(&state, a.id, &b["profile"])?;
+        let p = match input.id {
+            // Token-identified visitor: the profile must belong to this account.
+            Some(id) => {
+                let owned: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE id = $1 AND account_id = $2").bind(id).bind(a.id).fetch_optional(&state.db).await?;
+                match owned {
+                    Some(_) if input.email.is_none() && input.phone_number.is_none() && input.external_id.is_none() => crate::api::audience::load_profile(&state, a.id, id).await?,
+                    Some(_) => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
+                    None => audience::upsert_profile_public(&state.db, a.id, &ProfileInput { id: None, ..input }).await?.profile,
+                }
+            }
+            None => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
+        };
         let props = if b["properties"].is_object() { b["properties"].clone() } else { json!({}) };
         let value = b["value"].as_f64();
         audience::record_event(
@@ -244,20 +273,68 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
     })
 }
 
-async fn client_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
-    let base = state.cfg.public_url();
-    let k = serde_json::to_string(&q.k).unwrap_or_default();
-    let js = format!(
-        r#"(function(){{var K={k},B="{base}",S="pl_profile";
-function g(){{try{{return JSON.parse(localStorage.getItem(S)||"{{}}")}}catch(e){{return{{}}}}}}
-function send(p,b){{try{{fetch(B+p+"?k="+encodeURIComponent(K),{{method:"POST",headers:{{"content-type":"application/json"}},body:JSON.stringify(b),keepalive:true}})}}catch(e){{}}}}
-var api={{identify:function(p){{var c=g();for(var x in p)c[x]=p[x];try{{localStorage.setItem(S,JSON.stringify(c))}}catch(e){{}}return api}},
-track:function(m,props,value){{var p=g();if(!p.email&&!p.phone_number&&!p.external_id)return api;send("/client/events",{{metric:m,profile:p,properties:props||{{}},value:value}});return api}},
-profile:g}};
-var q=(window.postlark&&window.postlark.q)||[];window.postlark=api;q.forEach(function(c){{api[c[0]]&&api[c[0]].apply(api,c.slice(1))}});
-api.track("Active on Site",{{url:location.href,title:document.title}});}})();"#
-    );
+const ONSITE_JS: &str = include_str!("onsite.js");
+
+fn onsite_script(state: &AppState, key: &str, only_form: Option<Uuid>) -> Response {
+    let js = ONSITE_JS
+        .replacen("__BASE__", &serde_json::to_string(state.cfg.public_url()).unwrap_or_default(), 1)
+        .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
+        .replacen("__FORM__", &only_form.map(|f| serde_json::to_string(&f.to_string()).unwrap_or_default()).unwrap_or_else(|| "null".into()), 1);
     ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=300")], js).into_response()
+}
+
+async fn onsite_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
+    onsite_script(&state, &q.k, None)
+}
+
+/// Live forms for the onsite script.
+async fn client_forms(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
+    let res: AppResult<Value> = async {
+        let a = account_by_public_key(&state, &q.k).await?;
+        let forms: Vec<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 AND status = 'live' ORDER BY created_at").bind(a.id).fetch_all(&state.db).await?;
+        let data: Vec<Value> = forms
+            .iter()
+            .map(|f| {
+                let mut c = f.config.clone();
+                if c.get("brand_color").and_then(|v| v.as_str()).is_none() {
+                    c["brand_color"] = json!(a.brand_color);
+                }
+                json!({"id": f.id, "kind": f.kind, "config": c})
+            })
+            .collect();
+        Ok(json!({"data": data}))
+    }
+    .await;
+    let mut r = cors(match res {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    });
+    r.headers_mut().insert(header::CACHE_CONTROL, "public, max-age=60".parse().expect("static header"));
+    r
+}
+
+/// The script reports where it runs, so the dashboard can show "Installed".
+async fn client_ping(State(state): State<AppState>, Query(q): Query<KeyQuery>, body: Bytes) -> Response {
+    let url: String = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["url"].as_str().map(String::from)).unwrap_or_default();
+    let url: String = url.chars().take(500).collect();
+    let _ = sqlx::query(
+        "UPDATE accounts SET onsite_last_seen_at = now(), onsite_last_url = $2
+         WHERE public_key = $1 AND (onsite_last_seen_at IS NULL OR onsite_last_seen_at < now() - interval '2 minutes')",
+    )
+    .bind(&q.k)
+    .bind(url.starts_with("http").then_some(url))
+    .execute(&state.db)
+    .await;
+    cors(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Signed token identifying a profile to the onsite script (added to tracked links as ?_pl=).
+pub fn profile_token(state: &AppState, profile_id: Uuid) -> String {
+    auth::sign(&state.cfg.secret_key, &format!("p{}", profile_id.simple()))
+}
+
+fn profile_from_token(state: &AppState, token: &str) -> Option<Uuid> {
+    auth::verify(&state.cfg.secret_key, token)?.strip_prefix('p').and_then(|h| Uuid::parse_str(h).ok())
 }
 
 // ---------- Forms ----------
@@ -390,39 +467,7 @@ async fn form_embed(State(state): State<AppState>, Path(id): Path<Uuid>) -> Resp
     if f.status != "live" {
         return ([(header::CONTENT_TYPE, "application/javascript")], "/* form not published */").into_response();
     }
-    let cfg = json!({
-        "id": f.id, "kind": f.kind, "key": a.public_key, "base": state.cfg.public_url(),
-        "headline": f.config["headline"], "body": f.config["body"], "button": f.config["button_text"],
-        "success": f.config["success_message"], "delay": f.config["delay_seconds"].as_f64().unwrap_or(5.0),
-        "color": crate::render::safe_color(f.config["brand_color"].as_str().unwrap_or(&a.brand_color), "#1f6f5c"), "image": f.config["image_url"],
-        "fields": form_fields_html(&f),
-    });
-    let js = format!(
-        r##"(function(){{var C={cfg};var SK="pl_form_"+C.id;try{{if(C.kind!=="embed"&&localStorage.getItem(SK))return}}catch(e){{}}
-function e(t,a,h){{var x=document.createElement(t);for(var k in a)x.setAttribute(k,a[k]);if(h!=null)x.innerHTML=h;return x}}
-function esc(s){{return String(s||"").replace(/[&<>"]/g,function(c){{return{{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}}[c]}})}}
-var css="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#fff;color:#111827;border-radius:12px;padding:28px;box-sizing:border-box;";
-var box=e("div",{{style:css+(C.kind==="embed"?"max-width:480px;":"width:min(420px,calc(100vw - 32px));box-shadow:0 20px 50px rgba(0,0,0,.25);position:relative;")}},
-(C.image?'<img src="'+esc(C.image)+'" style="width:100%;border-radius:8px;margin-bottom:14px">':"")+
-'<h2 style="margin:0 0 8px;font-size:22px">'+esc(C.headline)+'</h2><p style="margin:0 0 16px;color:#4b5563;line-height:1.5">'+esc(C.body)+'</p>'+
-'<form>'+C.fields+'<button type="submit" style="width:100%;padding:12px;border:0;border-radius:8px;background:'+esc(C.color)+';color:#fff;font-size:16px;font-weight:600;cursor:pointer">'+esc(C.button)+'</button><p class="pl-err" style="color:#b91c1c;font-size:13px;margin:8px 0 0"></p></form>');
-box.querySelectorAll("input[type=email],input[type=tel],input[type=text]").forEach(function(i){{i.style.cssText="width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:8px;font-size:16px;margin:0 0 10px"}});
-box.querySelectorAll("label").forEach(function(l){{l.style.fontSize="12px";l.style.color="#6b7280"}});
-var wrap=box;function close(){{try{{localStorage.setItem(SK,"1")}}catch(e){{}}wrap.remove()}}
-if(C.kind!=="embed"){{var x=e("button",{{type:"button","aria-label":"Close",style:"position:absolute;top:10px;right:12px;border:0;background:none;font-size:22px;cursor:pointer;color:#6b7280"}},"&times;");x.onclick=close;box.appendChild(x);
-wrap=e("div",{{style:C.kind==="flyout"?"position:fixed;right:16px;bottom:16px;z-index:2147483000":"position:fixed;inset:0;background:rgba(17,24,39,.55);display:flex;align-items:center;justify-content:center;z-index:2147483000"}});wrap.appendChild(box);
-if(C.kind==="popup")wrap.addEventListener("click",function(ev){{if(ev.target===wrap)close()}})}}
-box.querySelector("form").addEventListener("submit",function(ev){{ev.preventDefault();var f=ev.target,d={{form_id:C.id}};
-["email","phone_number","first_name"].forEach(function(n){{var i=f.querySelector("[name="+n+"]");if(i&&i.value)d[n]=i.value}});var c=f.querySelector("[name=sms_consent]");d.sms_consent=!!(c&&c.checked);
-fetch(C.base+"/client/subscribe?k="+encodeURIComponent(C.key),{{method:"POST",headers:{{"content-type":"application/json"}},body:JSON.stringify(d)}}).then(function(r){{return r.json()}}).then(function(j){{
-if(j.error){{f.querySelector(".pl-err").textContent=j.error.message;return}}try{{localStorage.setItem(SK,"1")}}catch(e){{}}
-if(window.postlark&&d.email)window.postlark.identify({{email:d.email}});box.querySelector("form").outerHTML='<p style="font-size:18px;font-weight:600">'+esc(j.message||C.success)+'</p>';if(C.kind!=="embed")setTimeout(function(){{wrap.remove()}},2500)}})}});
-function show(){{var s=document.currentScript;if(C.kind==="embed"){{var t=document.querySelector('[data-postlark-form="'+C.id+'"]');(t||document.body).appendChild(wrap)}}else document.body.appendChild(wrap);
-fetch(C.base+"/client/forms/"+C.id+"/view",{{method:"POST"}}).catch(function(){{}})}}
-if(C.kind==="embed"){{document.readyState==="loading"?document.addEventListener("DOMContentLoaded",show):show()}}else setTimeout(show,C.delay*1000);}})();"##,
-        cfg = cfg
-    );
-    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=60")], js).into_response()
+    onsite_script(&state, &a.public_key, Some(f.id))
 }
 
 // ---------- Provider webhooks ----------
@@ -435,6 +480,16 @@ fn check_secret(state: &AppState, s: &str) -> AppResult<()> {
     } else {
         Err(AppError::NotFound("not found".into()))
     }
+}
+
+/// Inbound SMS webhooks: the platform secret covers every account; a customer's own token
+/// (for bring-your-own providers) only covers that customer's account.
+async fn webhook_scope(state: &AppState, s: &str) -> AppResult<Option<Uuid>> {
+    if check_secret(state, s).is_ok() {
+        return Ok(None);
+    }
+    let acct: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE webhook_token = $1").bind(s).fetch_optional(&state.db).await?;
+    acct.map(Some).ok_or_else(|| AppError::NotFound("not found".into()))
 }
 
 async fn msg_by_provider_id(state: &AppState, pid: &str) -> AppResult<Option<Msg>> {
@@ -490,9 +545,16 @@ const STOP_WORDS: &[&str] = &["stop", "stopall", "unsubscribe", "cancel", "end",
 const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
 
 /// Inbound text: STOP/START keywords update SMS consent for the matching profile.
-async fn inbound_sms(state: &AppState, from: &str, to: &str, text: &str) -> AppResult<()> {
+async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str, text: &str) -> AppResult<()> {
     let (Some(from), Some(to)) = (normalize_phone(from), normalize_phone(to)) else { return Ok(()) };
-    let accounts: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE sms_from = $1").bind(&to).fetch_all(&state.db).await?;
+    let accounts: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT a.id FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
+         WHERE (a.sms_from = $1 OR n.phone_number = $1) AND ($2::uuid IS NULL OR a.id = $2)",
+    )
+    .bind(&to)
+    .bind(scope)
+    .fetch_all(&state.db)
+    .await?;
     let word: String = text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
     for account_id in accounts {
         let pid: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&from).fetch_optional(&state.db).await?;
@@ -522,12 +584,12 @@ async fn sms_status(state: &AppState, provider_id: &str, delivered: bool) -> App
 }
 
 async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String>, Json(v): Json<Value>) -> AppResult<StatusCode> {
-    check_secret(&state, &secret)?;
+    let scope = webhook_scope(&state, &secret).await?;
     let p = &v["data"]["payload"];
     match v["data"]["event_type"].as_str().unwrap_or("") {
         "message.received" => {
             let to = p["to"][0]["phone_number"].as_str().unwrap_or_default();
-            inbound_sms(&state, p["from"]["phone_number"].as_str().unwrap_or_default(), to, p["text"].as_str().unwrap_or_default()).await?;
+            inbound_sms(&state, scope, p["from"]["phone_number"].as_str().unwrap_or_default(), to, p["text"].as_str().unwrap_or_default()).await?;
         }
         "message.finalized" => {
             let st = p["to"][0]["status"].as_str().unwrap_or_default();
@@ -541,10 +603,10 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
 }
 
 async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, body: Bytes) -> AppResult<Response> {
-    check_secret(&state, &secret)?;
+    let scope = webhook_scope(&state, &secret).await?;
     let f: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
     if let (Some(from), Some(to), Some(text)) = (f.get("From"), f.get("To"), f.get("Body")) {
-        inbound_sms(&state, from, to, text).await?;
+        inbound_sms(&state, scope, from, to, text).await?;
     } else if let (Some(sid), Some(st)) = (f.get("MessageSid"), f.get("MessageStatus")) {
         match st.as_str() {
             "delivered" => sms_status(&state, sid, true).await?,
@@ -553,4 +615,15 @@ async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String
         }
     }
     Ok(([(header::CONTENT_TYPE, "text/xml")], "<Response></Response>").into_response())
+}
+
+async fn stripe_webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> AppResult<StatusCode> {
+    let Some(secret) = state.cfg.stripe_webhook_secret.as_deref() else { return Err(AppError::NotFound("not found".into())) };
+    let sig = headers.get("stripe-signature").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if !crate::billing::verify_stripe_signature(secret, sig, &body, chrono::Utc::now().timestamp()) {
+        return Err(AppError::BadRequest("bad signature".into()));
+    }
+    let ev: Value = serde_json::from_slice(&body)?;
+    crate::billing::handle_stripe_event(&state, &ev).await?;
+    Ok(StatusCode::OK)
 }

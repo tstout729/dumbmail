@@ -49,6 +49,18 @@ impl Harness {
             send_rate_per_sec: 1000,
             workers: 1,
             secure_cookies: false,
+            stripe_secret_key: None,
+            stripe_webhook_secret: Some("whsec_test".into()),
+            price_email_per_1000: 0.20,
+            price_sms_segment: 0.0099,
+            price_mms: 0.025,
+            price_number_monthly: 2.20,
+            free_emails_per_month: 25,
+            aws_region: "us-east-1".into(),
+            railway_api_token: None,
+            railway_project_id: None,
+            railway_environment_id: None,
+            railway_service_id: None,
         };
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
@@ -107,6 +119,21 @@ impl Harness {
         let v = self.ok("POST", "/api/auth/signup", Some(json!({"email": "owner@acme.test", "password": "correct horse", "company": "Acme Goods"}))).await;
         self.ok("PATCH", "/api/account", Some(json!({"address": "1 Main St, Portland, OR 97201", "from_email": "hello@acme.test", "website": "acme.test"}))).await;
         v
+    }
+
+    /// Give the account prepaid credit (as a Stripe top-up would).
+    async fn credit(&self, usd: f64) {
+        let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&self.state.db).await.unwrap();
+        postlark::billing::post_entry(&self.state.db, id, "topup", postlark::billing::to_micros(usd), "test credit", &uuid::Uuid::new_v4().to_string()).await.unwrap();
+    }
+
+    /// Claim a texting number from the dev inventory and return it.
+    async fn claim_number(&mut self) -> String {
+        let avail = self.ok("GET", "/api/phone-numbers/available?type=toll_free", None).await;
+        let num = avail["data"][0]["phone_number"].as_str().unwrap().to_string();
+        let row = self.ok("POST", "/api/phone-numbers", Some(json!({"phone_number": num}))).await;
+        assert_eq!(row["status"], "active", "{row}");
+        num
     }
 
     async fn cleanup(self) {
@@ -192,7 +219,7 @@ async fn signup_import_segment_campaign_tracking_unsubscribe() {
     let click = find_link(&mail.html, "https://pl.test/t/c/").replace("https://pl.test", "");
     let (s, hd, _) = h.raw("GET", &click, &[], "").await;
     assert_eq!(s, StatusCode::SEE_OTHER);
-    assert_eq!(hd.get("location").unwrap(), "https://acme.test/fall");
+    assert!(hd.get("location").unwrap().to_str().unwrap().starts_with("https://acme.test/fall?_pl="));
     // Tampered destination is refused (no open redirect).
     let evil = click.replace("acme.test%2Ffall", "evil.test");
     let (s, _, _) = h.raw("GET", &evil, &[], "").await;
@@ -264,7 +291,8 @@ async fn welcome_and_abandoned_checkout_flows() {
     // The blueprint has an SMS step, so going live needs an SMS number.
     let (s, v) = h.req("POST", &format!("/api/flows/{acid}/status"), Some(json!({"status": "live"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-    h.ok("PATCH", "/api/account", Some(json!({"sms_from": "+15035550100"}))).await;
+    h.credit(5.0).await;
+    h.claim_number().await;
     h.ok("POST", &format!("/api/flows/{acid}/status"), Some(json!({"status": "live"}))).await;
 
     h.ok("POST", "/api/events", Some(json!({"metric": "Started Checkout", "profile": {"email": "buyer@x.test"}, "properties": {"checkout_url": "https://acme.test/cart/1"}, "value": 80}))).await;
@@ -287,7 +315,11 @@ async fn sms_stop_forms_client_events_and_limits() {
     let mut h = harness!();
     let me = h.signup().await;
     let pk = me["account"]["public_key"].as_str().unwrap().to_string();
-    h.ok("PATCH", "/api/account", Some(json!({"sms_from": "+15035550100"}))).await;
+    // Hosted: you can't just type in someone else's number.
+    let (s, _) = h.req("PATCH", "/api/account", Some(json!({"sms_from": "+15035550100"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    h.credit(5.0).await;
+    let our_number = h.claim_number().await;
 
     // Browser events with the public key; consent can't be set from the browser.
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
@@ -325,15 +357,16 @@ async fn sms_stop_forms_client_events_and_limits() {
     // Inbound STOP through the Telnyx webhook.
     let (s, _, _) = h.raw("POST", "/webhooks/telnyx/wrong", &[("content-type", "application/json")], "{}").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
-    let stop = json!({"data": {"event_type": "message.received", "payload": {"text": "STOP", "from": {"phone_number": "+15035550199"}, "to": [{"phone_number": "+15035550100"}]}}});
+    let stop = json!({"data": {"event_type": "message.received", "payload": {"text": "STOP", "from": {"phone_number": "+15035550199"}, "to": [{"phone_number": our_number}]}}});
     let (s, _, _) = h.raw("POST", "/webhooks/telnyx/hooksecret", &[("content-type", "application/json")], &stop.to_string()).await;
     assert_eq!(s, StatusCode::OK);
     let fan = h.ok("GET", "/api/profiles?q=fan", None).await["data"][0].clone();
     assert_eq!(fan["sms_consent"], "unsubscribed");
 
-    // Free plan has no SMS: sending is refused with a clear limit error.
+    // An empty balance refuses SMS sends with a clear message.
     let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"body": "hi"}}))).await;
     sqlx::query("UPDATE profiles SET sms_consent = 'subscribed'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE accounts SET balance_micros = 0").execute(&h.state.db).await.unwrap();
     let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
     assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
 
@@ -486,5 +519,144 @@ async fn security_guards() {
     h.ok("DELETE", &format!("/api/api-keys/{}", key["id"].as_str().unwrap()), None).await;
     let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {k}"))], "").await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    h.cleanup().await;
+}
+
+
+#[tokio::test]
+async fn billing_numbers_onsite_and_domains() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["mode"], "hosted");
+    assert_eq!(b["balance"], 0.0);
+    assert_eq!(b["prices"]["email_per_1000"], 0.2);
+    assert_eq!(b["free_emails_remaining"], 25);
+
+    // 30 recipients: 25 free, 5 billable at $0.0002 → refused on an empty balance, then sent after a top-up.
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "All"}))).await;
+    let mut csv = String::from("email\n");
+    for i in 0..30 { csv.push_str(&format!("p{i}@x.test\n")); }
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("$0.00"));
+
+    // Stripe top-up webhook (signed) credits the balance once, even if delivered twice.
+    let ev = json!({"type": "checkout.session.completed", "data": {"object": {"id": "cs_test_1", "payment_status": "paid", "amount_total": 1000,
+        "metadata": {"kind": "topup", "account_id": me["account"]["id"]}, "customer": "cus_1"}}}).to_string();
+    let t = chrono::Utc::now().timestamp();
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"whsec_test").unwrap();
+    mac.update(format!("{t}.{ev}").as_bytes());
+    let sig = format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()));
+    for _ in 0..2 {
+        let (s, _, body) = h.raw("POST", "/webhooks/stripe", &[("stripe-signature", &sig), ("content-type", "application/json")], &ev).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+    }
+    let (s, _, _) = h.raw("POST", "/webhooks/stripe", &[("stripe-signature", "t=1,v1=bad")], &ev).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(h.ok("GET", "/api/billing", None).await["balance"], 10.0);
+
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["free_emails_remaining"], 0);
+    assert!((b["balance"].as_f64().unwrap() - (10.0 - 5.0 * 0.0002)).abs() < 1e-9, "{}", b["balance"]);
+    assert_eq!(b["usage"][0]["kind"], "email");
+    assert_eq!(b["usage"][0]["quantity"], 30);
+
+    // Phone numbers: claim one (first month charged), then text a subscriber and get billed per segment.
+    let num = h.claim_number().await;
+    let nums = h.ok("GET", "/api/phone-numbers", None).await;
+    assert_eq!(nums["sms"]["from_number"], num.as_str());
+    assert_eq!(nums["sms"]["can_send"], true);
+    assert!(nums["sms"]["inbound_webhook_url"].as_str().unwrap().contains("/webhooks/telnyx/"));
+    let before = h.ok("GET", "/api/billing", None).await["balance"].as_f64().unwrap();
+    assert!((before - (10.0 - 0.001 - 2.20)).abs() < 1e-6, "{before}");
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let sc = h.ok("POST", "/api/campaigns", Some(json!({"channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"body": "Flash sale today"}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", sc["id"].as_str().unwrap()), None).await;
+    assert!(s.is_success(), "{v}");
+    h.drain().await;
+    // Quiet hours may defer the text; when it sent, it cost one segment.
+    let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE channel = 'sms' AND status = 'sent'").fetch_one(&h.state.db).await.unwrap();
+    let after = h.ok("GET", "/api/billing", None).await["balance"].as_f64().unwrap();
+    assert!((before - after - 0.0099 * sent as f64).abs() < 1e-6, "{before} {after} {sent}");
+
+    // Per-account inbound webhook token only affects that account.
+    let hook = nums["sms"]["inbound_webhook_url"].as_str().unwrap().replace("https://pl.test", "");
+    let stop = json!({"data": {"event_type": "message.received", "payload": {"text": "stop", "from": {"phone_number": "+15035550142"}, "to": [{"phone_number": num}]}}});
+    let (s, _, _) = h.raw("POST", &hook, &[("content-type", "application/json")], &stop.to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    let p = h.ok("GET", "/api/profiles?q=0142", None).await;
+    assert_eq!(p["data"][0]["sms_consent"], "unsubscribed");
+
+    // Onsite script, forms feed and install detection.
+    let (s, hd, js) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(hd.get("content-type").unwrap().to_str().unwrap().contains("javascript"));
+    assert!(js.contains(&format!("\"{pk}\"")) && js.contains("\"https://pl.test\"") && !js.contains("__BASE__"));
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Pop", "kind": "popup", "list_id": list["id"], "status": "live",
+        "config": {"targeting": {"trigger": "exit_intent", "url_excludes": ["/checkout"]}}}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", form["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    let (_, _, feed) = h.raw("GET", &format!("/client/forms?k={pk}"), &[], "").await;
+    let feed: Value = serde_json::from_str(&feed).unwrap();
+    assert_eq!(feed["data"][0]["config"]["targeting"]["trigger"], "exit_intent");
+    assert_eq!(h.ok("GET", "/api/website", None).await["installed"], false);
+    h.raw("POST", &format!("/client/ping?k={pk}"), &[("content-type", "application/json")], &json!({"url": "https://shop.example.com/"}).to_string()).await;
+    let w = h.ok("GET", "/api/website", None).await;
+    assert_eq!(w["installed"], true);
+    assert_eq!(w["last_seen_url"], "https://shop.example.com/");
+    assert!(w["snippet"].as_str().unwrap().contains("/onsite.js?k="));
+    let (s, v) = h.req("POST", "/api/website/check", Some(json!({"url": "http://127.0.0.1:5432/"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+    // Email click → destination gets a token that identifies the visitor to the onsite script.
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "p0@x.test" && !m.subject.starts_with("[Test]")).unwrap();
+    let _ = mail; // campaign had no links; send one with a link
+    let lc = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"subject": "Link", "blocks": [{"type": "button", "text": "Shop", "href": "https://shop.example.com/new?x=1"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", lc["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let mail = h.state.email.sent().into_iter().rev().find(|m| m.to == "p1@x.test").unwrap();
+    let i = mail.html.find("https://pl.test/t/c/").unwrap();
+    let click = mail.html[i..mail.html[i..].find('"').unwrap() + i].replace("&amp;", "&").replace("https://pl.test", "");
+    let (s, hd, _) = h.raw("GET", &click, &[], "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let loc = hd.get("location").unwrap().to_str().unwrap().to_string();
+    assert!(loc.starts_with("https://shop.example.com/new?x=1&_pl="), "{loc}");
+    let token = url::Url::parse(&loc).unwrap().query_pairs().find(|(k, _)| k == "_pl").unwrap().1.to_string();
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
+        &json!({"metric": "Viewed Product", "profile": {"$token": token}, "properties": {"name": "Scarf"}}).to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE m.name = 'Viewed Product' AND p.email = 'p1@x.test'")
+        .fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 1, "token identified the clicker");
+    // A forged token is ignored (no profile without an identifier).
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
+        &json!({"metric": "Viewed Product", "profile": {"$token": "pdeadbeef.forged"}}).to_string()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Sending domain: DKIM + MAIL FROM + DMARC records; link domain: CNAME to the app, plus routing guard.
+    let sd = h.ok("POST", "/api/account/domain", Some(json!({"domain": "Acme-Test-Domain.example"}))).await;
+    let recs = sd["email"]["dns_records"].as_array().unwrap();
+    assert!(recs.iter().any(|r| r["purpose"] == "dkim"));
+    assert!(recs.iter().any(|r| r["purpose"] == "mail_from" && r["type"] == "MX" && r["name"] == "send.acme-test-domain.example"));
+    assert!(recs.iter().any(|r| r["purpose"] == "dmarc"));
+    assert_eq!(sd["email"]["mail_from_domain"], "send.acme-test-domain.example");
+    let ld = h.ok("POST", "/api/account/link-domain", Some(json!({"domain": "links.acme-test-domain.example"}))).await;
+    assert_eq!(ld["link_domain"]["domain"], "links.acme-test-domain.example");
+    assert_eq!(ld["link_domain"]["dns_records"][0]["value"], "pl.test");
+    let (s, hd, _) = h.raw("GET", "/campaigns", &[("host", "links.acme-test-domain.example")], "").await;
+    assert_eq!(s, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(hd.get("location").unwrap(), "https://pl.test/campaigns");
+    let (s, _, _) = h.raw("GET", "/healthz", &[("host", "links.acme-test-domain.example")], "").await;
+    assert_eq!(s, StatusCode::OK);
+    h.ok("DELETE", "/api/account/link-domain", None).await;
     h.cleanup().await;
 }

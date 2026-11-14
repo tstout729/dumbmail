@@ -316,7 +316,14 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     if count == 0 {
         return Err(AppError::bad("nobody in this audience can receive this campaign (check consent and that profiles have an address)"));
     }
-    crate::plans::check_send(&state.db, state.cfg.hosted, account_id, &account.plan, &c.channel, count).await?;
+    let (segments, mms) = if c.channel == "sms" {
+        let body = c.content.get("body").and_then(|b| b.as_str()).unwrap_or("");
+        // Personalization changes length a little; estimate from the template plus compliance text.
+        (crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64, c.content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
+    } else {
+        (1, false)
+    };
+    crate::billing::check_campaign(state, account_id, &c.channel, count, segments, mms).await?;
     // Validate the template renders before committing to a send.
     render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content: c.content.clone(), profile_id: None, event: None }).await?;
     let now = Utc::now();

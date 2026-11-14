@@ -33,6 +33,13 @@ pub trait EmailProvider: Send + Sync {
     async fn send(&self, email: &OutgoingEmail) -> anyhow::Result<String>;
     async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState>;
     async fn domain_state(&self, domain: &str) -> anyhow::Result<DomainState>;
+    /// Use a custom MAIL FROM subdomain so SPF aligns with the sending domain (DMARC).
+    async fn set_mail_from(&self, _domain: &str, _mail_from: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn remove_domain(&self, _domain: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Sent messages kept in memory (log provider only).
     fn sent(&self) -> Vec<OutgoingEmail> {
         Vec::new()
@@ -117,7 +124,7 @@ impl EmailProvider for LogEmail {
         Ok(format!("log-{}", email.message_id))
     }
     async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState> {
-        Ok(DomainState { status: "verified".into(), records: fake_records(domain, "verified") })
+        Ok(DomainState { status: "pending".into(), records: fake_records(domain) })
     }
     async fn domain_state(&self, domain: &str) -> anyhow::Result<DomainState> {
         self.add_domain(domain).await
@@ -127,13 +134,14 @@ impl EmailProvider for LogEmail {
     }
 }
 
-fn fake_records(domain: &str, status: &str) -> Vec<DnsRecord> {
-    vec![DnsRecord {
-        kind: "TXT".into(),
-        name: format!("_dmarc.{domain}"),
-        value: "v=DMARC1; p=none;".into(),
-        status: status.into(),
-    }]
+/// Dev stand-in for DKIM records: deterministic CNAMEs that look like SES's.
+fn fake_records(domain: &str) -> Vec<DnsRecord> {
+    (1..=3)
+        .map(|i| {
+            let token = format!("pl{i}{:x}", domain.len() * 7919 + i);
+            DnsRecord { kind: "CNAME".into(), name: format!("{token}._domainkey.{domain}"), value: format!("{token}.dkim.amazonses.com"), status: "pending".into() }
+        })
+        .collect()
 }
 
 pub struct SesEmail {
@@ -209,6 +217,24 @@ impl EmailProvider for SesEmail {
             // Already exists: fall through to reading its state.
             Err(_) => self.domain_state(domain).await,
         }
+    }
+
+    async fn set_mail_from(&self, domain: &str, mail_from: &str) -> anyhow::Result<()> {
+        use aws_sdk_sesv2::types::BehaviorOnMxFailure;
+        self.client
+            .put_email_identity_mail_from_attributes()
+            .email_identity(domain)
+            .mail_from_domain(mail_from)
+            .behavior_on_mx_failure(BehaviorOnMxFailure::UseDefaultValue)
+            .send()
+            .await
+            .context("SES PutEmailIdentityMailFromAttributes failed")?;
+        Ok(())
+    }
+
+    async fn remove_domain(&self, domain: &str) -> anyhow::Result<()> {
+        self.client.delete_email_identity().email_identity(domain).send().await.context("SES DeleteEmailIdentity failed")?;
+        Ok(())
     }
 
     async fn domain_state(&self, domain: &str) -> anyhow::Result<DomainState> {

@@ -156,6 +156,13 @@ fn tools() -> Vec<Value> {
             obj(json!({"name": {"type": "string"}, "website": {"type": "string"}, "from_name": {"type": "string"}, "from_email": {"type": "string"}, "reply_to": {"type": "string"}, "sms_from": {"type": "string"}, "timezone": {"type": "string"}, "address": {"type": "string"}, "brand_color": {"type": "string"}, "logo_url": {"type": "string"}, "conversion_metric": {"type": "string"}}), &[]), false, false),
         tool("set_sending_domain", "Set up a sending domain", "Start authenticating a sending domain (DKIM). Returns the DNS records to add. Use check_sending_domain after DNS is updated.", obj(json!({"domain": {"type": "string", "description": "e.g. mail.yourbrand.com or yourbrand.com"}}), &["domain"]), false, false),
         tool("check_sending_domain", "Check sending domain DNS", "Re-check the sending domain's DNS records and verification status.", obj(json!({}), &[]), false, false),
+        tool("set_link_domain", "Set a branded link domain", "Use the brand's own subdomain (e.g. links.brand.com) for tracking links, unsubscribe pages and hosted forms. Returns the DNS records to add.", obj(json!({"domain": {"type": "string"}}), &["domain"]), false, false),
+        tool("check_link_domain", "Check link domain", "Re-check the branded link domain's DNS and certificate.", obj(json!({}), &[]), false, false),
+        tool("get_billing", "Get balance and usage", "Prepaid balance, prices per email/SMS/number, free emails left this month, auto-recharge settings and recent charges.", obj(json!({}), &[]), true, false),
+        tool("list_phone_numbers", "List phone numbers", "The account's texting numbers, their verification status and the SMS setup (platform or bring-your-own provider).", obj(json!({}), &[]), true, false),
+        tool("find_phone_numbers", "Find numbers to claim", "Search toll-free (recommended) or local numbers that can be claimed.", obj(json!({"type": {"enum": ["toll_free", "local"]}, "area_code": {"type": "string"}}), &[]), true, false),
+        tool("claim_phone_number", "Claim a phone number", "Claim a texting number (billed monthly from the balance). Toll-free numbers then need carrier verification in Settings → SMS. Requires confirm=true and the user's approval.", obj(json!({"phone_number": {"type": "string"}, "confirm": {"type": "boolean"}}), &["phone_number"]), false, true),
+        tool("get_website_snippet", "Get the website snippet", "The one-line script for the brand's website (tracking, identification, sign-up forms) and whether it's installed.", obj(json!({}), &[]), true, false),
         tool("search_profiles", "Search profiles", "Find profiles by email, phone, name or external id, optionally within a list or segment. Returns up to `limit` (default 25) plus the total match count.",
             obj(json!({"query": {"type": "string"}, "list_id": {"type": "string"}, "segment_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}, "offset": {"type": "integer", "minimum": 0}}), &[]), true, false),
         tool("get_profile", "Get a profile", "Full profile: properties, consent, lists, segments, recent events (activity timeline) and messages received. Look up by id, email or phone_number.",
@@ -246,7 +253,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             if account.from_email.is_none() { missing.push("sender email (update_account from_email)"); }
             if account.address.is_none() { missing.push("mailing address (update_account address; required in every marketing email)"); }
             if account.sending_domain_status != "verified" { missing.push("verified sending domain (set_sending_domain) for best deliverability"); }
-            if account.sms_from.is_none() { missing.push("SMS number (update_account sms_from) to send texts"); }
+            if account.sms_from.is_none() { missing.push("texting number (find_phone_numbers + claim_phone_number, or connect your own provider in Settings → SMS)"); }
             Ok(json!({
                 "account": account,
                 "sending": crate::api::account::sending_json(state, &account),
@@ -258,16 +265,33 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "update_account" => Ok(serde_json::to_value(crate::api::account::patch_account(state, acct, from(a)?).await?)?),
         "set_sending_domain" => crate::api::account::set_domain(state, acct, a["domain"].as_str().unwrap_or("")).await,
         "check_sending_domain" => {
-            let account = load_account(&state.db, acct).await?;
-            let domain = account.sending_domain.ok_or_else(|| AppError::bad("no sending domain yet; call set_sending_domain"))?;
-            let st = state.email.domain_state(&domain).await.map_err(|e| AppError::bad(format!("could not check DNS: {e:#}")))?;
-            let a2: crate::models::Account = sqlx::query_as("UPDATE accounts SET sending_domain_status = $2, sending_domain_records = $3 WHERE id = $1 RETURNING *")
-                .bind(acct)
-                .bind(&st.status)
-                .bind(serde_json::to_value(&st.records)?)
-                .fetch_one(&state.db)
-                .await?;
+            crate::domains::verify_sending_domain(state, acct).await?;
+            let a2 = load_account(&state.db, acct).await?;
             Ok(crate::api::account::sending_json(state, &a2))
+        }
+        "set_link_domain" => {
+            crate::domains::set_link_domain(state, acct, a["domain"].as_str().unwrap_or("")).await?;
+            Ok(crate::api::account::sending_json(state, &load_account(&state.db, acct).await?))
+        }
+        "check_link_domain" => {
+            crate::domains::verify_link_domain(state, acct).await?;
+            Ok(crate::api::account::sending_json(state, &load_account(&state.db, acct).await?))
+        }
+        "get_billing" => crate::billing::billing_json(state, acct).await,
+        "list_phone_numbers" => crate::api::account::numbers_json(state, acct).await,
+        "find_phone_numbers" => crate::phone::available(state, a["type"].as_str().unwrap_or("toll_free"), a["area_code"].as_str()).await,
+        "claim_phone_number" => {
+            if a["confirm"].as_bool() != Some(true) {
+                let price = crate::billing::to_usd(crate::billing::prices(state).number_monthly);
+                return Ok(json!({"dry_run": true, "note": format!("Nothing claimed. This number costs ${price:.2}/month from the account balance. Call again with confirm=true once the user approves.")}));
+            }
+            Ok(crate::phone::row_json(&crate::phone::claim(state, acct, a["phone_number"].as_str().unwrap_or("")).await?))
+        }
+        "get_website_snippet" => {
+            let (pk, seen, url): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+                sqlx::query_as("SELECT public_key, onsite_last_seen_at, onsite_last_url FROM accounts WHERE id = $1").bind(acct).fetch_one(&state.db).await?;
+            Ok(json!({"snippet": crate::api::account::snippet(state, &pk), "installed": seen.is_some(), "last_seen_at": seen, "last_seen_url": url,
+                "usage": "Paste the snippet in the site's <head> or footer on every page. Then call postlark.identify({email}) and postlark.track('Viewed Product', {...}, value). Embedded forms: <div data-postlark-form=\"FORM_ID\"></div>."}))
         }
         "search_profiles" => {
             let q = aud::ProfileQuery {
