@@ -130,6 +130,7 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
 }
 
 fn page(title: &str, body: &str, color: &str) -> Html<String> {
+    let color = crate::render::safe_color(color, "#1f6f5c");
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t}</title>
 <style>body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f4f5;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center}}
@@ -226,7 +227,7 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
         let input = public_profile(&b["profile"])?;
-        let p = audience::upsert_profile(&state.db, a.id, &input).await?.profile;
+        let p = audience::upsert_profile_public(&state.db, a.id, &input).await?.profile;
         let props = if b["properties"].is_object() { b["properties"].clone() } else { json!({}) };
         let value = b["value"].as_f64();
         audience::record_event(
@@ -298,7 +299,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
     };
-    let p = audience::upsert_profile(&state.db, account.id, &input).await?.profile;
+    let p = audience::upsert_profile_public(&state.db, account.id, &input).await?.profile;
     sqlx::query("UPDATE forms SET submits = submits + 1 WHERE id = $1").bind(form.id).execute(&state.db).await?;
     audience::record_event(
         &state.db,
@@ -393,7 +394,7 @@ async fn form_embed(State(state): State<AppState>, Path(id): Path<Uuid>) -> Resp
         "id": f.id, "kind": f.kind, "key": a.public_key, "base": state.cfg.public_url(),
         "headline": f.config["headline"], "body": f.config["body"], "button": f.config["button_text"],
         "success": f.config["success_message"], "delay": f.config["delay_seconds"].as_f64().unwrap_or(5.0),
-        "color": f.config["brand_color"].as_str().unwrap_or(&a.brand_color), "image": f.config["image_url"],
+        "color": crate::render::safe_color(f.config["brand_color"].as_str().unwrap_or(&a.brand_color), "#1f6f5c"), "image": f.config["image_url"],
         "fields": form_fields_html(&f),
     });
     let js = format!(

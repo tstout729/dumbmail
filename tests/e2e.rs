@@ -434,3 +434,57 @@ async fn mcp_server() {
     assert!(res["result"]["contents"][0]["text"].as_str().unwrap().contains("exit_condition"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn security_guards() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+
+    // Flow webhooks can't target internal addresses.
+    for url in ["http://127.0.0.1:7311/api/me", "http://169.254.169.254/latest/meta-data", "http://localhost/", "http://[::1]/", "http://10.0.0.5/"] {
+        let (s, v) = h.req("POST", "/api/flows", Some(json!({"name": "w", "trigger": {"type": "metric", "metric": "X"},
+            "definition": {"entry": "a", "nodes": [{"id": "a", "type": "webhook", "url": url, "next": null}]}}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{url}: {v}");
+    }
+
+    // Lists from another account can't be used in flows.
+    let mut other = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
+    other.ok("POST", "/api/auth/signup", Some(json!({"email": "other@b.test", "password": "another pass", "company": "Other"}))).await;
+    let foreign = other.ok("POST", "/api/lists", Some(json!({"name": "Theirs"}))).await;
+    let (s, _) = h.req("POST", "/api/flows", Some(json!({"name": "steal", "trigger": {"type": "metric", "metric": "X"},
+        "definition": {"entry": "a", "nodes": [{"id": "a", "type": "add_to_list", "list_id": foreign["id"], "next": null}]}}))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = h.req("GET", &format!("/api/lists/{}", foreign["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Form colors must be hex (no CSS/HTML injection).
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "L"}))).await;
+    let (s, _) = h.req("POST", "/api/forms", Some(json!({"list_id": list["id"], "config": {"brand_color": "red}</style><script>alert(1)</script>"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // The browser can't overwrite an existing profile's identity or name.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "vic@x.test", "first_name": "Victoria", "phone_number": "+15035550111"}))).await;
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
+        &json!({"metric": "Active on Site", "profile": {"email": "vic@x.test", "first_name": "Mallory", "phone_number": "+15035550999"}}).to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    let vic = h.ok("GET", "/api/profiles?q=vic", None).await["data"][0].clone();
+    assert_eq!(vic["first_name"], "Victoria");
+    assert_eq!(vic["phone_number"], "+15035550111");
+
+    // Test sends refuse unsubscribed addresses.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "nope@x.test", "email_consent": "unsubscribed"}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "content": {"subject": "s", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}))).await;
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["nope@x.test"]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // API keys can't mint more keys; revoked keys stop working.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await;
+    let k = key["key"].as_str().unwrap();
+    let (s, _, _) = h.raw("POST", "/api/api-keys", &[("authorization", &format!("Bearer {k}")), ("content-type", "application/json")], "{}").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    h.ok("DELETE", &format!("/api/api-keys/{}", key["id"].as_str().unwrap()), None).await;
+    let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {k}"))], "").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    h.cleanup().await;
+}

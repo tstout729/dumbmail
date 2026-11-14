@@ -77,7 +77,8 @@ fn align(b: &Value) -> &str {
     }
 }
 
-fn safe_color(c: &str, fallback: &str) -> String {
+/// Only hex colors are allowed anywhere a color lands in HTML or CSS.
+pub fn safe_color(c: &str, fallback: &str) -> String {
     static HEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#[0-9a-fA-F]{3,8}$").unwrap());
     if HEX.is_match(c) { c.to_string() } else { fallback.to_string() }
 }

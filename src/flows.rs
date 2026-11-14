@@ -183,6 +183,56 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     Ok(def)
 }
 
+fn ip_is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_broadcast() || v4.is_unspecified()
+                || v4.is_documentation() || o[0] == 0 || (o[0] == 100 && (o[1] & 0xc0) == 64) || (o[0] == 198 && (o[1] & 0xfe) == 18) || o[0] >= 224)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_public(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Webhook steps may only call public internet hosts (no localhost, private networks or cloud metadata).
+/// Returns the host and a vetted address to pin the connection to, so DNS can't be swapped afterwards.
+pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::SocketAddr)> {
+    let u = url::Url::parse(raw).map_err(|_| AppError::bad("webhook url is not a valid URL"))?;
+    if !matches!(u.scheme(), "https" | "http") {
+        return Err(AppError::bad("webhook url must be http(s)"));
+    }
+    let host = u.host_str().ok_or_else(|| AppError::bad("webhook url needs a host"))?.trim_matches(['[', ']']).to_string();
+    let port = u.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| AppError::bad(format!("webhook host {host:?} doesn't resolve")))?
+        .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip())) {
+        return Err(AppError::bad("webhook url must point to a public internet address"));
+    }
+    Ok((host, addrs[0]))
+}
+
+async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
+    let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let client = reqwest::Client::builder()
+        .resolve(&host, addr)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("postlark-webhook/0.1")
+        .build()?;
+    let req = if get { client.get(url) } else { client.post(url).json(payload) };
+    req.send().await?.error_for_status()?;
+    Ok(())
+}
+
 async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
     let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
     Ok(sqlx::query_as::<_, Profile>(&q).bind(id).fetch_optional(db).await?)
@@ -271,8 +321,11 @@ pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
 }
 
 pub async fn on_list_add(state: &AppState, list_id: Uuid, profile_ids: &[Uuid]) -> anyhow::Result<()> {
-    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'list' AND trigger->>'list_id' = $1")
-        .bind(list_id.to_string())
+    let flows: Vec<FlowRow> = sqlx::query_as(
+        "SELECT f.* FROM flows f JOIN lists l ON l.id = $1 AND l.account_id = f.account_id
+         WHERE f.status = 'live' AND f.trigger->>'type' = 'list' AND f.trigger->>'list_id' = $1::text",
+    )
+        .bind(list_id)
         .fetch_all(&state.db)
         .await?;
     for f in &flows {
@@ -296,8 +349,9 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     if refreshed_at.is_none() {
         return Ok(());
     }
-    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $2 AND status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")
         .bind(segment_id.to_string())
+        .bind(account_id)
         .fetch_all(&state.db)
         .await?;
     for f in &flows {
@@ -501,7 +555,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     .await?;
             }
             "add_to_list" | "remove_from_list" => {
-                if let Some(list_id) = node.str("list_id").and_then(|s| s.parse::<Uuid>().ok()) {
+                let owned = match node.str("list_id").and_then(|s| s.parse::<Uuid>().ok()) {
+                    Some(id) => crate::audience::list_belongs(&state.db, flow.account_id, id).await.ok().map(|_| id),
+                    None => None,
+                };
+                if let Some(list_id) = owned {
                     if node.kind == "add_to_list" {
                         crate::audience::add_to_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     } else {
@@ -515,8 +573,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     "flow": {"id": flow.id, "name": flow.name}, "node_id": node_id,
                     "profile": person, "event": context.get("event"), "body": node.data.get("body"),
                 });
-                let req = if node.str("method") == Some("GET") { state.http.get(&url) } else { state.http.post(&url).json(&payload) };
-                if let Err(e) = req.send().await.and_then(|r| r.error_for_status()) {
+                if let Err(e) = call_webhook(&url, node.str("method") == Some("GET"), &payload).await {
                     tracing::warn!(run = %run.id, url = %url, error = %e, "flow webhook failed");
                 }
             }
@@ -536,7 +593,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
 pub async fn stats(db: &PgPool, account_id: Uuid, flow_id: Uuid) -> AppResult<(MessageStats, i64, i64)> {
     let q = format!("SELECT {STATS_SELECT} FROM messages m WHERE m.flow_id = $1 AND NOT m.is_test");
     let mut s: MessageStats = sqlx::query_as(&q).bind(flow_id).fetch_one(db).await?;
-    let q = format!("SELECT count(*)::bigint, COALESCE(sum(value), 0)::float8 FROM ({}) x WHERE x.flow_id = $2", crate::campaigns::ATTRIBUTION_SQL);
+    let q = format!("SELECT count(*)::bigint, COALESCE(sum(value), 0)::float8 FROM ({} AND e.profile_id IN (SELECT profile_id FROM messages WHERE flow_id = $2)) x WHERE x.flow_id = $2", crate::campaigns::ATTRIBUTION_SQL);
     let (orders, revenue): (i64, f64) = sqlx::query_as(&q).bind(account_id).bind(flow_id).fetch_one(db).await?;
     s.orders = orders;
     s.revenue = revenue;

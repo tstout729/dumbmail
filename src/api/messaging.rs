@@ -307,7 +307,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
     }
     let account = load_account(&state.db, account_id).await?;
-    let problems = campaigns::readiness(&account, &c);
+    let problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
@@ -451,6 +451,22 @@ pub struct FlowBody {
     pub definition: Option<Value>,
 }
 
+/// Every list a flow step touches must belong to this account.
+async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value) -> AppResult<()> {
+    let def = flows::parse_definition(definition)?;
+    for n in &def.nodes {
+        if n.kind == "add_to_list" || n.kind == "remove_from_list" {
+            let id = n.data.get("list_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok())
+                .ok_or_else(|| AppError::bad(format!("step {} needs a valid list_id", n.id)))?;
+            crate::audience::list_belongs(&state.db, account_id, id).await?;
+        }
+        if n.kind == "webhook" {
+            crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn check_trigger_refs(state: &AppState, account_id: Uuid, t: &flows::Trigger) -> AppResult<()> {
     match t {
         flows::Trigger::List { list_id } => crate::audience::list_belongs(&state.db, account_id, *list_id).await,
@@ -465,7 +481,7 @@ pub async fn create_flow(state: &AppState, account_id: Uuid, b: FlowBody) -> App
     let t = flows::parse_trigger(&trigger)?;
     check_trigger_refs(state, account_id, &t).await?;
     let def = b.definition.unwrap_or(json!({"entry": null, "nodes": []}));
-    flows::parse_definition(&def)?;
+    check_node_refs(state, account_id, &def).await?;
     Ok(sqlx::query_as("INSERT INTO flows (id, account_id, name, trigger, definition) VALUES ($1, $2, $3, $4, $5) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -497,7 +513,7 @@ pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, b: FlowBo
         None => None,
     };
     if let Some(d) = &b.definition {
-        flows::parse_definition(d)?;
+        check_node_refs(state, account_id, d).await?;
     }
     Ok(sqlx::query_as("UPDATE flows SET name = COALESCE($3, name), trigger = COALESCE($4, trigger), definition = COALESCE($5, definition), updated_at = now() WHERE id = $1 AND account_id = $2 RETURNING *")
         .bind(id)
@@ -647,6 +663,20 @@ pub struct FormBody {
     pub status: Option<String>,
 }
 
+fn check_form_config(config: &Option<Value>) -> AppResult<()> {
+    if let Some(c) = config.as_ref().and_then(|c| c.get("brand_color")).and_then(|v| v.as_str()) {
+        if crate::render::safe_color(c, "") != c {
+            return Err(AppError::bad("brand_color must be a hex color like #1f6f5c"));
+        }
+    }
+    if let Some(u) = config.as_ref().and_then(|c| c.get("image_url")).and_then(|v| v.as_str()) {
+        if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") {
+            return Err(AppError::bad("image_url must be an http(s) URL"));
+        }
+    }
+    Ok(())
+}
+
 fn default_form_config() -> Value {
     json!({
         "headline": "Get 10% off your first order",
@@ -666,6 +696,7 @@ pub async fn create_form(state: &AppState, account_id: Uuid, b: FormBody) -> App
     if let Some(l) = b.list_id {
         crate::audience::list_belongs(&state.db, account_id, l).await?;
     }
+    check_form_config(&b.config)?;
     let mut config = default_form_config();
     if let (Some(o), Some(Value::Object(extra))) = (config.as_object_mut(), b.config) {
         o.extend(extra);
@@ -704,6 +735,7 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
     if let Some(l) = b.list_id {
         crate::audience::list_belongs(&state.db, account_id, l).await?;
     }
+    check_form_config(&b.config)?;
     let f: Option<FormRow> = sqlx::query_as(
         "UPDATE forms SET name = COALESCE($3, name), kind = COALESCE($4, kind), list_id = COALESCE($5, list_id),
            config = CASE WHEN $6::jsonb IS NULL THEN config ELSE config || $6 END, status = COALESCE($7, status), updated_at = now()

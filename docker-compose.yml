@@ -23,8 +23,11 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://postlark:${POSTGRES_PASSWORD:-postlark}@postgres:5432/postlark
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env (openssl rand -base64 48)}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env (openssl rand -hex 24)}
     ports:
-      - "8080:8080"
+      # Put a TLS reverse proxy (Caddy, nginx) in front; change to "8080:8080" to expose directly.
+      - "127.0.0.1:8080:8080"
 
 volumes:
   pgdata:

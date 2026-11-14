@@ -119,7 +119,8 @@ pub async fn load_account(db: &PgPool, id: Uuid) -> AppResult<Account> {
 }
 
 /// Check a campaign is complete enough to send; returns a list of problems.
-pub fn readiness(account: &Account, c: &CampaignRow) -> Vec<String> {
+/// `verify_domain`: true when sending through a shared provider (SES) that requires a verified domain.
+pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec<String> {
     let mut problems = Vec::new();
     let aud: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
     if aud.include.is_empty() {
@@ -138,6 +139,11 @@ pub fn readiness(account: &Account, c: &CampaignRow) -> Vec<String> {
         let from = c.content.get("from_email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or(account.from_email.clone());
         if from.is_none() {
             problems.push("Set a sender email in Settings → Sending".into());
+        }
+        if let Some(f) = from.as_ref().filter(|_| verify_domain) {
+            if let Err(e) = crate::sending::check_sender_domain_name(account, f) {
+                problems.push(e);
+            }
         }
         if account.address.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
@@ -271,7 +277,7 @@ pub const ATTRIBUTION_SQL: &str = "
 pub async fn stats(db: &PgPool, account_id: Uuid, campaign_id: Uuid) -> AppResult<MessageStats> {
     let q = format!("SELECT {STATS_SELECT} FROM messages m WHERE m.campaign_id = $1 AND NOT m.is_test AND m.status <> 'skipped'");
     let mut s: MessageStats = sqlx::query_as(&q).bind(campaign_id).fetch_one(db).await?;
-    let q = format!("SELECT count(*)::bigint, COALESCE(sum(value), 0)::float8 FROM ({ATTRIBUTION_SQL}) x WHERE x.campaign_id = $2");
+    let q = format!("SELECT count(*)::bigint, COALESCE(sum(value), 0)::float8 FROM ({ATTRIBUTION_SQL} AND e.profile_id IN (SELECT profile_id FROM messages WHERE campaign_id = $2)) x WHERE x.campaign_id = $2");
     let (orders, revenue): (i64, f64) = sqlx::query_as(&q).bind(account_id).bind(campaign_id).fetch_one(db).await?;
     s.orders = orders;
     s.revenue = revenue;
@@ -282,6 +288,13 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
     if to.is_empty() || to.len() > 10 {
         return Err(AppError::bad("send tests to 1-10 addresses"));
     }
+    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'")
+        .bind(account.id)
+        .fetch_one(&state.db)
+        .await?;
+    if recent + to.len() as i64 > 50 {
+        return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
+    }
     let mut sent = 0;
     for addr in to {
         let input = if c.channel == "email" {
@@ -291,7 +304,14 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         };
         // Use the matching profile for realistic personalization; create one only if absent.
         let profile = match crate::audience::find_profile(&state.db, account.id, &input).await? {
-            Some(p) => p,
+            Some(p) => {
+                let suppressed: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE id = $1").bind(p.id).fetch_one(&state.db).await?;
+                let opted_out = if c.channel == "sms" { p.sms_consent == "unsubscribed" } else { p.email_consent == "unsubscribed" || suppressed.is_some() };
+                if opted_out {
+                    return Err(AppError::bad(format!("{addr} has unsubscribed or bounced; pick another test address")));
+                }
+                p
+            }
             None => crate::audience::upsert_profile(&state.db, account.id, &input).await?.profile,
         };
         let out = sending::send(

@@ -474,8 +474,8 @@ async fn campaign_with_readiness(state: &AppState, acct: Uuid, id: Uuid) -> AppR
     let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
     let est = if audience.include.is_empty() { 0 } else { campaigns::estimate(&state.db, acct, &c.channel, &audience).await? };
     v["estimated_recipients"] = json!(est);
-    v["ready_to_send"] = json!(campaigns::readiness(&account, &c).is_empty() && est > 0);
-    v["problems"] = json!(campaigns::readiness(&account, &c));
+    v["ready_to_send"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses").is_empty() && est > 0);
+    v["problems"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses"));
     Ok(v)
 }
 

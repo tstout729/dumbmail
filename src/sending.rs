@@ -73,6 +73,21 @@ pub fn sms_quiet_until(account: &Account, now: DateTime<Utc>) -> Option<DateTime
     Some(at.with_timezone(&Utc))
 }
 
+/// With a shared SES account, each customer may only send from the domain they verified.
+pub fn check_sender_domain(state: &AppState, account: &Account, from_email: &str) -> AppResult<()> {
+    if state.email.name() != "ses" {
+        return Ok(());
+    }
+    check_sender_domain_name(account, from_email).map_err(AppError::BadRequest)
+}
+
+pub fn check_sender_domain_name(account: &Account, from_email: &str) -> Result<(), String> {
+    let from_domain = from_email.rsplit_once('@').map(|(_, d)| d.to_lowercase()).unwrap_or_default();
+    let ok = account.sending_domain_status == "verified"
+        && account.sending_domain.as_deref().is_some_and(|d| from_domain == d || from_domain.ends_with(&format!(".{d}")));
+    if ok { Ok(()) } else { Err(format!("Verify {from_domain} in Settings → Sending before sending from {from_email}")) }
+}
+
 pub fn unsubscribe_url(state: &AppState, message_id: Uuid) -> String {
     format!("{}/u/{}", state.cfg.public_url(), crate::auth::sign(&state.cfg.secret_key, &format!("u{}", message_id.simple())))
 }
@@ -133,6 +148,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             .filter(|s| !s.is_empty())
             .or_else(|| spec.account.from_email.clone())
             .ok_or_else(|| AppError::bad("set a sender email in Settings → Sending before sending email"))?;
+        check_sender_domain(state, spec.account, &from_email)?;
         let r = render::render_email(spec.account, &content, &ctx, Some(&tracking))?;
         let subject = if spec.is_test { format!("[Test] {}", r.subject) } else { r.subject.clone() };
         let email = OutgoingEmail {

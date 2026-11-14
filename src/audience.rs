@@ -72,6 +72,16 @@ pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -
 
 /// Create or update a profile, merging properties. Identity priority: id, external_id, email, phone.
 pub async fn upsert_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
+    upsert_inner(db, account_id, input, false).await
+}
+
+/// For unauthenticated callers (browser snippet, forms): an existing profile's identity and
+/// names are only filled in where blank, never overwritten, so nobody can take over a profile.
+pub async fn upsert_profile_public(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
+    upsert_inner(db, account_id, input, true).await
+}
+
+async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool) -> AppResult<Upserted> {
     let email = match input.email.as_deref().filter(|e| !e.trim().is_empty()) {
         Some(e) => Some(normalize_email(e).ok_or_else(|| AppError::bad(format!("{e:?} is not a valid email")))?),
         None => None,
@@ -94,15 +104,27 @@ pub async fn upsert_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput)
         let existing = find_profile(db, account_id, input).await?;
         let res = match &existing {
             Some(p) => {
-                let q = format!(
-                    "UPDATE profiles p SET
-                        email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
-                        external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
-                        last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
-                        email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
-                        updated_at = now()
-                     WHERE p.id = $1 RETURNING {PROFILE_COLS}"
-                );
+                let q = if fill_only {
+                    format!(
+                        "UPDATE profiles p SET
+                            email = COALESCE(p.email, $2), phone_number = COALESCE(p.phone_number, $3),
+                            external_id = COALESCE(p.external_id, $4), first_name = COALESCE(p.first_name, $5),
+                            last_name = COALESCE(p.last_name, $6), properties = $7 || p.properties,
+                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            updated_at = now()
+                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                    )
+                } else {
+                    format!(
+                        "UPDATE profiles p SET
+                            email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
+                            external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
+                            last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
+                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            updated_at = now()
+                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                    )
+                };
                 sqlx::query_as::<_, Profile>(&q)
                     .bind(p.id)
                     .bind(&email)
@@ -226,6 +248,7 @@ pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_i
     let added: Vec<Uuid> = sqlx::query_scalar(
         "INSERT INTO list_members (list_id, profile_id)
          SELECT $1, p.id FROM profiles p WHERE p.account_id = $2 AND p.id = ANY($3)
+           AND EXISTS (SELECT 1 FROM lists l WHERE l.id = $1 AND l.account_id = $2)
          ON CONFLICT DO NOTHING RETURNING profile_id",
     )
     .bind(list_id)

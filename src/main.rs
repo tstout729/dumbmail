@@ -68,8 +68,13 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     init_tracing();
     let db = PgPoolOptions::new().max_connections(20).connect(&cfg.database_url).await?;
     MIGRATOR.run(&db).await?;
-    if cfg.secret_key == "dev-secret-change-me" {
-        tracing::warn!("SECRET_KEY is the development default; set a long random value in production");
+    let local = ["http://localhost", "http://127.0.0.1", "http://0.0.0.0"].iter().any(|p| cfg.public_url.starts_with(p));
+    let weak = cfg.secret_key == "dev-secret-change-me" || cfg.secret_key.len() < 32 || cfg.webhook_secret == "dev-webhook-secret" || cfg.webhook_secret.len() < 16;
+    if weak && !local {
+        anyhow::bail!("PUBLIC_URL is not local, so SECRET_KEY (32+ chars) and WEBHOOK_SECRET (16+ chars) must be set to random values (openssl rand -base64 48)");
+    }
+    if weak {
+        tracing::warn!("using development secrets; set SECRET_KEY and WEBHOOK_SECRET before exposing this server");
     }
     let bind = cfg.bind.clone();
     let state = AppState::build(cfg, db).await?;
