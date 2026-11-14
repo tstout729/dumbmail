@@ -324,7 +324,7 @@ async fn client_ping(State(state): State<AppState>, Query(q): Query<KeyQuery>, b
          WHERE public_key = $1 AND (onsite_last_seen_at IS NULL OR onsite_last_seen_at < now() - interval '2 minutes')",
     )
     .bind(&q.k)
-    .bind(url.starts_with("http").then_some(url))
+    .bind(url::Url::parse(&url).ok().filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string()))
     .execute(&state.db)
     .await;
     cors(StatusCode::NO_CONTENT.into_response())

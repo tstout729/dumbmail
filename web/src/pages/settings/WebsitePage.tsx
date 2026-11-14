@@ -6,6 +6,17 @@ import { useCheckWebsite, useForms, useSession, useWebsite } from "../../api";
 import { Button, Card, CodeBlock, CopyField, Field, Input, Notice, Select, Skeleton, Tabs } from "../../components/ui";
 import { formatRelative } from "../../lib/format";
 
+/** Only http(s) URLs become links; anything else is shown as plain text. */
+function safeHttpUrl(u: string | null | undefined): string | null {
+  if (!u) return null;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export function WebsitePage() {
   const website = useWebsite();
   if (website.isPending) {
@@ -52,12 +63,12 @@ function SnippetCard({ w }: { w: WebsiteStatus }) {
         {w.installed ? (
           <Notice tone="green" icon={<CheckCircle2 />} title="Installed">
             Last seen on{" "}
-            {w.last_seen_url ? (
-              <a href={w.last_seen_url} target="_blank" rel="noreferrer" className="break-all font-medium underline">
+            {safeHttpUrl(w.last_seen_url) ? (
+              <a href={safeHttpUrl(w.last_seen_url) ?? undefined} target="_blank" rel="noreferrer" className="break-all font-medium underline">
                 {w.last_seen_url}
               </a>
             ) : (
-              "your site"
+              <span className="break-all">{w.last_seen_url ?? "your site"}</span>
             )}{" "}
             {formatRelative(w.last_seen_at)}.
           </Notice>
