@@ -67,8 +67,9 @@ pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Vec<PhoneNumb
         .await?)
 }
 
-/// The provider and sending number for an account, or why it can't text yet.
-pub async fn sender(state: &AppState, account_id: Uuid) -> AppResult<(Arc<dyn SmsProvider>, String)> {
+/// The provider and sending number for an account, or why it can't text yet. The flag is true
+/// when the provider is the customer's own account (those texts aren't billed).
+pub async fn sender(state: &AppState, account_id: Uuid) -> AppResult<(Arc<dyn SmsProvider>, String, bool)> {
     let (mode, enc, from): (String, Option<String>, Option<String>) = sqlx::query_as("SELECT sms_mode, sms_byo_credentials, sms_from FROM accounts WHERE id = $1")
         .bind(account_id)
         .fetch_one(&state.db)
@@ -82,7 +83,7 @@ pub async fn sender(state: &AppState, account_id: Uuid) -> AppResult<(Arc<dyn Sm
             ByoCredentials::Telnyx { api_key, messaging_profile_id } => Arc::new(TelnyxSms::new(state.http.clone(), api_key, messaging_profile_id)),
             ByoCredentials::Twilio { account_sid, auth_token } => Arc::new(TwilioSms::new(state.http.clone(), account_sid, auth_token)),
         };
-        return Ok((p, from));
+        return Ok((p, from, true));
     }
     if state.cfg.hosted && state.sms.name() != "log" {
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM phone_numbers WHERE account_id = $1 AND phone_number = $2 AND status <> 'released'")
@@ -98,7 +99,7 @@ pub async fn sender(state: &AppState, account_id: Uuid) -> AppResult<(Arc<dyn Sm
             _ => return Err(AppError::bad("claim or connect a texting number in Settings → SMS first")),
         }
     }
-    Ok((state.sms.clone(), from))
+    Ok((state.sms.clone(), from, false))
 }
 
 pub async fn sms_setup_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {

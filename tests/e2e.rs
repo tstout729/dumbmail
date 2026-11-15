@@ -672,12 +672,16 @@ async fn billing_numbers_onsite_and_domains() {
 
     // Texts through the customer's own provider are never charged.
     let acct = uuid::Uuid::parse_str(me["account"]["id"].as_str().unwrap()).unwrap();
-    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false).await.unwrap() > 0);
+    // The flag comes from the provider that sends, so flipping the account setting mid-send can't skip a charge.
+    let (_, _, own) = postlark::phone::sender(&h.state, acct).await.unwrap();
+    assert!(!own);
+    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0);
     sqlx::query("UPDATE accounts SET sms_mode = 'byo' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
-    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 2, false).await.unwrap(), 0);
-    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 1, true).await.unwrap(), 0);
-    assert_eq!(postlark::billing::charge_message(&h.state, acct, "sms", 3, false).await.unwrap(), 0);
+    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0, "platform send stays billed");
     sqlx::query("UPDATE accounts SET sms_mode = 'platform' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 2, false, true).await.unwrap(), 0);
+    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 1, true, true).await.unwrap(), 0);
+    assert_eq!(postlark::billing::charge_message(&h.state, acct, "sms", 3, false, true).await.unwrap(), 0);
 
     // Number rent never drives a balance negative: unpaid → past due → released after the grace period.
     sqlx::query("UPDATE accounts SET balance_micros = 1000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
@@ -686,6 +690,10 @@ async fn billing_numbers_onsite_and_domains() {
     assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 1_000_000, "rent must not be charged into a negative balance");
     let nums = h.ok("GET", "/api/phone-numbers", None).await;
     assert!(nums["data"][0]["release_at"].is_string(), "{nums}");
+    let marked: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT past_due_since FROM phone_numbers WHERE account_id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    let again: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT past_due_since FROM phone_numbers WHERE account_id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(marked, again, "a past-due number inside the grace period is left alone");
     // Topping up within the grace period pays the rent and clears the warning.
     sqlx::query("UPDATE accounts SET balance_micros = 5000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
     postlark::billing::charge_numbers(&h.state).await.unwrap();
