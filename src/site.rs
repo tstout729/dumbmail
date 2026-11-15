@@ -87,6 +87,18 @@ footer a {{ color:var(--muted); margin-right:16px; }}
     ))
 }
 
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
 fn money(v: f64) -> String {
     let s = format!("{v:.3}");
     let s = s.trim_end_matches('0');
@@ -96,7 +108,7 @@ fn money(v: f64) -> String {
 
 async fn about(State(state): State<AppState>) -> Html<String> {
     let c = &state.cfg;
-    let free = if c.free_emails_per_month > 0 { format!("<p>The first {} emails each month are free.</p>", c.free_emails_per_month) } else { String::new() };
+    let free = if c.free_emails_per_month > 0 { format!("<p>The first {} emails each month are free.</p>", thousands(c.free_emails_per_month)) } else { String::new() };
     page(
         "Postlark: email and text marketing you pay for as you go",
         &format!(
@@ -259,7 +271,7 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::money;
+    use super::{money, thousands};
 
     #[test]
     fn prices_read_naturally() {
@@ -268,5 +280,8 @@ mod tests {
         assert_eq!(money(0.03), "$0.03");
         assert_eq!(money(2.20), "$2.20");
         assert_eq!(money(2.0), "$2.00");
+        assert_eq!(thousands(25), "25");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(1234567), "1,234,567");
     }
 }
