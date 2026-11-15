@@ -223,7 +223,10 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 ### Billing (hosted service; self-hosted installs return `mode: "self_hosted"` and never charge)
 
 Money is prepaid credit. Each email or SMS segment sent is charged from the balance at cost plus markup.
-Every account gets `free_emails_per_month` free emails each calendar month. SMS has no free allowance.
+Every account gets `free_emails_per_month` free emails each calendar month. SMS has no free allowance,
+but texts sent through the account's own Telnyx or Twilio connection (`sms.mode: "byo"`) are never charged.
+Monthly number rent is charged only when the balance covers it; otherwise the number gets a `release_at`
+time (7 days out) and is released then unless the balance is topped up first.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
@@ -273,6 +276,7 @@ type PhoneNumber = {
   verification_note: string | null;  // carrier feedback when rejected
   monthly_price: number;             // 0 for connected numbers
   created_at: string;
+  release_at: string | null;         // set when this month's rent is unpaid: released at this time unless credit is added
 };
 type SmsSetup = {
   mode: "platform" | "byo";

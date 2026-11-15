@@ -6,9 +6,14 @@ It covers the core of what Klaviyo does at a fraction of the cost. Self-host it 
 
 | | Hosted Postlark | Klaviyo |
 | --- | --- | --- |
-| Email | $0.20 per 1,000 (first 3,000 a month free) | about $150/mo for 10,000 contacts |
-| SMS (US, carrier fees included) | $0.0099 per segment | about $0.009–0.012 per message, plus a monthly plan |
-| Texting number | $2.20 a month, or connect your own Telnyx/Twilio account at no markup | included in a plan |
+| Email | $0.40 per 1,000 (first 1,000 a month free) | $150/mo for 10,000 contacts, $720/mo for 50,000 |
+| SMS (US, carrier fees included) | $0.012 per segment | about $0.011–0.015 per message, plus carrier fees |
+| MMS (US, carrier fees included) | $0.03 | more than an SMS, plus carrier fees |
+| Texting number | $2.20 a month, or connect your own Telnyx/Twilio account and texts are free | not listed |
+
+A 10,000-contact store sending about 8 emails per contact a month pays about $32 instead of $150.
+
+Numbers are charged monthly from your credit. If your balance can't cover the rent, the number is marked past due and released after 7 days unless you add credit.
 
 Email goes out through Amazon SES and texts through Telnyx (or your own Telnyx or Twilio account).
 

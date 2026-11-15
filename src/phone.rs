@@ -33,11 +33,14 @@ pub struct PhoneNumberRow {
     #[serde(skip)]
     pub monthly_price_micros: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Set when monthly rent came due and the balance couldn't cover it.
+    pub past_due_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub fn row_json(r: &PhoneNumberRow) -> Value {
     let mut v = serde_json::to_value(r).unwrap_or_default();
     v["monthly_price"] = json!(billing::to_usd(r.monthly_price_micros));
+    v["release_at"] = json!(r.past_due_since.map(|t| t + billing::number_grace()));
     v
 }
 

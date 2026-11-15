@@ -556,6 +556,8 @@ export type PhoneNumber = {
   verification_note: string | null;
   monthly_price: number;
   created_at: string;
+  /** Set when this month's rent couldn't be paid from the balance: the number is released then unless credit is added. */
+  release_at: string | null;
 };
 
 export type SmsSetup = {

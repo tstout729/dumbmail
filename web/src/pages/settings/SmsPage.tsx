@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { Link } from "react-router";
 import { AlertTriangle, CheckCircle2, Clock, Info, Phone, Search, Trash2, XCircle } from "lucide-react";
 import type { AvailableNumber, AvailableQuery, PhoneNumber, PhoneNumberStatus, PhoneNumberType, SmsConnectInput, SmsProvider, SmsSetup } from "../../api";
 import {
@@ -67,6 +68,19 @@ export function SmsPage() {
 }
 
 function StatusBanner({ sms, purchased }: { sms: SmsSetup; purchased: PhoneNumber[] }) {
+  const { account } = useSession();
+  const pastDue = purchased.find((n) => n.release_at);
+  if (pastDue?.release_at) {
+    return (
+      <Notice tone="red" icon={<AlertTriangle />} title={`Add credit to keep ${formatPhone(pastDue.phone_number)}`}>
+        Your balance couldn't cover this month's {formatPrice(pastDue.monthly_price)} for this number. Add credit in{" "}
+        <Link to="/settings/billing" className="font-medium underline">
+          Billing
+        </Link>{" "}
+        by {formatDate(pastDue.release_at, account.timezone)} or the number is released and can't be recovered.
+      </Notice>
+    );
+  }
   if (sms.can_send) {
     return (
       <div className="space-y-2">

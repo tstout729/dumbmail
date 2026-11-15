@@ -58,7 +58,13 @@ pub async fn free_emails_remaining(state: &AppState, account_id: Uuid) -> AppRes
     Ok((state.cfg.free_emails_per_month - used).max(0))
 }
 
-/// Price of one message before sending (0 when free or self-hosted).
+/// Texts sent through the customer's own Telnyx or Twilio account cost us nothing, so they're free.
+async fn sms_billed(state: &AppState, account_id: Uuid) -> AppResult<bool> {
+    let mode: String = sqlx::query_scalar("SELECT sms_mode FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    Ok(mode != "byo")
+}
+
+/// Price of one message before sending (0 when free, self-hosted, or texting through the customer's own provider).
 pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: i64, mms: bool) -> AppResult<i64> {
     if !state.cfg.hosted {
         return Ok(0);
@@ -68,6 +74,7 @@ pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: 
         "email" => {
             if free_emails_remaining(state, account_id).await? > 0 { 0 } else { p.email }
         }
+        _ if !sms_billed(state, account_id).await? => 0,
         _ if mms => p.mms,
         _ => p.sms_segment * segments.max(1),
     })
@@ -97,6 +104,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     let p = prices(state);
     let cost = if channel == "email" {
         (recipients - free_emails_remaining(state, account_id).await?).max(0) * p.email
+    } else if !sms_billed(state, account_id).await? {
+        0
     } else if mms {
         recipients * p.mms
     } else {
@@ -125,6 +134,8 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
         .await?;
         let free = used as i64 <= state.cfg.free_emails_per_month;
         ("email", 1i64, if free { 0 } else { p.email })
+    } else if !sms_billed(state, account_id).await? {
+        return Ok(0);
     } else if mms {
         ("mms", 1, p.mms)
     } else {
@@ -434,21 +445,46 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Scheduler: monthly phone number rent.
+/// How long a number stays past due before it's released.
+pub fn number_grace() -> chrono::Duration {
+    chrono::Duration::days(7)
+}
+
+/// Scheduler: monthly phone number rent. Rent is charged only when the balance covers it, so it
+/// never pushes a balance negative. An unpaid number is marked past due (auto-recharge gets a
+/// chance to top up) and released after the grace period. The first month is paid at claim, so
+/// the operator's provider cost for a number never exceeds what the customer paid for it.
 pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
-    let due: Vec<(Uuid, Uuid, String, i64)> = sqlx::query_as(
-        "SELECT id, account_id, phone_number, monthly_price_micros FROM phone_numbers
-         WHERE status <> 'released' AND monthly_price_micros > 0 AND next_charge_at <= now() LIMIT 200",
+    let due: Vec<(Uuid, Uuid, String, i64, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, account_id, phone_number, monthly_price_micros, past_due_since, next_charge_at FROM phone_numbers
+         WHERE status <> 'released' AND monthly_price_micros > 0 AND next_charge_at <= now()
+         ORDER BY next_charge_at LIMIT 200",
     )
     .fetch_all(&state.db)
     .await?;
-    for (id, account_id, number, price) in due {
-        let month = Utc::now().format("%Y-%m").to_string();
-        let reference = format!("{id}:{month}");
-        if state.cfg.hosted {
-            post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    for (id, account_id, number, price, past_due_since, due_at) in due {
+        if !state.cfg.hosted || balance(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? >= price {
+            if state.cfg.hosted {
+                // Keyed by the billing period (not today's date), so a late payment can't make the
+                // next period's charge look like a duplicate.
+                let reference = format!("{id}:{}", due_at.format("%Y-%m-%d"));
+                post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            }
+            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+            continue;
         }
-        sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month' WHERE id = $1").bind(id).execute(&state.db).await?;
+        match past_due_since {
+            None => {
+                sqlx::query("UPDATE phone_numbers SET past_due_since = now() WHERE id = $1").bind(id).execute(&state.db).await?;
+            }
+            Some(since) if Utc::now() - since >= number_grace() => {
+                tracing::warn!(%account_id, number, "releasing phone number: monthly rent unpaid");
+                if let Err(e) = crate::phone::release(state, account_id, id).await {
+                    tracing::error!(%account_id, number, error = %e.public_message(), "couldn't release past-due number");
+                }
+            }
+            Some(_) => {}
+        }
     }
     Ok(())
 }

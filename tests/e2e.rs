@@ -669,5 +669,37 @@ async fn billing_numbers_onsite_and_domains() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _, out) = h.raw("POST", "/admin/credit", &[("authorization", "Bearer test-admin-token-0123456789abcdef0123"), ("content-type", "application/json")], &body).await;
     assert_eq!(s, StatusCode::OK, "{out}");
+
+    // Texts through the customer's own provider are never charged.
+    let acct = uuid::Uuid::parse_str(me["account"]["id"].as_str().unwrap()).unwrap();
+    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false).await.unwrap() > 0);
+    sqlx::query("UPDATE accounts SET sms_mode = 'byo' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 2, false).await.unwrap(), 0);
+    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 1, true).await.unwrap(), 0);
+    assert_eq!(postlark::billing::charge_message(&h.state, acct, "sms", 3, false).await.unwrap(), 0);
+    sqlx::query("UPDATE accounts SET sms_mode = 'platform' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+
+    // Number rent never drives a balance negative: unpaid → past due → released after the grace period.
+    sqlx::query("UPDATE accounts SET balance_micros = 1000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE phone_numbers SET next_charge_at = now() - interval '1 minute' WHERE account_id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 1_000_000, "rent must not be charged into a negative balance");
+    let nums = h.ok("GET", "/api/phone-numbers", None).await;
+    assert!(nums["data"][0]["release_at"].is_string(), "{nums}");
+    // Topping up within the grace period pays the rent and clears the warning.
+    sqlx::query("UPDATE accounts SET balance_micros = 5000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 5_000_000 - 2_200_000);
+    assert!(h.ok("GET", "/api/phone-numbers", None).await["data"][0]["release_at"].is_null());
+    // Unpaid past the grace period → released.
+    sqlx::query("UPDATE accounts SET balance_micros = 0 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE phone_numbers SET next_charge_at = now() - interval '1 minute', past_due_since = now() - interval '8 days' WHERE account_id = $1")
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    assert_eq!(h.ok("GET", "/api/phone-numbers", None).await["data"].as_array().unwrap().len(), 0);
+    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 0);
     h.cleanup().await;
 }
