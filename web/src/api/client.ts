@@ -49,7 +49,7 @@ export async function api<T>(method: Method, path: string, body?: unknown): Prom
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
-    throw new ApiError(0, "network", "Can't reach the Postlark server. Check your connection and try again.");
+    throw new ApiError(0, "network", "Can't reach the DumbMail server. Check your connection and try again.");
   }
 
   const text = await res.text();

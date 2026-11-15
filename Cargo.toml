@@ -1,8 +1,8 @@
 [package]
-name = "postlark"
+name = "dumbmail"
 description = "Open-source email and SMS marketing: campaigns, flows, segments and an MCP server"
 license = "AGPL-3.0-only"
-default-run = "postlark"
+default-run = "dumbmail"
 version = "0.1.0"
 edition = "2024"
 

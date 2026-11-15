@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/t/c/{token}", get(click))
         .route("/u/{token}", get(unsubscribe_page).post(unsubscribe_post))
         .route("/onsite.js", get(onsite_js))
+        .route("/client/dumbmail.js", get(onsite_js))
         .route("/client/postlark.js", get(onsite_js))
         .route("/client/forms", get(client_forms))
         .route("/client/ping", post(client_ping).options(cors_preflight))
@@ -671,7 +672,7 @@ async fn admin_credit(State(state): State<AppState>, headers: HeaderMap, Json(b)
     .fetch_optional(&state.db)
     .await?;
     let (id, name) = row.ok_or_else(|| AppError::not_found("account"))?;
-    let note = b["note"].as_str().unwrap_or("Credit added by Postlark");
+    let note = b["note"].as_str().unwrap_or("Credit added by DumbMail");
     crate::billing::post_entry(&state.db, id, "adjustment", crate::billing::to_micros(amount), note, &Uuid::now_v7().to_string()).await?;
     let bal = crate::billing::balance(&state.db, id).await?;
     tracing::info!(account = %id, amount, "admin credit");

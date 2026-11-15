@@ -12,7 +12,7 @@ export function AuthLayout({ title, subtitle, children, footer }: { title: strin
       </div>
       <div className="mt-5 text-sm text-zinc-500">{footer}</div>
       {/* Server-rendered pages, so plain links (full page loads), not router links. */}
-      <nav className="mt-8 flex gap-4 text-xs text-zinc-400" aria-label="About Postlark">
+      <nav className="mt-8 flex gap-4 text-xs text-zinc-400" aria-label="About DumbMail">
         <a href="/about" className="hover:text-zinc-600 hover:underline">
           About
         </a>

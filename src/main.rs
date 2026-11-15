@@ -1,18 +1,18 @@
 use std::io::{BufRead, Write};
 
 use clap::{Parser, Subcommand};
-use postlark::config::Config;
-use postlark::{app, jobs, AppState, MIGRATOR};
+use dumbmail::config::Config;
+use dumbmail::{app, jobs, AppState, MIGRATOR};
 use sqlx::postgres::PgPoolOptions;
 
 #[derive(Parser)]
-#[command(name = "postlark", version, about = "Open-source email and SMS marketing")]
+#[command(name = "dumbmail", version, about = "Open-source email and SMS marketing")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
 
-/// Parses only server settings, for running `postlark` with no subcommand.
+/// Parses only server settings, for running `dumbmail` with no subcommand.
 #[derive(Parser)]
 struct ServeOnly {
     #[command(flatten)]
@@ -38,16 +38,16 @@ enum Cmd {
         /// Amount in USD
         #[arg(long, allow_hyphen_values = true)]
         amount: f64,
-        #[arg(long, default_value = "Credit added by Postlark")]
+        #[arg(long, default_value = "Credit added by DumbMail")]
         note: String,
     },
-    /// Bridge stdio MCP clients to a Postlark server's HTTP MCP endpoint.
+    /// Bridge stdio MCP clients to a DumbMail server's HTTP MCP endpoint.
     McpStdio {
-        /// Server base URL, e.g. https://app.postlark.dev
-        #[arg(long, env = "POSTLARK_URL")]
+        /// Server base URL, e.g. https://dumbmail.ai
+        #[arg(long, env = "DUMBMAIL_URL")]
         url: String,
         /// Private API key (pl_sk_...)
-        #[arg(long, env = "POSTLARK_API_KEY", hide_env_values = true)]
+        #[arg(long, env = "DUMBMAIL_API_KEY", hide_env_values = true)]
         api_key: String,
     },
 }
@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cmd = match cli.cmd {
         Some(c) => c,
-        None => Cmd::Serve(Box::new(ServeOnly::parse_from(["postlark"]).cfg)),
+        None => Cmd::Serve(Box::new(ServeOnly::parse_from(["dumbmail"]).cfg)),
     };
     match cmd {
         Cmd::Serve(cfg) => serve(*cfg).await,
@@ -78,11 +78,11 @@ async fn main() -> anyhow::Result<()> {
             .fetch_optional(&db)
             .await?;
             let (id, name) = account.ok_or_else(|| anyhow::anyhow!("no account for {email}"))?;
-            postlark::billing::post_entry(&db, id, "adjustment", postlark::billing::to_micros(amount), &note, &uuid::Uuid::now_v7().to_string())
+            dumbmail::billing::post_entry(&db, id, "adjustment", dumbmail::billing::to_micros(amount), &note, &uuid::Uuid::now_v7().to_string())
                 .await
                 .map_err(|e| anyhow::anyhow!(e.public_message()))?;
-            let bal = postlark::billing::balance(&db, id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-            println!("{name}: balance now ${:.4}", postlark::billing::to_usd(bal));
+            let bal = dumbmail::billing::balance(&db, id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            println!("{name}: balance now ${:.4}", dumbmail::billing::to_usd(bal));
             Ok(())
         }
     }
@@ -110,7 +110,7 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(email = state.email.name(), sms = state.sms.name(), "providers ready");
     jobs::spawn_workers(state.clone());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!("Postlark listening on http://{bind}");
+    tracing::info!("DumbMail listening on http://{bind}");
     axum::serve(listener, app(state)).with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
     })
@@ -145,7 +145,7 @@ async fn mcp_stdio(url: &str, api_key: &str) -> anyhow::Result<()> {
             Ok(r) => Some(r.text().await.unwrap_or_default()),
             Err(e) => {
                 let id = serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v.get("id").cloned()).unwrap_or(serde_json::Value::Null);
-                Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("could not reach Postlark: {e}")}}).to_string())
+                Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("could not reach DumbMail: {e}")}}).to_string())
             }
         };
         if let Some(o) = out.filter(|o| !o.trim().is_empty()) {

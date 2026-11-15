@@ -134,7 +134,7 @@ function BalanceCard({ b }: { b: Billing }) {
       <div className="mt-4 border-t border-zinc-100 pt-4">
         {!b.stripe_enabled ? (
           <Notice tone="gray" icon={<CreditCard />} title="Card payments aren't configured on this server">
-            Contact the person who runs this Postlark server to add credit.
+            Contact the person who runs this DumbMail server to add credit.
           </Notice>
         ) : (
           <form onSubmit={onSubmit} className="space-y-3">
@@ -372,7 +372,7 @@ function PricesCard({ b }: { b: Billing }) {
     { item: "Email", price: `${formatPrice(p.email_per_1000)} per 1,000`, note: `First ${formatNumber(b.free_emails_per_month)} each month are free` },
     { item: "SMS", price: `${formatPrice(p.sms_per_segment)} per segment`, note: "A segment is up to 160 characters, or 70 with emoji" },
     { item: "MMS", price: `${formatPrice(p.mms_per_message)} per message`, note: "Texts with an image" },
-    { item: "Phone number", price: `${formatPrice(p.phone_number_monthly)} per month`, note: "Only for numbers you get from Postlark" },
+    { item: "Phone number", price: `${formatPrice(p.phone_number_monthly)} per month`, note: "Only for numbers you get from DumbMail" },
   ];
   return (
     <Card title="Prices" padded={false}>
@@ -391,7 +391,7 @@ function PricesCard({ b }: { b: Billing }) {
         </tbody>
       </Table>
       <div className="border-t border-zinc-100 px-4 py-3 text-xs text-zinc-600">
-        <p>No plans or contact tiers. Klaviyo: about $150/mo for 10,000 contacts; Postlark: you only pay per message.</p>
+        <p>No plans or contact tiers. Klaviyo: about $150/mo for 10,000 contacts; DumbMail: you only pay per message.</p>
         <p className="mt-1 text-zinc-500">
           For example, 4 emails this month to each of 10,000 contacts ({formatNumber(exampleEmails)} emails) costs {formatCurrency(exampleCost, true)} here.
         </p>

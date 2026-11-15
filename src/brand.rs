@@ -605,7 +605,7 @@ pub fn analyze(html: &str, base: &Url) -> PageFindings {
             }
         }
     }
-    logos.sort_by(|a, b| (is_svg_url(&a.0), -a.1).cmp(&(is_svg_url(&b.0), -b.1)));
+    logos.sort_by_key(|a| (is_svg_url(&a.0), -a.1));
     for (u, _) in logos {
         if !f.logo_candidates.contains(&u) {
             f.logo_candidates.push(u);
@@ -815,7 +815,7 @@ async fn import_inner(url: &str) -> AppResult<BrandKit> {
 
     // Stylesheets and the logo are fetched in parallel.
     let mut sheets = tokio::task::JoinSet::new();
-    for s in f.stylesheets.iter().take(4).cloned() {
+    for s in f.stylesheets.iter().take(4).cloned().collect::<Vec<String>>() {
         sheets.spawn(async move { fetch_public(&s, 1536 * 1024).await.ok().map(|p| String::from_utf8_lossy(&p.body).into_owned()) });
     }
     let candidates = f.logo_candidates.clone();

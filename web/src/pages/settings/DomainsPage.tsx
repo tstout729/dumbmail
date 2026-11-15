@@ -82,7 +82,7 @@ export function DomainsPage() {
             : toast.info(notReadyMessage(r.email.dns_records))
         }
         zoneOf={(d) => d}
-        removeBody="Postlark stops signing your emails with this domain. You can add it again later, but you'll need to re-check the DNS records."
+        removeBody="DumbMail stops signing your emails with this domain. You can add it again later, but you'll need to re-check the DNS records."
       />
       <DomainSection
         title="Branded link domain"
@@ -117,7 +117,7 @@ export function DomainsPage() {
           r.link_domain.status === "active" ? toast.success("Link domain is active") : toast.info(notReadyMessage(r.link_domain.dns_records))
         }
         zoneOf={(d) => d.split(".").slice(1).join(".")}
-        removeBody="New links go back to the default Postlark domain. Links in emails you already sent keep working only while the DNS record stays in place."
+        removeBody="New links go back to the default DumbMail domain. Links in emails you already sent keep working only while the DNS record stays in place."
       />
     </div>
   );

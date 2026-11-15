@@ -28,7 +28,7 @@ impl AppState {
     pub async fn build(cfg: Config, db: PgPool) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
-            .user_agent("postlark/0.1")
+            .user_agent("dumbmail/0.1")
             .build()?;
         let email: Arc<dyn EmailProvider> = match cfg.email_provider.as_str() {
             "ses" => Arc::new(SesEmail::new(cfg.ses_configuration_set.clone()).await),

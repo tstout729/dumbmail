@@ -4,8 +4,8 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
-use postlark::config::Config;
-use postlark::{app, jobs, AppState, MIGRATOR};
+use dumbmail::config::Config;
+use dumbmail::{app, jobs, AppState, MIGRATOR};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -23,7 +23,7 @@ impl Harness {
     async fn new() -> Option<Self> {
         let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
         let admin = PgPoolOptions::new().max_connections(2).connect(&admin_url).await.expect("admin connect");
-        let dbname = format!("postlark_test_{}", uuid::Uuid::new_v4().simple());
+        let dbname = format!("dumbmail_test_{}", uuid::Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE DATABASE {dbname}")).execute(&admin).await.unwrap();
         let url = match admin_url.rsplit_once('/') {
             Some((base, _)) => format!("{base}/{dbname}"),
@@ -66,6 +66,7 @@ impl Harness {
             google_client_secret: Some("test-google-secret".into()),
             google_site_verification: Some("google0123abcd.html".into()),
             support_email: Some("help@pl.test".into()),
+            redirect_hosts: vec!["old.pl.test".into()],
         };
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
@@ -129,7 +130,7 @@ impl Harness {
     /// Give the account prepaid credit (as a Stripe top-up would).
     async fn credit(&self, usd: f64) {
         let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&self.state.db).await.unwrap();
-        postlark::billing::post_entry(&self.state.db, id, "topup", postlark::billing::to_micros(usd), "test credit", &uuid::Uuid::new_v4().to_string()).await.unwrap();
+        dumbmail::billing::post_entry(&self.state.db, id, "topup", dumbmail::billing::to_micros(usd), "test credit", &uuid::Uuid::new_v4().to_string()).await.unwrap();
     }
 
     /// Claim a texting number from the dev inventory and return it.
@@ -654,8 +655,8 @@ async fn billing_numbers_onsite_and_domains() {
     assert!(recs.iter().any(|r| r["purpose"] == "dkim"));
     assert!(recs.iter().any(|r| r["purpose"] == "mail_from" && r["type"] == "MX" && r["name"] == "send.acme-test-domain.example"));
     assert!(recs.iter().any(|r| r["purpose"] == "dmarc"));
-    assert!(recs.iter().any(|r| r["purpose"] == "verification" && r["name"] == "_postlark.acme-test-domain.example"
-        && r["value"].as_str().unwrap().starts_with("postlark-verify=")));
+    assert!(recs.iter().any(|r| r["purpose"] == "verification" && r["name"] == "_dumbmail.acme-test-domain.example"
+        && r["value"].as_str().unwrap().starts_with("dumbmail-verify=")));
     assert_eq!(sd["email"]["status"], "pending", "not verified without the ownership record");
     assert_eq!(sd["email"]["mail_from_domain"], "send.acme-test-domain.example");
     let ld = h.ok("POST", "/api/account/link-domain", Some(json!({"domain": "links.acme-test-domain.example"}))).await;
@@ -678,31 +679,31 @@ async fn billing_numbers_onsite_and_domains() {
     // Texts through the customer's own provider are never charged.
     let acct = uuid::Uuid::parse_str(me["account"]["id"].as_str().unwrap()).unwrap();
     // The flag comes from the provider that sends, so flipping the account setting mid-send can't skip a charge.
-    let (_, _, own) = postlark::phone::sender(&h.state, acct).await.unwrap();
+    let (_, _, own) = dumbmail::phone::sender(&h.state, acct).await.unwrap();
     assert!(!own);
-    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0);
+    assert!(dumbmail::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0);
     sqlx::query("UPDATE accounts SET sms_mode = 'byo' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
-    assert!(postlark::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0, "platform send stays billed");
+    assert!(dumbmail::billing::quote(&h.state, acct, "sms", 2, false, own).await.unwrap() > 0, "platform send stays billed");
     sqlx::query("UPDATE accounts SET sms_mode = 'platform' WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
-    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 2, false, true).await.unwrap(), 0);
-    assert_eq!(postlark::billing::quote(&h.state, acct, "sms", 1, true, true).await.unwrap(), 0);
-    assert_eq!(postlark::billing::charge_message(&h.state, acct, "sms", 3, false, true).await.unwrap(), 0);
+    assert_eq!(dumbmail::billing::quote(&h.state, acct, "sms", 2, false, true).await.unwrap(), 0);
+    assert_eq!(dumbmail::billing::quote(&h.state, acct, "sms", 1, true, true).await.unwrap(), 0);
+    assert_eq!(dumbmail::billing::charge_message(&h.state, acct, "sms", 3, false, true).await.unwrap(), 0);
 
     // Number rent never drives a balance negative: unpaid → past due → released after the grace period.
     sqlx::query("UPDATE accounts SET balance_micros = 1000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
     sqlx::query("UPDATE phone_numbers SET next_charge_at = now() - interval '1 minute' WHERE account_id = $1").bind(acct).execute(&h.state.db).await.unwrap();
-    postlark::billing::charge_numbers(&h.state).await.unwrap();
-    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 1_000_000, "rent must not be charged into a negative balance");
+    dumbmail::billing::charge_numbers(&h.state).await.unwrap();
+    assert_eq!(dumbmail::billing::balance(&h.state.db, acct).await.unwrap(), 1_000_000, "rent must not be charged into a negative balance");
     let nums = h.ok("GET", "/api/phone-numbers", None).await;
     assert!(nums["data"][0]["release_at"].is_string(), "{nums}");
     let marked: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT past_due_since FROM phone_numbers WHERE account_id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
-    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    dumbmail::billing::charge_numbers(&h.state).await.unwrap();
     let again: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT past_due_since FROM phone_numbers WHERE account_id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(marked, again, "a past-due number inside the grace period is left alone");
     // Topping up within the grace period pays the rent and clears the warning.
     sqlx::query("UPDATE accounts SET balance_micros = 5000000 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
-    postlark::billing::charge_numbers(&h.state).await.unwrap();
-    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 5_000_000 - 2_200_000);
+    dumbmail::billing::charge_numbers(&h.state).await.unwrap();
+    assert_eq!(dumbmail::billing::balance(&h.state.db, acct).await.unwrap(), 5_000_000 - 2_200_000);
     assert!(h.ok("GET", "/api/phone-numbers", None).await["data"][0]["release_at"].is_null());
     // Unpaid past the grace period → released.
     sqlx::query("UPDATE accounts SET balance_micros = 0 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
@@ -711,15 +712,15 @@ async fn billing_numbers_onsite_and_domains() {
         .execute(&h.state.db)
         .await
         .unwrap();
-    postlark::billing::charge_numbers(&h.state).await.unwrap();
+    dumbmail::billing::charge_numbers(&h.state).await.unwrap();
     assert_eq!(h.ok("GET", "/api/phone-numbers", None).await["data"].as_array().unwrap().len(), 0);
-    assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 0);
+    assert_eq!(dumbmail::billing::balance(&h.state.db, acct).await.unwrap(), 0);
     h.cleanup().await;
 }
 
 #[tokio::test]
 async fn brand_import_and_google_sign_in() {
-    use postlark::api::google::{google_user, GoogleClaims};
+    use dumbmail::api::google::{google_user, GoogleClaims};
     let mut h = harness!();
     h.signup().await;
     let old_cookie = h.cookie.clone();
@@ -800,6 +801,21 @@ async fn public_pages_and_site_verification() {
         assert!(body.contains("mailto:help@pl.test"), "{path} shows the support address");
         assert!(body.contains("href=\"/privacy\"") && body.contains("href=\"/terms\""), "{path} links the legal pages");
     }
+    // The retired hostname sends page visits to PUBLIC_URL but keeps webhooks, API and tracking working.
+    let (s, headers, _) = h.raw("GET", "/settings/account?tab=1", &[("host", "old.pl.test")], "").await;
+    assert_eq!(s, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(headers["location"], "https://pl.test/settings/account?tab=1");
+    let (s, headers, _) = h.raw("GET", "/api/auth/google", &[("host", "old.pl.test")], "").await;
+    assert_eq!(s, StatusCode::PERMANENT_REDIRECT, "sign-in must start on the new host so its cookie matches");
+    assert_eq!(headers["location"], "https://pl.test/api/auth/google");
+    for path in ["/healthz", "/api/auth/options", "/onsite.js?k=x"] {
+        let (s, _, _) = h.raw("GET", path, &[("host", "old.pl.test")], "").await;
+        assert_ne!(s, StatusCode::PERMANENT_REDIRECT, "{path} stays on the old host");
+    }
+    let (s, _, _) = h.raw("POST", "/privacy", &[("host", "old.pl.test")], "").await;
+    assert_ne!(s, StatusCode::PERMANENT_REDIRECT, "only GET and HEAD move");
+    let (s, _, _) = h.raw("GET", "/privacy", &[("host", "pl.test")], "").await;
+    assert_eq!(s, StatusCode::OK);
     let (s, _, body) = h.raw("GET", "/google0123abcd.html", &[], "").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body, "google-site-verification: google0123abcd.html");

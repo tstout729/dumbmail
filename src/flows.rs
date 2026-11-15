@@ -243,7 +243,7 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
             .resolve(&host, addr)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (compatible; Postlark/0.3; +https://postlark-production.up.railway.app)")
+            .user_agent("Mozilla/5.0 (compatible; DumbMail/0.3; +https://dumbmail.ai)")
             .build()
             .map_err(|e| AppError::Internal(e.into()))?;
         let res = client
@@ -281,7 +281,7 @@ async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<(
         .resolve(&host, addr)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("postlark-webhook/0.1")
+        .user_agent("dumbmail-webhook/0.1")
         .build()?;
     let req = if get { client.get(url) } else { client.post(url).json(payload) };
     req.send().await?.error_for_status()?;

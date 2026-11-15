@@ -50,7 +50,7 @@ export function AnalyticsPage() {
               </div>
             ))}
             <p className="text-xs text-zinc-500">
-              {formatCurrency(t?.attributed_revenue)} of {formatCurrency(t?.revenue)} total revenue came from Postlark messages.
+              {formatCurrency(t?.attributed_revenue)} of {formatCurrency(t?.revenue)} total revenue came from DumbMail messages.
             </p>
           </div>
         </Card>

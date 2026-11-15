@@ -37,14 +37,14 @@ export function DevelopersPage() {
   const [client, setClient] = useState<"code" | "desktop" | "cursor">("code");
 
   const configs = {
-    code: { label: "Terminal", code: `claude mcp add --transport http postlark ${origin}/mcp --header "Authorization: Bearer <key>"` },
+    code: { label: "Terminal", code: `claude mcp add --transport http dumbmail ${origin}/mcp --header "Authorization: Bearer <key>"` },
     desktop: {
       label: "claude_desktop_config.json",
-      code: JSON.stringify({ mcpServers: { postlark: { command: "npx", args: ["-y", "mcp-remote", `${origin}/mcp`, "--header", "Authorization: Bearer <key>"] } } }, null, 2),
+      code: JSON.stringify({ mcpServers: { dumbmail: { command: "npx", args: ["-y", "mcp-remote", `${origin}/mcp`, "--header", "Authorization: Bearer <key>"] } } }, null, 2),
     },
     cursor: {
       label: ".cursor/mcp.json",
-      code: JSON.stringify({ mcpServers: { postlark: { url: `${origin}/mcp`, headers: { Authorization: "Bearer <key>" } } } }, null, 2),
+      code: JSON.stringify({ mcpServers: { dumbmail: { url: `${origin}/mcp`, headers: { Authorization: "Bearer <key>" } } } }, null, 2),
     },
   };
 

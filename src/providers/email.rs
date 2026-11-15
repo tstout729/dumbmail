@@ -58,7 +58,7 @@ pub fn build_mime(email: &OutgoingEmail, config_set_header: Option<&str>) -> Str
     }
     out.push_str(&format!("Subject: {}\r\n", encode_header(&email.subject)));
     out.push_str("MIME-Version: 1.0\r\n");
-    out.push_str(&format!("X-Postlark-Message: {}\r\n", email.message_id));
+    out.push_str(&format!("X-DumbMail-Message: {}\r\n", email.message_id));
     if let Some(cs) = config_set_header {
         out.push_str(&format!("X-SES-CONFIGURATION-SET: {cs}\r\n"));
     }

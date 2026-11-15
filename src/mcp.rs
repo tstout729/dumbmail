@@ -33,7 +33,7 @@ async fn handle(State(state): State<AppState>, ctx: Result<Ctx, AppError>, body:
             return (
                 StatusCode::UNAUTHORIZED,
                 [("WWW-Authenticate", "Bearer")],
-                Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32001, "message": "Send Authorization: Bearer <Postlark API key>. Create one in Settings → Developers."}})),
+                Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32001, "message": "Send Authorization: Bearer <DumbMail API key>. Create one in Settings → Developers."}})),
             )
                 .into_response()
         }
@@ -72,7 +72,7 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": false}, "prompts": {"listChanged": false}, "resources": {"listChanged": false}},
-                "serverInfo": {"name": "postlark", "title": "Postlark email & SMS marketing", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "dumbmail", "title": "DumbMail email & SMS marketing", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             }))
         }
@@ -93,17 +93,17 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         "prompts/list" => Ok(json!({"prompts": prompts()})),
         "prompts/get" => prompt(params["name"].as_str().unwrap_or(""), &params["arguments"]).ok_or((-32602, "unknown prompt".into())),
         "resources/list" => Ok(json!({"resources": [
-            {"uri": "postlark://docs/segments", "name": "Segment rules", "description": "How to write segment definitions, flow splits and filters", "mimeType": "text/markdown"},
-            {"uri": "postlark://docs/email", "name": "Email content blocks", "description": "Email block types and personalization variables", "mimeType": "text/markdown"},
-            {"uri": "postlark://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"}
+            {"uri": "dumbmail://docs/segments", "name": "Segment rules", "description": "How to write segment definitions, flow splits and filters", "mimeType": "text/markdown"},
+            {"uri": "dumbmail://docs/email", "name": "Email content blocks", "description": "Email block types and personalization variables", "mimeType": "text/markdown"},
+            {"uri": "dumbmail://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"}
         ]})),
         "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
         "resources/read" => {
             let uri = params["uri"].as_str().unwrap_or("");
             let text = match uri {
-                "postlark://docs/segments" => Some(SEGMENT_DOC),
-                "postlark://docs/email" => Some(EMAIL_DOC),
-                "postlark://docs/flows" => Some(FLOW_DOC),
+                "dumbmail://docs/segments" | "postlark://docs/segments" => Some(SEGMENT_DOC),
+                "dumbmail://docs/email" | "postlark://docs/email" => Some(EMAIL_DOC),
+                "dumbmail://docs/flows" | "postlark://docs/flows" => Some(FLOW_DOC),
                 _ => None,
             };
             text.map(|t| json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": t}]})).ok_or((-32002, format!("resource not found: {uri}")))
@@ -117,11 +117,11 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
     })
 }
 
-const INSTRUCTIONS: &str = "Postlark is an email and SMS marketing platform (an open-source Klaviyo alternative). \
+const INSTRUCTIONS: &str = "DumbMail is an email and SMS marketing platform (an open-source Klaviyo alternative). \
 Start with get_account to see sending readiness, plan usage and what exists. \
 Audience: profiles, lists (static membership) and segments (live rules; test rules with preview_segment before saving). \
 Messaging: campaigns are one-off sends to lists/segments; flows are automations started by a trigger (event/metric, list join, segment entry, date property). \
-Email content is a list of blocks (see the postlark://docs/email resource) personalized with Jinja tags like {{ first_name|default('there') }}. \
+Email content is a list of blocks (see the dumbmail://docs/email resource) personalized with Jinja tags like {{ first_name|default('there') }}. \
 Always render_preview new content and send_test before sending. Sending a campaign or turning a flow live reaches real people: \
 the tools require confirm=true and you should get the user's explicit go-ahead first. Data: get_analytics, query_metric, campaign_performance, get_campaign_report, get_flow_report. \
 Times are ISO 8601; the account has a time zone (default America/Los_Angeles) used for reporting buckets.";
@@ -294,7 +294,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let (pk, seen, url): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
                 sqlx::query_as("SELECT public_key, onsite_last_seen_at, onsite_last_url FROM accounts WHERE id = $1").bind(acct).fetch_one(&state.db).await?;
             Ok(json!({"snippet": crate::api::account::snippet(state, &pk), "installed": seen.is_some(), "last_seen_at": seen, "last_seen_url": url,
-                "usage": "Paste the snippet in the site's <head> or footer on every page. Then call postlark.identify({email}) and postlark.track('Viewed Product', {...}, value). Embedded forms: <div data-postlark-form=\"FORM_ID\"></div>."}))
+                "usage": "Paste the snippet in the site's <head> or footer on every page. Then call dumbmail.identify({email}) and dumbmail.track('Viewed Product', {...}, value). Embedded forms: <div data-dumbmail-form=\"FORM_ID\"></div>."}))
         }
         "search_profiles" => {
             let q = aud::ProfileQuery {
@@ -471,7 +471,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "list_forms" => {
             let rows: Vec<crate::models::FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(acct).fetch_all(&state.db).await?;
             let base = state.cfg.public_url();
-            Ok(json!({"forms": rows.iter().map(|f| json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-postlark-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
+            Ok(json!({"forms": rows.iter().map(|f| json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
         }
         "create_form" => {
             let status = a["status"].as_str().map(String::from);
@@ -481,7 +481,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 None => f,
             };
             let base = state.cfg.public_url();
-            Ok(json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-postlark-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }}))
+            Ok(json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }}))
         }
         "update_form" => {
             let id = uuid_arg(&a, "id")?;
@@ -551,7 +551,7 @@ fn prompt(name: &str, args: &Value) -> Option<Value> {
             "Goal: {}.\n1. get_account and fix anything blocking sending.\n2. campaign_performance (days 180) to learn what subject lines, timing and audiences worked.\n3. list_segments / preview_segment to pick the best audience; create a segment if needed.\n4. create_campaign with on-brand blocks and a strong subject + preheader; render_preview it.\n5. send_test to the user, summarize the plan (audience size, send time, content) and ask for approval before send_campaign with confirm=true.",
             args["goal"].as_str().unwrap_or("(ask the user)")
         ),
-        "audit_account" => "Audit this Postlark account: get_account (setup gaps), list_flows + get_flow_report (missing core flows, weak steps), get_analytics days=90 (revenue split, open/click/unsubscribe/bounce rates), campaign_performance (best and worst). Give the top 5 fixes ranked by expected revenue impact, each with the exact tool calls to make it.".to_string(),
+        "audit_account" => "Audit this DumbMail account: get_account (setup gaps), list_flows + get_flow_report (missing core flows, weak steps), get_analytics days=90 (revenue split, open/click/unsubscribe/bounce rates), campaign_performance (best and worst). Give the top 5 fixes ranked by expected revenue impact, each with the exact tool calls to make it.".to_string(),
         "build_core_flows" => format!(
             "Brand voice: {}. list_flow_blueprints, then for welcome_series, abandoned_checkout, post_purchase and winback: create_flow_from_blueprint, rewrite every email/SMS in the brand voice with update_flow, render_preview each step, and show the user a summary. Only set_flow_status live with confirm=true after they approve.",
             args["brand_voice"].as_str().unwrap_or("match the brand's website")

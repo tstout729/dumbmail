@@ -121,6 +121,10 @@ pub struct Config {
     /// Contact address shown on the About, Privacy and Terms pages.
     #[arg(long, env = "SUPPORT_EMAIL")]
     pub support_email: Option<String>,
+    /// Old hostnames (comma-separated) whose page visits are sent to PUBLIC_URL with a permanent
+    /// redirect. Webhooks, the API, MCP, tracking links and the website snippet keep working there.
+    #[arg(long, env = "REDIRECT_HOSTS", value_delimiter = ',')]
+    pub redirect_hosts: Vec<String>,
 }
 
 impl Config {

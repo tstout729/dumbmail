@@ -333,7 +333,7 @@ function InstallPanel({ form, kind, hosted }: { form: Form; kind: FormKind; host
             {kind === "embed" ? (
               <>
                 <p className="text-sm text-zinc-600">Put this where the form should appear. It renders there once the website snippet is installed.</p>
-                <CodeBlock code={`<div data-postlark-form="${form.id}"></div>`} label="HTML" />
+                <CodeBlock code={`<div data-dumbmail-form="${form.id}"></div>`} label="HTML" />
               </>
             ) : (
               <p className="text-sm text-zinc-600">

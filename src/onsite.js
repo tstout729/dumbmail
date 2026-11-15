@@ -1,9 +1,9 @@
-/* Postlark onsite script: tracking, identification and sign-up forms. Paste once in <head> or the footer. */
+/* DumbMail onsite script: tracking, identification and sign-up forms. Paste once in <head> or the footer. */
 (function () {
   "use strict";
   var BASE = __BASE__, KEY = __KEY__, ONLY_FORM = __FORM__;
-  if (window.__postlarkLoaded && !ONLY_FORM) return;
-  if (!ONLY_FORM) window.__postlarkLoaded = true;
+  if ((window.__dumbmailLoaded || window.__postlarkLoaded) && !ONLY_FORM) return;
+  if (!ONLY_FORM) window.__dumbmailLoaded = true;
 
   var store = {
     get: function (k, s) { try { return JSON.parse((s ? sessionStorage : localStorage).getItem(k)); } catch (e) { return null; } },
@@ -48,12 +48,12 @@
   } catch (e) {}
 
   if (!ONLY_FORM) {
-    // Run calls queued before the script loaded: window.postlark = window.postlark || []; postlark.push(["track", ...])
-    var queued = window.postlark;
-    window.postlark = api;
-    var q = (queued && (queued.q || (Array.isArray(queued) ? queued : null))) || window._postlarkq || [];
+    // Run calls queued before the script loaded: window.dumbmail = window.dumbmail || []; dumbmail.push(["track", ...]) (window.postlark still works)
+    var queued = window.dumbmail || window.postlark;
+    window.dumbmail = window.postlark = api;
+    var q = (queued && (queued.q || (Array.isArray(queued) ? queued : null))) || window._dumbmailq || window._postlarkq || [];
     for (var i = 0; i < q.length; i++) { var c = q[i]; if (c && api[c[0]]) api[c[0]].apply(api, Array.prototype.slice.call(c, 1)); }
-    window._postlarkq = { push: function (c) { if (c && api[c[0]]) api[c[0]].apply(api, Array.prototype.slice.call(c, 1)); } };
+    window._dumbmailq = window._postlarkq = { push: function (c) { if (c && api[c[0]]) api[c[0]].apply(api, Array.prototype.slice.call(c, 1)); } };
 
     post("/client/ping", { url: location.href });
     if (!store.get("pl_active", true)) { store.set("pl_active", 1, true); api.track("Active on Site", { url: location.href, title: document.title, referrer: document.referrer || null }); }
@@ -147,7 +147,7 @@
 
   function show(f, force) {
     if (f.kind === "embed") {
-      var slots = document.querySelectorAll('[data-postlark-form="' + f.id + '"]');
+      var slots = document.querySelectorAll('[data-dumbmail-form="' + f.id + '"], [data-postlark-form="' + f.id + '"]');
       if (!slots.length && ONLY_FORM && document.currentScript) slots = [document.currentScript.parentNode];
       for (var i = 0; i < slots.length; i++) { if (slots[i].getAttribute("data-pl-rendered")) continue; slots[i].setAttribute("data-pl-rendered", "1"); slots[i].appendChild(render(f).wrap); view(f); }
       return;

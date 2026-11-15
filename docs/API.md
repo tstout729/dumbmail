@@ -1,4 +1,4 @@
-# Postlark HTTP API (v0.1 contract)
+# DumbMail HTTP API (v0.1 contract)
 
 All JSON. Base path `/api`. IDs are UUID strings. Times are RFC 3339 UTC strings; the UI shows them in the account time zone (default `America/Los_Angeles`).
 
@@ -258,8 +258,8 @@ Sending with an empty balance fails with error code `limit_reached` (HTTP 402) a
 ### Phone numbers and SMS
 
 There are two ways to send texts:
-- **platform**: claim a number through Postlark. Toll-free numbers can send once carriers approve a toll-free verification, which is free and usually takes 1–5 business days. Texts are billed per segment.
-- **byo**: connect your own Telnyx or Twilio account and number. Postlark adds no fees; you pay your provider directly.
+- **platform**: claim a number through DumbMail. Toll-free numbers can send once carriers approve a toll-free verification, which is free and usually takes 1–5 business days. Texts are billed per segment.
+- **byo**: connect your own Telnyx or Twilio account and number. DumbMail adds no fees; you pay your provider directly.
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
@@ -343,8 +343,8 @@ The script:
 - tracks "Active on Site" once per visit;
 - identifies people who arrive from a tracked email or SMS link;
 - shows live popup and flyout forms using each form's targeting rules;
-- renders embedded forms in any `<div data-postlark-form="FORM_ID"></div>`;
-- exposes `postlark.identify({email})` and `postlark.track(metric, properties, value)`. Calls queued before the script loads are kept.
+- renders embedded forms in any `<div data-dumbmail-form="FORM_ID"></div>`;
+- exposes `dumbmail.identify({email})` and `dumbmail.track(metric, properties, value)`. Calls queued before the script loads are kept.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |

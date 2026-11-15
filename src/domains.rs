@@ -80,11 +80,17 @@ pub fn mail_from_for(domain: &str) -> String {
 /// by every account that adds the same domain, so its "verified" status alone proves nothing).
 pub fn ownership_token(state: &AppState, account_id: Uuid, domain: &str) -> String {
     let sig = crate::auth::sign(&state.cfg.secret_key, &format!("own:{account_id}:{domain}"));
-    format!("postlark-verify={}", sig.rsplit_once('.').map(|(_, s)| s).unwrap_or_default())
+    format!("dumbmail-verify={}", sig.rsplit_once('.').map(|(_, s)| s).unwrap_or_default())
+}
+
+/// Domains verified before the rename used a `_postlark` record; it still proves ownership.
+async fn legacy_ownership(state: &AppState, account_id: Uuid, domain: &str) -> bool {
+    let want = ownership_token(state, account_id, domain).replacen("dumbmail-verify=", "postlark-verify=", 1);
+    lookup(state, &format!("_postlark.{domain}"), "TXT").await.iter().any(|f| f.eq_ignore_ascii_case(&want))
 }
 
 fn sending_records(state: &AppState, account_id: Uuid, domain: &str, provider_records: &[crate::providers::DnsRecord]) -> Vec<Value> {
-    let mut out: Vec<Value> = vec![rec("TXT", &format!("_postlark.{domain}"), &ownership_token(state, account_id, domain), "verification", None)];
+    let mut out: Vec<Value> = vec![rec("TXT", &format!("_dumbmail.{domain}"), &ownership_token(state, account_id, domain), "verification", None)];
     out.extend(provider_records
         .iter()
         .filter(|r| r.kind == "CNAME")
@@ -150,7 +156,7 @@ pub async fn verify_sending_domain(state: &AppState, account_id: Uuid) -> AppRes
     let st = state.email.domain_state(&domain).await.map_err(|e| AppError::bad(format!("could not check the domain: {e:#}")))?;
     let mut records = sending_records(state, account_id, &domain, &st.records);
     annotate(state, &mut records).await;
-    let owns = records.iter().any(|r| r["purpose"] == "verification" && r["status"] == "verified");
+    let owns = records.iter().any(|r| r["purpose"] == "verification" && r["status"] == "verified") || legacy_ownership(state, account_id, &domain).await;
     let dkim_ok = {
         let dkim: Vec<&Value> = records.iter().filter(|r| r["purpose"] == "dkim").collect();
         !dkim.is_empty() && dkim.iter().all(|r| r["status"] == "verified")

@@ -1,6 +1,6 @@
-# Postlark web UI
+# DumbMail web UI
 
-The Postlark web app: Vite, React 19, TypeScript (strict), React Router 7, TanStack Query, Tailwind CSS 4, lucide-react and Recharts. It talks to the Rust backend through the HTTP API in [`../docs/API.md`](../docs/API.md).
+The DumbMail web app: Vite, React 19, TypeScript (strict), React Router 7, TanStack Query, Tailwind CSS 4, lucide-react and Recharts. It talks to the Rust backend through the HTTP API in [`../docs/API.md`](../docs/API.md).
 
 ## Develop
 

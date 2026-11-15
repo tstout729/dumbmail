@@ -285,7 +285,7 @@ pub async fn submit_verification(state: &AppState, account_id: Uuid, id: Uuid, v
         .await?
         .ok_or_else(|| AppError::not_found("phone number"))?;
     if row.kind != "toll_free" || row.source != "purchased" {
-        return Err(AppError::bad("only toll-free numbers claimed through Postlark need this verification"));
+        return Err(AppError::bad("only toll-free numbers claimed through DumbMail need this verification"));
     }
     for (name, val) in [("business name", &v.business_name), ("website", &v.website), ("address", &v.address1), ("city", &v.city), ("state", &v.state), ("ZIP", &v.zip),
         ("contact name", &v.contact_first_name), ("contact email", &v.contact_email), ("contact phone", &v.contact_phone), ("use case summary", &v.use_case_summary),
@@ -311,7 +311,7 @@ pub async fn submit_verification(state: &AppState, account_id: Uuid, id: Uuid, v
                 "useCase": v.use_case, "useCaseSummary": v.use_case_summary, "productionMessageContent": v.sample_message,
                 "optInWorkflow": v.opt_in_description, "optInWorkflowImageURLs": [{"url": v.opt_in_image_url}],
                 "additionalInformation": "Marketing messages to customers who opted in through the business's own website sign-up form.",
-                "isvReseller": "Postlark",
+                "isvReseller": "DumbMail",
             });
             let res = telnyx(state, key, reqwest::Method::POST, "messaging_tollfree/verification/requests", Some(body)).await?;
             res["id"].as_str().or(res["data"]["id"].as_str()).map(String::from)

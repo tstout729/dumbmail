@@ -123,13 +123,13 @@ function StatusBanner({ sms, purchased }: { sms: SmsSetup; purchased: PhoneNumbe
   return (
     <Notice tone="amber" icon={<Phone />} title="You can't send texts yet">
       {sms.platform_available
-        ? "Get a number from Postlark below, or connect your own Telnyx or Twilio account."
+        ? "Get a number from DumbMail below, or connect your own Telnyx or Twilio account."
         : "Connect your own Telnyx or Twilio account below to send texts."}
     </Notice>
   );
 }
 
-// ---- Numbers from Postlark ----
+// ---- Numbers from DumbMail ----
 
 function PlatformCard({ sms, purchased }: { sms: SmsSetup; purchased: PhoneNumber[] }) {
   const { account, user } = useSession();
@@ -139,7 +139,7 @@ function PlatformCard({ sms, purchased }: { sms: SmsSetup; purchased: PhoneNumbe
   const [releasing, setReleasing] = useState<PhoneNumber | null>(null);
 
   return (
-    <Card title="Get a number from Postlark">
+    <Card title="Get a number from DumbMail">
       <div className="space-y-4">
         {purchased.length > 0 ? (
           <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200">
@@ -174,7 +174,7 @@ function PlatformCard({ sms, purchased }: { sms: SmsSetup; purchased: PhoneNumbe
           </ul>
         ) : null}
         {sms.mode === "byo" ? (
-          <p className="text-sm text-zinc-500">You're sending through your own provider. Disconnect it below to send from a Postlark number.</p>
+          <p className="text-sm text-zinc-500">You're sending through your own provider. Disconnect it below to send from a DumbMail number.</p>
         ) : sms.platform_available ? (
           <NumberSearch hasNumbers={purchased.length > 0} onClaimed={(n) => (n.status === "needs_verification" ? setVerifying(n) : undefined)} />
         ) : null}
@@ -346,7 +346,7 @@ function ByoCard({ sms, connected }: { sms: SmsSetup; connected: PhoneNumber | n
           {confirm ? (
             <ConfirmDialog
               title={`Disconnect ${provider ? providerLabels[provider] : "your provider"}?`}
-              body="Postlark deletes the saved credentials and stops sending through your account. Texts go back to your Postlark number, if you have one."
+              body="DumbMail deletes the saved credentials and stops sending through your account. Texts go back to your DumbMail number, if you have one."
               confirmLabel="Disconnect"
               danger
               loading={disconnect.isPending}
@@ -388,7 +388,7 @@ function ConnectForm() {
   return (
     <form onSubmit={onSubmit} className="space-y-4">
       <p className="text-sm text-zinc-600">
-        Already have an account and number? Postlark sends through it and adds no fees; you pay your provider directly. Credentials are checked
+        Already have an account and number? DumbMail sends through it and adds no fees; you pay your provider directly. Credentials are checked
         with the provider before they're saved, and stored encrypted.
       </p>
       <Segmented

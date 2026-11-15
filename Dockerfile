@@ -22,11 +22,11 @@ RUN cargo build --release --locked
 # 3. Runtime: one small binary
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 postlark
-COPY --from=server /app/target/release/postlark /usr/local/bin/postlark
-USER postlark
+    && useradd --system --uid 10001 dumbmail
+COPY --from=server /app/target/release/dumbmail /usr/local/bin/dumbmail
+USER dumbmail
 ENV BIND=0.0.0.0:8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
-ENTRYPOINT ["postlark"]
+ENTRYPOINT ["dumbmail"]
 CMD ["serve"]

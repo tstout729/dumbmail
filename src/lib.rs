@@ -1,4 +1,4 @@
-//! Postlark: open-source email and SMS marketing (campaigns, flows, segments, forms, analytics, MCP).
+//! DumbMail: open-source email and SMS marketing (campaigns, flows, segments, forms, analytics, MCP).
 #![allow(clippy::collapsible_if, clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod api;
@@ -34,6 +34,31 @@ pub use state::AppState;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Paths that must keep answering on an old hostname: provider webhooks, API clients, MCP clients,
+/// links in emails already sent, the website snippet and Google's site verification file.
+fn stays_on_old_host(path: &str) -> bool {
+    if path.starts_with("/api/auth/google") {
+        return false;
+    }
+    ["/api/", "/webhooks/", "/mcp", "/healthz", "/t/", "/o/", "/u/", "/f/", "/client/", "/onsite.js", "/google"].iter().any(|p| path.starts_with(p))
+}
+
+/// Visits to a retired hostname (REDIRECT_HOSTS) move permanently to PUBLIC_URL.
+async fn legacy_host_redirect(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
+    let page_visit = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if page_visit && !host.is_empty() && state.cfg.redirect_hosts.iter().any(|h| h.trim().eq_ignore_ascii_case(&host)) && !stays_on_old_host(req.uri().path()) {
+        let target = format!("{}{}", state.cfg.public_url(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        return axum::response::Redirect::permanent(&target).into_response();
+    }
+    next.run(req).await
+}
+
 /// Requests arriving on a customer's branded link domain may only reach public pages
 /// (tracking, unsubscribe, forms, the onsite script). Everything else goes to the main app.
 async fn link_domain_guard(
@@ -68,6 +93,7 @@ pub fn app(state: AppState) -> Router {
         .merge(site::routes())
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), legacy_host_redirect))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())

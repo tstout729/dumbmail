@@ -55,7 +55,7 @@ fn safe_next(next: Option<&str>) -> String {
     if !n.starts_with('/') || n.starts_with("//") || n.len() >= 500 || n.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
         return "/".into();
     }
-    let base = url::Url::parse("https://postlark.invalid/").expect("static url");
+    let base = url::Url::parse("https://dumbmail.invalid/").expect("static url");
     match base.join(n) {
         Ok(u) if u.origin() == base.origin() => match u.query() {
             Some(q) => format!("{}?{q}", u.path()),
@@ -201,7 +201,7 @@ const FREE_MAIL: [&str; 16] = [
     "proton.me", "protonmail.com", "gmx.com", "mail.com",
 ];
 
-/// Find or create the Postlark user for a Google sign-in. Returns (user, account, created).
+/// Find or create the DumbMail user for a Google sign-in. Returns (user, account, created).
 pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid, Uuid, bool)> {
     let first_account = |uid: Uuid| async move {
         sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM memberships WHERE user_id = $1 ORDER BY created_at LIMIT 1").bind(uid).fetch_one(&state.db).await
@@ -229,7 +229,7 @@ pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid,
         return Ok((uid, first_account(uid).await?, false));
     }
     if !state.cfg.allow_signup {
-        return Err(AppError::Forbidden("no Postlark account uses this Google address, and sign-ups are off on this server".into()));
+        return Err(AppError::Forbidden("no DumbMail account uses this Google address, and sign-ups are off on this server".into()));
     }
     let domain = c.email.rsplit('@').next().unwrap_or_default().to_string();
     let (company, website) = if FREE_MAIL.contains(&domain.as_str()) {

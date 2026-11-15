@@ -218,20 +218,20 @@ function GuidesCard({ snippet }: { snippet: string }) {
 }
 
 const queueStub = `<script>
-  // Lets you call postlark before the snippet has loaded; queued calls run once it does.
-  window.postlark = window.postlark || { q: [] };
+  // Lets you call dumbmail before the snippet has loaded; queued calls run once it does.
+  window.dumbmail = window.dumbmail || { q: [] };
   ["identify", "track"].forEach(function (m) {
-    window.postlark[m] = window.postlark[m] || function () {
-      window.postlark.q.push([m].concat([].slice.call(arguments)));
+    window.dumbmail[m] = window.dumbmail[m] || function () {
+      window.dumbmail.q.push([m].concat([].slice.call(arguments)));
     };
   });
 </script>`;
 
 const eventsExample = `// When someone logs in, checks out or gives you their email
-postlark.identify({ email: "jane@example.com" });
+dumbmail.identify({ email: "jane@example.com" });
 
 // On a product page: metric, properties, value
-postlark.track("Viewed Product", {
+dumbmail.track("Viewed Product", {
   name: "Ceramic Mug",
   price: 18,
   url: "https://yourstore.com/products/ceramic-mug",
@@ -242,9 +242,9 @@ function EventsCard() {
   return (
     <Card title="Track events from your site">
       <p className="mb-3 text-sm text-zinc-600">
-        The snippet tracks {c("Active on Site")} on its own. Call {c("postlark.track")} for anything else, like {c("Viewed Product")} for
+        The snippet tracks {c("Active on Site")} on its own. Call {c("dumbmail.track")} for anything else, like {c("Viewed Product")} for
         browse-abandonment flows. Events are recorded for people the browser knows: anyone who signed up through a form, arrived from a tracked
-        email or text, or was passed to {c("postlark.identify")}.
+        email or text, or was passed to {c("dumbmail.identify")}.
       </p>
       <CodeBlock code={eventsExample} label="JavaScript" />
       <p className="mb-2 mt-4 text-xs text-zinc-500">Calling it from code that may run before the snippet loads? Add this first:</p>
@@ -288,7 +288,7 @@ function EmbedCard() {
           and its ID fills in here.
         </p>
       )}
-      <CodeBlock code={`<div data-postlark-form="${formId}"></div>`} label="HTML" />
+      <CodeBlock code={`<div data-dumbmail-form="${formId}"></div>`} label="HTML" />
     </Card>
   );
 }

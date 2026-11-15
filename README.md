@@ -1,10 +1,10 @@
-# Postlark
+# DumbMail
 
 Open-source email and SMS marketing: campaigns, automated flows, live segments, sign-up forms, revenue attribution and a full MCP server, in one Rust binary with Postgres.
 
 It covers the core of what Klaviyo does at a fraction of the cost. Self-host it for free, or use the hosted service and pay only for what you send. There's no monthly plan and no per-contact fee:
 
-| | Hosted Postlark | Klaviyo |
+| | Hosted DumbMail | Klaviyo |
 | --- | --- | --- |
 | Email | $0.40 per 1,000 (first 1,000 a month free) | $150/mo for 10,000 contacts, $720/mo for 50,000 |
 | SMS (US, carrier fees included) | $0.012 per segment | about $0.011–0.015 per message, plus carrier fees |
@@ -45,21 +45,21 @@ Without Docker you need Rust 1.85+, Node 22+, pnpm and Postgres 15+:
 
 ```bash
 pnpm -C web install && pnpm -C web build        # dashboard (embedded into the binary)
-DATABASE_URL=postgres://localhost/postlark cargo run --release -- serve
+DATABASE_URL=postgres://localhost/dumbmail cargo run --release -- serve
 ```
 
 `EMAIL_PROVIDER=log` and `SMS_PROVIDER=log` print messages instead of sending them, so you can try everything safely.
 
 ### Amazon SES
 
-1. In SES, verify your domain from **Settings → Sending** in Postlark. It creates the identity and shows the DKIM CNAME records to add.
+1. In SES, verify your domain from **Settings → Sending** in DumbMail. It creates the identity and shows the DKIM CNAME records to add.
 2. Ask AWS to move the account out of the SES sandbox.
-3. Create a configuration set with an event destination for Bounce, Complaint and Delivery that publishes to an SNS topic. Subscribe `https://YOUR_HOST/webhooks/ses/WEBHOOK_SECRET` over HTTPS (Postlark confirms the subscription automatically).
+3. Create a configuration set with an event destination for Bounce, Complaint and Delivery that publishes to an SNS topic. Subscribe `https://YOUR_HOST/webhooks/ses/WEBHOOK_SECRET` over HTTPS (DumbMail confirms the subscription automatically).
 4. Set `EMAIL_PROVIDER=ses`, `SES_CONFIGURATION_SET`, `AWS_REGION` and credentials (or use an instance role). The IAM user needs `ses:SendRawEmail`, `ses:CreateEmailIdentity`, `ses:GetEmailIdentity`, `ses:DeleteEmailIdentity` and `ses:PutEmailIdentityMailFromAttributes`.
 
 ### Hosted billing (Stripe)
 
-Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stripe webhook at `https://YOUR_HOST/webhooks/stripe` with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `payment_intent.succeeded`. Prices are set with `PRICE_EMAIL_PER_1000`, `PRICE_SMS_SEGMENT`, `PRICE_MMS`, `PRICE_NUMBER_MONTHLY` and `FREE_EMAILS_PER_MONTH`. Operators can adjust a balance with `postlark admin-credit --email owner@brand.com --amount 25`.
+Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stripe webhook at `https://YOUR_HOST/webhooks/stripe` with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `payment_intent.succeeded`. Prices are set with `PRICE_EMAIL_PER_1000`, `PRICE_SMS_SEGMENT`, `PRICE_MMS`, `PRICE_NUMBER_MONTHLY` and `FREE_EMAILS_PER_MONTH`. Operators can adjust a balance with `dumbmail admin-credit --email owner@brand.com --amount 25`.
 
 ### Branded link domains
 
@@ -75,7 +75,7 @@ Create an API key in **Settings → Developers**, then:
 
 ```bash
 # Claude Code
-claude mcp add --transport http postlark https://YOUR_HOST/mcp --header "Authorization: Bearer pl_sk_..."
+claude mcp add --transport http dumbmail https://YOUR_HOST/mcp --header "Authorization: Bearer pl_sk_..."
 ```
 
 For clients that only speak stdio (Claude Desktop, older Cursor builds):
@@ -83,10 +83,10 @@ For clients that only speak stdio (Claude Desktop, older Cursor builds):
 ```json
 {
   "mcpServers": {
-    "postlark": {
-      "command": "postlark",
+    "dumbmail": {
+      "command": "dumbmail",
       "args": ["mcp-stdio", "--url", "https://YOUR_HOST"],
-      "env": { "POSTLARK_API_KEY": "pl_sk_..." }
+      "env": { "DUMBMAIL_API_KEY": "pl_sk_..." }
     }
   }
 }
@@ -104,7 +104,7 @@ curl https://YOUR_HOST/api/events -H "Authorization: Bearer pl_sk_..." -H "conte
        "properties": {"items": ["Wool scarf"]}}'
 ```
 
-Website: `<script async src="https://YOUR_HOST/onsite.js?k=PUBLIC_KEY"></script>` in the header or footer. Then use `postlark.identify({email})` and `postlark.track("Viewed Product", {...}, value)`. Embed a form with `<div data-postlark-form="FORM_ID"></div>`.
+Website: `<script async src="https://YOUR_HOST/onsite.js?k=PUBLIC_KEY"></script>` in the header or footer. Then use `dumbmail.identify({email})` and `dumbmail.track("Viewed Product", {...}, value)`. Embed a form with `<div data-dumbmail-form="FORM_ID"></div>`.
 
 ## Development
 

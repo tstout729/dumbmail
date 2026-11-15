@@ -11,10 +11,10 @@ const proxied = ["api", "client", "t", "u", "f", "mcp", "webhooks", "healthz", "
 // The repo tracks dist/.placeholder.html so the Rust embed compiles before the UI is built;
 // emptyOutDir wipes it, so write it back after each build.
 const placeholder =
-  '<!doctype html><title>Postlark</title><p>UI not built. Run <code>pnpm -C web build</code>.</p>\n';
+  '<!doctype html><title>DumbMail</title><p>UI not built. Run <code>pnpm -C web build</code>.</p>\n';
 function keepPlaceholder(): Plugin {
   return {
-    name: "postlark-keep-placeholder",
+    name: "dumbmail-keep-placeholder",
     apply: "build",
     closeBundle() {
       writeFileSync(resolve(import.meta.dirname, "dist/.placeholder.html"), placeholder);

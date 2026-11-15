@@ -560,11 +560,11 @@ async fn check_website(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
     let raw = if b.url.starts_with("http") { b.url.trim().to_string() } else { format!("https://{}", b.url.trim()) };
     let html = crate::flows::fetch_public_page(&raw).await?;
     let found = html.contains(&format!("k={pk}"));
-    let other = !found && (html.contains("/onsite.js?k=") || html.contains("/client/postlark.js?k="));
+    let other = !found && (html.contains("/onsite.js?k=") || html.contains("/client/dumbmail.js?k=") || html.contains("/client/postlark.js?k="));
     let message = if found {
         "Found your snippet on that page.".to_string()
     } else if other {
-        "Found a Postlark snippet, but with a different key. Copy the snippet from this page again.".to_string()
+        "Found a DumbMail snippet, but with a different key. Copy the snippet from this page again.".to_string()
     } else {
         "Couldn't find the snippet in that page's HTML. If you just added it, publish your site and try again. Tag managers (like GTM) load it later, so we'll show Installed once a visitor's browser runs it.".to_string()
     };

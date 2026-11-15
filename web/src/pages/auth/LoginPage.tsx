@@ -53,7 +53,7 @@ export function LoginPage() {
       subtitle="Welcome back."
       footer={
         <>
-          New to Postlark?{" "}
+          New to DumbMail?{" "}
           <Link to="/signup" className="font-medium text-accent-700 hover:underline">
             Create an account
           </Link>

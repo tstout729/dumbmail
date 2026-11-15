@@ -75,7 +75,7 @@ footer a {{ color:var(--muted); margin-right:16px; }}
 </head>
 <body>
 <header>
-<a class="mark" href="/about"><svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#0f5132"/><path d="M8 21c4-1 7-4 9-9l7-3-3 7c-5 2-8 5-9 9z" fill="#fff"/></svg>Postlark</a>
+<a class="mark" href="/about"><svg aria-hidden="true" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#115f42"/><rect x="5.5" y="8.5" width="21" height="15" rx="2.5" fill="#fff"/><path d="M6.6 9.8 16 16.2l9.4-6.4" fill="none" stroke="#115f42" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="19.6" r="2.3" fill="#115f42"/><circle cx="20.2" cy="19.6" r="2.3" fill="#115f42"/><circle cx="12.9" cy="20.3" r="0.9" fill="#fff"/><circle cx="19.4" cy="18.8" r="0.9" fill="#fff"/></svg>DumbMail</a>
 <nav><a href="/login">Log in</a><a href="/signup">Sign up</a></nav>
 </header>
 <main>
@@ -91,7 +91,7 @@ fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -110,10 +110,10 @@ async fn about(State(state): State<AppState>) -> Html<String> {
     let c = &state.cfg;
     let free = if c.free_emails_per_month > 0 { format!("<p>The first {} emails each month are free.</p>", thousands(c.free_emails_per_month)) } else { String::new() };
     page(
-        "Postlark: email and text marketing you pay for as you go",
+        "DumbMail: email and text marketing you pay for as you go",
         &format!(
             r#"<h1>Email and text marketing, without the monthly plan.</h1>
-<p>Postlark sends your store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow your list; flows follow up on browsing, carts and orders. You pay only for what you send.</p>
+<p>DumbMail sends your store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow your list; flows follow up on browsing, carts and orders. You pay only for what you send.</p>
 <p><a class="cta" href="/signup">Create an account</a><a class="cta secondary" href="/login">Log in</a></p>
 <h2>What it does</h2>
 <ul>
@@ -134,7 +134,7 @@ async fn about(State(state): State<AppState>) -> Html<String> {
 {free}
 <p class="muted">Add credit with a card and it's used as you send. No subscription.</p>
 <h2>Open source</h2>
-<p>Postlark is open source under the AGPL-3.0 license, so you can also run it yourself.</p>
+<p>DumbMail is open source under the AGPL-3.0 license, so you can also run it yourself.</p>
 <h2>Contact</h2>
 <p>Questions: {contact}.</p>"#,
             email = money(c.price_email_per_1000),
@@ -148,11 +148,11 @@ async fn about(State(state): State<AppState>) -> Html<String> {
 
 async fn privacy(State(state): State<AppState>) -> Html<String> {
     page(
-        "Privacy Policy · Postlark",
+        "Privacy Policy · DumbMail",
         &format!(
             r#"<h1>Privacy Policy</h1>
 <p class="muted">Last updated {UPDATED}</p>
-<p>This policy explains what information Postlark collects, how we use it and the choices you have. "Postlark", "we" and "us" mean the operator of this service. "You" means a person who has a Postlark account. "Subscribers" means the people our customers send email and text messages to.</p>
+<p>This policy explains what information DumbMail collects, how we use it and the choices you have. "DumbMail", "we" and "us" mean the operator of this service. "You" means a person who has a DumbMail account. "Subscribers" means the people our customers send email and text messages to.</p>
 
 <h2>Information we collect from account holders</h2>
 <ul>
@@ -167,7 +167,7 @@ async fn privacy(State(state): State<AppState>) -> Html<String> {
 <p>Customers upload or collect subscriber details such as email addresses, phone numbers, names, consent records, and activity like opens, clicks, page views and orders. Our customers decide what they collect and why. We process that data on their behalf and only to provide the service to them. If you're a subscriber, contact the business that messaged you first; you can also unsubscribe with the link in any email or by replying STOP to any text.</p>
 
 <h2>Website snippet</h2>
-<p>Customers can add Postlark's snippet to their own websites. It shows sign-up forms and records page views and events for that customer. It stores a visitor identifier in the browser's local storage on the customer's site. It doesn't track people across different websites.</p>
+<p>Customers can add DumbMail's snippet to their own websites. It shows sign-up forms and records page views and events for that customer. It stores a visitor identifier in the browser's local storage on the customer's site. It doesn't track people across different websites.</p>
 
 <h2>How we use information</h2>
 <ul>
@@ -178,10 +178,10 @@ async fn privacy(State(state): State<AppState>) -> Html<String> {
 <p>We don't sell personal information, and we don't use it for advertising.</p>
 
 <h2>Google user data</h2>
-<p>Postlark's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements. We request only the basic sign-in scopes (openid, email and profile). That data is used only to sign you in and set up your account. It isn't sold, used for advertising, shared with third parties except as needed to run the service or required by law, or used to train AI models.</p>
+<p>DumbMail's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements. We request only the basic sign-in scopes (openid, email and profile). That data is used only to sign you in and set up your account. It isn't sold, used for advertising, shared with third parties except as needed to run the service or required by law, or used to train AI models.</p>
 
 <h2>Service providers</h2>
-<p>We share information with providers only as needed to run Postlark:</p>
+<p>We share information with providers only as needed to run DumbMail:</p>
 <ul>
 <li>Railway: hosting and database.</li>
 <li>Amazon Web Services (Amazon SES): email delivery.</li>
@@ -201,7 +201,7 @@ async fn privacy(State(state): State<AppState>) -> Html<String> {
 <p>Data is encrypted in transit, passwords are hashed, and provider credentials are encrypted at rest. No system is perfectly secure, but we work to protect your information and will tell you about a breach that affects you as the law requires.</p>
 
 <h2>Children</h2>
-<p>Postlark is a business service and isn't meant for anyone under 16.</p>
+<p>DumbMail is a business service and isn't meant for anyone under 16.</p>
 
 <h2>Changes</h2>
 <p>If we change this policy, we'll update the date above and, for significant changes, let account holders know by email.</p>
@@ -215,11 +215,11 @@ async fn privacy(State(state): State<AppState>) -> Html<String> {
 
 async fn terms(State(state): State<AppState>) -> Html<String> {
     page(
-        "Terms of Service · Postlark",
+        "Terms of Service · DumbMail",
         &format!(
             r#"<h1>Terms of Service</h1>
 <p class="muted">Last updated {UPDATED}</p>
-<p>These terms apply when you create a Postlark account or use the hosted service. By using it, you agree to them. If you use Postlark for a business, you agree on that business's behalf.</p>
+<p>These terms apply when you create a DumbMail account or use the hosted service. By using it, you agree to them. If you use DumbMail for a business, you agree on that business's behalf.</p>
 
 <h2>Your account</h2>
 <p>Give accurate information and keep your password, API keys and sign-in secure. You're responsible for activity on your account, including by people and tools you give access to.</p>
@@ -228,7 +228,7 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 <p>You may only message people who have agreed to hear from you, and you must follow the laws that apply to your messages, including CAN-SPAM, the TCPA, CASL and GDPR where relevant. In particular:</p>
 <ul>
 <li>Don't send spam or use purchased, rented or scraped lists.</li>
-<li>Honor unsubscribes and STOP replies. Postlark adds unsubscribe links and handles STOP for you; don't remove or work around them.</li>
+<li>Honor unsubscribes and STOP replies. DumbMail adds unsubscribe links and handles STOP for you; don't remove or work around them.</li>
 <li>Include your real business name and mailing address in marketing email.</li>
 <li>Get express written consent before sending marketing texts, and respect quiet hours.</li>
 <li>Don't send illegal, deceptive, harassing or harmful content, phishing or malware.</li>
@@ -242,13 +242,13 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 <p>You own your content and subscriber data. You give us permission to store and process it only to provide the service. You're responsible for having the rights and consents needed to upload and message it.</p>
 
 <h2>Open source</h2>
-<p>Postlark's code is available under the AGPL-3.0 license. These terms cover the hosted service; the license covers the code.</p>
+<p>DumbMail's code is available under the AGPL-3.0 license. These terms cover the hosted service; the license covers the code.</p>
 
 <h2>Availability and changes</h2>
-<p>We work to keep Postlark running, but it may sometimes be unavailable. We may change or discontinue features. If we shut down the hosted service, we'll give at least 30 days' notice so you can export your data.</p>
+<p>We work to keep DumbMail running, but it may sometimes be unavailable. We may change or discontinue features. If we shut down the hosted service, we'll give at least 30 days' notice so you can export your data.</p>
 
 <h2>Ending your account</h2>
-<p>You can stop using Postlark at any time and ask us to close your account. We may suspend or close accounts that break these terms.</p>
+<p>You can stop using DumbMail at any time and ask us to close your account. We may suspend or close accounts that break these terms.</p>
 
 <h2>Disclaimers and limits</h2>
 <p>The service is provided "as is", without warranties of any kind, to the extent the law allows. We aren't liable for indirect or consequential losses, lost profits or lost data. Our total liability for any claim is limited to the amount you paid us in the 12 months before the claim.</p>
@@ -260,7 +260,7 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 <p>These terms are governed by the laws of the State of Oregon, USA.</p>
 
 <h2>Changes to these terms</h2>
-<p>We may update these terms. For significant changes, we'll email account holders before they take effect. Continuing to use Postlark after that means you accept the new terms.</p>
+<p>We may update these terms. For significant changes, we'll email account holders before they take effect. Continuing to use DumbMail after that means you accept the new terms.</p>
 
 <h2>Contact</h2>
 <p>Questions: {contact}.</p>"#,

@@ -1304,6 +1304,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "dumbmail"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sesv2",
+ "axum",
+ "axum-extra",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "csv",
+ "hex",
+ "hmac 0.12.1",
+ "http-body-util",
+ "image",
+ "mime_guess",
+ "minijinja",
+ "once_cell",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "rust-embed",
+ "rust_decimal",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2687,51 +2732,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
-]
-
-[[package]]
-name = "postlark"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "argon2",
- "async-trait",
- "aws-config",
- "aws-sdk-sesv2",
- "axum",
- "axum-extra",
- "base64 0.22.1",
- "chrono",
- "chrono-tz",
- "clap",
- "csv",
- "hex",
- "hmac 0.12.1",
- "http-body-util",
- "image",
- "mime_guess",
- "minijinja",
- "once_cell",
- "rand 0.8.8",
- "regex",
- "reqwest",
- "rust-embed",
- "rust_decimal",
- "scraper",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "thiserror",
- "time",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

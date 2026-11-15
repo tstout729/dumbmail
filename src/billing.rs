@@ -312,7 +312,7 @@ pub async fn checkout(state: &AppState, account_id: Uuid, amount_usd: f64) -> Ap
         ("line_items[0][quantity]".into(), "1".into()),
         ("line_items[0][price_data][currency]".into(), "usd".into()),
         ("line_items[0][price_data][unit_amount]".into(), cents.to_string()),
-        ("line_items[0][price_data][product_data][name]".into(), "Postlark credit".into()),
+        ("line_items[0][price_data][product_data][name]".into(), "DumbMail credit".into()),
         ("line_items[0][price_data][product_data][description]".into(), "Prepaid credit for emails and texts".into()),
         ("payment_intent_data[setup_future_usage]".into(), "off_session".into()),
         ("payment_intent_data[metadata][account_id]".into(), account_id.to_string()),
@@ -428,7 +428,7 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
             ("payment_method".into(), pm),
             ("off_session".into(), "true".into()),
             ("confirm".into(), "true".into()),
-            ("description".into(), "Postlark auto-recharge".into()),
+            ("description".into(), "DumbMail auto-recharge".into()),
             ("metadata[account_id]".into(), account_id.to_string()),
             ("metadata[kind]".into(), "auto_recharge".into()),
         ];

@@ -11,7 +11,7 @@ use crate::state::AppState;
 #[folder = "web/dist/"]
 struct Assets;
 
-const NOT_BUILT: &str = "<!doctype html><meta charset=utf-8><title>Postlark</title><body style=\"font-family:system-ui;padding:40px\"><h1>Postlark API is running</h1><p>The dashboard isn't built into this binary. Run <code>pnpm -C web install &amp;&amp; pnpm -C web build</code>, then rebuild.</p>";
+const NOT_BUILT: &str = "<!doctype html><meta charset=utf-8><title>DumbMail</title><body style=\"font-family:system-ui;padding:40px\"><h1>DumbMail API is running</h1><p>The dashboard isn't built into this binary. Run <code>pnpm -C web install &amp;&amp; pnpm -C web build</code>, then rebuild.</p>";
 
 pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
     if let Some(r) = crate::site::site_verification(&state, &uri) {
