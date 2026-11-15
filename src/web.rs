@@ -1,8 +1,11 @@
 //! The React dashboard, compiled into the binary from web/dist.
 
+use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use rust_embed::Embed;
+
+use crate::state::AppState;
 
 #[derive(Embed)]
 #[folder = "web/dist/"]
@@ -10,7 +13,10 @@ struct Assets;
 
 const NOT_BUILT: &str = "<!doctype html><meta charset=utf-8><title>Postlark</title><body style=\"font-family:system-ui;padding:40px\"><h1>Postlark API is running</h1><p>The dashboard isn't built into this binary. Run <code>pnpm -C web install &amp;&amp; pnpm -C web build</code>, then rebuild.</p>";
 
-pub async fn serve(uri: Uri) -> Response {
+pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
+    if let Some(r) = crate::site::site_verification(&state, &uri) {
+        return r;
+    }
     let path = uri.path().trim_start_matches('/');
     if path.starts_with("api/") {
         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": {"code": "not_found", "message": "no such endpoint"}}))).into_response();

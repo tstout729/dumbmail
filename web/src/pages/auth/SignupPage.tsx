@@ -50,6 +50,17 @@ export function SignupPage() {
         <Button type="submit" variant="primary" className="w-full" loading={signup.isPending}>
           Create account
         </Button>
+        <p className="text-center text-xs text-zinc-500">
+          By creating an account you agree to the{" "}
+          <a href="/terms" className="underline hover:text-zinc-700">
+            Terms
+          </a>{" "}
+          and{" "}
+          <a href="/privacy" className="underline hover:text-zinc-700">
+            Privacy Policy
+          </a>
+          .
+        </p>
       </form>
     </AuthLayout>
   );

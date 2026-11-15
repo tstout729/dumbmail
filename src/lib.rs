@@ -22,6 +22,7 @@ pub mod public;
 pub mod render;
 pub mod segments;
 pub mod sending;
+pub mod site;
 pub mod state;
 pub mod web;
 
@@ -64,6 +65,7 @@ pub fn app(state: AppState) -> Router {
         .merge(api::router())
         .merge(public::routes())
         .merge(mcp::routes())
+        .merge(site::routes())
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))

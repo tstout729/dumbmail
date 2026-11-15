@@ -64,6 +64,8 @@ impl Harness {
             admin_token: Some("test-admin-token-0123456789abcdef0123".into()),
             google_client_id: Some("test-client.apps.googleusercontent.com".into()),
             google_client_secret: Some("test-google-secret".into()),
+            google_site_verification: Some("google0123abcd.html".into()),
+            support_email: Some("help@pl.test".into()),
         };
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
@@ -781,5 +783,28 @@ async fn brand_import_and_google_sign_in() {
     let (_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap();
     let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(bob_acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((name.as_str(), website.as_deref()), ("stayportland.com", Some("https://stayportland.com")));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_pages_and_site_verification() {
+    let h = harness!();
+    for (path, needle) in [("/about", "$0.20 per 1,000"), ("/privacy", "Limited Use"), ("/terms", "CAN-SPAM")] {
+        let (s, headers, body) = h.raw("GET", path, &[], "").await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+        assert!(headers[axum::http::header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"), "{path}");
+        assert!(body.contains(needle), "{path} should mention {needle}");
+        if path == "/about" {
+            assert!(body.contains("first 25 emails each month are free"));
+        }
+        assert!(body.contains("mailto:help@pl.test"), "{path} shows the support address");
+        assert!(body.contains("href=\"/privacy\"") && body.contains("href=\"/terms\""), "{path} links the legal pages");
+    }
+    let (s, _, body) = h.raw("GET", "/google0123abcd.html", &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "google-site-verification: google0123abcd.html");
+    // Other google*.html paths fall through to the dashboard, not the verification file.
+    let (_, _, body) = h.raw("GET", "/google9999.html", &[], "").await;
+    assert!(!body.contains("google-site-verification"));
     h.cleanup().await;
 }

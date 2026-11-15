@@ -11,6 +11,18 @@ export function AuthLayout({ title, subtitle, children, footer }: { title: strin
         <div className="mt-5">{children}</div>
       </div>
       <div className="mt-5 text-sm text-zinc-500">{footer}</div>
+      {/* Server-rendered pages, so plain links (full page loads), not router links. */}
+      <nav className="mt-8 flex gap-4 text-xs text-zinc-400" aria-label="About Postlark">
+        <a href="/about" className="hover:text-zinc-600 hover:underline">
+          About
+        </a>
+        <a href="/privacy" className="hover:text-zinc-600 hover:underline">
+          Privacy
+        </a>
+        <a href="/terms" className="hover:text-zinc-600 hover:underline">
+          Terms
+        </a>
+      </nav>
     </div>
   );
 }

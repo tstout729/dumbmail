@@ -115,6 +115,12 @@ pub struct Config {
     pub google_client_id: Option<String>,
     #[arg(long, env = "GOOGLE_CLIENT_SECRET", hide_env_values = true)]
     pub google_client_secret: Option<String>,
+    /// Google Search Console HTML-file token (e.g. google0123abcd.html), served at /<token>.
+    #[arg(long, env = "GOOGLE_SITE_VERIFICATION")]
+    pub google_site_verification: Option<String>,
+    /// Contact address shown on the About, Privacy and Terms pages.
+    #[arg(long, env = "SUPPORT_EMAIL")]
+    pub support_email: Option<String>,
 }
 
 impl Config {
