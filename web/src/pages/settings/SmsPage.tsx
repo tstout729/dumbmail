@@ -403,7 +403,7 @@ function ConnectForm() {
         ]}
       />
       {/* key: the two providers' fields are different inputs, so switching clears them. */}
-      <div key={provider} className="grid gap-4 sm:grid-cols-2">
+      <div key={provider} className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {provider === "telnyx" ? (
           <>
             <Field label="API key" className="sm:col-span-2" hint="Telnyx portal → Account settings → Keys & credentials.">

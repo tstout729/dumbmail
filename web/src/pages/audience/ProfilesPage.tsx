@@ -109,7 +109,7 @@ function AddProfileDialog({ onClose }: { onClose: () => void }) {
   };
   return (
     <Modal title="Add profile" onClose={onClose} size="md">
-      <form onSubmit={onSubmit} className="grid gap-3 sm:grid-cols-2">
+      <form onSubmit={onSubmit} className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label="Email" className="sm:col-span-2">
           <Input name="email" type="email" autoFocus />
         </Field>

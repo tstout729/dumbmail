@@ -111,7 +111,7 @@ function SegmentEditor({ segment }: { segment: Segment | null }) {
           </>
         }
       />
-      <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
         <Card title="Definition">
           <ConditionBuilder
             value={definition}

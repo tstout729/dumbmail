@@ -581,6 +581,7 @@ async fn billing_numbers_onsite_and_domains() {
     assert!((before - (10.0 - 0.001 - 2.20)).abs() < 1e-6, "{before}");
     h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed", "list_ids": [list["id"]]}))).await;
     let sc = h.ok("POST", "/api/campaigns", Some(json!({"channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"body": "Flash sale today"}}))).await;
+    assert_eq!(sc["audience"]["exclude"], json!([]), "a partial audience comes back in full: {sc}");
     let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", sc["id"].as_str().unwrap()), None).await;
     assert!(s.is_success(), "{v}");
     h.drain().await;

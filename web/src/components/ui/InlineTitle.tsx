@@ -13,6 +13,7 @@ export function InlineTitle({ value, placeholder, ...rest }: InlineTitleProps) {
         {value || placeholder || " "}
       </span>
       <input
+        size={1}
         {...rest}
         value={value}
         placeholder={placeholder}

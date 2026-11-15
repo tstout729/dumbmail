@@ -38,7 +38,7 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
 
   return (
     <div className={cx("flex min-h-0 flex-col gap-4", className)}>
-      <fieldset disabled={readOnly} className="min-w-0 grid gap-3 md:grid-cols-2">
+      <fieldset disabled={readOnly} className="min-w-0 grid grid-cols-1 gap-3 md:grid-cols-2">
         <Field label="Subject line" className="md:col-span-1">
           <div className="flex items-center gap-1">
             <Input
@@ -69,7 +69,7 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
             Reply-to and theme
           </button>
           {showMore ? (
-            <div className="mt-3 grid gap-3 md:grid-cols-3">
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
               <Field label="Reply-to">
                 <Input type="email" value={value.reply_to ?? ""} onChange={(e) => set({ reply_to: e.target.value || undefined })} placeholder={account.reply_to ?? ""} />
               </Field>
@@ -84,7 +84,7 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
         </div>
       </fieldset>
 
-      <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[minmax(340px,440px)_1fr]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(340px,440px)_minmax(0,1fr)]">
         <div className="flex min-h-0 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
             <Segmented

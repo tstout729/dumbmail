@@ -106,7 +106,7 @@ function BrandStep({ save, saving, onSkip }: { save: (p: BrandPatch) => void; sa
   return (
     <form onSubmit={onSubmit}>
       <StepHeader title="Your brand" description="Used in your emails, sign-up forms and footers. Change any of it later in Settings." />
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Field label="Website">
           <Input name="website" type="text" inputMode="url" autoComplete="url" placeholder="acme.com" defaultValue={account.website ?? ""} autoFocus />
         </Field>
@@ -301,7 +301,7 @@ function FlowStep({ onFinish, markDone }: { onFinish: () => void; markDone: () =
   return (
     <div>
       <StepHeader title="Turn on a starter flow" description="Automations that earn money while you sleep. Each one is ready to go and you can edit it any time." />
-      <div className="grid gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {blueprints.isPending
           ? [0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-32" />)
           : (blueprints.data ?? []).map((b) => (

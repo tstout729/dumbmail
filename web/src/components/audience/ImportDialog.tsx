@@ -100,7 +100,7 @@ export function ImportDialog({ onClose, listId }: Props) {
             <input type="file" accept=".csv,text/csv" className="sr-only" onChange={(e) => void readFile(e.target.files?.[0])} />
           </label>
           <Textarea rows={6} value={csv} onChange={(e) => setCsv(e.target.value)} placeholder={"email,first_name,city\njane@example.com,Jane,Portland"} className="font-mono text-xs" aria-label="CSV" />
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <Field label="Add to list">
               <Select value={targetList} onChange={(e) => setTargetList(e.target.value)}>
                 <option value="">No list</option>

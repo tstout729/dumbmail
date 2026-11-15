@@ -214,7 +214,7 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
     <fieldset>
       <legend className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{title}</legend>
       {hint ? <p className="mt-0.5 text-xs text-zinc-500">{hint}</p> : null}
-      <div className="mt-2 grid gap-3 sm:grid-cols-2">{children}</div>
+      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">{children}</div>
     </fieldset>
   );
 }

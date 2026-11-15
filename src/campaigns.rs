@@ -1,6 +1,6 @@
 //! Campaign audiences, preparation and batched sending.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
@@ -11,7 +11,7 @@ use crate::segments::{self, Definition};
 use crate::sending::{self, Outcome, SendSpec};
 use crate::state::AppState;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Audience {
     #[serde(default)]
     pub include: Vec<AudienceRef>,
@@ -19,7 +19,7 @@ pub struct Audience {
     pub exclude: Vec<AudienceRef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AudienceRef {
     #[serde(rename = "type")]
     pub kind: String,

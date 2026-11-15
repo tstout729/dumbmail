@@ -33,7 +33,7 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
   const segments = settled ? render.data.segments : local.segments;
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
       <fieldset disabled={readOnly} className="min-w-0 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-xs font-medium text-zinc-700">Message</div>

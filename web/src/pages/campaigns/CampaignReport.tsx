@@ -60,7 +60,7 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
         <Stat label="Spam complaints" value={formatNumber(stats.complaints)} />
         <Stat label="Failed" value={formatNumber(stats.failed)} />
       </div>
-      <div className="mt-4 grid gap-4 lg:grid-cols-[1.4fr_1fr]">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Card title={campaign.channel === "email" ? "Opens and clicks over time" : "Clicks over time"}>
           <TimeSeriesChart
             loading={loading}

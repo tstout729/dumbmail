@@ -79,7 +79,7 @@ export function MetricsPage() {
   return (
     <Page wide>
       <PageHeader title="Metrics" description="Every event you track, and how it trends." />
-      <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
         <Card padded={false}>
           <div className="border-b border-zinc-100 p-2">
             <div className="relative">
@@ -122,7 +122,7 @@ export function MetricsPage() {
         </Card>
         <div className="space-y-4">
           <Card>
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <Field label="Measure">
                 <Select value={measurement} onChange={(e) => setMeasurement(e.target.value as Measurement)}>
                   <option value="count">Total events</option>

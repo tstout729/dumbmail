@@ -24,7 +24,7 @@ export function AnalyticsPage() {
       />
       {overview.error ? <p className="mb-4 text-sm text-red-600">{overview.error.message}</p> : null}
       <KpiRow data={data} loading={loading} extended />
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <RevenueChart data={data} loading={loading} />
         <Card title="Attributed revenue by source">
           <div className="space-y-4 pt-1">
@@ -57,7 +57,7 @@ export function AnalyticsPage() {
         <SendsChart data={data} loading={loading} />
         <EngagementChart data={data} loading={loading} />
       </div>
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
         <div>
           <h2 className="mb-2 text-sm font-semibold text-zinc-900">Campaigns</h2>
           <Table>

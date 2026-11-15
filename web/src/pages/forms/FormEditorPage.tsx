@@ -37,7 +37,7 @@ export function FormEditorPage() {
     return (
       <Page wide>
         <Skeleton className="mb-6 h-7 w-64" />
-        <div className="grid gap-4 lg:grid-cols-[400px_1fr]">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[400px_minmax(0,1fr)]">
           <Skeleton className="h-[520px]" />
           <Skeleton className="h-[520px]" />
         </div>
@@ -139,7 +139,7 @@ function FormEditor({ form }: { form: Form }) {
         ]}
       />
       {tab === "design" ? (
-        <div className="grid gap-4 lg:grid-cols-[400px_1fr]">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[400px_minmax(0,1fr)]">
           <div className="space-y-4">
             <Card title="Setup">
               <div className="space-y-3">
@@ -326,7 +326,7 @@ function InstallPanel({ form, kind, hosted }: { form: Form; kind: FormKind; host
     </Notice>
   );
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
       {kind === "page" ? null : (
         <Card title="Show it on your site">
           <div className="space-y-3">

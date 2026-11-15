@@ -37,9 +37,9 @@ const tabStatuses: Record<Tab, CampaignStatus[] | null> = {
 
 export function ChannelIcon({ channel }: { channel: Channel }) {
   return channel === "email" ? (
-    <Mail className="size-4 text-zinc-400" aria-label="Email" />
+    <Mail className="size-4 shrink-0 text-zinc-400" aria-label="Email" />
   ) : (
-    <MessageSquare className="size-4 text-zinc-400" aria-label="SMS" />
+    <MessageSquare className="size-4 shrink-0 text-zinc-400" aria-label="SMS" />
   );
 }
 
@@ -136,7 +136,7 @@ export function CampaignsPage() {
                   <Td>
                     <div className="flex items-center gap-2.5">
                       <ChannelIcon channel={c.channel} />
-                      <span className="font-medium text-zinc-900">{c.name}</span>
+                      <span className="min-w-36 font-medium text-zinc-900">{c.name}</span>
                     </div>
                   </Td>
                   <Td>

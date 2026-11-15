@@ -166,6 +166,10 @@ pub async fn campaign_json(state: &AppState, c: &CampaignRow) -> AppResult<Value
     if let Some(o) = v.as_object_mut() {
         o.remove("account_id");
         o.insert("stats".into(), serde_json::to_value(stats)?);
+        // Older rows may hold a partial audience; always return the full shape.
+        if let Ok(a) = normalize_audience(&c.audience) {
+            o.insert("audience".into(), a);
+        }
     }
     Ok(v)
 }
@@ -199,16 +203,18 @@ pub struct CampaignBody {
     pub send_at: Option<DateTime<Utc>>,
 }
 
-fn validate_audience(v: &Value) -> AppResult<()> {
-    serde_json::from_value::<Audience>(v.clone()).map(|_| ()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))
+/// Parse an audience and return it in full form (`include` and `exclude` always present), so
+/// campaigns created through the API or MCP with a partial audience look the same as UI-made ones.
+fn normalize_audience(v: &Value) -> AppResult<Value> {
+    let a: Audience = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
+    Ok(serde_json::to_value(a)?)
 }
 
 pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody) -> AppResult<CampaignRow> {
     let channel = b.channel.unwrap_or_else(|| "email".into());
     check_channel(&channel)?;
     let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{} campaign {}", if channel == "sms" { "SMS" } else { "Email" }, Utc::now().format("%b %-d")));
-    let audience = b.audience.unwrap_or(json!({"include": [], "exclude": []}));
-    validate_audience(&audience)?;
+    let audience = normalize_audience(&b.audience.unwrap_or(json!({})))?;
     let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
     Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *")
         .bind(Uuid::now_v7())
@@ -236,9 +242,7 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     if !matches!(c.status.as_str(), "draft" | "scheduled" | "failed" | "cancelled") {
         return Err(AppError::Conflict(format!("this campaign is {} and can't be edited; duplicate it instead", c.status)));
     }
-    if let Some(a) = &b.audience {
-        validate_audience(a)?;
-    }
+    let audience = b.audience.as_ref().map(normalize_audience).transpose()?;
     if let Some(ch) = &b.channel {
         check_channel(ch)?;
     }
@@ -252,7 +256,7 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     .bind(account_id)
     .bind(b.name.filter(|n| !n.trim().is_empty()))
     .bind(b.channel)
-    .bind(b.audience)
+    .bind(audience)
     .bind(b.content)
     .bind(b.send_at)
     .fetch_one(&state.db)

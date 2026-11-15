@@ -4,7 +4,7 @@ import { Activity, ListChecks, Mail, MessageSquare, MousePointerClick, MailOpen,
 import type { Consent, Profile, ProfileDetail } from "../../api";
 import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../../api";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
-import { formatDateTime, formatRelative, fullName } from "../../lib/format";
+import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
 
 export function ProfileDetailPage() {
@@ -15,7 +15,7 @@ export function ProfileDetailPage() {
       <Page>
         <Skeleton className="mb-2 h-7 w-64" />
         <Skeleton className="mb-6 h-4 w-48" />
-        <div className="grid gap-4 lg:grid-cols-[340px_1fr]">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
           <Skeleton className="h-80" />
           <Skeleton className="h-80" />
         </div>
@@ -58,7 +58,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
         description={
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
             {profile.email ? <span>{profile.email}</span> : null}
-            {profile.phone_number ? <span className="tabular-nums">{profile.phone_number}</span> : null}
+            {profile.phone_number ? <span className="tabular-nums">{formatPhone(profile.phone_number)}</span> : null}
             <span className="flex items-center gap-1">
               <Mail className="size-3.5" /> <StatusBadge status={profile.email_consent} />
             </span>
@@ -80,7 +80,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
           </>
         }
       />
-      <div className="grid gap-4 lg:grid-cols-[360px_1fr]">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[360px_minmax(0,1fr)]">
         <div className="space-y-4">
           {editing ? <ProfileEditForm profile={profile} onDone={() => setEditing(false)} /> : <PropertiesCard profile={profile} tz={tz} />}
           <Card title="Lists & segments" padded={false}>
@@ -209,7 +209,7 @@ function PropertiesCard({ profile, tz }: { profile: Profile; tz: string }) {
     ["First name", profile.first_name],
     ["Last name", profile.last_name],
     ["Email", profile.email],
-    ["Phone", profile.phone_number],
+    ["Phone", profile.phone_number ? formatPhone(profile.phone_number) : null],
     ["External ID", profile.external_id],
     ["Created", formatDateTime(profile.created_at, tz)],
     ["Last active", profile.last_event_at ? formatDateTime(profile.last_event_at, tz) : null],

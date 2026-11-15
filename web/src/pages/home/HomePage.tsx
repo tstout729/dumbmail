@@ -83,11 +83,11 @@ export function HomePage() {
       {!account.onboarding.dismissed ? <SetupChecklist /> : null}
       {overview.error ? <p className="mb-4 text-sm text-red-600">{overview.error.message}</p> : null}
       <KpiRow data={data} loading={loading} />
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <RevenueChart data={data} loading={loading} />
         <SendsChart data={data} loading={loading} />
       </div>
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card title="Recent campaigns" actions={<Link to="/campaigns" className="text-xs font-medium text-accent-700 hover:underline">View all</Link>} padded={false}>
           {loading ? (
             <ListSkeleton />

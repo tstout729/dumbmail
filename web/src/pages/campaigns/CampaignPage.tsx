@@ -180,7 +180,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
               : "Choose lists or segments"
           }
         >
-          <div className="grid gap-6 lg:grid-cols-[1fr_260px]">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
             <AudiencePicker value={current.audience} onChange={(audience: Audience) => edit({ audience })} disabled={!editable} />
             <div className="rounded-lg bg-zinc-50 p-4">
               <div className="flex items-center gap-2 text-xs font-medium text-zinc-500">
@@ -206,7 +206,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
         </Step>
 
         <Step index={3} title="Review & send" open={open === 3} onToggle={() => setOpen(open === 3 ? null : 3)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
-          <div className="grid gap-6 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
               <ul className="space-y-2">
                 {checks.map((c) => (

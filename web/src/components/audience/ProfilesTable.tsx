@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { ChevronLeft, ChevronRight, Users } from "lucide-react";
 import type { Profile } from "../../api";
 import { useSession } from "../../api";
-import { formatNumber, formatRelative, fullName } from "../../lib/format";
+import { formatNumber, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { EmptyRow, EmptyState, IconButton, RowLink, SkeletonRows, StatusBadge, Table, Td, Th } from "../ui";
 
 type Props = {
@@ -53,7 +53,7 @@ export function ProfilesTable({ profiles, total, loading, offset, limit, onPage,
                   <div className="font-medium text-zinc-900">{fullName(p) || p.email || p.phone_number || p.external_id || "Anonymous"}</div>
                   {fullName(p) && p.email ? <div className="text-xs text-zinc-500">{p.email}</div> : null}
                 </Td>
-                <Td className="text-zinc-600 tabular-nums">{p.phone_number ?? "—"}</Td>
+                <Td className="whitespace-nowrap text-zinc-600 tabular-nums">{p.phone_number ? formatPhone(p.phone_number) : "—"}</Td>
                 <Td>
                   <StatusBadge status={p.email_consent} />
                 </Td>

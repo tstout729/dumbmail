@@ -48,7 +48,7 @@ export function BillingPage() {
   if (billing.isPending) {
     return (
       <div className="space-y-4">
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Skeleton className="h-56" />
           <Skeleton className="h-56" />
         </div>
@@ -62,7 +62,7 @@ export function BillingPage() {
   if (b.mode === "self_hosted") return <SelfHostedCard b={b} />;
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <BalanceCard b={b} />
         <AutoRechargeCard b={b} />
       </div>
@@ -262,7 +262,7 @@ function ThisMonthCard({ b }: { b: Billing }) {
   const pct = b.free_emails_per_month ? Math.min(100, (freeUsed / b.free_emails_per_month) * 100) : 100;
   return (
     <Card title="This month">
-      <div className="grid gap-6 sm:grid-cols-[2fr_1fr]">
+      <div className="grid grid-cols-1 gap-6 sm:grid-cols-[2fr_1fr]">
         <div>
           <div className="mb-1 flex justify-between text-sm">
             <span className="text-zinc-700">Free emails</span>
@@ -380,9 +380,12 @@ function PricesCard({ b }: { b: Billing }) {
         <tbody>
           {rows.map((r) => (
             <tr key={r.item} className="[&:last-child>td]:border-b-0">
-              <Td className="w-36 font-medium text-zinc-900">{r.item}</Td>
-              <Td className="whitespace-nowrap tabular-nums text-zinc-900">{r.price}</Td>
-              <Td className="text-xs text-zinc-500">{r.note}</Td>
+              <Td className="font-medium text-zinc-900 sm:w-36">{r.item}</Td>
+              <Td className="tabular-nums text-zinc-900">
+                <div className="whitespace-nowrap">{r.price}</div>
+                <div className="mt-0.5 text-xs text-zinc-500 sm:hidden">{r.note}</div>
+              </Td>
+              <Td className="hidden text-xs text-zinc-500 sm:table-cell">{r.note}</Td>
             </tr>
           ))}
         </tbody>

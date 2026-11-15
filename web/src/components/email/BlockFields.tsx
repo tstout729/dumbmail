@@ -92,7 +92,7 @@ function TextFields({ block, onChange }: Props<Extract<EmailBlock, { type: "text
 
 function ImageFields({ block, onChange }: Props<Extract<EmailBlock, { type: "image" }>>) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <Field label="Image URL" className="sm:col-span-2">
         <Input value={block.src} onChange={(e) => onChange({ ...block, src: e.target.value })} placeholder="https://…/image.jpg" />
       </Field>
@@ -117,7 +117,7 @@ function ImageFields({ block, onChange }: Props<Extract<EmailBlock, { type: "ima
 
 function ButtonFields({ block, onChange }: Props<Extract<EmailBlock, { type: "button" }>>) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <Field label="Label">
         <Input value={block.text} onChange={(e) => onChange({ ...block, text: e.target.value })} />
       </Field>
@@ -152,7 +152,7 @@ function SpacerFields({ block, onChange }: Props<Extract<EmailBlock, { type: "sp
 
 function ProductFields({ block, onChange }: Props<Extract<EmailBlock, { type: "product" }>>) {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <Field label="Title" className="sm:col-span-2">
         <Input value={block.title} onChange={(e) => onChange({ ...block, title: e.target.value })} />
       </Field>
