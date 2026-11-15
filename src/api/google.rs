@@ -48,9 +48,19 @@ fn redirect_uri(state: &AppState) -> String {
 }
 
 /// Only same-site paths, so `?next=//evil.com` can't send people elsewhere after signing in.
+/// Browsers drop tabs and newlines and read `\\` as `/`, so any of those (or other control
+/// characters) is refused, and the result is re-resolved against a fixed origin to be sure.
 fn safe_next(next: Option<&str>) -> String {
-    match next {
-        Some(n) if n.starts_with('/') && !n.starts_with("//") && !n.starts_with("/\\") && n.len() < 500 => n.to_string(),
+    let Some(n) = next else { return "/".into() };
+    if !n.starts_with('/') || n.starts_with("//") || n.len() >= 500 || n.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
+        return "/".into();
+    }
+    let base = url::Url::parse("https://postlark.invalid/").expect("static url");
+    match base.join(n) {
+        Ok(u) if u.origin() == base.origin() => match u.query() {
+            Some(q) => format!("{}?{q}", u.path()),
+            None => u.path().to_string(),
+        },
         _ => "/".into(),
     }
 }
@@ -204,11 +214,17 @@ pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid,
         if linked.is_some() {
             return Err(AppError::Conflict("this email is already linked to a different Google account".into()));
         }
-        // Sign-up doesn't confirm email addresses, so a password set before Google proved who owns
-        // this address may be someone else's. Linking turns it off and ends every older session.
+        // Sign-up doesn't confirm email addresses, so whoever set this password may not own the
+        // address. Linking cuts off every way they could still get in: the password, every older
+        // session and every API key on the user's accounts (the owner makes new keys if needed).
+        // Accounts have no team invites, so the user's memberships are only accounts they created.
         let mut tx = state.db.begin().await?;
         sqlx::query("UPDATE users SET google_sub = $2, password_hash = NULL WHERE id = $1").bind(uid).bind(&c.sub).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE revoked_at IS NULL AND account_id IN (SELECT account_id FROM memberships WHERE user_id = $1)")
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         return Ok((uid, first_account(uid).await?, false));
     }
@@ -254,6 +270,10 @@ mod tests {
         assert_eq!(safe_next(Some("//evil.com")), "/");
         assert_eq!(safe_next(Some("/\\evil.com")), "/");
         assert_eq!(safe_next(Some("https://evil.com")), "/");
+        assert_eq!(safe_next(Some("/\t/evil.com")), "/");
+        assert_eq!(safe_next(Some("/\n/evil.com")), "/");
+        assert_eq!(safe_next(Some("/a\\b")), "/");
+        assert_eq!(safe_next(Some("/flows/../settings")), "/settings");
         assert_eq!(safe_next(None), "/");
     }
 }

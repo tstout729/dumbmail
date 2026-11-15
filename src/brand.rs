@@ -709,10 +709,39 @@ fn pick_from_email(emails: &[String], host: &str) -> (Option<String>, bool) {
     (None, false)
 }
 
+/// Decode an image with hard limits, so a small file that claims to be gigapixels can't eat memory.
+fn decode_limited(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    reader.limits(limits_for_decode());
+    let (w, h) = reader.into_dimensions().ok()?;
+    if w > 4096 || h > 4096 {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    reader.limits(limits_for_decode());
+    reader.decode().ok()
+}
+
+fn limits_for_decode() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    limits
+}
+
+/// Check a logo is a real, reasonably sized image and find its main color. Decodes once.
+fn inspect_logo(bytes: &[u8]) -> Option<Option<(Rgb, f32)>> {
+    let img = decode_limited(bytes)?;
+    if img.width() < 24 || img.height() < 16 {
+        return None;
+    }
+    Some(logo_color(&img))
+}
+
 /// Main color of a logo image, if it has a clear one.
-fn logo_color(bytes: &[u8]) -> Option<(Rgb, f32)> {
-    let img = image::load_from_memory(bytes).ok()?;
-    let thumb = image::imageops::thumbnail(&img.to_rgba8(), 64, 64);
+fn logo_color(img: &image::DynamicImage) -> Option<(Rgb, f32)> {
+    let thumb = image::imageops::thumbnail(img, 64, 64);
     let mut buckets: std::collections::HashMap<(u8, u8, u8), (u32, u32, u32, u32)> = std::collections::HashMap::new();
     let mut opaque = 0u32;
     for p in thumb.pixels() {
@@ -745,12 +774,6 @@ fn logo_color(bytes: &[u8]) -> Option<(Rgb, f32)> {
     None
 }
 
-fn image_dims_ok(bytes: &[u8]) -> bool {
-    match image::load_from_memory(bytes) {
-        Ok(img) => img.width() >= 24 && img.height() >= 16,
-        Err(_) => false,
-    }
-}
 
 /// "acme.com", "https://acme.com/shop" → a full https URL, or a friendly error.
 pub fn normalize_site_url(raw: &str) -> AppResult<String> {
@@ -802,10 +825,13 @@ async fn import_inner(url: &str) -> AppResult<BrandKit> {
             if img.content_type.contains("svg") || is_svg_url(&img.url) {
                 return Some((u, None));
             }
-            if img.content_type.starts_with("text/") || !image_dims_ok(&img.body) {
+            if img.content_type.starts_with("text/") {
                 continue;
             }
-            return Some((u, logo_color(&img.body)));
+            // Decoding is CPU work; keep it off the async workers.
+            let body = img.body;
+            let Ok(Some(color)) = tokio::task::spawn_blocking(move || inspect_logo(&body)).await else { continue };
+            return Some((u, color));
         }
         None
     };
@@ -942,6 +968,21 @@ mod tests {
         assert_eq!(rank_colors(&[(Rgb(0x11, 0x11, 0x11), 10.0), (Rgb(0xff, 0xff, 0xff), 10.0)]), vec!["#111111".to_string()]);
         // Tailwind's blue-gray text color is not a brand color.
         assert!(rank_colors(&[(Rgb(0x36, 0x41, 0x53), 3.0)]).is_empty());
+    }
+
+    #[test]
+    fn huge_images_are_refused_without_decoding() {
+        // A valid PNG header claiming 100,000 x 100,000 pixels.
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR");
+        png.extend_from_slice(&100_000u32.to_be_bytes());
+        png.extend_from_slice(&100_000u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(decode_limited(&png).is_none());
+        let mut ok = Vec::new();
+        image::RgbaImage::from_pixel(40, 20, image::Rgba([200, 30, 30, 255])).write_to(&mut std::io::Cursor::new(&mut ok), image::ImageFormat::Png).unwrap();
+        let (c, _) = inspect_logo(&ok).unwrap().unwrap();
+        assert_eq!(c, Rgb(200, 30, 30));
     }
 
     #[test]

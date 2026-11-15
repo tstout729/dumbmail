@@ -758,6 +758,8 @@ async fn brand_import_and_google_sign_in() {
     // Google with the same email joins the existing account, turns its password off and ends old sessions.
     let claims = |sub: &str, email: &str, given: Option<&str>| GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from) };
     let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "planted"}))).await;
+    let key = key["key"].as_str().unwrap().to_string();
     let (uid, acct, created) = google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap();
     assert_eq!((acct, created), (account_id, false));
     assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), (uid, account_id, false));
@@ -768,6 +770,8 @@ async fn brand_import_and_google_sign_in() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(v.to_string().contains("Google"), "{v}");
     assert!(google_user(&h.state, &claims("g-intruder", "owner@acme.test", None)).await.is_err(), "a second Google account can't take over the email");
+    let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {key}"))], "").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "API keys made before Google proved the email are revoked");
 
     // New people get a new account: named after them on free mail, after their domain on a work address.
     let (_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap();
