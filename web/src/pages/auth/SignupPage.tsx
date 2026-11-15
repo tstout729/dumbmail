@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router";
 import { useSignup } from "../../api";
 import { Button, Field, InlineError, Input } from "../../components/ui";
 import { AuthLayout } from "./AuthLayout";
+import { GoogleSignIn } from "./GoogleButton";
 
 export function SignupPage() {
   const signup = useSignup();
@@ -34,7 +35,8 @@ export function SignupPage() {
         </>
       }
     >
-      <form onSubmit={onSubmit} className="space-y-3.5">
+      <GoogleSignIn />
+      <form onSubmit={onSubmit} className="mt-4 space-y-3.5">
         <Field label="Company name" htmlFor="company">
           <Input id="company" name="company" autoComplete="organization" required autoFocus placeholder="Acme Coffee" />
         </Field>

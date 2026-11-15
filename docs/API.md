@@ -132,8 +132,11 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | POST | `/api/auth/signup` | `{email, password, name?, company}` | `{user, account}` + cookie |
 | POST | `/api/auth/login` | `{email, password}` | `{user, account}` + cookie |
 | POST | `/api/auth/logout` | – | `{ok: true}` |
+| GET | `/api/auth/options` | – | `{google, signup}`: which sign-in methods this server offers |
+| GET | `/api/auth/google?next=/path` | – | Redirects to Google ("Continue with Google"). The callback (`/api/auth/google/callback`) signs in, joins an existing user with the same email (turning its password off and ending older sessions), or creates a new account and sends it to `/onboarding`. Failures redirect to `/login?error=<code>` |
 | GET | `/api/me` | – | `{user, account}` (401 if signed out) |
-| PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial | `Account` |
+| PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial. `social_links` is `{instagram\|facebook\|tiktok\|x\|youtube\|pinterest\|linkedin\|threads: https URL}`; a blank value removes that network. Social links appear in email footers | `Account` |
+| POST | `/api/brand/import` | `{url, apply?}` | `{brand: {website, name, logo_url, brand_color, colors[], address, from_email, from_email_found, social_links}}`. Reads the public website (and its stylesheets and logo) for brand suggestions. With `apply: true`, also saves website, logo, brand color and social links, plus name and address when the account has none, and returns `account` |
 | GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}}` |
 | POST | `/api/account/domain` | `{domain}` | same as GET sending |
 | POST | `/api/account/domain/verify` | – | same as GET sending |

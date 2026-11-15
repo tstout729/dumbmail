@@ -18,6 +18,8 @@ pub struct Account {
     pub address: Option<String>,
     pub brand_color: String,
     pub logo_url: Option<String>,
+    /// Social profile links by network (instagram, facebook, tiktok, x, youtube, pinterest, linkedin, threads).
+    pub social_links: Value,
     pub plan: String,
     pub onboarding: Value,
     #[serde(skip)]

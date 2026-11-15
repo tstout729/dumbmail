@@ -62,6 +62,8 @@ impl Harness {
             railway_environment_id: None,
             railway_service_id: None,
             admin_token: Some("test-admin-token-0123456789abcdef0123".into()),
+            google_client_id: Some("test-client.apps.googleusercontent.com".into()),
+            google_client_secret: Some("test-google-secret".into()),
         };
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
@@ -710,5 +712,70 @@ async fn billing_numbers_onsite_and_domains() {
     postlark::billing::charge_numbers(&h.state).await.unwrap();
     assert_eq!(h.ok("GET", "/api/phone-numbers", None).await["data"].as_array().unwrap().len(), 0);
     assert_eq!(postlark::billing::balance(&h.state.db, acct).await.unwrap(), 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn brand_import_and_google_sign_in() {
+    use postlark::api::google::{google_user, GoogleClaims};
+    let mut h = harness!();
+    h.signup().await;
+    let old_cookie = h.cookie.clone();
+
+    // Social links and logo are validated.
+    let a = h.ok("PATCH", "/api/account", Some(json!({"social_links": {"instagram": "instagram.com/acme", "x": ""}, "logo_url": "https://cdn.acme.test/logo.png"}))).await;
+    assert_eq!(a["social_links"], json!({"instagram": "https://instagram.com/acme"}));
+    let (s, _) = h.req("PATCH", "/api/account", Some(json!({"social_links": {"myspace": "https://myspace.com/a"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = h.req("PATCH", "/api/account", Some(json!({"logo_url": "javascript:alert(1)"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Brand import only reads public websites.
+    for url in ["http://127.0.0.1:9/", "localhost", "http://169.254.169.254/latest", ""] {
+        let (s, v) = h.req("POST", "/api/brand/import", Some(json!({"url": url}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{url}: {v}");
+    }
+
+    // The sign-in pages learn Google is on; starting sends the browser to Google with PKCE.
+    let opts = h.ok("GET", "/api/auth/options", None).await;
+    assert_eq!(opts, json!({"google": true, "signup": true}));
+    let (s, hdrs, _) = h.raw("GET", "/api/auth/google?next=/campaigns", &[], "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let loc = hdrs.get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+    assert!(loc.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"), "{loc}");
+    for part in ["client_id=test-client.apps.googleusercontent.com", "redirect_uri=https%3A%2F%2Fpl.test%2Fapi%2Fauth%2Fgoogle%2Fcallback", "code_challenge_method=S256", "scope=openid+email+profile"] {
+        assert!(loc.contains(part), "{part} missing from {loc}");
+    }
+    let oauth_cookie = hdrs.get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+    assert!(oauth_cookie.starts_with("pl_oauth="));
+    // A callback whose state doesn't match the cookie is refused before anything is sent to Google.
+    let (s, hdrs, _) = h.raw("GET", "/api/auth/google/callback?code=abc&state=forged", &[("cookie", &oauth_cookie)], "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(hdrs.get(header::LOCATION).unwrap().to_str().unwrap(), "/login?error=expired");
+    let (_, hdrs, _) = h.raw("GET", "/api/auth/google/callback?error=access_denied&state=x", &[], "").await;
+    assert_eq!(hdrs.get(header::LOCATION).unwrap().to_str().unwrap(), "/login?error=cancelled");
+
+    // Google with the same email joins the existing account, turns its password off and ends old sessions.
+    let claims = |sub: &str, email: &str, given: Option<&str>| GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from) };
+    let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let (uid, acct, created) = google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap();
+    assert_eq!((acct, created), (account_id, false));
+    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), (uid, account_id, false));
+    h.cookie = old_cookie;
+    let (s, _) = h.req("GET", "/api/me", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "old sessions end when Google is linked");
+    let (s, v) = h.req("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v.to_string().contains("Google"), "{v}");
+    assert!(google_user(&h.state, &claims("g-intruder", "owner@acme.test", None)).await.is_err(), "a second Google account can't take over the email");
+
+    // New people get a new account: named after them on free mail, after their domain on a work address.
+    let (_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap();
+    assert!(created);
+    let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(ann_acct).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((name.as_str(), website), ("Ann's brand", None));
+    let (_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap();
+    let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(bob_acct).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((name.as_str(), website.as_deref()), ("stayportland.com", Some("https://stayportland.com")));
     h.cleanup().await;
 }

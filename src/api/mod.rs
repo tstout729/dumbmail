@@ -1,6 +1,7 @@
 pub mod account;
 pub mod analytics;
 pub mod audience;
+pub mod google;
 pub mod messaging;
 
 use axum::extract::{FromRequest, Request};
@@ -47,6 +48,7 @@ pub fn page<T: serde::Serialize>(data: Vec<T>, total: i64) -> axum::Json<Value> 
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(account::routes())
+        .merge(google::routes())
         .merge(audience::routes())
         .merge(messaging::routes())
         .merge(analytics::routes())

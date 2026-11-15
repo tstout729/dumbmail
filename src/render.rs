@@ -191,6 +191,22 @@ fn block_text(b: &Value, out: &mut String) {
     }
 }
 
+fn no_tpl(s: &str) -> String {
+    s.replace('{', "&#123;").replace('}', "&#125;")
+}
+
+/// The account's social profile links as (label, https URL), in a fixed order.
+fn social_links(account: &Account) -> Vec<(&'static str, String)> {
+    let labels = [("instagram", "Instagram"), ("facebook", "Facebook"), ("tiktok", "TikTok"), ("x", "X"), ("youtube", "YouTube"), ("pinterest", "Pinterest"), ("linkedin", "LinkedIn"), ("threads", "Threads")];
+    labels
+        .iter()
+        .filter_map(|(k, label)| {
+            let u = account.social_links.get(*k)?.as_str()?;
+            u.starts_with("https://").then(|| (*label, u.to_string()))
+        })
+        .collect()
+}
+
 fn layout(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer: &str) -> String {
     let bg = safe_color(theme.background.as_deref().unwrap_or(""), "#f4f4f5");
     let font = theme.font.clone().unwrap_or_else(|| "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif".into());
@@ -277,10 +293,23 @@ pub fn render_email(
     let font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
     let unsub = tracking.map(|t| t.unsubscribe_url.clone()).unwrap_or_else(|| "#".into());
     let address = account.address.clone().unwrap_or_default();
+    let socials = social_links(account);
+    let social_html = if socials.is_empty() {
+        String::new()
+    } else {
+        let links: Vec<String> = socials
+            .iter()
+            .map(|(label, url)| format!(r#"<a href="{}" style="color:#6b7280;text-decoration:underline;">{label}</a>"#, esc(url)))
+            .collect();
+        format!("{}<br>", links.join(" · "))
+    };
     let footer = format!(
-        r#"{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
-        name = esc(&account.name),
-        addr = if address.is_empty() { String::new() } else { format!(" · {}", esc(&address)) },
+        r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
+        // The footer goes through the template engine with the body, so brand text (often read
+        // from a website) must not be able to open a template tag.
+        social_html = no_tpl(&social_html),
+        name = no_tpl(&esc(&account.name)),
+        addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
         unsub = esc(&unsub),
     );
 
@@ -313,6 +342,9 @@ pub fn render_email(
     let preheader = render_str(content.preheader.as_deref().unwrap_or(""), ctx, false)?;
     let mut html = render_str(&html_source, ctx, true)?;
     let mut text = render_str(&text_source, ctx, false)?;
+    for (label, url) in &socials {
+        text.push_str(&format!("\n{label}: {url}"));
+    }
     text.push_str(&format!("\n--\n{}{}\nUnsubscribe: {unsub}\n", account.name, if address.is_empty() { String::new() } else { format!(", {address}") }));
 
     if let Some(t) = tracking {
@@ -400,6 +432,7 @@ mod tests {
             address: Some("1 Main St, Portland OR".into()),
             brand_color: "#123456".into(),
             logo_url: None,
+            social_links: serde_json::json!({}),
             plan: "free".into(),
             onboarding: json!({}),
             sending_domain: None,
@@ -457,6 +490,21 @@ mod tests {
         let content: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "text", "html": "<p>{{ first_name }}</p>"}]})).unwrap();
         let out = render_email(&acct, &content, &ctx, None).unwrap();
         assert!(!out.html.contains("<script>"));
+    }
+
+    #[test]
+    fn footer_shows_social_links_and_brand_text_is_inert() {
+        let mut acct = account();
+        acct.name = "Acme {{ oops".into();
+        acct.social_links = json!({"tiktok": "https://tiktok.com/@acme", "instagram": "https://instagram.com/acme", "evil": "javascript:alert(1)"});
+        let content: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]})).unwrap();
+        let out = render_email(&acct, &content, &json!({}), None).unwrap();
+        let ig = out.html.find("https://instagram.com/acme").expect("instagram link");
+        let tt = out.html.find("https://tiktok.com/@acme").expect("tiktok link");
+        assert!(ig < tt, "fixed network order");
+        assert!(!out.html.contains("javascript:"));
+        assert!(out.html.contains("Acme &#123;&#123; oops"));
+        assert!(out.text.contains("Instagram: https://instagram.com/acme"));
     }
 
     #[test]

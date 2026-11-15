@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/account", axum::routing::patch(update_account))
+        .route("/api/brand/import", post(brand_import))
         .route("/api/account/sending", get(sending))
         .route("/api/account/domain", post(add_domain).delete(remove_domain))
         .route("/api/account/domain/verify", post(verify_domain))
@@ -47,7 +48,7 @@ struct SignupBody {
     company: String,
 }
 
-fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
+pub(crate) fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, token))
         .path("/")
         .http_only(true)
@@ -61,7 +62,7 @@ fn time_days(d: i64) -> time::Duration {
     time::Duration::days(d)
 }
 
-async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid) -> AppResult<String> {
+pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid) -> AppResult<String> {
     let token = auth::random_token(32);
     sqlx::query("INSERT INTO sessions (token_hash, user_id, account_id, expires_at) VALUES ($1, $2, $3, now() + interval '30 days')")
         .bind(auth::sha256_hex(&token))
@@ -78,23 +79,38 @@ pub async fn create_account(state: &AppState, email: &str, password: &str, name:
     if password.len() < 8 {
         return Err(AppError::bad("use a password of at least 8 characters"));
     }
+    let hash = auth::hash_password(password)?;
+    insert_owner(state, &email, Some(hash), None, name, company, None).await
+}
+
+/// Insert a new account and its owner (with a password hash, a Google subject id, or both).
+pub(crate) async fn insert_owner(
+    state: &AppState,
+    email: &str,
+    password_hash: Option<String>,
+    google_sub: Option<&str>,
+    name: Option<String>,
+    company: &str,
+    website: Option<String>,
+) -> AppResult<(User, Account)> {
     let company = company.trim();
     if company.is_empty() {
         return Err(AppError::bad("enter your company or brand name"));
     }
-    let hash = auth::hash_password(password)?;
     let mut tx = state.db.begin().await?;
-    let account: Account = sqlx::query_as("INSERT INTO accounts (id, public_key, name, from_name) VALUES ($1, $2, $3, $3) RETURNING *")
+    let account: Account = sqlx::query_as("INSERT INTO accounts (id, public_key, name, from_name, website) VALUES ($1, $2, $3, $3, $4) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(format!("pk_{}", auth::random_token(12)))
         .bind(company)
+        .bind(website)
         .fetch_one(&mut *tx)
         .await?;
-    let user: User = sqlx::query_as("INSERT INTO users (id, email, name, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, email, name")
+    let user: User = sqlx::query_as("INSERT INTO users (id, email, name, password_hash, google_sub) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name")
         .bind(Uuid::now_v7())
-        .bind(&email)
+        .bind(email)
         .bind(name.filter(|n| !n.trim().is_empty()))
-        .bind(hash)
+        .bind(password_hash)
+        .bind(google_sub)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match AppError::from(e) {
@@ -123,12 +139,15 @@ struct LoginBody {
 
 async fn login(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJson<LoginBody>) -> AppResult<(CookieJar, Json<Value>)> {
     let email = b.email.trim().to_lowercase();
-    let row: Option<(Uuid, String, Option<String>, String)> = sqlx::query_as("SELECT id, email, name, password_hash FROM users WHERE email = $1")
+    let row: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as("SELECT id, email, name, password_hash FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&state.db)
         .await?;
     let bad = || AppError::BadRequest("that email and password don't match".into());
     let (id, email, name, hash) = row.ok_or_else(bad)?;
+    let Some(hash) = hash else {
+        return Err(AppError::BadRequest("this account signs in with Google; use Continue with Google".into()));
+    };
     if !auth::verify_password(&b.password, &hash) {
         return Err(bad());
     }
@@ -170,6 +189,8 @@ pub struct AccountPatch {
     pub brand_color: Option<String>,
     pub logo_url: Option<String>,
     pub conversion_metric: Option<String>,
+    /// Network → profile URL; a blank value removes that network.
+    pub social_links: Option<serde_json::Map<String, Value>>,
     pub onboarding: Option<serde_json::Map<String, Value>>,
 }
 
@@ -232,7 +253,16 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
         account.brand_color = c;
     }
     if let Some(v) = blank_to_none(b.logo_url) {
+        if let Some(u) = &v {
+            let ok = url::Url::parse(u).map(|u| matches!(u.scheme(), "http" | "https")).unwrap_or(false);
+            if !ok || u.len() > 1000 {
+                return Err(AppError::bad("logo must be an image URL starting with https://"));
+            }
+        }
         account.logo_url = v;
+    }
+    if let Some(links) = &b.social_links {
+        account.social_links = crate::brand::clean_social_links(&account.social_links, links)?;
     }
     if let Some(m) = b.conversion_metric.filter(|m| !m.trim().is_empty()) {
         account.conversion_metric = m;
@@ -248,7 +278,7 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     }
     let saved: Account = sqlx::query_as(
         "UPDATE accounts SET name=$2, website=$3, from_name=$4, from_email=$5, reply_to=$6, sms_from=$7, timezone=$8, address=$9,
-            brand_color=$10, logo_url=$11, conversion_metric=$12, onboarding=$13 WHERE id=$1 RETURNING *",
+            brand_color=$10, logo_url=$11, conversion_metric=$12, onboarding=$13, social_links=$14 WHERE id=$1 RETURNING *",
     )
     .bind(account.id)
     .bind(&account.name)
@@ -263,9 +293,54 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     .bind(&account.logo_url)
     .bind(&account.conversion_metric)
     .bind(&account.onboarding)
+    .bind(&account.social_links)
     .fetch_one(&state.db)
     .await?;
     Ok(saved)
+}
+
+#[derive(Deserialize)]
+struct BrandImportBody {
+    url: String,
+    #[serde(default)]
+    apply: bool,
+}
+
+/// Read a website's brand (name, logo, colors, address, sender email, social links). With
+/// `apply`, also save what was found: the website, logo, brand color and social links always;
+/// name, sender name and address only where the account still has none of its own.
+pub async fn import_brand(state: &AppState, account_id: Uuid, url: &str, apply: bool) -> AppResult<Value> {
+    let kit = crate::brand::import(url).await?;
+    if !apply {
+        return Ok(json!({"brand": kit}));
+    }
+    let current = load_account(&state.db, account_id).await?;
+    let mut social = serde_json::Map::new();
+    for (k, v) in &kit.social_links {
+        social.insert(k.clone(), Value::String(v.clone()));
+    }
+    let unset_name = current.from_name.is_none() || current.from_name.as_deref() == Some(current.name.as_str());
+    let patch = AccountPatch {
+        name: kit.name.clone().filter(|_| unset_name),
+        website: Some(kit.website.clone()),
+        from_name: kit.name.clone().filter(|_| unset_name),
+        from_email: None,
+        reply_to: None,
+        sms_from: None,
+        timezone: None,
+        address: kit.address.clone().filter(|_| current.address.is_none()),
+        brand_color: kit.brand_color.clone(),
+        logo_url: kit.logo_url.clone(),
+        conversion_metric: None,
+        social_links: Some(social),
+        onboarding: None,
+    };
+    let account = patch_account(state, account_id, patch).await?;
+    Ok(json!({"brand": kit, "account": account}))
+}
+
+async fn brand_import(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<BrandImportBody>) -> AppResult<Json<Value>> {
+    Ok(Json(import_brand(&state, ctx.account_id, &b.url, b.apply).await?))
 }
 
 async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AccountPatch>) -> AppResult<Json<Account>> {

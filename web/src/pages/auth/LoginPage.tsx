@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from "react-router";
 import { useLogin } from "../../api";
 import { Button, Field, InlineError, Input } from "../../components/ui";
 import { AuthLayout } from "./AuthLayout";
+import { GoogleSignIn } from "./GoogleButton";
 
 /** Only same-origin paths are allowed after login, so `?next=//evil.com` can't bounce users off-site. */
 export function safeNextPath(next: string | null): string {
@@ -17,11 +18,25 @@ export function safeNextPath(next: string | null): string {
   }
 }
 
+/** What each Google sign-in error code from the server means. */
+const googleErrors: Record<string, string> = {
+  cancelled: "Google sign-in was cancelled.",
+  expired: "Your Google sign-in expired. Try again.",
+  unavailable: "Google sign-in isn't set up on this server.",
+  google: "Google didn't finish the sign-in. Try again.",
+  unverified: "Your Google account needs a verified email address.",
+  conflict: "This email is already linked to a different Google account.",
+  closed: "No account uses this Google address, and sign-ups are closed.",
+  failed: "Couldn't sign you in. Try again.",
+};
+
 export function LoginPage() {
   const login = useLogin();
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const next = params.get("next");
+  // Set when Google sign-in bounces back here with a problem.
+  const oauthError = params.get("error");
 
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -45,7 +60,9 @@ export function LoginPage() {
         </>
       }
     >
-      <form onSubmit={onSubmit} className="space-y-3.5">
+      <GoogleSignIn next={safeNextPath(next)} />
+      <form onSubmit={onSubmit} className="mt-4 space-y-3.5">
+        {oauthError && !login.error ? <InlineError message={googleErrors[oauthError] ?? googleErrors.failed} /> : null}
         <Field label="Email" htmlFor="email">
           <Input id="email" name="email" type="email" autoComplete="email" required autoFocus />
         </Field>

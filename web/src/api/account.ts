@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
 import { keys } from "./keys";
-import type { Account, AccountPatch, ApiKey, CreatedApiKey, Sending, Session } from "./types";
+import type { Account, AccountPatch, ApiKey, BrandKit, CreatedApiKey, Sending, Session } from "./types";
 
 export const accountApi = {
   update: (patch: AccountPatch) => api<Account>("PATCH", "/api/account", patch),
+  importBrand: (url: string) => api<{ brand: BrandKit }>("POST", "/api/brand/import", { url }),
   sending: () => api<Sending>("GET", "/api/account/sending"),
   setDomain: (domain: string) => api<Sending>("POST", "/api/account/domain", { domain }),
   verifyDomain: () => api<Sending>("POST", "/api/account/domain/verify"),
@@ -90,4 +91,9 @@ export function useRevokeApiKey() {
     },
     onSettled: () => qc.invalidateQueries({ queryKey: keys.apiKeys }),
   });
+}
+
+/** Read a website's brand. Returns suggestions only; the caller saves what the user keeps. */
+export function useImportBrand() {
+  return useMutation({ mutationFn: (url: string) => accountApi.importBrand(url).then((r) => r.brand), meta: { silentError: true } });
 }

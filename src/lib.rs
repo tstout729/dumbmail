@@ -5,6 +5,7 @@ pub mod api;
 pub mod audience;
 pub mod auth;
 pub mod billing;
+pub mod brand;
 pub mod campaigns;
 pub mod config;
 pub mod crypto;

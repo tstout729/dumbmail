@@ -223,17 +223,35 @@ pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::Socket
 /// Fetch a public web page (for checking a customer's site for the snippet): public IPs only,
 /// pinned DNS, a few redirects re-checked hop by hop, and at most 3 MB read.
 pub async fn fetch_public_page(raw: &str) -> AppResult<String> {
+    let page = fetch_public(raw, 3 * 1024 * 1024).await?;
+    Ok(String::from_utf8_lossy(&page.body).into_owned())
+}
+
+/// A fetched public resource: where it ended up after redirects, its content type and (at most `max`) bytes.
+pub struct Fetched {
+    pub url: String,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+/// Fetch any public http(s) resource with the same protections as [`fetch_public_page`].
+pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     let mut url = raw.to_string();
-    for _ in 0..4 {
+    for _ in 0..5 {
         let (host, addr) = check_webhook_url(&url).await.map_err(|_| AppError::bad("enter a public website address"))?;
         let client = reqwest::Client::builder()
             .resolve(&host, addr)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (compatible; PostlarkSnippetCheck/0.2)")
+            .user_agent("Mozilla/5.0 (compatible; Postlark/0.3; +https://postlark-production.up.railway.app)")
             .build()
             .map_err(|e| AppError::Internal(e.into()))?;
-        let res = client.get(&url).send().await.map_err(|e| AppError::bad(format!("couldn't load that page: {e}")))?;
+        let res = client
+            .get(&url)
+            .header("accept", "text/html,application/xhtml+xml,text/css,image/*;q=0.9,*/*;q=0.8")
+            .send()
+            .await
+            .map_err(|e| AppError::bad(format!("couldn't load that page: {}", e.without_url())))?;
         if res.status().is_redirection() {
             let loc = res.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default();
             url = url::Url::parse(&url).and_then(|b| b.join(loc)).map(|u| u.to_string()).map_err(|_| AppError::bad("the page redirected somewhere invalid"))?;
@@ -242,15 +260,17 @@ pub async fn fetch_public_page(raw: &str) -> AppResult<String> {
         if !res.status().is_success() {
             return Err(AppError::bad(format!("that page returned HTTP {}", res.status().as_u16())));
         }
+        let content_type = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
         let mut body = Vec::new();
         let mut stream = res;
-        while let Some(chunk) = stream.chunk().await.map_err(|e| AppError::bad(format!("couldn't read that page: {e}")))? {
+        while let Some(chunk) = stream.chunk().await.map_err(|e| AppError::bad(format!("couldn't read that page: {}", e.without_url())))? {
             body.extend_from_slice(&chunk);
-            if body.len() > 3 * 1024 * 1024 {
+            if body.len() > max {
+                body.truncate(max);
                 break;
             }
         }
-        return Ok(String::from_utf8_lossy(&body).into_owned());
+        return Ok(Fetched { url, content_type, body });
     }
     Err(AppError::bad("that page redirects too many times"))
 }

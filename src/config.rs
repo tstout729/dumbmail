@@ -108,6 +108,13 @@ pub struct Config {
     /// Serve cookies with the Secure flag (turn on behind HTTPS).
     #[arg(long, env = "SECURE_COOKIES", default_value_t = false)]
     pub secure_cookies: bool,
+
+    /// Google OAuth web client for "Continue with Google". Both unset hides the button. The client's
+    /// authorized redirect URI must be PUBLIC_URL + /api/auth/google/callback.
+    #[arg(long, env = "GOOGLE_CLIENT_ID")]
+    pub google_client_id: Option<String>,
+    #[arg(long, env = "GOOGLE_CLIENT_SECRET", hide_env_values = true)]
+    pub google_client_secret: Option<String>,
 }
 
 impl Config {

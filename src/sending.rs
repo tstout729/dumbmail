@@ -300,6 +300,7 @@ mod tests {
             address: None,
             brand_color: "#000".into(),
             logo_url: None,
+            social_links: serde_json::json!({}),
             plan: "free".into(),
             onboarding: json!({}),
             sending_domain: None,

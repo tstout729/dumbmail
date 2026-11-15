@@ -51,6 +51,8 @@ export type Account = {
   address: string | null;
   brand_color: string;
   logo_url: string | null;
+  /** Network (instagram, facebook, tiktok, x, youtube, pinterest, linkedin, threads) → profile URL. */
+  social_links: Partial<Record<SocialNetwork, string>>;
   plan: Plan;
   onboarding: Onboarding;
   created_at: string;
@@ -70,7 +72,33 @@ export type AccountPatch = Partial<
     | "brand_color"
     | "logo_url"
   >
-> & { onboarding?: Partial<Onboarding> };
+> & { onboarding?: Partial<Onboarding>; social_links?: Partial<Record<SocialNetwork, string>> };
+
+export const socialNetworks = ["instagram", "facebook", "tiktok", "x", "youtube", "pinterest", "linkedin", "threads"] as const;
+export type SocialNetwork = (typeof socialNetworks)[number];
+export const socialLabels: Record<SocialNetwork, string> = {
+  instagram: "Instagram",
+  facebook: "Facebook",
+  tiktok: "TikTok",
+  x: "X",
+  youtube: "YouTube",
+  pinterest: "Pinterest",
+  linkedin: "LinkedIn",
+  threads: "Threads",
+};
+
+/** What brand import found on a website. Nothing is saved until the user confirms. */
+export type BrandKit = {
+  website: string;
+  name: string | null;
+  logo_url: string | null;
+  brand_color: string | null;
+  colors: string[];
+  address: string | null;
+  from_email: string | null;
+  from_email_found: boolean;
+  social_links: Partial<Record<SocialNetwork, string>>;
+};
 
 export type User = { id: string; email: string; name: string | null };
 

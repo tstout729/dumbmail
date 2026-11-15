@@ -5,13 +5,20 @@ import type { Session } from "./types";
 
 export type SignupInput = { email: string; password: string; name?: string; company: string };
 export type LoginInput = { email: string; password: string };
+export type AuthOptions = { google: boolean; signup: boolean };
 
 export const authApi = {
   me: () => api<Session>("GET", "/api/me"),
   signup: (input: SignupInput) => api<Session>("POST", "/api/auth/signup", input),
   login: (input: LoginInput) => api<Session>("POST", "/api/auth/login", input),
   logout: () => api<{ ok: true }>("POST", "/api/auth/logout"),
+  options: () => api<AuthOptions>("GET", "/api/auth/options"),
 };
+
+/** Which sign-in methods this server offers (Google appears once its client is configured). */
+export function useAuthOptions() {
+  return useQuery({ queryKey: ["auth-options"], queryFn: authApi.options, staleTime: Infinity, retry: false });
+}
 
 export function useMe() {
   return useQuery({ queryKey: keys.me, queryFn: authApi.me, staleTime: 5 * 60_000, retry: false });
