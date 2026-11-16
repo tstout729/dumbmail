@@ -38,6 +38,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sms/connect", post(connect_sms).delete(disconnect_sms))
         .route("/api/website", get(website))
         .route("/api/website/check", post(check_website))
+        .route("/api/website/tests", post(create_site_test))
+        .route("/api/website/tests/{code}", get(site_test))
 }
 
 #[derive(Deserialize)]
@@ -547,7 +549,14 @@ pub fn snippet(state: &AppState, public_key: &str) -> String {
 async fn website(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     let (pk, seen, url): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
         sqlx::query_as("SELECT public_key, onsite_last_seen_at, onsite_last_url FROM accounts WHERE id = $1").bind(ctx.account_id).fetch_one(&state.db).await?;
-    Ok(Json(json!({"snippet": snippet(&state, &pk), "public_key": pk, "installed": seen.is_some(), "last_seen_at": seen, "last_seen_url": url})))
+    Ok(Json(json!({
+        "snippet": snippet(&state, &pk),
+        "shopify_pixel": crate::public::shopify_pixel(&state, &pk),
+        "public_key": pk,
+        "installed": seen.is_some(),
+        "last_seen_at": seen,
+        "last_seen_url": url,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -568,5 +577,93 @@ async fn check_website(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
     } else {
         "Couldn't find the snippet in that page's HTML. If you just added it, publish your site and try again. Tag managers (like GTM) load it later, so we'll show Installed once a visitor's browser runs it.".to_string()
     };
-    Ok(Json(json!({"found": found, "message": message})))
+    Ok(Json(json!({"found": found, "message": message, "platform": detect_platform(&html)})))
+}
+
+/// Guess the site builder from a page's HTML, so the dashboard can open the right install guide.
+pub fn detect_platform(html: &str) -> Option<&'static str> {
+    let h = html.to_ascii_lowercase();
+    let has = |s: &str| h.contains(s);
+    if has("cdn.shopify.com") || has("shopify.theme") || has("window.shopify") {
+        Some("shopify")
+    } else if has("woocommerce") || has("/wp-content/") || has("content=\"wordpress") {
+        Some("wordpress")
+    } else if has("static1.squarespace.com") || has("squarespace_context") {
+        Some("squarespace")
+    } else if has("static.wixstatic.com") || has("content=\"wix.com") {
+        Some("wix")
+    } else if has("data-wf-site") || has("website-files.com") {
+        Some("webflow")
+    } else if has("framerusercontent.com") || has("content=\"framer") {
+        Some("framer")
+    } else if has("bigcommerce.com") {
+        Some("bigcommerce")
+    } else if has("id=\"__next\"") || has("/_next/static/") {
+        Some("nextjs")
+    } else {
+        None
+    }
+}
+
+#[derive(Deserialize)]
+struct SiteTestBody {
+    url: Option<String>,
+}
+
+fn site_test_json(row: &(String, Option<String>, Value, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>)) -> Value {
+    let (code, url, checks, created_at, expires_at, last_seen_at, last_url) = row;
+    let open_url = url.as_deref().and_then(|u| url::Url::parse(u).ok()).map(|mut u| {
+        u.query_pairs_mut().append_pair("dumbmail_test", code);
+        u.to_string()
+    });
+    json!({
+        "code": code, "url": url, "open_url": open_url, "checks": checks, "created_at": created_at, "expires_at": expires_at,
+        "active": *expires_at > chrono::Utc::now(), "last_seen_at": last_seen_at, "last_url": last_url,
+    })
+}
+
+const SITE_TEST_COLS: &str = "code, url, checks, created_at, expires_at, last_seen_at, last_url";
+
+/// Start a "Test your setup" session: the dashboard opens the site with ?dumbmail_test=CODE and watches what the script reports.
+async fn create_site_test(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<SiteTestBody>) -> AppResult<Json<Value>> {
+    let website: Option<String> = sqlx::query_scalar("SELECT website FROM accounts WHERE id = $1").bind(ctx.account_id).fetch_one(&state.db).await?;
+    let raw = b.url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).or(website).ok_or_else(|| AppError::bad("enter your website address"))?;
+    let raw = if raw.starts_with("http://") || raw.starts_with("https://") { raw } else { format!("https://{raw}") };
+    let url = url::Url::parse(&raw).ok().filter(|u| u.host_str().is_some_and(|h| h.contains('.'))).ok_or_else(|| AppError::bad("enter a website address like https://yourstore.com"))?;
+    let code = auth::random_token(12);
+    let row = sqlx::query_as(&format!(
+        "INSERT INTO site_tests (code, account_id, url, expires_at) VALUES ($1, $2, $3, now() + interval '2 hours') RETURNING {SITE_TEST_COLS}"
+    ))
+    .bind(&code)
+    .bind(ctx.account_id)
+    .bind(url.to_string())
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(site_test_json(&row)))
+}
+
+async fn site_test(State(state): State<AppState>, ctx: Ctx, Path(code): Path<String>) -> AppResult<Json<Value>> {
+    let row = sqlx::query_as(&format!("SELECT {SITE_TEST_COLS} FROM site_tests WHERE code = $1 AND account_id = $2"))
+        .bind(&code)
+        .bind(ctx.account_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("test"))?;
+    Ok(Json(site_test_json(&row)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_platform;
+
+    #[test]
+    fn detects_site_builders() {
+        assert_eq!(detect_platform(r#"<link href="//cdn.shopify.com/s/files/theme.css">"#), Some("shopify"));
+        assert_eq!(detect_platform(r#"<body class="woocommerce"><script src="/wp-content/x.js">"#), Some("wordpress"));
+        assert_eq!(detect_platform(r#"<meta name="generator" content="WordPress 6.6">"#), Some("wordpress"));
+        assert_eq!(detect_platform(r#"<html data-wf-site="abc">"#), Some("webflow"));
+        assert_eq!(detect_platform(r#"<img src="https://static.wixstatic.com/a.png">"#), Some("wix"));
+        assert_eq!(detect_platform(r#"<script src="/_next/static/chunks/main.js">"#), Some("nextjs"));
+        assert_eq!(detect_platform("<h1>Hello</h1>"), None);
+    }
 }

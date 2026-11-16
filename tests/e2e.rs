@@ -1291,3 +1291,72 @@ async fn form_ab_test() {
     assert!(html.contains("<h1>New A</h1>"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn website_setup_test_and_late_events() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let w = h.ok("GET", "/api/website", None).await;
+    assert!(w["shopify_pixel"].as_str().unwrap().contains(&pk), "pixel carries the account key");
+    assert!(w["shopify_pixel"].as_str().unwrap().contains("checkout_completed"));
+
+    // Starting a test defaults to the account website and gives a link that turns test mode on.
+    let t = h.ok("POST", "/api/website/tests", Some(json!({}))).await;
+    let code = t["code"].as_str().unwrap().to_string();
+    assert_eq!(t["url"], "https://acme.test/");
+    assert_eq!(t["open_url"], format!("https://acme.test/?dumbmail_test={code}"));
+    assert_eq!(t["active"], true);
+    let (s, _) = h.req("POST", "/api/website/tests", Some(json!({"url": "not a site"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let report = |check: &str, detail: Value| json!({"code": code, "check": check, "detail": detail, "url": "https://acme.test/products/mug"}).to_string();
+    let ct = [("content-type", "application/json")];
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("loaded", json!({"platform": "shopify", "summary": "On acme.test"}))).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("product", json!({"summary": "Mug · $18"}))).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("anything", json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "only known checks");
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("product", json!({"summary": "x".repeat(5000)}))).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    // A snippet from another account is flagged, not recorded as a pass.
+    let (s, _, _) = h.raw("POST", "/client/test?k=pk_someone_else", &ct, &report("cart", json!({"summary": "Mug"}))).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let t = h.ok("GET", &format!("/api/website/tests/{code}"), None).await;
+    assert_eq!(t["checks"]["loaded"]["platform"], "shopify");
+    assert_eq!(t["checks"]["product"]["summary"].as_str().unwrap().len(), 300, "long text is trimmed");
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("forms", json!({"summary": "y".repeat(20_000)}))).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "reports are small");
+    assert!(t["checks"]["cart"].is_null());
+    assert_eq!(t["checks"]["wrong_key"]["key"], "pk_someone_e");
+    assert_eq!(t["last_url"], "https://acme.test/products/mug");
+    let site = h.ok("GET", "/api/website", None).await;
+    assert_eq!(site["installed"], true, "a test report counts as installed");
+
+    // Expired tests and other accounts' tests accept nothing.
+    sqlx::query("UPDATE site_tests SET expires_at = now() - interval '1 minute' WHERE code = $1").bind(&code).execute(&h.state.db).await.unwrap();
+    let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("cart", json!({}))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(h.ok("GET", &format!("/api/website/tests/{code}"), None).await["active"], false);
+    let (s, _) = h.req("GET", "/api/website/tests/nope", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Events the browser held until it knew the visitor keep their original time (within a week) and dedupe by unique_id.
+    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
+    for _ in 0..2 {
+        let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &ct,
+            &json!({"metric": "Placed Order", "profile": {"email": "late@x.test"}, "properties": {"order_id": "1001"}, "value": 18, "unique_id": "order:1001", "time": two_hours_ago}).to_string()).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &ct,
+        &json!({"metric": "Viewed Product", "profile": {"email": "late@x.test"}, "time": 1_000_000_000_000_i64}).to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT m.name, EXTRACT(EPOCH FROM now() - e.occurred_at)::float8 FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE p.email = 'late@x.test' ORDER BY m.name")
+        .fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows.len(), 2, "duplicate order dropped: {rows:?}");
+    assert!((rows[0].1 - 7200.0).abs() < 120.0, "held order keeps its time: {rows:?}");
+    assert!(rows[1].1 < 60.0, "an old time is recorded as now: {rows:?}");
+    h.cleanup().await;
+}

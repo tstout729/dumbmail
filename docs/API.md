@@ -341,15 +341,29 @@ One script tag goes in the site's `<head>` or footer:
 
 The script:
 - tracks "Active on Site" once per visit;
-- identifies people who arrive from a tracked email or SMS link;
+- tracks shopping events by itself: "Viewed Product", "Added to Cart", "Started Checkout" and "Placed Order". It reads Shopify and WooCommerce stores directly, product structured data (JSON-LD, microdata, Open Graph) on any site, and Google Analytics ecommerce events (GA4 `view_item`, `add_to_cart`, `begin_checkout`, `purchase`, and Universal Analytics) in `dataLayer`. Single-page apps are followed through history changes;
+- recognizes people who arrive from a tracked email or SMS link, sign up through a form, or give their own email on the site: the checkout email box (as they type) and sign-up, login, account, contact and similar forms with one email field (on submit). It skips fields for someone else's address (gift recipients, referrals, invites), forms with several email fields, and staff pages (`/admin`, `/wp-admin`, `/dashboard`…). Mark a field or form `data-dumbmail-identify` to always use it, or `data-dumbmail-ignore` to never use it. Recognition never changes consent;
+- holds events from visitors it doesn't know yet in the browser for up to 3 days and sends them, with their original time, once the visitor is recognized;
 - shows live popup and flyout forms using each form's targeting rules;
-- renders embedded forms in any `<div data-dumbmail-form="FORM_ID"></div>`;
-- exposes `dumbmail.identify({email})` and `dumbmail.track(metric, properties, value)`. Calls queued before the script loads are kept.
+- renders embedded forms in any `<div data-dumbmail-form="FORM_ID"></div>`, including ones added to the page later;
+- exposes `dumbmail.identify({email})`, `dumbmail.track(metric, properties, value)` and shopping helpers for custom sites: `viewedProduct(item)`, `addedToCart(item, cart?)`, `startedCheckout(cart)`, `placedOrder({order_id, total, items, email?})`. An item is `{name, product_id?, variant_id?, sku?, price?, quantity?, image_url?, url?, brand?, categories?}`; a cart is `{items, total?, currency?, checkout_url?}`. Calls queued before the script loads are kept.
+
+Turn parts off with `window.dumbmailConfig = {autoTrack: false, captureEmails: false}` before the snippet, or `data-auto-track="false"` / `data-capture-emails="false"` on the script tag.
+
+Shopify checkout pages can't run theme scripts, so Shopify stores also add a custom pixel (Settings → Customer events → Add custom pixel). `GET /api/website` returns its code as `shopify_pixel`. On Shopify the pixel is the only source of "Started Checkout" (sent once the buyer's email or phone is known, with a `checkout_url` back to the checkout) and "Placed Order"; both are credited to the email on the checkout, and activity the storefront held for that visitor is sent with them.
+
+Shopping event properties: `Viewed Product` has the item fields; `Added to Cart` has the added item plus `items`, `item_names`, `cart_total`, `item_count` and `checkout_url`; `Started Checkout` has `items`, `item_names`, `total`, `item_count`, `currency` and `checkout_url`; `Placed Order` has `order_id`, `items`, `item_names`, `total`, `currency` and is de-duplicated by order id. Each also has `tracked_by` (where the data came from).
+
+`POST /client/events` also accepts `time` (milliseconds since 1970) for events from the last 7 days.
+
+**Test your setup.** `POST /api/website/tests` starts a 2-hour test session and returns `open_url` (the site with `?dumbmail_test=CODE`). Opening it shows a test panel on the site and makes the script report what it detects to `POST /client/test` (16 KB limit; only known plain fields are kept) instead of saving events. Sign-up forms submitted in test mode don't subscribe anyone. `GET /api/website/tests/{code}` returns the results as `checks`, keyed by `loaded`, `forms`, `product`, `cart`, `checkout`, `order`, `identify`, `pixel`, `custom`, `wrong_key` (the site's snippet belongs to another account) and `warn_*` (duplicate snippet, blocked by Content-Security-Policy, rejected key, network blocked). Add `?dumbmail_test=off` to a page URL to leave test mode early.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/website` | – | `{snippet, public_key, installed: boolean, last_seen_at: string \| null, last_seen_url: string \| null}` |
-| POST | `/api/website/check` | `{url}` | `{found: boolean, message: string}` (fetches the page server-side and looks for the snippet) |
+| GET | `/api/website` | – | `{snippet, shopify_pixel, public_key, installed: boolean, last_seen_at: string \| null, last_seen_url: string \| null}` |
+| POST | `/api/website/check` | `{url}` | `{found: boolean, message: string, platform: string \| null}` (fetches the page server-side, looks for the snippet and guesses the site builder) |
+| POST | `/api/website/tests` | `{url?}` (defaults to the account website) | `SiteTest` |
+| GET | `/api/website/tests/{code}` | – | `SiteTest`: `{code, url, open_url, checks, created_at, expires_at, active, last_seen_at, last_url}` |
 
 Forms gain `config.targeting`; every field is optional:
 

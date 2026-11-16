@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/client/forms", get(client_forms))
         .route("/client/ping", post(client_ping).options(cors_preflight))
         .route("/client/events", post(client_event).options(cors_preflight))
+        .route("/client/test", post(client_test).options(cors_preflight).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         .route("/client/subscribe", post(client_subscribe).options(cors_preflight))
         .route("/client/forms/{id}/view", post(form_view).options(cors_preflight))
         .route("/f/{id}", get(form_page))
@@ -264,7 +265,16 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let value = b["value"].as_f64();
         audience::record_event(
             &state.db,
-            NewEvent { account_id: a.id, profile_id: p.id, metric, properties: props, value, occurred_at: None, unique_id: b["unique_id"].as_str().map(String::from), message_id: None },
+            NewEvent {
+                account_id: a.id,
+                profile_id: p.id,
+                metric,
+                properties: props,
+                value,
+                occurred_at: client_time(&b["time"], chrono::Utc::now()),
+                unique_id: b["unique_id"].as_str().map(|u| u.chars().take(200).collect()),
+                message_id: None,
+            },
         )
         .await?;
         Ok(json!({"ok": true}))
@@ -276,7 +286,91 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
     })
 }
 
+/// When the browser held an event until it knew the visitor, it sends when it happened (ms since epoch).
+/// Only the last 7 days count; anything else is recorded as now.
+pub fn client_time(v: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let t = chrono::DateTime::from_timestamp_millis(v.as_f64()? as i64)?;
+    (t <= now && t > now - chrono::Duration::days(7)).then_some(t)
+}
+
+/// What the website script may report during a setup test.
+const TEST_CHECKS: &[&str] = &[
+    "loaded", "forms", "product", "cart", "checkout", "order", "identify", "pixel", "custom",
+    "warn_duplicate", "warn_csp", "warn_key", "warn_network",
+];
+
+/// Keep only the fields the dashboard shows, as plain short strings, numbers and booleans.
+fn test_detail(v: &Value) -> Value {
+    const TEXT: &[&str] = &["summary", "message", "platform", "tracked_by", "email", "metric", "name", "url", "image_url", "order_id", "how"];
+    const NUMBER: &[&str] = &["count", "value", "price", "item_count", "version"];
+    const FLAG: &[&str] = &["ok", "auto_track", "capture_emails", "identified"];
+    let mut out = serde_json::Map::new();
+    for k in TEXT {
+        if let Some(s) = v[*k].as_str() {
+            out.insert((*k).into(), json!(s.chars().take(300).collect::<String>()));
+        }
+    }
+    for k in NUMBER {
+        if let Some(n) = v[*k].as_f64().filter(|n| n.is_finite()) {
+            out.insert((*k).into(), json!(n));
+        }
+    }
+    for k in FLAG {
+        if let Some(b) = v[*k].as_bool() {
+            out.insert((*k).into(), json!(b));
+        }
+    }
+    Value::Object(out)
+}
+
+/// The website script (or the Shopify checkout pixel) reporting what it found during "Test your setup".
+async fn client_test(State(state): State<AppState>, Query(q): Query<KeyQuery>, body: Bytes) -> Response {
+    let res: AppResult<()> = async {
+        let b: Value = serde_json::from_slice(&body)?;
+        let code = b["code"].as_str().unwrap_or_default();
+        let check = b["check"].as_str().unwrap_or_default();
+        if !TEST_CHECKS.contains(&check) {
+            return Err(AppError::bad("unknown check"));
+        }
+        let test: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM site_tests WHERE code = $1 AND expires_at > now()").bind(code).fetch_optional(&state.db).await?;
+        let Some(account_id) = test else { return Err(AppError::not_found("test")) };
+        let key_account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1").bind(&q.k).fetch_optional(&state.db).await?;
+        let (check, mut detail) = if key_account == Some(account_id) {
+            (check.to_string(), test_detail(&b["detail"]))
+        } else {
+            // The snippet on the site belongs to a different account (or an old key): say so instead of recording its results.
+            ("wrong_key".to_string(), json!({"key": q.k.chars().take(12).collect::<String>()}))
+        };
+        detail["at"] = json!(chrono::Utc::now());
+        let url = b["url"].as_str().and_then(|u| url::Url::parse(u).ok()).filter(|u| matches!(u.scheme(), "http" | "https")).map(|u| u.to_string().chars().take(500).collect::<String>());
+        sqlx::query("UPDATE site_tests SET checks = checks || jsonb_build_object($2::text, $3::jsonb), last_seen_at = now(), last_url = COALESCE($4, last_url) WHERE code = $1")
+            .bind(code)
+            .bind(&check)
+            .bind(&detail)
+            .bind(&url)
+            .execute(&state.db)
+            .await?;
+        if check == "loaded" {
+            sqlx::query("UPDATE accounts SET onsite_last_seen_at = now(), onsite_last_url = COALESCE($2, onsite_last_url) WHERE id = $1").bind(account_id).bind(&url).execute(&state.db).await?;
+        }
+        Ok(())
+    }
+    .await;
+    cors(match res {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    })
+}
+
 const ONSITE_JS: &str = include_str!("onsite.js");
+const SHOPIFY_PIXEL_JS: &str = include_str!("shopify_pixel.js");
+
+/// The Shopify custom pixel code for an account, ready to paste.
+pub fn shopify_pixel(state: &AppState, key: &str) -> String {
+    SHOPIFY_PIXEL_JS
+        .replacen("__BASE__", &serde_json::to_string(state.cfg.public_url()).unwrap_or_default(), 1)
+        .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
+}
 
 fn onsite_script(state: &AppState, key: &str, only_form: Option<Uuid>) -> Response {
     let js = ONSITE_JS
@@ -718,4 +812,27 @@ async fn admin_credit(State(state): State<AppState>, headers: HeaderMap, Json(b)
     let bal = crate::billing::balance(&state.db, id).await?;
     tracing::info!(account = %id, amount, "admin credit");
     Ok(Json(json!({"account": name, "balance": crate::billing::to_usd(bal)})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_time;
+    use serde_json::json;
+
+    #[test]
+    fn test_details_keep_only_plain_known_fields() {
+        let d = super::test_detail(&json!({"summary": {"bad": true}, "message": "x".repeat(400), "count": 2, "ok": "yes", "other": 1, "value": 18.5}));
+        assert_eq!(d, json!({"message": "x".repeat(300), "count": 2.0, "value": 18.5}));
+    }
+
+    #[test]
+    fn client_time_accepts_only_the_last_week() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let ms = |d: chrono::Duration| json!((now - d).timestamp_millis());
+        assert_eq!(client_time(&ms(chrono::Duration::hours(5)), now), Some(now - chrono::Duration::hours(5)));
+        assert_eq!(client_time(&ms(chrono::Duration::days(8)), now), None, "too old");
+        assert_eq!(client_time(&ms(-chrono::Duration::minutes(1)), now), None, "in the future");
+        assert_eq!(client_time(&json!("yesterday"), now), None);
+        assert_eq!(client_time(&json!(null), now), None);
+    }
 }

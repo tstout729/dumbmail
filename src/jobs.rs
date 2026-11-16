@@ -155,6 +155,9 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     }
     crate::campaigns::release_abandoned_claims(state).await?;
     crate::campaigns::finish_due_tests(state).await?;
+    if tick.is_multiple_of(180) {
+        sqlx::query("DELETE FROM site_tests WHERE expires_at < now() - interval '7 days'").execute(&state.db).await?;
+    }
     sqlx::query("UPDATE jobs SET locked_at = NULL WHERE locked_at < now() - interval '15 minutes' AND run_at <> 'infinity'")
         .execute(&state.db)
         .await?;

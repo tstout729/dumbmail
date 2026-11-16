@@ -7,6 +7,7 @@ export const keys = {
   phoneNumbers: ["phone-numbers"] as const,
   availableNumbers: (params: object) => ["phone-numbers", "available", params] as const,
   website: ["website"] as const,
+  siteTest: (code: string) => ["site-test", code] as const,
   profiles: (params: object) => ["profiles", params] as const,
   profilesAll: ["profiles"] as const,
   profile: (id: string) => ["profile", id] as const,

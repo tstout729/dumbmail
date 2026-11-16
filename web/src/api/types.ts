@@ -682,10 +682,55 @@ export type SmsConnectInput =
 
 export type WebsiteStatus = {
   snippet: string;
+  /** Code for Shopify's Customer events → custom pixel (checkout and order tracking). */
+  shopify_pixel: string;
   public_key: string;
   installed: boolean;
   last_seen_at: string | null;
   last_seen_url: string | null;
 };
 
-export type WebsiteCheck = { found: boolean; message: string };
+export type SitePlatform = "shopify" | "wordpress" | "squarespace" | "wix" | "webflow" | "framer" | "bigcommerce" | "nextjs";
+
+export type WebsiteCheck = { found: boolean; message: string; platform: SitePlatform | null };
+
+/** One thing the website script reported during a setup test. */
+export type SiteTestCheck = {
+  at: string;
+  ok?: boolean;
+  summary?: string;
+  message?: string;
+  platform?: string;
+  tracked_by?: string;
+  email?: string | null;
+  key?: string;
+  count?: number;
+};
+
+export type SiteTestCheckKey =
+  | "loaded"
+  | "forms"
+  | "product"
+  | "cart"
+  | "checkout"
+  | "order"
+  | "identify"
+  | "pixel"
+  | "custom"
+  | "wrong_key"
+  | "warn_duplicate"
+  | "warn_csp"
+  | "warn_key"
+  | "warn_network";
+
+export type SiteTest = {
+  code: string;
+  url: string | null;
+  open_url: string | null;
+  checks: Partial<Record<SiteTestCheckKey, SiteTestCheck>>;
+  created_at: string;
+  expires_at: string;
+  active: boolean;
+  last_seen_at: string | null;
+  last_url: string | null;
+};
