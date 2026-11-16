@@ -27,7 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/client/forms", get(client_forms))
         .route("/client/ping", post(client_ping).options(cors_preflight))
         .route("/client/events", post(client_event).options(cors_preflight))
-        .route("/client/test", post(client_test).options(cors_preflight).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
+        .route("/client/test", get(client_test_status).post(client_test).options(cors_preflight).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         .route("/client/subscribe", post(client_subscribe).options(cors_preflight))
         .route("/client/forms/{id}/view", post(form_view).options(cors_preflight))
         .route("/f/{id}", get(form_page))
@@ -298,6 +298,27 @@ const TEST_CHECKS: &[&str] = &[
     "loaded", "forms", "product", "cart", "checkout", "order", "identify", "pixel", "custom",
     "warn_duplicate", "warn_csp", "warn_key", "warn_network",
 ];
+
+#[derive(Deserialize)]
+struct TestStatusQuery {
+    k: String,
+    code: String,
+}
+
+/// The website script asks this before turning on test mode from a link, so a made-up code does nothing.
+async fn client_test_status(State(state): State<AppState>, Query(q): Query<TestStatusQuery>) -> Response {
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM site_tests t JOIN accounts a ON a.id = t.account_id WHERE t.code = $1 AND a.public_key = $2 AND t.expires_at > now()",
+    )
+    .bind(&q.code)
+    .bind(&q.k)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut r = cors(Json(json!({"active": active.unwrap_or(false)})).into_response());
+    r.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    r
+}
 
 /// Keep only the fields the dashboard shows, as plain short strings, numbers and booleans.
 fn test_detail(v: &Value) -> Value {

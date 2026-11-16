@@ -1310,6 +1310,14 @@ async fn website_setup_test_and_late_events() {
     let (s, _) = h.req("POST", "/api/website/tests", Some(json!({"url": "not a site"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
+    // The script only enters test mode for a live test of the account its key belongs to.
+    let (_, _, body) = h.raw("GET", &format!("/client/test?k={pk}&code={code}"), &[], "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["active"], true);
+    let (_, _, body) = h.raw("GET", &format!("/client/test?k={pk}&code=madeUpCode123"), &[], "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["active"], false);
+    let (_, _, body) = h.raw("GET", &format!("/client/test?k=pk_other&code={code}"), &[], "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["active"], false);
+
     let report = |check: &str, detail: Value| json!({"code": code, "check": check, "detail": detail, "url": "https://acme.test/products/mug"}).to_string();
     let ct = [("content-type", "application/json")];
     let (s, _, _) = h.raw("POST", &format!("/client/test?k={pk}"), &ct, &report("loaded", json!({"platform": "shopify", "summary": "On acme.test"}))).await;

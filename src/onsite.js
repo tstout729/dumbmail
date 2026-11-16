@@ -128,7 +128,9 @@
 
   // ---------- Test mode ----------
   // ?dumbmail_test=CODE (from the Website page in DumbMail) turns it on for this browser tab for 2 hours.
-  var TEST = null;
+  // A test code from a link only counts once DumbMail confirms it's a live test for this site's account,
+  // so a made-up link can't put a shopper's browser into test mode.
+  var TEST = null, NEW_TEST = null;
   (function () {
     try {
       var u = new URL(location.href), changed = false;
@@ -139,7 +141,7 @@
       if (code) { u.searchParams.delete("dumbmail_test"); changed = true; }
       if (!code) { var m = /[#&]dumbmail_test=([A-Za-z0-9_-]+)/.exec(location.hash); if (m) code = m[1]; }
       if (code === "off") { store.del("pl_test", true); store.del("pl_test_state", true); }
-      else if (code && /^[A-Za-z0-9_-]{6,40}$/.test(code)) { store.set("pl_test", { code: code, until: now() + 2 * 3600000 }, true); store.del("pl_test_state", true); }
+      else if (code && /^[A-Za-z0-9_-]{6,40}$/.test(code) && !ONLY_FORM) NEW_TEST = code;
       if (changed) history.replaceState(history.state, "", u.pathname + (u.search ? u.search : "") + u.hash);
     } catch (e) {}
     if (ONLY_FORM) return;
@@ -227,10 +229,29 @@
         "<br><button data-a='forms'>Show my popups</button><button data-a='end'>End test</button></div>";
       list.innerHTML = h;
     }
-    return { check: check, warn: warn, event: event, draw: draw, state: state };
+    function reset() { state = { checks: {} }; save(); }
+    return { check: check, warn: warn, event: event, draw: draw, reset: reset };
   })();
 
-  if (TEST) {
+  function verifyTest(code, done) {
+    var called = false;
+    function finish() { if (!called) { called = true; done(); } }
+    fetch(BASE + "/client/test?k=" + encodeURIComponent(KEY) + "&code=" + encodeURIComponent(code), { credentials: "omit" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.active === true) {
+          TEST = { code: code, until: now() + 2 * 3600000 };
+          store.set("pl_test", TEST, true);
+          test.reset();
+        }
+        finish();
+      })
+      .catch(finish);
+    setTimeout(finish, 5000);
+  }
+
+  function testHooks() {
+    if (!TEST) return;
     window.__dumbmailDuplicate = function (k) {
       test.warn("duplicate", k === KEY ? "The DumbMail snippet is on this page twice. Remove one copy." : "This page has two DumbMail snippets with different keys. Keep only the one from your Website page.");
     };
@@ -810,14 +831,14 @@
     window.addEventListener("popstate", function () { setTimeout(onRoute, 0); });
   }
 
-  if (!ONLY_FORM) {
-    // Run calls queued before the script loaded: window.dumbmail = window.dumbmail || []; dumbmail.push(["track", ...]) (window.postlark still works)
-    var queued = window.dumbmail || window.postlark;
-    window.dumbmail = window.postlark = api;
+  // Run calls queued before the script loaded: window.dumbmail = window.dumbmail || []; dumbmail.push(["track", ...]) (window.postlark still works)
+  var queued = ONLY_FORM ? null : window.dumbmail || window.postlark;
+  if (!ONLY_FORM) window.dumbmail = window.postlark = api;
+  function runQueued() {
+    if (ONLY_FORM) return;
     var q = (queued && (queued.q || (Array.isArray(queued) ? queued : null))) || window._dumbmailq || window._postlarkq || [];
     for (var i = 0; i < q.length; i++) { var c = q[i]; if (c && api[c[0]]) api[c[0]].apply(api, Array.prototype.slice.call(c, 1)); }
     window._dumbmailq = window._postlarkq = { push: function (c) { if (c && api[c[0]]) api[c[0]].apply(api, Array.prototype.slice.call(c, 1)); } };
-
     if (!TEST) post("/client/ping", { url: location.href });
     if (!store.get("pl_active", true)) { store.set("pl_active", 1, true); if (!TEST) send("Active on Site", { url: location.href, title: document.title, referrer: document.referrer || null }); }
   }
@@ -1019,5 +1040,10 @@
       if (!ONLY_FORM) watchEmbeds();
     });
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
+  function begin() {
+    testHooks();
+    runQueued();
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
+  }
+  if (NEW_TEST) verifyTest(NEW_TEST, begin); else begin();
 })();
