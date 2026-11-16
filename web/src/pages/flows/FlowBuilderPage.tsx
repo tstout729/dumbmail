@@ -7,7 +7,7 @@ import { useFlow, useFlowReport, useLists, useSegments, useSession, useSetFlowSt
 import { EmailEditor } from "../../components/email/EmailEditor";
 import { FlowCanvas, nodeIcons } from "../../components/flows/FlowCanvas";
 import { FlowSettingsEditor } from "../../components/flows/FlowSettingsEditor";
-import { countDescendants, insertAt, newNode, nodeLabels, removeNode, replaceNode, triggerSummary, type Slot } from "../../components/flows/graph";
+import { countDescendants, insertAt, isBranch, newNode, nodeLabels, removeNode, replaceNode, triggerSummary, type Slot } from "../../components/flows/graph";
 import { DeleteStepButton, NodeEditor } from "../../components/flows/NodeEditor";
 import { TriggerEditor } from "../../components/flows/TriggerEditor";
 import { Button, ConfirmDialog, Drawer, Modal, Page, PageHeader, Segmented, Skeleton, Stat, cx } from "../../components/ui";
@@ -103,7 +103,7 @@ function FlowBuilder({ flow }: { flow: Flow }) {
   };
 
   const requestDelete = (node: FlowNode) => {
-    if (node.type === "condition" && countDescendants(def, node.no) > 0) setPendingDelete(node);
+    if (isBranch(node) && countDescendants(def, node.no) > 0) setPendingDelete(node);
     else doDelete(node);
   };
 
@@ -207,7 +207,11 @@ function FlowBuilder({ flow }: { flow: Flow }) {
       {pendingDelete ? (
         <ConfirmDialog
           title="Delete this split?"
-          body={`The Yes branch takes its place. The ${countDescendants(def, pendingDelete.type === "condition" ? pendingDelete.no : null)} steps on the No branch are deleted too.`}
+          body={
+            pendingDelete.type === "random_split"
+              ? `Path A takes its place. The ${countDescendants(def, pendingDelete.no)} steps on path B are deleted too.`
+              : `The Yes branch takes its place. The ${countDescendants(def, isBranch(pendingDelete) ? pendingDelete.no : null)} steps on the No branch are deleted too.`
+          }
           confirmLabel="Delete split"
           danger
           onConfirm={() => doDelete(pendingDelete)}

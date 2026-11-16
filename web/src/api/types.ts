@@ -202,7 +202,23 @@ export type MessageStats = {
 
 // ---- Campaigns ----
 
-export type CampaignStatus = "draft" | "scheduled" | "sending" | "sent" | "cancelled" | "failed";
+export type CampaignStatus = "draft" | "scheduled" | "sending" | "testing" | "sent" | "cancelled" | "failed";
+
+/** A/B test version ids. "a" is the campaign's own content; b-d are `ab_test.variants` in order. */
+export type VersionId = "a" | "b" | "c" | "d";
+export type AbMetric = "open_rate" | "click_rate" | "revenue";
+
+export type AbTest = {
+  variants: { id: Exclude<VersionId, "a">; content: EmailContent | SmsContent }[];
+  /** Share of the audience that gets the test, split evenly across versions (5-100, default 20). */
+  test_percent?: number;
+  /** Hours to wait before picking the winner (1-168, default 4). */
+  wait_hours?: number;
+  /** open_rate is email only. Default click_rate. */
+  metric?: AbMetric;
+  /** auto sends the leader when the wait ends; manual waits for someone to pick. Default auto. */
+  pick?: "auto" | "manual";
+};
 
 export type Campaign = {
   id: string;
@@ -216,9 +232,27 @@ export type Campaign = {
   created_at: string;
   updated_at: string;
   stats: MessageStats;
+  ab_test: AbTest | null;
+  /** When the test slice's wait ends (set once the test slice has gone out). */
+  ab_test_ends_at: string | null;
+  ab_winner: VersionId | null;
+};
+
+export type CampaignAbReport = {
+  metric: AbMetric;
+  pick: "auto" | "manual";
+  test_percent: number;
+  wait_hours: number;
+  ends_at: string | null;
+  winner: VersionId | null;
+  leader: VersionId;
+  /** Probability (0.5-1) that the leader really beats the runner-up; null for revenue. */
+  confidence: number | null;
+  versions: { id: VersionId; stats: MessageStats }[];
 };
 
 export type CampaignReport = {
+  ab_test: CampaignAbReport | null;
   stats: MessageStats;
   links: { url: string; clicks: number }[];
   series: { hour: string; opens: number; clicks: number }[];
@@ -241,6 +275,14 @@ export type ConditionNode = {
   id: string;
   type: "condition";
   condition: SegmentDefinition;
+  yes: string | null;
+  no: string | null;
+};
+/** Sends each person down `yes` (path A) with `percent`% chance, otherwise `no` (path B). */
+export type RandomSplitNode = {
+  id: string;
+  type: "random_split";
+  percent: number;
   yes: string | null;
   no: string | null;
 };
@@ -270,6 +312,7 @@ export type FlowNode =
   | EmailNode
   | SmsNode
   | ConditionNode
+  | RandomSplitNode
   | UpdateProfileNode
   | ListActionNode
   | WebhookNode;
@@ -401,7 +444,12 @@ export type FormConfig = {
   brand_color?: string;
   image_url?: string;
   targeting?: Targeting;
+  /** A/B test: versions b-d in order override these fields; the form itself is version A. */
+  variants?: FormVariant[] | null;
 };
+
+export type FormVariantField = "headline" | "body" | "button_text" | "image_url";
+export type FormVariant = { id: Exclude<VersionId, "a"> } & Partial<Record<FormVariantField, string>>;
 
 export type FormTrigger = "delay" | "scroll" | "exit_intent";
 export type FormDevices = "all" | "desktop" | "mobile";
@@ -427,6 +475,8 @@ export type Form = {
   created_at: string;
   updated_at: string;
   stats: { views: number; submits: number };
+  /** Per-version counts while an A/B test runs (empty otherwise). */
+  variant_stats: { id: VersionId; views: number; submits: number; submit_rate: number }[];
 };
 
 // ---- Events and metrics ----

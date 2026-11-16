@@ -8,16 +8,17 @@ import {
   Mail,
   MessageSquare,
   Plus,
+  Shuffle,
   UserCog,
   Webhook,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import type { FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats } from "../../api";
+import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode } from "../../api";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
 import { Menu, cx } from "../ui";
-import { getSlot, insertableTypes, nodeLabels, type Slot } from "./graph";
+import { getSlot, insertableTypes, isBranch, nodeLabels, type Slot } from "./graph";
 import { PanZoom } from "./PanZoom";
 
 export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }> = {
@@ -25,6 +26,7 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   email: { icon: Mail, tone: "bg-sky-50 text-sky-700" },
   sms: { icon: MessageSquare, tone: "bg-violet-50 text-violet-700" },
   condition: { icon: GitBranch, tone: "bg-amber-50 text-amber-700" },
+  random_split: { icon: Shuffle, tone: "bg-fuchsia-50 text-fuchsia-700" },
   update_profile: { icon: UserCog, tone: "bg-zinc-100 text-zinc-600" },
   add_to_list: { icon: ListPlus, tone: "bg-accent-50 text-accent-700" },
   remove_from_list: { icon: ListMinus, tone: "bg-red-50 text-red-700" },
@@ -139,8 +141,8 @@ function Chain({ slot, ctx, seen }: { slot: Slot; ctx: ChainCtx; seen: Set<strin
     <>
       <AddButton slot={slot} ctx={ctx} />
       <NodeCard node={node} ctx={ctx} />
-      {node.type === "condition" ? <Connector short /> : null}
-      {node.type === "condition" ? (
+      {isBranch(node) ? <Connector short /> : null}
+      {isBranch(node) ? (
         <div className="grid grid-cols-[1fr_1fr]">
           {(["yes", "no"] as const).map((branch) => (
             <div key={branch} className="flex flex-col items-center">
@@ -156,7 +158,7 @@ function Chain({ slot, ctx, seen }: { slot: Slot; ctx: ChainCtx; seen: Set<strin
                   branch === "yes" ? "bg-accent-100 text-accent-800" : "bg-zinc-200 text-zinc-700",
                 )}
               >
-                {branch}
+                {branchLabel(node, branch)}
               </span>
               <Chain slot={{ kind: branch, nodeId: node.id }} ctx={ctx} seen={nextSeen} />
               </div>
@@ -168,6 +170,12 @@ function Chain({ slot, ctx, seen }: { slot: Slot; ctx: ChainCtx; seen: Set<strin
       )}
     </>
   );
+}
+
+/** "yes"/"no" for a conditional split; "A · 50%"/"B · 50%" for a random split. */
+function branchLabel(node: ConditionNode | RandomSplitNode, branch: "yes" | "no"): string {
+  if (node.type === "condition") return branch;
+  return branch === "yes" ? `A · ${node.percent}%` : `B · ${100 - node.percent}%`;
 }
 
 function nodeTitle(node: FlowNode): string {
@@ -188,6 +196,8 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return node.condition.conditions.length
         ? { text: definitionSummary(node.condition, listName) }
         : { text: "No conditions", warning: "Add a condition" };
+    case "random_split":
+      return { text: `${node.percent}% A / ${100 - node.percent}% B` };
     case "update_profile": {
       const keys = Object.keys(node.properties);
       return keys.length ? { text: `Set ${keys.join(", ")}` } : { text: "No properties", warning: "Add a property" };

@@ -4,12 +4,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::state::AppState;
 
-pub async fn enqueue(db: &PgPool, kind: &str, payload: Value, run_at: Option<DateTime<Utc>>) -> sqlx::Result<i64> {
+pub async fn enqueue<'e>(db: impl sqlx::PgExecutor<'e>, kind: &str, payload: Value, run_at: Option<DateTime<Utc>>) -> sqlx::Result<i64> {
     sqlx::query_scalar("INSERT INTO jobs (kind, payload, run_at) VALUES ($1, $2, COALESCE($3, now())) RETURNING id")
         .bind(kind)
         .bind(payload)
@@ -154,6 +153,8 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     for id in due {
         enqueue(&state.db, "campaign_send", json!({"campaign_id": id}), None).await?;
     }
+    crate::campaigns::release_abandoned_claims(state).await?;
+    crate::campaigns::finish_due_tests(state).await?;
     sqlx::query("UPDATE jobs SET locked_at = NULL WHERE locked_at < now() - interval '15 minutes' AND run_at <> 'infinity'")
         .execute(&state.db)
         .await?;

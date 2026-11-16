@@ -824,3 +824,470 @@ async fn public_pages_and_site_verification() {
     assert!(!body.contains("google-site-verification"));
     h.cleanup().await;
 }
+
+// ---------- A/B tests ----------
+
+/// A list of `n` subscribed email profiles (ab0@x.test …), returning the list id.
+async fn ab_list(h: &mut Harness, n: usize) -> String {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "AB"}))).await;
+    let mut csv = String::from("email\n");
+    for i in 0..n {
+        csv.push_str(&format!("ab{i}@x.test\n"));
+    }
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    list["id"].as_str().unwrap().to_string()
+}
+
+fn ab_content(version: &str) -> Value {
+    json!({"subject": format!("Subject {}", version.to_uppercase()), "blocks": [{"type": "button", "text": "Shop", "href": format!("https://acme.test/{version}")}]})
+}
+
+/// An email campaign to the list whose version B has its own subject and link.
+fn ab_campaign(list_id: &str, test: Value) -> Value {
+    let mut test = test;
+    test["variants"] = json!([{"id": "b", "content": ab_content("b")}]);
+    json!({"name": "AB", "channel": "email", "audience": {"include": [{"type": "list", "id": list_id}]}, "content": ab_content("a"), "ab_test": test})
+}
+
+/// (to_address, variant) for a campaign's real messages.
+async fn ab_messages(h: &Harness, cid: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT to_address, variant FROM messages WHERE campaign_id = $1::uuid AND NOT is_test ORDER BY to_address")
+        .bind(cid)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap()
+}
+
+/// The subject each address received for the campaign's subject family ("Subject A"/"Subject B").
+fn subject_to(h: &Harness, to: &str) -> Vec<String> {
+    h.state.email.sent().into_iter().filter(|m| m.to == to && m.subject.starts_with("Subject ")).map(|m| m.subject).collect()
+}
+
+async fn enqueue_duplicate_send(h: &Harness, cid: &str) {
+    sqlx::query("INSERT INTO jobs (kind, payload) VALUES ('campaign_send', jsonb_build_object('campaign_id', $1::text))").bind(cid).execute(&h.state.db).await.unwrap();
+}
+
+async fn end_test_now(h: &Harness, cid: &str) {
+    sqlx::query("UPDATE campaigns SET ab_test_ends_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(cid).execute(&h.state.db).await.unwrap();
+}
+
+#[tokio::test]
+async fn campaign_ab_test_picks_winner_automatically() {
+    let mut h = harness!();
+    h.signup().await;
+    let list_id = ab_list(&mut h, 20).await;
+    let c = h.ok("POST", "/api/campaigns", Some(ab_campaign(&list_id, json!({"test_percent": 50, "wait_hours": 4, "metric": "click_rate", "pick": "auto"})))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    assert_eq!(c["ab_test"]["variants"][0]["id"], "b");
+    assert_eq!(h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await["status"], "sending");
+    h.drain().await;
+
+    // The test slice (half the list) went out split evenly; the campaign waits for results.
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "testing", "{c}");
+    assert!(c["ab_winner"].is_null());
+    let ends: chrono::DateTime<chrono::Utc> = c["ab_test_ends_at"].as_str().unwrap().parse().unwrap();
+    let sent_at: chrono::DateTime<chrono::Utc> = c["sent_at"].as_str().unwrap().parse().unwrap();
+    assert_eq!((ends - sent_at).num_hours(), 4);
+    let msgs = ab_messages(&h, &cid).await;
+    assert_eq!(msgs.len(), 10);
+    assert_eq!(msgs.iter().filter(|m| m.1.as_deref() == Some("a")).count(), 5);
+    assert_eq!(msgs.iter().filter(|m| m.1.as_deref() == Some("b")).count(), 5);
+    for (to, v) in &msgs {
+        assert_eq!(subject_to(&h, to), vec![format!("Subject {}", v.as_deref().unwrap().to_uppercase())], "{to} got its version");
+    }
+    assert_eq!(h.state.email.sent().len(), 10);
+
+    // Four of B's recipients click, one of A's.
+    let clickers: Vec<String> = msgs.iter().filter(|m| m.1.as_deref() == Some("b")).take(4).chain(msgs.iter().filter(|m| m.1.as_deref() == Some("a")).take(1)).map(|m| m.0.clone()).collect();
+    for to in &clickers {
+        let mail = h.state.email.sent().into_iter().find(|m| &m.to == to).unwrap();
+        let click = find_link(&mail.html, "https://pl.test/t/c/").replace("https://pl.test", "");
+        let (s, _, _) = h.raw("GET", &click, &[], "").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+    }
+    // A B clicker orders: revenue is credited to version B.
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": clickers[0]}, "value": 40}))).await;
+
+    let rep = h.ok("GET", &format!("/api/campaigns/{cid}/report"), None).await;
+    let ab = &rep["ab_test"];
+    assert_eq!(ab["leader"], "b", "{ab}");
+    assert!(ab["winner"].is_null());
+    assert!(ab["confidence"].as_f64().unwrap() > 0.5, "{ab}");
+    assert_eq!(ab["versions"][0]["id"], "a");
+    assert_eq!(ab["versions"][0]["stats"]["recipients"], 5);
+    assert_eq!(ab["versions"][0]["stats"]["unique_clicks"], 1);
+    assert_eq!(ab["versions"][1]["stats"]["unique_clicks"], 4);
+    assert_eq!(ab["versions"][1]["stats"]["orders"], 1);
+    assert_eq!(ab["versions"][1]["stats"]["revenue"], 40.0);
+    assert_eq!(ab["versions"][0]["stats"]["revenue"], 0.0);
+
+    // A testing campaign can't be edited or deleted.
+    let (s, _) = h.req("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"name": "x"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = h.req("DELETE", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // Before the wait is over the scheduler leaves it alone.
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "testing");
+
+    // Once it's over, the leader goes to everyone else.
+    end_test_now(&h, &cid).await;
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sent", "{c}");
+    assert_eq!(c["ab_winner"], "b");
+    let msgs = ab_messages(&h, &cid).await;
+    assert_eq!(msgs.len(), 20);
+    let rest: Vec<_> = msgs.iter().filter(|m| m.1.is_none()).collect();
+    assert_eq!(rest.len(), 10);
+    for (to, _) in rest {
+        assert_eq!(subject_to(&h, to), vec!["Subject B".to_string()], "{to} got the winner");
+    }
+    assert_eq!(h.state.email.sent().len(), 20, "nobody got two versions");
+    let rep = h.ok("GET", &format!("/api/campaigns/{cid}/report"), None).await;
+    assert_eq!(rep["ab_test"]["winner"], "b");
+    assert_eq!(rep["stats"]["recipients"], 20);
+    // A second tick doesn't resend.
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    assert_eq!(h.state.email.sent().len(), 20);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn campaign_ab_test_manual_pick_cancel_and_full_test() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let list_id = ab_list(&mut h, 20).await;
+
+    // Manual pick: the scheduler never picks, the sender does.
+    let c = h.ok("POST", "/api/campaigns", Some(ab_campaign(&list_id, json!({"test_percent": 50, "wait_hours": 1, "pick": "manual"})))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "a"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "no winner before the test runs");
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "testing");
+    end_test_now(&h, &cid).await;
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "testing");
+    assert!(c["ab_winner"].is_null());
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "z"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let picked = h.ok("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "a"}))).await;
+    assert_eq!(picked["status"], "sending");
+    assert_eq!(picked["ab_winner"], "a");
+    // Picking queues everyone else in the same step, before any job runs.
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND NOT is_test AND variant IS NULL AND status = 'queued'").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(queued, 10);
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sent");
+    let msgs = ab_messages(&h, &cid).await;
+    assert_eq!(msgs.len(), 20);
+    for (to, _) in msgs.iter().filter(|m| m.1.is_none()) {
+        assert_eq!(subject_to(&h, to), vec!["Subject A".to_string()]);
+    }
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "b"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}/report"), None).await["ab_test"]["winner"], "a");
+    let sent_so_far = h.state.email.sent().len();
+    assert_eq!(sent_so_far, 20);
+
+    // Cancelling while testing stops the winner send.
+    let c = h.ok("POST", "/api/campaigns", Some(ab_campaign(&list_id, json!({"test_percent": 50, "pick": "auto"})))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "testing");
+    assert_eq!(h.state.email.sent().len(), sent_so_far + 10);
+    assert_eq!(h.ok("POST", &format!("/api/campaigns/{cid}/cancel"), None).await["status"], "cancelled");
+    end_test_now(&h, &cid).await;
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "cancelled");
+    assert!(c["ab_winner"].is_null());
+    assert_eq!(ab_messages(&h, &cid).await.len(), 10);
+    assert_eq!(h.state.email.sent().len(), sent_so_far + 10);
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let sent_so_far = h.state.email.sent().len();
+
+    // At 100% everyone is in the test and the campaign is done once it's out.
+    let c = h.ok("POST", "/api/campaigns", Some(ab_campaign(&list_id, json!({"test_percent": 100})))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sent", "{c}");
+    assert!(c["ab_winner"].is_null());
+    let msgs = ab_messages(&h, &cid).await;
+    assert_eq!(msgs.iter().filter(|m| m.1.as_deref() == Some("a")).count(), 10);
+    assert_eq!(msgs.iter().filter(|m| m.1.as_deref() == Some("b")).count(), 10);
+    assert_eq!(h.state.email.sent().len(), sent_so_far + 20);
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn campaign_ab_test_validation() {
+    let mut h = harness!();
+    h.signup().await;
+    let list_id = ab_list(&mut h, 2).await;
+    let base = ab_campaign(&list_id, json!({}));
+    // A variant with empty content gets the fields the editor needs.
+    let mut sparse = base.clone();
+    sparse["ab_test"] = json!({"variants": [{"id": "b", "content": {}}], "metric": "revenue"});
+    let c = h.ok("POST", "/api/campaigns", Some(sparse)).await;
+    assert_eq!(c["ab_test"]["variants"][0]["content"], json!({"subject": "", "blocks": []}));
+    assert!(h.ok("GET", &format!("/api/campaigns/{}/report", c["id"].as_str().unwrap()), None).await["ab_test"]["confidence"].is_null(), "no confidence for revenue");
+    let bad = [
+        json!({"variants": [{"id": "c", "content": {"subject": "C"}}]}),
+        json!({"variants": [{"id": "b", "content": {"subject": "B"}}], "test_percent": 2}),
+        json!({"variants": [{"id": "b", "content": {"subject": "B"}}], "wait_hours": 0}),
+        json!({"variants": [{"id": "b", "content": {"subject": "B"}}], "metric": "vibes"}),
+        json!({"variants": [{"id": "b", "content": {"subject": "B"}}], "pick": "sometimes"}),
+        json!({"variants": [{"id": "b", "content": "B"}]}),
+        json!({"variants": []}),
+        json!("yes"),
+    ];
+    for t in bad {
+        let mut body = base.clone();
+        body["ab_test"] = t.clone();
+        let (s, v) = h.req("POST", "/api/campaigns", Some(body)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{t}: {v}");
+    }
+    let (s, v) = h.req("POST", "/api/campaigns", Some(json!({"channel": "sms", "content": {"body": "hi"},
+        "ab_test": {"variants": [{"id": "b", "content": {"body": "yo"}}], "metric": "open_rate"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "SMS has no opens: {v}");
+
+    // Only variants given: the settings are filled with defaults.
+    let c = h.ok("POST", "/api/campaigns", Some(base.clone())).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    assert_eq!(c["ab_test"]["test_percent"], 20);
+    assert_eq!(c["ab_test"]["wait_hours"], 4);
+    assert_eq!(c["ab_test"]["metric"], "click_rate");
+    assert_eq!(c["ab_test"]["pick"], "auto");
+
+    // Test sends can show either version.
+    h.ok("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["qa@acme.test"], "version": "b"}))).await;
+    assert_eq!(h.state.email.sent().last().unwrap().subject, "[Test] Subject B");
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["qa@acme.test"], "version": "d"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Editing other fields keeps the test; the channel change is re-checked against it.
+    let c = h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"name": "Renamed"}))).await;
+    assert_eq!(c["ab_test"]["variants"][0]["id"], "b");
+    h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": {"variants": [{"id": "b", "content": ab_content("b")}], "metric": "open_rate"}}))).await;
+    let (s, _) = h.req("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"channel": "sms"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = h.req("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": {"variants": [{"id": "b", "content": {}}], "test_percent": 101}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Duplicates carry the test.
+    let copy = h.ok("POST", &format!("/api/campaigns/{cid}/duplicate"), None).await;
+    assert_eq!(copy["ab_test"]["metric"], "open_rate");
+
+    // A version that isn't ready blocks the send.
+    h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": {"variants": [{"id": "b", "content": {"subject": "", "blocks": []}}]}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v.to_string().contains("Version B: Add a subject line"), "{v}");
+
+    // null removes the test.
+    let c = h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": null}))).await;
+    assert!(c["ab_test"].is_null(), "{c}");
+    assert!(h.ok("GET", &format!("/api/campaigns/{cid}/report"), None).await["ab_test"].is_null());
+
+    // Content types are checked; custom-HTML versions don't get blocks added.
+    for bad in [json!({"subject": "B", "blocks": "x"}), json!({"subject": null}), json!({"subject": "B", "html": 5})] {
+        let (s, v) = h.req("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": {"variants": [{"id": "b", "content": bad}]}}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let c = h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": {"variants": [{"id": "b", "content": {"subject": "Subject B", "html": "<p>B</p>"}}]}}))).await;
+    assert_eq!(c["ab_test"]["variants"][0]["content"], json!({"subject": "Subject B", "html": "<p>B</p>"}));
+    let mut sms = base.clone();
+    sms["channel"] = json!("sms");
+    sms["content"] = json!({"body": "A. Reply STOP to opt out."});
+    sms["ab_test"] = json!({"variants": [{"id": "b", "content": {"body": null}}]});
+    let (s, v) = h.req("POST", "/api/campaigns", Some(sms)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
+    // A duplicated send job can't send anyone a second email.
+    h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"ab_test": null}))).await;
+    let before = h.state.email.sent().len();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    enqueue_duplicate_send(&h, &cid).await;
+    h.drain().await;
+    assert_eq!(h.state.email.sent().len() - before, 2, "two recipients, one email each");
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+
+    // A message still claimed by another worker holds the campaign open; an abandoned claim is failed, not resent.
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1::uuid").bind(&cid).execute(&h.state.db).await.unwrap();
+    let mid: uuid::Uuid = sqlx::query_scalar("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = (SELECT id FROM messages WHERE campaign_id = $1::uuid AND NOT is_test LIMIT 1) RETURNING id").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    enqueue_duplicate_send(&h, &cid).await;
+    h.drain().await;
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sending", "an active claim keeps it open");
+    sqlx::query("UPDATE messages SET claimed_at = now() - interval '1 hour' WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    let status: String = sqlx::query_scalar("SELECT status FROM messages WHERE id = $1").bind(mid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(h.state.email.sent().len() - before, 2, "nothing resent");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn flow_random_split() {
+    let mut h = harness!();
+    h.signup().await;
+    let split = |percent: Option<Value>| {
+        let mut node = json!({"id": "s", "type": "random_split", "yes": "pa", "no": "pb"});
+        if let Some(p) = percent {
+            node["percent"] = p;
+        }
+        json!({"name": "Split", "trigger": {"type": "metric", "metric": "Split Me"}, "definition": {"entry": "s", "nodes": [
+            node,
+            {"id": "pa", "type": "update_profile", "properties": {"path": "a"}, "next": null},
+            {"id": "pb", "type": "update_profile", "properties": {"path": "b"}, "next": null}]}})
+    };
+    for p in [Some(json!(0)), Some(json!(100)), None, Some(json!(50.5)), Some(json!("50")), Some(json!(-5))] {
+        let (s, v) = h.req("POST", "/api/flows", Some(split(p.clone()))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{p:?}: {v}");
+    }
+    let mut dangling = split(Some(json!(50)));
+    dangling["definition"]["nodes"][0]["no"] = json!("nowhere");
+    let (s, _) = h.req("POST", "/api/flows", Some(dangling)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let f = h.ok("POST", "/api/flows", Some(split(Some(json!(50))))).await;
+    let fid = f["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    for i in 0..20 {
+        h.ok("POST", "/api/events", Some(json!({"metric": "Split Me", "profile": {"email": format!("s{i}@x.test")}}))).await;
+    }
+    h.drain().await;
+    let paths: Vec<(Option<String>, i64)> = sqlx::query_as("SELECT properties->>'path', count(*) FROM profiles WHERE email LIKE 's%@x.test' GROUP BY 1 ORDER BY 1")
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    let count = |p: &str| paths.iter().find(|x| x.0.as_deref() == Some(p)).map_or(0, |x| x.1);
+    // With 20 people the chance one path gets nobody is about 2 in a million.
+    assert!(count("a") > 0 && count("b") > 0, "{paths:?}");
+    assert_eq!(count("a") + count("b"), 20, "{paths:?}");
+    let rep = h.ok("GET", &format!("/api/flows/{fid}/report"), None).await;
+    assert_eq!(rep["total_runs"], 20);
+    assert_eq!(rep["active_runs"], 0);
+    let entered = |id: &str| rep["nodes"].as_array().unwrap().iter().find(|n| n["node_id"] == id).unwrap()["entered"].as_i64().unwrap();
+    assert_eq!(entered("s"), 20);
+    assert_eq!(entered("pa"), count("a"));
+    assert_eq!(entered("pb"), count("b"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn form_ab_test() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Signups"}))).await;
+    let form_body = |variants: Value| json!({"name": "Popup", "list_id": list["id"], "config": {"headline": "Headline A", "variants": variants}});
+
+    for bad in [
+        json!([{"id": "c", "headline": "C"}]),
+        json!([{"id": "b", "brand_color": "#000000"}]),
+        json!([{"id": "b", "headline": 5}]),
+        json!([{"id": "b", "image_url": "javascript:alert(1)"}]),
+        json!(["b"]),
+        json!("b"),
+        json!([{"id": "b"}, {"id": "c"}, {"id": "d"}, {"id": "e"}]),
+    ] {
+        let (s, v) = h.req("POST", "/api/forms", Some(form_body(bad.clone()))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let form = h.ok("POST", "/api/forms", Some(form_body(json!([{"id": "b", "headline": "Headline B", "body": ""}])))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    assert_eq!(form["variant_stats"], json!([{"id": "a", "views": 0, "submits": 0, "submit_rate": 0.0}, {"id": "b", "views": 0, "submits": 0, "submit_rate": 0.0}]));
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "live"}))).await;
+
+    // Views count per version; unknown versions only count toward the total.
+    for v in ["?v=a", "?v=b", "?v=b", "?v=z", ""] {
+        let (s, _, _) = h.raw("POST", &format!("/client/forms/{fid}/view{v}"), &[], "").await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+    let sub = |email: &str, variant: &str| json!({"form_id": fid, "email": email, "variant": variant}).to_string();
+    let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &sub("fb@x.test", "b")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, _, _) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &sub("fz@x.test", "z")).await;
+    assert_eq!(s, StatusCode::OK);
+    let db = h.state.db.clone();
+    let version_of = move |email: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT e.properties->>'form_version' FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE m.name = 'Subscribed to List' AND p.email = $1")
+                .bind(email)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(version_of("fb@x.test").await.as_deref(), Some("b"));
+    assert_eq!(version_of("fz@x.test").await, None);
+
+    let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
+    assert_eq!(f["stats"], json!({"views": 5, "submits": 2}));
+    assert_eq!(f["variant_stats"][0], json!({"id": "a", "views": 1, "submits": 0, "submit_rate": 0.0}));
+    assert_eq!(f["variant_stats"][1], json!({"id": "b", "views": 2, "submits": 1, "submit_rate": 0.5}));
+
+    // The hosted page shows one version and posts it back with the sign-up.
+    let (s, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let shown = if html.contains(r#"<input type="hidden" name="variant" value="b">"#) {
+        "b"
+    } else {
+        assert!(html.contains(r#"<input type="hidden" name="variant" value="a">"#), "{html}");
+        "a"
+    };
+    assert!(html.contains(&format!("<h1>Headline {}</h1>", shown.to_uppercase())), "{html}");
+    assert!(html.contains("Join our list"), "an empty variant field falls back to the form's own");
+    let (s, _, _) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/x-www-form-urlencoded")], &format!("form_id={fid}&email=fh%40x.test&variant={shown}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(version_of("fh@x.test").await.as_deref(), Some(shown));
+    let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
+    let i = if shown == "a" { 0 } else { 1 };
+    let (views, submits) = if shown == "a" { (2, 1) } else { (3, 2) };
+    assert_eq!(f["variant_stats"][i]["views"], views, "{f}");
+    assert_eq!(f["variant_stats"][i]["submits"], submits, "{f}");
+    assert_eq!(f["stats"], json!({"views": 6, "submits": 3}));
+    let listed = h.ok("GET", "/api/forms", None).await;
+    assert_eq!(listed["data"][0]["variant_stats"], f["variant_stats"]);
+
+    // Edits that leave a version's content alone keep its counts; changing what it shows starts it over.
+    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"success_message": "Welcome!"}}))).await;
+    assert_eq!(f["variant_stats"][1]["submits"], if shown == "b" { 2 } else { 1 });
+    assert_eq!(f["variant_stats"][0]["views"], if shown == "a" { 2 } else { 1 });
+    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"headline": "New A"}}))).await;
+    assert_eq!(f["variant_stats"][0], json!({"id": "a", "views": 0, "submits": 0, "submit_rate": 0.0}), "A changed");
+    assert_eq!(f["variant_stats"][1]["submits"], if shown == "b" { 2 } else { 1 }, "B overrides the headline, so it still shows the same");
+    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"variants": [{"id": "b", "headline": "Headline B", "button_text": "Join"}]}}))).await;
+    assert_eq!(f["variant_stats"][1], json!({"id": "b", "views": 0, "submits": 0, "submit_rate": 0.0}), "B changed");
+    // Ending the test drops every count.
+    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"variants": []}}))).await;
+    assert_eq!(f["variant_stats"], json!([]));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM form_variant_stats WHERE form_id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(rows, 0);
+    let (_, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert!(!html.contains(r#"name="variant""#));
+    assert!(html.contains("<h1>New A</h1>"));
+    h.cleanup().await;
+}

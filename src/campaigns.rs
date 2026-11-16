@@ -26,6 +26,93 @@ pub struct AudienceRef {
     pub id: Uuid,
 }
 
+/// Version ids in order: A is the campaign's own content, B-D live in `AbTest::variants`.
+pub const VERSION_IDS: [&str; 4] = ["a", "b", "c", "d"];
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AbVariant {
+    pub id: String,
+    pub content: Value,
+}
+
+/// A campaign A/B test: a random `test_percent` of the audience is split evenly across the
+/// versions; after `wait_hours` the leader on `metric` goes to everyone else (`pick` = auto),
+/// or the sender picks it (`pick` = manual). At 100% everyone is in the test and there's no winner send.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AbTest {
+    pub variants: Vec<AbVariant>,
+    #[serde(default = "default_test_percent")]
+    pub test_percent: i64,
+    #[serde(default = "default_wait_hours")]
+    pub wait_hours: i64,
+    #[serde(default = "default_metric")]
+    pub metric: String,
+    #[serde(default = "default_pick")]
+    pub pick: String,
+}
+
+fn default_test_percent() -> i64 {
+    20
+}
+fn default_wait_hours() -> i64 {
+    4
+}
+fn default_metric() -> String {
+    "click_rate".into()
+}
+fn default_pick() -> String {
+    "auto".into()
+}
+
+impl AbTest {
+    pub fn versions(&self) -> Vec<String> {
+        VERSION_IDS[..=self.variants.len()].iter().map(|v| v.to_string()).collect()
+    }
+}
+
+pub fn parse_ab_test(channel: &str, v: &Value) -> AppResult<AbTest> {
+    let t: AbTest = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid ab_test: {e}")))?;
+    if t.variants.is_empty() || t.variants.len() > 3 {
+        return Err(AppError::bad("an A/B test needs 1 to 3 versions besides A"));
+    }
+    for (i, var) in t.variants.iter().enumerate() {
+        if var.id != VERSION_IDS[i + 1] {
+            return Err(AppError::bad("A/B test versions must be named b, c and d, in order"));
+        }
+        if !var.content.is_object() {
+            return Err(AppError::bad(format!("version {} needs content", var.id.to_uppercase())));
+        }
+    }
+    if !(5..=100).contains(&t.test_percent) {
+        return Err(AppError::bad("test_percent must be between 5 and 100"));
+    }
+    if !(1..=168).contains(&t.wait_hours) {
+        return Err(AppError::bad("wait_hours must be between 1 and 168"));
+    }
+    match (t.metric.as_str(), channel) {
+        ("open_rate", "email") | ("click_rate", _) | ("revenue", _) => {}
+        ("open_rate", _) => return Err(AppError::bad("SMS has no opens; pick the winner by click_rate or revenue")),
+        _ => return Err(AppError::bad("metric must be open_rate, click_rate or revenue")),
+    }
+    if !matches!(t.pick.as_str(), "auto" | "manual") {
+        return Err(AppError::bad("pick must be auto or manual"));
+    }
+    Ok(t)
+}
+
+/// The campaign's A/B test, if it has one.
+pub fn ab_test(c: &CampaignRow) -> Option<AbTest> {
+    c.ab_test.as_ref().filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// The content a version sends: A (or no version) is the campaign's own content.
+pub fn version_content<'a>(c: &'a CampaignRow, ab: Option<&'a AbTest>, version: Option<&str>) -> Option<&'a Value> {
+    match version {
+        None | Some("a") => Some(&c.content),
+        Some(v) => ab?.variants.iter().find(|x| x.id == v).map(|x| &x.content),
+    }
+}
+
 enum Resolved {
     List(Uuid),
     Segment(Definition),
@@ -126,17 +213,42 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
     if aud.include.is_empty() {
         problems.push("Pick at least one list or segment".to_string());
     }
+    problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
+    if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
+        match parse_ab_test(&c.channel, v) {
+            Ok(t) => {
+                for var in &t.variants {
+                    let label = format!("Version {}", var.id.to_uppercase());
+                    problems.extend(content_problems(account, &c.channel, &var.content, verify_domain).into_iter().map(|p| format!("{label}: {p}")));
+                }
+            }
+            Err(e) => problems.push(e.public_message()),
+        }
+    }
     if c.channel == "email" {
-        let subject = c.content.get("subject").and_then(|s| s.as_str()).unwrap_or("");
+        if account.address.as_deref().unwrap_or("").trim().is_empty() {
+            problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
+        }
+    } else if account.sms_from.is_none() {
+        problems.push("Set an SMS sending number in Settings → SMS".into());
+    }
+    problems
+}
+
+/// Problems with one version's content (subject, body, sender).
+fn content_problems(account: &Account, channel: &str, content: &Value, verify_domain: bool) -> Vec<String> {
+    let mut problems = Vec::new();
+    if channel == "email" {
+        let subject = content.get("subject").and_then(|s| s.as_str()).unwrap_or("");
         if subject.trim().is_empty() {
             problems.push("Add a subject line".into());
         }
-        let has_body = c.content.get("blocks").and_then(|b| b.as_array()).is_some_and(|b| !b.is_empty())
-            || c.content.get("html").and_then(|h| h.as_str()).is_some_and(|h| !h.trim().is_empty());
+        let has_body = content.get("blocks").and_then(|b| b.as_array()).is_some_and(|b| !b.is_empty())
+            || content.get("html").and_then(|h| h.as_str()).is_some_and(|h| !h.trim().is_empty());
         if !has_body {
             problems.push("Add email content".into());
         }
-        let from = c.content.get("from_email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or(account.from_email.clone());
+        let from = content.get("from_email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or(account.from_email.clone());
         if from.is_none() {
             problems.push("Set a sender email in Settings → Sending".into());
         }
@@ -145,34 +257,49 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
                 problems.push(e);
             }
         }
-        if account.address.as_deref().unwrap_or("").trim().is_empty() {
-            problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
-        }
-    } else {
-        if c.content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
-            problems.push("Write the SMS message".into());
-        }
-        if account.sms_from.is_none() {
-            problems.push("Set an SMS sending number in Settings → SMS".into());
-        }
+    } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
+        problems.push("Write the SMS message".into());
     }
     problems
 }
 
 /// Job: create queued message rows for every recipient, then fan out batches.
+/// With an A/B test and no winner yet, only the test slice gets rows (each with its version);
+/// once a winner is picked this runs again and adds everyone else.
 pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result<()> {
-    let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1").bind(campaign_id).fetch_one(&state.db).await?;
+    // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
+    let mut tx = state.db.begin().await?;
+    let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;
     if c.status != "sending" {
         return Ok(());
     }
     let audience: Audience = serde_json::from_value(c.audience.clone())?;
-    let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
-    qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ");
-    qb.push(if c.channel == "sms" { "p.phone_number" } else { "p.email" });
-    append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
-    qb.build().execute(&state.db).await?;
-    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&state.db).await?;
+    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let ab = ab_test(&c);
+    let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
+    let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
+    match (&ab, &c.ab_winner) {
+        (Some(t), None) if !started => {
+            // Test slice: a random sample, dealt round-robin across the versions.
+            let versions = t.versions();
+            let n = versions.len() as i64;
+            let total = estimate(&state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
+            let size = if t.test_percent >= 100 { total } else { ((total * t.test_percent + 99) / 100).max(n).min(total) };
+            let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, variant) SELECT gen_random_uuid(), x.account_id, x.id, ");
+            qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", x.addr, (").push_bind(versions).push("::text[])[1 + ((row_number() OVER () - 1) % ").push_bind(n).push(")::int] FROM (SELECT p.account_id, p.id, ");
+            qb.push(addr).push(" AS addr");
+            append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
+            qb.push(" ORDER BY random() LIMIT ").push_bind(size).push(") x");
+            qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
+            qb.build().execute(&mut *tx).await?;
+        }
+        // The test slice was already created (this job is a retry): just send what's queued.
+        (Some(_), None) => {}
+        // Everyone (no test), or everyone left after the test (a retry; pick_winner normally adds them).
+        _ => insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?,
+    }
+    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
+    tx.commit().await?;
 
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY id")
         .bind(c.id)
@@ -187,10 +314,29 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     Ok(())
 }
 
+/// Queue a message (with no version: the winner, or the only content) for every audience member who has none yet.
+async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState, c: &CampaignRow) -> AppResult<()> {
+    let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
+    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
+    qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
+    append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await?;
+    qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
+    qb.build().execute(&mut **tx).await?;
+    Ok(())
+}
+
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE campaigns SET status = 'sent', updated_at = now() WHERE id = $1 AND status = 'sending'
-         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test)",
+        // A test slice that has gone out waits for its results ('testing') before the winner send;
+        // the wait starts when the last test message is handled (sends can be deferred, e.g. SMS quiet hours).
+        "UPDATE campaigns SET
+           status = CASE WHEN awaiting_winner THEN 'testing' ELSE 'sent' END,
+           ab_test_ends_at = CASE WHEN awaiting_winner THEN now() + make_interval(hours => (ab_test->>'wait_hours')::int) ELSE ab_test_ends_at END,
+           updated_at = now()
+         FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
+         WHERE id = $1 AND status = 'sending'
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)",
     )
     .bind(campaign_id)
     .execute(db)
@@ -209,20 +355,33 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     let account = load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT id, profile_id FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
+    let ab = ab_test(&c);
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
         .bind(ids)
         .fetch_all(&state.db)
         .await?;
-    for (i, (mid, pid)) in rows.iter().enumerate() {
+    for (i, mid) in rows.iter().enumerate() {
+        // Claim the message so a duplicate or retried batch can't send it again. A crash mid-send leaves it
+        // 'sending'; release_abandoned_claims fails it later instead of retrying: at most once, never twice.
+        let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING profile_id, variant")
+            .bind(mid)
+            .fetch_optional(&state.db)
+            .await?;
+        let Some((pid, variant)) = claimed else { continue };
         let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
-        let Some(profile) = sqlx::query_as::<_, Profile>(&q).bind(pid).fetch_optional(&state.db).await? else { continue };
+        let Some(profile) = sqlx::query_as::<_, Profile>(&q).bind(pid).fetch_optional(&state.db).await? else {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'profile deleted' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            continue;
+        };
+        // Test-slice messages carry their version; everyone after the test gets the winner.
+        let content = version_content(&c, ab.as_ref(), variant.as_deref().or(c.ab_winner.as_deref())).unwrap_or(&c.content);
         let outcome = sending::send(
             state,
             SendSpec {
                 account: &account,
                 profile: &profile,
                 channel: &c.channel,
-                content: &c.content,
+                content,
                 campaign_id: Some(c.id),
                 flow_id: None,
                 flow_node_id: None,
@@ -235,7 +394,8 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         .await;
         match outcome {
             Ok(Outcome::Deferred(until)) => {
-                let rest: Vec<Uuid> = rows[i..].iter().map(|r| r.0).collect();
+                sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(mid).execute(&state.db).await?;
+                let rest: Vec<Uuid> = rows[i..].to_vec();
                 crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": rest}), Some(until)).await?;
                 return Ok(());
             }
@@ -245,9 +405,10 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
             Ok(_) => {}
             Err(e) => {
                 // A content problem affects every recipient: fail the campaign instead of retrying forever.
-                sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND status = 'queued'")
+                sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)")
                     .bind(c.id)
                     .bind(e.public_message())
+                    .bind(mid)
                     .execute(&state.db)
                     .await?;
                 sqlx::query("UPDATE campaigns SET status = 'failed', error = $2 WHERE id = $1").bind(c.id).bind(e.public_message()).execute(&state.db).await?;
@@ -259,14 +420,14 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
 }
 
 /// Attribution: each conversion credited to the newest email opened/clicked in the prior 5 days,
-/// or SMS clicked in the prior 24 hours. Yields (event id, value, occurred_at, campaign_id, flow_id, flow_node_id).
+/// or SMS clicked in the prior 24 hours. Yields (event id, value, occurred_at, campaign_id, flow_id, flow_node_id, variant).
 pub const ATTRIBUTION_SQL: &str = "
-    SELECT e.id AS event_id, COALESCE(e.value, 0) AS value, e.occurred_at, att.campaign_id, att.flow_id, att.flow_node_id
+    SELECT e.id AS event_id, COALESCE(e.value, 0) AS value, e.occurred_at, att.campaign_id, att.flow_id, att.flow_node_id, att.variant
     FROM events e
     JOIN metrics mt ON mt.id = e.metric_id
     JOIN accounts a ON a.id = e.account_id AND mt.name = a.conversion_metric
     LEFT JOIN LATERAL (
-        SELECT m.campaign_id, m.flow_id, m.flow_node_id FROM messages m
+        SELECT m.campaign_id, m.flow_id, m.flow_node_id, m.variant FROM messages m
         WHERE m.profile_id = e.profile_id AND NOT m.is_test AND (
             (m.channel = 'email' AND GREATEST(m.opened_at, m.clicked_at) BETWEEN e.occurred_at - interval '5 days' AND e.occurred_at)
             OR (m.channel = 'sms' AND m.clicked_at BETWEEN e.occurred_at - interval '1 day' AND e.occurred_at))
@@ -284,10 +445,135 @@ pub async fn stats(db: &PgPool, account_id: Uuid, campaign_id: Uuid) -> AppResul
     Ok(s.finish())
 }
 
-pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String]) -> AppResult<usize> {
+/// Stats for each version's test-slice recipients, in version order.
+pub async fn version_stats(db: &PgPool, account_id: Uuid, campaign_id: Uuid, versions: &[String]) -> AppResult<Vec<MessageStats>> {
+    let mut out = Vec::with_capacity(versions.len());
+    for v in versions {
+        let q = format!("SELECT {STATS_SELECT} FROM messages m WHERE m.campaign_id = $1 AND m.variant = $2 AND NOT m.is_test AND m.status <> 'skipped'");
+        let mut s: MessageStats = sqlx::query_as(&q).bind(campaign_id).bind(v).fetch_one(db).await?;
+        let q = format!("SELECT count(*)::bigint, COALESCE(sum(value), 0)::float8 FROM ({ATTRIBUTION_SQL} AND e.profile_id IN (SELECT profile_id FROM messages WHERE campaign_id = $2)) x WHERE x.campaign_id = $2 AND x.variant = $3");
+        let (orders, revenue): (i64, f64) = sqlx::query_as(&q).bind(account_id).bind(campaign_id).bind(v).fetch_one(db).await?;
+        s.orders = orders;
+        s.revenue = revenue;
+        out.push(s.finish());
+    }
+    Ok(out)
+}
+
+/// The leading version on `metric` (ties go to the earlier version, so A wins a dead heat) and the
+/// confidence, from 0.5 (a coin flip) to 1.0, that it really beats the runner-up. Revenue has no
+/// confidence: one large order can swing revenue per recipient, and order counts don't capture that.
+pub fn leader(metric: &str, stats: &[MessageStats]) -> (usize, Option<f64>) {
+    let score = |s: &MessageStats| match metric {
+        "open_rate" => s.open_rate,
+        "revenue" => s.revenue / s.delivered.max(1) as f64,
+        _ => s.click_rate,
+    };
+    let mut best = 0;
+    for (i, s) in stats.iter().enumerate() {
+        if score(s) > score(&stats[best]) {
+            best = i;
+        }
+    }
+    if metric == "revenue" {
+        return (best, None);
+    }
+    let runner_up = (0..stats.len()).filter(|&i| i != best).max_by(|&a, &b| score(&stats[a]).total_cmp(&score(&stats[b])));
+    let Some(r) = runner_up else { return (best, Some(0.5)) };
+    // Two-proportion z-test on the rate.
+    let hits = |s: &MessageStats| if metric == "open_rate" { s.unique_opens } else { s.unique_clicks } as f64;
+    let (n1, n2) = (stats[best].delivered as f64, stats[r].delivered as f64);
+    if n1 == 0.0 || n2 == 0.0 {
+        return (best, Some(0.5));
+    }
+    let (p1, p2) = (hits(&stats[best]) / n1, hits(&stats[r]) / n2);
+    let pooled = (hits(&stats[best]) + hits(&stats[r])) / (n1 + n2);
+    let se = (pooled * (1.0 - pooled) * (1.0 / n1 + 1.0 / n2)).sqrt();
+    // A tie is a coin flip; the CDF approximation is off by ~5e-10 at z = 0.
+    if se == 0.0 || p1 <= p2 {
+        return (best, Some(0.5));
+    }
+    (best, Some(normal_cdf((p1 - p2) / se).max(0.5)))
+}
+
+/// Standard normal CDF (Abramowitz and Stegun 7.1.26, error < 1.5e-7).
+fn normal_cdf(z: f64) -> f64 {
+    let x = z.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let erf = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
+    if z >= 0.0 { 0.5 * (1.0 + erf) } else { 0.5 * (1.0 - erf) }
+}
+
+/// End a campaign's test: send `chosen` (or the leader, when None) to everyone not in the test slice.
+pub async fn pick_winner(state: &AppState, c: &CampaignRow, chosen: Option<&str>) -> AppResult<CampaignRow> {
+    let t = ab_test(c).ok_or_else(|| AppError::bad("this campaign has no A/B test"))?;
+    if c.status != "testing" {
+        return Err(AppError::Conflict(format!("this campaign is {}, not waiting on test results", c.status)));
+    }
+    let versions = t.versions();
+    let winner = match chosen {
+        Some(v) if versions.iter().any(|x| x == v) => v.to_string(),
+        Some(_) => return Err(AppError::bad(format!("pick one of: {}", versions.join(", ")))),
+        None => {
+            let stats = version_stats(&state.db, c.account_id, c.id, &versions).await?;
+            versions[leader(&t.metric, &stats).0].clone()
+        }
+    };
+    // One transaction: record the winner, queue everyone else and the send job, so a crash can't leave
+    // a campaign 'sending' with nothing queued, and no batch can mark it sent before the rest are queued.
+    let mut tx = state.db.begin().await?;
+    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET ab_winner = $2, status = 'sending', updated_at = now() WHERE id = $1 AND status = 'testing' RETURNING *")
+        .bind(c.id)
+        .bind(&winner)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let row = row.ok_or_else(|| AppError::Conflict("the winner was already picked".into()))?;
+    insert_rest(&mut tx, state, &row).await?;
+    crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": c.id}), None).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// How long a claimed campaign message can stay 'sending' before it counts as interrupted (a send takes seconds).
+const CLAIM_TIMEOUT_MINUTES: i32 = 10;
+
+/// Scheduler: a worker that crashed mid-send leaves its message 'sending'. Mark those failed (they may or
+/// may not have gone out, so they're never resent) and let their campaigns finish.
+pub async fn release_abandoned_claims(state: &AppState) -> anyhow::Result<()> {
+    let campaigns: Vec<Uuid> = sqlx::query_scalar(
+        "WITH r AS (UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
+                    WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
+                    RETURNING campaign_id)
+         SELECT DISTINCT campaign_id FROM r",
+    )
+    .bind(CLAIM_TIMEOUT_MINUTES)
+    .fetch_all(&state.db)
+    .await?;
+    for id in campaigns {
+        finish_if_done(&state.db, id).await?;
+    }
+    Ok(())
+}
+
+/// Scheduler: tests whose wait is over and that pick automatically send their leader.
+pub async fn finish_due_tests(state: &AppState) -> anyhow::Result<()> {
+    let due: Vec<CampaignRow> = sqlx::query_as("SELECT * FROM campaigns WHERE status = 'testing' AND ab_test_ends_at <= now() AND ab_test->>'pick' = 'auto'")
+        .fetch_all(&state.db)
+        .await?;
+    for c in due {
+        if let Err(e) = pick_winner(state, &c, None).await {
+            tracing::warn!(campaign = %c.id, error = %e.public_message(), "couldn't finish A/B test");
+        }
+    }
+    Ok(())
+}
+
+pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>) -> AppResult<usize> {
     if to.is_empty() || to.len() > 10 {
         return Err(AppError::bad("send tests to 1-10 addresses"));
     }
+    let ab = ab_test(c);
+    let content = version_content(c, ab.as_ref(), version).ok_or_else(|| AppError::bad("this campaign has no such version"))?;
     let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'")
         .bind(account.id)
         .fetch_one(&state.db)
@@ -320,7 +606,7 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
                 account,
                 profile: &profile,
                 channel: &c.channel,
-                content: &c.content,
+                content,
                 campaign_id: Some(c.id),
                 flow_id: None,
                 flow_node_id: None,
@@ -338,4 +624,44 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         }
     }
     Ok(sent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(delivered: i64, opens: i64, clicks: i64) -> MessageStats {
+        MessageStats { delivered, unique_opens: opens, unique_clicks: clicks, ..Default::default() }.finish()
+    }
+
+    #[test]
+    fn leader_and_confidence() {
+        // Clear win: 30% vs 10% clicks on 1,000 each.
+        let (i, conf) = leader("click_rate", &[stats(1000, 0, 100), stats(1000, 0, 300)]);
+        assert_eq!(i, 1);
+        assert!(conf.unwrap() > 0.99, "{conf:?}");
+        // A dozen opens can't call a winner.
+        let (i, conf) = leader("open_rate", &[stats(20, 5, 0), stats(20, 7, 0)]);
+        assert_eq!(i, 1);
+        assert!(conf.unwrap() < 0.9, "{conf:?}");
+        // A dead heat goes to A at coin-flip confidence.
+        assert_eq!(leader("click_rate", &[stats(100, 0, 5), stats(100, 0, 5)]), (0, Some(0.5)));
+        // Revenue per recipient picks the leader, with no confidence figure.
+        let rev = |delivered, revenue| MessageStats { delivered, revenue, ..Default::default() };
+        assert_eq!(leader("revenue", &[rev(100, 90.0), rev(100, 120.0)]), (1, None));
+        assert!((normal_cdf(1.96) - 0.975).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ab_test_validation() {
+        let ok = json!({"variants": [{"id": "b", "content": {"subject": "B"}}], "test_percent": 20, "wait_hours": 4, "metric": "open_rate"});
+        assert_eq!(parse_ab_test("email", &ok).unwrap().versions(), vec!["a", "b"]);
+        assert!(parse_ab_test("sms", &ok).is_err(), "SMS can't be judged on opens");
+        let skip = json!({"variants": [{"id": "c", "content": {}}]});
+        assert!(parse_ab_test("email", &skip).is_err());
+        let none = json!({"variants": []});
+        assert!(parse_ab_test("email", &none).is_err());
+        let big = json!({"variants": [{"id": "b", "content": {}}], "test_percent": 101});
+        assert!(parse_ab_test("email", &big).is_err());
+    }
 }

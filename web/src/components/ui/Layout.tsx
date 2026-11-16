@@ -102,6 +102,8 @@ const statusTones: Record<string, Tone> = {
   draft: "gray",
   scheduled: "blue",
   sending: "amber",
+  // A/B test slice sent; waiting on results before the winner goes out.
+  testing: "violet",
   sent: "green",
   cancelled: "gray",
   failed: "red",

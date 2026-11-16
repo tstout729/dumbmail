@@ -26,8 +26,8 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
     let since = format!("now() - interval '{days} days'");
 
     let (sent_email, sent_sms, delivered, opens, clicks, unsubs, bounces): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
-        "SELECT count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','failed','skipped')),
-                count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','failed','skipped')),
+        "SELECT count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','sending','failed','skipped')),
+                count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','sending','failed','skipped')),
                 count(*) FILTER (WHERE channel = 'email' AND status IN ('sent','delivered')),
                 count(opened_at) FILTER (WHERE channel = 'email'),
                 count(clicked_at),
@@ -63,8 +63,8 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
               date_trunc('day', ({since}) AT TIME ZONE $2), date_trunc('day', now() AT TIME ZONE $2), interval '1 day') g),
          m AS (
             SELECT to_char(created_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day,
-                   count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','failed','skipped')) AS emails,
-                   count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','failed','skipped')) AS sms
+                   count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','sending','failed','skipped')) AS emails,
+                   count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','sending','failed','skipped')) AS sms
             FROM messages WHERE account_id = $1 AND NOT is_test AND created_at >= {since} GROUP BY 1),
          o AS (SELECT to_char(opened_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n FROM messages WHERE account_id = $1 AND NOT is_test AND opened_at >= {since} GROUP BY 1),
          c AS (SELECT to_char(clicked_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n FROM messages WHERE account_id = $1 AND NOT is_test AND clicked_at >= {since} GROUP BY 1),
@@ -84,7 +84,7 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
         .collect();
 
     let top_campaigns: Vec<(Uuid, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(&format!(
-        "SELECT id, name, sent_at FROM campaigns WHERE account_id = $1 AND status IN ('sent','sending') AND sent_at >= {since} ORDER BY sent_at DESC LIMIT 10"
+        "SELECT id, name, sent_at FROM campaigns WHERE account_id = $1 AND status IN ('sent','sending','testing') AND sent_at >= {since} ORDER BY sent_at DESC LIMIT 10"
     ))
     .bind(account_id)
     .fetch_all(&state.db)

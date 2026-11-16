@@ -112,6 +112,11 @@ pub struct CampaignRow {
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// A/B test settings and the extra versions (version A is `content`); see `campaigns::AbTest`.
+    pub ab_test: Option<Value>,
+    /// When the test slice's results are read and the winner goes to everyone else.
+    pub ab_test_ends_at: Option<DateTime<Utc>>,
+    pub ab_winner: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

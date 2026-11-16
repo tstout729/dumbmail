@@ -2,7 +2,7 @@ import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState } from "react";
 import { Link, useBlocker, useNavigate, useParams } from "react-router";
 import { CheckCircle2, CircleDashed, ExternalLink, Monitor, Smartphone, Trash2, X } from "lucide-react";
-import type { Form, FormConfig, FormDevices, FormField, FormKind, FormTrigger, Targeting } from "../../api";
+import type { Form, FormConfig, FormDevices, FormField, FormKind, FormTrigger, FormVariant, Targeting, VersionId } from "../../api";
 import { useDeleteForm, useForm, useLists, useUpdateForm, useWebsite } from "../../api";
 import {
   Button,
@@ -29,6 +29,20 @@ import {
 import { formatNumber, formatPercent, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { formKinds } from "./FormsPage";
+import {
+  AbResultsCard,
+  AbTestCard,
+  SharedTitle,
+  VersionTabs,
+  newVariant,
+  nextVariantId,
+  removeVariant,
+  variantFields,
+  versionConfig,
+  versionIds,
+  versionLabel,
+  type VariantId,
+} from "./FormAbTest";
 
 export function FormEditorPage() {
   const { id = "" } = useParams();
@@ -67,6 +81,8 @@ function FormEditor({ form }: { form: Form }) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [tab, setTab] = useState<"design" | "install">("design");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [version, setVersion] = useState<VersionId>("a");
+  const [confirmAb, setConfirmAb] = useState<{ kind: "end" } | { kind: "remove"; id: VariantId } | { kind: "use"; id: VersionId } | null>(null);
   const current: Draft = draft ?? { name: form.name, kind: form.kind, list_id: form.list_id, config: form.config };
   const dirty = draft !== null;
   const c = current.config;
@@ -80,6 +96,64 @@ function FormEditor({ form }: { form: Form }) {
   const toggleField = (f: FormField, on: boolean) => {
     const collect = on ? [...c.collect, f] : c.collect.filter((x) => x !== f);
     setConfig({ collect: collect.length ? collect : ["email"] });
+  };
+
+  const variants = c.variants ?? [];
+  const versions = versionIds(c);
+  // A saved result can be picked only while that letter still shows the same content as when it was counted
+  // (removing or editing a version re-letters or changes it until saved).
+  const savedVersions = versionIds(form.config);
+  const pickable = versions.filter(
+    (v) => savedVersions.includes(v) && variantFields.every((k) => versionConfig(c, v)[k] === versionConfig(form.config, v)[k]),
+  );
+  const testing = versions.length > 0;
+  // The selected tab falls back to A when its version is removed or the test ends.
+  const selected: VersionId = versions.includes(version) ? version : "a";
+  const variant = variants.find((v) => v.id === selected);
+  const setVariant = (patch: Partial<FormVariant>) =>
+    setConfig({ variants: variants.map((v) => (v.id === selected ? { ...v, ...patch } : v)) });
+  const viewsFor = (id: VersionId) => form.variant_stats.find((s) => s.id === id)?.views ?? 0;
+
+  const addVersion = () => {
+    const id = nextVariantId(c);
+    if (!id) return;
+    setConfig({ variants: [...variants, newVariant(c, id)] });
+    setVersion(id);
+  };
+  const endTest = () => {
+    setConfig({ variants: [] });
+    setVersion("a");
+    setConfirmAb(null);
+  };
+  const doRemove = (id: VariantId) => {
+    setConfig({ variants: removeVariant(variants, id) });
+    setVersion("a");
+    setConfirmAb(null);
+  };
+  // Removing a version re-letters the ones after it, and the server resets the counts of every version whose content changed: warn first.
+  const requestRemove = (id: VariantId) => {
+    const affected = variants.slice(variants.findIndex((v) => v.id === id));
+    if (affected.some((v) => viewsFor(v.id) > 0)) setConfirmAb({ kind: "remove", id });
+    else doRemove(id);
+  };
+  const requestEnd = () => (form.variant_stats.some((s) => s.views > 0) ? setConfirmAb({ kind: "end" }) : endTest());
+  /** Copies the version's content into the form and ends the test, along with any other unsaved edits, in one save. */
+  const applyVersion = (id: VersionId) => {
+    const v = versionConfig(c, id);
+    update.mutate(
+      {
+        ...(draft ?? {}),
+        config: { ...c, headline: v.headline, body: v.body, button_text: v.button_text, image_url: v.image_url, variants: [] },
+      },
+      {
+        onSuccess: () => {
+          setDraft(null);
+          setConfirmAb(null);
+          setVersion("a");
+          toast.success(`${versionLabel(id)} is now the form`);
+        },
+      },
+    );
   };
 
   const save = (status?: Form["status"]) =>
@@ -141,7 +215,7 @@ function FormEditor({ form }: { form: Form }) {
       {tab === "design" ? (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-[400px_minmax(0,1fr)]">
           <div className="space-y-4">
-            <Card title="Setup">
+            <Card title={<SharedTitle testing={testing}>Setup</SharedTitle>}>
               <div className="space-y-3">
                 <Field label="Type">
                   <Select value={current.kind} onChange={(e) => edit({ kind: e.target.value as FormKind })}>
@@ -164,24 +238,74 @@ function FormEditor({ form }: { form: Form }) {
                 </Field>
               </div>
             </Card>
-            {current.kind === "popup" || current.kind === "flyout" ? <TargetingCard config={c} onChange={setConfig} /> : null}
-            <Card title="Content">
+            {current.kind === "popup" || current.kind === "flyout" ? <TargetingCard config={c} onChange={setConfig} testing={testing} /> : null}
+            <AbTestCard
+              config={c}
+              savedConfig={form.config}
+              onStart={() => {
+                setConfig({ variants: [newVariant(c, "b")] });
+                setVersion("b");
+              }}
+              onAdd={addVersion}
+              onEnd={requestEnd}
+            />
+            <Card
+              title={testing ? `Content · ${versionLabel(selected)}` : "Content"}
+              actions={testing ? <VersionTabs versions={versions} value={selected} onChange={setVersion} /> : null}
+            >
               <div className="space-y-3">
-                <Field label="Headline">
-                  <Input value={c.headline} onChange={(e) => setConfig({ headline: e.target.value })} />
-                </Field>
-                <Field label="Body">
-                  <Textarea rows={3} value={c.body} onChange={(e) => setConfig({ body: e.target.value })} />
-                </Field>
-                <Field label="Button text">
-                  <Input value={c.button_text} onChange={(e) => setConfig({ button_text: e.target.value })} />
-                </Field>
-                <Field label="Success message">
+                {variant ? (
+                  <div className="flex items-start justify-between gap-2 rounded-md bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                    <span>Empty fields use version A&rsquo;s.</span>
+                    <button type="button" className="shrink-0 font-medium text-red-700 hover:underline" onClick={() => requestRemove(variant.id)}>
+                      Remove version {variant.id.toUpperCase()}
+                    </button>
+                  </div>
+                ) : null}
+                {variant ? (
+                  <>
+                    <Field label="Headline">
+                      <Input value={variant.headline ?? ""} placeholder={c.headline} onChange={(e) => setVariant({ headline: e.target.value || undefined })} />
+                    </Field>
+                    <Field label="Body">
+                      <Textarea rows={3} value={variant.body ?? ""} placeholder={c.body} onChange={(e) => setVariant({ body: e.target.value || undefined })} />
+                    </Field>
+                    <Field label="Button text">
+                      <Input value={variant.button_text ?? ""} placeholder={c.button_text} onChange={(e) => setVariant({ button_text: e.target.value || undefined })} />
+                    </Field>
+                    <Field label="Image URL (optional)">
+                      <Input
+                        value={variant.image_url ?? ""}
+                        placeholder={c.image_url ?? "https://…/hero.jpg"}
+                        onChange={(e) => setVariant({ image_url: e.target.value || undefined })}
+                      />
+                    </Field>
+                  </>
+                ) : (
+                  <>
+                    <Field label="Headline">
+                      <Input value={c.headline} onChange={(e) => setConfig({ headline: e.target.value })} />
+                    </Field>
+                    <Field label="Body">
+                      <Textarea rows={3} value={c.body} onChange={(e) => setConfig({ body: e.target.value })} />
+                    </Field>
+                    <Field label="Button text">
+                      <Input value={c.button_text} onChange={(e) => setConfig({ button_text: e.target.value })} />
+                    </Field>
+                    <Field label="Image URL (optional)">
+                      <Input value={c.image_url ?? ""} onChange={(e) => setConfig({ image_url: e.target.value || undefined })} placeholder="https://…/hero.jpg" />
+                    </Field>
+                  </>
+                )}
+                <Field
+                  label={testing ? "Success message (all versions)" : "Success message"}
+                  hint={selected !== "a" ? "Shared by every version. Edit it on any tab." : undefined}
+                >
                   <Input value={c.success_message} onChange={(e) => setConfig({ success_message: e.target.value })} />
                 </Field>
               </div>
             </Card>
-            <Card title="Fields">
+            <Card title={<SharedTitle testing={testing}>Fields</SharedTitle>}>
               <div className="space-y-2">
                 {(Object.keys(fieldLabels) as FormField[]).map((f) => (
                   <Checkbox key={f} label={fieldLabels[f]} checked={c.collect.includes(f)} onChange={(e) => toggleField(f, e.target.checked)} />
@@ -198,18 +322,16 @@ function FormEditor({ form }: { form: Form }) {
                 ) : null}
               </div>
             </Card>
-            <Card title="Style">
-              <div className="space-y-3">
-                <Field label="Brand color">
-                  <ColorInput value={c.brand_color ?? "#115f42"} onChange={(brand_color) => setConfig({ brand_color })} />
-                </Field>
-                <Field label="Image URL (optional)">
-                  <Input value={c.image_url ?? ""} onChange={(e) => setConfig({ image_url: e.target.value || undefined })} placeholder="https://…/hero.jpg" />
-                </Field>
-              </div>
+            <Card title={<SharedTitle testing={testing}>Style</SharedTitle>}>
+              <Field label="Brand color">
+                <ColorInput value={c.brand_color ?? "#115f42"} onChange={(brand_color) => setConfig({ brand_color })} />
+              </Field>
             </Card>
           </div>
-          <FormPreview kind={current.kind} config={c} />
+          <div className="min-w-0 space-y-4">
+            <FormPreview kind={current.kind} config={versionConfig(c, selected)} version={testing ? selected : null} />
+            {testing ? <AbResultsCard form={form} versions={pickable} onUse={(id) => setConfirmAb({ kind: "use", id })} /> : null}
+          </div>
         </div>
       ) : (
         <InstallPanel form={form} kind={current.kind} hosted={hosted} />
@@ -223,6 +345,38 @@ function FormEditor({ form }: { form: Form }) {
           loading={remove.isPending}
           onConfirm={() => remove.mutate(form.id, { onSuccess: () => navigate("/forms", { state: { saved: true } }) })}
           onClose={() => setConfirmDelete(false)}
+        />
+      ) : null}
+      {confirmAb?.kind === "end" ? (
+        <ConfirmDialog
+          title="End the A/B test?"
+          body="Every visitor sees version A again. Versions B and up and their results are deleted when you save."
+          confirmLabel="End test"
+          danger
+          onConfirm={endTest}
+          onClose={() => setConfirmAb(null)}
+        />
+      ) : confirmAb?.kind === "remove" ? (
+        <ConfirmDialog
+          title={`Remove version ${confirmAb.id.toUpperCase()}?`}
+          body="Its results are deleted when you save. The versions after it move up a letter and their results start over."
+          confirmLabel="Remove version"
+          danger
+          onConfirm={() => doRemove(confirmAb.id)}
+          onClose={() => setConfirmAb(null)}
+        />
+      ) : confirmAb?.kind === "use" ? (
+        <ConfirmDialog
+          title={`Use version ${confirmAb.id.toUpperCase()} for everyone?`}
+          body={
+            confirmAb.id === "a"
+              ? `The form keeps version A's content and the test ends. Its results are deleted.${dirty ? " Your other unsaved changes are saved too." : ""}`
+              : `${versionLabel(confirmAb.id)}'s headline, body, button text and image become the form's content and the test ends. Its results are deleted.${dirty ? " Your other unsaved changes are saved too." : ""}`
+          }
+          confirmLabel="Use this version"
+          loading={update.isPending}
+          onConfirm={() => applyVersion(confirmAb.id)}
+          onClose={() => setConfirmAb(null)}
         />
       ) : null}
       {blocker.state === "blocked" ? (
@@ -247,13 +401,13 @@ const triggerLabels: Record<FormTrigger, string> = {
 
 const toInt = (v: string, min: number, max = Number.MAX_SAFE_INTEGER) => Math.min(max, Math.max(min, Math.round(Number(v) || 0)));
 
-function TargetingCard({ config, onChange }: { config: FormConfig; onChange: (patch: Partial<FormConfig>) => void }) {
+function TargetingCard({ config, onChange, testing }: { config: FormConfig; onChange: (patch: Partial<FormConfig>) => void; testing: boolean }) {
   const t = config.targeting ?? {};
   const set = (patch: Partial<Targeting>) => onChange({ targeting: { ...t, ...patch } });
   const trigger = t.trigger ?? "delay";
   const tags = (v: string[]) => (v.length ? v : undefined);
   return (
-    <Card title="Targeting">
+    <Card title={<SharedTitle testing={testing}>Targeting</SharedTitle>}>
       <div className="space-y-3">
         <Field label="Show it">
           <Select value={trigger} onChange={(e) => set({ trigger: e.target.value as FormTrigger })}>
@@ -361,7 +515,7 @@ function InstallPanel({ form, kind, hosted }: { form: Form; kind: FormKind; host
   );
 }
 
-function FormPreview({ kind, config }: { kind: FormKind; config: FormConfig }) {
+function FormPreview({ kind, config, version }: { kind: FormKind; config: FormConfig; version: VersionId | null }) {
   const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
   const [submitted, setSubmitted] = useState(false);
   const color = config.brand_color || "#115f42";
@@ -410,7 +564,10 @@ function FormPreview({ kind, config }: { kind: FormKind; config: FormConfig }) {
   return (
     <div className="flex min-h-0 flex-col">
       <div className="mb-2 flex items-center justify-between">
-        <span className="text-xs text-zinc-500">Preview · {formKinds.find((k) => k.value === kind)?.label}</span>
+        <span className="text-xs text-zinc-500">
+          Preview · {formKinds.find((k) => k.value === kind)?.label}
+          {version ? ` · ${versionLabel(version)}` : ""}
+        </span>
         <Segmented
           size="sm"
           value={device}

@@ -377,6 +377,25 @@ pub struct SubscribeBody {
     first_name: Option<String>,
     #[serde(default)]
     sms_consent: bool,
+    /// The A/B test version the visitor saw.
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// Count a view or sign-up for a form's A/B test version. Returns the version when the form is testing it.
+async fn count_variant(state: &AppState, form: &FormRow, variant: Option<&str>, submit: bool) -> AppResult<Option<String>> {
+    let Some(v) = variant.filter(|v| crate::api::messaging::form_versions(&form.config).contains(v)) else { return Ok(None) };
+    sqlx::query(
+        "INSERT INTO form_variant_stats (form_id, variant, views, submits) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (form_id, variant) DO UPDATE SET views = form_variant_stats.views + EXCLUDED.views, submits = form_variant_stats.submits + EXCLUDED.submits",
+    )
+    .bind(form.id)
+    .bind(v)
+    .bind(i64::from(!submit))
+    .bind(i64::from(submit))
+    .execute(&state.db)
+    .await?;
+    Ok(Some(v.to_string()))
 }
 
 pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -> AppResult<Value> {
@@ -402,9 +421,13 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
     };
     let p = audience::upsert_profile_public(&state.db, account.id, &input).await?.profile;
     sqlx::query("UPDATE forms SET submits = submits + 1 WHERE id = $1").bind(form.id).execute(&state.db).await?;
+    let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
+    if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
+        props["form_version"] = json!(v);
+    }
     audience::record_event(
         &state.db,
-        NewEvent { account_id: account.id, profile_id: p.id, metric: "Subscribed to List", properties: json!({"form_id": form.id, "form": form.name, "list_id": form.list_id}), value: None, occurred_at: None, unique_id: None, message_id: None },
+        NewEvent { account_id: account.id, profile_id: p.id, metric: "Subscribed to List", properties: props, value: None, occurred_at: None, unique_id: None, message_id: None },
     )
     .await?;
     if let Some(l) = form.list_id {
@@ -425,6 +448,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 phone_number: pairs.get("phone_number").cloned(),
                 first_name: pairs.get("first_name").cloned(),
                 sms_consent: pairs.contains_key("sms_consent"),
+                variant: pairs.get("variant").cloned(),
             }
         } else {
             serde_json::from_slice(&body)?
@@ -445,8 +469,19 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
     })
 }
 
-async fn form_view(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1 AND status = 'live'").bind(id).execute(&state.db).await;
+#[derive(Deserialize)]
+struct ViewQuery {
+    /// The A/B test version shown.
+    v: Option<String>,
+}
+
+async fn form_view(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q): Query<ViewQuery>) -> Response {
+    if let Ok((f, _)) = load_form(&state, id).await {
+        if f.status == "live" {
+            let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
+            let _ = count_variant(&state, &f, q.v.as_deref(), false).await;
+        }
+    }
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -472,16 +507,22 @@ async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>) -> Respo
         return (StatusCode::NOT_FOUND, "this form isn't published yet").into_response();
     }
     let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
+    // A/B test: each page load shows a random version.
+    let versions = crate::api::messaging::form_versions(&f.config);
+    let version = (!versions.is_empty()).then(|| versions[rand::Rng::gen_range(&mut rand::thread_rng(), 0..versions.len())].to_string());
+    let _ = count_variant(&state, &f, version.as_deref(), false).await;
+    let config = version.as_deref().map(|v| crate::api::messaging::form_version_config(&f.config, v)).unwrap_or_else(|| f.config.clone());
+    let variant_input = version.map(|v| format!(r#"<input type="hidden" name="variant" value="{}">"#, esc(&v))).unwrap_or_default();
     let color = f.config["brand_color"].as_str().unwrap_or(&a.brand_color).to_string();
-    let img = f.config["image_url"].as_str().filter(|s| !s.is_empty()).map(|u| format!(r#"<img src="{}" alt="" style="width:100%;border-radius:8px;margin-bottom:16px">"#, esc(u))).unwrap_or_default();
+    let img = config["image_url"].as_str().filter(|s| !s.is_empty()).map(|u| format!(r#"<img src="{}" alt="" style="width:100%;border-radius:8px;margin-bottom:16px">"#, esc(u))).unwrap_or_default();
     let body = format!(
-        r#"{img}<h1>{h}</h1><p>{b}</p><form method="post" action="{base}/client/subscribe?k={k}"><input type="hidden" name="form_id" value="{id}">{fields}<input type="submit" value="{btn}"></form>"#,
-        h = esc(f.config["headline"].as_str().unwrap_or("")),
-        b = esc(f.config["body"].as_str().unwrap_or("")),
+        r#"{img}<h1>{h}</h1><p>{b}</p><form method="post" action="{base}/client/subscribe?k={k}"><input type="hidden" name="form_id" value="{id}">{variant_input}{fields}<input type="submit" value="{btn}"></form>"#,
+        h = esc(config["headline"].as_str().unwrap_or("")),
+        b = esc(config["body"].as_str().unwrap_or("")),
         base = state.cfg.public_url(),
         k = esc(&a.public_key),
         fields = form_fields_html(&f),
-        btn = esc(f.config["button_text"].as_str().unwrap_or("Sign up")),
+        btn = esc(config["button_text"].as_str().unwrap_or("Sign up")),
     );
     page(&a.name, &body, &color).into_response()
 }

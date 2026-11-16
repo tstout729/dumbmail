@@ -65,7 +65,7 @@
     if (formsCache) return cb(formsCache);
     fetch(BASE + "/client/forms?k=" + encodeURIComponent(KEY), { credentials: "omit" })
       .then(function (r) { return r.json(); })
-      .then(function (j) { formsCache = j.data || []; cb(formsCache); })
+      .then(function (j) { formsCache = (j.data || []).map(withVersion); cb(formsCache); })
       .catch(function () {});
   }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
@@ -73,6 +73,20 @@
   function days(n) { return n * 86400000; }
   function closedKey(f) { return "pl_form_closed_" + f.id; }
   function doneKey(f) { return "pl_form_done_" + f.id; }
+
+  // A/B test: each visitor keeps one version (a = the form itself) and sees its text and image.
+  function withVersion(f) {
+    var base = f.config || {}, vs = base.variants || [];
+    if (!vs.length) return f;
+    var ids = ["a"].concat(vs.map(function (x) { return x.id; })), key = "pl_form_var_" + f.id, v = store.get(key);
+    if (ids.indexOf(v) < 0) { v = ids[Math.floor(Math.random() * ids.length)]; store.set(key, v); }
+    var c = {};
+    for (var k in base) c[k] = base[k];
+    vs.forEach(function (x) {
+      if (x.id === v) ["headline", "body", "button_text", "image_url"].forEach(function (k) { if (x[k] && String(x[k]).trim()) c[k] = x[k]; });
+    });
+    return { id: f.id, kind: f.kind, config: c, version: v };
+  }
 
   function fieldsHtml(f) {
     var c = f.config || {}, collect = c.collect || ["email"], h = "";
@@ -124,7 +138,7 @@
     }
     box.querySelector("form").addEventListener("submit", function (e) {
       e.preventDefault();
-      var form = e.target, d = { form_id: f.id }, err = form.querySelector("[data-pl-err]"), btn = form.querySelector("button[type=submit]");
+      var form = e.target, d = { form_id: f.id, variant: f.version || null }, err = form.querySelector("[data-pl-err]"), btn = form.querySelector("button[type=submit]");
       ["email", "phone_number", "first_name"].forEach(function (n) { var i = form.querySelector("[name=" + n + "]"); if (i && i.value) d[n] = i.value.trim(); });
       var cb = form.querySelector("[name=sms_consent]"); d.sms_consent = !!(cb && cb.checked);
       if (form.querySelector("[name=email]") && !d.email) { err.textContent = "Enter your email address."; return; }
@@ -143,7 +157,7 @@
     return { wrap: wrap, close: close };
   }
 
-  function view(f) { fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
+  function view(f) { fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
 
   function show(f, force) {
     if (f.kind === "embed") {

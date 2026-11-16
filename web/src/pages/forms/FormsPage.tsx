@@ -100,7 +100,10 @@ export function FormsPage() {
             (forms.data ?? []).map((f) => (
               <RowLink key={f.id} to={`/forms/${f.id}`}>
                 <Td>
-                  <div className="font-medium text-zinc-900">{f.name}</div>
+                  <div className="flex items-center gap-2 font-medium text-zinc-900">
+                    {f.name}
+                    {f.config.variants?.length ? <Badge tone="violet">A/B test</Badge> : null}
+                  </div>
                   <div className="text-xs text-zinc-500">Updated {formatRelative(f.updated_at)}</div>
                 </Td>
                 <Td>

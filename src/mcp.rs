@@ -149,7 +149,11 @@ fn tools() -> Vec<Value> {
     let profile_ref = json!({"type": "object", "description": "Who did it: email, phone_number (E.164) or external_id, plus optional first_name, last_name and custom properties.",
         "properties": {"email": {"type": "string"}, "phone_number": {"type": "string"}, "external_id": {"type": "string"}, "first_name": {"type": "string"}, "last_name": {"type": "string"}, "properties": {"type": "object"}}});
     let trigger = json!({"type": "object", "description": "Flow trigger. {type:'metric', metric:'Placed Order', filters?:[{field, op, value}]} | {type:'list', list_id} | {type:'segment', segment_id} | {type:'date_property', field:'birthday', offset_days?}"});
-    let flow_def = json!({"type": "object", "description": "Flow graph: {entry: firstNodeId, nodes: [...], settings?: {reentry: 'never'|'always'|{after_days}, exit_condition?: segment rules, profile_filter?: segment rules, smart_sending_hours?}}. Node types (each has a unique id): delay{amount, unit: minutes|hours|days, next}, email{name?, content, next}, sms{name?, content:{body}, next}, condition{condition: segment rules, yes, no}, update_profile{properties, next}, add_to_list|remove_from_list{list_id, next}, webhook{url, method?, body?, next}. next/yes/no are node ids or null to end. Read postlark://docs/flows."});
+    let ab_test = json!({"type": ["object", "null"], "description": "A/B test. The campaign's own content is version A; variants are versions b, c, d in order, each with a full content object. A random test_percent (5-100, default 20) of the audience is split evenly across versions; after wait_hours (1-168, default 4) the best version by metric (open_rate (email only), click_rate (default) or revenue) goes to everyone else. pick: auto (default) or manual (call pick_campaign_winner). null removes the test.",
+        "properties": {"variants": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "object", "properties": {"id": {"enum": ["b", "c", "d"]}, "content": {"type": "object"}}, "required": ["id", "content"]}},
+            "test_percent": {"type": "integer", "minimum": 5, "maximum": 100}, "wait_hours": {"type": "integer", "minimum": 1, "maximum": 168},
+            "metric": {"enum": ["open_rate", "click_rate", "revenue"]}, "pick": {"enum": ["auto", "manual"]}}, "required": ["variants"]});
+    let flow_def = json!({"type": "object", "description": "Flow graph: {entry: firstNodeId, nodes: [...], settings?: {reentry: 'never'|'always'|{after_days}, exit_condition?: segment rules, profile_filter?: segment rules, smart_sending_hours?}}. Node types (each has a unique id): delay{amount, unit: minutes|hours|days, next}, email{name?, content, next}, sms{name?, content:{body}, next}, condition{condition: segment rules, yes, no}, random_split{percent: 1-99 share sent down yes (path A), yes, no} for A/B testing paths, update_profile{properties, next}, add_to_list|remove_from_list{list_id, next}, webhook{url, method?, body?, next}. next/yes/no are node ids or null to end. Read postlark://docs/flows."});
     vec![
         tool("get_account", "Get account overview", "Account settings, sending readiness (sender, domain, SMS number, mailing address), plan usage, counts of profiles/lists/segments/campaigns/flows and the setup checklist. Call this first.", obj(json!({}), &[]), true, false),
         tool("update_account", "Update account settings", "Update brand and sender settings: name, website, from_name, from_email, reply_to, sms_from (E.164), timezone (IANA), address (mailing address shown in email footers, required to send), brand_color (hex), logo_url, social_links ({instagram|facebook|tiktok|x|youtube|pinterest|linkedin|threads: url}, blank removes), conversion_metric (metric used for revenue attribution, default 'Placed Order').",
@@ -192,18 +196,20 @@ fn tools() -> Vec<Value> {
         tool("create_template", "Create a template", "Save reusable email or SMS content.", obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "content": email_content}), &["name", "content"]), false, false),
         tool("render_preview", "Preview a message", "Render email or SMS content as a real recipient would see it (optionally as a specific profile) to check personalization and wording. Returns subject, preheader and plain-text body (set include_html for the full HTML), or the SMS body with segment count.",
             obj(json!({"channel": {"enum": ["email", "sms"]}, "content": email_content, "profile_id": {"type": "string"}, "event": {"type": "object", "description": "Sample trigger event for flow content, e.g. {properties: {checkout_url: ...}}"}, "include_html": {"type": "boolean"}}), &["channel", "content"]), true, false),
-        tool("list_campaigns", "List campaigns", "Campaigns with status and performance stats (recipients, open/click rates, revenue).", obj(json!({"status": {"enum": ["draft", "scheduled", "sending", "sent", "cancelled", "failed"]}, "channel": {"enum": ["email", "sms"]}}), &[]), true, false),
+        tool("list_campaigns", "List campaigns", "Campaigns with status and performance stats (recipients, open/click rates, revenue).", obj(json!({"status": {"enum": ["draft", "scheduled", "sending", "testing", "sent", "cancelled", "failed"]}, "channel": {"enum": ["email", "sms"]}}), &[]), true, false),
         tool("get_campaign", "Get a campaign", "One campaign with content, audience, stats and readiness problems.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
         tool("create_campaign", "Create a campaign draft", "Create a draft email or SMS campaign. Returns the draft plus estimated recipients and anything still missing before it can send. Nothing is sent.",
-            obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "audience": audience_schema, "content": email_content}), &["channel"]), false, false),
-        tool("update_campaign", "Update a campaign draft", "Change a draft or scheduled campaign's name, audience or content (content replaces the whole content object).",
-            obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "audience": audience_schema, "content": email_content}), &["id"]), false, false),
-        tool("send_test", "Send a test", "Send a test of a campaign to up to 10 email addresses or phone numbers. Tests are marked [Test] and don't count in reports.",
-            obj(json!({"campaign_id": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}, "maxItems": 10}}), &["campaign_id", "to"]), false, false),
+            obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "audience": audience_schema, "content": email_content, "ab_test": ab_test}), &["channel"]), false, false),
+        tool("update_campaign", "Update a campaign draft", "Change a draft or scheduled campaign's name, audience, content or A/B test (content and ab_test replace the whole object; ab_test null removes the test).",
+            obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "audience": audience_schema, "content": email_content, "ab_test": ab_test}), &["id"]), false, false),
+        tool("send_test", "Send a test", "Send a test of a campaign to up to 10 email addresses or phone numbers. Tests are marked [Test] and don't count in reports. For an A/B test, version picks which version (a-d, default a).",
+            obj(json!({"campaign_id": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}, "maxItems": 10}, "version": {"enum": ["a", "b", "c", "d"]}}), &["campaign_id", "to"]), false, false),
         tool("send_campaign", "Send or schedule a campaign", "Send a campaign now or schedule it (send_at in the future). This messages real people and can't be undone once sent. Without confirm=true it returns a dry run with the recipient count and readiness problems. Get the user's explicit approval before confirming.",
             obj(json!({"campaign_id": {"type": "string"}, "send_at": {"type": "string", "format": "date-time", "description": "Omit to send now"}, "confirm": {"type": "boolean"}}), &["campaign_id"]), false, true),
-        tool("cancel_campaign", "Cancel a campaign", "Unschedule a scheduled campaign (back to draft) or stop a campaign that is mid-send.", obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), false, true),
-        tool("get_campaign_report", "Campaign report", "Detailed results: delivered, bounces, unique opens/clicks, unsubscribes, attributed orders and revenue, top links and an hourly engagement series.", obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), true, false),
+        tool("cancel_campaign", "Cancel a campaign", "Unschedule a scheduled campaign (back to draft) or stop a campaign that is mid-send or waiting on its A/B test.", obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), false, true),
+        tool("pick_campaign_winner", "Pick an A/B test winner", "For a campaign in status testing: send the chosen version (or, if version is omitted, the current leader) to the rest of the audience now. This messages real people; requires confirm=true and the user's approval. Check get_campaign_report's ab_test first.",
+            obj(json!({"campaign_id": {"type": "string"}, "version": {"enum": ["a", "b", "c", "d"]}, "confirm": {"type": "boolean"}}), &["campaign_id"]), false, true),
+        tool("get_campaign_report", "Campaign report", "Detailed results: delivered, bounces, unique opens/clicks, unsubscribes, attributed orders and revenue, top links, an hourly engagement series and, for A/B tests, per-version stats with the leader, confidence and winner.", obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), true, false),
         tool("campaign_performance", "Compare campaign performance", "Table of campaigns sent in the last `days` (default 90) with recipients, open rate, click rate, unsubscribes and revenue, sorted by `sort` (default revenue).",
             obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}, "channel": {"enum": ["email", "sms"]}, "sort": {"enum": ["revenue", "open_rate", "click_rate", "recipients", "sent_at"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}), &[]), true, false),
         tool("list_flows", "List flows", "All flows with status, trigger and performance.", obj(json!({}), &[]), true, false),
@@ -214,10 +220,10 @@ fn tools() -> Vec<Value> {
         tool("update_flow", "Update a flow", "Rename a flow or replace its trigger or definition (the whole graph). Live flows apply changes to people already waiting in them.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "trigger": trigger, "definition": flow_def}), &["id"]), false, false),
         tool("set_flow_status", "Turn a flow on, pause or draft", "live starts sending to people who trigger it; paused holds people in place; draft stops and exits everyone. Turning live requires confirm=true and the user's approval.", obj(json!({"id": {"type": "string"}, "status": {"enum": ["live", "paused", "draft"]}, "confirm": {"type": "boolean"}}), &["id", "status"]), false, true),
         tool("get_flow_report", "Flow report", "Flow totals plus per-step entered counts, opens, clicks and revenue.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
-        tool("list_forms", "List sign-up forms", "Sign-up forms with views, submits and install snippets.", obj(json!({}), &[]), true, false),
-        tool("create_form", "Create a sign-up form", "Create a popup, embed, flyout or hosted page form that adds subscribers to a list. config: headline, body, button_text, success_message, collect (email, phone_number, first_name), sms_consent_text, delay_seconds, brand_color, image_url. Set status 'live' to publish.",
+        tool("list_forms", "List sign-up forms", "Sign-up forms with views, submits, per-version A/B test stats (variant_stats) and install snippets.", obj(json!({}), &[]), true, false),
+        tool("create_form", "Create a sign-up form", "Create a popup, embed, flyout or hosted page form that adds subscribers to a list. config: headline, body, button_text, success_message, collect (email, phone_number, first_name), sms_consent_text, delay_seconds, brand_color, image_url, variants (A/B test: [{id: 'b'|'c'|'d' in order, headline?, body?, button_text?, image_url?}]; the form itself is version A and each visitor sees one version at random). Set status 'live' to publish.",
             obj(json!({"name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": {"type": "object"}, "status": {"enum": ["draft", "live"]}}), &["list_id"]), false, false),
-        tool("update_form", "Update a sign-up form", "Change a form's text, fields, list, kind or status (draft/live).", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": {"type": "object"}, "status": {"enum": ["draft", "live"]}}), &["id"]), false, false),
+        tool("update_form", "Update a sign-up form", "Change a form's text, fields, list, kind or status (draft/live). config is merged into the current one. A/B test: set config.variants (see create_form); end it with variants [] after copying the winner's fields into the base config.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": {"type": "object"}, "status": {"enum": ["draft", "live"]}}), &["id"]), false, false),
         tool("get_analytics", "Analytics overview", "Dashboard for the last `days` (default 30): total and attributed revenue (campaigns vs flows), emails/SMS sent, open/click/unsubscribe/bounce rates, profile growth, a daily series and top campaigns and flows.", obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]), true, false),
         tool("delete", "Delete something", "Delete a draft campaign, a non-live flow, a segment, a list, a template, a form or a profile. Permanent.", obj(json!({"type": {"enum": ["campaign", "flow", "segment", "list", "template", "form", "profile"]}, "id": {"type": "string"}}), &["type", "id"]), false, true),
     ]
@@ -383,14 +389,14 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         }
         "update_campaign" => {
             let id = uuid_arg(&a, "id")?;
-            msg::update_campaign(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None }).await?;
+            msg::update_campaign(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None, ab_test: a.get("ab_test").cloned() }).await?;
             campaign_with_readiness(state, acct, id).await
         }
         "send_test" => {
             let c = campaigns::load(&state.db, acct, uuid_arg(&a, "campaign_id")?).await?;
             let account = load_account(&state.db, acct).await?;
             let to: Vec<String> = from(a["to"].clone())?;
-            Ok(json!({"sent": campaigns::send_test(state, &account, &c, &to).await?}))
+            Ok(json!({"sent": campaigns::send_test(state, &account, &c, &to, a["version"].as_str()).await?}))
         }
         "send_campaign" => {
             let id = uuid_arg(&a, "campaign_id")?;
@@ -409,10 +415,20 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let c = msg::cancel(state, acct, uuid_arg(&a, "campaign_id")?).await?;
             msg::campaign_json(state, &c).await
         }
+        "pick_campaign_winner" => {
+            let c = campaigns::load(&state.db, acct, uuid_arg(&a, "campaign_id")?).await?;
+            if a["confirm"].as_bool() != Some(true) {
+                let report = msg::report(state, acct, c.id).await?;
+                return Ok(json!({"dry_run": true, "ab_test": report["ab_test"],
+                    "note": "Nothing sent. Call again with confirm=true once the user approves sending this version to the rest of the audience."}));
+            }
+            let c = campaigns::pick_winner(state, &c, a["version"].as_str()).await?;
+            msg::campaign_json(state, &c).await
+        }
         "get_campaign_report" => msg::report(state, acct, uuid_arg(&a, "campaign_id")?).await,
         "campaign_performance" => {
             let days = a["days"].as_i64().unwrap_or(90).clamp(1, 365);
-            let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM campaigns WHERE account_id = $1 AND status IN ('sent','sending') AND sent_at > now() - make_interval(days => $2) AND ($3::text IS NULL OR channel = $3) ORDER BY sent_at DESC LIMIT 200")
+            let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM campaigns WHERE account_id = $1 AND status IN ('sent','sending','testing') AND sent_at > now() - make_interval(days => $2) AND ($3::text IS NULL OR channel = $3) ORDER BY sent_at DESC LIMIT 200")
                 .bind(acct)
                 .bind(days as i32)
                 .bind(a["channel"].as_str())
@@ -471,7 +487,8 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "list_forms" => {
             let rows: Vec<crate::models::FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(acct).fetch_all(&state.db).await?;
             let base = state.cfg.public_url();
-            Ok(json!({"forms": rows.iter().map(|f| json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
+            let forms = msg::forms_json(&state.db, &rows).await?;
+            Ok(json!({"forms": rows.iter().zip(forms).map(|(f, form)| json!({"form": form, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
         }
         "create_form" => {
             let status = a["status"].as_str().map(String::from);
@@ -510,7 +527,7 @@ async fn delete(state: &AppState, acct: Uuid, kind: &str, id: Uuid) -> AppResult
     let table = match kind {
         "campaign" => {
             let c = campaigns::load(&state.db, acct, id).await?;
-            if matches!(c.status.as_str(), "sending" | "sent") {
+            if matches!(c.status.as_str(), "sending" | "testing" | "sent") {
                 return Err(AppError::Conflict("sent campaigns are kept for reporting".into()));
             }
             "campaigns"
@@ -628,6 +645,7 @@ Triggers: `{"type": "metric", "metric": "Started Checkout", "filters": [{"field"
 - `exit_condition`: checked before every step; people who match leave the flow (e.g. they purchased).
 - `profile_filter`: only people matching it enter.
 - `smart_sending_hours`: skip a message if the person got one on that channel in the last N hours.
+- `random_split {percent, yes, no}`: an A/B test inside a flow. Each person goes down `yes` (path A) with `percent`% chance, otherwise `no` (path B). Compare the paths' steps in get_flow's per-step stats, then replace the split with the winning path.
 - Other steps: `update_profile {properties}`, `add_to_list`/`remove_from_list {list_id}`, `webhook {url, method, body}`.
 - In metric-triggered flows, `{{ event.properties.* }}` is the triggering event (e.g. cart items, checkout_url).
 "#;

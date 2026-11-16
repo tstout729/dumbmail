@@ -4,6 +4,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{page, ApiJson};
@@ -29,6 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/campaigns/{id}/cancel", post(cancel_h))
         .route("/api/campaigns/{id}/duplicate", post(duplicate_h))
         .route("/api/campaigns/{id}/report", get(report_h))
+        .route("/api/campaigns/{id}/winner", post(winner_h))
         .route("/api/flows", get(flows_h).post(create_flow_h))
         .route("/api/flows/blueprints", get(blueprints_h))
         .route("/api/flows/from-blueprint", post(from_blueprint_h))
@@ -201,6 +203,53 @@ pub struct CampaignBody {
     pub audience: Option<Value>,
     pub content: Option<Value>,
     pub send_at: Option<DateTime<Utc>>,
+    /// Missing: leave as is. `null`: remove the A/B test. An object: set it (see `campaigns::AbTest`).
+    #[serde(default, deserialize_with = "present")]
+    pub ab_test: Option<Value>,
+}
+
+/// Deserializes a present field (even `null`) as Some, so a missing field stays None.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// Validate an A/B test for `channel`: None/null clears it, otherwise it's stored normalized.
+fn checked_ab_test(channel: &str, v: Option<&Value>) -> AppResult<Option<Value>> {
+    match v.filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => {
+            let mut t = campaigns::parse_ab_test(channel, v)?;
+            // Fill the fields editors expect, like a new campaign's content, and reject wrong types.
+            for var in &mut t.variants {
+                let label = var.id.to_uppercase();
+                let Some(o) = var.content.as_object_mut() else { continue };
+                let text = |o: &serde_json::Map<String, Value>, k: &str, required: bool| -> AppResult<()> {
+                    match o.get(k) {
+                        None if !required => Ok(()),
+                        Some(Value::String(_)) => Ok(()),
+                        _ => Err(AppError::bad(format!("version {label} {k} must be text"))),
+                    }
+                };
+                if channel == "sms" {
+                    o.entry("body").or_insert(json!(""));
+                    text(o, "body", true)?;
+                    text(o, "media_url", false)?;
+                } else {
+                    o.entry("subject").or_insert(json!(""));
+                    if !o.contains_key("blocks") && !o.contains_key("html") {
+                        o.insert("blocks".into(), json!([]));
+                    }
+                    text(o, "subject", true)?;
+                    text(o, "preheader", false)?;
+                    text(o, "html", false)?;
+                    if o.get("blocks").is_some_and(|b| !b.is_array()) {
+                        return Err(AppError::bad(format!("version {label} blocks must be a list")));
+                    }
+                }
+            }
+            Ok(Some(serde_json::to_value(t)?))
+        }
+    }
 }
 
 /// Parse an audience and return it in full form (`include` and `exclude` always present), so
@@ -216,13 +265,15 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{} campaign {}", if channel == "sms" { "SMS" } else { "Email" }, Utc::now().format("%b %-d")));
     let audience = normalize_audience(&b.audience.unwrap_or(json!({})))?;
     let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
-    Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *")
+    let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
+    Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
         .bind(name.trim())
         .bind(channel)
         .bind(audience)
         .bind(content)
+        .bind(ab_test)
         .fetch_one(&state.db)
         .await?)
 }
@@ -246,9 +297,14 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     if let Some(ch) = &b.channel {
         check_channel(ch)?;
     }
+    // Re-check the test against the final channel (SMS can't be judged on opens).
+    let channel = b.channel.as_deref().unwrap_or(&c.channel);
+    let set_ab = b.ab_test.is_some() || b.channel.is_some();
+    let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
     Ok(sqlx::query_as(
         "UPDATE campaigns SET name = COALESCE($3, name), channel = COALESCE($4, channel), audience = COALESCE($5, audience),
             content = COALESCE($6, content), send_at = COALESCE($7, send_at), updated_at = now(),
+            ab_test = CASE WHEN $8 THEN $9 ELSE ab_test END,
             status = CASE WHEN status IN ('failed','cancelled') THEN 'draft' ELSE status END, error = NULL
          WHERE id = $1 AND account_id = $2 RETURNING *",
     )
@@ -259,6 +315,8 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     .bind(audience)
     .bind(b.content)
     .bind(b.send_at)
+    .bind(set_ab)
+    .bind(ab_test)
     .fetch_one(&state.db)
     .await?)
 }
@@ -270,7 +328,7 @@ async fn patch_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
 
 async fn delete_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    if matches!(c.status.as_str(), "sending" | "sent") {
+    if matches!(c.status.as_str(), "sending" | "testing" | "sent") {
         return Err(AppError::Conflict("sent campaigns are kept for reporting and can't be deleted".into()));
     }
     sqlx::query("DELETE FROM campaigns WHERE id = $1").bind(id).execute(&state.db).await?;
@@ -295,12 +353,14 @@ async fn estimate_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson
 #[derive(Deserialize)]
 struct TestBody {
     to: Vec<String>,
+    /// A/B test version to send (a-d); defaults to A.
+    version: Option<String>,
 }
 
 async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TestBody>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
     let account = load_account(&state.db, ctx.account_id).await?;
-    let sent = campaigns::send_test(&state, &account, &c, &b.to).await?;
+    let sent = campaigns::send_test(&state, &account, &c, &b.to, b.version.as_deref()).await?;
     Ok(Json(json!({"sent": sent})))
 }
 
@@ -320,16 +380,29 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     if count == 0 {
         return Err(AppError::bad("nobody in this audience can receive this campaign (check consent and that profiles have an address)"));
     }
+    let mut versions = vec![c.content.clone()];
+    versions.extend(campaigns::ab_test(&c).into_iter().flat_map(|t| t.variants).map(|v| v.content));
     let (segments, mms) = if c.channel == "sms" {
-        let body = c.content.get("body").and_then(|b| b.as_str()).unwrap_or("");
-        // Personalization changes length a little; estimate from the template plus compliance text.
-        (crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64, c.content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
+        // Personalization changes length a little; estimate from the template plus compliance text,
+        // using the costliest version of an A/B test (priced per version: MMS and long SMS cost differently).
+        let p = crate::billing::prices(state);
+        let per_version: Vec<(i64, bool)> = versions
+            .iter()
+            .map(|content| {
+                let body = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                let n = crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64;
+                (n.max(1), content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
+            })
+            .collect();
+        per_version.into_iter().max_by_key(|&(n, mms)| if mms { p.mms } else { n * p.sms_segment }).unwrap_or((1, false))
     } else {
         (1, false)
     };
     crate::billing::check_campaign(state, account_id, &c.channel, count, segments, mms).await?;
-    // Validate the template renders before committing to a send.
-    render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content: c.content.clone(), profile_id: None, event: None }).await?;
+    // Validate every version renders before committing to a send.
+    for content in versions {
+        render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content, profile_id: None, event: None }).await?;
+    }
     let now = Utc::now();
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
         Some(t) => sqlx::query_as("UPDATE campaigns SET status = 'scheduled', send_at = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(t).fetch_one(&state.db).await?,
@@ -364,7 +437,7 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
     let c = campaigns::load(&state.db, account_id, id).await?;
     let new_status = match c.status.as_str() {
         "scheduled" => "draft",
-        "sending" => "cancelled",
+        "sending" | "testing" => "cancelled",
         other => return Err(AppError::Conflict(format!("a {other} campaign can't be cancelled"))),
     };
     sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&state.db).await?;
@@ -378,7 +451,7 @@ async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None }).await?;
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None, ab_test: c.ab_test }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 
@@ -404,8 +477,22 @@ pub async fn report(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<V
     .bind(&tz)
     .fetch_all(&state.db)
     .await?;
+    let ab_test = match campaigns::ab_test(&c) {
+        Some(t) => {
+            let versions = t.versions();
+            let stats = campaigns::version_stats(&state.db, account_id, id, &versions).await?;
+            let (lead, confidence) = campaigns::leader(&t.metric, &stats);
+            json!({
+                "metric": t.metric, "pick": t.pick, "test_percent": t.test_percent, "wait_hours": t.wait_hours,
+                "ends_at": c.ab_test_ends_at, "winner": c.ab_winner, "leader": versions[lead], "confidence": confidence,
+                "versions": versions.iter().zip(stats).map(|(v, s)| json!({"id": v, "stats": s})).collect::<Vec<_>>(),
+            })
+        }
+        None => Value::Null,
+    };
     Ok(json!({
         "campaign": {"id": c.id, "name": c.name, "channel": c.channel, "status": c.status, "sent_at": c.sent_at},
+        "ab_test": ab_test,
         "stats": stats,
         "links": links.into_iter().map(|(url, clicks, unique)| json!({"url": url, "clicks": clicks, "unique_clicks": unique})).collect::<Vec<_>>(),
         "series": series.into_iter().map(|(hour, opens, clicks)| json!({"hour": hour, "opens": opens, "clicks": clicks})).collect::<Vec<_>>(),
@@ -414,6 +501,18 @@ pub async fn report(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<V
 
 async fn report_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     Ok(Json(report(&state, ctx.account_id, id).await?))
+}
+
+#[derive(Deserialize)]
+struct WinnerBody {
+    /// The version to send everyone else; omit to send the current leader.
+    version: Option<String>,
+}
+
+async fn winner_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<WinnerBody>) -> AppResult<Json<Value>> {
+    let c = campaigns::load(&state.db, ctx.account_id, id).await?;
+    let c = campaigns::pick_winner(&state, &c, b.version.as_deref()).await?;
+    Ok(Json(campaign_json(&state, &c).await?))
 }
 
 // ---------- Flows ----------
@@ -651,18 +750,60 @@ async fn from_blueprint_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): A
 
 // ---------- Forms ----------
 
-fn form_json(f: &FormRow) -> Value {
+/// The fields a form A/B variant can change; everything else comes from the form itself (version A).
+pub const FORM_VARIANT_FIELDS: [&str; 4] = ["headline", "body", "button_text", "image_url"];
+
+/// A form's A/B test versions ("a" plus each variant's id), or none when it isn't testing.
+pub fn form_versions(config: &Value) -> Vec<&str> {
+    match config.get("variants").and_then(|v| v.as_array()).filter(|a| !a.is_empty()) {
+        Some(vs) => std::iter::once("a").chain(vs.iter().filter_map(|v| v["id"].as_str())).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The form's config as `version` shows it: the variant's non-empty fields over the base config.
+pub fn form_version_config(config: &Value, version: &str) -> Value {
+    let mut c = config.clone();
+    if let Some(var) = config.get("variants").and_then(|v| v.as_array()).and_then(|vs| vs.iter().find(|v| v["id"].as_str() == Some(version))) {
+        for k in FORM_VARIANT_FIELDS {
+            if let Some(val) = var.get(k).and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty()) {
+                c[k] = json!(val);
+            }
+        }
+    }
+    c
+}
+
+fn form_json(f: &FormRow, variant_stats: &[(Uuid, String, i64, i64)]) -> Value {
     let mut v = serde_json::to_value(f).unwrap_or_default();
+    let versions: Vec<Value> = form_versions(&f.config)
+        .into_iter()
+        .map(|id| {
+            let (views, submits) = variant_stats.iter().find(|s| s.0 == f.id && s.1 == id).map(|s| (s.2, s.3)).unwrap_or((0, 0));
+            json!({"id": id, "views": views, "submits": submits, "submit_rate": if views > 0 { submits as f64 / views as f64 } else { 0.0 }})
+        })
+        .collect();
     if let Some(o) = v.as_object_mut() {
         o.insert("stats".into(), json!({"views": f.views, "submits": f.submits}));
+        o.insert("variant_stats".into(), json!(versions));
     }
     v
+}
+
+pub async fn forms_json(db: &PgPool, rows: &[FormRow]) -> AppResult<Vec<Value>> {
+    let ids: Vec<Uuid> = rows.iter().map(|f| f.id).collect();
+    let stats: Vec<(Uuid, String, i64, i64)> = sqlx::query_as("SELECT form_id, variant, views, submits FROM form_variant_stats WHERE form_id = ANY($1)").bind(&ids).fetch_all(db).await?;
+    Ok(rows.iter().map(|f| form_json(f, &stats)).collect())
+}
+
+async fn form_one(db: &PgPool, f: &FormRow) -> AppResult<Value> {
+    Ok(forms_json(db, std::slice::from_ref(f)).await?.remove(0))
 }
 
 async fn forms_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     let rows: Vec<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(ctx.account_id).fetch_all(&state.db).await?;
     let n = rows.len() as i64;
-    Ok(page(rows.iter().map(form_json).collect(), n))
+    Ok(page(forms_json(&state.db, &rows).await?, n))
 }
 
 #[derive(Deserialize, Default)]
@@ -680,10 +821,36 @@ fn check_form_config(config: &Option<Value>) -> AppResult<()> {
             return Err(AppError::bad("brand_color must be a hex color like #1f6f5c"));
         }
     }
-    if let Some(u) = config.as_ref().and_then(|c| c.get("image_url")).and_then(|v| v.as_str()) {
-        if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") {
-            return Err(AppError::bad("image_url must be an http(s) URL"));
+    let check_image = |c: &Value| -> AppResult<()> {
+        match c.get("image_url").and_then(|v| v.as_str()) {
+            Some(u) if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") => Err(AppError::bad("image_url must be an http(s) URL")),
+            _ => Ok(()),
         }
+    };
+    let Some(c) = config else { return Ok(()) };
+    check_image(c)?;
+    match c.get("variants") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(vs)) => {
+            if vs.len() > 3 {
+                return Err(AppError::bad("a form A/B test can have at most 3 extra versions (B, C and D)"));
+            }
+            for (i, v) in vs.iter().enumerate() {
+                let want = campaigns::VERSION_IDS[i + 1];
+                let o = v.as_object().filter(|o| o.get("id").and_then(|x| x.as_str()) == Some(want));
+                let Some(o) = o else { return Err(AppError::bad(format!("form variant {} must be an object with id {want:?}", i + 1))) };
+                for (k, val) in o {
+                    if k != "id" && !FORM_VARIANT_FIELDS.contains(&k.as_str()) {
+                        return Err(AppError::bad(format!("form variants can change only {}, not {k:?}", FORM_VARIANT_FIELDS.join(", "))));
+                    }
+                    if !(val.is_string() || val.is_null()) {
+                        return Err(AppError::bad(format!("form variant {want} {k} must be text")));
+                    }
+                }
+                check_image(v)?;
+            }
+        }
+        Some(_) => return Err(AppError::bad("variants must be a list")),
     }
     Ok(())
 }
@@ -724,12 +891,12 @@ pub async fn create_form(state: &AppState, account_id: Uuid, b: FormBody) -> App
 }
 
 async fn create_form_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<FormBody>) -> AppResult<Json<Value>> {
-    Ok(Json(form_json(&create_form(&state, ctx.account_id, b).await?)))
+    Ok(Json(form_one(&state.db, &create_form(&state, ctx.account_id, b).await?).await?))
 }
 
 async fn get_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let f: Option<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).fetch_optional(&state.db).await?;
-    Ok(Json(form_json(&f.ok_or_else(|| AppError::not_found("form"))?)))
+    Ok(Json(form_one(&state.db, &f.ok_or_else(|| AppError::not_found("form"))?).await?))
 }
 
 pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBody) -> AppResult<FormRow> {
@@ -747,6 +914,7 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
         crate::audience::list_belongs(&state.db, account_id, l).await?;
     }
     check_form_config(&b.config)?;
+    let before: Option<Value> = sqlx::query_scalar("SELECT config FROM forms WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).fetch_optional(&state.db).await?;
     let f: Option<FormRow> = sqlx::query_as(
         "UPDATE forms SET name = COALESCE($3, name), kind = COALESCE($4, kind), list_id = COALESCE($5, list_id),
            config = CASE WHEN $6::jsonb IS NULL THEN config ELSE config || $6 END, status = COALESCE($7, status), updated_at = now()
@@ -761,11 +929,22 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
     .bind(b.status)
     .fetch_optional(&state.db)
     .await?;
-    f.ok_or_else(|| AppError::not_found("form"))
+    let f = f.ok_or_else(|| AppError::not_found("form"))?;
+    // A version's counts only describe what it showed: reset any version that was removed or now
+    // shows different content (including re-lettered ones), so ending a test and starting a new one starts from zero.
+    let before = before.unwrap_or_default();
+    let shown = |c: &Value, v: &str| -> Vec<Value> {
+        let c = form_version_config(c, v);
+        FORM_VARIANT_FIELDS.iter().map(|k| c.get(*k).cloned().unwrap_or(Value::Null)).collect()
+    };
+    let now = form_versions(&f.config);
+    let keep: Vec<&str> = form_versions(&before).into_iter().filter(|v| now.contains(v) && shown(&before, v) == shown(&f.config, v)).collect();
+    sqlx::query("DELETE FROM form_variant_stats WHERE form_id = $1 AND NOT (variant = ANY($2))").bind(f.id).bind(&keep).execute(&state.db).await?;
+    Ok(f)
 }
 
 async fn patch_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<FormBody>) -> AppResult<Json<Value>> {
-    Ok(Json(form_json(&update_form(&state, ctx.account_id, id, b).await?)))
+    Ok(Json(form_one(&state.db, &update_form(&state, ctx.account_id, id, b).await?).await?))
 }
 
 async fn delete_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

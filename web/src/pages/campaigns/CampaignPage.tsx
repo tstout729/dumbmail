@@ -1,8 +1,8 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState } from "react";
 import { useBlocker, useNavigate, useParams } from "react-router";
-import { AlertTriangle, CalendarClock, CheckCircle2, Copy, Send, Users, XCircle } from "lucide-react";
-import type { Audience, Campaign, EmailContent, SmsContent } from "../../api";
+import { AlertTriangle, CalendarClock, CheckCircle2, Copy, FlaskConical, Send, Users, XCircle } from "lucide-react";
+import type { AbTest, Audience, Campaign, EmailContent, SmsContent, VersionId } from "../../api";
 import {
   useCampaign,
   useCancelCampaign,
@@ -18,10 +18,25 @@ import {
 import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
 import { SmsEditor } from "../../components/email/SmsEditor";
-import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
+import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
+import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
+import {
+  addVersion,
+  afterTestSentence,
+  removeVersion,
+  splitSentence,
+  startTest,
+  testSettings,
+  testSplit,
+  versionContent,
+  versionIds,
+  versionLabel,
+  waitLabel,
+  withVersionContent,
+} from "./abTest";
 import { CampaignReportView } from "./CampaignReport";
 import { ChannelIcon } from "./CampaignsPage";
 
@@ -50,11 +65,11 @@ export function CampaignPage() {
     );
   }
   const c = campaign.data;
-  if (c.status === "sent" || c.status === "sending") return <CampaignReportView campaign={c} />;
+  if (c.status === "sent" || c.status === "sending" || c.status === "testing") return <CampaignReportView campaign={c} />;
   return <CampaignEditor key={c.id} campaign={c} />;
 }
 
-type Draft = Pick<Campaign, "name" | "audience" | "content">;
+type Draft = Pick<Campaign, "name" | "audience" | "content" | "ab_test">;
 
 function isEmail(_content: Campaign["content"], channel: Campaign["channel"]): _content is EmailContent {
   return channel === "email";
@@ -69,13 +84,19 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const send = useSendCampaign(campaign.id);
   const cancel = useCancelCampaign(campaign.id);
   const duplicate = useDuplicateCampaign();
-  const test = useTestCampaign(campaign.id);
+  const testSend = useTestCampaign(campaign.id);
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [open, setOpen] = useState<number | null>(campaign.audience.include.length === 0 ? 1 : 2);
   const [confirmSend, setConfirmSend] = useState(false);
+  const [tab, setTab] = useState<VersionId>("a");
+  const [removing, setRemoving] = useState<VersionId | "test" | null>(null);
   const editable = campaign.status === "draft" || campaign.status === "scheduled";
-  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content };
+  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content, ab_test: campaign.ab_test };
+  const test = current.ab_test;
+  const versions = versionIds(test);
+  // A removed version's tab falls back to A.
+  const version = versions.includes(tab) ? tab : "a";
   const dirty = draft !== null;
   const tz = account.timezone;
 
@@ -97,32 +118,49 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
 
   const email = isEmail(current.content, campaign.channel) ? current.content : null;
   const sms = email ? null : (current.content as SmsContent);
-  const fromEmail = email ? email.from_email || account.from_email : null;
   const domainVerified = sending.data?.email.status === "verified";
+  const shown = versionContent(current, version);
+  const editVersion = (content: EmailContent | SmsContent) => setDraft(withVersionContent(current, version, content));
 
+  // Each version's own checks; with a test they're labelled "Version B: …".
+  const versionChecks = versions.flatMap((v) => {
+    const content = versionContent(current, v);
+    const prefix = test ? `${versionLabel(v)}: ` : "";
+    if (isEmail(content, campaign.channel)) {
+      return [
+        { ok: (content.subject ?? "").trim() !== "", label: `${prefix}Add a subject line`, blocking: true },
+        { ok: Boolean(content.from_email || account.from_email), label: `${prefix}Set a from email (here or in Settings)`, blocking: true },
+      ];
+    }
+    const body = (content as SmsContent).body ?? "";
+    return [
+      { ok: body.trim() !== "", label: `${prefix}Write your message`, blocking: true },
+      { ok: /stop/i.test(body), label: `${prefix}Include opt-out language like “Reply STOP to opt out”`, blocking: false },
+    ];
+  });
   const checks: { ok: boolean; label: string; blocking: boolean }[] = [
     { ok: current.audience.include.length > 0, label: "Choose who receives it", blocking: true },
+    ...versionChecks,
     ...(email
       ? [
-          { ok: email.subject.trim() !== "", label: "Add a subject line", blocking: true },
-          { ok: Boolean(fromEmail), label: "Set a from email (here or in Settings)", blocking: true },
           { ok: domainVerified, label: "Verify your sending domain for best deliverability", blocking: false },
           { ok: Boolean(account.address), label: "Add a mailing address in Settings (required by CAN-SPAM)", blocking: true },
         ]
-      : [
-          { ok: (sms?.body ?? "").trim() !== "", label: "Write your message", blocking: true },
-          { ok: /stop/i.test(sms?.body ?? ""), label: "Include opt-out language like “Reply STOP to opt out”", blocking: false },
-        ]),
+      : []),
   ];
   const ready = checks.every((c) => c.ok || !c.blocking);
+  const contentDone = versions.every((v) => {
+    const content = versionContent(current, v);
+    return isEmail(content, campaign.channel) ? Boolean(content.subject) : Boolean((content as SmsContent).body);
+  });
 
-  const contentSummary = email
-    ? email.subject
-      ? `Subject: ${email.subject}`
-      : "No subject yet"
-    : sms?.body
-      ? sms.body.slice(0, 90)
-      : "No message yet";
+  const contentSummary = [
+    test ? `A/B test, ${versions.length} versions` : null,
+    email ? (email.subject ? `Subject: ${email.subject}` : "No subject yet") : sms?.body ? sms.body.slice(0, 90) : "No message yet",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const count = estimate.data?.count;
 
   return (
     <Page wide>
@@ -197,11 +235,43 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           </div>
         </Step>
 
-        <Step index={2} title="Content" done={campaign.channel === "email" ? Boolean(email?.subject) : Boolean(sms?.body)} open={open === 2} onToggle={() => setOpen(open === 2 ? null : 2)} summary={contentSummary}>
-          {email ? (
-            <EmailEditor value={email} onChange={(content) => edit({ content })} readOnly={!editable} templateName={current.name} />
+        <Step index={2} title="Content" done={contentDone} open={open === 2} onToggle={() => setOpen(open === 2 ? null : 2)} summary={contentSummary}>
+          {test ? (
+            <>
+              <AbTestSettings
+                test={test}
+                channel={campaign.channel}
+                total={count}
+                disabled={!editable}
+                onChange={(ab_test) => edit({ ab_test })}
+                onRemove={() => setRemoving("test")}
+              />
+              <VersionBar
+                versions={versions}
+                value={version}
+                onChange={setTab}
+                disabled={!editable}
+                onAdd={() => {
+                  const next = addVersion(current, version);
+                  setDraft(next);
+                  setTab(versionIds(next.ab_test).at(-1) ?? "a");
+                }}
+                onRemove={setRemoving}
+              />
+            </>
+          ) : editable ? (
+            <AbTestStart
+              onStart={() => {
+                setDraft(startTest(current));
+                setTab("b");
+              }}
+            />
+          ) : null}
+          {/* Keyed by version so each tab's editor keeps its own UI state (open blocks, dialogs). */}
+          {isEmail(shown, campaign.channel) ? (
+            <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} />
           ) : (
-            <SmsEditor value={sms ?? { body: "" }} onChange={(content) => edit({ content })} readOnly={!editable} templateName={current.name} />
+            <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} />
           )}
         </Step>
 
@@ -222,14 +292,19 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
                 defaultTo={campaign.channel === "email" ? user.email : ""}
                 channel={campaign.channel}
-                loading={test.isPending}
+                versions={test ? versions : null}
+                loading={testSend.isPending}
                 disabled={!editable}
-                onSend={async (to) => {
+                onSend={async (to, v) => {
                   if (!(await save())) return;
-                  test.mutate(to, { onSuccess: (r) => toast.success(`Sent ${pluralize(r.sent, "test")}`) });
+                  testSend.mutate(
+                    { to, version: test ? v : undefined },
+                    { onSuccess: (r) => toast.success(`Sent ${pluralize(r.sent, "test")}${test ? ` of version ${v.toUpperCase()}` : ""}`) },
+                  );
                 }}
               />
             </div>
@@ -238,7 +313,8 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                 timezone={tz}
                 initial={campaign.send_at}
                 disabled={!ready}
-                count={estimate.data?.count}
+                count={count}
+                test={test}
                 scheduling={schedule.isPending || update.isPending}
                 onSchedule={async (sendAt) => {
                   if (!(await save())) return;
@@ -254,11 +330,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
       {confirmSend ? (
         <ConfirmDialog
           title="Send this campaign now?"
-          body={
-            estimate.data
-              ? `It goes to about ${pluralize(estimate.data.count, "person", "people")} right away. You can't unsend it.`
-              : "It goes out right away. You can't unsend it."
-          }
+          body={sendNowBody(test, count)}
           confirmLabel="Send now"
           loading={send.isPending || update.isPending}
           onConfirm={async () => {
@@ -271,6 +343,31 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
             });
           }}
           onClose={() => setConfirmSend(false)}
+        />
+      ) : null}
+      {removing ? (
+        <ConfirmDialog
+          title={removing === "test" ? "Remove the A/B test?" : `Remove version ${removing.toUpperCase()}?`}
+          body={
+            removing === "test"
+              ? `${versions.length === 2 ? "Version B is" : `Versions ${versions.slice(1).map((v) => v.toUpperCase()).join(", ")} are`} deleted. Version A stays as the campaign's message.`
+              : versions.length === 2
+                ? "Its content is deleted, and with one version left the A/B test ends."
+                : "Its content is deleted. Later versions move up a letter."
+          }
+          confirmLabel="Remove"
+          danger
+          onConfirm={() => {
+            if (removing === "test") {
+              edit({ ab_test: null });
+            } else {
+              setDraft(removeVersion(current, removing));
+              const i = versions.indexOf(removing);
+              setTab(versions[Math.max(0, i - 1)] ?? "a");
+            }
+            setRemoving(null);
+          }}
+          onClose={() => setRemoving(null)}
         />
       ) : null}
       {blocker.state === "blocked" ? (
@@ -287,10 +384,21 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   );
 }
 
-type TestSendProps = { defaultTo: string; channel: Campaign["channel"]; loading: boolean; disabled: boolean; onSend: (to: string[]) => void };
+type TestSendProps = {
+  defaultTo: string;
+  channel: Campaign["channel"];
+  /** The A/B test's versions, or null without a test. */
+  versions: VersionId[] | null;
+  loading: boolean;
+  disabled: boolean;
+  onSend: (to: string[], version: VersionId) => void;
+};
 
-function TestSend({ defaultTo, channel, loading, disabled, onSend }: TestSendProps) {
+function TestSend({ defaultTo, channel, versions, loading, disabled, onSend }: TestSendProps) {
   const [to, setTo] = useState(defaultTo);
+  const [picked, setPicked] = useState<VersionId>("a");
+  // A version removed since it was picked falls back to A.
+  const version = versions?.includes(picked) ? picked : "a";
   const list = to
     .split(/[,\s]+/)
     .map((s) => s.trim())
@@ -300,7 +408,16 @@ function TestSend({ defaultTo, channel, loading, disabled, onSend }: TestSendPro
       <Field label="Send a test" hint={channel === "email" ? "Comma-separated email addresses." : "Comma-separated phone numbers in +1… format."}>
         <div className="flex gap-2">
           <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "email" ? "you@company.com" : "+15035550100"} disabled={disabled} />
-          <Button loading={loading} disabled={disabled || list.length === 0} onClick={() => onSend(list)}>
+          {versions ? (
+            <Select value={version} onChange={(e) => setPicked(e.target.value as VersionId)} disabled={disabled} aria-label="Version to test" className="w-32 shrink-0">
+              {versions.map((v) => (
+                <option key={v} value={v}>
+                  {versionLabel(v)}
+                </option>
+              ))}
+            </Select>
+          ) : null}
+          <Button loading={loading} disabled={disabled || list.length === 0} onClick={() => onSend(list, version)}>
             Send test
           </Button>
         </div>
@@ -314,6 +431,7 @@ type SendPanelProps = {
   initial: string | null;
   disabled: boolean;
   count: number | undefined;
+  test: AbTest | null;
   scheduling: boolean;
   onSchedule: (sendAt: string) => void;
   onSendNow: () => void;
@@ -324,7 +442,7 @@ function defaultSendTime(timezone: string) {
   return { date: utcToZoned(tomorrow, timezone).date, time: "10:00" };
 }
 
-function SendPanel({ timezone, initial, disabled, count, scheduling, onSchedule, onSendNow }: SendPanelProps) {
+function SendPanel({ timezone, initial, disabled, count, test, scheduling, onSchedule, onSendNow }: SendPanelProps) {
   const [when, setWhen] = useState(() => (initial ? utcToZoned(initial, timezone) : defaultSendTime(timezone)));
   const sendAt = when.date && when.time ? zonedToUtc(when.date, when.time, timezone) : null;
   const [openedAt] = useState(() => Date.now());
@@ -333,7 +451,9 @@ function SendPanel({ timezone, initial, disabled, count, scheduling, onSchedule,
     <div className="space-y-4 rounded-lg bg-zinc-50 p-4">
       <div>
         <div className="text-sm font-semibold text-zinc-900">Send now</div>
-        <p className="mb-2 text-xs text-zinc-500">{count !== undefined ? `Goes to about ${pluralize(count, "person", "people")}.` : "Goes out immediately."}</p>
+        <p className="mb-2 text-xs text-zinc-500">
+          {test ? "The test goes out immediately." : count !== undefined ? `Goes to about ${pluralize(count, "person", "people")}.` : "Goes out immediately."}
+        </p>
         <Button variant="primary" icon={<Send className="size-3.5" />} disabled={disabled} onClick={onSendNow}>
           Send now
         </Button>
@@ -358,4 +478,30 @@ function SendPanel({ timezone, initial, disabled, count, scheduling, onSchedule,
       </div>
     </div>
   );
+}
+
+/** The A/B test in one box on the review step. */
+function AbSummary({ test, total }: { test: AbTest; total: number | undefined }) {
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-violet-200 bg-violet-50/40 px-3 py-2.5 text-sm text-zinc-700">
+      <FlaskConical className="mt-0.5 size-4 shrink-0 text-violet-700" />
+      <div>
+        <div className="font-medium text-zinc-900">A/B test with {versionIds(test).length} versions</div>
+        <p className="mt-0.5">
+          {splitSentence(test, total)} {afterTestSentence(test)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function sendNowBody(test: AbTest | null, count: number | undefined) {
+  if (!test) {
+    return count !== undefined ? `It goes to about ${pluralize(count, "person", "people")} right away. You can't unsend it.` : "It goes out right away. You can't unsend it.";
+  }
+  const s = testSettings(test);
+  if (s.test_percent >= 100 || count === undefined) return `${splitSentence(test, count)} The test goes out right away. You can't unsend it.`;
+  const { inTest, rest } = testSplit(count, s.test_percent, versionIds(test).length);
+  const after = s.pick === "auto" ? `the winner goes to the other ${formatNumber(rest)} automatically` : `you pick the winner for the other ${formatNumber(rest)}`;
+  return `The test goes to about ${pluralize(inTest, "person", "people")} right away; after ${waitLabel(s.wait_hours)}, ${after}. You can't unsend it.`;
 }

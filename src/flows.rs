@@ -85,6 +85,11 @@ pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
     serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))
 }
 
+/// A random split's share of people sent down path A (`yes`); the rest take path B (`no`).
+fn split_percent(n: &Node) -> Option<u32> {
+    n.data.get("percent").and_then(|v| v.as_u64()).filter(|p| (1..=99).contains(p)).map(|p| p as u32)
+}
+
 /// Validate a flow graph: known node types, required fields, edges point at real nodes, no cycles.
 pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     let def: FlowDef = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid flow definition: {e}")))?;
@@ -104,7 +109,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     }
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
-            "condition" => vec!["yes", "no"],
+            "condition" | "random_split" => vec!["yes", "no"],
             "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
@@ -136,6 +141,11 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
+            }
+            "random_split" => {
+                if split_percent(n).is_none() {
+                    return Err(AppError::bad(format!("random split {} needs `percent` (whole number 1-99, the share sent down path A)", n.id)));
+                }
             }
             "update_profile" => need("properties")?,
             "add_to_list" | "remove_from_list" => need("list_id")?,
@@ -601,6 +611,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }
+            "random_split" => {
+                let percent = split_percent(&node).unwrap_or(50);
+                let path_a = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100) < percent;
+                next = node.str(if path_a { "yes" } else { "no" }).map(str::to_string);
+            }
             "update_profile" => {
                 let props = node.data.get("properties").cloned().unwrap_or(json!({}));
                 sqlx::query("UPDATE profiles SET properties = properties || $2, updated_at = now() WHERE id = $1")
@@ -859,5 +874,18 @@ mod tests {
         assert!(parse_definition(&dangling).is_err());
         let unknown = json!({"entry": "a", "nodes": [{"id": "a", "type": "teleport"}]});
         assert!(parse_definition(&unknown).is_err());
+    }
+
+    #[test]
+    fn random_split_needs_a_whole_percent() {
+        let split = |percent: Value| json!({"entry": "s", "nodes": [
+            {"id": "s", "type": "random_split", "percent": percent, "yes": "a", "no": null},
+            {"id": "a", "type": "delay", "amount": 1, "unit": "days", "next": null}]});
+        for ok in [json!(1), json!(50), json!(99)] {
+            assert!(parse_definition(&split(ok.clone())).is_ok(), "{ok}");
+        }
+        for bad in [json!(0), json!(100), json!(-1), json!(12.5), json!("50"), Value::Null] {
+            assert!(parse_definition(&split(bad.clone())).is_err(), "{bad}");
+        }
     }
 }

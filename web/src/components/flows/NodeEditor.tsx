@@ -65,6 +65,8 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
         </fieldset>
       );
+    case "random_split":
+      return <RandomSplitEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
     case "update_profile":
       return <UpdateProfileEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
     case "add_to_list":
@@ -94,6 +96,43 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
     case "webhook":
       return <WebhookEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
   }
+}
+
+/** A whole number from 1 to 99, or null. */
+function parsePercent(raw: string): number | null {
+  if (!/^\d+$/.test(raw.trim())) return null;
+  const n = Number(raw);
+  return n >= 1 && n <= 99 ? n : null;
+}
+
+function RandomSplitEditor({ node, onChange, readOnly }: { node: Extract<FlowNode, { type: "random_split" }>; onChange: (n: FlowNode) => void; readOnly?: boolean }) {
+  // Kept as text so the field can be cleared or mid-edit; only valid values reach the flow.
+  const [draft, setDraft] = useState(() => String(node.percent));
+  const valid = parsePercent(draft) !== null;
+  return (
+    <fieldset disabled={readOnly} className="min-w-0 space-y-3">
+      <p className="text-sm text-zinc-600">
+        Each person is sent down path <b>A</b> or <b>B</b> at random. Compare the paths' per-step stats, then keep the winner.
+      </p>
+      <Field label="Path A share (%)" error={valid ? null : "Enter a whole number from 1 to 99."} hint={`Path B gets the other ${100 - node.percent}%.`}>
+        <Input
+          type="number"
+          min={1}
+          max={99}
+          step={1}
+          inputMode="numeric"
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            const percent = parsePercent(e.target.value);
+            if (percent !== null) onChange({ ...node, percent });
+          }}
+          onBlur={() => setDraft(String(node.percent))}
+          className="w-24"
+        />
+      </Field>
+    </fieldset>
+  );
 }
 
 type Kind = "text" | "number" | "boolean";

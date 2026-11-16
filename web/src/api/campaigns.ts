@@ -10,6 +10,7 @@ import type {
   EmailContent,
   ListResponse,
   SmsContent,
+  VersionId,
 } from "./types";
 
 export type CampaignInput = {
@@ -18,7 +19,8 @@ export type CampaignInput = {
   audience?: Audience;
   content?: EmailContent | SmsContent;
 };
-export type CampaignPatch = Partial<Pick<Campaign, "name" | "audience" | "content">>;
+/** `ab_test`: an object replaces the whole test, `null` removes it, omitted leaves it as is. */
+export type CampaignPatch = Partial<Pick<Campaign, "name" | "audience" | "content" | "ab_test">>;
 
 export const campaignsApi = {
   list: (params?: { status?: CampaignStatus; channel?: Channel }) =>
@@ -29,13 +31,24 @@ export const campaignsApi = {
   remove: (id: string) => api<Campaign>("DELETE", `/api/campaigns/${id}`),
   estimate: (input: { channel: Channel; audience: Audience }) =>
     api<{ count: number }>("POST", "/api/campaigns/estimate", input),
-  test: (id: string, to: string[]) => api<{ sent: number }>("POST", `/api/campaigns/${id}/test`, { to }),
+  /** `version` picks which A/B test version to send; omitted sends A. */
+  test: (id: string, to: string[], version?: VersionId) =>
+    api<{ sent: number }>("POST", `/api/campaigns/${id}/test`, { to, version }),
   schedule: (id: string, send_at: string) => api<Campaign>("POST", `/api/campaigns/${id}/schedule`, { send_at }),
   send: (id: string) => api<Campaign>("POST", `/api/campaigns/${id}/send`),
   cancel: (id: string) => api<Campaign>("POST", `/api/campaigns/${id}/cancel`),
   duplicate: (id: string) => api<Campaign>("POST", `/api/campaigns/${id}/duplicate`),
   report: (id: string) => api<CampaignReport>("GET", `/api/campaigns/${id}/report`),
+  /** End an A/B test: send `version` (omitted: the current leader) to everyone not in the test. */
+  pickWinner: (id: string, version?: VersionId) => api<Campaign>("POST", `/api/campaigns/${id}/winner`, { version }),
 };
+
+/** Poll fast while messages go out, slower while an A/B test waits for results. */
+function livePoll(status: CampaignStatus | undefined): number | false {
+  if (status === "sending") return 5000;
+  if (status === "testing") return 30_000;
+  return false;
+}
 
 export function useCampaigns() {
   return useQuery({ queryKey: keys.campaigns, queryFn: () => campaignsApi.list(), select: (r) => r.data });
@@ -45,17 +58,18 @@ export function useCampaign(id: string) {
   return useQuery({
     queryKey: keys.campaign(id),
     queryFn: () => campaignsApi.get(id),
-    // Poll while messages are going out so status and stats move on their own.
-    refetchInterval: (query) => (query.state.data?.status === "sending" ? 5000 : false),
+    // Poll while messages are going out or a test is running so status and stats move on their own.
+    refetchInterval: (query) => livePoll(query.state.data?.status),
   });
 }
 
-export function useCampaignReport(id: string, enabled: boolean, live = false) {
+/** `status` is the campaign's status; the report polls while it's sending or testing. */
+export function useCampaignReport(id: string, enabled: boolean, status?: CampaignStatus) {
   return useQuery({
     queryKey: keys.campaignReport(id),
     queryFn: () => campaignsApi.report(id),
     enabled,
-    refetchInterval: live ? 5000 : false,
+    refetchInterval: livePoll(status),
   });
 }
 
@@ -121,7 +135,22 @@ export function useDuplicateCampaign() {
 }
 
 export function useTestCampaign(id: string) {
-  return useMutation({ mutationFn: (to: string[]) => campaignsApi.test(id, to) });
+  return useMutation({ mutationFn: ({ to, version }: { to: string[]; version?: VersionId }) => campaignsApi.test(id, to, version) });
+}
+
+/** Send an A/B test's winner (omitted: the leader) to everyone else. */
+export function usePickWinner(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (version?: VersionId) => campaignsApi.pickWinner(id, version),
+    onSuccess: (campaign) => qc.setQueryData(keys.campaign(id), campaign),
+    // Refresh either way: a 409 means someone (or the scheduler) already picked.
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: keys.campaign(id) });
+      void qc.invalidateQueries({ queryKey: keys.campaignReport(id) });
+      void qc.invalidateQueries({ queryKey: keys.campaigns });
+    },
+  });
 }
 
 export function useDeleteCampaign() {

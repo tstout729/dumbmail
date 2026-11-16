@@ -5,6 +5,7 @@ import type { Campaign, CampaignStatus, Channel } from "../../api";
 import { useCampaigns, useCreateCampaign, useDeleteCampaign, useDuplicateCampaign, useSession } from "../../api";
 import { starterEmail } from "../../components/email/blocks";
 import {
+  Badge,
   Button,
   ConfirmDialog,
   EmptyRow,
@@ -31,7 +32,8 @@ type Tab = "all" | "draft" | "scheduled" | "sent";
 const tabStatuses: Record<Tab, CampaignStatus[] | null> = {
   all: null,
   draft: ["draft"],
-  scheduled: ["scheduled", "sending"],
+  // In progress counts as scheduled until it's fully sent, including an A/B test waiting on its winner.
+  scheduled: ["scheduled", "sending", "testing"],
   sent: ["sent", "cancelled", "failed"],
 };
 
@@ -130,13 +132,20 @@ export function CampaignsPage() {
             </EmptyRow>
           ) : (
             rows.map((c) => {
-              const sent = c.status === "sent" || c.status === "sending";
+              const sent = c.status === "sent" || c.status === "sending" || c.status === "testing";
               return (
                 <RowLink key={c.id} to={`/campaigns/${c.id}`}>
                   <Td>
                     <div className="flex items-center gap-2.5">
                       <ChannelIcon channel={c.channel} />
-                      <span className="min-w-36 font-medium text-zinc-900">{c.name}</span>
+                      <span className="min-w-36 font-medium text-zinc-900">
+                        {c.name}
+                        {c.ab_test ? (
+                          <span className="ml-2 align-middle">
+                            <Badge tone="violet">A/B</Badge>
+                          </span>
+                        ) : null}
+                      </span>
                     </div>
                   </Td>
                   <Td>
