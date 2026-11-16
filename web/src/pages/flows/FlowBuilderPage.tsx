@@ -112,7 +112,7 @@ function FlowBuilder({ flow }: { flow: Flow }) {
   const stats = report.data?.stats ?? flow.stats;
 
   return (
-    <div className="flex min-h-[calc(100dvh-3rem)] flex-col lg:min-h-dvh">
+    <div className="flex h-[calc(100dvh-3rem)] flex-col lg:h-dvh">
       <div className="border-b border-zinc-200 bg-white">
         <Page wide>
           <PageHeader
@@ -151,7 +151,7 @@ function FlowBuilder({ flow }: { flow: Flow }) {
           ) : null}
         </Page>
       </div>
-      <div className="flex-1 bg-[radial-gradient(circle,#e4e4e7_1px,transparent_1px)] [background-size:18px_18px]">
+      <div className="min-h-80 flex-1">
         <FlowCanvas
           definition={def}
           trigger={current.trigger}

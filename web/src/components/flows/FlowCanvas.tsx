@@ -18,6 +18,7 @@ import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
 import { Menu, cx } from "../ui";
 import { getSlot, insertableTypes, nodeLabels, type Slot } from "./graph";
+import { PanZoom } from "./PanZoom";
 
 export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }> = {
   delay: { icon: Clock, tone: "bg-zinc-100 text-zinc-600" },
@@ -52,8 +53,8 @@ export function FlowCanvas(props: CanvasProps) {
   const ctx: ChainCtx = { ...props, nodesById, stats };
 
   return (
-    <div className="overflow-auto">
-      <div className="mx-auto flex min-w-max flex-col items-center px-6 py-8">
+    <PanZoom>
+      <div className="flex flex-col items-center px-6 py-8">
         <button
           type="button"
           onClick={onSelectTrigger}
@@ -70,7 +71,7 @@ export function FlowCanvas(props: CanvasProps) {
         </button>
         <Chain slot={{ kind: "entry" }} ctx={ctx} seen={new Set()} />
       </div>
-    </div>
+    </PanZoom>
   );
 }
 

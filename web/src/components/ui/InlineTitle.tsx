@@ -6,8 +6,9 @@ type InlineTitleProps = Omit<InputHTMLAttributes<HTMLInputElement>, "value" | "c
 
 /** A page title that edits in place and grows with its text. */
 export function InlineTitle({ value, placeholder, ...rest }: InlineTitleProps) {
+  // max-w adds back the 0.5rem the negative margins take, or the last letter clips.
   return (
-    <span className="-mx-1 inline-grid min-w-0 max-w-full font-semibold">
+    <span className="-mx-1 inline-grid min-w-0 max-w-[calc(100%+0.5rem)] font-semibold">
       {/* Invisible copy of the text sizes the input to fit it exactly. */}
       <span aria-hidden="true" className="invisible col-start-1 row-start-1 overflow-hidden whitespace-pre px-1 pr-2">
         {value || placeholder || " "}
