@@ -1,27 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { Link } from "react-router";
-import { AlertTriangle, KeyRound, Plus, Trash2 } from "lucide-react";
-import type { ApiKey, CreatedApiKey } from "../../api";
-import { useApiKeys, useCreateApiKey, useRevokeApiKey, useSession } from "../../api";
-import {
-  Button,
-  Card,
-  CodeBlock,
-  ConfirmDialog,
-  CopyField,
-  EmptyRow,
-  EmptyState,
-  Field,
-  IconButton,
-  Input,
-  Modal,
-  Segmented,
-  SkeletonRows,
-  Table,
-  Td,
-  Th,
-} from "../../components/ui";
-import { formatDate, formatRelative } from "../../lib/format";
+import { Card, CodeBlock, Segmented } from "../../components/ui";
+import { ApiKeysCard } from "../../features/team/ApiKeysCard";
 
 const mcpAbilities = [
   "Look up, create and update profiles; import contacts",
@@ -72,7 +52,7 @@ export function DevelopersPage() {
         <ApiKeysCard />
         <Card title="MCP server">
           <p className="mb-3 text-sm text-zinc-600">
-            Let Claude, Cursor or any MCP client run your marketing: point it at <code className="rounded bg-zinc-100 px-1 text-xs">{origin}/mcp</code> with a private API key.
+            Let Claude, Cursor or any MCP client run your marketing: point it at <code className="rounded bg-zinc-100 px-1 text-xs">{origin}/mcp</code> with a private API key. Give each key only the access it needs.
           </p>
           <div className="mb-3">
             <Segmented
@@ -107,125 +87,5 @@ export function DevelopersPage() {
         </Card>
       </div>
     </div>
-  );
-}
-
-function ApiKeysCard() {
-  const { account } = useSession();
-  const keys = useApiKeys();
-  const create = useCreateApiKey();
-  const revoke = useRevokeApiKey();
-  const [creating, setCreating] = useState(false);
-  const [created, setCreated] = useState<CreatedApiKey | null>(null);
-  const [revoking, setRevoking] = useState<ApiKey | null>(null);
-
-  const onCreate = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const name = String(new FormData(e.currentTarget).get("name")).trim();
-    create.mutate(name, {
-      onSuccess: (k) => {
-        setCreating(false);
-        setCreated(k);
-      },
-    });
-  };
-
-  return (
-    <Card
-      title="API keys"
-      padded={false}
-      actions={
-        <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setCreating(true)}>
-          Create key
-        </Button>
-      }
-    >
-      <Table className="rounded-none border-0 shadow-none">
-        <thead>
-          <tr>
-            <Th>Name</Th>
-            <Th>Key</Th>
-            <Th>Created</Th>
-            <Th>Last used</Th>
-            <Th className="w-10" />
-          </tr>
-        </thead>
-        <tbody>
-          {keys.isPending ? (
-            <SkeletonRows cols={5} rows={2} />
-          ) : (keys.data ?? []).length === 0 ? (
-            <EmptyRow cols={5}>
-              <EmptyState icon={<KeyRound className="size-5" />} title="No API keys" description="Create a private key for your server, scripts or an AI agent." />
-            </EmptyRow>
-          ) : (
-            (keys.data ?? []).map((k) => (
-              <tr key={k.id}>
-                <Td className="font-medium text-zinc-900">{k.name}</Td>
-                <Td>
-                  <code className="font-mono text-xs text-zinc-600">{k.prefix}…</code>
-                </Td>
-                <Td className="text-zinc-600">{formatDate(k.created_at, account.timezone)}</Td>
-                <Td className="text-zinc-600">{formatRelative(k.last_used_at)}</Td>
-                <Td>
-                  <IconButton label={`Revoke ${k.name}`} onClick={() => setRevoking(k)} className="hover:text-red-600">
-                    <Trash2 className="size-3.5" />
-                  </IconButton>
-                </Td>
-              </tr>
-            ))
-          )}
-        </tbody>
-      </Table>
-      {creating ? (
-        <Modal title="Create API key" onClose={() => setCreating(false)} size="sm">
-          <form onSubmit={onCreate} className="space-y-4">
-            <Field label="Name" hint="So you know what uses it.">
-              <Input name="name" required autoFocus placeholder="Claude agent" />
-            </Field>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" onClick={() => setCreating(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" variant="primary" loading={create.isPending}>
-                Create key
-              </Button>
-            </div>
-          </form>
-        </Modal>
-      ) : null}
-      {created ? (
-        <Modal
-          title="Copy your new key"
-          onClose={() => setCreated(null)}
-          size="md"
-          footer={
-            <Button variant="primary" onClick={() => setCreated(null)}>
-              I've saved it
-            </Button>
-          }
-        >
-          <div className="space-y-3">
-            <div className="flex items-start gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-              This is the only time you'll see this key. Store it somewhere safe; it has full access to your account.
-            </div>
-            <CopyField value={created.key} />
-          </div>
-        </Modal>
-      ) : null}
-      {revoking ? (
-        <ConfirmDialog
-          title={`Revoke "${revoking.name}"?`}
-          body="Anything using this key stops working immediately."
-          confirmLabel="Revoke key"
-          danger
-          onConfirm={() => {
-            revoke.mutate(revoking.id);
-            setRevoking(null);
-          }}
-          onClose={() => setRevoking(null)}
-        />
-      ) : null}
-    </Card>
   );
 }
