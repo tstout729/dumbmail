@@ -3,6 +3,8 @@ import { AlignCenter, AlignLeft, AlignRight, Bold, Italic, Link2, List } from "l
 import type { Align, EmailBlock } from "../../api";
 import { ColorInput, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 import { ProductsBlockFields } from "../../features/catalog/ProductsBlockFields";
+import { ContentBlockFields } from "../../features/content/ContentBlockFields";
+import { isContentBlock } from "../../features/content/blockDefs";
 import { VariableMenu, insertAtCursor, wrapSelection } from "./VariableMenu";
 
 type Props<T extends EmailBlock> = { block: T; onChange: (b: EmailBlock) => void };
@@ -97,7 +99,7 @@ function ImageFields({ block, onChange }: Props<Extract<EmailBlock, { type: "ima
       <Field label="Image URL" className="sm:col-span-2">
         <Input value={block.src} onChange={(e) => onChange({ ...block, src: e.target.value })} placeholder="https://…/image.jpg" />
       </Field>
-      <Field label="Alt text">
+      <Field label="Alt text" error={block.src && !block.alt?.trim() ? "Describe the image for people who can't see it" : undefined}>
         <Input value={block.alt ?? ""} onChange={(e) => onChange({ ...block, alt: e.target.value || undefined })} />
       </Field>
       <Field label="Width (px)" hint="Blank = full width">
@@ -109,8 +111,11 @@ function ImageFields({ block, onChange }: Props<Extract<EmailBlock, { type: "ima
           onChange={(e) => onChange({ ...block, width: e.target.value ? Number(e.target.value) : undefined })}
         />
       </Field>
-      <Field label="Link (optional)" className="sm:col-span-2">
+      <Field label="Link (optional)">
         <Input value={block.href ?? ""} onChange={(e) => onChange({ ...block, href: e.target.value || undefined })} placeholder="https://" />
+      </Field>
+      <Field label="Rounded corners (px)">
+        <Input type="number" min={0} max={40} value={block.radius ?? 6} onChange={(e) => onChange({ ...block, radius: e.target.value === "" ? undefined : Math.min(40, Math.max(0, Number(e.target.value))) })} />
       </Field>
     </div>
   );
@@ -206,6 +211,7 @@ function ColumnsCount({ block, onChange }: Props<Extract<EmailBlock, { type: "co
 
 /** Field editor for every block type except the nested content of columns (handled by BlockList). */
 export function BlockFields({ block, onChange }: { block: EmailBlock; onChange: (b: EmailBlock) => void }) {
+  if (isContentBlock(block)) return <ContentBlockFields block={block} onChange={onChange} />;
   switch (block.type) {
     case "heading":
       return <HeadingFields block={block} onChange={onChange} />;

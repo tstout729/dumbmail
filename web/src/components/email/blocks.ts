@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import type { EmailBlock, EmailBlockType, EmailContent } from "../../api";
 import { newProductsBlock, sourceLabel } from "../../features/catalog/ProductsBlockFields";
+import { contentBlockMeta, contentBlockOrder, contentBlockSummary, isContentBlock, isContentType, newContentBlock } from "../../features/content/blockDefs";
 
 export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon }> = {
   heading: { label: "Heading", icon: Heading },
@@ -25,11 +26,13 @@ export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon
   product: { label: "Product", icon: ShoppingBag },
   products: { label: "Products from catalog", icon: LayoutGrid },
   html: { label: "HTML", icon: Code },
+  ...contentBlockMeta,
 };
 
-export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "columns", "divider", "spacer", "html"];
+export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "columns", "divider", "spacer", "html", ...contentBlockOrder];
 
 export function newBlock(type: EmailBlockType): EmailBlock {
+  if (isContentType(type)) return newContentBlock(type);
   switch (type) {
     case "heading":
       return { type, text: "A headline that earns the open", level: 1, align: "left" };
@@ -65,6 +68,7 @@ function stripTags(html: string) {
 }
 
 export function blockSummary(b: EmailBlock): string {
+  if (isContentBlock(b)) return contentBlockSummary(b);
   switch (b.type) {
     case "heading":
       return b.text || "Empty heading";

@@ -514,15 +514,21 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
         Some(id) => Some(campaigns::load(&state.db, account_id, id).await?),
         None => None,
     };
-    let flow_content = match (input.flow_id, input.node_id.as_deref()) {
-        (Some(fid), Some(nid)) => {
+    let flow_content = match input.flow_id {
+        Some(fid) => {
+            // Ownership is checked even when unsaved content comes with it.
             let f = crate::api::messaging::load_flow(state, account_id, fid).await?;
-            let def = crate::flows::parse_definition(&f.definition)?;
-            let node = def.nodes.iter().find(|n| n.id == nid && n.kind == "email").ok_or_else(|| AppError::not_found("email step"))?;
-            Some(node.data.get("content").cloned().unwrap_or(json!({})))
+            match (&input.content, input.node_id.as_deref()) {
+                (Some(_), _) => None,
+                (None, Some(nid)) => {
+                    let def = crate::flows::parse_definition(&f.definition)?;
+                    let node = def.nodes.iter().find(|n| n.id == nid && n.kind == "email").ok_or_else(|| AppError::not_found("email step"))?;
+                    Some(node.data.get("content").cloned().unwrap_or(json!({})))
+                }
+                (None, None) => return Err(AppError::bad("give node_id: the flow's email step to check")),
+            }
         }
-        (Some(_), None) => return Err(AppError::bad("give node_id: the flow's email step to check")),
-        _ => None,
+        None => None,
     };
     if let Some(c) = &campaign {
         if c.channel != "email" {

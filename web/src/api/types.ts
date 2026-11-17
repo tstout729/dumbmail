@@ -1,6 +1,7 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+import type { BlockOptions, ContentBlock } from "../features/content/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
@@ -232,17 +233,20 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock =
+export type EmailBlock = BlockOptions &
+  (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
-  | { type: "image"; src: string; alt?: string; href?: string; width?: number }
+  | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }
   | { type: "button"; text: string; href: string; color?: string; align?: Align }
   | { type: "divider" }
   | { type: "spacer"; height?: number }
   | { type: "columns"; columns: EmailBlock[][] }
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
   | { type: "html"; html: string }
-  | ProductsBlock;
+  | ProductsBlock
+  | ContentBlock
+  );
 
 export type EmailBlockType = EmailBlock["type"];
 

@@ -156,6 +156,8 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                     [image(&b.square(), "Feature one", ""), heading("Feature one", 3, "left"), text("<p>What it does for them.</p>", "left")],
                     [image(&b.square(), "Feature two", ""), heading("Feature two", 3, "left"), text("<p>What it does for them.</p>", "left")]
                 ]}),
+                // The newest products in the catalog (shows nothing until the catalog has products).
+                json!({"type": "products", "source": "newest", "count": 2, "columns": 2}),
                 footer(b),
             ],
         ),
@@ -251,9 +253,10 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
             "The item you wanted is available again.",
             vec![
                 heading("Good news: it's back", 1, "center"),
-                json!({"type": "image_text", "src": "{{ event.properties.image_url|default('PLACEHOLDER') }}".replace("PLACEHOLDER", &b.square()), "alt": "{{ event.properties.product_name|default('Product') }}",
-                    "heading": "{{ event.properties.product_name|default('Your item') }}", "html": "<p>It sold out fast last time, so don't wait too long.</p>",
-                    "button_text": "Get it now", "button_href": format!("{{{{ event.properties.url|default('{}') }}}}", b.website), "image_position": "left"}),
+                text("<p>Hi {{ first_name|default('there') }}, the item you asked about is available again. It sold out fast last time, so don't wait too long.</p>", "center"),
+                // The product from the triggering event, with its photo and price from the catalog.
+                json!({"type": "products", "source": "event_items", "count": 1, "columns": 1, "button_text": "Get it now"}),
+                button("Shop now", &format!("{{{{ event.properties.url|default('{}') }}}}", b.website)),
                 footer(b),
             ],
         ),
@@ -307,7 +310,7 @@ pub fn sample_event(key: &str) -> Option<Value> {
         "abandoned_cart" => Some(json!({"value": 84.0, "properties": {"items": items}})),
         "order_confirmation" => Some(json!({"value": "$84.00", "properties": {"order_id": "1042", "items": items}})),
         "shipping" => Some(json!({"properties": {"order_id": "1042", "carrier": "UPS", "tracking_number": "1Z999AA10123456784"}})),
-        "back_in_stock" => Some(json!({"properties": {"product_name": "Everyday tote"}})),
+        "back_in_stock" => Some(json!({"properties": {"product_name": "Everyday tote", "product_id": "TOTE-1"}})),
         "booking_confirmation" => Some(json!({"properties": {"name": "Sunset kayak tour", "start_date": "Sat, Jun 6 at 6:00 PM", "end_date": "Sat, Jun 6 at 8:00 PM", "confirmation_code": "K7Q2P"}})),
         "pre_arrival" => Some(json!({"properties": {"address": "123 Ocean View Rd"}})),
         _ => None,
