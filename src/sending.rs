@@ -120,12 +120,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
-            // A number on the suppression list (see features::people) gets no texts.
-            if !spec.is_test {
-                let suppressed: Option<String> = sqlx::query_scalar("SELECT sms_suppressed_reason FROM profiles WHERE id = $1").bind(p.id).fetch_one(&state.db).await?;
-                if suppressed.is_some() {
-                    return Ok(Outcome::Skipped("suppressed"));
-                }
+            // A number on the suppression list (see features::people) gets no texts at all, tests included.
+            let suppressed: Option<String> = sqlx::query_scalar("SELECT sms_suppressed_reason FROM profiles WHERE id = $1").bind(p.id).fetch_one(&state.db).await?;
+            if suppressed.is_some() {
+                return Ok(Outcome::Skipped("suppressed"));
             }
             if !spec.is_test {
                 if let Some(until) = sms_quiet_until(spec.account, Utc::now()) {
@@ -137,6 +135,14 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         _ => return Err(AppError::bad("channel must be email or sms")),
     };
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
+    // A queued message names the address it was meant for. If the profile's address has changed since
+    // (an edit, a merge), it isn't sent to the new one.
+    if let (Some(mid), false) = (spec.message_id, spec.is_test) {
+        let meant: Option<String> = sqlx::query_scalar("SELECT to_address FROM messages WHERE id = $1").bind(mid).fetch_optional(&state.db).await?;
+        if meant.is_some_and(|m| m != to) {
+            return Ok(Outcome::Skipped("address changed"));
+        }
+    }
 
     // A paused account sends no email (see `deliverability`). Tests say why; real sends keep a
     // skipped message row with the reason instead of disappearing.

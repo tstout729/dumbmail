@@ -21,40 +21,62 @@ pub enum OnMerge {
     /// Point them at the kept profile.
     Move,
     /// Point them at the kept profile unless it already has a row with the same values in these
-    /// columns; those duplicates go with the merged profile.
+    /// columns (NULLs count as equal); those duplicates go with the merged profile.
     MoveUnless(&'static [&'static str]),
     /// They go with the merged profile.
     Drop,
-    /// Handled by its own code in [`merge`] (named in `custom_merge`).
+    /// Handled by its own code in [`merge`] (named in `CUSTOM_MERGE`).
     Custom,
+}
+
+/// What erasing a person does with their rows in one table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnErase {
+    Delete,
+    /// Keep the row but drop the profile id (a bulk action's target, reported as skipped).
+    Forget,
 }
 
 pub struct ProfileRef {
     pub table: &'static str,
     pub column: &'static str,
     pub on_merge: OnMerge,
+    pub on_erase: OnErase,
 }
 
-/// Every column that holds a profile id. Deleting a person deletes their rows in all of these.
+const fn r(table: &'static str, column: &'static str, on_merge: OnMerge) -> ProfileRef {
+    ProfileRef { table, column, on_merge, on_erase: OnErase::Delete }
+}
+
+/// Every column that holds a profile id, with what a merge and an erasure do to its rows.
 pub const PROFILE_TABLES: &[ProfileRef] = &[
-    ProfileRef { table: "list_members", column: "profile_id", on_merge: OnMerge::MoveUnless(&["list_id"]) },
-    ProfileRef { table: "segment_members", column: "profile_id", on_merge: OnMerge::MoveUnless(&["segment_id"]) },
-    ProfileRef { table: "events", column: "profile_id", on_merge: OnMerge::Move },
+    r("list_members", "profile_id", OnMerge::MoveUnless(&["list_id"])),
+    r("segment_members", "profile_id", OnMerge::MoveUnless(&["segment_id"])),
+    r("events", "profile_id", OnMerge::Move),
     // Active runs of a flow the kept profile is already in are exited first.
-    ProfileRef { table: "flow_runs", column: "profile_id", on_merge: OnMerge::Custom },
-    // A campaign the kept profile also got keeps one link to it (the other message stays, unlinked).
-    ProfileRef { table: "messages", column: "profile_id", on_merge: OnMerge::Custom },
-    ProfileRef { table: "optin_confirmations", column: "profile_id", on_merge: OnMerge::Move },
-    // Append-only: copied onto the kept profile.
-    ProfileRef { table: "consent_events", column: "profile_id", on_merge: OnMerge::Custom },
-    ProfileRef { table: "profile_notes", column: "profile_id", on_merge: OnMerge::Move },
-    ProfileRef { table: "identity_conflicts", column: "profile_a", on_merge: OnMerge::Drop },
-    ProfileRef { table: "identity_conflicts", column: "profile_b", on_merge: OnMerge::Drop },
-    ProfileRef { table: "bulk_action_targets", column: "profile_id", on_merge: OnMerge::Drop },
+    r("flow_runs", "profile_id", OnMerge::Custom),
+    // Queued duplicates are cancelled; a campaign the kept profile also got keeps one link to it.
+    r("messages", "profile_id", OnMerge::Custom),
+    // Waiting confirmations sent to an address the merged profile won't have are voided.
+    r("optin_confirmations", "profile_id", OnMerge::Custom),
+    // Append-only: copied onto the kept profile (marked merged_from); the originals go with the profile.
+    r("consent_events", "profile_id", OnMerge::Custom),
+    r("profile_notes", "profile_id", OnMerge::Move),
+    r("identity_conflicts", "profile_a", OnMerge::Drop),
+    r("identity_conflicts", "profile_b", OnMerge::Drop),
+    // A bulk action acts on the people it was approved for: a merged-away target is skipped.
+    ProfileRef { table: "bulk_action_targets", column: "profile_id", on_merge: OnMerge::Custom, on_erase: OnErase::Forget },
+    // Personal exports follow the person, so erasing the kept profile removes them too.
+    r("people_file_subjects", "profile_id", OnMerge::MoveUnless(&["file_id"])),
+    r("catalog_interactions", "profile_id", OnMerge::Move),
+    // One waiting alert per product and variant.
+    r("catalog_stock_subscriptions", "profile_id", OnMerge::Custom),
+    // The most recent notice wins, so the cooldown never gets shorter.
+    r("catalog_price_drop_notices", "profile_id", OnMerge::Custom),
 ];
 
 /// Tables whose `OnMerge::Custom` handling lives in [`merge`].
-pub const CUSTOM_MERGE: &[&str] = &["flow_runs", "messages", "consent_events"];
+pub const CUSTOM_MERGE: &[&str] = &["flow_runs", "messages", "optin_confirmations", "consent_events", "bulk_action_targets", "catalog_stock_subscriptions", "catalog_price_drop_notices"];
 
 #[derive(Debug, Deserialize)]
 pub struct MergeBody {
@@ -231,6 +253,18 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
         return Ok(out);
     }
 
+    // A message already handed to a worker or being sent by a flow can't be moved safely: ask to retry.
+    let busy: Vec<(Uuid, String, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, status, campaign_id, created_at FROM messages WHERE profile_id = ANY($1) AND status IN ('queued', 'sending') ORDER BY id FOR UPDATE",
+    )
+    .bind([keep.id, other.id])
+    .fetch_all(&mut *tx)
+    .await?;
+    let recent = Utc::now() - chrono::Duration::minutes(10);
+    if busy.iter().any(|m| m.1 == "sending" || (m.2.is_none() && m.3 > recent)) {
+        return Err(AppError::Conflict("A message to one of these profiles is being sent right now. Try the merge again in a minute.".into()));
+    }
+
     let r = &merged.row;
     // Free the identifiers first: they're unique per account.
     sqlx::query("UPDATE profiles SET email = NULL, phone_number = NULL, external_id = NULL WHERE id = $1").bind(other.id).execute(&mut *tx).await?;
@@ -259,12 +293,26 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     .execute(&mut *tx)
     .await?;
     let src = ConsentSource { method: "merge", ..src.clone() }.with_detail("merged_profile_id", json!(other.id));
+    // The merged state is never less restrictive than the kept one, so a failed history write can't
+    // block it (see consent::record_diff).
     consent::record_diff(&mut tx, account_id, keep.id, Some(&keep.state()), &r.state(), &src).await?;
     // Addresses that don't survive the merge keep their suppression record, so a later import of
     // one of them can't come back more contactable.
     let keep_addrs: Vec<&str> = [r.email.as_deref(), r.phone_number.as_deref()].into_iter().flatten().collect();
     super::privacy::write_tombstones(&mut tx, account_id, &salt, &other.state(), &keep_addrs).await?;
     super::privacy::write_tombstones(&mut tx, account_id, &salt, &keep.state(), &keep_addrs).await?;
+    // History rows still waiting to be written for the merged profile land on the kept one.
+    sqlx::query(
+        "UPDATE jobs SET payload = jsonb_build_object('profile_id', $1::text, 'rows',
+             (SELECT COALESCE(jsonb_agg(x || jsonb_build_object('profile_id', $1::text, 'detail', COALESCE(x->'detail', '{}'::jsonb) || jsonb_build_object('merged_from', $2::text))), '[]'::jsonb)
+              FROM jsonb_array_elements(payload->'rows') x))
+         WHERE kind = $3 AND payload->>'profile_id' = $2::text",
+    )
+    .bind(keep.id)
+    .bind(other.id)
+    .bind(consent::HISTORY_JOB)
+    .execute(&mut *tx)
+    .await?;
 
     for t in PROFILE_TABLES {
         let (table, col) = (t.table, t.column);
@@ -273,54 +321,18 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
                 sqlx::query(&format!("UPDATE {table} SET {col} = $1 WHERE {col} = $2")).bind(keep.id).bind(other.id).execute(&mut *tx).await?;
             }
             OnMerge::MoveUnless(cols) => {
-                let same: String = cols.iter().map(|c| format!(" AND x.{c} = t.{c}")).collect();
-                sqlx::query(&format!("UPDATE {table} t SET {col} = $1 WHERE t.{col} = $2 AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{col} = $1{same})"))
+                let same: String = cols.iter().map(|c| format!(" AND x.{c} IS NOT DISTINCT FROM t.{c}")).collect();
+                sqlx::query(&format!("DELETE FROM {table} t WHERE t.{col} = $2 AND EXISTS (SELECT 1 FROM {table} x WHERE x.{col} = $1{same})"))
                     .bind(keep.id)
                     .bind(other.id)
                     .execute(&mut *tx)
                     .await?;
+                sqlx::query(&format!("UPDATE {table} SET {col} = $1 WHERE {col} = $2")).bind(keep.id).bind(other.id).execute(&mut *tx).await?;
             }
             OnMerge::Drop => {
                 sqlx::query(&format!("DELETE FROM {table} WHERE {col} = $1")).bind(other.id).execute(&mut *tx).await?;
             }
-            OnMerge::Custom => match table {
-                "flow_runs" => {
-                    sqlx::query(
-                        "UPDATE flow_runs r SET status = 'exited', finished_at = now() WHERE r.profile_id = $2 AND r.status = 'active'
-                           AND EXISTS (SELECT 1 FROM flow_runs k WHERE k.profile_id = $1 AND k.flow_id = r.flow_id AND k.status = 'active')",
-                    )
-                    .bind(keep.id)
-                    .bind(other.id)
-                    .execute(&mut *tx)
-                    .await?;
-                    sqlx::query("UPDATE flow_runs SET profile_id = $1 WHERE profile_id = $2").bind(keep.id).bind(other.id).execute(&mut *tx).await?;
-                }
-                "messages" => {
-                    sqlx::query(
-                        "UPDATE messages m SET campaign_id = NULL WHERE m.profile_id = $2 AND m.campaign_id IS NOT NULL AND NOT m.is_test
-                           AND EXISTS (SELECT 1 FROM messages k WHERE k.profile_id = $1 AND k.campaign_id = m.campaign_id AND NOT k.is_test)",
-                    )
-                    .bind(keep.id)
-                    .bind(other.id)
-                    .execute(&mut *tx)
-                    .await?;
-                    sqlx::query("UPDATE messages SET profile_id = $1 WHERE profile_id = $2").bind(keep.id).bind(other.id).execute(&mut *tx).await?;
-                }
-                "consent_events" => {
-                    sqlx::query(
-                        "INSERT INTO consent_events (id, account_id, profile_id, channel, field, old_value, new_value, method, via, address,
-                                                     actor_user_id, form_id, message_id, ip, user_agent, detail, occurred_at)
-                         SELECT gen_random_uuid(), account_id, $1, channel, field, old_value, new_value, method, via, address,
-                                actor_user_id, form_id, message_id, ip, user_agent, detail || jsonb_build_object('merged_from', $2::text), occurred_at
-                         FROM consent_events WHERE profile_id = $2",
-                    )
-                    .bind(keep.id)
-                    .bind(other.id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                other_table => return Err(AppError::Internal(anyhow::anyhow!("no merge handling for {other_table}"))),
-            },
+            OnMerge::Custom => custom_merge(&mut tx, table, keep.id, other.id, r.email.as_deref(), r.phone_number.as_deref()).await?,
         }
     }
     sqlx::query("DELETE FROM profiles WHERE id = $1 AND account_id = $2").bind(other.id).bind(account_id).execute(&mut *tx).await?;
@@ -328,6 +340,121 @@ pub async fn merge(db: &PgPool, account_id: Uuid, b: &MergeBody, src: &ConsentSo
     let mut out = preview;
     out["merged"] = json!(true);
     Ok(out)
+}
+
+/// The tables a merge handles with its own code (see [`PROFILE_TABLES`]).
+async fn custom_merge(tx: &mut sqlx::PgConnection, table: &str, keep: Uuid, other: Uuid, merged_email: Option<&str>, merged_phone: Option<&str>) -> AppResult<()> {
+    match table {
+        "flow_runs" => {
+            sqlx::query(
+                "UPDATE flow_runs r SET status = 'exited', finished_at = now() WHERE r.profile_id = $2 AND r.status = 'active'
+                   AND EXISTS (SELECT 1 FROM flow_runs k WHERE k.profile_id = $1 AND k.flow_id = r.flow_id AND k.status = 'active')",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE flow_runs SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "messages" => {
+            // Both have a queued message for one campaign, and only the merged profile's message names
+            // the address it keeps: that one stays, the kept profile's is cancelled.
+            sqlx::query(
+                "UPDATE messages k SET status = 'skipped', error = 'merged into another profile', campaign_id = NULL
+                 WHERE k.profile_id = $1 AND k.status = 'queued' AND NOT k.is_test AND k.campaign_id IS NOT NULL
+                   AND k.to_address IS DISTINCT FROM (CASE k.channel WHEN 'sms' THEN $4 ELSE $3 END)
+                   AND EXISTS (SELECT 1 FROM messages m WHERE m.profile_id = $2 AND m.campaign_id = k.campaign_id AND m.status = 'queued' AND NOT m.is_test
+                                 AND m.to_address = (CASE m.channel WHEN 'sms' THEN $4 ELSE $3 END))",
+            )
+            .bind(keep)
+            .bind(other)
+            .bind(merged_email)
+            .bind(merged_phone)
+            .execute(&mut *tx)
+            .await?;
+            // A queued message for a campaign or flow step the kept profile already has a message for
+            // would reach the same person twice: cancel it. (Both profiles' queued messages are locked
+            // above, so a worker can't claim one meanwhile.)
+            sqlx::query(
+                "UPDATE messages m SET status = 'skipped', error = 'merged into another profile', campaign_id = NULL
+                 WHERE m.profile_id = $2 AND m.status = 'queued' AND NOT m.is_test AND (
+                   (m.campaign_id IS NOT NULL AND EXISTS (SELECT 1 FROM messages k WHERE k.profile_id = $1 AND k.campaign_id = m.campaign_id AND NOT k.is_test))
+                   OR (m.flow_id IS NOT NULL AND EXISTS (SELECT 1 FROM messages k WHERE k.profile_id = $1 AND k.flow_id = m.flow_id AND k.flow_node_id IS NOT DISTINCT FROM m.flow_node_id AND NOT k.is_test)))",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            // A campaign both got keeps one link to it (the other message stays in the history, unlinked).
+            sqlx::query(
+                "UPDATE messages m SET campaign_id = NULL WHERE m.profile_id = $2 AND m.campaign_id IS NOT NULL AND NOT m.is_test
+                   AND EXISTS (SELECT 1 FROM messages k WHERE k.profile_id = $1 AND k.campaign_id = m.campaign_id AND NOT k.is_test)",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            // The rest move. A queued one still names the address it was meant for, and the sender skips
+            // it unless that's the merged profile's address now.
+            sqlx::query("UPDATE messages SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "optin_confirmations" => {
+            // A confirmation is for the address it was sent to: waiting ones (on either profile) for an
+            // address the merged profile doesn't have are voided, so the link can't subscribe another one.
+            let key = merged_email.map(crate::optin::email_key);
+            sqlx::query("UPDATE optin_confirmations SET voided_at = now() WHERE profile_id = ANY($1) AND confirmed_at IS NULL AND voided_at IS NULL AND email_key IS DISTINCT FROM $2")
+                .bind([keep, other])
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE optin_confirmations SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "consent_events" => {
+            sqlx::query(
+                "INSERT INTO consent_events (id, account_id, profile_id, channel, field, old_value, new_value, method, via, address,
+                                             actor_user_id, form_id, message_id, ip, user_agent, detail, occurred_at, recorded_at)
+                 SELECT gen_random_uuid(), account_id, $1, channel, field, old_value, new_value, method, via, address,
+                        actor_user_id, form_id, message_id, ip, user_agent, detail || jsonb_build_object('merged_from', $2::text), occurred_at, recorded_at
+                 FROM consent_events WHERE profile_id = $2",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+        }
+        "bulk_action_targets" => {
+            sqlx::query("UPDATE bulk_action_targets SET profile_id = NULL WHERE profile_id = $1").bind(other).execute(&mut *tx).await?;
+        }
+        "catalog_stock_subscriptions" => {
+            sqlx::query(
+                "DELETE FROM catalog_stock_subscriptions t WHERE t.profile_id = $2 AND t.notified_at IS NULL AND EXISTS (
+                   SELECT 1 FROM catalog_stock_subscriptions x WHERE x.profile_id = $1 AND x.notified_at IS NULL AND x.product_id = t.product_id AND x.variant_id IS NOT DISTINCT FROM t.variant_id)",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE catalog_stock_subscriptions SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "catalog_price_drop_notices" => {
+            sqlx::query(
+                "UPDATE catalog_price_drop_notices k SET notified_at = GREATEST(k.notified_at, o.notified_at)
+                 FROM catalog_price_drop_notices o WHERE k.profile_id = $1 AND o.profile_id = $2 AND o.product_id = k.product_id",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM catalog_price_drop_notices o WHERE o.profile_id = $2 AND EXISTS (SELECT 1 FROM catalog_price_drop_notices k WHERE k.profile_id = $1 AND k.product_id = o.product_id)")
+                .bind(keep)
+                .bind(other)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE catalog_price_drop_notices SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        other_table => return Err(AppError::Internal(anyhow::anyhow!("no merge handling for {other_table}"))),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

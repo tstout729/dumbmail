@@ -234,13 +234,22 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
     let src = ConsentSource::new(method, "public").with_message(m.id).with_ip(client_ip(&headers).as_deref()).with_user_agent(user_agent(&headers));
     let channel = if m.channel == "sms" { Channel::Sms } else { Channel::Email };
     let changed = people_consent::set_consent(&state.db, m.account_id, m.profile_id, channel, "unsubscribed", None, &src).await;
+    let a = account_for_msg(&state, &m).await;
+    let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+    // Say "unsubscribed" only once it's saved; otherwise they can try again.
+    let changed = match changed {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(message = %m.id, error = %e.public_message(), "couldn't save an unsubscribe");
+            let body = "<h1>Something went wrong</h1><p>We couldn't save that just now. Please try again in a minute.</p>";
+            return (StatusCode::SERVICE_UNAVAILABLE, page("Unsubscribe", body, &color)).into_response();
+        }
+    };
     let _ = sqlx::query("UPDATE messages SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1").bind(id).execute(&state.db).await;
-    if matches!(changed, Ok(Some(_))) {
+    if changed.is_some() {
         let metric = if m.channel == "sms" { "Unsubscribed from SMS" } else { "Unsubscribed" };
         let _ = msg_event(&state, &m, metric, json!({"method": "link"}), None).await;
     }
-    let a = account_for_msg(&state, &m).await;
-    let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
     page("Unsubscribed", &format!("<h1>You're unsubscribed</h1><p>You won't get marketing messages from {} anymore.</p>", esc(&name)), &color).into_response()
 }
 
@@ -255,6 +264,11 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
 
 fn user_agent(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok())
+}
+
+/// The browser's Global Privacy Control header (`Sec-GPC: 1`).
+fn gpc_header(headers: &HeaderMap) -> bool {
+    headers.get("sec-gpc").and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == "1")
 }
 
 /// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
@@ -343,7 +357,7 @@ fn public_profile(state: &AppState, account_id: Uuid, v: &Value) -> AppResult<Pr
     Ok(input)
 }
 
-async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, body: Bytes) -> Response {
+async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, headers: HeaderMap, body: Bytes) -> Response {
     let res: AppResult<Value> = async {
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
@@ -364,8 +378,9 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
             }
             None => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
         };
-        // Global Privacy Control from the visitor's browser: "do not sell or share" (only ever turned on here).
-        if b["gpc"] == json!(true) {
+        // Global Privacy Control from the visitor's browser: "do not sell or share". It only restricts,
+        // so it's taken from anyone for the profile their request names (only ever turned on here).
+        if b["gpc"] == json!(true) || gpc_header(&headers) {
             people_consent::set_ads_opt_out(&state.db, a.id, p.id, true, &ConsentSource::new("gpc", "public")).await?;
         }
         let props = if b["properties"].is_object() { b["properties"].clone() } else { json!({}) };
@@ -651,6 +666,9 @@ pub struct SubscribeBody {
     /// From the first screen's response: lets the phone step add the number to that same person.
     #[serde(default)]
     phone_token: Option<String>,
+    /// The browser sent Global Privacy Control: turn on "do not sell or share".
+    #[serde(default)]
+    gpc: bool,
 }
 
 impl SubscribeBody {
@@ -737,14 +755,19 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
     };
-    let upserted = audience::upsert_profile_public(&state.db, account.id, &input).await?;
+    // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they
+    // confirm: the profile is created waiting to confirm.
+    let upserted = if double_opt_in {
+        audience::upsert_profile_public_double_opt_in(&state.db, account.id, &input).await?
+    } else {
+        audience::upsert_profile_public(&state.db, account.id, &input).await?
+    };
     let p = upserted.profile;
     if let Some(tz) = &b.timezone {
         audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
     }
-    // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
-    if double_opt_in && upserted.created {
-        people_consent::set_consent(&state.db, account.id, p.id, Channel::Email, "pending", Some(&["never_subscribed"]), &people_consent::current_source()).await?;
+    if b.gpc {
+        people_consent::set_ads_opt_out(&state.db, account.id, p.id, true, &people_consent::current_source().method("gpc")).await?;
     }
     count_form(state, form.id, true).await?;
     let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
@@ -841,7 +864,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
             // Everything else is a field answer; a key sent more than once (ticked checkboxes) becomes a list.
             let mut fields = Map::new();
             for (k, v) in &pairs {
-                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone") {
+                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone" | "gpc") {
                     continue;
                 }
                 match fields.get_mut(k) {
@@ -864,10 +887,13 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 step: one("step"),
                 phone_token: one("phone_token"),
                 timezone: one("timezone"),
+                gpc: false,
             }
         } else {
             serde_json::from_slice(&body)?
         };
+        let mut b = b;
+        b.gpc |= gpc_header(&headers);
         let ip = client_ip(&headers);
         let src = ConsentSource::form(b.form_id, ip.as_deref(), user_agent(&headers));
         people_consent::with_source(src, subscribe(&state, &a, &b, ip.as_deref())).await
@@ -1206,7 +1232,14 @@ async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str
             continue;
         };
         let src = ConsentSource::new("sms_keyword", "public").with_detail("keyword", json!(word)).with_detail("to", json!(to));
-        people_consent::set_consent(&state.db, account_id, pid, Channel::Sms, consent, None, &src).await?;
+        if consent == "subscribed" {
+            // START from the number itself: the person's own opt-in for that number.
+            let mut tx = state.db.begin().await?;
+            people_consent::opt_in_verified_in(&mut tx, account_id, pid, Channel::Sms, &src).await?;
+            tx.commit().await?;
+        } else {
+            people_consent::set_consent(&state.db, account_id, pid, Channel::Sms, consent, None, &src).await?;
+        }
         audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric, properties: json!({"keyword": word}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
     }
     Ok(())

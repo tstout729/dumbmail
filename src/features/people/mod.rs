@@ -188,7 +188,7 @@ fn download(filename: &str, content_type: &str, bytes: Vec<u8>) -> Response {
 
 async fn suppressions_export_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<suppression::SuppressionQuery>) -> AppResult<Response> {
     let csv = suppression::export_csv(&s.db, ctx.account_id, &q).await?;
-    Ok(download(&format!("suppressions-{}.csv", Utc::now().format("%Y-%m-%d")), "text/csv; charset=utf-8", csv.into_bytes()))
+    Ok(download(&format!("suppressions-{}.csv", bulk::local_date(&s, ctx.account_id).await?), "text/csv; charset=utf-8", csv.into_bytes()))
 }
 
 async fn suppress_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<suppression::SuppressBody>) -> AppResult<Json<Value>> {
@@ -253,12 +253,11 @@ async fn bulk_get_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -
 }
 
 async fn export_person_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<privacy::PersonQuery>) -> AppResult<Json<Value>> {
-    let mut out = privacy::export_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?;
-    // The dashboard downloads the files; it doesn't need the data twice.
-    if let Some(o) = out.as_object_mut() {
-        o.remove("data");
-    }
-    Ok(Json(out))
+    Ok(Json(privacy::export_person(&s, ctx.account_id, &b, &ConsentSource::from_ctx(&ctx).method("privacy_request")).await?))
+}
+
+async fn request_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    Ok(Json(privacy::request(&s.db, ctx.account_id, id).await?))
 }
 
 async fn delete_person_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<privacy::PersonQuery>) -> AppResult<Json<Value>> {
@@ -271,7 +270,7 @@ async fn requests_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<PageQue
 }
 
 async fn file_h(State(s): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Response> {
-    let (name, ct, bytes) = privacy::file(&s.db, ctx.account_id, id).await?;
+    let (_kind, name, ct, bytes) = privacy::file(&s.db, ctx.account_id, id).await?;
     Ok(download(&name, &ct, bytes))
 }
 
@@ -332,6 +331,9 @@ async fn mcp(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<Va
         "export_person_data" => privacy::export_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await,
         "delete_person_data" => privacy::delete_person(state, acct, &from(a.clone())?, &src.method("privacy_request")).await,
         "list_privacy_requests" => {
+            if a["id"].as_str().is_some_and(|s| !s.is_empty()) {
+                return privacy::request(db, acct, uuid_arg(a, "id")?).await;
+            }
             let (data, total) = privacy::requests(db, acct, a["limit"].as_i64().unwrap_or(50), a["offset"].as_i64().unwrap_or(0)).await?;
             Ok(json!({"requests": data, "total": total}))
         }
@@ -391,16 +393,16 @@ fn mcp_tools() -> Vec<Value> {
             obj(json!({"limit": {"type": "integer", "minimum": 1, "maximum": 200}}), &[]), true, false),
         tool("merge_profiles", "Merge two profiles", "Merge merge_id into keep_id: events, messages, lists, flow runs, sign-ups, notes and consent history move to the kept profile, then the other is removed. The kept profile's values win unless choices says {\"field\": \"merge\"} (fields: email, phone_number, external_id, first_name, last_name, properties.<key>). Consent becomes the more restrictive of the two on each channel and suppressions carry over. Without confirm=true it returns the merged result without changing anything.",
             obj(json!({"keep_id": {"type": "string"}, "merge_id": {"type": "string"}, "choices": {"type": "object", "additionalProperties": {"enum": ["keep", "merge"]}}, "confirm": {"type": "boolean"}}), &["keep_id", "merge_id"]), false, true),
-        tool("start_bulk_action", "Start a bulk action on profiles", "Act on many profiles in the background: add_to_list or remove_from_list (list_id), set_property (key, value) or clear_property (key), suppress (channels: email and/or sms), delete, or export (CSV download). There's no bulk subscribe. First call without confirm to get the count; then call with confirm=true and expected_count set to that count (if the matching set changed, nothing runs). One bulk action per account at a time; check progress with get_bulk_action.",
-            obj(json!({"action": {"enum": bulk::ACTIONS}, "selection": selection, "list_id": {"type": "string"}, "key": {"type": "string"}, "value": {}, "channels": {"type": "array", "items": {"enum": ["email", "sms"]}}, "confirm": {"type": "boolean"}, "expected_count": {"type": "integer", "minimum": 0}}), &["action", "selection"]), false, true),
+        tool("start_bulk_action", "Start a bulk action on profiles", "Act on many profiles in the background: add_to_list or remove_from_list (list_id), set_property (key, value) or clear_property (key), suppress (channels: email and/or sms), delete, or export (CSV download). There's no bulk subscribe. First call without confirm: it counts the matching profiles and saves exactly those as a set (set_id, kept 15 minutes). Show the user the count; then call with confirm=true, that set_id and the same action and settings, and it acts on exactly that set (people merged away or deleted since are skipped). Deleting people also deletes the account's stored export files. One bulk action per account at a time; check progress with get_bulk_action.",
+            obj(json!({"action": {"enum": bulk::ACTIONS}, "selection": selection, "list_id": {"type": "string"}, "key": {"type": "string"}, "value": {}, "channels": {"type": "array", "items": {"enum": ["email", "sms"]}}, "confirm": {"type": "boolean"}, "set_id": {"type": "string", "description": "From the preview; required with confirm=true."}}), &["action"]), false, true),
         tool("get_bulk_action", "Get a bulk action's progress", "Status, progress and result of a bulk action (and the download link for an export). Without id, the 10 most recent.",
             obj(json!({"id": {"type": "string"}}), &[]), true, false),
-        tool("export_person_data", "Export one person's data", "For a privacy (access) request: everything held about the person found by email or phone_number (profile, consent history, events, messages with subjects and outcomes, lists, segments, form sign-ups, internal notes). Returns the data and two download links (JSON and a readable HTML page) that need sign-in or an API key and expire in 7 days. The request is logged.",
+        tool("export_person_data", "Export one person's data", "For a privacy (access) request: builds, in the background, everything held about the person found by email or phone_number (profile, earlier addresses, consent history, events, messages with subjects and outcomes, lists, segments, form sign-ups, internal notes) as a JSON file and a readable HTML page. Returns the request id; call list_privacy_requests with that id for the status and, once ready, the two download links (they need sign-in or an API key and expire in 7 days). The data itself is never returned here. The request is logged.",
             obj(json!({"email": {"type": "string"}, "phone_number": {"type": "string"}}), &[]), false, false),
-        tool("delete_person_data", "Delete one person's data", "For a privacy (erasure) request: delete the person found by email or phone_number with all their events, messages, list memberships and consent history. If they had unsubscribed or were suppressed, only a one-way code of the address is kept so they stay suppressed if re-imported. Can't be undone; without confirm=true it shows what would be deleted. The request is logged.",
+        tool("delete_person_data", "Delete one person's data", "For a privacy (erasure) request: delete the person found by email or phone_number with all their events, messages, list memberships, consent history and exports of their data. The account's other stored export files are deleted too, because they may hold this person (they can be made again). If they had unsubscribed or were suppressed, only a one-way code of the address is kept so they stay suppressed if re-imported. Can't be undone; without confirm=true it shows what would be deleted. The request is logged.",
             obj(json!({"email": {"type": "string"}, "phone_number": {"type": "string"}, "confirm": {"type": "boolean"}}), &[]), false, true),
-        tool("list_privacy_requests", "List privacy requests", "The log of export and delete requests: when, who made them, and what was done (the person's data isn't kept).",
-            obj(json!({"limit": {"type": "integer", "minimum": 1, "maximum": 200}, "offset": {"type": "integer", "minimum": 0}}), &[]), true, false),
+        tool("list_privacy_requests", "List privacy requests", "The log of export and delete requests: when, who made them, what was done and, for exports, the status (building, ready, failed) and download links. With id, just that request. The person's data isn't kept.",
+            obj(json!({"id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}, "offset": {"type": "integer", "minimum": 0}}), &[]), true, false),
         tool("set_do_not_sell", "Set \"do not sell or share\"", "Turn a person's \"do not sell or share my personal information\" flag on or off (other features, like ad audience syncs, leave flagged people out). The website snippet also turns it on when a visitor's browser sends Global Privacy Control.",
             obj(with(json!({"do_not_sell": {"type": "boolean"}})), &["do_not_sell"]), false, false),
         tool("list_profile_notes", "List a profile's notes", "Internal notes your team wrote on a profile, newest first, with who wrote each and when.", obj(who.clone(), &[]), true, false),
@@ -432,6 +434,7 @@ impl Feature for Module {
             .route("/api/people/privacy/export", post(export_person_h))
             .route("/api/people/privacy/delete", post(delete_person_h))
             .route("/api/people/privacy/requests", get(requests_h))
+            .route("/api/people/privacy/requests/{id}", get(request_h))
             .route("/api/people/files/{id}", get(file_h))
     }
 
@@ -456,13 +459,18 @@ impl Feature for Module {
     }
 
     async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
-        (kind == bulk::JOB).then_some(())?;
-        Some(bulk::run(state, payload).await)
+        Some(match kind {
+            bulk::JOB => bulk::run(state, payload).await,
+            consent::HISTORY_JOB => consent::run_history_job(&state.db, payload).await,
+            privacy::EXPORT_JOB => privacy::run_export_job(state, payload).await,
+            _ => return None,
+        })
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
         if tick.is_multiple_of(15) {
             bulk::fail_stuck(&state.db).await?;
+            privacy::fail_stuck_exports(&state.db).await?;
         }
         if tick.is_multiple_of(180) {
             sqlx::query("DELETE FROM people_files WHERE expires_at < now()").execute(&state.db).await?;

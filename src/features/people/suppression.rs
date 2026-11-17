@@ -13,7 +13,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{normalize_email, normalize_phone};
 use crate::state::AppState;
 
-pub const REASONS: &[&str] = &["unsubscribed", "hard_bounce", "complaint", "manual", "pending"];
+pub const REASONS: &[&str] = &["unsubscribed", "hard_bounce", "complaint", "manual", "pending", "not_subscribed"];
 /// Addresses suppressed in the request itself; more go to a background job.
 pub const INLINE_MAX: usize = 200;
 pub const REQUEST_MAX: usize = 100_000;
@@ -42,12 +42,13 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
     .push(
         " AND p.email IS NOT NULL AND (p.email_suppressed_reason IS NOT NULL OR p.email_consent IN ('unsubscribed', 'pending'))
             UNION ALL
-            SELECT p.id, 'sms', p.phone_number, p.first_name, p.last_name, p.updated_at, COALESCE(p.sms_suppressed_reason, 'unsubscribed')
+            SELECT p.id, 'sms', p.phone_number, p.first_name, p.last_name, p.updated_at,
+                   COALESCE(p.sms_suppressed_reason, CASE p.sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END)
             FROM profiles p WHERE p.account_id = ",
     )
     .push_bind(account_id)
     .push(
-        " AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent = 'unsubscribed')
+        " AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent <> 'subscribed')
          ) s
          LEFT JOIN LATERAL (
             SELECT e.occurred_at, e.method, e.message_id, e.actor_user_id FROM consent_events e
@@ -82,16 +83,17 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
     Ok(())
 }
 
-type SupRow = (Uuid, String, String, Option<String>, Option<String>, String, DateTime<Utc>, Option<String>, Option<Uuid>, Option<String>);
+type SupRow = (Uuid, String, String, Option<String>, Option<String>, String, Option<DateTime<Utc>>, Option<String>, Option<Uuid>, Option<String>);
 
 async fn fetch(db: &PgPool, account_id: Uuid, q: &SuppressionQuery, limit: i64, offset: i64) -> AppResult<(Vec<SupRow>, i64, String)> {
     let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let mut cq = QueryBuilder::new("SELECT count(*) ");
     rows_sql(&mut cq, account_id, &tz, q)?;
     let total: i64 = cq.build_query_scalar().fetch_one(db).await?;
-    let mut dq = QueryBuilder::new("SELECT s.id, s.channel, s.address, s.first_name, s.last_name, s.reason, COALESCE(ev.occurred_at, s.updated_at), ev.method, ev.message_id, (SELECT u.email FROM users u WHERE u.id = ev.actor_user_id) ");
+    // "since" is the recorded change; a block from before consent history started has none.
+    let mut dq = QueryBuilder::new("SELECT s.id, s.channel, s.address, s.first_name, s.last_name, s.reason, ev.occurred_at, ev.method, ev.message_id, (SELECT u.email FROM users u WHERE u.id = ev.actor_user_id) ");
     rows_sql(&mut dq, account_id, &tz, q)?;
-    dq.push(" ORDER BY 7 DESC, s.id, s.channel LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+    dq.push(" ORDER BY COALESCE(ev.occurred_at, s.updated_at) DESC, s.id, s.channel LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
     let rows: Vec<SupRow> = dq.build_query_as().fetch_all(db).await?;
     Ok((rows, total, tz))
 }
@@ -104,6 +106,7 @@ fn reason_text(channel: &str, reason: &str) -> &'static str {
         (_, "complaint") => "Spam complaint",
         (_, "manual") => "Suppressed by hand",
         (_, "pending") => "Hasn't confirmed sign-up",
+        (_, "not_subscribed") => "Never agreed to texts",
         _ => "Suppressed",
     }
 }
@@ -115,8 +118,13 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
         .iter()
         .map(|r| {
             let ch = if r.1 == "sms" { Channel::Sms } else { Channel::Email };
-            let consent = if r.5 == "unsubscribed" { "unsubscribed" } else if r.5 == "pending" { "pending" } else { "" };
-            let suppressed = (!matches!(r.5.as_str(), "unsubscribed" | "pending")).then_some(r.5.as_str());
+            let consent = match r.5.as_str() {
+                "unsubscribed" => "unsubscribed",
+                "pending" => "pending",
+                "not_subscribed" => "never_subscribed",
+                _ => "",
+            };
+            let suppressed = (!matches!(r.5.as_str(), "unsubscribed" | "pending" | "not_subscribed")).then_some(r.5.as_str());
             let why_not = consent::why_not_unsuppressible(ch, suppressed, consent);
             json!({
                 "profile_id": r.0, "channel": r.1, "address": r.2, "first_name": r.3, "last_name": r.4, "reason": r.5,
@@ -130,8 +138,8 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
         "SELECT 'email', COALESCE(email_suppressed_reason, CASE email_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'pending' END), count(*)
          FROM profiles WHERE account_id = $1 AND email IS NOT NULL AND (email_suppressed_reason IS NOT NULL OR email_consent IN ('unsubscribed', 'pending')) GROUP BY 2
          UNION ALL
-         SELECT 'sms', COALESCE(sms_suppressed_reason, 'unsubscribed'), count(*)
-         FROM profiles WHERE account_id = $1 AND phone_number IS NOT NULL AND (sms_suppressed_reason IS NOT NULL OR sms_consent = 'unsubscribed') GROUP BY 2",
+         SELECT 'sms', COALESCE(sms_suppressed_reason, CASE sms_consent WHEN 'unsubscribed' THEN 'unsubscribed' ELSE 'not_subscribed' END), count(*)
+         FROM profiles WHERE account_id = $1 AND phone_number IS NOT NULL AND (sms_suppressed_reason IS NOT NULL OR sms_consent <> 'subscribed') GROUP BY 2",
     )
     .bind(account_id)
     .fetch_all(db)
@@ -162,7 +170,7 @@ pub async fn export_csv(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> 
     let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
     let mut out = csv_line(&["address", "channel", "reason", "since", "first_name", "last_name", "profile_id"]);
     for r in rows {
-        let since = r.6.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string();
+        let since = r.6.map(|d| d.with_timezone(&tz).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "before history".into());
         out.push_str(&csv_line(&[&r.2, &r.1, &r.5, &since, r.3.as_deref().unwrap_or(""), r.4.as_deref().unwrap_or(""), &r.0.to_string()]));
     }
     Ok(out)
@@ -236,6 +244,15 @@ pub fn parse_addresses(b: &SuppressBody) -> AppResult<(Vec<Address>, Vec<String>
 
 /// Suppress one address by hand (creating the profile if needed). Returns whether it changed.
 pub async fn suppress_address(state: &AppState, account_id: Uuid, a: &Address, src: &ConsentSource) -> AppResult<bool> {
+    let mut tx = state.db.begin().await?;
+    let changed = suppress_address_in(state, &mut tx, account_id, a, src).await?;
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// [`suppress_address`] with the suppression written in the caller's transaction. A profile it
+/// has to create is created (never subscribed) and committed first.
+pub async fn suppress_address_in(state: &AppState, conn: &mut sqlx::PgConnection, account_id: Uuid, a: &Address, src: &ConsentSource) -> AppResult<bool> {
     let (input, ch) = match a {
         Address::Email(e) => (ProfileInput { email: Some(e.clone()), ..Default::default() }, Channel::Email),
         Address::Phone(p) => (ProfileInput { phone_number: Some(p.clone()), ..Default::default() }, Channel::Sms),
@@ -244,7 +261,7 @@ pub async fn suppress_address(state: &AppState, account_id: Uuid, a: &Address, s
         Some(p) => p,
         None => consent::with_source(src.clone(), crate::audience::upsert_profile(&state.db, account_id, &input)).await?.profile,
     };
-    consent::suppress(&state.db, account_id, profile.id, ch, "manual", false, false, src).await
+    Ok(consent::suppress_in(conn, account_id, profile.id, ch, "manual", false, false, src).await?)
 }
 
 /// Suppress many addresses: a few at once, more in a background job.

@@ -1,7 +1,7 @@
 -- Consent history: one row for every change to a person's email or SMS consent, their suppression,
 -- or their "do not sell or share" choice, with how it happened. Rows are only ever added: an update
--- is refused by the trigger below, and the app has no delete path (rows go only when the profile is
--- deleted). See src/features/people/consent.rs.
+-- is refused by the trigger below. The app deletes rows only with their profile (an erasure, or a
+-- merge, which first copies them onto the kept profile). See src/features/people/consent.rs.
 CREATE TABLE consent_events (
     id            uuid PRIMARY KEY,
     account_id    uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -25,7 +25,10 @@ CREATE TABLE consent_events (
     ip            text,
     user_agent    text,
     detail        jsonb NOT NULL DEFAULT '{}',
-    occurred_at   timestamptz NOT NULL DEFAULT now()
+    occurred_at   timestamptz NOT NULL DEFAULT now(),
+    -- When the row was written. Later than occurred_at when writing it failed the first time and a
+    -- background retry wrote it (the consent change itself was saved on time).
+    recorded_at   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX consent_events_profile_idx ON consent_events (profile_id, occurred_at DESC);
 CREATE INDEX consent_events_account_idx ON consent_events (account_id, occurred_at DESC);

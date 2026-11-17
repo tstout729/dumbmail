@@ -1060,7 +1060,11 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             });
         }
         Condition::Suppressed { value } => {
-            qb.push(if *value { "(p.email_suppressed_reason IS NOT NULL)" } else { "(p.email_suppressed_reason IS NULL)" });
+            qb.push(if *value {
+                "(p.email_suppressed_reason IS NOT NULL OR p.sms_suppressed_reason IS NOT NULL)"
+            } else {
+                "(p.email_suppressed_reason IS NULL AND p.sms_suppressed_reason IS NULL)"
+            });
         }
         Condition::Form { form_id, op, within_days, since, until } => {
             if *op == HasOp::HasNot {

@@ -633,6 +633,7 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         match out {
             Outcome::Sent(_) => sent += 1,
             Outcome::Failed(e) => return Err(AppError::bad(format!("test to {addr} failed: {e}"))),
+            Outcome::Skipped(why) => return Err(AppError::bad(format!("{addr} can't get this test ({why}); pick another test address"))),
             _ => {}
         }
     }

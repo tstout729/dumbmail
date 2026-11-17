@@ -52,13 +52,19 @@ pub struct Upserted {
 }
 
 pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Option<Profile>> {
+    find_profile_in(&mut *db.acquire().await?, account_id, input, false).await
+}
+
+/// [`find_profile`] on a connection; with `lock`, the row found is locked for update.
+async fn find_profile_in(conn: &mut sqlx::PgConnection, account_id: Uuid, input: &ProfileInput, lock: bool) -> AppResult<Option<Profile>> {
     let email = input.email.as_deref().and_then(normalize_email);
     let phone = input.phone_number.as_deref().and_then(normalize_phone);
     let q = format!(
         "SELECT {PROFILE_COLS} FROM profiles p WHERE p.account_id = $1 AND (
             p.id = $2 OR p.external_id = $3 OR p.email = $4 OR p.phone_number = $5)
          ORDER BY (p.id = $2) DESC NULLS LAST, (p.external_id = $3) DESC NULLS LAST, (p.email = $4) DESC NULLS LAST
-         LIMIT 1"
+         LIMIT 1{}",
+        if lock { " FOR UPDATE" } else { "" }
     );
     Ok(sqlx::query_as::<_, Profile>(&q)
         .bind(account_id)
@@ -66,22 +72,28 @@ pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -
         .bind(&input.external_id)
         .bind(&email)
         .bind(&phone)
-        .fetch_optional(db)
+        .fetch_optional(conn)
         .await?)
 }
 
 /// Create or update a profile, merging properties. Identity priority: id, external_id, email, phone.
 pub async fn upsert_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, false).await
+    upsert_inner(db, account_id, input, false, None).await
 }
 
 /// For unauthenticated callers (browser snippet, forms): an existing profile's identity and
 /// names are only filled in where blank, never overwritten, so nobody can take over a profile.
 pub async fn upsert_profile_public(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, true).await
+    upsert_inner(db, account_id, input, true, None).await
 }
 
-async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool) -> AppResult<Upserted> {
+/// [`upsert_profile_public`] for a double opt-in sign-up: a profile it creates starts out waiting to
+/// confirm (`pending`), in the statement that creates it, so it's never emailable before confirming.
+pub async fn upsert_profile_public_double_opt_in(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
+    upsert_inner(db, account_id, input, true, Some("pending")).await
+}
+
+async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool, new_email_consent: Option<&str>) -> AppResult<Upserted> {
     let email = match input.email.as_deref().filter(|e| !e.trim().is_empty()) {
         Some(e) => Some(normalize_email(e).ok_or_else(|| AppError::bad(format!("{e:?} is not a valid email")))?),
         None => None,
@@ -98,10 +110,15 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
     if input.id.is_none() && email.is_none() && phone.is_none() && input.external_id.is_none() {
         return Err(AppError::bad("a profile needs an email, phone_number or external_id"));
     }
-    let props = Value::Object(input.merged_properties());
+    let props = input.merged_properties();
+    crate::features::people::consent::check_property_keys(props.keys())?;
+    let props = Value::Object(props);
 
     for attempt in 0..2 {
-        let existing = find_profile(db, account_id, input).await?;
+        // One transaction with the row locked: the consent history sees the exact before and after,
+        // and a deleted person's retained suppression applies before anything else can read the row.
+        let mut tx = db.begin().await?;
+        let existing = find_profile_in(&mut tx, account_id, input, true).await?;
         let res = match &existing {
             Some(p) => {
                 let q = if fill_only {
@@ -135,14 +152,14 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&props)
                     .bind(&input.email_consent)
                     .bind(&input.sms_consent)
-                    .fetch_one(db)
+                    .fetch_one(&mut *tx)
                     .await
                     .map(|profile| Upserted { profile, created: false })
             }
             None => {
                 let q = format!(
                     "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 'never_subscribed'), COALESCE($10, 'never_subscribed'))
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, $11, 'never_subscribed'), COALESCE($10, 'never_subscribed'))
                      RETURNING {PROFILE_COLS}"
                 );
                 sqlx::query_as::<_, Profile>(&q)
@@ -156,14 +173,21 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&props)
                     .bind(&input.email_consent)
                     .bind(&input.sms_consent)
-                    .fetch_one(db)
+                    .bind(new_email_consent)
+                    .fetch_one(&mut *tx)
                     .await
                     .map(|profile| Upserted { profile, created: true })
             }
         };
         match res {
-            // Consent history, a deleted person's suppression record, linked-identifier conflicts.
-            Ok(u) => return crate::features::people::consent::after_upsert(db, account_id, input, existing.as_ref(), u).await,
+            // Consent history and a deleted person's suppression record, in this transaction; then
+            // linked-identifier conflicts.
+            Ok(u) => {
+                let u = crate::features::people::consent::after_upsert(&mut tx, account_id, existing.as_ref(), u).await?;
+                tx.commit().await?;
+                crate::features::people::consent::note_identity_conflict(db, account_id, input).await;
+                return Ok(u);
+            }
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
@@ -367,6 +391,9 @@ pub async fn import_csv(
     };
     let roles: Vec<Option<&str>> = headers.iter().map(|h| role(h)).collect();
     let mut out = ImportResult { created: 0, updated: 0, skipped: 0, errors: Vec::new() };
+    for (h, _) in headers.iter().zip(&roles).filter(|(h, r)| r.is_none() && crate::features::people::consent::is_reserved_property(h)) {
+        out.errors.push(format!("column {h:?} was left out: consent, suppression and identity fields can't be set as custom properties"));
+    }
     let mut ids = Vec::new();
     let (mut roles_skipped, mut disposable_skipped) = (0u64, 0u64);
     for (i, rec) in rdr.records().enumerate() {
@@ -396,7 +423,7 @@ pub async fn import_csv(
                 Some("last_name") => input.last_name = Some(val.to_string()),
                 Some("external_id") => input.external_id = Some(val.to_string()),
                 _ => {
-                    if let Some(h) = headers.get(j) {
+                    if let Some(h) = headers.get(j).filter(|h| !crate::features::people::consent::is_reserved_property(h)) {
                         let v = match val {
                             "true" | "TRUE" => json!(true),
                             "false" | "FALSE" => json!(false),

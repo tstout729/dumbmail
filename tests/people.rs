@@ -180,12 +180,15 @@ async fn consent_history_rows_cant_be_changed() {
     h.cleanup().await;
 }
 
-/// Every write of a consent or suppression column outside the instrumented places fails this test:
-/// record it with `features::people::consent` (see its setters) instead of a raw UPDATE.
+/// A lint, not proof: it finds raw SQL in `src` that writes a consent, suppression or opt-out column
+/// outside the files that record history (an UPDATE ... SET col = ..., or an INSERT INTO profiles
+/// naming one in its column list), in any case and spacing. It can't see SQL built at runtime from
+/// column names; those paths need behaviour tests (see `consent_history_records_every_path`).
 #[test]
 fn consent_writes_go_through_the_history() {
     let allowed = ["src/audience.rs", "src/features/people/consent.rs", "src/features/people/merge.rs"];
-    let cols = ["email_consent =", "sms_consent =", "email_suppressed_reason =", "sms_suppressed_reason =", "ads_opt_out ="];
+    let cols = ["email_consent", "sms_consent", "email_suppressed_reason", "sms_suppressed_reason", "ads_opt_out", "marketing_hold"];
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let mut stack = vec![std::path::PathBuf::from("src")];
     let mut offenders = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -199,16 +202,29 @@ fn consent_writes_go_through_the_history() {
                 continue;
             }
             let rel = path.to_string_lossy().replace('\\', "/");
-            let text = std::fs::read_to_string(&path).unwrap();
-            for (i, _) in text.match_indices("UPDATE profiles").chain(text.match_indices("INSERT INTO profiles")) {
-                let stmt: String = text[i..].chars().take_while(|c| *c != '"').collect();
-                if cols.iter().any(|c| stmt.contains(c)) && !allowed.contains(&rel.as_str()) {
-                    offenders.push(format!("{rel}: {}", stmt.chars().take(80).collect::<String>()));
+            if allowed.contains(&rel.as_str()) {
+                continue;
+            }
+            let text = squash(&std::fs::read_to_string(&path).unwrap());
+            for start in ["update profiles", "insert into profiles"] {
+                for (i, _) in text.match_indices(start) {
+                    // The statement up to the end of its string literal.
+                    let stmt: String = text[i..].chars().take_while(|c| *c != '"').collect();
+                    let writes = cols.iter().any(|c| {
+                        if start == "update profiles" {
+                            stmt.contains(&format!("{c} =")) || stmt.contains(&format!("{c}="))
+                        } else {
+                            stmt.split(')').next().is_some_and(|list| list.contains(c))
+                        }
+                    });
+                    if writes {
+                        offenders.push(format!("{rel}: {}", stmt.chars().take(100).collect::<String>()));
+                    }
                 }
             }
         }
     }
-    assert!(offenders.is_empty(), "consent written without recording history:\n{}", offenders.join("\n"));
+    assert!(offenders.is_empty(), "consent written without recording history (use features::people::consent):\n{}", offenders.join("\n"));
     let audience = std::fs::read_to_string("src/audience.rs").unwrap();
     assert!(audience.contains("people::consent::after_upsert"), "the shared upsert must record its consent changes");
 }
@@ -425,6 +441,26 @@ async fn duplicates_finder_suggests_and_never_merges() {
     h.cleanup().await;
 }
 
+/// Preview, then confirm the saved set with the same action and settings.
+async fn bulk(h: &mut Harness, body: Value) -> Value {
+    let dry = h.ok("POST", "/api/people/bulk", Some(body.clone())).await;
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    let mut confirm = body;
+    confirm["confirm"] = json!(true);
+    confirm["set_id"] = dry["set_id"].clone();
+    h.ok("POST", "/api/people/bulk", Some(confirm)).await
+}
+
+async fn export_ready(h: &mut Harness, body: Value) -> Value {
+    let started = h.ok("POST", "/api/people/privacy/export", Some(body)).await;
+    assert_eq!(started["status"], "building", "{started}");
+    assert!(started.get("data").is_none(), "nothing is returned inline");
+    h.drain().await;
+    let r = h.ok("GET", &format!("/api/people/privacy/requests/{}", started["request_id"].as_str().unwrap()), None).await;
+    assert_eq!(r["status"], "ready", "{r}");
+    r
+}
+
 #[tokio::test]
 async fn bulk_actions_act_on_exactly_the_counted_set() {
     let mut h = harness!();
@@ -442,18 +478,36 @@ async fn bulk_actions_act_on_exactly_the_counted_set() {
     h.ok("POST", "/api/profiles", Some(json!({"email": "outside@x.test"}))).await;
 
     let sel = json!({"list_id": list["id"]});
-    let dry = h.ok("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "tier", "value": "gold", "selection": sel}))).await;
+    let set = json!({"action": "set_property", "key": "tier", "value": "gold", "selection": sel});
+    let dry = h.ok("POST", "/api/people/bulk", Some(set.clone())).await;
     assert_eq!((dry["dry_run"].as_bool(), dry["count"].as_i64()), (Some(true), Some(1203)));
-    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "subscribe", "selection": sel, "confirm": true, "expected_count": 1203}))).await;
+    assert!(dry["set_id"].is_string() && dry["expires_at"].is_string(), "{dry}");
+    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "subscribe", "selection": sel}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "there's no bulk subscribe: {v}");
-    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "tier", "value": "gold", "selection": sel, "confirm": true, "expected_count": 1202}))).await;
-    assert_eq!(s, StatusCode::CONFLICT, "count changed: {v}");
-    let started = h.ok("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "tier", "value": "gold", "selection": sel, "confirm": true, "expected_count": 1203}))).await;
+    // Confirming needs the set, and exactly the previewed action and settings.
+    let (s, _) = h.req("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "tier", "value": "gold", "selection": sel, "confirm": true}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": "tier", "value": "platinum", "selection": sel, "confirm": true, "set_id": dry["set_id"]}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "another value than previewed: {v}");
+    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "delete", "selection": sel, "confirm": true, "set_id": dry["set_id"]}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "another action than previewed: {v}");
+    // Reserved keys can't be set or cleared.
+    for key in ["email_consent", "marketing_hold", "ads_opt_out", "$source", "email"] {
+        let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "set_property", "key": key, "value": "x", "selection": sel}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{key}: {v}");
+    }
+    let mut confirm = set.clone();
+    confirm["confirm"] = json!(true);
+    confirm["set_id"] = dry["set_id"].clone();
+    let started = h.ok("POST", "/api/people/bulk", Some(confirm.clone())).await;
     assert_eq!(started["total"], 1203);
+    let (s, _) = h.req("POST", "/api/people/bulk", Some(confirm)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "a set runs once");
     // One at a time.
-    let (s, _) = h.req("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": sel, "confirm": true, "expected_count": 1203}))).await;
+    let ex = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": sel}))).await;
+    let (s, _) = h.req("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": sel, "confirm": true, "set_id": ex["set_id"]}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
-    // Someone joining the list after it started isn't part of it.
+    // Someone joining the list after the preview isn't part of it.
     let late = h.ok("POST", "/api/profiles", Some(json!({"email": "late@x.test", "list_ids": [list["id"]]}))).await;
     h.drain().await;
     let job = h.ok("GET", &format!("/api/people/bulk/{}", started["id"].as_str().unwrap()), None).await;
@@ -462,25 +516,32 @@ async fn bulk_actions_act_on_exactly_the_counted_set() {
     assert_eq!(gold, 1203);
     let late_tier: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE id = $1::uuid").bind(late["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
     assert!(late_tier.get("tier").is_none());
+    // An expired preview can't be confirmed.
+    let old = h.ok("POST", "/api/people/bulk", Some(json!({"action": "clear_property", "key": "tier", "selection": sel}))).await;
+    sqlx::query("UPDATE bulk_actions SET expires_at = now() - interval '1 minute' WHERE id = $1::uuid").bind(old["set_id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", "/api/people/bulk", Some(json!({"action": "clear_property", "key": "tier", "selection": sel, "confirm": true, "set_id": old["set_id"]}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("expired"));
 
-    // Selected profiles: add to a list, then export.
+    // Selected profiles: add to a list, then export (the file is ready only once the job is done).
     let some: Vec<String> = sqlx::query_scalar("SELECT id::text FROM profiles WHERE email IN ('p2@x.test', 'p3@x.test', 'outside@x.test')").fetch_all(&h.state.db).await.unwrap();
-    h.ok("POST", "/api/people/bulk", Some(json!({"action": "add_to_list", "list_id": target["id"], "selection": {"profile_ids": some}, "confirm": true, "expected_count": 3}))).await;
+    bulk(&mut h, json!({"action": "add_to_list", "list_id": target["id"], "selection": {"profile_ids": some}})).await;
     h.drain().await;
     assert_eq!(h.ok("GET", &format!("/api/lists/{}", target["id"].as_str().unwrap()), None).await["member_count"], 3);
-    let ex = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "outside"}, "confirm": true, "expected_count": 1}))).await;
+    let ex = bulk(&mut h, json!({"action": "export", "selection": {"q": "outside"}})).await;
+    assert!(ex["file_url"].is_null(), "no download before it's done");
     h.drain().await;
     let ex = h.ok("GET", &format!("/api/people/bulk/{}", ex["id"].as_str().unwrap()), None).await;
-    let (s, _, csv) = h.bytes("GET", ex["file_url"].as_str().unwrap(), "text/plain", vec![]).await;
+    let (s, hd, csv) = h.bytes("GET", ex["file_url"].as_str().unwrap(), "text/plain", vec![]).await;
     assert_eq!(s, StatusCode::OK);
+    assert!(hd.get("content-disposition").unwrap().to_str().unwrap().contains("profiles-"));
     let csv = String::from_utf8(csv).unwrap();
     assert_eq!(csv.lines().count(), 2, "{csv}");
     assert!(csv.contains("outside@x.test"));
 
-    // Delete everyone on the list (exact count typed); the unsubscribed one stays suppressed if they come back.
-    let n = h.ok("POST", "/api/people/bulk", Some(json!({"action": "delete", "selection": sel}))).await["count"].as_i64().unwrap();
-    assert_eq!(n, 1204);
-    h.ok("POST", "/api/people/bulk", Some(json!({"action": "delete", "selection": sel, "confirm": true, "expected_count": n}))).await;
+    // Delete everyone on the list; the unsubscribed one stays suppressed if they come back.
+    let deleted = bulk(&mut h, json!({"action": "delete", "selection": sel})).await;
+    assert_eq!(deleted["total"], 1204);
     h.drain().await;
     let left: Vec<String> = sqlx::query_scalar("SELECT email FROM profiles ORDER BY email").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(left, vec!["outside@x.test".to_string()]);
@@ -498,6 +559,35 @@ async fn bulk_actions_act_on_exactly_the_counted_set() {
 }
 
 #[tokio::test]
+async fn bulk_confirm_acts_on_the_previewed_people_not_whoever_matches_now() {
+    let mut h = harness!();
+    h.signup().await;
+    let a = h.ok("POST", "/api/profiles", Some(json!({"email": "a@x.test", "properties": {"plan": "trial"}}))).await;
+    let b = h.ok("POST", "/api/profiles", Some(json!({"email": "b@x.test", "properties": {"plan": "paid"}}))).await;
+    let c = h.ok("POST", "/api/profiles", Some(json!({"email": "c@x.test", "properties": {"plan": "trial"}}))).await;
+    let d = h.ok("POST", "/api/profiles", Some(json!({"email": "d@x.test", "properties": {"plan": "paid"}}))).await;
+    let seg = h.ok("POST", "/api/segments", Some(json!({"name": "Trials", "definition": {"match": "all", "conditions": [{"type": "property", "field": "plan", "op": "eq", "value": "trial"}]}}))).await;
+    let body = json!({"action": "delete", "selection": {"segment_id": seg["id"]}});
+    let dry = h.ok("POST", "/api/people/bulk", Some(body.clone())).await;
+    assert_eq!(dry["count"], 2, "{dry}");
+    // Between preview and confirm, A leaves the segment and B joins it: the count is unchanged.
+    h.ok("PATCH", &format!("/api/profiles/{}", a["id"].as_str().unwrap()), Some(json!({"properties": {"plan": "paid"}}))).await;
+    h.ok("PATCH", &format!("/api/profiles/{}", b["id"].as_str().unwrap()), Some(json!({"properties": {"plan": "trial"}}))).await;
+    // And C is merged into D before the job runs.
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": d["id"], "merge_id": c["id"], "confirm": true}))).await;
+    let mut confirm = body;
+    confirm["confirm"] = json!(true);
+    confirm["set_id"] = dry["set_id"].clone();
+    let started = h.ok("POST", "/api/people/bulk", Some(confirm)).await;
+    h.drain().await;
+    let job = h.ok("GET", &format!("/api/people/bulk/{}", started["id"].as_str().unwrap()), None).await;
+    assert_eq!((job["status"].as_str(), job["succeeded"].as_i64(), job["skipped"].as_i64()), (Some("done"), Some(1), Some(1)), "C was merged away: skipped. {job}");
+    let left: Vec<String> = sqlx::query_scalar("SELECT email FROM profiles ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(left, vec!["b@x.test".to_string(), "d@x.test".to_string()], "A (previewed) is deleted; B (joined later) and D (kept in the merge) aren't");
+    h.cleanup().await;
+}
+
+#[tokio::test]
 async fn privacy_export_and_delete() {
     let mut h = harness!();
     h.signup().await;
@@ -510,17 +600,24 @@ async fn privacy_export_and_delete() {
     send_campaign(&mut h, &list["id"]).await;
     h.raw("POST", &unsub_path(&h, "ann@x.test"), &[], "").await;
 
-    // A bulk export that includes Ann.
-    let bulk = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "ann@x.test"}, "confirm": true, "expected_count": 1}))).await;
+    // A bulk export that includes Ann, and one that doesn't.
+    let with_ann = bulk(&mut h, json!({"action": "export", "selection": {"q": "ann@x.test"}})).await;
     h.drain().await;
-    let bulk_url = h.ok("GET", &format!("/api/people/bulk/{}", bulk["id"].as_str().unwrap()), None).await["file_url"].as_str().unwrap().to_string();
-    let ex = h.ok("POST", "/api/people/privacy/export", Some(json!({"email": "ANN@x.test"}))).await;
-    assert_eq!(ex["found"], 1);
+    let without = bulk(&mut h, json!({"action": "export", "selection": {"q": "bob@x.test"}})).await;
+    h.drain().await;
+    let file_of = |v: &Value| format!("/api/people/bulk/{}", v["id"].as_str().unwrap());
+    let with_url = h.ok("GET", &file_of(&with_ann), None).await["file_url"].as_str().unwrap().to_string();
+    let without_url = h.ok("GET", &file_of(&without), None).await["file_url"].as_str().unwrap().to_string();
+    let ex = export_ready(&mut h, json!({"email": "ANN@x.test"})).await;
+    assert_eq!(ex["profiles_found"], 1);
     let files = ex["files"].as_array().unwrap();
-    let (s, hd, body) = h.bytes("GET", files[0]["url"].as_str().unwrap(), "text/plain", vec![]).await;
+    let json_url = files.iter().find(|f| f["name"].as_str().unwrap().ends_with(".json")).unwrap()["url"].as_str().unwrap().to_string();
+    let html_url = files.iter().find(|f| f["name"].as_str().unwrap().ends_with(".html")).unwrap()["url"].as_str().unwrap().to_string();
+    let (s, hd, body) = h.bytes("GET", &json_url, "text/plain", vec![]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(hd.get("cache-control").unwrap(), "no-store");
     let data: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["complete"], true, "nothing was cut off");
     let mine = &data["profiles"][0];
     assert_eq!(mine["profile"]["email"], "ann@x.test");
     assert_eq!(mine["events"].as_array().unwrap().iter().filter(|e| e["metric"] == "Placed Order").count(), 1);
@@ -529,12 +626,12 @@ async fn privacy_export_and_delete() {
     assert_eq!(mine["internal_notes"][0]["note"], "Prefers texts");
     assert!(mine["consent_history"].as_array().unwrap().len() >= 2);
     assert!(!String::from_utf8_lossy(&body).contains("bob@x.test"), "no one else's data");
-    let (_, _, html) = h.bytes("GET", files[1]["url"].as_str().unwrap(), "text/plain", vec![]).await;
+    let (_, _, html) = h.bytes("GET", &html_url, "text/plain", vec![]).await;
     let html = String::from_utf8(html).unwrap();
     assert!(html.contains("&lt;b&gt;Ann") && !html.contains("<b>Ann"), "escaped");
     assert!(html.contains("Spring sale"));
     // Downloads need sign-in, and only this account's.
-    let (s, _, _) = h.raw("GET", files[0]["url"].as_str().unwrap(), &[], "").await;
+    let (s, _, _) = h.raw("GET", &json_url, &[], "").await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     // Delete: dry run, then everything goes but a one-way code.
@@ -542,28 +639,29 @@ async fn privacy_export_and_delete() {
     assert_eq!((dry["dry_run"].as_bool(), dry["found"].as_i64()), (Some(true), Some(1)));
     let del = h.ok("POST", "/api/people/privacy/delete", Some(json!({"email": "ann@x.test", "confirm": true}))).await;
     assert_eq!(del["deleted"], 1);
-    assert_eq!(del["export_files_deleted"], 3, "both privacy files and the bulk export that held them");
-    let (s, _, _) = h.bytes("GET", &bulk_url, "text/plain", vec![]).await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
-    let q: Value = sqlx::query_scalar("SELECT selection FROM bulk_actions WHERE id = $1::uuid").bind(bulk["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(del["export_files_deleted"], 4, "both personal files and every stored bulk export: {del}");
+    for url in [&with_url, &without_url, &json_url, &html_url] {
+        let (s, _, _) = h.bytes("GET", url, "text/plain", vec![]).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{url} is gone");
+    }
+    let q: Value = sqlx::query_scalar("SELECT selection FROM bulk_actions WHERE id = $1::uuid").bind(with_ann["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
     assert!(q.get("q").is_none(), "a saved search naming them is cleared: {q}");
     for t in PROFILE_TABLES {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {} WHERE {} = $1::uuid", t.table, t.column)).bind(&id).fetch_one(&h.state.db).await.unwrap();
         assert_eq!(n, 0, "{}.{} still holds the deleted person", t.table, t.column);
     }
-    let (s, _, _) = h.bytes("GET", files[0]["url"].as_str().unwrap(), "text/plain", vec![]).await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "the earlier export went too");
     // Nothing identifying is left in the request log or the suppression record.
     let log = h.ok("GET", "/api/people/privacy/requests", None).await;
     assert_eq!(log["total"], 2);
     assert_eq!(log["data"][0]["kind"], "delete");
     assert_eq!(log["data"][0]["requested_by"], "owner@acme.test");
-    for table in ["privacy_requests", "suppression_tombstones"] {
+    assert_eq!(log["data"][1]["files"].as_array().unwrap().len(), 0, "the export's links are gone");
+    for table in ["privacy_requests", "suppression_tombstones", "jobs"] {
         let dump: String = sqlx::query_scalar(&format!("SELECT COALESCE(string_agg(t::text, ' '), '') FROM {table} t")).fetch_one(&h.state.db).await.unwrap();
         assert!(!dump.contains("ann"), "{table} keeps no personal data: {dump}");
     }
 
-    // Re-imported later (even as Ann.Doe+x), they stay unsubscribed; a sign-up of their own would be their choice.
+    // Re-imported later (even as ann+promo), they stay unsubscribed.
     h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email\nann+promo@x.test\nann@x.test\n", "email_consent": "subscribed", "permission_confirmed": true}))).await;
     let back: Vec<String> = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email LIKE 'ann%' ORDER BY email").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(back, vec!["unsubscribed".to_string(), "unsubscribed".to_string()]);
@@ -650,6 +748,7 @@ async fn mcp_tools_dry_run_until_confirmed() {
     assert_eq!(r["dry_run"], true);
     let r = mcp(&h, &key, "start_bulk_action", json!({"action": "delete", "selection": {"q": "x.test"}})).await;
     assert_eq!((r["dry_run"].as_bool(), r["count"].as_i64()), (Some(true), Some(2)));
+    assert!(r["set_id"].is_string(), "the dry run returns the saved set: {r}");
     let r = mcp(&h, &key, "delete_person_data", json!({"email": "a@x.test"})).await;
     assert_eq!(r["dry_run"], true);
     assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap(), 2, "dry runs change nothing");
@@ -661,12 +760,18 @@ async fn mcp_tools_dry_run_until_confirmed() {
     assert_eq!(r["ok"], true);
     let src: (String, String) = sqlx::query_as("SELECT method, via FROM consent_events WHERE field = 'suppression' ORDER BY occurred_at LIMIT 1").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(src, ("suppression_list".to_string(), "mcp".to_string()));
-    let started = mcp(&h, &key, "start_bulk_action", json!({"action": "set_property", "key": "k", "value": 1, "selection": {"q": "x.test"}, "confirm": true, "expected_count": 2})).await;
+    let dry = mcp(&h, &key, "start_bulk_action", json!({"action": "set_property", "key": "k", "value": 1, "selection": {"q": "x.test"}})).await;
+    let started = mcp(&h, &key, "start_bulk_action", json!({"action": "set_property", "key": "k", "value": 1, "selection": {"q": "x.test"}, "confirm": true, "set_id": dry["set_id"]})).await;
     h.drain().await;
     let got = mcp(&h, &key, "get_bulk_action", json!({"id": started["id"]})).await;
     assert_eq!(got["status"], "done");
     let ex = mcp(&h, &key, "export_person_data", json!({"email": "a@x.test"})).await;
-    assert_eq!(ex["data"]["profiles"][0]["profile"]["email"], "a@x.test");
+    assert_eq!(ex["status"], "building");
+    assert!(ex.get("data").is_none(), "no personal data inline: {ex}");
+    h.drain().await;
+    let req = mcp(&h, &key, "list_privacy_requests", json!({"id": ex["request_id"]})).await;
+    assert_eq!(req["status"], "ready");
+    assert_eq!(req["files"].as_array().unwrap().len(), 2);
     let del = mcp(&h, &key, "delete_person_data", json!({"email": "b@x.test", "confirm": true})).await;
     assert_eq!(del["deleted"], 1);
     let log = mcp(&h, &key, "list_privacy_requests", json!({})).await;
@@ -695,26 +800,405 @@ async fn erasing_someone_waiting_in_a_suppress_job_keeps_them_suppressed() {
 }
 
 #[tokio::test]
-async fn erasing_someone_removes_bulk_exports_made_before_a_merge() {
+async fn erasing_someone_clears_every_stored_export_and_finds_their_files_after_a_merge() {
     let mut h = harness!();
     h.signup().await;
     let a = h.ok("POST", "/api/profiles", Some(json!({"email": "dana@x.test", "phone_number": "+15035550160"}))).await;
     let b = h.ok("POST", "/api/profiles", Some(json!({"external_id": "D-1"}))).await;
     h.ok("POST", "/api/profiles", Some(json!({"email": "other@x.test"}))).await;
-    // Exported under the first profile's id, then merged into the second.
-    let ex = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "dana"}, "confirm": true, "expected_count": 1}))).await;
-    let keep = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "other"}, "confirm": false}))).await;
-    assert_eq!(keep["count"], 1);
+    // Exported by phone from the first profile, which is then merged into the second.
+    let ex = export_ready(&mut h, json!({"phone_number": "+15035550160"})).await;
+    let personal: Vec<String> = ex["files"].as_array().unwrap().iter().map(|f| f["url"].as_str().unwrap().to_string()).collect();
+    let other = bulk(&mut h, json!({"action": "export", "selection": {"q": "other"}})).await;
     h.drain().await;
-    let keep = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "other"}, "confirm": true, "expected_count": 1}))).await;
-    h.drain().await;
+    let other_url = h.ok("GET", &format!("/api/people/bulk/{}", other["id"].as_str().unwrap()), None).await["file_url"].as_str().unwrap().to_string();
+    // A reports CSV export of the account.
+    let acct: Uuid = sqlx::query_scalar("SELECT id FROM accounts LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let report = Uuid::now_v7();
+    sqlx::query("INSERT INTO exports (id, account_id, kind, status, filename) VALUES ($1, $2, 'profiles', 'done', 'profiles.csv')").bind(report).bind(acct).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO export_chunks (export_id, seq, bytes) VALUES ($1, 0, 'id,email\n'::bytea)").bind(report).execute(&h.state.db).await.unwrap();
     h.ok("POST", "/api/people/merge", Some(json!({"keep_id": b["id"], "merge_id": a["id"], "confirm": true}))).await;
-    let ex_file = h.ok("GET", &format!("/api/people/bulk/{}", ex["id"].as_str().unwrap()), None).await["file_url"].clone();
-    let keep_file = h.ok("GET", &format!("/api/people/bulk/{}", keep["id"].as_str().unwrap()), None).await["file_url"].clone();
-    h.ok("POST", "/api/people/privacy/delete", Some(json!({"phone_number": "+15035550160", "confirm": true}))).await;
-    let (s, _, _) = h.bytes("GET", ex_file.as_str().unwrap(), "text/plain", vec![]).await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "the export that held them is gone");
-    let (s, _, _) = h.bytes("GET", keep_file.as_str().unwrap(), "text/plain", vec![]).await;
-    assert_eq!(s, StatusCode::OK, "other people's exports stay");
+
+    // Erased by email now (the export was asked for by phone, on the other profile).
+    let del = h.ok("POST", "/api/people/privacy/delete", Some(json!({"email": "dana@x.test", "confirm": true}))).await;
+    assert_eq!(del["deleted"], 1, "{del}");
+    for url in personal.iter().chain([&other_url]) {
+        let (s, _, _) = h.bytes("GET", url, "text/plain", vec![]).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{url} is gone");
+    }
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM people_files").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 0);
+    let reports: i64 = sqlx::query_scalar("SELECT count(*) FROM exports").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(reports, 0, "report exports may hold them too");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn an_export_finishing_after_an_erasure_publishes_nothing() {
+    let mut h = harness!();
+    h.signup().await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "eve@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "eve@x.test"}}))).await;
+    h.drain().await;
+    let started = h.ok("POST", "/api/people/privacy/export", Some(json!({"email": "eve@x.test"}))).await;
+    let request: Uuid = started["request_id"].as_str().unwrap().parse().unwrap();
+    let payload: Value = sqlx::query_scalar("SELECT payload FROM jobs WHERE kind = 'people_privacy_export'").fetch_one(&h.state.db).await.unwrap();
+    // The erasure holds her row while the export job builds; the job can only publish after it.
+    let acct: Uuid = sqlx::query_scalar("SELECT id FROM accounts LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    dumbmail::features::people::privacy::erase_in(&mut tx, acct, &[p["id"].as_str().unwrap().parse().unwrap()]).await.unwrap();
+    let state = h.state.clone();
+    let job = tokio::spawn(async move { dumbmail::features::people::privacy::run_export_job(&state, &payload).await });
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tx.commit().await.unwrap();
+    job.await.unwrap().unwrap();
+    let r = h.ok("GET", &format!("/api/people/privacy/requests/{request}"), None).await;
+    assert_eq!(r["status"], "failed", "{r}");
+    assert_eq!(r["files"].as_array().unwrap().len(), 0);
+    let files: i64 = sqlx::query_scalar("SELECT count(*) FROM people_files").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(files, 0, "no copy of her data is left behind");
+
+    // A bulk export running when someone is erased throws its file away too.
+    let acct_id = acct;
+    sqlx::query("INSERT INTO profiles (id, account_id, email) SELECT gen_random_uuid(), $1, 'b' || i || '@x.test' FROM generate_series(1, 700) i").bind(acct_id).execute(&h.state.db).await.unwrap();
+    let ex = bulk(&mut h, json!({"action": "export", "selection": {"q": "@x.test"}})).await;
+    assert!(dumbmail::jobs::run_one(&h.state).await.unwrap(), "first batch");
+    h.ok("POST", "/api/people/privacy/delete", Some(json!({"email": "b7@x.test", "confirm": true}))).await;
+    h.drain().await;
+    let job = h.ok("GET", &format!("/api/people/bulk/{}", ex["id"].as_str().unwrap()), None).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(job["error"].as_str().unwrap().contains("erased"), "{job}");
+    assert!(job["file_url"].is_null());
+    let files: i64 = sqlx::query_scalar("SELECT count(*) FROM people_files").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(files, 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failed_history_write_never_loses_an_opt_out() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    h.credit(10.0).await;
+    let our_number = h.claim_number().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    for (e, phone) in [("u@x.test", "+15035550201"), ("b@x.test", "+15035550202")] {
+        h.ok("POST", "/api/profiles", Some(json!({"email": e, "phone_number": phone, "email_consent": "subscribed", "sms_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    }
+    send_campaign(&mut h, &list["id"]).await;
+    // A double opt-in sign-up waiting to be confirmed.
+    let dlist = h.ok("POST", "/api/lists", Some(json!({"name": "Double", "double_opt_in": true}))).await;
+    let dform = h.ok("POST", "/api/forms", Some(json!({"name": "D", "list_id": dlist["id"], "config": {"headline": "Join"}}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", dform["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": dform["id"], "email": "doi@x.test"}).to_string()).await;
+    let link = find_link(&h.state.email.sent().into_iter().find(|m| m.to == "doi@x.test").unwrap().html, "https://pl.test/c/").trim_start_matches("https://pl.test").to_string();
+    h.drain().await;
+
+    // Consent history can't be written for a while.
+    sqlx::query("CREATE FUNCTION fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'history is down'; END $$").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_history BEFORE INSERT ON consent_events FOR EACH ROW EXECUTE FUNCTION fail_history()").execute(&h.state.db).await.unwrap();
+
+    // An unsubscribe link, a STOP and a hard bounce are all saved, and acknowledged.
+    let (s, _, page) = h.raw("POST", &unsub_path(&h, "u@x.test"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("You're unsubscribed"));
+    let text = json!({"data": {"event_type": "message.received", "payload": {"text": "STOP", "from": {"phone_number": "+15035550201"}, "to": [{"phone_number": our_number}]}}}).to_string();
+    let (s, _, _) = h.raw("POST", "/webhooks/telnyx/hooksecret", &[("content-type", "application/json")], &text).await;
+    assert_eq!(s, StatusCode::OK);
+    ses(&h, "b@x.test", "Permanent").await;
+    let state: Vec<(String, String, String, Option<String>)> = sqlx::query_as("SELECT email, email_consent, sms_consent, email_suppressed_reason FROM profiles WHERE email IN ('u@x.test', 'b@x.test') ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(state, vec![
+        ("b@x.test".into(), "subscribed".into(), "subscribed".into(), Some("hard_bounce".into())),
+        ("u@x.test".into(), "unsubscribed".into(), "unsubscribed".into(), None),
+    ]);
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'people_consent_history'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(waiting, 3, "each one's history row waits to be written");
+
+    // Changes that make someone more reachable fail as a whole instead, and can be retried.
+    let u = pid(&h, "u@x.test").await;
+    let (s, _) = h.req("PATCH", &format!("/api/profiles/{u}"), Some(json!({"sms_consent": "subscribed"}))).await;
+    assert!(s.is_server_error(), "{s}");
+    let sms: String = sqlx::query_scalar("SELECT sms_consent FROM profiles WHERE email = 'u@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(sms, "unsubscribed");
+    // The confirmation link isn't used up by a confirmation that couldn't be saved.
+    let (_, _, page) = h.raw("POST", &link, &[], "").await;
+    assert!(page.contains("Something went wrong"), "{page}");
+    let doi: (String, bool) = sqlx::query_as("SELECT p.email_consent, o.confirmed_at IS NOT NULL FROM profiles p JOIN optin_confirmations o ON o.profile_id = p.id WHERE p.email = 'doi@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(doi, ("pending".to_string(), false));
+
+    // History is back: the waiting rows are written, once, and say they were late.
+    sqlx::query("DROP TRIGGER fail_history ON consent_events").execute(&h.state.db).await.unwrap();
+    h.fast_forward().await;
+    h.fast_forward().await;
+    let late: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT method, channel || ':' || field, new_value, recorded_at >= occurred_at FROM consent_events WHERE detail->>'recorded_late' = 'true' ORDER BY method",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(late, vec![
+        ("hard_bounce".into(), "email:suppression".into(), Some("hard_bounce".into()), true),
+        ("sms_keyword".into(), "sms:consent".into(), Some("unsubscribed".into()), true),
+        ("unsubscribe_link".into(), "email:consent".into(), Some("unsubscribed".into()), true),
+    ]);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE kind = 'people_consent_history'").fetch_one(&h.state.db).await.unwrap(), 0);
+    let (_, _, page) = h.raw("POST", &link, &[], "").await;
+    assert!(page.contains("You're subscribed"), "{page}");
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'doi@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(consent, "subscribed");
+
+    // If the unsubscribe itself can't be saved, the person is told so and can try again.
+    sqlx::query("CREATE FUNCTION fail_unsub() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.email_consent = 'unsubscribed' AND OLD.email_consent <> 'unsubscribed' THEN RAISE EXCEPTION 'down'; END IF; RETURN NEW; END $$").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_unsub BEFORE UPDATE ON profiles FOR EACH ROW EXECUTE FUNCTION fail_unsub()").execute(&h.state.db).await.unwrap();
+    let path = unsub_path(&h, "b@x.test");
+    let (s, _, page) = h.raw("POST", &path, &[], "").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(page.contains("try again") && !page.contains("You're unsubscribed"), "{page}");
+    let stamped: bool = sqlx::query_scalar("SELECT unsubscribed_at IS NOT NULL FROM messages WHERE to_address = 'b@x.test' AND channel = 'email'").fetch_one(&h.state.db).await.unwrap();
+    assert!(!stamped);
+    sqlx::query("DROP TRIGGER fail_unsub ON profiles").execute(&h.state.db).await.unwrap();
+    let (s, _, page) = h.raw("POST", &path, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("You're unsubscribed"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_double_opt_in_profile_is_created_waiting_to_confirm() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let dlist = h.ok("POST", "/api/lists", Some(json!({"name": "Double", "double_opt_in": true}))).await;
+    let dform = h.ok("POST", "/api/forms", Some(json!({"name": "D", "list_id": dlist["id"], "config": {"headline": "Join"}}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", dform["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    // Any later write that sets a profile to pending fails: so the sign-up only works if the profile
+    // is created pending.
+    sqlx::query("CREATE FUNCTION no_late_pending() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.email_consent = 'pending' AND OLD.email_consent <> 'pending' THEN RAISE EXCEPTION 'late'; END IF; RETURN NEW; END $$").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER no_late_pending BEFORE UPDATE ON profiles FOR EACH ROW EXECUTE FUNCTION no_late_pending()").execute(&h.state.db).await.unwrap();
+    let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": dform["id"], "email": "new@x.test"}).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, "pending");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_consent_changes_keep_an_exact_history() {
+    use dumbmail::features::people::{consent, Channel, ConsentSource};
+    let mut h = harness!();
+    h.signup().await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "race@x.test", "phone_number": "+15035550300"}))).await;
+    let acct: Uuid = sqlx::query_scalar("SELECT id FROM accounts LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let id: Uuid = p["id"].as_str().unwrap().parse().unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let db = h.state.db.clone();
+        tasks.push(tokio::spawn(async move {
+            let v = if i % 2 == 0 { "subscribed" } else { "unsubscribed" };
+            if i % 3 == 0 {
+                // Through the shared upsert, matched by email.
+                let input = dumbmail::audience::ProfileInput { email: Some("race@x.test".into()), email_consent: Some(v.into()), ..Default::default() };
+                dumbmail::audience::upsert_profile(&db, acct, &input).await.map(|_| ())
+            } else {
+                consent::set_consent(&db, acct, id, Channel::Email, v, None, &ConsentSource::new("api", "api")).await.map(|_| ())
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as("SELECT old_value, new_value FROM consent_events WHERE profile_id = $1 AND channel = 'email' AND field = 'consent' ORDER BY id")
+        .bind(id)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    assert!(rows.len() > 2, "{rows:?}");
+    let mut prev = "never_subscribed".to_string();
+    for (old, new) in &rows {
+        assert_eq!(old.as_deref(), Some(prev.as_str()), "each change starts where the last ended: {rows:?}");
+        assert_ne!(old, new);
+        prev = new.clone().unwrap();
+    }
+    let now: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE id = $1").bind(id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(now, prev, "the last row is the current state");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn retained_blocks_survive_every_reimport_until_a_verified_opt_in() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "gone@x.test", "email_consent": "unsubscribed"}))).await;
+    h.ok("DELETE", &format!("/api/profiles/{}", p["id"].as_str().unwrap()), None).await;
+
+    // Imported as subscribed, twice; then the API, then a single opt-in form, all say subscribed.
+    for _ in 0..2 {
+        h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email\ngone@x.test\n", "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
+        let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'gone@x.test'").fetch_one(&h.state.db).await.unwrap();
+        assert_eq!(c, "unsubscribed", "a re-import can't undo the unsubscribe");
+    }
+    h.ok("POST", "/api/profiles", Some(json!({"email": "gone@x.test", "email_consent": "subscribed"}))).await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Popup", "list_id": list["id"]}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", form["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": form["id"], "email": "gone@x.test"}).to_string()).await;
+    let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'gone@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, "unsubscribed", "a form alone doesn't prove the address is theirs");
+    let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}}))).await;
+    assert_eq!(est["count"], 0);
+
+    // Their own confirmation, clicked from that inbox, is what brings them back; later imports keep it.
+    let dlist = h.ok("POST", "/api/lists", Some(json!({"name": "Double", "double_opt_in": true}))).await;
+    let dform = h.ok("POST", "/api/forms", Some(json!({"name": "D", "list_id": dlist["id"]}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", dform["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": dform["id"], "email": "gone@x.test"}).to_string()).await;
+    let link = find_link(&h.state.email.sent().into_iter().rev().find(|m| m.to == "gone@x.test").unwrap().html, "https://pl.test/c/");
+    h.raw("POST", link.trim_start_matches("https://pl.test"), &[], "").await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email\ngone@x.test\n", "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'gone@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, "subscribed");
+
+    // The stronger block wins and keeps its reason: a manually suppressed profile moved onto a deleted
+    // hard-bounced address is suppressed for the bounce, which can't be lifted.
+    let bounced = h.ok("POST", "/api/profiles", Some(json!({"email": "bounced@x.test"}))).await;
+    sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce' WHERE id = $1::uuid").bind(bounced["id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+    h.ok("DELETE", &format!("/api/profiles/{}", bounced["id"].as_str().unwrap()), None).await;
+    let m = h.ok("POST", "/api/profiles", Some(json!({"email": "manual@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": ["manual@x.test"], "confirm": true}))).await;
+    h.ok("PATCH", &format!("/api/profiles/{}", m["id"].as_str().unwrap()), Some(json!({"email": "bounced@x.test"}))).await;
+    let r: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE id = $1::uuid").bind(m["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(r.as_deref(), Some("hard_bounce"));
+    let (s, _) = h.req("POST", "/api/people/suppressions/unsuppress", Some(json!({"profile_id": m["id"], "channel": "email", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // A lifted manual suppression stays lifted (its retained record goes with it).
+    let x = h.ok("POST", "/api/profiles", Some(json!({"email": "manual2@x.test"}))).await;
+    h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": ["manual2@x.test"], "confirm": true}))).await;
+    h.ok("DELETE", &format!("/api/profiles/{}", x["id"].as_str().unwrap()), None).await;
+    let again = h.ok("POST", "/api/profiles", Some(json!({"email": "manual2@x.test"}))).await;
+    h.ok("POST", "/api/people/suppressions/unsuppress", Some(json!({"profile_id": again["id"], "channel": "email", "confirm": true}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "manual2@x.test", "first_name": "M"}))).await;
+    let r: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE email = 'manual2@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(r, None);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn merging_profiles_with_queued_messages_sends_each_campaign_once() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let keep = h.ok("POST", "/api/profiles", Some(json!({"email": "keep@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let other = h.ok("POST", "/api/profiles", Some(json!({"email": "old@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    // An earlier email to the merged-away address, and a confirmation waiting at that address.
+    send_campaign(&mut h, &list["id"]).await;
+    let old_unsub = unsub_path(&h, "old@x.test");
+    sqlx::query("UPDATE profiles SET email_consent = 'never_subscribed'").execute(&h.state.db).await.unwrap();
+    let dlist = h.ok("POST", "/api/lists", Some(json!({"name": "Double", "double_opt_in": true}))).await;
+    let dform = h.ok("POST", "/api/forms", Some(json!({"name": "D", "list_id": dlist["id"]}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", dform["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": dform["id"], "email": "old@x.test"}).to_string()).await;
+    let link = find_link(&h.state.email.sent().into_iter().rev().find(|m| m.to == "old@x.test").unwrap().html, "https://pl.test/c/");
+    h.drain().await;
+
+    // A second campaign is queued for both, but not sent yet.
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "Second", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert!(dumbmail::jobs::run_one(&h.state).await.unwrap());
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND status = 'queued'").bind(c["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(queued, 2);
+
+    // While a message to one of them is being sent, the merge waits.
+    sqlx::query("UPDATE messages SET status = 'sending' WHERE campaign_id = $1::uuid AND to_address = 'old@x.test'").bind(c["id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", "/api/people/merge", Some(json!({"keep_id": keep["id"], "merge_id": other["id"], "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    sqlx::query("UPDATE messages SET status = 'queued' WHERE campaign_id = $1::uuid AND to_address = 'old@x.test'").bind(c["id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": keep["id"], "merge_id": other["id"], "confirm": true}))).await;
+    h.drain().await;
+    let second: Vec<String> = h.state.email.sent().into_iter().filter(|m| m.subject == "Second").map(|m| m.to).collect();
+    assert_eq!(second, vec!["keep@x.test".to_string()], "one email, to the kept address");
+    let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE subject = 'Second' AND status = 'sent'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(sent, 1, "and one billed send");
+
+    // The confirmation sent to old@ can't subscribe keep@.
+    let (_, _, page) = h.raw("POST", link.trim_start_matches("https://pl.test"), &[], "").await;
+    assert!(page.contains("expired"), "{page}");
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE id = $1::uuid").bind(keep["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(consent, "never_subscribed");
+    // The unsubscribe link in the old email unsubscribes the kept profile (the safe direction).
+    let (s, _, _) = h.raw("POST", &old_unsub, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE id = $1::uuid").bind(keep["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(consent, "unsubscribed");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_queued_message_isnt_sent_to_an_address_the_profile_no_longer_has() {
+    let mut h = harness!();
+    h.signup().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "before@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    h.drain().await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "Queued", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert!(dumbmail::jobs::run_one(&h.state).await.unwrap());
+    h.ok("PATCH", &format!("/api/profiles/{}", p["id"].as_str().unwrap()), Some(json!({"email": "after@x.test"}))).await;
+    h.drain().await;
+    assert!(h.state.email.sent().iter().all(|m| m.subject != "Queued"), "nothing sent");
+    let why: Option<String> = sqlx::query_scalar("SELECT error FROM messages WHERE subject IS NULL OR subject = 'Queued'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(why.as_deref(), Some("address changed"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_manually_suppressed_number_gets_no_texts_not_even_tests() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    h.claim_number().await;
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550400", "sms_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": ["+15035550400"], "confirm": true}))).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Texts"}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"body": "Hello"}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["+15035550400"]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("suppressed"), "{v}");
+    assert!(h.state.sms.sent().is_empty(), "no text went out");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn gpc_and_reserved_property_keys() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Popup"}))).await;
+    h.ok("PATCH", &format!("/api/forms/{}", form["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    // From the snippet's body flag, and from the browser's Sec-GPC header on a plain form post.
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": form["id"], "email": "g1@x.test", "gpc": true}).to_string()).await;
+    let body = format!("form_id={}&email=g2%40x.test", form["id"].as_str().unwrap());
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/x-www-form-urlencoded"), ("sec-gpc", "1")], &body).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": form["id"], "email": "g3@x.test"}).to_string()).await;
+    let flags: Vec<(String, bool)> = sqlx::query_as("SELECT email, ads_opt_out FROM profiles ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(flags, vec![("g1@x.test".into(), true), ("g2@x.test".into(), true), ("g3@x.test".into(), false)]);
+    let how: String = sqlx::query_scalar("SELECT method FROM consent_events WHERE channel = 'ads' LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(how, "gpc");
+
+    // Custom properties can't shadow consent, privacy or identity fields.
+    for props in [json!({"email_consent": "subscribed"}), json!({"marketing_hold": false}), json!({"$source": "x"})] {
+        let (s, v) = h.req("POST", "/api/profiles", Some(json!({"email": "k@x.test", "properties": props}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    let (s, _) = h.req("POST", "/api/profiles", Some(json!({"email": "k@x.test", "ads_opt_out": false}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email,ads_opt_out,city\nk@x.test,false,Portland\n", "permission_confirmed": true}))).await;
+    assert_eq!(imp["created"], 1, "{imp}");
+    let props: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE email = 'k@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(props, json!({"city": "Portland"}), "the reserved column is left out");
+    h.cleanup().await;
+}
+
