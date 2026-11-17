@@ -39,7 +39,7 @@ const COLS: &str = "id, keyword, aliases, match_type, subscribe, double_opt_in, 
 /// Carrier words that keep their standard meaning (opt out, opt back in, help) and the "Y" that
 /// confirms a double opt-in. No keyword or alias may use them.
 pub fn reserved(word: &str) -> bool {
-    optout::STANDALONE_STOP.contains(&word) || optout::START_WORDS.contains(&word) || optout::HELP_WORDS.contains(&word) || word == "y" || optout::is_opt_out(word)
+    optout::STANDALONE_STOP.contains(&word) || optout::RESERVED_CONSENT_WORDS.contains(&word) || optout::HELP_WORDS.contains(&word) || optout::is_opt_out(word)
 }
 
 /// Keywords are one word of letters and digits, stored lowercase (matching ignores case).
@@ -75,18 +75,21 @@ async fn get(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Keyword> {
 }
 
 /// The enabled keyword a text matches: exact matches on the keyword or an alias first, then
-/// "starts with" keywords (longest first). Sign-up keywords only ever match exactly.
-pub async fn matching(db: &PgPool, account_id: Uuid, word: &str) -> AppResult<Option<Keyword>> {
+/// "starts with" keywords (longest first). `word` is the text with everything but letters and
+/// digits dropped; `strict` is the whole text with only its ends trimmed ([`optout::strict_word`]).
+/// Sign-up keywords grant permission, so they match only `strict`, exactly.
+pub async fn matching(db: &PgPool, account_id: Uuid, word: &str, strict: &str) -> AppResult<Option<Keyword>> {
     if word.is_empty() {
         return Ok(None);
     }
     let q = format!(
         "SELECT {COLS} FROM sms_keywords WHERE account_id = $1 AND enabled AND (
-            keyword = $2 OR $2 = ANY(aliases)
-            OR (match_type = 'starts_with' AND NOT subscribe AND (starts_with($2, keyword) OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE starts_with($2, a))))
-         ) ORDER BY (keyword = $2 OR $2 = ANY(aliases)) DESC, length(keyword) DESC LIMIT 1"
+            (subscribe AND (keyword = $3 OR $3 = ANY(aliases)))
+            OR (NOT subscribe AND (keyword = $2 OR $2 = ANY(aliases)
+                OR (match_type = 'starts_with' AND (starts_with($2, keyword) OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE starts_with($2, a))))))
+         ) ORDER BY (keyword IN ($2, $3) OR $2 = ANY(aliases) OR $3 = ANY(aliases)) DESC, length(keyword) DESC LIMIT 1"
     );
-    Ok(sqlx::query_as::<_, Keyword>(&q).bind(account_id).bind(word).fetch_optional(db).await?)
+    Ok(sqlx::query_as::<_, Keyword>(&q).bind(account_id).bind(word).bind(strict).fetch_optional(db).await?)
 }
 
 fn opt_str(v: &Value, k: &str) -> AppResult<Option<String>> {
@@ -249,17 +252,20 @@ pub fn opt_in_request(s: &Settings) -> String {
 }
 
 /// A double opt-in waiting for this number's "Y": the prompt was accepted by the provider within
-/// the last 7 days, it went from `ours`, and its keyword still subscribes people and is on.
-pub async fn pending_optin(conn: &mut sqlx::PgConnection, account_id: Uuid, theirs: &str, ours: &str) -> AppResult<Option<Uuid>> {
+/// the last 7 days, it went from `ours`, the answer was received (`received_at`: the provider's time
+/// where it gives one, else when it arrived) after the prompt was sent, and its keyword still
+/// subscribes people and is on.
+pub async fn pending_optin(conn: &mut sqlx::PgConnection, account_id: Uuid, theirs: &str, ours: &str, received_at: DateTime<Utc>) -> AppResult<Option<Uuid>> {
     Ok(sqlx::query_scalar(
         "SELECT p.id FROM sms_pending_optins p JOIN sms_keywords k ON k.id = p.keyword_id
          WHERE p.account_id = $1 AND p.phone_number = $2 AND p.our_number = $3
-           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days'
+           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days' AND p.prompt_sent_at <= $4
            AND k.enabled AND k.subscribe AND k.double_opt_in",
     )
     .bind(account_id)
     .bind(theirs)
     .bind(ours)
+    .bind(received_at)
     .fetch_optional(conn)
     .await?)
 }
@@ -326,12 +332,14 @@ pub async fn confirm_pending(state: &AppState, rx: &Received) -> AppResult<bool>
     let row: Option<(Uuid, i32, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         "DELETE FROM sms_pending_optins p USING sms_keywords k
          WHERE k.id = p.keyword_id AND p.account_id = $1 AND p.phone_number = $2 AND p.our_number = $3
-           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days' AND k.enabled AND k.subscribe AND k.double_opt_in
+           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days' AND p.prompt_sent_at <= $4
+           AND k.enabled AND k.subscribe AND k.double_opt_in
          RETURNING p.keyword_id, p.keyword_version, p.inbound_id, p.prompt_id",
     )
     .bind(rx.account_id)
     .bind(&rx.from)
     .bind(&rx.to)
+    .bind(rx.received_at)
     .fetch_optional(&state.db)
     .await?;
     let Some((keyword_id, version, signup_inbound, prompt_id)) = row else { return Ok(false) };
@@ -375,7 +383,19 @@ pub async fn subscribed(state: &AppState, auto: &replies::AutoSend, message_id: 
     if store::is_opted_out(&mut tx, auto.account_id, &auto.to_number).await? {
         return Ok(());
     }
-    sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(auto.profile_id).execute(&mut *tx).await?;
+    // The profile must still have the number that agreed: if its number was changed meanwhile,
+    // nobody is subscribed.
+    let updated = sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND phone_number = $3")
+        .bind(auto.profile_id)
+        .bind(auto.account_id)
+        .bind(&auto.to_number)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        tracing::info!(auto = %auto.id, "sign-up not recorded: the profile's number changed before the confirmation went out");
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO sms_consents (id, account_id, profile_id, method, phone_number, our_number, keyword_id, keyword, keyword_version, disclosure,
              signup_inbound_id, signup_provider_message_id, confirm_inbound_id, confirm_provider_message_id, prompt_message_id, prompt_provider_message_id,

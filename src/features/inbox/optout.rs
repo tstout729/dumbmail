@@ -12,9 +12,13 @@ const STOP_PHRASES: &[&[&str]] = &[&["stop"], &["unsubscribe"], &["opt", "out"],
 /// Words that ask for help. DumbMail (or the provider) answers them with the program's help text.
 pub const HELP_WORDS: &[&str] = &["help", "info"];
 
-/// What DumbMail treated as "opt back in" before the inbox existed (kept for people who haven't
-/// opted out at the carrier: START, UNSTOP, YES and SUBSCRIBE mark them subscribed).
-pub const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
+/// The words that mark a known number subscribed when it hasn't opted out at the carrier level, as
+/// before the inbox. YES counts only as the answer to a double opt-in prompt (see `keywords`), and
+/// SUBSCRIBE no longer subscribes anyone without one.
+pub const START_WORDS: &[&str] = &["start", "unstop"];
+
+/// Words reserved for consent that no keyword may use (with the opt-out and help words).
+pub const RESERVED_CONSENT_WORDS: &[&str] = &["start", "unstop", "yes", "y", "subscribe"];
 
 /// Telnyx toll-free and US numbers lift a carrier opt-out on START and UNSTOP; Twilio also on YES,
 /// except on toll-free numbers, where Twilio documents that YES doesn't opt a person back in.
@@ -33,6 +37,13 @@ pub fn is_toll_free(number: &str) -> bool {
 /// The text in lowercase letters and digits only: how keywords and single words are matched.
 pub fn word(text: &str) -> String {
     text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// The whole text, lowercased, with whitespace and punctuation trimmed from its ends only: how
+/// words that grant permission (START, UNSTOP, YES, Y, sign-up keywords) are matched. "Start!" is
+/// "start"; "s-t-a-r-t" and "start now" aren't.
+pub fn strict_word(text: &str) -> String {
+    text.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
 }
 
 /// Lowercase words, apostrophes dropped ("don't" is "dont"), split on everything else.

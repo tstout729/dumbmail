@@ -52,28 +52,47 @@ async fn byo(state: &AppState, account_id: Uuid) -> AppResult<Option<ByoCredenti
     Ok(serde_json::from_str(&crate::crypto::decrypt(&state.cfg.secret_key, &enc)?).ok())
 }
 
+/// A webhook on one provider's route for a connection that uses the other provider: refused, never
+/// treated as "no key configured".
+fn wrong_provider(route: &str, scope: Option<Uuid>) -> AppError {
+    tracing::warn!(account = ?scope, route, "rejected a webhook on the route of a provider this connection doesn't use");
+    AppError::Forbidden(format!("this texting connection doesn't use {route}"))
+}
+
+/// The platform's own texting provider is `route` (or the log provider, which stands in for either).
+fn platform_uses(state: &AppState, route: &str) -> bool {
+    matches!(state.sms.name(), "log") || state.sms.name() == route
+}
+
 /// The Telnyx public key for a webhook: the account's own (when it connected its own Telnyx and
-/// the webhook used its URL) or the platform's `TELNYX_PUBLIC_KEY`.
+/// the webhook used its URL) or the platform's `TELNYX_PUBLIC_KEY`. Refused when that connection
+/// doesn't use Telnyx.
 pub async fn telnyx_key(state: &AppState, scope: Option<Uuid>) -> AppResult<Option<String>> {
     if let Some(account_id) = scope {
         match byo(state, account_id).await? {
             Some(ByoCredentials::Telnyx { public_key, .. }) => return Ok(public_key.filter(|k| !k.trim().is_empty())),
-            Some(ByoCredentials::Twilio { .. }) => return Ok(None),
+            Some(ByoCredentials::Twilio { .. }) => return Err(wrong_provider("telnyx", scope)),
             None => {}
         }
+    }
+    if !platform_uses(state, "telnyx") {
+        return Err(wrong_provider("telnyx", scope));
     }
     Ok(state.cfg.telnyx_public_key.clone().filter(|k| !k.trim().is_empty()))
 }
 
 /// The Twilio auth token for a webhook: the account's own (connected Twilio) or the platform's
-/// `TWILIO_AUTH_TOKEN`.
+/// `TWILIO_AUTH_TOKEN`. Refused when that connection doesn't use Twilio.
 pub async fn twilio_token(state: &AppState, scope: Option<Uuid>) -> AppResult<Option<String>> {
     if let Some(account_id) = scope {
         match byo(state, account_id).await? {
             Some(ByoCredentials::Twilio { auth_token, .. }) => return Ok(Some(auth_token)),
-            Some(ByoCredentials::Telnyx { .. }) => return Ok(None),
+            Some(ByoCredentials::Telnyx { .. }) => return Err(wrong_provider("twilio", scope)),
             None => {}
         }
+    }
+    if !platform_uses(state, "twilio") {
+        return Err(wrong_provider("twilio", scope));
     }
     Ok(state.cfg.twilio_auth_token.clone().filter(|k| !k.trim().is_empty()))
 }

@@ -3,28 +3,31 @@
 -- tied to a prompt that actually went out.
 
 -- A number that texted STOP (or a provider said opted out) can't be texted at all from this
--- account until it texts START (or UNSTOP, or a re-opt-in word its provider documents). This is
--- separate from the profile's marketing consent (`profiles.sms_consent`).
+-- account. Each row is one pair: their number and the number of ours that got the opt-out. Only
+-- START or UNSTOP (or a re-opt-in word the provider documents) sent to that same number of ours
+-- lifts that row; the number stays blocked while any row for it remains. This is separate from
+-- the profile's marketing consent (`profiles.sms_consent`).
+--
+-- It starts empty: people who texted STOP before this table existed are still protected as they
+-- were, by their profile's SMS consent being `unsubscribed`. No history is scanned, so this
+-- migration holds its locks only for an instant.
 CREATE TABLE sms_opt_outs (
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     phone_number text NOT NULL,
-    our_number text,
-    source text NOT NULL, -- keyword | phrase | provider | earlier (from before this table)
+    our_number text NOT NULL,
+    source text NOT NULL, -- keyword | phrase | provider
     inbound_id uuid REFERENCES sms_inbound(id) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (account_id, phone_number)
+    PRIMARY KEY (account_id, phone_number, our_number)
 );
 
--- People who texted STOP before this table existed: their profile says unsubscribed and they have
--- an "Unsubscribed from SMS" event from a texted keyword (link unsubscribes carry no keyword).
-INSERT INTO sms_opt_outs (account_id, phone_number, source, created_at)
-SELECT p.account_id, p.phone_number, 'earlier', max(e.occurred_at)
-FROM profiles p
-JOIN events e ON e.profile_id = p.id
-JOIN metrics m ON m.id = e.metric_id AND m.name = 'Unsubscribed from SMS'
-WHERE p.sms_consent = 'unsubscribed' AND p.phone_number IS NOT NULL AND e.properties ? 'keyword'
-GROUP BY p.account_id, p.phone_number
-ON CONFLICT DO NOTHING;
+-- HELP answers: at most one per number per hour, enforced by the write itself.
+CREATE TABLE sms_help_answers (
+    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    phone_number text NOT NULL,
+    last_at timestamptz NOT NULL,
+    PRIMARY KEY (account_id, phone_number)
+);
 
 -- Every automatic text, written down before it's sent. Its id is also the id of the message it
 -- goes out as, so a job that runs twice can't send it twice.

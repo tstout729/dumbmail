@@ -88,10 +88,14 @@ fn twilio_params(sid: &str, from: &str, to: &str, text: &str, extra: &[(&str, &s
 
 /// Twilio's signature: HMAC-SHA1 (auth token) over the URL then each parameter, sorted, as name+value.
 fn twilio_signature(token: &str, params: &[(String, String)]) -> String {
+    twilio_signature_for(TWILIO_URL, token, params)
+}
+
+fn twilio_signature_for(url: &str, token: &str, params: &[(String, String)]) -> String {
     let mut sorted = params.to_vec();
     sorted.sort();
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(token.as_bytes()).unwrap();
-    mac.update(TWILIO_URL.as_bytes());
+    mac.update(url.as_bytes());
     for (k, v) in &sorted {
         mac.update(k.as_bytes());
         mac.update(v.as_bytes());
@@ -691,17 +695,22 @@ async fn unverified_texts_can_opt_out_but_nothing_else() {
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM sms_inbound WHERE from_number = $1").bind(b).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(stored, 0);
 
-    // A number two accounts claim: nothing stored in either; an opt-out applies to both.
+    // A number two accounts claim: nothing stored in either, not even an opt-out, and not even
+    // through one of their own webhook addresses.
+    let acme_token: String = sqlx::query_scalar("SELECT webhook_token FROM accounts WHERE name = 'Acme Goods'").fetch_one(&h.state.db).await.unwrap();
     h.cookie = None;
     h.ok("POST", "/api/auth/signup", Some(json!({"email": "other@else.test", "password": "correct horse", "company": "Else"}))).await;
     sqlx::query("UPDATE accounts SET sms_from = $1 WHERE name = 'Else'").bind(&ours).execute(&h.state.db).await.unwrap();
     let c2 = "+15035550603";
     assert_eq!(telnyx_post(&h, &telnyx_body("u-6", c2, &ours, "private question", json!({})), false).await.0, StatusCode::OK);
+    let (s, _, _) = h.raw("POST", &format!("/webhooks/telnyx/{acme_token}"), &[("content-type", "application/json")], &telnyx_body("u-6b", c2, &ours, "private question", json!({}))).await;
+    assert_eq!(s, StatusCode::OK);
     let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM sms_inbound WHERE from_number = $1").bind(c2).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(stored, 0);
     assert_eq!(telnyx_post(&h, &telnyx_body("u-7", c2, &ours, "STOP", json!({})), false).await.0, StatusCode::OK);
+    assert_eq!(telnyx_post(&h, &no_id_stop.replace(b, c2), false).await.0, StatusCode::OK);
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sms_opt_outs WHERE phone_number = $1").bind(c2).fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(n, 0, "never written into several accounts");
     h.cleanup().await;
 }
 
@@ -1234,5 +1243,204 @@ async fn a_stop_that_lands_while_a_text_waits_for_its_turn_stops_it() {
     assert!(reply.await.unwrap().is_ok());
     assert_eq!(texts_to(&h, fine).len(), 1);
     assert_eq!(message_status_to(&h, fine).await[0].0, "sent");
+    h.cleanup().await;
+}
+
+/// Post a Twilio webhook to an account's own address, signed with `token` for that exact URL.
+async fn twilio_post_to(h: &Harness, path: &str, params: &[(String, String)], token: &str) -> StatusCode {
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in params {
+        form.append_pair(k, v);
+    }
+    let sig = twilio_signature_for(&format!("https://pl.test{path}"), token, params);
+    h.raw("POST", path, &[("content-type", "application/x-www-form-urlencoded"), ("x-twilio-signature", &sig)], &form.finish()).await.0
+}
+
+#[tokio::test]
+async fn a_verified_text_belongs_to_exactly_one_account() {
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    let stored = |h: &Harness, from: &'static str| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, String>("SELECT a.name FROM sms_inbound i JOIN accounts a ON a.id = i.account_id WHERE i.from_number = $1").bind(from).fetch_all(&db).await.unwrap() }
+    };
+    let opt_outs = |h: &Harness, phone: &'static str| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, String>("SELECT a.name FROM sms_opt_outs o JOIN accounts a ON a.id = o.account_id WHERE o.phone_number = $1").bind(phone).fetch_all(&db).await.unwrap() }
+    };
+
+    // A second account that connected its own Twilio, with its own number and webhook address.
+    h.cookie = None;
+    h.ok("POST", "/api/auth/signup", Some(json!({"email": "own@twilio.test", "password": "correct horse", "company": "Own Twilio"}))).await;
+    let byo_number = "+15035559100";
+    let creds = dumbmail::crypto::encrypt(&h.state.cfg.secret_key, &json!({"provider": "twilio", "account_sid": "ACown", "auth_token": "own-token"}).to_string()).unwrap();
+    sqlx::query("UPDATE accounts SET sms_mode = 'byo', sms_byo_provider = 'twilio', sms_byo_credentials = $1, sms_from = $2 WHERE name = 'Own Twilio'")
+        .bind(&creds)
+        .bind(byo_number)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO phone_numbers (id, account_id, phone_number, type, source, provider, status) SELECT $1, id, $2, 'local', 'connected', 'twilio', 'active' FROM accounts WHERE name = 'Own Twilio'")
+        .bind(Uuid::now_v7())
+        .bind(byo_number)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let token: String = sqlx::query_scalar("SELECT webhook_token FROM accounts WHERE name = 'Own Twilio'").fetch_one(&h.state.db).await.unwrap();
+    let own_path = format!("/webhooks/twilio/{token}");
+
+    // Its Telnyx address doesn't fall back to "no key" because it uses Twilio: refused.
+    let (s, _, _) = h.raw("POST", &format!("/webhooks/telnyx/{token}"), &[("content-type", "application/json")], &telnyx_body("x-1", "+15035559201", byo_number, "JOIN", json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Signed with its own token, for its own number: stored there, verified.
+    assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-2", "+15035559202", byo_number, "hello", &[]), "own-token").await, StatusCode::OK);
+    assert_eq!(stored(&h, "+15035559202").await, vec!["Own Twilio".to_string()]);
+    assert_eq!(inbound_kind(&h, "x-2").await.2, true);
+    // Signed with its own token but for the other account's number: nothing stored anywhere, not even a STOP.
+    assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-3", "+15035559203", &ours, "question", &[]), "own-token").await, StatusCode::OK);
+    assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-4", "+15035559204", &ours, "STOP", &[]), "own-token").await, StatusCode::OK);
+    assert!(stored(&h, "+15035559203").await.is_empty() && stored(&h, "+15035559204").await.is_empty());
+    assert!(opt_outs(&h, "+15035559204").await.is_empty());
+    // The platform's address (and key) for the connected account's number: the platform doesn't
+    // carry that number, so nothing is stored; an opt-out is still recorded there, and only there.
+    twilio(&h, "x-5", "+15035559205", byo_number, "hi").await;
+    twilio(&h, "x-6", "+15035559206", byo_number, "Stop").await;
+    assert!(stored(&h, "+15035559205").await.is_empty() && stored(&h, "+15035559206").await.is_empty());
+    assert_eq!(opt_outs(&h, "+15035559206").await, vec!["Own Twilio".to_string()]);
+    // The platform's address for the platform account's number works as always.
+    twilio(&h, "x-7", "+15035559207", &ours, "hi").await;
+    assert_eq!(stored(&h, "+15035559207").await, vec!["Acme Goods".to_string()]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn start_lifts_only_the_opt_out_made_on_its_own_number() {
+    let mut h = signed!();
+    let first = setup(&mut h).await;
+    let second = h.claim_number().await;
+    let fan = "+15035552101";
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": fan}))).await;
+
+    // STOP to the first number; START to the second doesn't undo it.
+    telnyx(&h, "p-1", fan, &first, "STOP").await;
+    telnyx(&h, "p-2", fan, &second, "START").await;
+    assert!(opted_out(&h, fan).await);
+    assert_eq!(inbound_kind(&h, "p-2").await.0, "blocked");
+    assert_eq!(consent(&h, fan).await, "unsubscribed");
+    // START to the number that got the STOP does, and (as before the inbox) subscribes them.
+    twilio(&h, "p-3", fan, &first, "Start!").await;
+    assert!(!opted_out(&h, fan).await);
+    assert_eq!(consent(&h, fan).await, "subscribed");
+
+    // Opted out on both: each START lifts its own; they're blocked until both are lifted.
+    telnyx(&h, "p-4", fan, &first, "stop").await;
+    telnyx(&h, "p-5", fan, &second, "stop").await;
+    telnyx(&h, "p-6", fan, &first, "UNSTOP").await;
+    assert!(opted_out(&h, fan).await, "the second number's opt-out still stands");
+    assert_eq!(consent(&h, fan).await, "unsubscribed");
+    telnyx(&h, "p-7", fan, &second, "start").await;
+    assert!(!opted_out(&h, fan).await);
+    assert_eq!(consent(&h, fan).await, "subscribed");
+    // Only the whole word: "start now" or "s-t-a-r-t" isn't START.
+    telnyx(&h, "p-8", fan, &first, "STOP").await;
+    for (id, text) in [("p-9", "start now"), ("p-10", "s-t-a-r-t")] {
+        telnyx(&h, id, fan, &first, text).await;
+        assert!(opted_out(&h, fan).await, "{text}");
+    }
+
+    // Twilio's YES opts back in on a long code, not on toll-free; Telnyx's never.
+    let long_code = "+15035559300";
+    sqlx::query("INSERT INTO phone_numbers (id, account_id, phone_number, type, source, provider, status) SELECT $1, id, $2, 'local', 'purchased', 'telnyx', 'active' FROM accounts")
+        .bind(Uuid::now_v7())
+        .bind(long_code)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let a = "+15035552102";
+    twilio(&h, "p-11", a, long_code, "STOP").await;
+    telnyx(&h, "p-12", a, long_code, "YES").await;
+    assert!(opted_out(&h, a).await, "Telnyx documents only START and UNSTOP");
+    twilio(&h, "p-13", a, long_code, "yes").await;
+    assert!(!opted_out(&h, a).await, "Twilio long code: YES opts back in");
+    let b = "+15035552103";
+    twilio(&h, "p-14", b, &first, "STOP").await;
+    twilio(&h, "p-15", b, &first, "YES").await;
+    assert!(opted_out(&h, b).await, "Twilio toll-free: YES doesn't");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn yes_is_consent_only_as_the_answer_to_a_prompt() {
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    program(&mut h).await;
+
+    // A known profile texting YES or SUBSCRIBE with no prompt: an ordinary text. START still subscribes.
+    let known = "+15035552201";
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": known}))).await;
+    telnyx(&h, "y-1", known, &ours, "YES").await;
+    twilio(&h, "y-2", known, &ours, "Subscribe").await;
+    h.drain().await;
+    assert_eq!(consent(&h, known).await, "never_subscribed");
+    assert_eq!(inbound_kind(&h, "y-1").await.0, "message");
+    assert_eq!(inbound_kind(&h, "y-2").await.0, "message");
+    telnyx(&h, "y-3", known, &ours, "START").await;
+    assert_eq!(consent(&h, known).await, "subscribed");
+
+    let vip = h.ok("POST", "/api/inbox/keywords", Some(json!({"keyword": "VIP", "subscribe": true, "double_opt_in": true, "reply": "Welcome to VIP!"}))).await;
+    let vip_id = vip["id"].as_str().unwrap().to_string();
+    // A sign-up keyword is matched only as the whole text.
+    let fuzzy = "+15035552202";
+    telnyx(&h, "y-4", fuzzy, &ours, "V-I-P").await;
+    h.drain().await;
+    assert!(texts_to(&h, fuzzy).is_empty());
+    assert_eq!(inbound_kind(&h, "y-4").await.0, "message");
+
+    // YES sent (by the provider's clock) before the prompt went out doesn't count.
+    let early = "+15035552203";
+    telnyx(&h, "y-5", early, &ours, "VIP!").await;
+    h.drain().await;
+    assert_eq!(texts_to(&h, early).len(), 1, "the prompt");
+    let sent_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT prompt_sent_at FROM sms_pending_optins WHERE phone_number = $1").bind(early).fetch_one(&h.state.db).await.unwrap();
+    let body = telnyx_body("y-6", early, &ours, "YES", json!({"received_at": (sent_at - chrono::Duration::seconds(30)).to_rfc3339()}));
+    assert_eq!(telnyx_post(&h, &body, true).await.0, StatusCode::OK);
+    h.drain().await;
+    assert_eq!(consent(&h, early).await, "never_subscribed");
+    assert_eq!(inbound_kind(&h, "y-6").await.0, "message");
+    // "yes please" isn't YES either; "Yes!" is.
+    telnyx(&h, "y-7", early, &ours, "yes please").await;
+    h.drain().await;
+    assert_eq!(consent(&h, early).await, "never_subscribed");
+    telnyx(&h, "y-8", early, &ours, "Yes!").await;
+    h.drain().await;
+    assert_eq!(consent(&h, early).await, "subscribed");
+
+    // An expired prompt, or the keyword turned off: YES does nothing.
+    let slow = "+15035552204";
+    telnyx(&h, "y-9", slow, &ours, "VIP").await;
+    h.drain().await;
+    sqlx::query("UPDATE sms_pending_optins SET prompt_sent_at = now() - interval '8 days' WHERE phone_number = $1").bind(slow).execute(&h.state.db).await.unwrap();
+    telnyx(&h, "y-10", slow, &ours, "YES").await;
+    h.drain().await;
+    assert_eq!(consent(&h, slow).await, "never_subscribed");
+    let off = "+15035552205";
+    telnyx(&h, "y-11", off, &ours, "VIP").await;
+    h.drain().await;
+    h.ok("PATCH", &format!("/api/inbox/keywords/{vip_id}"), Some(json!({"enabled": false}))).await;
+    telnyx(&h, "y-12", off, &ours, "YES").await;
+    h.drain().await;
+    assert_eq!(consent(&h, off).await, "never_subscribed");
+    h.ok("PATCH", &format!("/api/inbox/keywords/{vip_id}"), Some(json!({"enabled": true}))).await;
+
+    // Staff change the profile's number after the YES: nobody is subscribed.
+    let moved = "+15035552206";
+    telnyx(&h, "y-13", moved, &ours, "VIP").await;
+    h.drain().await;
+    telnyx(&h, "y-14", moved, &ours, "YES").await;
+    let pid: String = sqlx::query_scalar("SELECT id::text FROM profiles WHERE phone_number = $1").bind(moved).fetch_one(&h.state.db).await.unwrap();
+    h.ok("PATCH", &format!("/api/profiles/{pid}"), Some(json!({"phone_number": "+15035552299"}))).await;
+    h.drain().await;
+    let (c, n): (String, i64) = sqlx::query_as("SELECT sms_consent, (SELECT count(*) FROM sms_consents WHERE profile_id = p.id) FROM profiles p WHERE id = $1::uuid").bind(&pid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((c.as_str(), n), ("never_subscribed", 0));
     h.cleanup().await;
 }

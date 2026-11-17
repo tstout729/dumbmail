@@ -152,7 +152,7 @@ pub async fn is_opted_out(conn: &mut PgConnection, account_id: Uuid, phone: &str
 async fn apply_opt_out(conn: &mut PgConnection, account_id: Uuid, phone: &str, ours: &str, source: &str, inbound_id: Option<Uuid>) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO sms_opt_outs (account_id, phone_number, our_number, source, inbound_id) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (account_id, phone_number) DO NOTHING",
+         ON CONFLICT DO NOTHING",
     )
     .bind(account_id)
     .bind(phone)
@@ -176,8 +176,9 @@ async fn apply_opt_out(conn: &mut PgConnection, account_id: Uuid, phone: &str, o
     Ok(())
 }
 
-/// A STOP whose receiving number belongs to more than one account: nothing is stored, but the
-/// opt-out is applied in each of them (opting out is always the safe direction).
+/// An opt-out that can't be stored as a text (no message id, or it came through a connection the
+/// number doesn't use) but whose number belongs to exactly one account: the opt-out is still
+/// applied there (opting out is always the safe direction).
 pub async fn opt_out_only(db: &PgPool, account_id: Uuid, phone: &str, ours: &str) -> AppResult<()> {
     let mut tx = db.begin().await?;
     lock_number(&mut tx, account_id, phone).await?;
@@ -250,7 +251,9 @@ pub async fn receive(state: &AppState, account_id: Uuid, from: &str, to: &str, m
     let db = &state.db;
     let class = optout::classify(&msg.text, msg.provider_signal.as_deref());
     let word = optout::word(&msg.text);
-    let keyword: Option<Keyword> = if class == Class::Other { keywords::matching(db, account_id, &word).await? } else { None };
+    // Words that grant permission (START, UNSTOP, YES, Y, sign-up keywords) only count as the whole text.
+    let strict = optout::strict_word(&msg.text);
+    let keyword: Option<Keyword> = if class == Class::Other { keywords::matching(db, account_id, &word, &strict).await? } else { None };
 
     let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(from).fetch_optional(db).await?;
     let (profile_id, new_profile) = match existing {
@@ -269,22 +272,28 @@ pub async fn receive(state: &AppState, account_id: Uuid, from: &str, to: &str, m
 
     let mut tx = db.begin().await?;
     lock_number(&mut tx, account_id, from).await?;
-    let opted_out = is_opted_out(&mut tx, account_id, from).await?;
+    // Their opt-outs, one per number of ours that got one.
+    let blocked_on: Vec<String> = sqlx::query_scalar("SELECT our_number FROM sms_opt_outs WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(from).fetch_all(&mut *tx).await?;
+    let opted_out = !blocked_on.is_empty();
+    // A re-opt-in word lifts only the opt-out made on the number it was sent to.
+    let lift_here = verified && blocked_on.iter().any(|o| o == to) && (class == Class::ProviderStart || optout::lifts_opt_out(msg.provider, to, &strict));
+    let lifts_all = lift_here && blocked_on.iter().all(|o| o == to);
+    // YES or Y is consent only as the answer to a prompt that went to this number before it was received.
     let pending_confirm = verified
         && !opted_out
-        && matches!(word.as_str(), "y" | "yes")
-        && keywords::pending_optin(&mut tx, account_id, from, to).await?.is_some();
-    let start_word = class == Class::ProviderStart || optout::START_WORDS.contains(&word.as_str());
-    let lifts = class == Class::ProviderStart || optout::lifts_opt_out(msg.provider, to, &word);
+        && matches!(strict.as_str(), "y" | "yes")
+        && keywords::pending_optin(&mut tx, account_id, from, to, received_at).await?.is_some();
+    let start_word = class == Class::ProviderStart || optout::START_WORDS.contains(&strict.as_str());
     // What this text is. STOP is decided first; an opted-out number can only opt back in (with the
-    // provider's own words) or ask for help: anything else from it does nothing.
+    // provider's own words, on the number that got the opt-out) or ask for help: anything else from
+    // it does nothing.
     let (kind, kw): (&str, Option<String>) = match class {
         Class::Stop => ("stop", None),
-        _ if opted_out && lifts && verified => ("start", None),
+        _ if lifts_all => ("start", None),
         Class::Help => ("help", None),
         _ if opted_out => ("blocked", keyword.as_ref().map(|k| k.keyword.clone())),
         _ if pending_confirm => ("confirm", None),
-        // As before the inbox: START, UNSTOP, YES or SUBSCRIBE from a known number subscribes it.
+        // As before the inbox: START or UNSTOP from a known number subscribes it.
         _ if start_word && verified && !new_profile => ("start", None),
         _ => match &keyword {
             Some(k) => ("keyword", Some(k.keyword.clone())),
@@ -333,8 +342,13 @@ pub async fn receive(state: &AppState, account_id: Uuid, from: &str, to: &str, m
     match kind {
         "stop" => apply_opt_out(&mut tx, account_id, from, to, opt_out_source(msg), Some(id)).await?,
         "start" => {
-            sqlx::query("DELETE FROM sms_opt_outs WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(from).execute(&mut *tx).await?;
-            sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(profile_id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM sms_opt_outs WHERE account_id = $1 AND phone_number = $2 AND our_number = $3").bind(account_id).bind(from).bind(to).execute(&mut *tx).await?;
+            // Only while the profile still has the number that texted.
+            sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND phone_number = $2").bind(profile_id).bind(from).execute(&mut *tx).await?;
+        }
+        // START on this number while another of ours still has their opt-out: lift this one only.
+        _ if lift_here => {
+            sqlx::query("DELETE FROM sms_opt_outs WHERE account_id = $1 AND phone_number = $2 AND our_number = $3").bind(account_id).bind(from).bind(to).execute(&mut *tx).await?;
         }
         _ => {}
     }

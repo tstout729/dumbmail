@@ -38,51 +38,68 @@ use crate::state::AppState;
 
 pub struct Module;
 
-/// An inbound text from a provider webhook. `scope` is the account whose webhook URL was used
-/// (None for the platform's). The receiving number must belong to exactly one account; otherwise
-/// nothing is stored (an opt-out is still applied in every account it could be for). A text
-/// without the provider's message id is refused, except that an opt-out is still applied.
+/// An inbound text from a provider webhook, whose signature was already checked with the key of
+/// the route's own provider and connection ([`verify`]). `scope` is the account whose webhook URL
+/// was used (None for the platform's).
+///
+/// The receiving number must be assigned to exactly one account, and to it through this
+/// connection: the platform's (an account on the platform's numbers) or, for an account's own
+/// URL, that account (its own provider when it connected one). Otherwise nothing is stored and it's
+/// logged. One exception: an opt-out is still recorded when the number belongs to exactly one
+/// account and the URL used is the platform's or that account's, even without a message id, a
+/// signing key or a matching connection; it is never written into several accounts. A text
+/// without the provider's message id is otherwise refused.
 pub async fn inbound(state: &AppState, scope: Option<Uuid>, msg: &Inbound, proof: Proof) -> AppResult<()> {
     let (Some(from), Some(to)) = (normalize_phone(&msg.from), normalize_phone(&msg.to)) else {
         tracing::warn!(provider = msg.provider, "inbound text with an unreadable number; not stored");
         return Ok(());
     };
     let stop = optout::classify(&msg.text, msg.provider_signal.as_deref()) == optout::Class::Stop;
-    let accounts: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT a.id FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
-         WHERE (a.sms_from = $1 OR n.phone_number = $1) AND ($2::uuid IS NULL OR a.id = $2)",
+    // Every account the number is assigned to (whatever the URL), and how it texts.
+    let claims: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT a.id, a.sms_mode, a.sms_byo_provider FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
+         WHERE a.sms_from = $1 OR n.phone_number = $1",
     )
     .bind(&to)
-    .bind(scope)
     .fetch_all(&state.db)
     .await?;
-    // Without the provider's message id a retry can't be recognized, so nothing is stored. An
-    // opt-out is still applied: that direction is always safe.
-    let Some(provider_message_id) = msg.provider_message_id.clone() else {
-        tracing::warn!(provider = msg.provider, to = %to, "inbound text without a message id; not stored");
-        if stop {
-            for a in &accounts {
-                store::opt_out_only(&state.db, *a, &from, &to).await?;
-            }
-            return Ok(());
-        }
-        return Err(crate::error::AppError::bad("an inbound text needs the provider's message id"));
-    };
-    let account_id = match accounts.as_slice() {
-        [one] => *one,
+    let message = msg.provider_message_id.as_deref().unwrap_or("none");
+    let owner = match claims.as_slice() {
+        [one] => one.clone(),
         [] => {
-            tracing::warn!(provider = msg.provider, message = %provider_message_id, to = %to, "inbound text for a number no account uses; not stored");
+            tracing::warn!(provider = msg.provider, message, to = %to, "inbound text for a number no account uses; not stored");
             return Ok(());
         }
         many => {
-            tracing::error!(provider = msg.provider, message = %provider_message_id, to = %to, accounts = many.len(), "inbound text for a number several accounts claim; not stored");
-            if stop {
-                for a in many {
-                    store::opt_out_only(&state.db, *a, &from, &to).await?;
-                }
-            }
+            tracing::error!(provider = msg.provider, message, to = %to, accounts = many.len(), "inbound text for a number several accounts claim; nothing stored in any");
             return Ok(());
         }
+    };
+    let (account_id, mode, byo_provider) = owner;
+    // The URL used is the platform's or this account's own: only then may it write anything here.
+    let url_fits = scope.is_none_or(|s| s == account_id);
+    // And the connection that verified it is the one the number belongs to.
+    let connection_fits = url_fits
+        && match (scope, mode.as_str()) {
+            (_, "byo") => scope == Some(account_id) && byo_provider.as_deref() == Some(msg.provider),
+            _ => true,
+        };
+    let Some(provider_message_id) = msg.provider_message_id.clone().filter(|_| connection_fits) else {
+        if !url_fits {
+            tracing::warn!(provider = msg.provider, message, to = %to, "inbound text on another account's webhook address; not stored");
+            return Ok(());
+        }
+        if stop {
+            // Opting out is always the safe direction.
+            tracing::warn!(provider = msg.provider, message, to = %to, "opt-out without a message id or through another connection; recorded, text not stored");
+            return store::opt_out_only(&state.db, account_id, &from, &to).await;
+        }
+        if !connection_fits {
+            tracing::warn!(provider = msg.provider, message, to = %to, "inbound text through a connection the number doesn't use; not stored");
+            return Ok(());
+        }
+        tracing::warn!(provider = msg.provider, to = %to, "inbound text without a message id; not stored");
+        return Err(crate::error::AppError::bad("an inbound text needs the provider's message id"));
     };
     let rx = store::receive(state, account_id, &from, &to, msg, &provider_message_id, proof.verified()).await?;
     if rx.processed {
