@@ -1,5 +1,6 @@
 import { createBrowserRouter } from "react-router";
 import { AppShell, RedirectIfAuthed, RequireAuth } from "./components/shell/AppShell";
+import { featureRoutes, featureSettingsRoutes } from "./features/registry";
 import { RootLayout } from "./RootLayout";
 
 // Each page is its own chunk; navigation keeps the current page visible until the next one loads.
@@ -55,8 +56,10 @@ export const router = createBrowserRouter([
                     lazy: () => import("./pages/settings/BillingPage").then((m) => ({ Component: m.BillingPage, loader: m.billingLoader })),
                   },
                   { path: "developers", lazy: () => import("./pages/settings/DevelopersPage").then((m) => ({ Component: m.DevelopersPage })) },
+                  ...featureSettingsRoutes,
                 ],
               },
+              ...featureRoutes,
               { path: "*", lazy: () => import("./pages/NotFoundPage").then((m) => ({ Component: m.NotFoundPage })) },
             ],
           },

@@ -88,17 +88,25 @@ async fn dispatch(state: &AppState, kind: &str, p: &Value) -> anyhow::Result<()>
             let ids: Vec<Uuid> = serde_json::from_value(p["message_ids"].clone())?;
             crate::campaigns::send_batch(state, uuid("campaign_id")?, &ids).await
         }
-        "flow_event" => crate::flows::on_event(state, uuid("event_id")?).await,
+        "flow_event" => {
+            let id = uuid("event_id")?;
+            crate::flows::on_event(state, id).await?;
+            crate::features::on_event(state, id).await;
+            Ok(())
+        }
         "flow_list" => {
             let ids: Vec<Uuid> = serde_json::from_value(p["profile_ids"].clone())?;
             crate::flows::on_list_add(state, uuid("list_id")?, &ids).await
         }
         "flow_step" => crate::flows::step(state, uuid("run_id")?).await,
         "segment_refresh" => crate::flows::refresh_segment(state, uuid("segment_id")?).await,
-        other => {
-            tracing::error!(kind = other, "unknown job kind; dropping");
-            Ok(())
-        }
+        other => match crate::features::run_job(state, other, p).await {
+            Some(r) => r,
+            None => {
+                tracing::error!(kind = other, "unknown job kind; dropping");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -198,5 +206,6 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     if tick.is_multiple_of(90) {
         crate::flows::date_triggers(state).await?;
     }
+    crate::features::tick(state, tick).await;
     Ok(())
 }
