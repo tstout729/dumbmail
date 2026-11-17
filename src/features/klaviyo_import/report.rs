@@ -1,10 +1,12 @@
 //! The switch-over report: Klaviyo's numbers next to DumbMail's, line by line.
 //!
-//! Each line is **match**, **mismatch** or **not verified**. A line matches only when both numbers come
-//! from independent sources (Klaviyo's own count, or a full Klaviyo scan that completed, against
-//! DumbMail's own data) and agree within the stated tolerance. Anything capped, failed, partial or
-//! computed from the importer's own bookkeeping is "not verified", with the reason. The headline ("nothing
-//! was lost") shows only when there are no mismatches and nothing unverified.
+//! Each line is **match**, **mismatch** or **not verified**. A line matches only when it has a number
+//! from Klaviyo itself (its own count, or a full Klaviyo scan this run completed) and a number from
+//! DumbMail's own data, and they agree within the stated tolerance. Anything capped, failed, partial,
+//! malformed, skipped or unresolved is "not verified", with the reason and the count. Lines with no
+//! Klaviyo number are **diagnostics** (`info` when there's nothing to report, otherwise a problem):
+//! they're labelled as such and are never "match". The headline ("nothing was lost") needs every required
+//! line present and matching.
 //!
 //! Consent lines compare person by person: what Klaviyo said about each profile (kept verbatim on its
 //! reference during a scan that read every Klaviyo profile) against that profile's state in DumbMail now.
@@ -23,13 +25,23 @@ use crate::state::AppState;
 pub const MATCH: &str = "match";
 pub const MISMATCH: &str = "mismatch";
 pub const NOT_VERIFIED: &str = "not_verified";
+/// A diagnostic line with nothing to report (it has no Klaviyo number, so it can't be a match).
+pub const INFO: &str = "info";
 
 #[derive(Default)]
 struct Lines(Vec<Value>);
 
 impl Lines {
+    /// A comparison: "match" needs both numbers.
     fn push(&mut self, section: &str, label: &str, klaviyo: Value, dumbmail: Value, state: &str, note: impl Into<String>) {
-        self.0.push(json!({"section": section, "label": label, "klaviyo": klaviyo, "dumbmail": dumbmail, "state": state, "ok": state == MATCH, "note": note.into()}));
+        let state = if state == MATCH && (klaviyo.is_null() || dumbmail.is_null()) { NOT_VERIFIED } else { state };
+        self.0.push(json!({"section": section, "label": label, "klaviyo": klaviyo, "dumbmail": dumbmail, "state": state, "ok": state == MATCH, "diagnostic": false, "note": note.into()}));
+    }
+
+    /// A diagnostic: a DumbMail-side count with no Klaviyo number. `problem` decides how a nonzero count reads.
+    fn diag(&mut self, section: &str, label: &str, dumbmail: i64, problem: &str, note: impl Into<String>) {
+        let state = if dumbmail == 0 { INFO } else { problem };
+        self.0.push(json!({"section": section, "label": label, "klaviyo": Value::Null, "dumbmail": dumbmail, "state": state, "ok": false, "diagnostic": true, "note": note.into()}));
     }
 }
 
@@ -87,47 +99,56 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
     let src = &imp.source_counts;
 
     // ----- Profiles -----
+    // Only references this run read: Klaviyo profiles deleted since an earlier run don't count.
+    let run_from = imp.started_at;
     let scan = &src["profiles_scan"];
     let scan_done = scan["complete"] == true;
     let scan_total = scan["total"].as_i64();
-    let scan_at = ts(&scan["at"]);
-    let (seen, at_scan, linked, skipped, gone, conflicts): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT count(*), count(*) FILTER (WHERE r.created_at <= COALESCE($2, now())), count(DISTINCT p.id), count(*) FILTER (WHERE r.local_id IS NULL),
+    let (seen, linked, skipped, gone, conflicts): (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT p.id), count(*) FILTER (WHERE r.local_id IS NULL),
                 count(*) FILTER (WHERE r.local_id IS NOT NULL AND p.id IS NULL), count(*) FILTER (WHERE p.id IS NOT NULL AND jsonb_typeof(r.detail->'conflict') = 'array')
-         FROM klaviyo_refs r LEFT JOIN profiles p ON p.id = r.local_id WHERE r.account_id = $1 AND r.kind = 'profile'",
+         FROM klaviyo_refs r LEFT JOIN profiles p ON p.id = r.local_id WHERE r.account_id = $1 AND r.kind = 'profile' AND r.updated_at >= COALESCE($2, '-infinity')",
     )
     .bind(a)
-    .bind(scan_at)
+    .bind(run_from)
     .fetch_one(db)
     .await?;
     let merged = (seen - skipped - gone - linked).max(0);
     let mut note = Vec::new();
     if merged > 0 {
-        note.push(format!("{} shared an email, phone number or external id with another profile and were combined into one", plural(merged, "Klaviyo profile", "Klaviyo profiles")));
+        note.push(format!("{} shared an email, phone number or external id with another and were combined into one profile here", plural(merged, "Klaviyo profile", "Klaviyo profiles")));
     }
     if skipped > 0 {
-        note.push(format!("{} had no usable email, phone number or external id (listed below)", plural(skipped, "profile", "profiles")));
+        note.push(format!("{} had no usable email, phone number or external id, or clashed with another profile (listed below)", plural(skipped, "profile", "profiles")));
     }
     if gone > 0 {
         note.push(format!("{} were deleted in DumbMail after the import", plural(gone, "profile", "profiles")));
     }
+    if conflicts > 0 {
+        note.push(format!("{} have a different email or phone here than in Klaviyo (listed below)", plural(conflicts, "profile", "profiles")));
+    }
     match (scan_done, scan_total) {
         (true, Some(total)) => {
-            let state = if gone == 0 && at_scan >= total { MATCH } else { MISMATCH };
-            if at_scan < total {
-                note.push(format!("{} Klaviyo returned never reached DumbMail. Run the import again", plural(total - at_scan, "profile", "profiles")));
-            }
+            let accounted = linked + merged + skipped + gone;
+            let state = if accounted < total || seen < total {
+                note.push(format!("{} Klaviyo returned never reached DumbMail. Run the import again", plural(total - seen.min(accounted), "profile", "profiles")));
+                MISMATCH
+            } else if linked == total && conflicts == 0 {
+                MATCH
+            } else {
+                // Every Klaviyo profile is accounted for, but not each as its own profile here.
+                NOT_VERIFIED
+            };
             l.push("Profiles", "Profiles", json!(total), json!(linked), state, format!("Klaviyo: every profile read in a full scan. DumbMail: profiles made from them. {}", note.join(". ")).trim().to_string());
         }
         _ => l.push("Profiles", "Profiles", Value::Null, json!(linked), NOT_VERIFIED, "The scan of every Klaviyo profile didn't finish, so the total can't be checked."),
     }
-    l.push(
+    l.diag(
         "Profiles",
-        "Email or phone differs between Klaviyo and DumbMail",
-        json!(0),
-        json!(conflicts),
-        if conflicts == 0 { MATCH } else { MISMATCH },
-        if conflicts == 0 { "None.".to_string() } else { "Klaviyo's consent for those addresses or numbers wasn't applied. Each is listed below with both values; decide which is right and update the profile.".into() },
+        "Email or phone differs between Klaviyo and DumbMail (diagnostic)",
+        conflicts,
+        NOT_VERIFIED,
+        if conflicts == 0 { "None.".to_string() } else { "Klaviyo's opt-in for those addresses or numbers wasn't applied to these profiles (its opt-outs were, to whichever profile has the address). Each is listed below; decide which is right and update the profile.".into() },
     );
 
     // ----- Consent, person by person -----
@@ -142,7 +163,7 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
                    (p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold) AS ereach,
                    (p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND NOT p.marketing_hold) AS sreach
             FROM klaviyo_refs r JOIN profiles p ON p.id = r.local_id
-            WHERE r.account_id = $1 AND r.kind = 'profile')
+            WHERE r.account_id = $1 AND r.kind = 'profile' AND r.updated_at >= COALESCE($2, '-infinity'))
          SELECT
             count(*) FILTER (WHERE ae AND es = 'unsubscribed') AS e_unsub_k,
             count(*) FILTER (WHERE ae AND es = 'unsubscribed' AND ec = 'unsubscribed') AS e_unsub_d,
@@ -170,12 +191,23 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
          FROM x",
     )
     .bind(a)
+    .bind(run_from)
     .fetch_one(db)
     .await?;
-    let covered = scan_done && scan_total.is_some_and(|t| at_scan >= t);
-    let verdict = |ok: bool| if !covered { NOT_VERIFIED } else if ok { MATCH } else { MISMATCH };
-    let unverified_note = "Not every Klaviyo profile was read (the profile scan didn't finish), so this can't be checked.";
-    let with = |base: String| if covered { base } else { format!("{unverified_note} {base}") };
+    // Consent can be compared only for people placed on a profile with the same address: a profile scan
+    // that didn't finish, or people skipped or with a clashing address, leave it unverified.
+    let covered = scan_done && scan_total.is_some_and(|t| seen >= t);
+    let unresolved = skipped + conflicts;
+    let verdict = |ok: bool| if !covered || unresolved > 0 { NOT_VERIFIED } else if ok { MATCH } else { MISMATCH };
+    let with = |base: String| {
+        if !covered {
+            format!("Not every Klaviyo profile was read (the profile scan didn't finish), so this can't be checked. {base}")
+        } else if unresolved > 0 {
+            format!("{} couldn't be compared (skipped, or a different email or phone here). {base}", plural(unresolved, "Klaviyo profile", "Klaviyo profiles"))
+        } else {
+            base
+        }
+    };
     l.push("Email", "Unsubscribed in Klaviyo", json!(c.e_unsub_k), json!(c.e_unsub_d), verdict(c.e_unsub_k == c.e_unsub_d),
         with(if c.e_unsub_k == c.e_unsub_d { "Every one is unsubscribed here.".into() } else { format!("{} aren't unsubscribed here. Run the import again; if it still differs, contact support with this report.", c.e_unsub_k - c.e_unsub_d) }));
     l.push("Email", "Suppressed in Klaviyo (bounced, complained, invalid, by hand, or not emailable)", json!(c.e_sup_k), json!(c.e_sup_d), verdict(c.e_sup_k == c.e_sup_d),
@@ -194,35 +226,45 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
         l.push("Email", "Consent unknown in Klaviyo (held back)", json!(c.e_unknown_k), json!(c.e_unknown_d), verdict(c.e_unknown_k == c.e_unknown_d),
             with("Klaviyo had no consent record DumbMail recognises for them, so they're held back from marketing until they opt in.".into()));
     }
-    l.push("Email", "More reachable here than in Klaviyo", json!(0), json!(c.e_more), verdict(c.e_more == 0),
-        with(if c.e_more == 0 { "Nobody can get marketing email here that Klaviyo wouldn't have sent.".into() } else { "These people can get marketing email here though Klaviyo wouldn't email them. Contact support with this report.".into() }));
+    l.diag("Email", "More reachable here than in Klaviyo (diagnostic)", c.e_more, MISMATCH,
+        if c.e_more == 0 { "Nobody can get marketing email here that Klaviyo wouldn't have sent.".to_string() } else { "These people can get marketing email here though Klaviyo wouldn't email them. Contact support with this report.".into() });
     if c.e_kept > 0 {
-        l.push("Email", "Kept their DumbMail opt-in", Value::Null, json!(c.e_kept), MATCH,
+        l.diag("Email", "Kept their DumbMail opt-in (diagnostic)", c.e_kept, INFO,
             "They subscribed through DumbMail directly and Klaviyo had no opt-out for them, so their consent stays.");
     }
     l.push("SMS", "Unsubscribed in Klaviyo", json!(c.s_unsub_k), json!(c.s_unsub_d), verdict(c.s_unsub_k == c.s_unsub_d),
         with(if c.s_unsub_k == c.s_unsub_d { "Every one is unsubscribed here.".into() } else { "Some can still be texted here. Run the import again.".into() }));
     l.push("SMS", "Subscribed and textable in Klaviyo", json!(c.s_sub_k), json!(c.s_sub_d), verdict(c.s_sub_k == c.s_sub_d + c.s_sub_r),
         with(if c.s_sub_r > 0 { format!("{} replied STOP or are waiting to confirm in DumbMail, and that wins.", c.s_sub_r) } else { String::new() }));
-    l.push("SMS", "More textable here than in Klaviyo", json!(0), json!(c.s_more), verdict(c.s_more == 0),
-        with(if c.s_more == 0 { "Nobody can get texts here that Klaviyo wouldn't have sent.".into() } else { "These people can get texts here though Klaviyo couldn't text them. Contact support with this report.".into() }));
+    l.diag("SMS", "More textable here than in Klaviyo (diagnostic)", c.s_more, MISMATCH,
+        if c.s_more == 0 { "Nobody can get texts here that Klaviyo wouldn't have sent.".to_string() } else { "These people can get texts here though Klaviyo couldn't text them. Contact support with this report.".into() });
     if c.s_kept > 0 {
-        l.push("SMS", "Kept their DumbMail opt-in", Value::Null, json!(c.s_kept), MATCH, "They opted in to texts through DumbMail directly and Klaviyo had no opt-out for them.");
+        l.diag("SMS", "Kept their DumbMail opt-in (diagnostic)", c.s_kept, INFO, "They opted in to texts through DumbMail directly and Klaviyo had no opt-out for them.");
     }
 
     // ----- List-level opt-outs -----
-    let (lo_k, lo_d): (i64, i64) = sqlx::query_as(
-        "SELECT count(*), count(*) FILTER (WHERE m.state = 'left' AND NOT EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = lr.local_id AND lm.profile_id = pr.local_id))
+    // Every list opt-out on a profile read this run; one for a list that wasn't imported has no list
+    // here to check against.
+    let (lo_k, lo_d, lo_unresolved): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE lr.local_id IS NOT NULL),
+                count(*) FILTER (WHERE lr.local_id IS NOT NULL AND m.state = 'left' AND NOT EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = lr.local_id AND lm.profile_id = pr.local_id)),
+                count(*) FILTER (WHERE lr.local_id IS NULL)
          FROM klaviyo_refs pr CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.detail->'list_suppressions', '[]')) AS ls(kid)
-         JOIN klaviyo_refs lr ON lr.account_id = pr.account_id AND lr.kind = 'list' AND lr.klaviyo_id = ls.kid AND lr.local_id IS NOT NULL
+         LEFT JOIN klaviyo_refs lr ON lr.account_id = pr.account_id AND lr.kind = 'list' AND lr.klaviyo_id = ls.kid AND lr.local_id IS NOT NULL
          LEFT JOIN klaviyo_memberships m ON m.list_id = lr.local_id AND m.profile_id = pr.local_id
-         WHERE pr.account_id = $1 AND pr.kind = 'profile' AND pr.local_id IS NOT NULL",
+         WHERE pr.account_id = $1 AND pr.kind = 'profile' AND pr.local_id IS NOT NULL AND pr.updated_at >= COALESCE($2, '-infinity')",
     )
     .bind(a)
+    .bind(run_from)
     .fetch_one(db)
     .await?;
-    l.push("List opt-outs", "Unsubscribed from a list in Klaviyo", json!(lo_k), json!(lo_d), verdict(lo_k == lo_d),
-        with(if lo_k == lo_d { "Each is off that list here and won't be added back; their other lists aren't touched.".into() } else { format!("{} are still on the list they left. Run the import again.", lo_k - lo_d) }));
+    let lo_base = if lo_k == lo_d { "Each is off that list here and won't be added back; their other lists aren't touched.".to_string() } else { format!("{} are still on the list they left. Run the import again.", lo_k - lo_d) };
+    if lo_unresolved > 0 {
+        l.push("List opt-outs", "Unsubscribed from a list in Klaviyo", json!(lo_k + lo_unresolved), json!(lo_d), if lo_k == lo_d { NOT_VERIFIED } else { MISMATCH },
+            with(format!("{} are for lists that weren't imported, so there's no list here to check. {lo_base}", plural(lo_unresolved, "opt-out", "opt-outs"))));
+    } else {
+        l.push("List opt-outs", "Unsubscribed from a list in Klaviyo", json!(lo_k), json!(lo_d), verdict(lo_k == lo_d), with(lo_base));
+    }
 
     // ----- Lists -----
     let lists: Vec<(String, String, Uuid, i64, i64, Value)> = sqlx::query_as(
@@ -247,8 +289,12 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
             l.push("Lists", name, Value::Null, json!(from_k), NOT_VERIFIED, format!("{why}{extra}"));
             continue;
         };
-        if !scan.is_object() {
-            l.push("Lists", name, json!(k), json!(from_k), NOT_VERIFIED, format!("The scan of this list's members didn't finish.{extra}"));
+        if let Some(err) = scan["error"].as_str().filter(|_| scan["import"] == json!(imp.id.to_string())) {
+            l.push("Lists", name, json!(k), json!(from_k), NOT_VERIFIED, format!("Not reconciled: Klaviyo wouldn't give its members this run ({err}).{extra}"));
+            continue;
+        }
+        if !scan.is_object() || scan["import"] != json!(imp.id.to_string()) || scan["members"].is_null() {
+            l.push("Lists", name, json!(k), json!(from_k), NOT_VERIFIED, format!("Not reconciled: this run didn't finish scanning its members.{extra}"));
             continue;
         }
         let skipped = scan["skipped"].as_i64().unwrap_or(0);
@@ -284,13 +330,13 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
             let d: i64 = sqlx::query_scalar("SELECT count(*) FROM list_members WHERE list_id = $1").bind(local).fetch_one(db).await?;
             let skipped = scan["skipped"].as_i64().unwrap_or(0);
             let base = "Snapshot: a list of the segment's members when it was imported, because its rules couldn't be translated. It won't update by itself.";
-            match (k, missing, scan.is_object()) {
+            match (k, missing, scan.is_object() && scan["import"] == json!(imp.id.to_string()) && scan["members"].is_i64()) {
                 (Some(k), None, true) => {
                     let state = if (k - (d + skipped)).abs() <= tolerance(k) { MATCH } else { MISMATCH };
                     l.push("Segments", name, json!(k), json!(d), state, format!("{base} Within {}.{}", tolerance_text(k), if skipped > 0 { format!(" {} had no usable email or phone.", plural(skipped, "member", "members")) } else { String::new() }));
                 }
                 (_, Some(why), _) => l.push("Segments", name, json!(k), json!(d), NOT_VERIFIED, format!("{base} {why}")),
-                _ => l.push("Segments", name, json!(k), json!(d), NOT_VERIFIED, format!("{base} The scan of its members didn't finish.")),
+                _ => l.push("Segments", name, json!(k), json!(d), NOT_VERIFIED, format!("{base} Not reconciled: this run didn't finish scanning its members.")),
             }
         } else {
             let def: Option<Value> = sqlx::query_scalar("SELECT definition FROM segments WHERE id = $1 AND account_id = $2").bind(local).bind(a).fetch_optional(db).await?;
@@ -395,8 +441,21 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
             }
         }
     }
-    if imp.wants("events") && by_name.is_empty() && imp.compared_at.is_some() {
-        l.push("Events", "Event history", Value::Null, Value::Null, NOT_VERIFIED, "Klaviyo's event counts weren't fetched (the key may lack Metrics access).");
+    // Every metric chosen for import has a line: one Klaviyo gave no answer for is "not verified", never absent.
+    if imp.wants("events") {
+        let chosen: Vec<(String, String)> = sqlx::query_as("SELECT klaviyo_id, COALESCE(name, '') FROM klaviyo_refs WHERE account_id = $1 AND kind = 'metric' AND local_id IS NOT NULL ORDER BY name")
+            .bind(a)
+            .fetch_all(db)
+            .await?;
+        for (kid, name) in &chosen {
+            if src["metrics"][kid].is_object() || by_name.contains_key(name) {
+                continue;
+            }
+            l.push("Events", name, Value::Null, Value::Null, NOT_VERIFIED, "Klaviyo's count for this metric wasn't fetched.");
+        }
+        if chosen.is_empty() && by_name.is_empty() && imp.compared_at.is_some() {
+            l.push("Events", "Event history", Value::Null, Value::Null, NOT_VERIFIED, "Klaviyo's event counts weren't fetched (the key may lack Metrics access).");
+        }
     }
 
     // ----- What didn't come across exactly -----
@@ -407,12 +466,16 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
     let lines = l.0;
     let mismatches = lines.iter().filter(|x| x["state"] == MISMATCH).count();
     let unverified = lines.iter().filter(|x| x["state"] == NOT_VERIFIED).count();
+    // "Nothing was lost" needs the run finished with Klaviyo's counts in, the profile total line present and
+    // matching, and nothing else short of that.
+    let profiles_ok = lines.iter().any(|x| x["section"] == "Profiles" && x["label"] == "Profiles" && x["state"] == MATCH);
+    let all_ok = mismatches == 0 && unverified == 0 && profiles_ok && imp.status == "done" && imp.compared_at.is_some();
     Ok(json!({
         "import_id": imp.id,
         "status": imp.status,
         "compared_at": imp.compared_at,
         "klaviyo_counts_at": src["until"],
-        "all_ok": mismatches == 0 && unverified == 0,
+        "all_ok": all_ok,
         "mismatches": mismatches,
         "not_verified": unverified,
         "lines_not_ok": mismatches + unverified,
@@ -443,6 +506,7 @@ pub fn csv(report: &Value) -> String {
         let result = match l["state"].as_str() {
             Some(MATCH) => "MATCH",
             Some(NOT_VERIFIED) => "NOT VERIFIED",
+            Some(INFO) => "DIAGNOSTIC",
             _ => "MISMATCH",
         };
         let _ = w.write_record([cell(&l["section"]), cell(&l["label"]), cell(&l["klaviyo"]), cell(&l["dumbmail"]), result.to_string(), cell(&l["note"])]);
@@ -456,8 +520,8 @@ pub const MANUAL_ITEMS: &[&str] = &["klaviyo_removed", "flows_reviewed", "warmup
 
 pub async fn checklist(state: &AppState, imp: Option<&Import>, account_id: Uuid) -> AppResult<Value> {
     let db = &state.db;
-    let (domain, snippet_seen, website): (bool, Option<chrono::DateTime<chrono::Utc>>, Option<String>) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM sending_domains d WHERE d.account_id = a.id AND d.status = 'verified'), a.onsite_last_seen_at, a.website FROM accounts a WHERE a.id = $1",
+    let (domain, snippet_seen, website, tz): (bool, Option<chrono::DateTime<chrono::Utc>>, Option<String>, String) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM sending_domains d WHERE d.account_id = a.id AND d.status = 'verified'), a.onsite_last_seen_at, a.website, a.timezone FROM accounts a WHERE a.id = $1",
     )
     .bind(account_id)
     .fetch_one(db)
@@ -481,10 +545,11 @@ pub async fn checklist(state: &AppState, imp: Option<&Import>, account_id: Uuid)
     let suppressions = match imp {
         Some(i) if i.status == "done" && i.compared_at.is_some() => {
             let r = cached(state, i, Duration::minutes(10)).await?;
-            r["lines"].as_array().into_iter().flatten().filter(|l| matches!(l["section"].as_str(), Some("Email" | "SMS" | "List opt-outs"))).all(|l| l["state"] == MATCH)
+            r["lines"].as_array().into_iter().flatten().filter(|l| matches!(l["section"].as_str(), Some("Email" | "SMS" | "List opt-outs"))).all(|l| l["state"] == MATCH || l["state"] == INFO)
         }
         _ => false,
     };
+    let (current, current_detail) = unsubscribes_current(imp, &tz, Utc::now());
     let snippet_recent = snippet_seen.is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::days(7));
     let klaviyo_check = &manual["klaviyo_removed"];
     let items = vec![
@@ -502,6 +567,7 @@ pub async fn checklist(state: &AppState, imp: Option<&Import>, account_id: Uuid)
             "detail": format!("{flows_live} of {flows_total} imported flows are live. Imported flows start as drafts: check each one, preview its emails, then turn it on."), "link": "/flows"}),
         json!({"key": "forms_live", "label": "Sign-up forms live", "done": forms_live > 0, "auto": true,
             "detail": format!("{} live in DumbMail.", plural(forms_live, "form", "forms")), "link": "/forms"}),
+        json!({"key": "unsubscribes_current", "label": "Unsubscribes up to date", "done": current, "auto": true, "detail": current_detail}),
         json!({"key": "suppressions", "label": "Unsubscribes and suppressions imported", "done": suppressions, "auto": true,
             "detail": if suppressions { "The report shows every email and SMS opt-out, suppression and list opt-out came across." } else { "Finish the import and check the Email, SMS and List opt-outs lines of the report." }}),
         json!({"key": "test_send", "label": "A test send went through", "done": test_send, "auto": true,
@@ -511,4 +577,27 @@ pub async fn checklist(state: &AppState, imp: Option<&Import>, account_id: Uuid)
     ];
     let done = items.iter().filter(|i| i["done"] == true).count();
     Ok(json!({"items": items, "done": done, "total": items.len()}))
+}
+
+/// Whether the latest import's unsubscribes are current enough to start sending from DumbMail: a run that
+/// finished in the last 24 hours and began after the last Klaviyo send it found (people can keep
+/// unsubscribing through links in Klaviyo's emails). Otherwise, how old the last import is.
+pub fn unsubscribes_current(imp: Option<&Import>, tz: &str, now: DateTime<Utc>) -> (bool, String) {
+    let tzv: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
+    let day = |t: DateTime<Utc>| t.with_timezone(&tzv).format("%b %-d, %Y at %-I:%M %p").to_string();
+    let Some(i) = imp.filter(|i| i.status == "done") else {
+        return (false, "Finish an import first. Before you send from DumbMail, stop sending from Klaviyo and run the import again.".into());
+    };
+    let (Some(started), Some(finished)) = (i.started_at, i.finished_at) else { return (false, "Run the import again before you send from DumbMail.".into()) };
+    let last_send = ts(&i.source_counts["last_klaviyo_send"]);
+    if let Some(t) = last_send.filter(|t| *t >= started) {
+        return (false, format!("Klaviyo sent a message on {} while the last import ran. Stop sending from Klaviyo, then run the import again.", day(t)));
+    }
+    let age = now - finished;
+    if age > Duration::hours(24) {
+        let ago = if age > Duration::days(2) { format!("{} days", age.num_days()) } else { format!("{} hours", age.num_hours()) };
+        return (false, format!("The last import finished {ago} ago ({}). People can still unsubscribe through Klaviyo's emails: run it again before you send from DumbMail.", day(finished)));
+    }
+    let after = last_send.map(|t| format!(" and after Klaviyo's last send ({})", day(t))).unwrap_or_default();
+    (true, format!("The last import finished {}{after}. Don't send from Klaviyo and DumbMail at once.", day(finished)))
 }

@@ -6,18 +6,25 @@
 //! same phone number.
 //!
 //! This module turns Klaviyo's record into an *incoming* state per channel. The merge with what the
-//! DumbMail profile already has happens inside the single `UPDATE` in `runner.rs` (see `MERGE_SET`), so a
-//! STOP or unsubscribe committed while the import runs can't be overwritten:
+//! DumbMail profile already has happens inside one statement in `profiles.rs` that locks the profile
+//! first, so a STOP or unsubscribe committed while the import runs can't be overwritten:
 //!
-//! | Incoming (same address/number) | DumbMail never subscribed | subscribed | unsubscribed | pending | suppressed |
-//! | --- | --- | --- | --- | --- | --- |
-//! | opt-out (unsubscribed, spam) | unsubscribed | unsubscribed | unsubscribed | unsubscribed | unsubscribed, stays suppressed |
-//! | opt-in (subscribed, reachable) | subscribed | subscribed | unchanged | unchanged | unchanged |
-//! | never subscribed / no record | unchanged | unchanged (consent given through DumbMail) | unchanged | unchanged | unchanged |
+//! | Incoming (same address/number) | DumbMail never subscribed | subscribed by an earlier import | subscribed in DumbMail | unsubscribed | pending | suppressed |
+//! | --- | --- | --- | --- | --- | --- | --- |
+//! | opt-out (unsubscribed, spam) | unsubscribed | unsubscribed | unsubscribed | unsubscribed | unsubscribed | unsubscribed, stays suppressed |
+//! | opt-in (subscribed, reachable) | subscribed | subscribed | subscribed | unchanged | unchanged | unchanged |
+//! | never subscribed, no record, unknown, SMS "can't receive" | unchanged | never subscribed (unknown: held) | unchanged | unchanged | unchanged | unchanged |
 //!
-//! A Klaviyo suppression (bounce, complaint, invalid, by hand, or "Klaviyo can't email them") is added to
-//! the profile; one already there is never removed. Unknown or unrecognised consent, and (when the customer
-//! chooses it) never subscribed, set `marketing_hold`, which only the person opting in clears.
+//! "Subscribed by an earlier import" means the import's own record (`klaviyo_consent_writes`) says the
+//! import set that subscription for this exact address or number: it was Klaviyo's opt-in, so what
+//! Klaviyo says now governs it. Only a subscription the import didn't write counts as the person's own
+//! DumbMail opt-in.
+//!
+//! A Klaviyo suppression (bounce, complaint, invalid, by hand, a reason DumbMail doesn't recognise, or
+//! "Klaviyo can't email them") is added to the profile; one already there is never removed. Klaviyo's
+//! opt-outs and suppressions also apply to any other profile here that has that exact address or number.
+//! Unknown or unrecognised consent (a blank SMS state included), and (when the customer chooses it)
+//! never subscribed, set `marketing_hold`, which only the person opting in clears.
 
 use serde_json::{json, Value};
 
@@ -27,7 +34,8 @@ pub struct KlaviyoEmail {
     /// SUBSCRIBED | UNSUBSCRIBED | NEVER_SUBSCRIBED; anything else is unknown.
     pub consent: String,
     pub can_receive: bool,
-    /// (reason, timestamp): HARD_BOUNCE | INVALID_EMAIL | SPAM_COMPLAINT | UNSUBSCRIBE | USER_SUPPRESSED
+    /// (reason, timestamp): HARD_BOUNCE | INVALID_EMAIL | SPAM_COMPLAINT | UNSUBSCRIBE | USER_SUPPRESSED, or a
+    /// reason added since (which blocks too).
     pub suppressions: Vec<(String, Option<String>)>,
     /// (list id, reason, timestamp)
     pub list_suppressions: Vec<(String, String, Option<String>)>,
@@ -111,7 +119,8 @@ pub struct EmailIn {
 /// What Klaviyo's SMS record asks of the import, for a number it matches exactly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SmsIn {
-    /// subscribed | unsubscribed | none
+    /// subscribed | unsubscribed | unreachable (subscribed, but Klaviyo can't text it) | never | none (no
+    /// record) | unknown (blank or unrecognised)
     pub state: &'static str,
     pub hold: bool,
 }
@@ -133,6 +142,7 @@ pub fn email_in(k: Option<&KlaviyoEmail>, hold_never: bool) -> EmailIn {
     if has("UNSUBSCRIBE") || has("SPAM_COMPLAINT") {
         state = "unsubscribed";
     }
+    let unrecognised = k.suppressions.iter().any(|(r, _)| !matches!(r.as_str(), "SPAM_COMPLAINT" | "HARD_BOUNCE" | "INVALID_EMAIL" | "USER_SUPPRESSED" | "UNSUBSCRIBE"));
     let mut suppressed = if has("SPAM_COMPLAINT") {
         Some("complaint")
     } else if has("HARD_BOUNCE") {
@@ -141,6 +151,9 @@ pub fn email_in(k: Option<&KlaviyoEmail>, hold_never: bool) -> EmailIn {
         Some("invalid_email")
     } else if has("USER_SUPPRESSED") {
         Some("manual")
+    } else if unrecognised {
+        // A suppression DumbMail doesn't know yet still blocks, whatever the reachability flag says.
+        Some("klaviyo_suppressed")
     } else {
         None
     };
@@ -153,16 +166,17 @@ pub fn email_in(k: Option<&KlaviyoEmail>, hold_never: bool) -> EmailIn {
 }
 
 /// Only a subscribed, reachable number Klaviyo could text comes in as subscribed; nothing else ever makes
-/// a number textable.
+/// a number textable. A record whose consent is blank or a value DumbMail doesn't recognise is unknown.
 pub fn sms_in(k: Option<&KlaviyoSms>, has_phone: bool) -> SmsIn {
     let Some(k) = k else { return SmsIn { state: "none", hold: false } };
     let state = match k.consent.as_str() {
         "SUBSCRIBED" if k.can_receive && has_phone => "subscribed",
+        "SUBSCRIBED" => "unreachable",
         "UNSUBSCRIBED" => "unsubscribed",
-        _ => "none",
+        "NEVER_SUBSCRIBED" => "never",
+        _ => "unknown",
     };
-    let known = matches!(k.consent.as_str(), "SUBSCRIBED" | "UNSUBSCRIBED" | "NEVER_SUBSCRIBED" | "");
-    SmsIn { state, hold: has_phone && !known }
+    SmsIn { state, hold: has_phone && state == "unknown" }
 }
 
 /// Consent for a brand-new DumbMail profile.
@@ -244,6 +258,7 @@ mod tests {
         assert_eq!(st("SUBSCRIBED", false, &[]).suppressed, Some("klaviyo_suppressed"));
         assert_eq!(st("NEVER_SUBSCRIBED", false, &[]).suppressed, Some("klaviyo_suppressed"));
         assert_eq!(st("SOMETHING_NEW", true, &[]), EmailIn { state: "unknown", suppressed: None, hold: true });
+        assert_eq!(st("SUBSCRIBED", true, &["NEW_REASON"]), EmailIn { state: "subscribed", suppressed: Some("klaviyo_suppressed"), hold: false }, "an unrecognised suppression blocks even when Klaviyo says reachable");
         assert_eq!(email_in(None, false), EmailIn { state: "unknown", suppressed: None, hold: true });
     }
 
@@ -251,12 +266,13 @@ mod tests {
     fn sms_cases() {
         let k = |c: &str, can: bool| KlaviyoSms { consent: c.into(), can_receive: can, ..Default::default() };
         assert_eq!(sms_in(Some(&k("SUBSCRIBED", true)), true).state, "subscribed");
-        assert_eq!(sms_in(Some(&k("SUBSCRIBED", true)), false).state, "none", "no usable number");
-        assert_eq!(sms_in(Some(&k("SUBSCRIBED", false)), true).state, "none", "Klaviyo couldn't text it");
+        assert_eq!(sms_in(Some(&k("SUBSCRIBED", true)), false).state, "unreachable", "no usable number");
+        assert_eq!(sms_in(Some(&k("SUBSCRIBED", false)), true).state, "unreachable", "Klaviyo couldn't text it");
         assert_eq!(sms_in(Some(&k("UNSUBSCRIBED", false)), true).state, "unsubscribed");
-        assert_eq!(sms_in(Some(&k("NEVER_SUBSCRIBED", false)), true).state, "none");
+        assert_eq!(sms_in(Some(&k("NEVER_SUBSCRIBED", false)), true), SmsIn { state: "never", hold: false });
         assert_eq!(sms_in(None, true), SmsIn { state: "none", hold: false });
-        assert_eq!(sms_in(Some(&k("ODD", true)), true), SmsIn { state: "none", hold: true });
+        assert_eq!(sms_in(Some(&k("ODD", true)), true), SmsIn { state: "unknown", hold: true });
+        assert_eq!(sms_in(Some(&k("", true)), true), SmsIn { state: "unknown", hold: true }, "a present but blank state is unknown");
     }
 
     #[test]

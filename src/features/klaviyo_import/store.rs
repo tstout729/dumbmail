@@ -52,9 +52,7 @@ pub struct Import {
     #[serde(skip)]
     pub lease_until: Option<DateTime<Utc>>,
     #[serde(skip)]
-    pub history_started_at: Option<DateTime<Utc>>,
-    #[serde(skip)]
-    pub history_done_at: Option<DateTime<Utc>>,
+    pub history_open: bool,
     #[serde(skip)]
     pub report_cache: Option<Value>,
     #[serde(skip)]
@@ -151,12 +149,14 @@ pub async fn finish_step<'e>(db: impl sqlx::PgExecutor<'e>, id: Uuid, step: &str
 /// Most issues one import records; past this they're only counted.
 const MAX_ISSUES: i64 = 5000;
 
-pub async fn issue(db: &PgPool, imp: &Import, step: &str, kind: &str, item: &str, klaviyo_id: Option<&str>, local_id: Option<Uuid>, message: &str) -> sqlx::Result<()> {
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM klaviyo_import_issues WHERE import_id = $1").bind(imp.id).fetch_one(db).await?;
+/// Record an issue, in the caller's transaction (the one that wrote the item it's about).
+#[allow(clippy::too_many_arguments)]
+pub async fn issue(db: &mut sqlx::PgConnection, imp: &Import, step: &str, kind: &str, item: &str, klaviyo_id: Option<&str>, local_id: Option<Uuid>, message: &str) -> sqlx::Result<()> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM klaviyo_import_issues WHERE import_id = $1").bind(imp.id).fetch_one(&mut *db).await?;
     if n >= MAX_ISSUES {
         sqlx::query("UPDATE klaviyo_imports SET step_state = jsonb_set(step_state, '{issues_over_limit}', to_jsonb(COALESCE((step_state->>'issues_over_limit')::bigint, 0) + 1)) WHERE id = $1")
             .bind(imp.id)
-            .execute(db)
+            .execute(&mut *db)
             .await?;
         return Ok(());
     }
@@ -174,7 +174,7 @@ pub async fn issue(db: &PgPool, imp: &Import, step: &str, kind: &str, item: &str
     .bind(klaviyo_id)
     .bind(local_id)
     .bind(message)
-    .execute(db)
+    .execute(&mut *db)
     .await?;
     Ok(())
 }
@@ -207,7 +207,7 @@ pub async fn set_ref<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid, kind: 
 }
 
 /// Many references of one kind in one statement (a page of profiles).
-pub async fn set_refs(db: &PgPool, account_id: Uuid, kind: &str, rows: &[(String, Option<Uuid>, String, Value)]) -> sqlx::Result<()> {
+pub async fn set_refs(db: &mut sqlx::PgConnection, account_id: Uuid, kind: &str, rows: &[(String, Option<Uuid>, String, Value)]) -> sqlx::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -251,23 +251,24 @@ pub async fn ref_map(db: &PgPool, account_id: Uuid, kind: &str) -> sqlx::Result<
 
 /// Stop an import for good: the key is deleted.
 pub async fn close(db: &PgPool, id: Uuid, status: &str, error: Option<&str>) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
     sqlx::query(
         "UPDATE klaviyo_imports SET status = $2, error = COALESCE($3, error), api_key_enc = NULL,
-            finished_at = COALESCE(finished_at, now()), lease_owner = NULL, lease_until = NULL,
-            -- History writing that stopped part-way still counts as done now: segment flows absorb once more, then run normally.
-            history_done_at = CASE WHEN history_started_at > COALESCE(history_done_at, '-infinity') THEN now() ELSE history_done_at END,
-            updated_at = now() WHERE id = $1",
+            finished_at = COALESCE(finished_at, now()), lease_owner = NULL, lease_until = NULL, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(status)
     .bind(error)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    // History writing that stopped part-way ends here: segments are re-baselined and run normally again.
+    super::history::close(&mut tx, id).await?;
     sqlx::query("DELETE FROM jobs WHERE kind IN ($1, $2) AND payload->>'import_id' = $3 AND locked_at IS NULL")
         .bind(JOB_RUN)
         .bind(JOB_SURVEY)
         .bind(id.to_string())
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }

@@ -370,7 +370,7 @@ async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
 
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
     core::list_belongs(&state.db, ctx.account_id, id).await?;
-    let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(id).bind(&b.profile_ids).execute(&state.db).await?.rows_affected();
+    let n = crate::features::klaviyo_import::remove_members(&state.db, ctx.account_id, id, &b.profile_ids).await?;
     Ok(Json(json!({"removed": n})))
 }
 

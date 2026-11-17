@@ -6,7 +6,8 @@
 pub mod client;
 pub mod consent;
 pub mod flows;
-pub mod gate;
+pub mod history;
+pub mod lists;
 pub mod profiles;
 pub mod report;
 pub mod review;
@@ -37,8 +38,7 @@ use client::{Client, KlaviyoError, SCOPES};
 use store::{Import, CHOOSABLE, JOB_RUN, JOB_SURVEY, STEPS};
 
 pub use client::set_api_base;
-pub use gate::absorb_segment_entries;
-pub use review::{check_flow_live, problems as review_problems};
+pub use lists::remove_members;
 
 const DOC: &str = include_str!("../../../docs/MOVING_FROM_KLAVIYO.md");
 
@@ -260,7 +260,13 @@ pub async fn start(state: &AppState, account_id: Uuid, b: StartBody) -> AppResul
 pub async fn pause(state: &AppState, account_id: Uuid, resume: bool) -> AppResult<Value> {
     let imp = store::current(&state.db, account_id).await?;
     let (from, to) = if resume { ("paused", "importing") } else { ("importing", "paused") };
-    let n = sqlx::query("UPDATE klaviyo_imports SET status = $3, updated_at = now() WHERE id = $1 AND status = $2").bind(imp.id).bind(from).bind(to).execute(&state.db).await?.rows_affected();
+    let mut tx = state.db.begin().await?;
+    let n = sqlx::query("UPDATE klaviyo_imports SET status = $3, updated_at = now() WHERE id = $1 AND status = $2").bind(imp.id).bind(from).bind(to).execute(&mut *tx).await?.rows_affected();
+    if n > 0 && !resume {
+        // A paused run writes no more history: segment-triggered flows go back to normal.
+        history::close(&mut tx, imp.id).await?;
+    }
+    tx.commit().await?;
     if n == 0 {
         return Err(AppError::Conflict(format!("This import is {}, so it can't be {}.", imp.status, if resume { "resumed" } else { "paused" })));
     }
@@ -278,6 +284,17 @@ pub async fn cancel(state: &AppState, account_id: Uuid) -> AppResult<Value> {
         return Err(AppError::Conflict(format!("This import is already {}.", imp.status)));
     }
     status_json(state, account_id).await
+}
+
+/// What clearing a review would do, without doing it (MCP without confirm).
+pub async fn clear_review_dry_run(state: &AppState, account_id: Uuid, kind: &str, id: Uuid) -> AppResult<Value> {
+    let item = review::list(&state.db, account_id).await?.into_iter().find(|r| r["kind"] == kind && r["id"] == json!(id));
+    let Some(item) = item else { return Err(AppError::NotFound(format!("No {kind} with that id needs review."))) };
+    Ok(json!({
+        "dry_run": true,
+        "item": item,
+        "message": "Nothing has been cleared. Once cleared, this item can be sent or turned on like any other, so check what the notes say first. Call again with confirm=true to clear it.",
+    }))
 }
 
 pub async fn clear_review(state: &AppState, account_id: Uuid, kind: &str, id: Uuid) -> AppResult<Value> {
@@ -522,8 +539,8 @@ impl Feature for Module {
             tool("klaviyo_import_issues", "What the Klaviyo import couldn't bring across", "Segments imported as snapshots and why, template tags removed, flow steps skipped, profiles skipped, and notes.",
                 obj(json!({"step": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}, "offset": {"type": "integer", "minimum": 0}}), &[]), true, false),
             tool("klaviyo_clear_review", "Mark an imported Klaviyo item reviewed",
-                "Imported campaigns, flows and templates the importer couldn't translate with certainty are marked as needing review (listed under reviews in klaviyo_import_status): a campaign can't send and a flow can't go live until this is called. Fix what the notes say first.",
-                obj(json!({"kind": {"enum": review::KINDS}, "id": {"type": "string", "format": "uuid"}}), &["kind", "id"]), false, false),
+                "Imported campaigns, flows, templates and forms the importer couldn't translate with certainty need review (listed under reviews in klaviyo_import_status, with notes): a campaign can't be sent, scheduled or test-sent, a flow can't go live, and a form without a list can't be published until a person clears it. Copies made from them (a duplicate, content loaded from an imported template) need it too. Fix what the notes say first. Without confirm=true returns what would be cleared.",
+                obj(json!({"kind": {"enum": review::KINDS}, "id": {"type": "string", "format": "uuid"}, "confirm": {"type": "boolean"}}), &["kind", "id"]), false, false),
             tool("klaviyo_checklist", "Switch-over checklist",
                 "The steps to finish moving from Klaviyo, most checked from live data. item+done ticks one of the hand-checked items (klaviyo_removed, flows_reviewed, warmup); check_site=true looks for Klaviyo's script on the account's website.",
                 obj(json!({"item": {"enum": report::MANUAL_ITEMS}, "done": {"type": "boolean"}, "check_site": {"type": "boolean"}}), &[]), false, false),
@@ -550,7 +567,8 @@ impl Feature for Module {
                 issues(state, acct, &q).await
             }
             "klaviyo_clear_review" => match (a["kind"].as_str(), a["id"].as_str().and_then(|i| i.parse::<Uuid>().ok())) {
-                (Some(k), Some(id)) => clear_review(state, acct, k, id).await,
+                (Some(k), Some(id)) if a["confirm"].as_bool() == Some(true) => clear_review(state, acct, k, id).await,
+                (Some(k), Some(id)) => clear_review_dry_run(state, acct, k, id).await,
                 _ => Err(AppError::bad("kind and id are required")),
             },
             "klaviyo_checklist" => {
@@ -580,6 +598,10 @@ impl Feature for Module {
             JOB_SURVEY => Some(match id() {
                 Ok(i) => run_survey(state, i).await,
                 Err(e) => Err(e),
+            }),
+            history::JOB_REBASELINE => Some(match payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
+                Some(a) => history::rebaseline(state, a).await,
+                None => Err(anyhow::anyhow!("job payload missing account_id")),
             }),
             _ => None,
         }

@@ -8,28 +8,58 @@ use serde_json::{json, Value};
 use super::client::{next_link, q, Client, KlaviyoError};
 use super::runner::DEFAULT_METRICS;
 
-/// Count a collection by paging, up to `max_pages`. Returns (count, exact).
-async fn count(k: &mut Client, first: &str, max_pages: usize) -> Result<(u64, bool), KlaviyoError> {
-    let mut url = first.to_string();
-    let mut n = 0u64;
-    for _ in 0..max_pages {
-        let page = k.get(&url).await?;
-        n += page["data"].as_array().map(|a| a.len()).unwrap_or(0) as u64;
-        match next_link(&page) {
-            Some(nx) => url = nx,
-            None => return Ok((n, true)),
-        }
-    }
-    Ok((n, false))
-}
-
-/// What has been counted so far. Saved after a section finishes, so a late 429 resumes the survey where
-/// it stopped instead of starting over.
+/// What has been counted so far, kept as it goes: whole sections once they finish, and inside a section
+/// the page it reached (`_at`), so a late 429 resumes the survey at the page it was on, not at the start of
+/// the section or of the survey. Saved by the job when the survey has to wait.
 struct Tally<'a> {
     out: &'a mut serde_json::Map<String, Value>,
 }
 
 impl Tally<'_> {
+    /// Where an unfinished part (`part`) had got to.
+    fn at(&self, part: &str) -> Value {
+        self.out.get("_at").and_then(|a| a.get(part)).cloned().unwrap_or(Value::Null)
+    }
+
+    fn set_at(&mut self, part: &str, v: Value) {
+        let a = self.out.entry("_at").or_insert(json!({}));
+        if !a.is_object() {
+            *a = json!({});
+        }
+        a[part] = v;
+    }
+
+    fn clear_at(&mut self, part: &str) {
+        if let Some(a) = self.out.get_mut("_at").and_then(|a| a.as_object_mut()) {
+            a.remove(part);
+        }
+    }
+
+    /// Count a collection by paging, up to `max_pages`, picking up where `part` stopped. Returns (count, exact).
+    async fn count(&mut self, k: &mut Client, part: &str, first: &str, max_pages: usize) -> Result<(u64, bool), KlaviyoError> {
+        let at = self.at(part);
+        let mut url = at["url"].as_str().unwrap_or(first).to_string();
+        let mut n = at["n"].as_u64().unwrap_or(0);
+        let mut pages = at["pages"].as_u64().unwrap_or(0) as usize;
+        while pages < max_pages {
+            let page = k.get(&url).await?;
+            n += page["data"].as_array().map(|a| a.len()).unwrap_or(0) as u64;
+            pages += 1;
+            match next_link(&page) {
+                Some(nx) => {
+                    url = nx;
+                    self.set_at(part, json!({"url": url, "n": n, "pages": pages}));
+                }
+                None => {
+                    self.clear_at(part);
+                    return Ok((n, true));
+                }
+            }
+        }
+        self.clear_at(part);
+        Ok((n, false))
+    }
+
     fn done(&self, key: &str) -> bool {
         self.out.contains_key(key)
     }
@@ -87,45 +117,65 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
     ];
     for (key, scope, url, pages) in sections {
         if !t.done(key) {
-            let r = count(k, url, pages).await;
+            let r = t.count(k, key, url, pages).await;
             t.put(key, scope, r)?;
         }
     }
-    // Suppressions, by reason.
+    // Suppressions, by reason (each reason kept as it's counted).
     if !t.done("suppressions") {
+        for reason in ["HARD_BOUNCE", "SPAM_COMPLAINT", "USER_SUPPRESSED", "INVALID_EMAIL", "UNSUBSCRIBE"] {
+            let part = format!("sup_{reason}");
+            if !t.at(&format!("{part}_done")).is_null() {
+                continue;
+            }
+            let f = q(&format!("equals(subscriptions.email.marketing.suppression.reason,'{reason}')"));
+            let got = match t.count(k, &part, &format!("/api/profiles?page%5Bsize%5D=100&fields%5Bprofile%5D=email&filter={f}"), 20).await {
+                Ok((n, exact)) => json!({"count": n, "exact": exact}),
+                // Not every account can filter on every reason; leave it out.
+                Err(KlaviyoError::MissingScope(_)) => json!({"skipped": true}),
+                Err(KlaviyoError::Status { status, .. }) if status < 500 => json!({"skipped": true}),
+                Err(e) => return Err(e),
+            };
+            t.set_at(&format!("{part}_done"), got);
+        }
         let mut sup = serde_json::Map::new();
         let mut sup_total = 0u64;
         let mut sup_exact = true;
         for reason in ["HARD_BOUNCE", "SPAM_COMPLAINT", "USER_SUPPRESSED", "INVALID_EMAIL", "UNSUBSCRIBE"] {
-            let f = q(&format!("equals(subscriptions.email.marketing.suppression.reason,'{reason}')"));
-            match count(k, &format!("/api/profiles?page%5Bsize%5D=100&fields%5Bprofile%5D=email&filter={f}"), 20).await {
-                Ok((n, exact)) => {
-                    sup.insert(reason.to_lowercase(), json!({"count": n, "exact": exact}));
+            let part = format!("sup_{reason}_done");
+            let r = t.at(&part);
+            match r["count"].as_u64() {
+                Some(n) => {
                     sup_total += n;
-                    sup_exact &= exact;
+                    sup_exact &= r["exact"] == true;
+                    sup.insert(reason.to_lowercase(), json!({"count": n, "exact": r["exact"]}));
                 }
-                Err(KlaviyoError::MissingScope(_)) => sup_exact = false,
-                // Not every account can filter on every reason; leave it out.
-                Err(KlaviyoError::Status { status, .. }) if status < 500 => sup_exact = false,
-                Err(e) => return Err(e),
+                None => sup_exact = false,
             }
+            t.clear_at(&part);
         }
         t.out.insert("suppressions".into(), json!({"count": sup_total, "exact": sup_exact, "by_reason": sup}));
     }
     // Metrics, and an estimate of the events in the chosen range for the ones imported by default.
     if !t.done("all_metrics") {
-        let mut metrics = Vec::new();
-        let mut url = "/api/metrics".to_string();
-        for _ in 0..10 {
+        let at = t.at("metrics");
+        let mut metrics: Vec<Value> = at["found"].as_array().cloned().unwrap_or_default();
+        let mut url = at["url"].as_str().unwrap_or("/api/metrics").to_string();
+        let mut pages = at["pages"].as_u64().unwrap_or(0);
+        while pages < 10 {
             match k.get(&url).await {
                 Ok(page) => {
+                    pages += 1;
                     for m in page["data"].as_array().into_iter().flatten() {
                         if let (Some(id), Some(name)) = (m["id"].as_str(), m["attributes"]["name"].as_str()) {
                             metrics.push(json!({"id": id, "name": name, "integration": m["attributes"]["integration"]["name"].as_str().unwrap_or("")}));
                         }
                     }
                     match next_link(&page) {
-                        Some(n) => url = n,
+                        Some(n) => {
+                            url = n;
+                            t.set_at("metrics", json!({"url": url, "pages": pages, "found": metrics}));
+                        }
                         None => break,
                     }
                 }
@@ -136,6 +186,7 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
                 Err(e) => return Err(e),
             }
         }
+        t.clear_at("metrics");
         t.out.insert("metrics".into(), json!({"count": metrics.len(), "exact": true}));
         t.out.insert("all_metrics".into(), json!(metrics));
     }
@@ -145,8 +196,10 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
         // One year sampled, scaled to the chosen range.
         let sample_start = (now - chrono::Duration::days(365)).max(since);
         let scale = ((now - since).num_days() as f64 / (now - sample_start).num_days().max(1) as f64).max(1.0);
-        let mut per_metric = Vec::new();
-        let mut events_total = 0f64;
+        let at = t.at("events");
+        let mut per_metric: Vec<Value> = at["by_metric"].as_array().cloned().unwrap_or_default();
+        let mut tried: Vec<Value> = at["tried"].as_array().cloned().unwrap_or_default();
+        let mut events_total: f64 = per_metric.iter().filter_map(|m| m["estimate"].as_f64()).sum();
         let metrics: Vec<(String, String, String)> = t.out["all_metrics"]
             .as_array()
             .into_iter()
@@ -154,6 +207,9 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
             .filter_map(|m| Some((m["id"].as_str()?.to_string(), m["name"].as_str()?.to_string(), m["integration"].as_str().unwrap_or("").to_string())))
             .collect();
         for (id, name, integration) in metrics.iter().filter(|(_, n, _)| DEFAULT_METRICS.iter().any(|d| d.eq_ignore_ascii_case(n))).take(25) {
+            if tried.iter().any(|x| x == id.as_str()) {
+                continue;
+            }
             let body = json!({"data": {"type": "metric-aggregate", "attributes": {"metric_id": id, "measurements": ["count"], "interval": "month", "timezone": tz,
                 "filter": [format!("greater-or-equal(datetime,{})", sample_start.format("%Y-%m-%dT%H:%M:%S")), format!("less-than(datetime,{})", now.format("%Y-%m-%dT%H:%M:%S"))]}}});
             match k.post("/api/metric-aggregates", &body).await {
@@ -166,7 +222,10 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
                 Err(KlaviyoError::MissingScope(_)) | Err(KlaviyoError::Status { .. }) => {}
                 Err(e) => return Err(e),
             }
+            tried.push(json!(id));
+            t.set_at("events", json!({"by_metric": per_metric, "tried": tried}));
         }
+        t.clear_at("events");
         t.out.insert("events".into(), json!({"estimate": events_total, "since": events_since.map(|s| s.format("%Y-%m-%d").to_string()), "by_metric": per_metric}));
     }
     // Time: profiles ~4,000/min (plus as many again for list members), events ~20,000/min, each list
@@ -186,5 +245,7 @@ pub async fn survey(k: &mut Client, events_since: Option<chrono::DateTime<Utc>>,
         t.out.insert("missing_scopes".into(), json!([]));
     }
     t.out.insert("surveyed_at".into(), json!(now));
-    Ok(Value::Object(t.out.clone()))
+    let mut out = t.out.clone();
+    out.remove("_at");
+    Ok(Value::Object(out))
 }

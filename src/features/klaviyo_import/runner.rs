@@ -3,9 +3,13 @@
 //! a page in memory. Everything upserts on Klaviyo's ids, so running it again only adds what's new.
 //!
 //! Replay safety: each imported item and its Klaviyo reference are written in one transaction, and a
-//! page's progress counts are saved in the same transaction as the cursor that moves past it, so a crash
-//! at any point neither duplicates an item nor counts it twice. Only one worker runs an import at a time
-//! (a lease on the row, renewed at every save).
+//! page's progress counts are saved in the same transaction as the cursor that moves past it (events: in
+//! the transaction that writes them), so a crash at any point neither duplicates an item nor counts it
+//! twice. Only one worker runs an import at a time (a lease on the row, renewed at every save).
+//!
+//! Every transaction that writes imported data starts by locking the import row and checking that this
+//! run still owns it and it's still importing ([`Run::begin`]). A page whose response arrives after a
+//! pause, a cancel or another worker taking over writes nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -25,6 +29,8 @@ const RUN_BUDGET: Duration = Duration::from_secs(50);
 /// How long a run owns the import without saving before another worker may take over.
 const LEASE_SECS: i64 = 300;
 const PROFILE_PAGE: u32 = 100;
+/// Most departed list members taken off in one statement when a list's scan completes.
+const REMOVE_BATCH: i64 = 5000;
 const EVENT_PAGE: u32 = 500;
 /// The most event properties kept for one event, as JSON text.
 const MAX_EVENT_PROPS: usize = 64 * 1024;
@@ -39,6 +45,14 @@ pub const DEFAULT_METRICS: &[&str] = &[
 ];
 /// Metrics whose values are revenue in the report.
 pub const ORDER_METRICS: &[&str] = &["Placed Order"];
+
+/// This run no longer owns the import (paused, cancelled, failed, or another worker took over): stop
+/// without writing.
+#[derive(Debug, thiserror::Error)]
+#[error("this import run no longer owns the import")]
+pub struct Superseded;
+
+pub type Tx = sqlx::Transaction<'static, sqlx::Postgres>;
 
 pub struct Run<'a> {
     pub state: &'a AppState,
@@ -108,10 +122,43 @@ impl<'a> Run<'a> {
         self.pending.push((step.to_string(), done, skipped));
     }
 
-    /// Save the cursor, step state and progress together, and renew the lease. Returns false when another
-    /// worker has taken the import over (this run must stop).
-    async fn save(&mut self) -> anyhow::Result<bool> {
+    /// A transaction for writing imported data, holding the import row's lock: fails with [`Superseded`]
+    /// unless this run still owns the import and it's still importing.
+    pub async fn begin(&self) -> anyhow::Result<Tx> {
         let mut tx = self.state.db.begin().await?;
+        let ok: Option<i32> = sqlx::query_scalar("SELECT 1 FROM klaviyo_imports WHERE id = $1 AND lease_owner = $2 AND status = 'importing' FOR UPDATE")
+            .bind(self.imp.id)
+            .bind(self.owner)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if ok.is_none() {
+            tx.rollback().await?;
+            return Err(Superseded.into());
+        }
+        Ok(tx)
+    }
+
+    /// Take the import for this run (tests drive a run by hand with this).
+    pub async fn claim(&self) -> anyhow::Result<bool> {
+        Ok(claim(&self.state.db, self.imp.id, self.owner).await?)
+    }
+
+    /// Run the current step once, without saving the cursor (tests use this to stop "mid-page").
+    pub async fn step_once(&mut self) -> anyhow::Result<bool> {
+        let phase = match self.imp.phase.clone() {
+            Some(p) => p,
+            None => {
+                self.imp.phase = self.next_phase(None).map(String::from);
+                self.imp.phase.clone().unwrap_or_default()
+            }
+        };
+        self.step(&phase).await
+    }
+
+    /// Save the cursor, step state and progress together, and renew the lease. Returns false when this run
+    /// no longer owns the import (it must stop).
+    pub async fn save(&mut self) -> anyhow::Result<bool> {
+        let mut tx = self.begin().await?;
         for (step, d, sk) in self.pending.drain(..) {
             store::bump(&mut *tx, self.imp.id, &step, d, sk).await?;
         }
@@ -122,7 +169,7 @@ impl<'a> Run<'a> {
             "UPDATE klaviyo_imports SET phase = $2, cursor = $3,
                 step_state = $4 || jsonb_strip_nulls(jsonb_build_object('issues_over_limit', step_state->'issues_over_limit')),
                 lease_until = now() + make_interval(secs => $6), updated_at = now()
-             WHERE id = $1 AND lease_owner = $5",
+             WHERE id = $1 AND lease_owner = $5 AND status = 'importing'",
         )
         .bind(self.imp.id)
         .bind(&self.imp.phase)
@@ -142,7 +189,9 @@ impl<'a> Run<'a> {
     }
 
     pub(super) async fn issue(&self, step: &str, kind: &str, item: &str, kid: Option<&str>, local: Option<Uuid>, msg: &str) -> anyhow::Result<()> {
-        store::issue(&self.state.db, &self.imp, step, kind, item, kid, local, msg).await?;
+        let mut tx = self.begin().await?;
+        store::issue(&mut tx, &self.imp, step, kind, item, kid, local, msg).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -170,16 +219,22 @@ impl<'a> Run<'a> {
         let url = self.imp.cursor.clone().unwrap_or_else(|| "/api/metrics".into());
         let page = self.k.get(&url).await?;
         let events_on = self.imp.wants("events");
-        let mut n = 0;
+        let mut rows = Vec::new();
         for m in page["data"].as_array().into_iter().flatten() {
             let (Some(kid), Some(name)) = (m["id"].as_str(), s(&m["attributes"]["name"])) else { continue };
             let name: String = name.chars().take(128).collect();
             let selected = events_on && self.metric_selected(&name, kid);
+            // The metric itself (DumbMail's, by name) is shared; only the reference is the import's own write.
             let local = if selected { Some(crate::audience::metric_id(&self.state.db, self.acct(), &name).await.map_err(|e| anyhow::anyhow!(e.public_message()))?) } else { None };
-            let integration = m["attributes"]["integration"]["name"].as_str().unwrap_or("");
-            store::set_ref(&self.state.db, self.acct(), "metric", kid, local, &name, &json!({"selected": selected, "integration": integration, "created": m["attributes"]["created"]})).await?;
-            n += 1;
+            let integration = m["attributes"]["integration"]["name"].as_str().unwrap_or("").to_string();
+            rows.push((kid.to_string(), local, name, json!({"selected": selected, "integration": integration, "created": m["attributes"]["created"]})));
         }
+        let n = rows.len() as i64;
+        let mut tx = self.begin().await?;
+        for (kid, local, name, detail) in &rows {
+            store::set_ref(&mut *tx, self.acct(), "metric", kid, *local, name, detail).await?;
+        }
+        tx.commit().await?;
         self.bump("metrics", n, 0);
         self.metrics = None;
         self.imp.cursor = next_link(&page);
@@ -202,36 +257,36 @@ impl<'a> Run<'a> {
         Ok(up)
     }
 
-    /// People who unsubscribed from a Klaviyo list: off its DumbMail list, and never added back. Only that
-    /// list; their other lists and their consent are untouched.
+    /// People who unsubscribed from a Klaviyo list: off that DumbMail list, and not added back while the
+    /// opt-out stands. Exactly those (list, person) pairs; their other lists and their consent are untouched.
     async fn apply_list_optouts(&self, sups: &[(Uuid, String)]) -> anyhow::Result<()> {
         if sups.is_empty() {
             return Ok(());
         }
         let pids: Vec<Uuid> = sups.iter().map(|x| x.0).collect();
         let kids: Vec<&str> = sups.iter().map(|x| x.1.as_str()).collect();
-        let mut tx = self.state.db.begin().await?;
-        sqlx::query(
+        let mut tx = self.begin().await?;
+        // The leave first (it waits for any import insert of the same pair), then the removal.
+        let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
             "WITH x AS (SELECT DISTINCT x.p, r.local_id AS l FROM unnest($2::uuid[], $3::text[]) AS x(p, k)
                         JOIN klaviyo_refs r ON r.account_id = $1 AND r.kind = 'list' AND r.klaviyo_id = x.k AND r.local_id IS NOT NULL
-                        JOIN lists li ON li.id = r.local_id)
+                        JOIN lists li ON li.id = r.local_id AND li.account_id = $1)
              INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, left_via)
              SELECT $1, x.l, x.p, 'left', 'klaviyo_list_unsubscribe' FROM x JOIN profiles p ON p.id = x.p AND p.account_id = $1
-             ON CONFLICT (list_id, profile_id) DO UPDATE SET state = 'left', left_via = COALESCE(CASE WHEN klaviyo_memberships.state = 'left' THEN klaviyo_memberships.left_via END, 'klaviyo_list_unsubscribe'), updated_at = now()",
+             ON CONFLICT (list_id, profile_id) DO UPDATE SET state = 'left', left_via = COALESCE(CASE WHEN klaviyo_memberships.state = 'left' THEN klaviyo_memberships.left_via END, 'klaviyo_list_unsubscribe'), updated_at = now()
+             RETURNING list_id, profile_id",
         )
         .bind(self.acct())
         .bind(&pids)
         .bind(&kids)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        sqlx::query(
-            "DELETE FROM list_members lm USING klaviyo_memberships m
-             WHERE m.account_id = $1 AND m.state = 'left' AND m.list_id = lm.list_id AND m.profile_id = lm.profile_id AND m.profile_id = ANY($2)",
-        )
-        .bind(self.acct())
-        .bind(&pids)
-        .execute(&mut *tx)
-        .await?;
+        let (lists, people): (Vec<Uuid>, Vec<Uuid>) = pairs.into_iter().unzip();
+        sqlx::query("DELETE FROM list_members lm USING unnest($1::uuid[], $2::uuid[]) AS x(l, p) WHERE lm.list_id = x.l AND lm.profile_id = x.p")
+            .bind(&lists)
+            .bind(&people)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -301,7 +356,7 @@ impl<'a> Run<'a> {
             let Some(kid) = l["id"].as_str() else { continue };
             let name: String = s(&l["attributes"]["name"]).unwrap_or("Klaviyo list").chars().take(200).collect();
             let double = l["attributes"]["opt_in_process"] == "double_opt_in";
-            let mut tx = self.state.db.begin().await?;
+            let mut tx = self.begin().await?;
             let exists: Option<Uuid> = sqlx::query_scalar("SELECT l.id FROM klaviyo_refs r JOIN lists l ON l.id = r.local_id WHERE r.account_id = $1 AND r.kind = 'list' AND r.klaviyo_id = $2 FOR UPDATE OF r")
                 .bind(self.acct())
                 .bind(kid)
@@ -335,9 +390,9 @@ impl<'a> Run<'a> {
         .await?)
     }
 
-    /// Mark people who left a list in DumbMail since the import last saw them (the preference page, or
-    /// removed by hand): they're never added back.
-    async fn note_dumbmail_leaves(&self, list_id: Uuid, pids: &[Uuid]) -> sqlx::Result<()> {
+    /// Mark people who left a list in DumbMail since the import last saw them (removed by hand, by a flow,
+    /// or through the preference page before leaves were recorded): they're never added back.
+    async fn note_dumbmail_leaves(&self, tx: &mut Tx, list_id: Uuid, pids: &[Uuid]) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE klaviyo_memberships m SET state = 'left', left_via = 'dumbmail', updated_at = now()
              WHERE m.list_id = $1 AND m.profile_id = ANY($2) AND m.state = 'member'
@@ -345,28 +400,48 @@ impl<'a> Run<'a> {
         )
         .bind(list_id)
         .bind(pids)
-        .execute(&self.state.db)
+        .execute(&mut **tx)
         .await?;
         // Left through the preference page (recorded as an event) and not back on the list since.
         sqlx::query(
             "INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, left_via)
              SELECT DISTINCT $3::uuid, $1::uuid, e.profile_id, 'left', 'dumbmail' FROM events e JOIN metrics mt ON mt.id = e.metric_id
-             WHERE e.account_id = $3 AND mt.name = 'Unsubscribed from List' AND e.properties->>'list_id' = $1::text AND e.profile_id = ANY($2)
+             WHERE e.account_id = $3 AND mt.account_id = $3 AND mt.name = 'Unsubscribed from List' AND e.properties->>'list_id' = $1::text AND e.profile_id = ANY($2)
                AND NOT EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = $1 AND lm.profile_id = e.profile_id)
              ON CONFLICT (list_id, profile_id) DO UPDATE SET state = 'left', left_via = COALESCE(CASE WHEN klaviyo_memberships.state = 'left' THEN klaviyo_memberships.left_via END, 'dumbmail'), updated_at = now()",
         )
         .bind(list_id)
         .bind(pids)
         .bind(self.acct())
-        .execute(&self.state.db)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
 
+    /// A list or snapshot segment Klaviyo wouldn't give (deleted since, or an error): its members can't be
+    /// reconciled this run, and the report says so.
+    async fn not_reconciled(&self, list_id: Uuid, why: &str) -> anyhow::Result<()> {
+        let mut tx = self.begin().await?;
+        sqlx::query(
+            "UPDATE klaviyo_refs SET detail = detail || jsonb_build_object('scan', jsonb_build_object('import', $3::text, 'error', $4::text, 'at', now()))
+             WHERE account_id = $1 AND local_id = $2 AND kind IN ('list', 'segment')",
+        )
+        .bind(self.acct())
+        .bind(list_id)
+        .bind(self.imp.id.to_string())
+        .bind(why)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Copy members of Klaviyo lists (or snapshot segments) into their DumbMail lists, one page at a time.
-    /// Members join quietly: no list-triggered flow starts. People who left a list (in Klaviyo or here)
-    /// are never added back. A full scan of a list ends by taking off anyone Klaviyo no longer has on it;
-    /// a snapshot segment's members are staged and swapped in only when its scan is complete.
+    /// Members join quietly: no list-triggered flow starts. People who left a list in DumbMail are never
+    /// added back; people Klaviyo itself took off (or who unsubscribed from the list there) are, once a
+    /// later run finds them back on it in Klaviyo with no list opt-out. A full scan of a list ends by
+    /// taking off anyone Klaviyo no longer has on it; a snapshot segment's members are staged and swapped
+    /// in only when its scan is complete.
     async fn step_members(&mut self, step: &str, segments: bool) -> anyhow::Result<bool> {
         let groups = self.groups(segments).await?;
         let i = self.st_i("group");
@@ -388,8 +463,14 @@ impl<'a> Run<'a> {
         let scan = self.st("scan").as_i64().unwrap_or(0);
         let page = match self.k.get(&url).await {
             Ok(p) => p,
-            Err(KlaviyoError::Status { status: 404, .. }) => {
-                // Deleted in Klaviyo since: nothing to copy, and nothing to take off on its account.
+            Err(e @ KlaviyoError::Status { .. }) if !e.is_transient() => {
+                // Deleted in Klaviyo since, or refused: nothing is taken off on its account, and the report
+                // shows the list as not reconciled.
+                let why = match &e {
+                    KlaviyoError::Status { status: 404, .. } => "Klaviyo no longer has this list (404)".to_string(),
+                    other => other.to_string(),
+                };
+                self.not_reconciled(list_id, &why).await?;
                 self.imp.cursor = None;
                 self.set_st("group", json!(i + 1));
                 return Ok(false);
@@ -399,63 +480,58 @@ impl<'a> Run<'a> {
         let data = page["data"].as_array().cloned().unwrap_or_default();
         let seen_n = self.st("scan_seen").as_i64().unwrap_or(0) + data.len() as i64;
         self.set_st("scan_seen", json!(seen_n));
-        {
-            let ids = self.resolve_profiles(&data).await?;
-            // List-level opt-outs on this page, for every list they name (this one included).
-            let sups: Vec<(Uuid, String)> = data
-                .iter()
-                .filter_map(|m| Some((*ids.get(m["id"].as_str()?)?, consent::list_suppressions(&m["attributes"]["subscriptions"]))))
-                .flat_map(|(p, ls)| ls.into_iter().map(move |l| (p, l)))
-                .collect();
-            self.apply_list_optouts(&sups).await?;
-            let (mut pids, mut times) = (Vec::new(), Vec::new());
-            let mut skipped = 0;
-            for m in &data {
-                let Some(pid) = m["id"].as_str().and_then(|mid| ids.get(mid)) else {
-                    skipped += 1;
-                    continue;
-                };
-                if !segments && consent::list_suppressions(&m["attributes"]["subscriptions"]).iter().any(|l| l == &kid) {
-                    skipped += 1;
-                    continue;
-                }
-                pids.push(*pid);
-                times.push(ts(&m["attributes"]["joined_group_at"]).unwrap_or_else(Utc::now));
-            }
-            self.note_dumbmail_leaves(list_id, &pids).await?;
-            let mut tx = self.state.db.begin().await?;
-            // Record Klaviyo's membership (people who left stay left), with this scan's number.
-            sqlx::query(
-                "INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, scan)
-                 SELECT $1, $2, x.p, 'member', $4 FROM unnest($3::uuid[]) AS x(p) JOIN profiles pr ON pr.id = x.p AND pr.account_id = $1
-                 ON CONFLICT (list_id, profile_id) DO UPDATE SET scan = EXCLUDED.scan, updated_at = now()",
-            )
-            .bind(self.acct())
-            .bind(list_id)
-            .bind(&pids)
-            .bind(scan)
-            .execute(&mut *tx)
-            .await?;
-            let added = if segments {
-                // Snapshots are swapped in whole when the scan completes.
-                0
-            } else {
-                sqlx::query(
-                    "INSERT INTO list_members (list_id, profile_id, added_at)
-                     SELECT $1, x.p, x.t FROM unnest($2::uuid[], $3::timestamptz[]) AS x(p, t)
-                     JOIN klaviyo_memberships m ON m.list_id = $1 AND m.profile_id = x.p AND m.state = 'member'
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(list_id)
-                .bind(&pids)
-                .bind(&times)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected() as i64
+        let ids = self.resolve_profiles(&data).await?;
+        // List-level opt-outs on this page, for every list they name (this one included).
+        let sups: Vec<(Uuid, String)> = data
+            .iter()
+            .filter_map(|m| Some((*ids.get(m["id"].as_str()?)?, consent::list_suppressions(&m["attributes"]["subscriptions"]))))
+            .flat_map(|(p, ls)| ls.into_iter().map(move |l| (p, l)))
+            .collect();
+        self.apply_list_optouts(&sups).await?;
+        let (mut pids, mut times) = (Vec::new(), Vec::new());
+        let mut skipped = 0;
+        for m in &data {
+            let Some(pid) = m["id"].as_str().and_then(|mid| ids.get(mid)) else {
+                skipped += 1;
+                continue;
             };
-            tx.commit().await?;
-            self.bump(step, if segments { pids.len() as i64 } else { added }, skipped);
+            if !segments && consent::list_suppressions(&m["attributes"]["subscriptions"]).iter().any(|l| l == &kid) {
+                skipped += 1;
+                continue;
+            }
+            pids.push(*pid);
+            times.push(ts(&m["attributes"]["joined_group_at"]).unwrap_or_else(Utc::now));
         }
+        let mut tx = self.begin().await?;
+        self.note_dumbmail_leaves(&mut tx, list_id, &pids).await?;
+        // One statement: record Klaviyo's membership with this scan's number and add exactly those it
+        // records as members. The upsert takes each (list, person) row's lock and re-reads it, so a leave
+        // recorded in DumbMail meanwhile (see `lists::remove_members`) is always seen: no re-add.
+        let added = sqlx::query(
+            "WITH x AS (SELECT * FROM unnest($3::uuid[], $4::timestamptz[]) AS x(p, t)),
+             j AS (
+                INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, scan)
+                SELECT $1, $2, x.p, 'member', $5 FROM x JOIN profiles pr ON pr.id = x.p AND pr.account_id = $1
+                ON CONFLICT (list_id, profile_id) DO UPDATE SET state = 'member', left_via = NULL, scan = EXCLUDED.scan, updated_at = now()
+                -- People who left stay left. Only a leave Klaviyo itself recorded is lifted: they're back on the list there.
+                WHERE klaviyo_memberships.state = 'member' OR klaviyo_memberships.left_via IN ('klaviyo', 'klaviyo_list_unsubscribe')
+                RETURNING profile_id)
+             INSERT INTO list_members (list_id, profile_id, added_at)
+             SELECT $2, j.profile_id, x.t FROM j JOIN x ON x.p = j.profile_id WHERE NOT $6
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.acct())
+        .bind(list_id)
+        .bind(&pids)
+        .bind(&times)
+        .bind(scan)
+        // Snapshots are swapped in whole when the scan completes.
+        .bind(segments)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as i64;
+        tx.commit().await?;
+        self.bump(step, if segments { pids.len() as i64 } else { added }, skipped);
         self.imp.cursor = next_link(&page);
         if self.imp.cursor.is_none() {
             self.complete_scan(list_id, segments, scan).await?;
@@ -464,11 +540,12 @@ impl<'a> Run<'a> {
         Ok(false)
     }
 
-    /// A full scan of one list or snapshot segment finished: reconcile removals.
+    /// A full scan of one list or snapshot segment finished: reconcile removals, set-based and in bounded
+    /// batches (a list that lost a million members never brings their ids into memory).
     async fn complete_scan(&mut self, list_id: Uuid, segments: bool, scan: i64) -> anyhow::Result<()> {
         let started = ts(self.st("scan_started")).unwrap_or_else(Utc::now);
-        let mut tx = self.state.db.begin().await?;
         if segments {
+            let mut tx = self.begin().await?;
             // Swap in the new member set: off if not in this scan, on if in it (and hasn't left).
             sqlx::query(
                 "DELETE FROM list_members lm WHERE lm.list_id = $1
@@ -479,39 +556,55 @@ impl<'a> Run<'a> {
             .execute(&mut *tx)
             .await?;
             sqlx::query("DELETE FROM klaviyo_memberships WHERE list_id = $1 AND state = 'member' AND scan <> $2").bind(list_id).bind(scan).execute(&mut *tx).await?;
+            // Each member row is locked and re-checked as it's added, so a leave recorded meanwhile wins.
             sqlx::query(
-                "INSERT INTO list_members (list_id, profile_id, added_at) SELECT $1, m.profile_id, now() FROM klaviyo_memberships m
-                 WHERE m.list_id = $1 AND m.state = 'member' AND m.scan = $2 ON CONFLICT DO NOTHING",
+                "WITH j AS (UPDATE klaviyo_memberships m SET updated_at = now() WHERE m.list_id = $1 AND m.state = 'member' AND m.scan = $2 RETURNING m.profile_id)
+                 INSERT INTO list_members (list_id, profile_id, added_at) SELECT $1, j.profile_id, now() FROM j ON CONFLICT DO NOTHING",
             )
             .bind(list_id)
             .bind(scan)
             .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
         } else {
             // Klaviyo no longer has them on the list (and they didn't join while the scan ran): take them
-            // off here too, and remember it so a later import doesn't add them back.
-            let gone: Vec<Uuid> = sqlx::query_scalar(
-                "UPDATE klaviyo_memberships SET state = 'left', left_via = 'klaviyo', updated_at = now()
-                 WHERE list_id = $1 AND state = 'member' AND scan < $2 AND updated_at < $3 RETURNING profile_id",
-            )
-            .bind(list_id)
-            .bind(scan)
-            .bind(started)
-            .fetch_all(&mut *tx)
-            .await?;
-            sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(list_id).bind(&gone).execute(&mut *tx).await?;
+            // off here too, and remember it so a later import doesn't add them back unless Klaviyo does.
+            loop {
+                let mut tx = self.begin().await?;
+                let n: i64 = sqlx::query_scalar(
+                    "WITH gone AS (
+                        SELECT profile_id FROM klaviyo_memberships WHERE list_id = $1 AND state = 'member' AND scan < $2 AND updated_at < $3
+                        ORDER BY profile_id LIMIT $4 FOR UPDATE),
+                     up AS (
+                        UPDATE klaviyo_memberships m SET state = 'left', left_via = 'klaviyo', updated_at = now() FROM gone
+                        WHERE m.list_id = $1 AND m.profile_id = gone.profile_id RETURNING m.profile_id),
+                     d AS (DELETE FROM list_members lm USING up WHERE lm.list_id = $1 AND lm.profile_id = up.profile_id)
+                     SELECT count(*) FROM up",
+                )
+                .bind(list_id)
+                .bind(scan)
+                .bind(started)
+                .bind(REMOVE_BATCH)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                if n < REMOVE_BATCH {
+                    break;
+                }
+            }
         }
-        // Klaviyo's member count from this complete scan, for the report.
         // Klaviyo's members counted by this scan, and how many of them aren't members here (no usable
         // identifier, opted out of the list, or left it in DumbMail).
         let seen = self.st("scan_seen").as_i64().unwrap_or(0);
+        let mut tx = self.begin().await?;
         let matched: i64 = sqlx::query_scalar("SELECT count(*) FROM klaviyo_memberships WHERE list_id = $1 AND state = 'member' AND scan = $2").bind(list_id).bind(scan).fetch_one(&mut *tx).await?;
         let skipped = (seen - matched).max(0);
-        sqlx::query("UPDATE klaviyo_refs SET detail = detail || jsonb_build_object('scan', jsonb_build_object('members', $3::bigint, 'skipped', $4::bigint, 'at', now())) WHERE account_id = $1 AND local_id = $2 AND kind IN ('list', 'segment')")
+        sqlx::query("UPDATE klaviyo_refs SET detail = detail || jsonb_build_object('scan', jsonb_build_object('members', $3::bigint, 'skipped', $4::bigint, 'import', $5::text, 'at', now())) WHERE account_id = $1 AND local_id = $2 AND kind IN ('list', 'segment')")
             .bind(self.acct())
             .bind(list_id)
             .bind(seen)
             .bind(skipped)
+            .bind(self.imp.id.to_string())
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -553,7 +646,7 @@ impl<'a> Run<'a> {
             }
             let name: String = s(&sg["attributes"]["name"]).unwrap_or("Klaviyo segment").chars().take(180).collect();
             let id = Uuid::now_v7();
-            let mut tx = self.state.db.begin().await?;
+            let mut tx = self.begin().await?;
             let issue = match super::segments::translate(&ctx, &sg["attributes"]["definition"]) {
                 Ok(def) => {
                     sqlx::query("INSERT INTO segments (id, account_id, name, definition) VALUES ($1, $2, $3, $4)").bind(id).bind(self.acct()).bind(&name).bind(&def).execute(&mut *tx).await?;
@@ -573,10 +666,10 @@ impl<'a> Run<'a> {
                     Some(format!("Imported as a list of its current members, because DumbMail can't express {}. Rebuild it as a segment if it needs to keep updating.", reasons.join("; ")))
                 }
             };
-            tx.commit().await?;
             if let Some(msg) = issue {
-                self.issue("segments", "snapshot", &name, Some(kid), Some(id), &msg).await?;
+                store::issue(&mut tx, &self.imp, "segments", "snapshot", &name, Some(kid), Some(id), &msg).await?;
             }
+            tx.commit().await?;
             n += 1;
         }
         self.bump("segments", n, 0);
@@ -620,14 +713,22 @@ impl<'a> Run<'a> {
             let html = t["attributes"]["html"].as_str().unwrap_or("");
             let (content, removed, notes) = super::templates::email_content(html, "", None, None, None, None);
             let id = Uuid::now_v7();
-            let mut tx = self.state.db.begin().await?;
-            sqlx::query("INSERT INTO templates (id, account_id, name, channel, content) VALUES ($1, $2, $3, 'email', $4)").bind(id).bind(self.acct()).bind(&name).bind(&content).execute(&mut *tx).await?;
+            let mut tx = self.begin().await?;
+            let mut content = content;
+            review::mirror(&mut content, &notes);
+            sqlx::query("INSERT INTO templates (id, account_id, name, channel, content, import_review) VALUES ($1, $2, $3, 'email', $4, $5)")
+                .bind(id)
+                .bind(self.acct())
+                .bind(&name)
+                .bind(&content)
+                .bind(review::column(&notes))
+                .execute(&mut *tx)
+                .await?;
             store::set_ref(&mut *tx, self.acct(), "template", kid, Some(id), &name, &json!({"removed_tags": removed})).await?;
-            review::flag(&mut *tx, self.acct(), "template", id, &notes).await?;
-            tx.commit().await?;
             if !removed.is_empty() {
-                self.issue("templates", "unmapped", &name, Some(kid), Some(id), &format!("Removed template tags DumbMail doesn't have: {}", removed.join(", "))).await?;
+                store::issue(&mut tx, &self.imp, "templates", "unmapped", &name, Some(kid), Some(id), &format!("Removed template tags DumbMail doesn't have: {}", removed.join(", "))).await?;
             }
+            tx.commit().await?;
             n += 1;
         }
         self.bump("templates", n, 0);
@@ -777,8 +878,10 @@ impl<'a> Run<'a> {
                         json!({"body": c.text})
                     }
                     other => {
-                        self.issue("campaigns", "skipped", &name, Some(mid), None, &format!("A {other} campaign; DumbMail sends email and SMS only.")).await?;
-                        store::set_ref(&self.state.db, self.acct(), "campaign_message", mid, None, &name, &json!({"skipped": other})).await?;
+                        let mut tx = self.begin().await?;
+                        store::set_ref(&mut *tx, self.acct(), "campaign_message", mid, None, &name, &json!({"skipped": other})).await?;
+                        store::issue(&mut tx, &self.imp, "campaigns", "skipped", &name, Some(mid), None, &format!("A {other} campaign; DumbMail sends email and SMS only.")).await?;
+                        tx.commit().await?;
                         continue;
                     }
                 };
@@ -791,8 +894,8 @@ impl<'a> Run<'a> {
                 let created = ts(&c["attributes"]["created_at"]).unwrap_or_else(Utc::now);
                 let detail = json!({"campaign_id": cid, "channel": channel, "status": status_k, "sent_at": sent_at, "subject": details["subject"], "audience": names,
                     "send_options": send, "needs_review": !notes.is_empty()});
-                let mut tx = self.state.db.begin().await?;
-                sqlx::query("INSERT INTO campaigns (id, account_id, name, channel, status, audience, content, sent_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+                let mut tx = self.begin().await?;
+                sqlx::query("INSERT INTO campaigns (id, account_id, name, channel, status, audience, content, sent_at, created_at, import_review) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
                     .bind(id)
                     .bind(self.acct())
                     .bind(&name)
@@ -802,13 +905,13 @@ impl<'a> Run<'a> {
                     .bind(&content)
                     .bind(sent_at)
                     .bind(created)
+                    .bind(review::column(&notes))
                     .execute(&mut *tx)
                     .await?;
                 store::set_ref(&mut *tx, self.acct(), "campaign_message", mid, Some(id), &name, &detail).await?;
                 if mi == 0 {
                     store::set_ref(&mut *tx, self.acct(), "campaign", cid, Some(id), &cname, &json!({})).await?;
                 }
-                review::flag(&mut *tx, self.acct(), "campaign", id, &notes).await?;
                 store::bump(&mut *tx, self.imp.id, "campaigns", 1, 0).await?;
                 tx.commit().await?;
             }
@@ -851,15 +954,17 @@ impl<'a> Run<'a> {
             }
             Err(e) => return Err(e.into()),
         };
+        let mut tx = self.begin().await?;
         for r in page["data"]["attributes"]["results"].as_array().into_iter().flatten() {
             let Some(mid) = r["groupings"]["campaign_message_id"].as_str() else { continue };
             sqlx::query("UPDATE klaviyo_refs SET detail = jsonb_set(detail, '{stats}', $3), updated_at = now() WHERE account_id = $1 AND kind = 'campaign_message' AND klaviyo_id = $2")
                 .bind(self.acct())
                 .bind(mid)
                 .bind(&r["statistics"])
-                .execute(&self.state.db)
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         self.imp.cursor = next_link(&page);
         if self.imp.cursor.is_none() {
             self.set_st("window", json!(w + 1));
@@ -882,7 +987,9 @@ impl<'a> Run<'a> {
             }
             let name: String = s(&f["attributes"]["name"]).unwrap_or("Klaviyo flow").chars().take(180).collect();
             if f["attributes"]["archived"] == true {
-                store::set_ref(&self.state.db, self.acct(), "flow", kid, None, &name, &json!({"skipped": "archived"})).await?;
+                let mut tx = self.begin().await?;
+                store::set_ref(&mut *tx, self.acct(), "flow", kid, None, &name, &json!({"skipped": "archived"})).await?;
+                tx.commit().await?;
                 continue;
             }
             let full = match self.k.get(&format!("/api/flows/{kid}?additional-fields%5Bflow%5D=definition")).await {
@@ -917,29 +1024,32 @@ impl<'a> Run<'a> {
                     let id = Uuid::now_v7();
                     let partial = t.partial();
                     let fname = if partial { format!("{name} (partial import)") } else { name.clone() };
-                    let mut tx = self.state.db.begin().await?;
-                    sqlx::query("INSERT INTO flows (id, account_id, name, status, trigger, definition) VALUES ($1, $2, $3, 'draft', $4, $5)")
+                    let mut tx = self.begin().await?;
+                    // The flow's own notes go on its definition too, so a copy of it needs review as well.
+                    let mut definition = t.definition.clone();
+                    review::mirror(&mut definition, &t.review);
+                    sqlx::query("INSERT INTO flows (id, account_id, name, status, trigger, definition, import_review) VALUES ($1, $2, $3, 'draft', $4, $5, $6)")
                         .bind(id)
                         .bind(self.acct())
                         .bind(&fname)
                         .bind(&t.trigger)
-                        .bind(&t.definition)
+                        .bind(&definition)
+                        .bind(review::column(&t.review))
                         .execute(&mut *tx)
                         .await?;
                     store::set_ref(&mut *tx, self.acct(), "flow", kid, Some(id), &name, &json!({"klaviyo_status": kstatus, "partial": partial, "needs_review": !t.review.is_empty()})).await?;
-                    review::flag(&mut *tx, self.acct(), "flow", id, &t.review).await?;
                     store::bump(&mut *tx, self.imp.id, "flows", 1, 0).await?;
-                    tx.commit().await?;
                     for i in &t.issues {
-                        self.issue("flows", "partial", &name, Some(kid), Some(id), i).await?;
+                        store::issue(&mut tx, &self.imp, "flows", "partial", &name, Some(kid), Some(id), i).await?;
                     }
+                    tx.commit().await?;
                 }
                 Err(why) => {
-                    let mut tx = self.state.db.begin().await?;
+                    let mut tx = self.begin().await?;
                     store::set_ref(&mut *tx, self.acct(), "flow", kid, None, &name, &json!({"klaviyo_status": kstatus, "skipped": why})).await?;
                     store::bump(&mut *tx, self.imp.id, "flows", 0, 1).await?;
+                    store::issue(&mut tx, &self.imp, "flows", "skipped", &name, Some(kid), None, &format!("Not imported: {why}. Rebuild it by hand.")).await?;
                     tx.commit().await?;
-                    self.issue("flows", "skipped", &name, Some(kid), None, &format!("Not imported: {why}. Rebuild it by hand.")).await?;
                 }
             }
         }
@@ -978,20 +1088,23 @@ impl<'a> Run<'a> {
             };
             let id = Uuid::now_v7();
             let kstatus = f["attributes"]["status"].as_str().unwrap_or("");
-            let mut tx = self.state.db.begin().await?;
-            sqlx::query("INSERT INTO forms (id, account_id, name, status, kind, list_id, config) VALUES ($1, $2, $3, 'draft', 'popup', $4, '{}')")
+            let mut tx = self.begin().await?;
+            // A form whose list is missing or ambiguous can't be published until someone picks one.
+            let notes: Vec<String> = problem.iter().cloned().collect();
+            sqlx::query("INSERT INTO forms (id, account_id, name, status, kind, list_id, config, import_review) VALUES ($1, $2, $3, 'draft', 'popup', $4, '{}', $5)")
                 .bind(id)
                 .bind(self.acct())
                 .bind(&name)
                 .bind(list)
+                .bind(review::column(&notes))
                 .execute(&mut *tx)
                 .await?;
             store::set_ref(&mut *tx, self.acct(), "form", kid, Some(id), &name, &json!({"klaviyo_status": kstatus, "list_ids": ids})).await?;
             store::bump(&mut *tx, self.imp.id, "forms", 1, 0).await?;
-            tx.commit().await?;
-            if let Some(p) = problem {
-                self.issue("forms", "unmapped", &name, Some(kid), Some(id), &p).await?;
+            if let Some(p) = &problem {
+                store::issue(&mut tx, &self.imp, "forms", "unmapped", &name, Some(kid), Some(id), p).await?;
             }
+            tx.commit().await?;
         }
         self.imp.cursor = next_link(&page);
         if self.imp.cursor.is_none() {
@@ -1005,9 +1118,11 @@ impl<'a> Run<'a> {
 
     // ---------- events ----------
 
-    async fn mark_history(&self, started: bool) -> sqlx::Result<()> {
-        let q = if started { "UPDATE klaviyo_imports SET history_started_at = now() WHERE id = $1" } else { "UPDATE klaviyo_imports SET history_done_at = now() WHERE id = $1" };
-        sqlx::query(q).bind(self.imp.id).execute(&self.state.db).await?;
+    /// The events step ended without writing (left out): close the history window.
+    async fn close_history(&self) -> anyhow::Result<()> {
+        let mut tx = self.begin().await?;
+        super::history::close(&mut tx, self.imp.id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1016,8 +1131,6 @@ impl<'a> Run<'a> {
         let url = match self.imp.cursor.clone() {
             Some(c) => c,
             None => {
-                // History is about to be written: segment-triggered flows absorb new members until it's done.
-                self.mark_history(true).await?;
                 let mut u = format!("/api/events?sort=datetime&page%5Bsize%5D={EVENT_PAGE}");
                 if let Some(since) = self.imp.events_since().map(fmt_ts) {
                     u.push_str(&format!("&filter={}", q(&format!("greater-or-equal(datetime,{since})"))));
@@ -1060,7 +1173,7 @@ impl<'a> Run<'a> {
             if !store_events {
                 continue;
             }
-            let Some((_, Some(metric_id))) = rel_ids(e, "metric").first().and_then(|m| metrics.get(m)).cloned() else { continue };
+            let Some((mname, Some(metric_id))) = rel_ids(e, "metric").first().and_then(|m| metrics.get(m)).cloned() else { continue };
             let (Some(eid), Some(pk)) = (e["id"].as_str(), rel_ids(e, "profile").first().cloned()) else { continue };
             let Some(pid) = pmap.get(&pk) else {
                 skipped += 1;
@@ -1085,18 +1198,29 @@ impl<'a> Run<'a> {
                 props.insert("flow_id".into(), json!(f));
             }
             props.insert("klaviyo_event_id".into(), json!(eid));
+            // The latest message Klaviyo delivered, for the "unsubscribes up to date" check.
+            if matches!(mname.as_str(), "Received Email" | "Received SMS") && ts(self.st("last_send")).is_none_or(|t| t < at) {
+                self.set_st("last_send", json!(fmt_ts(at)));
+            }
             let value = props.get("$value").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|x| x.parse().ok())));
             batch.push(crate::audience::HistoryEvent { profile_id: *pid, metric_id, properties: Value::Object(props), value, occurred_at: at, unique_id: format!("klaviyo:{eid}") });
             done += 1;
         }
-        let new = crate::audience::record_history(&self.state.db, self.acct(), &batch).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-        // Replays (the overlap, a restart) find their events already there: count only new ones.
         let _ = done;
-        self.bump(step, new as i64, skipped);
-        self.imp.cursor = next_link(&page);
-        if self.imp.cursor.is_none() {
-            self.mark_history(false).await?;
+        let next = next_link(&page);
+        // One transaction: the events, their progress (only events actually new, so a replayed page counts
+        // nothing twice), and the history window (open while pages are written, closed with the last).
+        let mut tx = self.begin().await?;
+        if !batch.is_empty() {
+            super::history::open(&mut tx, self.imp.id, self.acct()).await?;
         }
+        let new = crate::audience::record_history(&mut *tx, self.acct(), &batch).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        store::bump(&mut *tx, self.imp.id, step, new as i64, skipped).await?;
+        if next.is_none() {
+            super::history::close(&mut tx, self.imp.id).await?;
+        }
+        tx.commit().await?;
+        self.imp.cursor = next;
         Ok(self.imp.cursor.is_none())
     }
 
@@ -1107,11 +1231,13 @@ impl<'a> Run<'a> {
             self.set_st("cmp_until", json!(fmt_ts(Utc::now())));
             self.set_st("cmp_stage", json!(0));
             self.set_st("cmp_i", json!(0));
+            let mut tx = self.begin().await?;
             sqlx::query("UPDATE klaviyo_imports SET source_counts = source_counts || jsonb_build_object('until', $2::text, 'lists', '{}'::jsonb, 'segments', '{}'::jsonb, 'metrics', '{}'::jsonb) WHERE id = $1")
                 .bind(self.imp.id)
                 .bind(self.st("cmp_until").as_str())
-                .execute(&self.state.db)
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
         }
         let until = ts(self.st("cmp_until")).unwrap_or_else(Utc::now);
         let stage = self.st_i("cmp_stage");
@@ -1134,7 +1260,7 @@ impl<'a> Run<'a> {
                 let path = if stage == 0 { format!("/api/lists/{kid}?additional-fields%5Blist%5D=profile_count") } else { format!("/api/segments/{kid}?additional-fields%5Bsegment%5D=profile_count") };
                 // Klaviyo's own count, or why there isn't one (the report then says "not verified").
                 let entry = match self.k.get_paced(&path, 15).await {
-                    Ok(v) => match v["data"]["attributes"]["profile_count"].as_i64() {
+                    Ok(v) => match v["data"]["attributes"]["profile_count"].as_i64().filter(|n| *n >= 0) {
                         Some(n) => json!(n),
                         None => json!({"error": "Klaviyo didn't give a count"}),
                     },
@@ -1142,13 +1268,15 @@ impl<'a> Run<'a> {
                     Err(e @ KlaviyoError::Status { .. }) => json!({"error": e.to_string()}),
                     Err(e) => return Err(e.into()),
                 };
+                let mut tx = self.begin().await?;
                 sqlx::query("UPDATE klaviyo_imports SET source_counts = jsonb_set(source_counts, ARRAY[$2, $3], $4, true) WHERE id = $1")
                     .bind(self.imp.id)
                     .bind(key)
                     .bind(kid)
                     .bind(&entry)
-                    .execute(&self.state.db)
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
                 self.set_st("cmp_i", json!(i + 1));
                 Ok(false)
             }
@@ -1181,20 +1309,21 @@ impl<'a> Run<'a> {
                                 "metric_id": kid, "measurements": ["count", "sum_value"], "interval": "month", "page_size": 500, "timezone": tz,
                                 "filter": [format!("greater-or-equal(datetime,{})", start.format("%Y-%m-%dT%H:%M:%S")), format!("less-than(datetime,{})", end.format("%Y-%m-%dT%H:%M:%S"))]}}});
                             match self.k.post("/api/metric-aggregates", &body).await {
-                                Ok(v) => {
-                                    let dates: Vec<String> = v["data"]["attributes"]["dates"].as_array().into_iter().flatten().filter_map(|d| d.as_str().and_then(|d| d.get(..7)).map(String::from)).collect();
-                                    for row in v["data"]["attributes"]["data"].as_array().into_iter().flatten() {
-                                        let counts = row["measurements"]["count"].as_array().cloned().unwrap_or_default();
-                                        let sums = row["measurements"]["sum_value"].as_array().cloned().unwrap_or_default();
-                                        for (j, d) in dates.iter().enumerate() {
-                                            let c = counts.get(j).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                            let sv = sums.get(j).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                                            let e = months.entry(d.clone()).or_insert(json!([0.0, 0.0]));
+                                Ok(v) => match aggregate_months(&v) {
+                                    Ok(got) => {
+                                        for (d, (c, sv)) in got {
+                                            let e = months.entry(d).or_insert(json!([0.0, 0.0]));
                                             e[0] = json!(e[0].as_f64().unwrap_or(0.0) + c);
                                             e[1] = json!(e[1].as_f64().unwrap_or(0.0) + sv);
                                         }
                                     }
-                                }
+                                    // A malformed or partial answer is no number at all, never zero.
+                                    Err(why) => {
+                                        error = Some(why);
+                                        months.clear();
+                                        break;
+                                    }
+                                },
                                 Err(e @ KlaviyoError::Status { .. }) => {
                                     error = Some(format!("Klaviyo wouldn't count this metric's events ({e})"));
                                     months.clear();
@@ -1206,17 +1335,21 @@ impl<'a> Run<'a> {
                         }
                     }
                 }
+                let mut tx = self.begin().await?;
                 sqlx::query("UPDATE klaviyo_imports SET source_counts = jsonb_set(source_counts, ARRAY['metrics', $2], $3, true) WHERE id = $1")
                     .bind(self.imp.id)
                     .bind(&kid)
                     .bind(json!({"name": name, "since": since.map(fmt_ts), "months": months, "error": error}))
-                    .execute(&self.state.db)
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
                 self.set_st("cmp_i", json!(i + 1));
                 Ok(false)
             }
             _ => {
-                sqlx::query("UPDATE klaviyo_imports SET compared_at = now(), report_cached_at = NULL WHERE id = $1").bind(self.imp.id).execute(&self.state.db).await?;
+                let mut tx = self.begin().await?;
+                sqlx::query("UPDATE klaviyo_imports SET compared_at = now(), report_cached_at = NULL WHERE id = $1").bind(self.imp.id).execute(&mut *tx).await?;
+                tx.commit().await?;
                 Ok(true)
             }
         }
@@ -1270,25 +1403,57 @@ impl<'a> Run<'a> {
         self.set_st("group", json!(0));
         if phase == "profiles" {
             let n = self.st("scan_profiles").as_i64().unwrap_or(0);
-            sqlx::query("UPDATE klaviyo_imports SET source_counts = source_counts || jsonb_build_object('profiles_scan', jsonb_build_object('total', $2::bigint, 'complete', true, 'at', now())) WHERE id = $1")
+            let mut tx = self.begin().await?;
+            sqlx::query("UPDATE klaviyo_imports SET source_counts = source_counts || jsonb_build_object('profiles_scan', jsonb_build_object('total', $2::bigint, 'complete', true, 'import', $3::text, 'at', now())) WHERE id = $1")
                 .bind(self.imp.id)
                 .bind(n)
-                .execute(&self.state.db)
+                .bind(self.imp.id.to_string())
+                .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
         }
         self.imp.phase = self.next_phase(Some(phase)).map(String::from);
         Ok(())
     }
 }
 
-/// Where a Klaviyo form signs people up: the `list_id` of a submitting action (`submit: true`) in the
-/// live versions (or every version when none is live). More than one, or none, is for a person to pick.
+/// Monthly (count, sum of values) from a metric-aggregates answer, keyed by YYYY-MM. Anything missing or
+/// out of shape (no dates, no row, a measurement array of the wrong length, a value that isn't a number)
+/// is an error: the report then says "not verified" instead of treating it as zero.
+pub fn aggregate_months(v: &Value) -> Result<Vec<(String, (f64, f64))>, String> {
+    let bad = || "Klaviyo's count for this metric came back incomplete".to_string();
+    let a = &v["data"]["attributes"];
+    let dates: Vec<String> = a["dates"].as_array().ok_or_else(bad)?.iter().map(|d| d.as_str().and_then(|d| d.get(..7)).map(String::from).ok_or_else(bad)).collect::<Result<_, _>>()?;
+    let rows = a["data"].as_array().ok_or_else(bad)?;
+    if rows.is_empty() && !dates.is_empty() {
+        return Err(bad());
+    }
+    let mut out: Vec<(String, (f64, f64))> = dates.iter().map(|d| (d.clone(), (0.0, 0.0))).collect();
+    for row in rows {
+        let counts = row["measurements"]["count"].as_array().ok_or_else(bad)?;
+        let sums = row["measurements"]["sum_value"].as_array().ok_or_else(bad)?;
+        if counts.len() != dates.len() || sums.len() != dates.len() {
+            return Err(bad());
+        }
+        for (j, slot) in out.iter_mut().enumerate() {
+            slot.1 .0 += counts[j].as_f64().ok_or_else(bad)?;
+            slot.1 .1 += sums[j].as_f64().ok_or_else(bad)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Where a Klaviyo form signs people up: the `list_id` of a sign-up action in the live versions (or every
+/// version when none is live). A sign-up action is a submitting (`submit: true`) next step, close or
+/// redirect; other actions that carry a `list_id` (a back-in-stock request) aren't sign-ups. More than
+/// one, or none, is for a person to pick.
 pub fn form_destinations(def: &Value) -> Vec<String> {
     fn walk(v: &Value, out: &mut Vec<String>) {
         match v {
             Value::Object(o) => {
                 if let Some(a) = o.get("action").filter(|a| a.is_object()) {
-                    let submits = a["submit"] == true || a["properties"]["submit"] == true;
+                    let signup = matches!(a["type"].as_str(), Some("next_step" | "close" | "redirect"));
+                    let submits = signup && a["submit"] == true;
                     if let Some(id) = a["properties"]["list_id"].as_str().filter(|i| !i.is_empty()) {
                         if submits && !out.iter().any(|x| x == id) {
                             out.push(id.to_string());
@@ -1355,7 +1520,11 @@ pub async fn run(state: &AppState, import_id: Uuid) -> anyhow::Result<()> {
     }
     let res = drive(&mut r).await;
     release(&state.db, r.imp.id, r.owner).await?;
-    res
+    match res {
+        // Paused, cancelled or taken over while this run worked: it stops without writing.
+        Err(e) if e.is::<Superseded>() => Ok(()),
+        other => other,
+    }
 }
 
 async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
@@ -1368,8 +1537,10 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
     }
     loop {
         let Some(phase) = r.imp.phase.clone() else {
-            finish(r).await?;
-            return Ok(());
+            return match finish(r).await {
+                Err(e) if e.is::<Superseded>() => Ok(()),
+                other => other,
+            };
         };
         match r.step(&phase).await {
             Ok(done) => {
@@ -1383,6 +1554,7 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
+            Err(e) if e.is::<Superseded>() => return Ok(()),
             Err(e) => {
                 let ke = e.downcast_ref::<KlaviyoError>();
                 match ke {
@@ -1396,7 +1568,7 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
                         let msg = format!("{}. This part was left out.", KlaviyoError::MissingScope(what.clone()));
                         r.issue(&phase, "skipped", "Klaviyo access", None, None, &msg).await?;
                         if phase == "events" {
-                            r.mark_history(false).await?;
+                            r.close_history().await?;
                         }
                         r.step_done(&phase).await?;
                         if !r.save().await? {
@@ -1441,16 +1613,31 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
 }
 
 async fn finish(r: &mut Run<'_>) -> anyhow::Result<()> {
-    let db = &r.state.db;
-    // Done, and the key is deleted, in one statement.
+    // Done, and the key is deleted, in one transaction that still owns the run.
+    let mut tx = r.begin().await?;
     sqlx::query(
         "UPDATE klaviyo_imports SET status = 'done', phase = NULL, cursor = NULL, finished_at = now(), report_cached_at = NULL,
             api_key_enc = NULL, lease_owner = NULL, lease_until = NULL, updated_at = now()
          WHERE id = $1 AND status = 'importing'",
     )
     .bind(r.imp.id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    // The last Klaviyo send this run found (a sent campaign, or an email or text Klaviyo delivered), for
+    // the "unsubscribes up to date" check.
+    sqlx::query(
+        "UPDATE klaviyo_imports SET source_counts = source_counts || jsonb_build_object('last_klaviyo_send', (SELECT GREATEST(
+            (SELECT max(c.sent_at) FROM klaviyo_refs r JOIN campaigns c ON c.id = r.local_id WHERE r.account_id = $2 AND r.kind = 'campaign_message'),
+            $3::timestamptz)))
+         WHERE id = $1",
+    )
+    .bind(r.imp.id)
+    .bind(r.acct())
+    .bind(ts(r.st("last_send")))
+    .execute(&mut *tx)
+    .await?;
+    super::history::close(&mut tx, r.imp.id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1489,6 +1676,10 @@ mod tests {
             {"status": "live", "steps": [{"components": [{"action": {"type": "redirect", "submit": true, "properties": {"list_id": "L2", "url": "x"}}}]}]}
         ]});
         assert_eq!(super::form_destinations(&two), vec!["L1", "L2"]);
+        let bis = json!({"versions": [{"status": "live", "steps": [{"components": [
+            {"action": {"type": "submit_back_in_stock", "submit": true, "properties": {"list_id": "LBIS"}}},
+            {"action": {"type": "next_step", "submit": true, "properties": {"list_id": "L1"}}}]}]}]});
+        assert_eq!(super::form_destinations(&bis), vec!["L1"], "a back-in-stock request isn't a sign-up");
         assert!(super::form_destinations(&json!({"versions": []})).is_empty());
     }
 }

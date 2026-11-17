@@ -229,17 +229,29 @@ async fn read_capped(mut res: reqwest::Response) -> KResult<Vec<u8>> {
     Ok(out)
 }
 
+/// Klaviyo error codes kept as they are; anything else is stored as "other" (a vendor's code is text we
+/// don't control, so only known values go into stored errors and logs).
+const KNOWN_CODES: &[&str] = &[
+    "invalid", "invalid_input", "parse_error", "not_found", "not_authenticated", "authentication_failed", "permission_denied", "throttled", "conflict",
+    "duplicate_profile", "method_not_allowed", "not_acceptable", "unsupported_media_type", "internal_error", "service_unavailable",
+];
+
 fn error_for(status: u16, body: &[u8]) -> KlaviyoError {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let first = &v["errors"][0];
     // The detail text is read only to tell a bad key or a missing scope; it's never kept.
-    let code: String = first["code"].as_str().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(60).collect();
+    let raw = first["code"].as_str().unwrap_or("");
     let detail = first["detail"].as_str().or(first["title"].as_str()).unwrap_or("").to_lowercase();
+    let code = match KNOWN_CODES.iter().find(|c| **c == raw) {
+        Some(c) => c.to_string(),
+        None if raw.is_empty() => "no code".to_string(),
+        None => "other".to_string(),
+    };
     match status {
         401 => KlaviyoError::BadKey,
-        400 if code.contains("authenticat") || detail.contains("api key") => KlaviyoError::BadKey,
+        400 if raw.contains("authenticat") || detail.contains("api key") => KlaviyoError::BadKey,
         403 => KlaviyoError::MissingScope(scope_hint(&detail)),
-        _ => KlaviyoError::Status { status, code: if code.is_empty() { "no code".into() } else { code } },
+        _ => KlaviyoError::Status { status, code },
     }
 }
 
@@ -300,6 +312,9 @@ mod tests {
         assert!(error_for(503, b"").is_transient());
         let e = error_for(400, br#"{"errors":[{"code":"invalid","detail":"Bad filter for pk_secret123 at profile ann@example.com"}]}"#);
         assert_eq!(e.to_string(), "Klaviyo returned 400 (invalid)", "Klaviyo's detail text is never kept");
+        let e = error_for(400, br#"{"errors":[{"code":"pk_live_abc123_leaked","detail":"x"}]}"#);
+        assert_eq!(e.to_string(), "Klaviyo returned 400 (other)", "an unknown code is stored as other, not filtered");
+        assert_eq!(error_for(500, br#"{"errors":[{}]}"#).to_string(), "Klaviyo returned 500 (no code)");
     }
 
     #[test]

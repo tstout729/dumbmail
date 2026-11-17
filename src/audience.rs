@@ -313,7 +313,7 @@ pub struct HistoryEvent {
 /// Record past events quietly: no flows start and nothing is sent or billed. Profiles' `last_event_at`
 /// moves only as far as the events' own times. Returns how many were new. One statement, so replaying a
 /// batch after a crash (its events already there) still brings `last_event_at` up to date.
-pub async fn record_history(db: &PgPool, account_id: Uuid, events: &[HistoryEvent]) -> AppResult<u64> {
+pub async fn record_history<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid, events: &[HistoryEvent]) -> AppResult<u64> {
     if events.is_empty() {
         return Ok(0);
     }

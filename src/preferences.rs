@@ -73,7 +73,7 @@ pub async fn save(db: &PgPool, account_id: Uuid, profile_id: Uuid, keep: &HashSe
             audience::add_to_list(db, account_id, l.id, &[profile_id]).await?;
             changed += 1;
         } else if !want && l.member {
-            sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = $2").bind(l.id).bind(profile_id).execute(db).await?;
+            crate::features::klaviyo_import::remove_members(db, account_id, l.id, &[profile_id]).await?;
             let mut props = json!({"list_id": l.id, "list": l.name, "method": "preferences"});
             if let Some((message_id, campaign_id, flow_id)) = message {
                 props["message_id"] = json!(message_id);
