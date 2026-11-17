@@ -89,6 +89,36 @@ pub fn resolve<'a>(source: &'a str, ctx: &Value) -> AppResult<Cow<'a, str>> {
     }
 }
 
+/// What [`hide_tags`] puts in place of a coupon tag: letters and digits, so a step that reads
+/// links can't change it.
+const HIDDEN: &str = "dmcoupontag";
+
+/// `source` with each literal coupon tag swapped for a plain placeholder, and the tags it took out
+/// (in order) for [`restore_tags`]. Lets a step that personalizes and checks a link before codes are
+/// claimed (the content module's blocks) leave the tag for the renderer. Codes are letters, digits,
+/// `-` and `_`, so a link that is valid with the placeholder stays valid with the code.
+pub fn hide_tags(source: &str) -> (Cow<'_, str>, Vec<String>) {
+    if !source.contains("coupon_") || !TAG.is_match(source) {
+        return (Cow::Borrowed(source), Vec::new());
+    }
+    let mut tags = Vec::new();
+    let out = TAG.replace_all(source, |c: &regex::Captures<'_>| {
+        tags.push(c[0].to_string());
+        format!("{HIDDEN}{}x", tags.len() - 1)
+    });
+    (Cow::Owned(out.into_owned()), tags)
+}
+
+/// Put back the tags [`hide_tags`] took out.
+pub fn restore_tags(s: &str, tags: &[String]) -> String {
+    let mut out = s.to_string();
+    // The trailing "x" keeps placeholder 1 from matching inside placeholder 11.
+    for (i, tag) in tags.iter().enumerate() {
+        out = out.replace(&format!("{HIDDEN}{i}x"), tag);
+    }
+    out
+}
+
 /// The coupon names in one template source, lowercased.
 fn names_in(source: &str, out: &mut BTreeSet<String>) {
     if !source.contains("coupon_") {
@@ -319,6 +349,16 @@ mod tests {
         assert!(check_content("email", &json!({"subject": "{% coupon_code 'A' %}", "blocks": []})).is_err());
         assert!(forbid(&json!({"subject": "x", "blocks": [{"type": "coupon", "coupon": "A"}]})).is_err());
         assert!(forbid(&json!({"subject": "Your receipt", "blocks": [{"type": "text", "html": "Thanks"}]})).is_ok());
+    }
+
+    #[test]
+    fn hidden_tags_come_back_unchanged() {
+        let src = "https://shop.example/discount/{% coupon_code 'WELCOME' %}?a={{ first_name }}&b={% coupon_code 'VIP' %}";
+        let (hidden, tags) = hide_tags(src);
+        assert!(!hidden.contains("coupon_code"));
+        assert_eq!(tags.len(), 2);
+        assert_eq!(restore_tags(&hidden, &tags), src);
+        assert!(matches!(hide_tags("https://x.test/{{ a }}").0, Cow::Borrowed(_)));
     }
 
     #[test]
