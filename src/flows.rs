@@ -668,7 +668,8 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
             "wait_for_reply" => {
                 let at = |k: &str| context.get(k).and_then(|v| serde_json::from_value::<chrono::DateTime<Utc>>(v.clone()).ok());
                 let since = at("_reply_since").unwrap_or_else(Utc::now);
-                let until = at("_reply_until").unwrap_or_else(Utc::now).min(Utc::now());
+                // A deadline that can't be read counts nothing after the wait began.
+                let until = at("_reply_until").unwrap_or(since).min(Utc::now());
                 if let Some(o) = context.as_object_mut() {
                     o.remove("_waited");
                     o.remove("_reply_since");

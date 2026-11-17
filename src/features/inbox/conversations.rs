@@ -77,7 +77,7 @@ fn row_json(r: &Row, now: DateTime<Utc>) -> Value {
 const SELECT: &str = "SELECT c.id, c.profile_id, c.status, c.unread_count, c.last_message_at, c.last_inbound_at, c.last_direction, c.last_preview,
         p.first_name, p.last_name, p.phone_number, p.email, p.sms_consent,
         t.from_number AS target_from, t.to_number AS target_to, t.verified AS target_verified, w.start AS window_start,
-        EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = c.account_id AND o.phone_number = t.from_number) AS opted_out
+        EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = c.account_id AND o.phone_number = COALESCE(t.from_number, p.phone_number)) AS opted_out
     FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id
     LEFT JOIN LATERAL (SELECT i.from_number, i.to_number, i.verified FROM sms_inbound i WHERE i.conversation_id = c.id AND i.kind NOT IN ('stop', 'blocked')
                        ORDER BY i.provider_received_at DESC, i.id DESC LIMIT 1) t ON true
@@ -209,7 +209,7 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTim
         .collect();
     let now = Utc::now();
     let f = facts(conv);
-    let oldest = items.iter().take(limit as usize).last().map(|m| m.at);
+    let oldest = items.iter().take(limit as usize).next_back().map(|m| m.at);
     Ok(json!({
         "conversation": row_json(conv, now),
         "messages": messages,

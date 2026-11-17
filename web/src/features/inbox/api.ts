@@ -1,4 +1,4 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "../../api/client";
 import type {
   ConversationDetail,
@@ -29,21 +29,31 @@ export const inboxKeys = {
 /** New texts arrive on their own, so inbox views refresh every 15 seconds while open. */
 const LIVE = 15_000;
 
+const PAGE = 50;
+
+/** Conversations, a page at a time ("Show more" loads the next). */
 export function useConversations(f: ConversationFilter) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: inboxKeys.conversations(f),
-    queryFn: () => api<ConversationList>("GET", withQuery("/api/inbox/conversations", { status: f.status, unread: f.unread || undefined, q: f.q, limit: 100 })),
+    queryFn: ({ pageParam }) =>
+      api<ConversationList>("GET", withQuery("/api/inbox/conversations", { status: f.status, unread: f.unread || undefined, q: f.q, limit: PAGE, offset: pageParam })),
+    initialPageParam: 0,
+    getNextPageParam: (last, pages) => {
+      const loaded = pages.reduce((n, p) => n + p.data.length, 0);
+      return loaded < last.total && last.data.length > 0 ? loaded : undefined;
+    },
     placeholderData: keepPreviousData,
     refetchInterval: LIVE,
   });
 }
 
-/** A thread's newest `limit` texts. */
-export function useConversation(id: string, limit: number) {
-  return useQuery({
-    queryKey: [...inboxKeys.conversation(id), limit],
-    queryFn: () => api<ConversationDetail>("GET", withQuery(`/api/inbox/conversations/${id}`, { limit })),
-    placeholderData: keepPreviousData,
+/** A thread: the newest texts first, then older pages by date (`before`). */
+export function useConversation(id: string) {
+  return useInfiniteQuery({
+    queryKey: inboxKeys.conversation(id),
+    queryFn: ({ pageParam }) => api<ConversationDetail>("GET", withQuery(`/api/inbox/conversations/${id}`, { limit: PAGE, before: pageParam ?? undefined })),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.next_before ?? undefined,
     refetchInterval: LIVE,
   });
 }

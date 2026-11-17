@@ -155,10 +155,13 @@ function KeywordDialog({ keyword, onClose }: { keyword: SmsKeyword | null; onClo
   const [enabled, setEnabled] = useState(keyword?.enabled ?? true);
   const s = settings.data;
   const needsDisclosure = subscribe && s !== undefined && !s.disclosure_ready;
+  const needsSupport = enabled && s !== undefined && !s.support_ready;
+  // Sign-up keywords only ever match the whole text, so "join me for lunch?" signs nobody up.
+  const matchType: KeywordMatch = subscribe ? "exact" : match;
 
   const submit = () =>
     save.mutate(
-      { id: keyword?.id, input: { keyword: word, aliases, match_type: match, subscribe, double_opt_in: subscribe && doubleOptIn, list_id: listId || null, reply, enabled } },
+      { id: keyword?.id, input: { keyword: word, aliases, match_type: matchType, subscribe, double_opt_in: subscribe && doubleOptIn, list_id: listId || null, reply, enabled } },
       {
         onSuccess: () => {
           toast.success(keyword ? "Keyword saved" : "Keyword added");
@@ -176,7 +179,7 @@ function KeywordDialog({ keyword, onClose }: { keyword: SmsKeyword | null; onClo
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} disabled={!word.trim() || needsDisclosure} onClick={submit}>
+          <Button variant="primary" loading={save.isPending} disabled={!word.trim() || needsDisclosure || needsSupport} onClick={submit}>
             Save
           </Button>
         </>
@@ -191,10 +194,12 @@ function KeywordDialog({ keyword, onClose }: { keyword: SmsKeyword | null; onClo
             <TagInput value={aliases} onChange={(v) => setAliases(v.map((a) => a.toUpperCase()))} placeholder="VIP, DEALS" />
           </Field>
         </div>
-        <Field label="Match">
+        <Field label="Match" hint={subscribe ? "Sign-up keywords must be the whole text." : undefined}>
           <Segmented
-            value={match}
-            onChange={setMatch}
+            value={matchType}
+            onChange={(m) => {
+              if (!subscribe) setMatch(m);
+            }}
             options={[
               { value: "exact", label: "The whole text is the word" },
               { value: "starts_with", label: "The text starts with it" },
@@ -202,12 +207,15 @@ function KeywordDialog({ keyword, onClose }: { keyword: SmsKeyword | null; onClo
           />
         </Field>
         <div className="space-y-2 rounded-lg border border-zinc-200 p-3">
-          <Checkbox label="Subscribe them to marketing texts" description="Texting the keyword is their sign-up. DumbMail records when and how they agreed." checked={subscribe} onChange={(e) => setSubscribe(e.target.checked)} />
+          <Checkbox
+            label="Subscribe them to marketing texts"
+            description="Texting the keyword is their sign-up. They're subscribed once the confirmation text (with the required disclosures) goes out, and DumbMail keeps a copy of exactly what it said."
+            checked={subscribe} onChange={(e) => setSubscribe(e.target.checked)} />
           {subscribe ? (
             <Checkbox
               className="ml-6"
               label="Ask them to reply Y first (double opt-in)"
-              description="They're only subscribed once they confirm."
+              description="We text them a question first. A Y within 7 days of it going out sends the confirmation."
               checked={doubleOptIn}
               onChange={(e) => setDoubleOptIn(e.target.checked)}
             />
@@ -239,6 +247,11 @@ function KeywordDialog({ keyword, onClose }: { keyword: SmsKeyword | null; onClo
           <Textarea value={reply} onChange={(e) => setReply(e.target.value)} rows={3} maxLength={480} placeholder={subscribe ? "Welcome! Here's 10% off: SAVE10" : "We're open 9 to 5, Monday to Friday."} />
         </Field>
         <Checkbox label="On" description="Turn off to stop answering this word without deleting it." checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+        {needsSupport ? (
+          <Notice tone="amber" title="Add a support contact first">
+            Anyone who texts HELP gets your program name and how to reach you. Add an email or phone in <Link to="/settings/inbox" className="underline">Inbox settings</Link>.
+          </Notice>
+        ) : null}
         <InlineError message={save.error ? errorMessage(save.error) : null} />
       </div>
     </Modal>

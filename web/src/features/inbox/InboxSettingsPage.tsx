@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { errorMessage, useSession } from "../../api";
-import { Button, Card, Checkbox, ConfirmDialog, EmptyState, Field, IconButton, InlineError, Input, Modal, Select, Skeleton, Textarea, Toggle } from "../../components/ui";
+import { Button, Card, Checkbox, ConfirmDialog, EmptyState, Field, IconButton, InlineError, Input, Modal, Notice, Segmented, Select, Skeleton, Textarea, Toggle } from "../../components/ui";
 import { toast } from "../../lib/toast";
 import { useDeleteSavedReply, useInboxSettings, useSaveInboxSettings, useSavedReplies, useSaveSavedReply } from "./api";
-import type { InboxSettings, InboxSettingsPatch, SavedReply } from "./types";
+import type { HelpReplies, InboxSettings, InboxSettingsPatch, SavedReply } from "./types";
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -30,11 +30,16 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
   const { account } = useSession();
   const save = useSaveInboxSettings();
   const [s, setS] = useState(initial);
+  const [telnyxKey, setTelnyxKey] = useState("");
   const set = (patch: Partial<InboxSettings>) => setS((v) => ({ ...v, ...patch }));
   const submit = () => {
     const patch: InboxSettingsPatch = {
       program_name: s.program_name,
       message_frequency: s.message_frequency,
+      support_contact: s.support_contact,
+      help_replies: s.help_replies,
+      auto_budget_account: s.auto_budget_account,
+      auto_budget_number: s.auto_budget_number,
       default_reply_enabled: s.default_reply_enabled,
       default_reply: s.default_reply,
       away_reply_enabled: s.away_reply_enabled,
@@ -43,14 +48,38 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
       close_hour: s.close_hour,
       open_days: s.open_days,
       notify_user_ids: s.notify_user_ids,
+      ...(telnyxKey.trim() ? { telnyx_public_key: telnyxKey.trim() } : {}),
     };
     save.mutate(patch, { onSuccess: () => toast.success("Inbox settings saved") });
   };
   const toggleDay = (d: number) => set({ open_days: s.open_days.includes(d) ? s.open_days.filter((x) => x !== d) : [...s.open_days, d].sort() });
   const toggleMember = (id: string) => set({ notify_user_ids: s.notify_user_ids.includes(id) ? s.notify_user_ids.filter((x) => x !== id) : [...s.notify_user_ids, id] });
 
+  const v = s.verification;
   return (
     <>
+      <Card title="Checking texts come from your provider">
+        {v.configured ? (
+          <Notice tone="green" title="Inbound texts are verified">
+            Each text's signature from {v.provider === "twilio" ? "Twilio" : "Telnyx"} is checked, and forged ones are refused.
+          </Notice>
+        ) : (
+          <Notice tone="amber" title="Keywords, automatic replies and reply windows need your provider's signing key">
+            Without it, texts are still kept and STOP is always honored, but a text can't sign anyone up, get an automatic reply, open the 24-hour reply window or start a
+            flow, because anyone who learned your webhook address could fake one. {v.how}
+          </Notice>
+        )}
+        {v.provider === "telnyx" && (s.telnyx_public_key_hint !== null || !v.configured) ? (
+          <div className="mt-3">
+            <Field
+              label="Telnyx public key (your own Telnyx account only)"
+              hint={s.telnyx_public_key_hint ? `Saved: ${s.telnyx_public_key_hint} Paste a new one to replace it.` : "Telnyx portal → Keys & Credentials → Public Key."}
+            >
+              <Input value={telnyxKey} onChange={(e) => setTelnyxKey(e.target.value)} placeholder="Base64 key" className="font-mono" autoComplete="off" />
+            </Field>
+          </div>
+        ) : null}
+      </Card>
       <Card title="Sign-up texts">
         <p className="mb-3 text-sm text-zinc-600">
           When someone texts a sign-up keyword like JOIN, the confirmation must say who you are and how often you text. DumbMail adds "Msg & data rates may apply. Reply
@@ -65,11 +94,36 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
           </Field>
         </div>
       </Card>
+      <Card title="HELP">
+        <p className="mb-3 text-sm text-zinc-600">
+          Anyone who texts HELP or INFO gets one fixed answer (at most once an hour): "{s.program_name || account.name}: For help, contact {s.support_contact || "…"}. Msg &
+          data rates may apply. Reply STOP to cancel." Keywords can't be turned on without a support contact.
+        </p>
+        <div className="space-y-4">
+          <Field label="Support contact" hint="An email address or phone number.">
+            <Input value={s.support_contact} onChange={(e) => set({ support_contact: e.target.value })} maxLength={80} placeholder={`help@${account.name.toLowerCase().replace(/[^a-z0-9]/g, "") || "example"}.com`} />
+          </Field>
+          <Field
+            label="Who answers HELP"
+            hint="Automatic follows your provider: Twilio answers HELP itself on regular and toll-free numbers, so DumbMail doesn't send a second answer; on Telnyx, DumbMail answers."
+          >
+            <Segmented<HelpReplies>
+              value={s.help_replies}
+              onChange={(h) => set({ help_replies: h })}
+              options={[
+                { value: "auto", label: "Automatic" },
+                { value: "dumbmail", label: "Always DumbMail" },
+                { value: "provider", label: "Only my provider" },
+              ]}
+            />
+          </Field>
+        </div>
+      </Card>
       <Card title="Automatic replies">
         <div className="space-y-4">
           <ReplySetting
             title="Default reply"
-            description="Answers texts that don't match a keyword. Each person gets it at most once every 12 hours, so two automated numbers can't text each other forever."
+            description="Answers texts that don't match a keyword, within 24 hours of their text. Each person gets it at most once every 12 hours, so two automated numbers can't text each other forever."
             enabled={s.default_reply_enabled}
             text={s.default_reply}
             placeholder="Thanks for your text! We'll get back to you soon."
@@ -122,6 +176,27 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
               </span>
             </div>
           </div>
+        </div>
+      </Card>
+      <Card title="Limits on automatic texts">
+        <p className="mb-3 text-sm text-zinc-600">
+          Keyword answers, sign-up texts, automatic replies and HELP answers are billed like any text. These hourly limits stop someone texting from many numbers from
+          running up your balance. When one is reached, automatic texts pause until the next hour and the inbox says so. Each person also gets at most 5 an hour.
+        </p>
+        {s.auto_paused ? (
+          <div className="mb-3">
+            <Notice tone="amber" title="A limit was reached this hour">
+              Automatic texts are paused until the next hour.
+            </Notice>
+          </div>
+        ) : null}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <Field label="Per hour for the account" hint={`Up to ${s.max_budget_account}.`}>
+            <Input type="number" min={0} max={s.max_budget_account} value={s.auto_budget_account} onChange={(e) => set({ auto_budget_account: Number(e.target.value) })} />
+          </Field>
+          <Field label="Per hour for each of your numbers" hint={`Up to ${s.max_budget_number}.`}>
+            <Input type="number" min={0} max={s.max_budget_number} value={s.auto_budget_number} onChange={(e) => set({ auto_budget_number: Number(e.target.value) })} />
+          </Field>
         </div>
       </Card>
       <Card title="Email me about new texts">

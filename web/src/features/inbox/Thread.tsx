@@ -9,13 +9,8 @@ import { useConversation, usePreviewReply, useSavedReplies, useSendReply, useSet
 import { personLabel } from "./InboxPage";
 import type { ConversationDetail, ThreadMessage } from "./types";
 
-/** Most texts a thread shows at once; older history is on the API (`before`). */
-const MAX_SHOWN = 500;
-
 export function Thread({ id }: { id: string }) {
-  // Showing more grows the page instead of paging by date, so the live refresh can't leave gaps.
-  const [limit, setLimit] = useState(100);
-  const detail = useConversation(id, limit);
+  const detail = useConversation(id);
   if (detail.isPending) {
     return (
       <div className="flex h-full flex-col gap-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-xs">
@@ -33,8 +28,11 @@ export function Thread({ id }: { id: string }) {
       </div>
     );
   }
-  const more = detail.data.has_more && limit < MAX_SHOWN ? () => setLimit((l) => Math.min(MAX_SHOWN, l + 100)) : null;
-  return <ThreadView id={id} detail={detail.data} onShowOlder={more} loadingOlder={detail.isFetching && detail.isPlaceholderData} />;
+  const [latest] = detail.data.pages;
+  const seen = new Set<string>();
+  const messages = detail.data.pages.flatMap((p) => p.messages).filter((m) => (seen.has(m.id) ? false : (seen.add(m.id), true)));
+  const more = detail.hasNextPage ? () => void detail.fetchNextPage() : null;
+  return <ThreadView id={id} detail={{ ...latest, messages }} onShowOlder={more} loadingOlder={detail.isFetchingNextPage} />;
 }
 
 function BackLink() {
@@ -63,6 +61,7 @@ function ThreadView({ id, detail, onShowOlder, loadingOlder }: ThreadViewProps) 
             <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
               {fullName(p) ? <span className="tabular-nums">{formatPhone(p.phone_number)}</span> : null}
               <StatusBadge status={p.sms_consent} label={consentLabel(p.sms_consent)} />
+              {conversation.opted_out ? <Badge tone="red">Opted out (texted STOP)</Badge> : null}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -100,7 +99,7 @@ function ThreadView({ id, detail, onShowOlder, loadingOlder }: ThreadViewProps) 
 }
 
 function consentLabel(c: string): string {
-  return { subscribed: "Subscribed to texts", unsubscribed: "Texted STOP", never_subscribed: "Not subscribed", pending: "Confirming sign-up" }[c] ?? c;
+  return { subscribed: "Subscribed to texts", unsubscribed: "Unsubscribed from texts", never_subscribed: "Not subscribed", pending: "Confirming sign-up" }[c] ?? c;
 }
 
 const kindBadges: Partial<Record<ThreadMessage["kind"], { tone: Tone; label: string }>> = {
@@ -110,11 +109,32 @@ const kindBadges: Partial<Record<ThreadMessage["kind"], { tone: Tone; label: str
   confirm: { tone: "green", label: "Confirmed sign-up" },
 };
 
+const outboundSources: Partial<Record<ThreadMessage["kind"], string>> = {
+  auto_reply: "Automatic reply",
+  keyword_reply: "Keyword answer",
+  confirmation: "Sign-up confirmation",
+  optin_request: "Sign-up question (reply Y)",
+  help: "Answer to HELP",
+};
+
+function inboundBadge(m: ThreadMessage): { tone: Tone; label: string } | undefined {
+  if (m.direction !== "inbound") return undefined;
+  if (m.kind === "keyword") return { tone: "violet", label: `Keyword ${m.keyword ?? ""}` };
+  if (m.kind === "blocked") return { tone: "gray", label: m.keyword ? `Texted ${m.keyword} while opted out` : "Texted while opted out" };
+  return kindBadges[m.kind];
+}
+
 function Bubble({ m }: { m: ThreadMessage }) {
   const { account } = useSession();
   const inbound = m.direction === "inbound";
-  const badge = m.kind === "keyword" ? { tone: "violet" as Tone, label: `Keyword ${m.keyword ?? ""}` } : kindBadges[m.kind];
-  const source = m.campaign ? `Campaign: ${m.campaign.name ?? "deleted"}` : m.flow ? `Flow: ${m.flow.name ?? "deleted"}` : m.kind === "auto_reply" ? "Automatic reply" : m.sent_by ? `Sent by ${m.sent_by}` : m.kind === "reply" ? "Sent over the API" : null;
+  const badge = inboundBadge(m);
+  const source = inbound
+    ? null
+    : m.campaign
+      ? `Campaign: ${m.campaign.name ?? "deleted"}`
+      : m.flow
+        ? `Flow: ${m.flow.name ?? "deleted"}`
+        : (outboundSources[m.kind] ?? (m.sent_by ? `Sent by ${m.sent_by}` : m.kind === "reply" ? "Sent over the API" : null));
   const failed = m.status === "failed" || m.status === "bounced";
   return (
     <div className={cx("flex max-w-[85%] flex-col gap-1 sm:max-w-[70%]", inbound ? "items-start self-start" : "items-end self-end")}>
@@ -128,10 +148,14 @@ function Bubble({ m }: { m: ThreadMessage }) {
         {m.media.length > 0 ? (
           <div className="mt-2 flex flex-wrap gap-2">
             {m.media.map((media, i) =>
-              media.stored ? (
+              media.stored && media.url ? (
                 <a key={i} href={media.url} target="_blank" rel="noreferrer">
                   <img src={media.url} alt="Picture they texted" className="max-h-48 rounded-lg" />
                 </a>
+              ) : !media.url ? (
+                <span key={i} className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                  <Paperclip className="size-3" /> {media.content_type ?? "Attachment"} (couldn't be copied; open it in your texting provider's console)
+                </span>
               ) : (
                 <a key={i} href={media.url} target="_blank" rel="noopener noreferrer nofollow" className={cx("inline-flex items-center gap-1 text-xs underline", inbound || m.kind !== "reply" ? "text-zinc-700" : "text-white")}>
                   <Paperclip className="size-3" /> {media.content_type ?? "Attachment"}
@@ -143,6 +167,11 @@ function Bubble({ m }: { m: ThreadMessage }) {
       </div>
       <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-400">
         {badge ? <Badge tone={badge.tone}>{badge.label}</Badge> : null}
+        {inbound && m.verified === false ? (
+          <span title="Your texting provider's signature couldn't be checked, so this text can't trigger keywords, automatic replies or flows">
+            <Badge tone="amber">Not verified</Badge>
+          </span>
+        ) : null}
         {source ? <span>{source}</span> : null}
         <span>{formatDateTime(m.at, account.timezone)}</span>
         {failed ? <span className="text-red-600">Not delivered{m.error ? `: ${m.error}` : ""}</span> : null}
@@ -193,6 +222,7 @@ function ReplyBox({ id, reply }: { id: string; reply: ConversationDetail["reply"
           They aren't subscribed to texts, so you can reply until {formatDateTime(reply.window_ends_at, account.timezone)} (24 hours after their last text).
         </p>
       ) : null}
+      {reply.from ? <p className="text-xs text-zinc-500">Replies go from {formatPhone(reply.from)}, the number they texted.</p> : null}
       <Textarea
         value={body}
         onChange={(e) => {

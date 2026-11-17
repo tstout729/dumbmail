@@ -252,7 +252,7 @@ Attribution: by default a conversion event (`Placed Order`) is credited to the n
 - `GET /client/form-render.js` – the shared form renderer as `window.DumbMailFormRenderer` (CORS open, cached 5 minutes).
 - `GET /i/:image_id` – an uploaded image, cached for a year (`immutable`), with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'`.
 - `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click). For email, when the account has lists with `show_on_preferences`, GET shows a preference page instead: a checkbox per list, "Save preferences" (`action=save` with a `list` field per checked list; leaving a list records "Unsubscribed from List") and "Unsubscribe from all emails". Any POST without `action=save`, including one-click, unsubscribes from all email.
-- `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
+- `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound texts. Telnyx and Twilio webhooks are signature-checked when a key is configured (`TELNYX_PUBLIC_KEY`, `TWILIO_AUTH_TOKEN`, or the account's own connection) and refused with 403 when the check fails; see `docs/SMS_INBOX.md`.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
 - `GET /healthz` – `{ok: true, git_sha}` (the deployed commit; empty for local builds).
 
@@ -416,7 +416,7 @@ type SmsSetup = {
   provider: string;                  // provider that will send: telnyx | twilio | log
   from_number: string | null;        // the account's active sending number
   can_send: boolean;                 // number exists and is verified (or connected)
-  inbound_webhook_url: string;       // BYO: paste into the provider's messaging webhook so STOP replies are recorded
+  inbound_webhook_url: string;       // BYO: paste into the provider's messaging webhook so replies and STOP reach the inbox
   platform_available: boolean;       // server has a platform Telnyx key (else only BYO)
 };
 type TollFreeVerification = {

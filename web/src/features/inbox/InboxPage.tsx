@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { Inbox, KeyRound, MessageSquare, Search, Settings2 } from "lucide-react";
-import { ButtonLink, Checkbox, EmptyState, Input, Page, PageHeader, Segmented, Skeleton, cx } from "../../components/ui";
+import { Button, ButtonLink, Checkbox, EmptyState, Input, Notice, Page, PageHeader, Segmented, Skeleton, cx } from "../../components/ui";
 import { useDebouncedValue } from "../../lib/hooks";
 import { formatPhone, formatRelative, fullName } from "../../lib/format";
-import { useConversations, useMarkRead, type ConversationFilter } from "./api";
+import { useConversations, useInboxSettings, useMarkRead, type ConversationFilter } from "./api";
 import { Thread } from "./Thread";
 import type { Conversation, ConversationStatus } from "./types";
 
@@ -36,6 +36,7 @@ export function InboxPage() {
           </>
         }
       />
+      <AutoPausedNotice />
       <div className="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-9.5rem)] lg:min-h-[520px] lg:grid-cols-[340px_minmax(0,1fr)]">
         <section className={cx("min-h-0 flex-col rounded-lg border border-zinc-200 bg-white shadow-xs", id ? "hidden lg:flex" : "flex")}>
           <div className="space-y-2.5 border-b border-zinc-100 p-3">
@@ -73,6 +74,26 @@ export function InboxPage() {
   );
 }
 
+/** Automatic texts stop for the rest of the hour when an hourly budget runs out. */
+function AutoPausedNotice() {
+  const settings = useInboxSettings();
+  const s = settings.data;
+  if (!s?.auto_paused) return null;
+  const which = s.auto_budget_hit_scope === "account" ? "Your account's" : `The ${formatPhone(s.auto_budget_hit_scope ?? "")}`;
+  return (
+    <div className="mb-4">
+      <Notice tone="amber" title="Automatic texts are paused until the next hour">
+        {which} hourly limit on automatic texts (keyword answers, sign-up texts, automatic replies, HELP answers) ran out. You can still reply yourself. Change the
+        limits in{" "}
+        <Link to="/settings/inbox" className="underline">
+          Inbox settings
+        </Link>
+        .
+      </Notice>
+    </div>
+  );
+}
+
 function ConversationList({ filter, selected }: { filter: ConversationFilter; selected: string }) {
   const list = useConversations(filter);
   const markRead = useMarkRead();
@@ -87,7 +108,7 @@ function ConversationList({ filter, selected }: { filter: ConversationFilter; se
     );
   }
   if (list.error) return <p className="p-4 text-sm text-red-600">{list.error.message}</p>;
-  const rows = list.data.data;
+  const rows = list.data.pages.flatMap((p) => p.data);
   if (rows.length === 0) {
     const filtered = filter.q !== "" || filter.unread || filter.status !== "open";
     return (
@@ -143,6 +164,13 @@ function ConversationList({ filter, selected }: { filter: ConversationFilter; se
           </button>
         </li>
       ))}
+      {list.hasNextPage ? (
+        <li className="flex justify-center p-2">
+          <Button size="sm" variant="ghost" loading={list.isFetchingNextPage} onClick={() => void list.fetchNextPage()}>
+            Show more
+          </Button>
+        </li>
+      ) : null}
     </ul>
   );
 }
