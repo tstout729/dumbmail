@@ -281,6 +281,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                 .bind(cost)
                 .execute(&state.db)
                 .await?;
+            if let Rendered::Email(e) = &rendered {
+                crate::features::reports::delivery::note_sender(&state.db, message_id, &e.from_email).await?;
+            }
             if limited {
                 crate::deliverability::record_send(&state.db, message_id, &provider_id, spec.account.id, spec.campaign_id).await?;
                 crate::deliverability::complete_daily_slot(state, spec.account.id);
