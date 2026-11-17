@@ -163,6 +163,10 @@ pub struct Config {
     /// PUBLIC_URL. On a different host than PUBLIC_URL, set COOKIE_DOMAIN to a domain covering both.
     #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
     pub google_redirect_base: Option<String>,
+
+    /// The Shopify app (SHOPIFY_API_KEY, SHOPIFY_API_SECRET; see docs/SHOPIFY.md).
+    #[command(flatten)]
+    pub shopify: crate::features::shopify::Settings,
 }
 
 impl Config {

@@ -174,6 +174,8 @@ pub enum Origin {
     Api,
     Csv,
     Feed(Uuid),
+    /// The connected Shopify store's Admin API (see `features::shopify`).
+    Shopify,
 }
 
 impl Origin {
@@ -182,6 +184,7 @@ impl Origin {
             Origin::Api => "api",
             Origin::Csv => "csv",
             Origin::Feed(_) => "feed",
+            Origin::Shopify => "shopify",
         }
     }
     fn feed_id(&self) -> Option<Uuid> {
@@ -414,7 +417,7 @@ enum Saved {
 /// Save products from an authoritative source (not events). Problems with one product are
 /// reported in the summary and don't stop the rest. Products saved here count as verified.
 pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInput], origin: Origin) -> AppResult<UpsertSummary> {
-    if inputs.len() > MAX_BATCH && !matches!(origin, Origin::Feed(_) | Origin::Csv) {
+    if inputs.len() > MAX_BATCH && !matches!(origin, Origin::Feed(_) | Origin::Csv | Origin::Shopify) {
         return Err(AppError::bad(format!("send at most {MAX_BATCH} products per call")));
     }
     let mut out = UpsertSummary::default();

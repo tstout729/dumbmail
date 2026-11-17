@@ -1,0 +1,236 @@
+//! Shopify app: connect a store, server-side order, refund, fulfilment and checkout events from
+//! webhooks, customers and their marketing consent, a history import, product sync into the
+//! catalog, per-person discount codes, and the storefront snippet without pasting code.
+//! See docs/SHOPIFY.md.
+//!
+//! - `shop`: the stored connection, domain checks, and the account's one background worker.
+//! - `client`: calls to the store's GraphQL Admin API, tokens, bulk result files.
+//! - `oauth`: installing (authorization-code grant) and what's set up in the store after.
+//! - `webhooks`: verified deliveries, stored and processed by the worker.
+//! - `orders`, `customers`, `products`: what each kind of record becomes here.
+//! - `events`: recording server events (one event per order whichever source saw it first).
+//! - `import`: history and product reconciles through bulk operations.
+//! - `discounts`: single-use codes made in the store.
+//! - `privacy`: Shopify's mandatory data request and redaction webhooks.
+
+pub mod api;
+pub mod client;
+pub mod customers;
+pub mod discounts;
+pub mod events;
+pub mod import;
+pub mod oauth;
+pub mod orders;
+pub mod privacy;
+pub mod products;
+pub mod shop;
+pub mod webhooks;
+
+use async_trait::async_trait;
+use axum::Router;
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::{Feature, McpDoc};
+use crate::auth::Ctx;
+use crate::error::AppResult;
+use crate::state::AppState;
+
+pub use discounts::{create_discount_code, create_discount_codes, DiscountTemplate, DiscountValue};
+pub use events::absorb_segment_entries;
+
+/// The Admin API version every call uses. 2026-10 is supported until October 16, 2027; move to a
+/// newer stable version before then (see docs/SHOPIFY.md).
+pub const API_VERSION: &str = "2026-10";
+
+const DOC: &str = include_str!("../../../docs/SHOPIFY.md");
+
+/// Operator configuration: the Shopify app's credentials from the Partner (Dev) Dashboard.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct Settings {
+    /// The app's client ID. Unset (with the secret), Settings → Shopify says it isn't available.
+    #[arg(long, env = "SHOPIFY_API_KEY")]
+    pub shopify_api_key: Option<String>,
+    /// The app's client secret: signs OAuth callbacks and webhooks.
+    #[arg(long, env = "SHOPIFY_API_SECRET", hide_env_values = true)]
+    pub shopify_api_secret: Option<String>,
+    /// Base URL that replaces `https://` before every store's host (tests point it at a local stand-in).
+    #[arg(long, env = "SHOPIFY_API_BASE", hide = true)]
+    pub shopify_api_base: Option<String>,
+}
+
+impl Settings {
+    pub fn key(&self) -> Option<&str> {
+        self.shopify_api_key.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    pub fn secret(&self) -> Option<&str> {
+        self.shopify_api_secret.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    pub fn available(&self) -> bool {
+        self.key().is_some() && self.secret().is_some()
+    }
+}
+
+/// Metrics only this app records from Shopify's servers; the browser endpoint refuses them (see
+/// `audience::BROWSER_RESERVED_METRICS`). `Placed Order` and `Started Checkout` stay open to the
+/// browser snippet (stores without the app rely on it) and are reconciled by `unique_id`.
+pub const SERVER_METRICS: &[&str] = &["Ordered Product", "Fulfilled Order", "Fulfilled Partial Order", "Cancelled Order", "Refunded Order"];
+
+pub struct Module;
+
+/// Job: the account's Shopify worker. Does whatever is waiting, most urgent first, for one slice,
+/// then hands back to the queue: webhook deliveries, then items to read again, then unsubscribes to
+/// write back, then the import.
+async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
+    let Some(lease) = shop::acquire(state, account_id).await? else { return Ok(()) };
+    let r = work_inner(state, account_id, &lease).await;
+    let (more, delay) = match &r {
+        Ok(x) => *x,
+        Err(_) => (true, Some(chrono::Duration::seconds(30))),
+    };
+    shop::release(state, &lease, more, delay).await?;
+    r.map(|_| ())
+}
+
+async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> anyhow::Result<(bool, Option<chrono::Duration>)> {
+    let Some(s) = shop::load(&state.db, account_id).await? else { return Ok((false, None)) };
+    if s.status != "connected" {
+        return Ok((false, None));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(shop::SLICE_SECS);
+    let mut metrics = events::Metrics::default();
+    let mut wait: Option<chrono::Duration> = None;
+
+    let mut cx = orders::Ctx { state, account_id, metrics: &mut metrics, quiet: false };
+    let mut more = webhooks::drain(state, &mut cx, deadline).await?;
+
+    // Items to read again: products, then customers, a batch at a time.
+    while std::time::Instant::now() < deadline {
+        let batch: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, shopify_id FROM shopify_refresh WHERE account_id = $1 ORDER BY kind DESC, queued_at LIMIT 50",
+        )
+        .bind(account_id)
+        .fetch_all(&state.db)
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let kind = batch[0].0.clone();
+        let ids: Vec<i64> = batch.iter().filter(|(k, _)| *k == kind).map(|(_, i)| *i).take(if kind == "product" { products::PER_QUERY } else { 50 }).collect();
+        let r = if kind == "product" { products::refresh(state, &s, &ids).await } else { customers::refresh(state, &s, &ids).await };
+        match r {
+            Ok(()) => {
+                sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
+            }
+            Err(e) => match e.retry_after() {
+                Some(secs) => {
+                    wait = Some(chrono::Duration::seconds(secs as i64));
+                    more = true;
+                    break;
+                }
+                None => {
+                    // Not worth retrying (permission, gone): drop them and say so.
+                    sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
+                    shop::note_error(&state.db, account_id, Some(&format!("Reading {kind}s from Shopify failed: {e}."))).await?;
+                }
+            },
+        }
+        shop::renew(state, lease).await?;
+    }
+    let refresh_left: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_refresh WHERE account_id = $1)").bind(account_id).fetch_one(&state.db).await?;
+    more |= refresh_left && wait.is_none();
+
+    if wait.is_none() && std::time::Instant::now() < deadline {
+        match customers::write_back(state, &s, 20).await {
+            Ok(n) if n >= 20 => more = true,
+            Ok(_) => {}
+            Err(e) => {
+                if let Some(secs) = e.retry_after() {
+                    wait = Some(chrono::Duration::seconds(secs as i64));
+                } else {
+                    tracing::warn!(account = %account_id, error = %e, "couldn't write an unsubscribe back to Shopify");
+                }
+            }
+        }
+    }
+
+    if wait.is_none() && std::time::Instant::now() < deadline {
+        match import::step(state, &s, &mut metrics, deadline).await? {
+            import::Step::More => more = true,
+            import::Step::Wait(d) => wait = Some(d),
+            import::Step::Idle => {}
+        }
+    }
+    Ok(match wait {
+        Some(d) => (true, Some(d)),
+        None => (more, None),
+    })
+}
+
+#[async_trait]
+impl Feature for Module {
+    fn name(&self) -> &'static str {
+        "shopify"
+    }
+
+    fn routes(&self) -> Router<AppState> {
+        api::routes()
+    }
+
+    fn mcp_tools(&self) -> Vec<Value> {
+        api::tools()
+    }
+
+    async fn mcp_call(&self, state: &AppState, ctx: &Ctx, name: &str, args: &Value) -> Option<AppResult<Value>> {
+        if !api::tools().iter().any(|t| t["name"] == name) {
+            return None;
+        }
+        Some(api::call(state, ctx, name, args).await)
+    }
+
+    fn mcp_docs(&self) -> Vec<McpDoc> {
+        vec![McpDoc {
+            slug: "shopify",
+            name: "Shopify app",
+            description: "Connecting a Shopify store: events from Shopify's servers, customers and consent, history import, product sync, discount codes, privacy webhooks and setting up the app.",
+            text: DOC,
+        }]
+    }
+
+    async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
+        let account = || payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).ok_or_else(|| anyhow::anyhow!("job payload missing account_id"));
+        Some(match kind {
+            "shopify_work" => match account() {
+                Ok(a) => work(state, a).await,
+                Err(e) => Err(e),
+            },
+            "shopify_setup" => match account() {
+                Ok(a) => oauth::setup(state, a).await,
+                Err(e) => Err(e),
+            },
+            "shopify_privacy" => match account() {
+                Ok(a) => privacy::run(state, a).await,
+                Err(e) => Err(e),
+            },
+            _ => return None,
+        })
+    }
+
+    async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
+        if tick.is_multiple_of(3) {
+            shop::requeue_stuck(&state.db).await?;
+            for account_id in customers::writeback_due(&state.db).await? {
+                shop::kick_now(&state.db, account_id).await?;
+            }
+            sqlx::query("DELETE FROM shopify_oauth_states WHERE created_at < now() - interval '1 hour'").execute(&state.db).await?;
+        }
+        if tick.is_multiple_of(30) {
+            import::queue_reconciles(&state.db).await?;
+        }
+        if tick.is_multiple_of(180) {
+            webhooks::prune(&state.db).await?;
+            privacy::prune(&state.db).await?;
+        }
+        Ok(())
+    }
+}

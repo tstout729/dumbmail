@@ -227,6 +227,8 @@ pub const BROWSER_RESERVED_METRICS: &[&str] = &[
     "Subscribed to List", "Unsubscribed from List", "Unsubscribed", "Subscribed to SMS", "Unsubscribed from SMS",
     "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam",
     "Received SMS", "Clicked SMS", "Received SMS Reply",
+    // Recorded from Shopify's servers by the Shopify app (`features::shopify::SERVER_METRICS`).
+    "Ordered Product", "Fulfilled Order", "Fulfilled Partial Order", "Cancelled Order", "Refunded Order",
 ];
 
 fn named(list: &[&str], name: &str) -> bool {

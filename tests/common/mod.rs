@@ -81,6 +81,7 @@ impl Harness {
             site_url: None,
             cookie_domain: None,
             google_redirect_base: None,
+            shopify: Default::default(),
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();
