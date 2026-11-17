@@ -248,7 +248,9 @@ pub fn identifiers(platform: Platform, p: &Person, with_location: bool) -> Resul
             }
         }
         Platform::Google => {
-            if cc.is_some_and(|c| CONSENT_REGIONS.contains(&c)) {
+            // A country we can't read might be one that needs consent: fail closed.
+            let unreadable = clean(&p.country).is_some() && cc.is_none();
+            if unreadable || cc.is_some_and(|c| CONSENT_REGIONS.contains(&c)) {
                 if p.ads_consent != Some(true) {
                     return Err(Skip::NoConsent);
                 }
@@ -413,6 +415,11 @@ mod tests {
         assert!(identifiers(Platform::Meta, &de, false).is_ok());
         let uk = Person { country: Some("UK".into()), ..de.clone() };
         assert_eq!(identifiers(Platform::Google, &uk, false), Err(Skip::NoConsent));
+        // A country we can't read is treated as one that needs consent.
+        let unknown = Person { country: Some("Österreich".into()), ..de.clone() };
+        assert_eq!(identifiers(Platform::Google, &unknown, false), Err(Skip::NoConsent));
+        let none = Person { country: None, ..de.clone() };
+        assert!(identifiers(Platform::Google, &none, false).is_ok());
     }
 
     #[test]

@@ -107,14 +107,15 @@ impl Feature for Module {
             tool(
                 "update_audience_sync",
                 "Change an ad audience sync",
-                "Pause or resume a sync (status), or change how often it runs, whether unsubscribed people are included (exclusion audiences only) and which fields are matched.",
+                "Pause or resume a sync (status), or change how often it runs, whether unsubscribed people are included (exclusion audiences only) and which fields are matched. Turning on include_unsubscribed or contact_and_location sends more to the platform: without confirm=true that returns a dry run.",
                 obj(
                     json!({
                         "id": {"type": "string"},
                         "status": {"enum": ["active", "paused"]},
                         "interval_hours": {"type": "integer", "minimum": 1, "maximum": 168},
                         "include_unsubscribed": {"type": "boolean"},
-                        "match_fields": {"enum": ["contact", "contact_and_location"]}
+                        "match_fields": {"enum": ["contact", "contact_and_location"]},
+                        "confirm": {"type": "boolean"}
                     }),
                     &["id"],
                 ),
@@ -167,8 +168,24 @@ impl Feature for Module {
                 if let Some(o) = body.as_object_mut() {
                     o.remove("id");
                 }
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("confirm");
+                }
                 match (id_arg(a), from::<api::UpdateBody>(body)) {
-                    (Ok(id), Ok(b)) => api::update_sync(state, acct, id, b).await,
+                    (Ok(id), Ok(b)) => {
+                        // Changes that send more about people than the user approved need confirming.
+                        let widens = match store::account_sync(&state.db, acct, id).await {
+                            Ok(Some(s)) => (b.include_unsubscribed == Some(true) && !s.include_unsubscribed)
+                                || (b.match_fields.as_deref() == Some("contact_and_location") && s.match_fields != "contact_and_location"),
+                            Ok(None) => return Some(Err(AppError::not_found("sync"))),
+                            Err(e) => return Some(Err(e.into())),
+                        };
+                        if widens && !confirmed {
+                            Ok(json!({"dry_run": true, "note": "Nothing changed. This sends more to the ad platform than before (unsubscribed people, or names and locations). Call again with confirm=true once the user approves."}))
+                        } else {
+                            api::update_sync(state, acct, id, b).await
+                        }
+                    }
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
             }
