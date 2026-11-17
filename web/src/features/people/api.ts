@@ -30,14 +30,16 @@ export const peopleKeys = {
   requests: ["people", "privacy-requests"] as const,
 };
 
-/** Refresh everything that shows profiles after a change made here. */
+/**
+ * Refresh everything that shows profiles after a change made here. Bulk-action progress isn't
+ * included: it's refreshed from its own query, which mustn't cancel itself.
+ */
 function useRefreshAll() {
   const qc = useQueryClient();
   return () => {
-    void qc.invalidateQueries({ queryKey: peopleKeys.all });
-    void qc.invalidateQueries({ queryKey: keys.profilesAll });
-    void qc.invalidateQueries({ queryKey: ["profile"] });
-    void qc.invalidateQueries({ queryKey: keys.lists });
+    for (const queryKey of [["people", "summary"], ["people", "suppressions"], peopleKeys.duplicates, peopleKeys.requests, keys.profilesAll, ["profile"], keys.lists]) {
+      void qc.invalidateQueries({ queryKey });
+    }
   };
 }
 
@@ -116,7 +118,7 @@ export function useDuplicates() {
 
 export function useMergePreview(input: Omit<MergeInput, "confirm"> | null) {
   return useQuery({
-    queryKey: ["people", "merge-preview", input],
+    queryKey: ["merge-preview", input],
     queryFn: () => api<MergePreview>("POST", "/api/people/merge", { ...input, confirm: false }),
     enabled: input !== null,
     placeholderData: keepPreviousData,
@@ -133,7 +135,7 @@ export function useMerge() {
 
 export function useBulkCount(input: BulkInput | null) {
   return useQuery({
-    queryKey: ["people", "bulk-count", input],
+    queryKey: ["bulk-count", input],
     queryFn: () => api<BulkDryRun>("POST", "/api/people/bulk", { ...input, confirm: false }),
     enabled: input !== null,
     staleTime: 0,
@@ -151,11 +153,15 @@ export function useStartBulk() {
 
 export function useBulkAction(id: string | null) {
   const refresh = useRefreshAll();
+  const qc = useQueryClient();
   return useQuery({
     queryKey: peopleKeys.bulk(id ?? ""),
     queryFn: async () => {
       const b = await api<BulkAction>("GET", `/api/people/bulk/${id}`);
-      if (b.status === "done" || b.status === "failed") refresh();
+      if (b.status === "done" || b.status === "failed") {
+        refresh();
+        void qc.invalidateQueries({ queryKey: peopleKeys.bulkRecent, exact: true });
+      }
       return b;
     },
     enabled: id !== null,

@@ -442,8 +442,13 @@ pub async fn delete_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
     .execute(&state.db)
     .await?
     .rows_affected();
-    // Bulk exports that include them: every row starts with the profile id, which is unique.
-    let rows: Vec<String> = p.profile_ids.iter().map(|id| format!("\n{id},")).collect();
+    // Bulk exports that include them: a row starting with their profile id, or a field that is
+    // exactly their email or phone number (an export made before a merge has another id).
+    let mut rows: Vec<String> = p.profile_ids.iter().map(|id| format!("\n{id},")).collect();
+    for a in addresses.iter().filter(|a| a.parse::<Uuid>().is_err()) {
+        // Phone numbers start with "+", which the CSV writer guards with a leading quote.
+        rows.push(if a.starts_with('+') { format!(",'{a},") } else { format!(",{a},") });
+    }
     let bulk_files = sqlx::query("DELETE FROM people_files WHERE account_id = $1 AND kind = 'bulk_export' AND EXISTS (SELECT 1 FROM unnest($2::text[]) r WHERE position(convert_to(r, 'UTF8') IN bytes) > 0)")
         .bind(account_id)
         .bind(&rows)

@@ -2,7 +2,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { CheckCircle2, Download, GitMerge, History, Mail, MessageSquare, Trash2, XCircle } from "lucide-react";
 import { Button, Card, ConfirmDialog, IconButton, Modal, Skeleton, Textarea, Toggle, cx } from "../../components/ui";
-import { formatDate, formatDateTime, formatRelative } from "../../lib/format";
+import { formatDate, formatDateTime, formatPhone, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useAddNote, useConsentPage, useDeleteNote, useExportPerson, usePeopleSummary, useSetAdsOptOut } from "./api";
 import { MergePicker } from "./MergeDialog";
@@ -216,7 +216,7 @@ export function ConsentTimeline({ profileId, tz }: { profileId: string; tz: stri
                 </div>
                 <div className="text-xs text-zinc-600">
                   {e.how}
-                  {e.address ? <span className="text-zinc-400"> · {channelLabel[e.channel]} {e.address}</span> : null}
+                  {e.address ? <span className="text-zinc-400"> · {channelLabel[e.channel]} {e.channel === "sms" ? formatPhone(e.address) : e.address}</span> : null}
                 </div>
                 {e.ip || e.user_agent ? (
                   <div className="mt-0.5 truncate text-[11px] text-zinc-400" title={e.user_agent ?? undefined}>

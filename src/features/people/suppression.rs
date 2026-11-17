@@ -50,7 +50,7 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
         " AND p.phone_number IS NOT NULL AND (p.sms_suppressed_reason IS NOT NULL OR p.sms_consent = 'unsubscribed')
          ) s
          LEFT JOIN LATERAL (
-            SELECT e.occurred_at, e.method, e.message_id FROM consent_events e
+            SELECT e.occurred_at, e.method, e.message_id, e.actor_user_id FROM consent_events e
             WHERE e.profile_id = s.id AND e.channel = s.channel AND e.new_value = s.reason AND e.field IN ('consent', 'suppression')
             ORDER BY e.occurred_at DESC LIMIT 1
          ) ev ON true
@@ -82,14 +82,14 @@ fn rows_sql(qb: &mut QueryBuilder<'_, sqlx::Postgres>, account_id: Uuid, tz: &st
     Ok(())
 }
 
-type SupRow = (Uuid, String, String, Option<String>, Option<String>, String, DateTime<Utc>, Option<String>, Option<Uuid>);
+type SupRow = (Uuid, String, String, Option<String>, Option<String>, String, DateTime<Utc>, Option<String>, Option<Uuid>, Option<String>);
 
 async fn fetch(db: &PgPool, account_id: Uuid, q: &SuppressionQuery, limit: i64, offset: i64) -> AppResult<(Vec<SupRow>, i64, String)> {
     let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let mut cq = QueryBuilder::new("SELECT count(*) ");
     rows_sql(&mut cq, account_id, &tz, q)?;
     let total: i64 = cq.build_query_scalar().fetch_one(db).await?;
-    let mut dq = QueryBuilder::new("SELECT s.id, s.channel, s.address, s.first_name, s.last_name, s.reason, COALESCE(ev.occurred_at, s.updated_at), ev.method, ev.message_id ");
+    let mut dq = QueryBuilder::new("SELECT s.id, s.channel, s.address, s.first_name, s.last_name, s.reason, COALESCE(ev.occurred_at, s.updated_at), ev.method, ev.message_id, (SELECT u.email FROM users u WHERE u.id = ev.actor_user_id) ");
     rows_sql(&mut dq, account_id, &tz, q)?;
     dq.push(" ORDER BY 7 DESC, s.id, s.channel LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
     let rows: Vec<SupRow> = dq.build_query_as().fetch_all(db).await?;
@@ -121,7 +121,7 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &SuppressionQuery) -> AppRes
             json!({
                 "profile_id": r.0, "channel": r.1, "address": r.2, "first_name": r.3, "last_name": r.4, "reason": r.5,
                 "reason_text": reason_text(&r.1, &r.5), "since": r.6,
-                "how": r.7.as_deref().map(|m| consent::describe_how(m, None, None, None, &Value::Null)),
+                "how": r.7.as_deref().map(|m| consent::describe_how(m, r.9.as_deref(), None, None, &Value::Null)),
                 "can_unsuppress": why_not.is_none(), "why_not": why_not,
             })
         })

@@ -154,7 +154,7 @@ export function SuppressionsPage() {
             (rows ?? []).map((r) => (
               <tr key={`${r.profile_id}-${r.channel}`} className="hover:bg-zinc-50/60">
                 <Td>
-                  <Link to={`/audience/profiles/${r.profile_id}`} className="font-medium text-zinc-900 hover:underline">
+                  <Link to={`/audience/profiles/${r.profile_id}`} className="whitespace-nowrap font-medium text-zinc-900 hover:underline">
                     {r.channel === "sms" ? formatPhone(r.address) : r.address}
                   </Link>
                   {fullName(r) ? <div className="text-xs text-zinc-500">{fullName(r)}</div> : null}

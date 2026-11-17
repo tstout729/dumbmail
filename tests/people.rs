@@ -693,3 +693,28 @@ async fn erasing_someone_waiting_in_a_suppress_job_keeps_them_suppressed() {
     assert_eq!(r.as_deref(), Some("manual"), "the suppression they were waiting for still applies");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn erasing_someone_removes_bulk_exports_made_before_a_merge() {
+    let mut h = harness!();
+    h.signup().await;
+    let a = h.ok("POST", "/api/profiles", Some(json!({"email": "dana@x.test", "phone_number": "+15035550160"}))).await;
+    let b = h.ok("POST", "/api/profiles", Some(json!({"external_id": "D-1"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "other@x.test"}))).await;
+    // Exported under the first profile's id, then merged into the second.
+    let ex = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "dana"}, "confirm": true, "expected_count": 1}))).await;
+    let keep = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "other"}, "confirm": false}))).await;
+    assert_eq!(keep["count"], 1);
+    h.drain().await;
+    let keep = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "other"}, "confirm": true, "expected_count": 1}))).await;
+    h.drain().await;
+    h.ok("POST", "/api/people/merge", Some(json!({"keep_id": b["id"], "merge_id": a["id"], "confirm": true}))).await;
+    let ex_file = h.ok("GET", &format!("/api/people/bulk/{}", ex["id"].as_str().unwrap()), None).await["file_url"].clone();
+    let keep_file = h.ok("GET", &format!("/api/people/bulk/{}", keep["id"].as_str().unwrap()), None).await["file_url"].clone();
+    h.ok("POST", "/api/people/privacy/delete", Some(json!({"phone_number": "+15035550160", "confirm": true}))).await;
+    let (s, _, _) = h.bytes("GET", ex_file.as_str().unwrap(), "text/plain", vec![]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the export that held them is gone");
+    let (s, _, _) = h.bytes("GET", keep_file.as_str().unwrap(), "text/plain", vec![]).await;
+    assert_eq!(s, StatusCode::OK, "other people's exports stay");
+    h.cleanup().await;
+}
