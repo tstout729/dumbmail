@@ -143,7 +143,7 @@ fn media_json(media: &Value) -> Value {
 pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTime<Utc>>, limit: Option<i64>) -> AppResult<Value> {
     let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} WHERE c.id = $1 AND c.account_id = $2")).bind(id).bind(account_id).fetch_all(db).await?;
     let conv = rows.first().ok_or_else(|| AppError::not_found("conversation"))?;
-    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let limit = limit.unwrap_or(50).clamp(1, 500);
     let items: Vec<Item> = sqlx::query_as(
         "SELECT * FROM (
             SELECT i.id, 'inbound' AS direction, i.kind, i.keyword, i.body, i.media, i.received_at AS at, NULL::text AS status, NULL::text AS error,

@@ -32,7 +32,7 @@ pub fn definitions() -> Vec<Value> {
                 "offset": {"type": "integer", "minimum": 0}
             }), &[]), true, false),
         tool("get_conversation", "Read an SMS conversation", "One conversation's two-way history, newest first (their texts, your replies, automatic replies, and campaign and flow texts), plus whether you can reply now and why not. Page back with `before` set to the oldest `at` you have.",
-            obj(json!({"conversation_id": id("From list_conversations."), "before": {"type": "string", "format": "date-time"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}), &["conversation_id"]), true, false),
+            obj(json!({"conversation_id": id("From list_conversations."), "before": {"type": "string", "format": "date-time"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}), &["conversation_id"]), true, false),
         tool("send_sms_reply", "Reply to a text", "Text a reply to someone who texted in. Allowed when they're subscribed to texts, or within 24 hours of their last text; never after they texted STOP. Billed like any text. Without confirm=true it returns the text as it would go out (personalization filled in, sender name and STOP line added where required). Get the user's go-ahead before confirming.",
             obj(json!({"conversation_id": id("From list_conversations."), "body": {"type": "string", "maxLength": 1600, "description": "The reply. Personalization tags like {{ first_name|default('there') }} work."}, "confirm": {"type": "boolean"}}), &["conversation_id", "body"]), false, true),
         tool("close_conversation", "Close or reopen a conversation", "Close a conversation once it's handled (it reopens by itself when they text again), or reopen it with reopen=true.",

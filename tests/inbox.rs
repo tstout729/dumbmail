@@ -126,7 +126,7 @@ async fn replies_follow_the_rules_and_go_through_normal_sending() {
         .find(|tz| {
             let t: chrono_tz::Tz = tz.parse().unwrap();
             let hour = chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&t));
-            hour < 8 || hour >= 21
+            !(8..21).contains(&hour)
         })
         .unwrap();
     sqlx::query("UPDATE accounts SET timezone = $1").bind(&night).execute(&h.state.db).await.unwrap();

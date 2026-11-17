@@ -7,6 +7,7 @@ import { bottomNav, mainNav, type NavItem } from "./nav";
 
 function NavEntry({ item, onNavigate }: { item: NavItem; onNavigate: () => void }) {
   const Icon = item.icon;
+  const Trailing = item.trailing;
   const { pathname } = useLocation();
   const active = (routerActive: boolean) => (item.isActive ? item.isActive(pathname) : routerActive);
   return (
@@ -27,6 +28,7 @@ function NavEntry({ item, onNavigate }: { item: NavItem; onNavigate: () => void 
           <>
             <Icon className={cx("size-4", isActive ? "text-accent-700" : "text-zinc-400")} />
             {item.label}
+            {Trailing ? <Trailing /> : null}
           </>
         );
       }}
