@@ -1,6 +1,7 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+import type { CouponBlock, CouponCondition } from "../features/coupons/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
@@ -207,6 +208,7 @@ export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: 
 
 export type Condition =
   | ProductCondition
+  | CouponCondition
   | PropertyCondition
   | EventCondition
   | EventValueCondition
@@ -242,7 +244,8 @@ export type EmailBlock =
   | { type: "columns"; columns: EmailBlock[][] }
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
   | { type: "html"; html: string }
-  | ProductsBlock;
+  | ProductsBlock
+  | CouponBlock;
 
 export type EmailBlockType = EmailBlock["type"];
 
@@ -314,6 +317,8 @@ export type Campaign = {
   /** When the test slice's wait ends (set once the test slice has gone out). */
   ab_test_ends_at: string | null;
   ab_winner: VersionId | null;
+  /** Why a campaign failed, or (while sending) why it's paused, e.g. a coupon ran out of codes. */
+  error?: string | null;
 };
 
 export type CampaignAbReport = {
@@ -613,6 +618,8 @@ export type FormConfig = {
   success_body?: string | null;
   discount_code?: string | null;
   // Shared by every version
+  /** A coupon's name: each new sign-up gets their own code from it instead of `discount_code`. */
+  coupon?: string | null;
   legal_text?: string | null;
   success_button_text?: string | null;
   success_button_url?: string | null;
