@@ -58,7 +58,8 @@ async fn legacy_host_redirect(
     use axum::response::IntoResponse;
     let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
     let page_visit = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
-    if page_visit && !host.is_empty() && state.cfg.redirect_hosts.iter().any(|h| h.trim().eq_ignore_ascii_case(&host)) && !stays_on_old_host(req.uri().path()) {
+    let site_host = state.cfg.site_host().is_some_and(|h| h == host);
+    if page_visit && !host.is_empty() && !site_host && state.cfg.redirect_hosts.iter().any(|h| h.trim().eq_ignore_ascii_case(&host)) && !stays_on_old_host(req.uri().path()) {
         let target = format!("{}{}", state.cfg.public_url(), req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         return axum::response::Redirect::permanent(&target).into_response();
     }
@@ -100,6 +101,7 @@ pub fn app(state: AppState) -> Router {
         .merge(mcp::routes())
         .merge(site::routes())
         .fallback(web::serve)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), site::host_split))
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))
         .layer(axum::middleware::from_fn_with_state(state.clone(), legacy_host_redirect))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))

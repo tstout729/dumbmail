@@ -505,9 +505,15 @@ async fn form_render_js() -> Response {
         .into_response()
 }
 
-fn onsite_script(state: &AppState, key: &str, only_form: Option<Uuid>) -> Response {
+/// The configured base URL public files served to this request point back to (see
+/// `Config::public_base_for`).
+fn public_base<'a>(state: &'a AppState, headers: &HeaderMap) -> &'a str {
+    state.cfg.public_base_for(&crate::site::request_host(headers))
+}
+
+fn onsite_script(base: &str, key: &str, only_form: Option<Uuid>) -> Response {
     let fill = |s: &str| {
-        s.replacen("__BASE__", &serde_json::to_string(state.cfg.public_url()).unwrap_or_default(), 1)
+        s.replacen("__BASE__", &serde_json::to_string(base).unwrap_or_default(), 1)
             .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
             .replacen("__FORM__", &only_form.map(|f| serde_json::to_string(&f.to_string()).unwrap_or_default()).unwrap_or_else(|| "null".into()), 1)
     };
@@ -520,8 +526,8 @@ fn onsite_script(state: &AppState, key: &str, only_form: Option<Uuid>) -> Respon
     ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=300")], js).into_response()
 }
 
-async fn onsite_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
-    onsite_script(&state, &q.k, None)
+async fn onsite_js(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<KeyQuery>) -> Response {
+    onsite_script(public_base(&state, &headers), &q.k, None)
 }
 
 /// Live forms for the onsite script (forms scheduled outside now are left out).
@@ -943,7 +949,7 @@ struct FormPageQuery {
 
 /// The hosted sign-up page. The shared renderer draws it; the noscript copy keeps sign-ups working
 /// without JavaScript. With a valid preview token it also shows drafts and counts and saves nothing.
-async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q): Query<FormPageQuery>) -> Response {
+async fn form_page(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Query(q): Query<FormPageQuery>) -> Response {
     let Ok((f, a)) = load_form(&state, id).await else { return (StatusCode::NOT_FOUND, "form not found").into_response() };
     let preview = q.preview.as_deref().is_some_and(|t| crate::forms::preview_ok(&state.cfg.secret_key, f.id, t));
     let color = f.config["brand_color"].as_str().filter(|c| !c.is_empty()).unwrap_or(&a.brand_color).to_string();
@@ -976,7 +982,7 @@ async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q)
     if config["brand_color"].as_str().is_none_or(|c| c.is_empty()) {
         config["brand_color"] = json!(a.brand_color);
     }
-    let base = state.cfg.public_url();
+    let base = public_base(&state, &headers);
     let submit_url = format!("{base}/client/subscribe?k={}", a.public_key);
     let variant_input = version.as_deref().map(|v| format!(r#"<input type="hidden" name="variant" value="{}">"#, esc(v))).unwrap_or_default();
     let img = config["image_url"].as_str().filter(|s| !s.is_empty()).map(|u| format!(r#"<img src="{}" alt="{}">"#, esc(u), esc(config["image_alt"].as_str().unwrap_or("")))).unwrap_or_default();
@@ -1037,12 +1043,12 @@ const MOUNT_JS: &str = r#"(function () {
   R.mount(d.form, opts);
 })();"#;
 
-async fn form_embed(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+async fn form_embed(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>) -> Response {
     let Ok((f, a)) = load_form(&state, id).await else { return (StatusCode::NOT_FOUND, "// form not found").into_response() };
     if f.status != "live" {
         return ([(header::CONTENT_TYPE, "application/javascript")], "/* form not published */").into_response();
     }
-    onsite_script(&state, &a.public_key, Some(f.id))
+    onsite_script(public_base(&state, &headers), &a.public_key, Some(f.id))
 }
 
 /// A public uploaded image. Served with the type it was sniffed as and locked down so it can only ever be an image.

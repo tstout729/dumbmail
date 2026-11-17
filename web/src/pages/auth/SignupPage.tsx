@@ -1,6 +1,6 @@
 import { type FormEvent } from "react";
 import { Link, useNavigate } from "react-router";
-import { useSignup } from "../../api";
+import { useSignup, useSiteHref } from "../../api";
 import { Button, Field, InlineError, Input } from "../../components/ui";
 import { AuthLayout } from "./AuthLayout";
 import { GoogleSignIn } from "./GoogleButton";
@@ -8,6 +8,8 @@ import { GoogleSignIn } from "./GoogleButton";
 export function SignupPage() {
   const signup = useSignup();
   const navigate = useNavigate();
+  const terms = useSiteHref("/terms");
+  const privacy = useSiteHref("/privacy");
 
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -52,11 +54,11 @@ export function SignupPage() {
         </Button>
         <p className="text-center text-xs text-zinc-500">
           By creating an account you agree to the{" "}
-          <a href="/terms" className="underline hover:text-zinc-700">
+          <a href={terms} className="underline hover:text-zinc-700">
             Terms
           </a>{" "}
           and{" "}
-          <a href="/privacy" className="underline hover:text-zinc-700">
+          <a href={privacy} className="underline hover:text-zinc-700">
             Privacy Policy
           </a>
           .

@@ -57,13 +57,19 @@ struct SignupBody {
 }
 
 pub(crate) fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
-    Cookie::build((SESSION_COOKIE, token))
-        .path("/")
-        .http_only(true)
-        .secure(state.cfg.secure_cookies)
-        .same_site(SameSite::Lax)
-        .max_age(time_days(30))
-        .build()
+    with_cookie_domain(
+        state,
+        Cookie::build((SESSION_COOKIE, token)).path("/").http_only(true).secure(state.cfg.secure_cookies).same_site(SameSite::Lax).max_age(time_days(30)).build(),
+    )
+}
+
+/// Scope a cookie to COOKIE_DOMAIN when it's set, so it reaches both the site and the app host.
+/// Removals need the same domain, or the browser keeps the cookie.
+pub(crate) fn with_cookie_domain(state: &AppState, mut c: Cookie<'static>) -> Cookie<'static> {
+    if let Some(d) = state.cfg.cookie_domain() {
+        c.set_domain(d.to_string());
+    }
+    c
 }
 
 fn time_days(d: i64) -> time::Duration {
@@ -172,7 +178,7 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(Coo
     if let Some(c) = jar.get(SESSION_COOKIE) {
         sqlx::query("DELETE FROM sessions WHERE token_hash = $1").bind(auth::sha256_hex(c.value())).execute(&state.db).await?;
     }
-    Ok((jar.remove(Cookie::build(SESSION_COOKIE).path("/").build()), Json(json!({"ok": true}))))
+    Ok((jar.remove(with_cookie_domain(&state, Cookie::build(SESSION_COOKIE).path("/").build())), Json(json!({"ok": true}))))
 }
 
 async fn me(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {

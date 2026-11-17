@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::account::{insert_owner, new_session, session_cookie};
+use super::account::{insert_owner, new_session, session_cookie, with_cookie_domain};
 use crate::auth;
 use crate::error::{AppError, AppResult};
 use crate::models::normalize_email;
@@ -40,11 +40,21 @@ fn client(state: &AppState) -> Option<(&str, &str)> {
 
 /// What the sign-in pages should offer.
 async fn options(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"google": client(&state).is_some(), "signup": state.cfg.allow_signup}))
+    Json(json!({"google": client(&state).is_some(), "signup": state.cfg.allow_signup, "site_url": state.cfg.site_url()}))
 }
 
 fn redirect_uri(state: &AppState) -> String {
-    format!("{}/api/auth/google/callback", state.cfg.public_url())
+    format!("{}/api/auth/google/callback", state.cfg.google_redirect_base())
+}
+
+/// Where the callback sends people: a same-site path, made absolute on PUBLIC_URL when Google
+/// returns them to another host (GOOGLE_REDIRECT_BASE), so they land in the app.
+fn app_location(state: &AppState, path: &str) -> String {
+    if state.cfg.google_redirect_base() == state.cfg.public_url() {
+        path.to_string()
+    } else {
+        format!("{}{path}", state.cfg.public_url())
+    }
 }
 
 /// Only same-site paths, so `?next=//evil.com` can't send people elsewhere after signing in.
@@ -82,6 +92,7 @@ async fn start(State(state): State<AppState>, jar: CookieJar, Query(q): Query<St
         .same_site(SameSite::Lax)
         .max_age(time::Duration::minutes(10))
         .build();
+    let cookie = with_cookie_domain(&state, cookie);
     let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
     let mut url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth").expect("static url");
     url.query_pairs_mut()
@@ -105,13 +116,13 @@ struct CallbackQuery {
 
 async fn callback(State(state): State<AppState>, jar: CookieJar, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
     let cookie = jar.get(OAUTH_COOKIE).map(|c| c.value().to_string());
-    let jar = jar.remove(Cookie::build(OAUTH_COOKIE).path(OAUTH_COOKIE_PATH).build());
+    let jar = jar.remove(with_cookie_domain(&state, Cookie::build(OAUTH_COOKIE).path(OAUTH_COOKIE_PATH).build()));
     // Errors go back to the login page as a short code it explains, never as free text, so a
     // crafted link can't put arbitrary words on our login page.
-    let fail = |jar: CookieJar, code: &str| (jar, Redirect::to(&format!("/login?error={code}")));
+    let fail = |jar: CookieJar, code: &str| (jar, Redirect::to(&app_location(&state, &format!("/login?error={code}"))));
     match finish(&state, cookie, q).await {
         Ok((user_id, account_id, dest)) => match new_session(&state, user_id, account_id).await {
-            Ok(token) => (jar.add(session_cookie(&state, token)), Redirect::to(&dest)),
+            Ok(token) => (jar.add(session_cookie(&state, token)), Redirect::to(&app_location(&state, &dest))),
             Err(_) => fail(jar, "failed"),
         },
         Err(code) => fail(jar, code),

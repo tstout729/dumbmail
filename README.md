@@ -68,6 +68,15 @@ Hosted installs should set `LINK_URL` to a separate domain used only for trackin
 
 On Railway, set `RAILWAY_API_TOKEN` to a project token (Railway provides the project, environment and service ids itself), and customer domains plus their certificates are created through Railway's API. Self-hosters point each customer's CNAME at `PUBLIC_URL`'s host and terminate TLS in their proxy (Caddy's on-demand TLS works well).
 
+### Marketing site and app on separate hosts
+
+By default one host serves everything: the dashboard at `/`, the landing page at `/home`, plus `/pricing`, `/about`, `/privacy` and `/terms`. To put the landing page on its own domain (as dumbmail.ai does, with the dashboard on app.dumbmail.ai), set:
+
+- `PUBLIC_URL` to the app host, e.g. `https://app.example.com`. Links in new email, forms, the website snippet and Stripe return URLs use it.
+- `SITE_URL` to the site host, e.g. `https://example.com`. There `/` is the landing page and `/pricing`, `/about`, `/privacy` and `/terms` are served. The API, MCP, webhooks, tracking and unsubscribe links, hosted forms, the website snippet, `/healthz`, Google sign-in and Google's site verification file keep working on it, so nothing already sent or installed breaks. Any other page visit gets a 302 to the same path on `PUBLIC_URL`, and the app host sends those four pages back to `SITE_URL`. Don't list the site host in `REDIRECT_HOSTS`.
+- `COOKIE_DOMAIN` to the shared parent domain, e.g. `example.com`, so the session and Google sign-in cookies reach both hosts.
+- `GOOGLE_REDIRECT_BASE` to the base of the redirect URI registered on your Google OAuth client, if it isn't `PUBLIC_URL` (e.g. `https://example.com`). The callback finishes signing in on that host and sends people to `PUBLIC_URL`. It needs `COOKIE_DOMAIN` when the hosts differ.
+
 ### SMS (Telnyx or Twilio)
 
 Register your brand and campaign for 10DLC, buy a number, and point its messaging webhook at `https://YOUR_HOST/webhooks/telnyx/WEBHOOK_SECRET` (or `/webhooks/twilio/…`). Then set `SMS_PROVIDER`, the API credentials and the account's SMS number in **Settings → SMS**.
