@@ -36,33 +36,53 @@ struct Row {
     phone_number: Option<String>,
     email: Option<String>,
     sms_consent: String,
+    target_from: Option<String>,
+    target_to: Option<String>,
+    target_verified: Option<bool>,
+    window_start: Option<DateTime<Utc>>,
+    opted_out: bool,
 }
 
 fn like(q: &str) -> String {
     format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
 }
 
+fn facts(r: &Row) -> replies::ReplyFacts {
+    replies::ReplyFacts {
+        consent: r.sms_consent.clone(),
+        phone: r.phone_number.clone(),
+        target: r.target_from.clone().zip(r.target_to.clone()),
+        opted_out: r.opted_out,
+        window_start: r.window_start,
+        latest_unverified: r.target_verified == Some(false),
+    }
+}
+
 fn can_reply(r: &Row, now: DateTime<Utc>) -> bool {
-    r.phone_number.is_some()
-        && match r.sms_consent.as_str() {
-            "unsubscribed" => false,
-            "subscribed" => true,
-            _ => r.last_inbound_at.is_some_and(|at| now - at < chrono::Duration::hours(replies::REPLY_WINDOW_HOURS)),
-        }
+    facts(r).block(now).is_none()
 }
 
 fn row_json(r: &Row, now: DateTime<Utc>) -> Value {
     json!({
         "id": r.id, "status": r.status, "unread_count": r.unread_count, "last_message_at": r.last_message_at,
         "last_inbound_at": r.last_inbound_at, "last_direction": r.last_direction, "last_preview": r.last_preview,
-        "can_reply": can_reply(r, now),
+        "can_reply": can_reply(r, now), "opted_out": r.opted_out,
+        "their_number": r.target_from, "our_number": r.target_to,
         "profile": {"id": r.profile_id, "first_name": r.first_name, "last_name": r.last_name, "phone_number": r.phone_number, "email": r.email, "sms_consent": r.sms_consent},
     })
 }
 
+/// Each conversation with its reply target (their number and ours, from their latest text), the
+/// start of that pair's reply window, and whether their number opted out.
 const SELECT: &str = "SELECT c.id, c.profile_id, c.status, c.unread_count, c.last_message_at, c.last_inbound_at, c.last_direction, c.last_preview,
-        p.first_name, p.last_name, p.phone_number, p.email, p.sms_consent
-    FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id";
+        p.first_name, p.last_name, p.phone_number, p.email, p.sms_consent,
+        t.from_number AS target_from, t.to_number AS target_to, t.verified AS target_verified, w.start AS window_start,
+        EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = c.account_id AND o.phone_number = t.from_number) AS opted_out
+    FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id
+    LEFT JOIN LATERAL (SELECT i.from_number, i.to_number, i.verified FROM sms_inbound i WHERE i.conversation_id = c.id AND i.kind NOT IN ('stop', 'blocked')
+                       ORDER BY i.provider_received_at DESC, i.id DESC LIMIT 1) t ON true
+    LEFT JOIN LATERAL (SELECT max(i.provider_received_at) AS start FROM sms_inbound i
+                       WHERE i.account_id = c.account_id AND i.from_number = t.from_number AND i.to_number = t.to_number AND i.verified AND i.kind NOT IN ('stop', 'blocked')) w ON true";
 
 pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Vec<Value>, i64)> {
     let status = match q.status.as_deref().unwrap_or("open") {
@@ -93,6 +113,7 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Ve
         .fetch_all(db)
         .await?;
     let count_sql = format!("SELECT count(*) FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id {filter}");
+    // The filter refers only to c and p, so the count doesn't need the reply-target joins.
     let total: i64 = sqlx::query_scalar(&count_sql).bind(account_id).bind(&status).bind(unread).bind(&pattern).bind(&digits).fetch_one(db).await?;
     let now = Utc::now();
     Ok((rows.iter().map(|r| row_json(r, now)).collect(), total))
@@ -115,6 +136,7 @@ struct Item {
     keyword: Option<String>,
     body: Option<String>,
     media: Value,
+    verified: Option<bool>,
     at: DateTime<Utc>,
     status: Option<String>,
     error: Option<String>,
@@ -125,6 +147,8 @@ struct Item {
     sent_by_name: Option<String>,
 }
 
+/// Attachments: a stored copy when there is one; otherwise the provider's link, except Twilio's,
+/// which need the account's credentials and so can't be opened from a browser (url null).
 fn media_json(media: &Value) -> Value {
     let items = media.as_array().cloned().unwrap_or_default();
     Value::Array(
@@ -132,7 +156,9 @@ fn media_json(media: &Value) -> Value {
             .iter()
             .map(|m| {
                 let stored = m["media_id"].as_str().map(|id| format!("/api/inbox/media/{id}"));
-                json!({"content_type": m["content_type"], "url": stored.clone().unwrap_or_else(|| m["url"].as_str().unwrap_or_default().to_string()), "stored": stored.is_some()})
+                let raw = m["url"].as_str().unwrap_or_default();
+                let link = stored.clone().or_else(|| (!super::notify::is_twilio_media(raw)).then(|| raw.to_string()));
+                json!({"content_type": m["content_type"], "url": link, "stored": stored.is_some()})
             })
             .collect(),
     )
@@ -146,12 +172,12 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTim
     let limit = limit.unwrap_or(50).clamp(1, 500);
     let items: Vec<Item> = sqlx::query_as(
         "SELECT * FROM (
-            SELECT i.id, 'inbound' AS direction, i.kind, i.keyword, i.body, i.media, i.received_at AS at, NULL::text AS status, NULL::text AS error,
+            SELECT i.id, 'inbound' AS direction, i.kind, i.keyword, i.body, i.media, i.verified, i.received_at AS at, NULL::text AS status, NULL::text AS error,
                    NULL::uuid AS campaign_id, NULL::text AS campaign_name, NULL::uuid AS flow_id, NULL::text AS flow_name, NULL::text AS sent_by_name
             FROM sms_inbound i WHERE i.account_id = $1 AND i.profile_id = $2
             UNION ALL
             SELECT m.id, 'outbound', COALESCE(t.kind, 'marketing'), NULL, t.body,
-                   CASE WHEN t.media_url IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object('url', t.media_url)) END,
+                   CASE WHEN t.media_url IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(jsonb_build_object('url', t.media_url)) END, NULL::boolean,
                    COALESCE(m.sent_at, m.created_at), m.status, m.error, m.campaign_id, c.name, m.flow_id, f.name, COALESCE(u.name, u.email)
             FROM messages m
             LEFT JOIN sms_sent_texts t ON t.message_id = m.id
@@ -174,23 +200,28 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTim
         .map(|m| {
             json!({
                 "id": m.id, "direction": m.direction, "kind": m.kind, "keyword": m.keyword.as_ref().map(|k| k.to_uppercase()),
-                "body": m.body, "media": media_json(&m.media), "at": m.at, "status": m.status, "error": m.error,
+                "body": m.body, "media": media_json(&m.media), "verified": m.verified, "at": m.at, "status": m.status, "error": m.error,
                 "campaign": m.campaign_id.map(|id| json!({"id": id, "name": m.campaign_name})),
                 "flow": m.flow_id.map(|id| json!({"id": id, "name": m.flow_name})),
                 "sent_by": m.sent_by_name,
             })
         })
         .collect();
-    let profile = replies::load_profile(db, account_id, conv.profile_id).await?;
     let now = Utc::now();
+    let f = facts(conv);
+    let oldest = items.iter().take(limit as usize).last().map(|m| m.at);
     Ok(json!({
         "conversation": row_json(conv, now),
         "messages": messages,
         "has_more": has_more,
+        // Pass as `before` to get the next older page.
+        "next_before": if has_more { json!(oldest) } else { Value::Null },
         "reply": {
-            "allowed": replies::reply_block(&profile, conv.last_inbound_at, now).is_none(),
-            "reason": replies::reply_block(&profile, conv.last_inbound_at, now),
-            "window_ends_at": replies::window_ends(&profile, conv.last_inbound_at),
+            "allowed": f.block(now).is_none(),
+            "reason": f.block(now),
+            "window_ends_at": f.window_ends(),
+            "to": f.target.as_ref().map(|t| t.0.clone()),
+            "from": f.target.as_ref().map(|t| t.1.clone()),
         },
     }))
 }

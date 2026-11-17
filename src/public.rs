@@ -340,6 +340,9 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
+        if audience::is_reserved_metric(metric) {
+            return Err(AppError::bad(format!("{metric:?} is recorded by DumbMail itself and can't be sent from a website")));
+        }
         let input = public_profile(&state, a.id, &b["profile"])?;
         let p = match input.id {
             // Token-identified visitor: the profile must belong to this account.
@@ -1158,42 +1161,6 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     Ok(StatusCode::OK)
 }
 
-pub(crate) const STOP_WORDS: &[&str] = &["stop", "stopall", "unsubscribe", "cancel", "end", "quit", "optout", "revoke"];
-pub(crate) const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
-
-/// Inbound text: every message is kept in the SMS inbox (see `features::inbox`, which also creates a
-/// profile for a number it hasn't seen, with SMS consent untouched). STOP/START keywords update SMS
-/// consent for the matching profile; everything else goes on to the inbox's keywords and auto-replies.
-async fn inbound_sms(state: &AppState, scope: Option<Uuid>, msg: &crate::features::inbox::Inbound) -> AppResult<()> {
-    let (Some(from), Some(to)) = (normalize_phone(&msg.from), normalize_phone(&msg.to)) else { return Ok(()) };
-    let accounts: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT a.id FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
-         WHERE (a.sms_from = $1 OR n.phone_number = $1) AND ($2::uuid IS NULL OR a.id = $2)",
-    )
-    .bind(&to)
-    .bind(scope)
-    .fetch_all(&state.db)
-    .await?;
-    let word: String = msg.text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
-    for account_id in accounts {
-        // None: the provider already delivered this message once (a webhook retry).
-        let Some(rx) = crate::features::inbox::receive(state, account_id, &from, &to, msg, &word).await? else { continue };
-        let pid = rx.profile_id;
-        let (consent, metric) = if STOP_WORDS.contains(&word.as_str()) {
-            ("unsubscribed", "Unsubscribed from SMS")
-        } else if START_WORDS.contains(&word.as_str()) && !rx.new_profile {
-            ("subscribed", "Subscribed to SMS")
-        } else {
-            crate::features::inbox::received(state, &rx).await?;
-            continue;
-        };
-        sqlx::query("UPDATE profiles SET sms_consent = $2, updated_at = now() WHERE id = $1").bind(pid).bind(consent).execute(&state.db).await?;
-        audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric, properties: json!({"keyword": word}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
-        crate::features::inbox::received(state, &rx).await?;
-    }
-    Ok(())
-}
-
 async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, delivered: bool) -> AppResult<()> {
     let status = if delivered { "delivered" } else { "failed" };
     sqlx::query("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3)")
@@ -1205,11 +1172,14 @@ async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, de
     Ok(())
 }
 
-async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String>, Json(v): Json<Value>) -> AppResult<StatusCode> {
+/// Telnyx webhooks. The signature (when a key is configured) is checked on the raw body first.
+async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String>, headers: HeaderMap, body: Bytes) -> AppResult<StatusCode> {
     let scope = webhook_scope(&state, &secret).await?;
+    let proof = crate::features::inbox::verify::telnyx(&state, scope, &headers, &body).await?;
+    let v: Value = serde_json::from_slice(&body)?;
     let p = &v["data"]["payload"];
     match v["data"]["event_type"].as_str().unwrap_or("") {
-        "message.received" => inbound_sms(&state, scope, &crate::features::inbox::Inbound::from_telnyx(p)).await?,
+        "message.received" => crate::features::inbox::inbound(&state, scope, &crate::features::inbox::Inbound::from_telnyx(p), proof).await?,
         "message.finalized" => {
             let st = p["to"][0]["status"].as_str().unwrap_or_default();
             if let Some(id) = p["id"].as_str() {
@@ -1221,13 +1191,17 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
     Ok(StatusCode::OK)
 }
 
-async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, body: Bytes) -> AppResult<Response> {
+/// Twilio webhooks. The signature (when an auth token is known) covers the exact URL and every parameter.
+async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, uri: axum::http::Uri, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
     let scope = webhook_scope(&state, &secret).await?;
-    let f: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+    let f: Vec<(String, String)> = url::form_urlencoded::parse(&body).into_owned().collect();
+    let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
+    let proof = crate::features::inbox::verify::twilio(&state, scope, &headers, path, &f).await?;
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Some(msg) = crate::features::inbox::Inbound::from_twilio(&f) {
-        inbound_sms(&state, scope, &msg).await?;
-    } else if let (Some(sid), Some(st)) = (f.get("MessageSid"), f.get("MessageStatus")) {
-        match st.as_str() {
+        crate::features::inbox::inbound(&state, scope, &msg, proof).await?;
+    } else if let (Some(sid), Some(st)) = (get("MessageSid"), get("MessageStatus")) {
+        match st {
             "delivered" => sms_status(&state, scope, sid, true).await?,
             "failed" | "undelivered" => sms_status(&state, scope, sid, false).await?,
             _ => {}

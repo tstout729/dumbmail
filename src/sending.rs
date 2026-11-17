@@ -98,12 +98,17 @@ pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) ->
 }
 
 /// A conversational text: an answer to someone who texted in (see `features::inbox`). It skips the
-/// marketing-consent check and quiet hours, because the inbox checks its own reply rules first; it
-/// never reaches anyone who texted STOP, and it is billed and recorded like any other text.
+/// marketing-consent check and quiet hours (the inbox's reply rules apply instead, checked again
+/// right before the provider call), goes to the number that texted from the number they texted,
+/// never reaches a number that opted out, and is billed and recorded like any other text.
 pub struct Conversational {
-    /// `reply` (typed by a person) or `auto_reply` (keyword answers and automatic replies).
+    /// `reply` (typed by a person), `auto_reply`, `keyword_reply`, `confirmation`, `optin_request`
+    /// or `help`. None of these count as marketing for smart sending.
     pub kind: &'static str,
     pub sent_by: Option<Uuid>,
+    /// Their number and ours, from the text being answered.
+    pub to: String,
+    pub from: String,
 }
 
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
@@ -135,10 +140,11 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             spec.to_override.clone().or_else(|| p.email.clone())
         }
         "sms" if conversational.is_some() => {
-            if p.sms_consent == "unsubscribed" {
+            let c = conversational.expect("checked");
+            if p.sms_consent == "unsubscribed" && c.kind != "help" {
                 return Ok(Outcome::Skipped("texted STOP"));
             }
-            spec.to_override.clone().or_else(|| p.phone_number.clone())
+            Some(c.to.clone())
         }
         "sms" => {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
@@ -226,7 +232,10 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         (Some(subject), Rendered::Email(email))
     } else {
         let content: SmsContent = serde_json::from_value(spec.content.clone())?;
-        let (provider, from, own_provider) = crate::phone::sender(state, spec.account.id).await?;
+        let (provider, mut from, own_provider) = crate::phone::sender(state, spec.account.id).await?;
+        if let Some(c) = conversational {
+            from = c.from.clone();
+        }
         let prior_sms: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = 'sms' AND status IN ('sent','delivered'))")
             .bind(p.id)
             .fetch_one(&state.db)
@@ -285,6 +294,14 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .await?;
     }
 
+    // The last check before the provider, under the same lock an inbound STOP takes: an opt-out
+    // that committed first always wins, on every path (campaigns, flows, replies, automatic texts).
+    if let Rendered::Sms(s, _, _) = &rendered {
+        if let Err(why) = crate::features::inbox::claim_send(&state.db, spec.account.id, p.id, &s.to, &s.from, spec.is_test, conversational).await? {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1").bind(message_id).bind(why).execute(&state.db).await?;
+            return Ok(Outcome::Skipped(why));
+        }
+    }
     // Keep the text as sent, so the SMS inbox can show campaign, flow and reply texts in each thread.
     if let (Rendered::Sms(s, _, _), false) = (&rendered, spec.is_test) {
         crate::features::inbox::record_sent(&state.db, spec.account.id, p.id, message_id, &s.body, s.media_url.as_deref(), conversational).await?;

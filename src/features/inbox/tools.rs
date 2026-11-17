@@ -15,12 +15,12 @@ pub fn definitions() -> Vec<Value> {
         "id": id("Keyword id to update; leave out to create one."),
         "keyword": {"type": "string", "maxLength": 20, "description": "One word of letters and digits, e.g. JOIN. Case doesn't matter. STOP, START, HELP, INFO, YES, Y and similar carrier words are reserved."},
         "aliases": {"type": "array", "items": {"type": "string", "maxLength": 20}, "maxItems": 10, "description": "Other words that do the same thing."},
-        "match_type": {"enum": ["exact", "starts_with"], "description": "exact: the whole text is the word. starts_with: the text begins with it (\"JOIN please\")."},
-        "subscribe": {"type": "boolean", "description": "Subscribe the sender to SMS marketing. Needs program_name and message_frequency in the inbox settings; the confirmation text includes the required disclosures automatically."},
-        "double_opt_in": {"type": "boolean", "description": "With subscribe: first ask them to reply Y, and only subscribe them when they do."},
+        "match_type": {"enum": ["exact", "starts_with"], "description": "exact: the whole text is the word. starts_with: the text begins with it (\"PROMO codes?\"). Keywords that subscribe must be exact."},
+        "subscribe": {"type": "boolean", "description": "Subscribe the sender to SMS marketing. Needs program_name and message_frequency in the inbox settings, and match_type exact. They're subscribed only once the confirmation text (with the required disclosures, added automatically) is accepted by the provider."},
+        "double_opt_in": {"type": "boolean", "description": "With subscribe: first ask them to reply Y; a Y within 7 days of that prompt going out sends the confirmation, and they're subscribed once it's accepted."},
         "list_id": {"type": ["string", "null"], "description": "Also add the sender to this list. null removes it."},
         "reply": {"type": "string", "maxLength": 480, "description": "Text sent back. For sign-ups it opens the confirmation (the disclosures are added after it). Personalization tags like {{ first_name|default('there') }} work."},
-        "enabled": {"type": "boolean"},
+        "enabled": {"type": "boolean", "description": "Turning a keyword on needs support_contact in the inbox settings (the HELP answer uses it)."},
     });
     vec![
         tool("list_conversations", "List SMS conversations", "Texting conversations, newest activity first: each person who texted in, their last message, unread count and whether you can reply now.",
@@ -33,7 +33,7 @@ pub fn definitions() -> Vec<Value> {
             }), &[]), true, false),
         tool("get_conversation", "Read an SMS conversation", "One conversation's two-way history, newest first (their texts, your replies, automatic replies, and campaign and flow texts), plus whether you can reply now and why not. Page back with `before` set to the oldest `at` you have.",
             obj(json!({"conversation_id": id("From list_conversations."), "before": {"type": "string", "format": "date-time"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}), &["conversation_id"]), true, false),
-        tool("send_sms_reply", "Reply to a text", "Text a reply to someone who texted in. Allowed when they're subscribed to texts, or within 24 hours of their last text; never after they texted STOP. Billed like any text. Without confirm=true it returns the text as it would go out (personalization filled in, sender name and STOP line added where required). Get the user's go-ahead before confirming.",
+        tool("send_sms_reply", "Reply to a text", "Text a reply to someone who texted in, to the number that texted and from the number they texted. Allowed when they're subscribed to texts on that number, or within 24 hours of their last verified text; never after they opted out. The rules are checked again at send time. Billed like any text. Without confirm=true it returns the text as it would go out (personalization filled in, sender name and STOP line added where required). Get the user's go-ahead before confirming.",
             obj(json!({"conversation_id": id("From list_conversations."), "body": {"type": "string", "maxLength": 1600, "description": "The reply. Personalization tags like {{ first_name|default('there') }} work."}, "confirm": {"type": "boolean"}}), &["conversation_id", "body"]), false, true),
         tool("close_conversation", "Close or reopen a conversation", "Close a conversation once it's handled (it reopens by itself when they text again), or reopen it with reopen=true.",
             obj(json!({"conversation_id": id("From list_conversations."), "reopen": {"type": "boolean"}}), &["conversation_id"]), false, false),
@@ -49,11 +49,16 @@ pub fn definitions() -> Vec<Value> {
             obj(json!({"id": id("Saved reply id to update."), "name": {"type": "string", "maxLength": 80}, "body": {"type": "string", "maxLength": 1600}}), &[]), false, false),
         tool("delete_saved_reply", "Delete a saved reply", "Delete a saved reply. Requires confirm=true.",
             obj(json!({"id": id("Saved reply id."), "confirm": {"type": "boolean"}}), &["id"]), false, true),
-        tool("get_sms_inbox_settings", "Read SMS inbox settings", "Program name and message frequency (used in sign-up disclosures), the default and away replies, opening hours, who gets email digests of new texts, and the account's members.", obj(json!({}), &[]), true, false),
+        tool("get_sms_inbox_settings", "Read SMS inbox settings", "Program name, message frequency and support contact (used in sign-up disclosures and the HELP answer), who answers HELP, the default and away replies, opening hours, hourly budgets for automatic texts (and whether one ran out this hour), whether inbound texts can be verified, who gets email digests of new texts, and the account's members.", obj(json!({}), &[]), true, false),
         tool("update_sms_inbox_settings", "Change SMS inbox settings", "Change any of the inbox settings; fields left out stay the same.",
             obj(json!({
                 "program_name": {"type": "string", "maxLength": 60, "description": "Shown at the start of sign-up texts, e.g. \"Acme VIP Texts\"."},
                 "message_frequency": {"type": "string", "maxLength": 60, "description": "e.g. \"Up to 4 msgs/month\"."},
+                "support_contact": {"type": "string", "maxLength": 80, "description": "An email or phone people can reach for help. It goes in the answer to HELP, and keywords can't be turned on without it."},
+                "help_replies": {"enum": ["auto", "dumbmail", "provider"], "description": "Who answers HELP and INFO. auto (default): DumbMail on Telnyx, Twilio itself on Twilio. dumbmail: always DumbMail. provider: never DumbMail."},
+                "auto_budget_account": {"type": "integer", "minimum": 0, "maximum": 2000, "description": "Most automatic texts (keyword answers, sign-up texts, default/away replies, HELP) the account sends per hour. Default 200."},
+                "auto_budget_number": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "Most automatic texts per hour from each of your numbers. Default 100."},
+                "telnyx_public_key": {"type": ["string", "null"], "description": "Only if you connected your own Telnyx account: its webhook public key (Telnyx portal → Keys & Credentials → Public Key), so inbound texts can be verified."},
                 "default_reply_enabled": {"type": "boolean", "description": "Answer texts no keyword matched (at most once per person every 12 hours)."},
                 "default_reply": {"type": "string", "maxLength": 480},
                 "away_reply_enabled": {"type": "boolean", "description": "Outside opening hours, send the away reply instead."},
@@ -151,11 +156,11 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
             Ok(json!({"ok": true}))
         }
         .await,
-        "get_sms_inbox_settings" => settings::settings_json(&state.db, acct).await,
+        "get_sms_inbox_settings" => settings::settings_json(state, acct).await,
         "update_sms_inbox_settings" => async {
             let account = crate::campaigns::load_account(&state.db, acct).await?;
-            settings::update(&state.db, &account, a).await?;
-            settings::settings_json(&state.db, acct).await
+            settings::update_all(state, &account, a).await?;
+            settings::settings_json(state, acct).await
         }
         .await,
         _ => return None,

@@ -11,6 +11,8 @@ CREATE TABLE sms_keywords (
     list_id uuid REFERENCES lists(id) ON DELETE SET NULL,
     reply text NOT NULL DEFAULT '',
     enabled boolean NOT NULL DEFAULT true,
+    -- Goes up on every change, so each consent record names the exact keyword setup it came from.
+    version integer NOT NULL DEFAULT 1,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -33,6 +35,17 @@ CREATE TABLE sms_inbox_settings (
     -- Required disclosures in keyword sign-up confirmations.
     program_name text NOT NULL DEFAULT '',
     message_frequency text NOT NULL DEFAULT '',
+    -- How people reach support (an email or phone), used in the HELP answer. Required for keywords.
+    support_contact text NOT NULL DEFAULT '',
+    -- Who answers HELP and INFO: auto (follow the provider: Telnyx, DumbMail answers; Twilio, Twilio
+    -- answers on long codes and toll-free numbers), dumbmail (always DumbMail) or provider (never DumbMail).
+    help_replies text NOT NULL DEFAULT 'auto',
+    -- Automatic texts (keyword answers, confirmations, default/away replies, HELP) per hour.
+    auto_budget_account integer NOT NULL DEFAULT 200,
+    auto_budget_number integer NOT NULL DEFAULT 100,
+    -- The last time a budget ran out ('account' or the receiving number), shown in the dashboard.
+    auto_budget_hit_at timestamptz,
+    auto_budget_hit_scope text,
     default_reply_enabled boolean NOT NULL DEFAULT false,
     default_reply text NOT NULL DEFAULT '',
     away_reply_enabled boolean NOT NULL DEFAULT false,
@@ -46,13 +59,4 @@ CREATE TABLE sms_inbox_settings (
     notified_through timestamptz,
     last_digest_at timestamptz,
     updated_at timestamptz NOT NULL DEFAULT now()
-);
-
--- A keyword sign-up with double opt-in, waiting for the person's "Y".
-CREATE TABLE sms_pending_optins (
-    profile_id uuid PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
-    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    keyword_id uuid REFERENCES sms_keywords(id) ON DELETE CASCADE,
-    inbound_id uuid REFERENCES sms_inbound(id) ON DELETE SET NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
 );

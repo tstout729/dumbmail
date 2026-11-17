@@ -31,20 +31,34 @@ CREATE TABLE sms_inbound (
     conversation_id uuid NOT NULL REFERENCES sms_conversations(id) ON DELETE CASCADE,
     profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
     provider text NOT NULL, -- telnyx | twilio
-    provider_message_id text,
+    provider_message_id text NOT NULL,
     from_number text NOT NULL,
     to_number text NOT NULL,
     body text NOT NULL DEFAULT '',
-    -- message | stop | start | help | keyword | confirm (a "Y" that finished a double opt-in)
+    -- message | stop (an opt-out) | start | help | keyword | confirm (a "Y" that finished a double
+    -- opt-in) | blocked (texted while opted out: does nothing, sends nothing)
     kind text NOT NULL DEFAULT 'message',
     keyword text,
+    -- The provider's signature checked out. Unverified texts are kept and their opt-outs honored,
+    -- but they can't subscribe anyone, open a reply window, get automatic replies or wake flows.
+    verified boolean NOT NULL DEFAULT false,
+    -- STOP | START | HELP when the provider said it handled the text as one (Twilio OptOutType,
+    -- Telnyx autoresponse_type).
+    provider_signal text,
+    -- When the provider received it (Telnyx received_at; Twilio sends none, so when we did).
+    provider_received_at timestamptz NOT NULL DEFAULT now(),
+    -- Set once everything after storing it (events, keywords, replies, flows) has run. A provider
+    -- retry of a text that isn't processed yet runs those steps again (each is idempotent).
+    processed_at timestamptz,
     -- [{url, content_type, media_id?}]; media_id is set once the file is copied into sms_media.
     media jsonb NOT NULL DEFAULT '[]',
     received_at timestamptz NOT NULL DEFAULT now()
 );
 
 -- A provider retrying its webhook must not store (or act on) the same text twice.
-CREATE UNIQUE INDEX sms_inbound_provider_message ON sms_inbound (account_id, provider, provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE UNIQUE INDEX sms_inbound_provider_message ON sms_inbound (account_id, provider, provider_message_id);
+-- Reply windows: the latest verified text from their number to ours.
+CREATE INDEX sms_inbound_window ON sms_inbound (account_id, from_number, to_number, provider_received_at DESC) WHERE verified;
 CREATE INDEX sms_inbound_profile ON sms_inbound (profile_id, received_at DESC);
 CREATE INDEX sms_inbound_account ON sms_inbound (account_id, received_at DESC);
 
@@ -66,7 +80,9 @@ CREATE TABLE sms_sent_texts (
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     body text NOT NULL,
     media_url text,
-    kind text NOT NULL DEFAULT 'marketing', -- marketing | reply | auto_reply
+    -- marketing (campaigns and flows) | reply (typed by a person) | auto_reply | keyword_reply |
+    -- confirmation | optin_request | help. Only marketing counts for smart sending.
+    kind text NOT NULL DEFAULT 'marketing',
     sent_by uuid REFERENCES users(id) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );

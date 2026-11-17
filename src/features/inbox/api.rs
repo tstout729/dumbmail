@@ -126,13 +126,13 @@ async fn delete_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
 }
 
 async fn settings_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(settings::settings_json(&state.db, ctx.account_id).await?))
+    Ok(Json(settings::settings_json(&state, ctx.account_id).await?))
 }
 
 async fn update_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(v): ApiJson<Value>) -> AppResult<Json<Value>> {
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    settings::update(&state.db, &account, &v).await?;
-    Ok(Json(settings::settings_json(&state.db, ctx.account_id).await?))
+    settings::update_all(&state, &account, &v).await?;
+    Ok(Json(settings::settings_json(&state, ctx.account_id).await?))
 }
 
 /// An image someone texted in. Only signed-in members of the account can see it.

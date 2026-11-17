@@ -8,14 +8,26 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::models::Account;
+use crate::phone::ByoCredentials;
+use crate::state::AppState;
 
 pub const MAX_REPLY_CHARS: usize = 480;
+/// Hard ceilings on the hourly budgets for automatic texts.
+pub const MAX_BUDGET_ACCOUNT: i32 = 2000;
+pub const MAX_BUDGET_NUMBER: i32 = 1000;
+pub const HELP_MODES: &[&str] = &["auto", "dumbmail", "provider"];
 pub const MAX_SAVED_REPLIES: i64 = 200;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Settings {
     pub program_name: String,
     pub message_frequency: String,
+    pub support_contact: String,
+    pub help_replies: String,
+    pub auto_budget_account: i32,
+    pub auto_budget_number: i32,
+    pub auto_budget_hit_at: Option<DateTime<Utc>>,
+    pub auto_budget_hit_scope: Option<String>,
     pub default_reply_enabled: bool,
     pub default_reply: String,
     pub away_reply_enabled: bool,
@@ -31,6 +43,12 @@ impl Default for Settings {
         Self {
             program_name: String::new(),
             message_frequency: String::new(),
+            support_contact: String::new(),
+            help_replies: "auto".into(),
+            auto_budget_account: 200,
+            auto_budget_number: 100,
+            auto_budget_hit_at: None,
+            auto_budget_hit_scope: None,
             default_reply_enabled: false,
             default_reply: String::new(),
             away_reply_enabled: false,
@@ -43,7 +61,7 @@ impl Default for Settings {
     }
 }
 
-const COLS: &str = "program_name, message_frequency, default_reply_enabled, default_reply, away_reply_enabled, away_reply, open_hour, close_hour, open_days, notify_user_ids";
+const COLS: &str = "program_name, message_frequency, support_contact, help_replies, auto_budget_account, auto_budget_number, auto_budget_hit_at, auto_budget_hit_scope, default_reply_enabled, default_reply, away_reply_enabled, away_reply, open_hour, close_hour, open_days, notify_user_ids";
 
 pub async fn load(db: &PgPool, account_id: Uuid) -> AppResult<Settings> {
     let q = format!("SELECT {COLS} FROM sms_inbox_settings WHERE account_id = $1");
@@ -97,7 +115,7 @@ pub fn check_template(account: &Account, body: &str, what: &str) -> AppResult<()
 /// Apply a partial update. Unknown keys are refused so typos don't silently do nothing.
 pub async fn update(db: &PgPool, account: &Account, patch: &Value) -> AppResult<Settings> {
     let obj: &Map<String, Value> = patch.as_object().ok_or_else(|| AppError::bad("send the settings to change as an object"))?;
-    const KEYS: &[&str] = &["program_name", "message_frequency", "default_reply_enabled", "default_reply", "away_reply_enabled", "away_reply", "open_hour", "close_hour", "open_days", "notify_user_ids"];
+    const KEYS: &[&str] = &["program_name", "message_frequency", "support_contact", "help_replies", "auto_budget_account", "auto_budget_number", "telnyx_public_key", "default_reply_enabled", "default_reply", "away_reply_enabled", "away_reply", "open_hour", "close_hour", "open_days", "notify_user_ids"];
     if let Some(k) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
         return Err(AppError::bad(format!("unknown setting {k:?}")));
     }
@@ -107,6 +125,34 @@ pub async fn update(db: &PgPool, account: &Account, patch: &Value) -> AppResult<
     }
     if let Some(t) = text(patch, "message_frequency", 60)? {
         s.message_frequency = t;
+    }
+    if let Some(t) = text(patch, "support_contact", 80)? {
+        if t.contains("{{") || t.contains("{%") {
+            return Err(AppError::bad("support_contact is plain text: an email address or phone number"));
+        }
+        s.support_contact = t;
+    }
+    if let Some(t) = text(patch, "help_replies", 20)? {
+        if !HELP_MODES.contains(&t.as_str()) {
+            return Err(AppError::bad("help_replies must be auto, dumbmail or provider"));
+        }
+        s.help_replies = t;
+    }
+    let budget = |k: &str, max: i32| -> AppResult<Option<i32>> {
+        match patch.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_i64()
+                .filter(|n| (0..=i64::from(max)).contains(n))
+                .map(|n| Some(n as i32))
+                .ok_or_else(|| AppError::bad(format!("{k} must be a whole number from 0 to {max}"))),
+        }
+    };
+    if let Some(n) = budget("auto_budget_account", MAX_BUDGET_ACCOUNT)? {
+        s.auto_budget_account = n;
+    }
+    if let Some(n) = budget("auto_budget_number", MAX_BUDGET_NUMBER)? {
+        s.auto_budget_number = n;
     }
     if let Some(t) = text(patch, "default_reply", MAX_REPLY_CHARS)? {
         check_template(account, &t, "default reply")?;
@@ -170,11 +216,25 @@ pub async fn update(db: &PgPool, account: &Account, patch: &Value) -> AppResult<
     if s.away_reply_enabled && s.away_reply.is_empty() {
         return Err(AppError::bad("write the away reply before turning it on"));
     }
+    for t in [&s.program_name, &s.message_frequency] {
+        if t.contains("{{") || t.contains("{%") {
+            return Err(AppError::bad("the program name and message frequency are plain text"));
+        }
+    }
+    // Sign-up confirmations and HELP answers depend on these: they can't be cleared while used.
+    if (s.program_name.is_empty() || s.message_frequency.is_empty()) && crate::features::inbox::keywords::any_subscribing(db, account.id).await? {
+        return Err(AppError::bad("a keyword subscribes people, so the program name and message frequency (part of every sign-up confirmation) can't be empty"));
+    }
+    if s.support_contact.is_empty() && crate::features::inbox::keywords::any_enabled(db, account.id).await? {
+        return Err(AppError::bad("keywords are on, so the support contact (part of the answer to HELP) can't be empty"));
+    }
     sqlx::query(
-        "INSERT INTO sms_inbox_settings (account_id, program_name, message_frequency, default_reply_enabled, default_reply, away_reply_enabled, away_reply, open_hour, close_hour, open_days, notify_user_ids, notified_through)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+        "INSERT INTO sms_inbox_settings (account_id, program_name, message_frequency, default_reply_enabled, default_reply, away_reply_enabled, away_reply, open_hour, close_hour, open_days, notify_user_ids, notified_through,
+                                         support_contact, help_replies, auto_budget_account, auto_budget_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), $12, $13, $14, $15)
          ON CONFLICT (account_id) DO UPDATE SET program_name = $2, message_frequency = $3, default_reply_enabled = $4, default_reply = $5,
              away_reply_enabled = $6, away_reply = $7, open_hour = $8, close_hour = $9, open_days = $10, notify_user_ids = $11,
+             support_contact = $12, help_replies = $13, auto_budget_account = $14, auto_budget_number = $15,
              -- Turning digests on starts from now, not from every text ever received.
              notified_through = CASE WHEN cardinality(sms_inbox_settings.notify_user_ids) = 0 THEN now() ELSE sms_inbox_settings.notified_through END,
              updated_at = now()",
@@ -190,13 +250,64 @@ pub async fn update(db: &PgPool, account: &Account, patch: &Value) -> AppResult<
     .bind(s.close_hour)
     .bind(&s.open_days)
     .bind(&s.notify_user_ids)
+    .bind(&s.support_contact)
+    .bind(&s.help_replies)
+    .bind(s.auto_budget_account)
+    .bind(s.auto_budget_number)
     .execute(db)
     .await?;
     Ok(s)
 }
 
-/// Settings plus the account's members (for choosing who gets digests).
-pub async fn settings_json(db: &PgPool, account_id: Uuid) -> AppResult<Value> {
+/// Apply a settings change, including `telnyx_public_key` (saved with the account's own Telnyx
+/// connection, encrypted, and never shown again in full).
+pub async fn update_all(state: &AppState, account: &Account, patch: &Value) -> AppResult<Settings> {
+    let mut patch = patch.clone();
+    if let Some(key) = patch.as_object_mut().and_then(|o| o.remove("telnyx_public_key")) {
+        let key = match key {
+            Value::Null => None,
+            Value::String(k) if k.trim().is_empty() => None,
+            Value::String(k) => Some(k.trim().to_string()),
+            _ => return Err(AppError::bad("telnyx_public_key must be text")),
+        };
+        set_telnyx_public_key(state, account.id, key).await?;
+    }
+    update(&state.db, account, &patch).await
+}
+
+async fn set_telnyx_public_key(state: &AppState, account_id: Uuid, key: Option<String>) -> AppResult<()> {
+    use base64::Engine;
+    if let Some(k) = &key {
+        let ok = base64::engine::general_purpose::STANDARD.decode(k).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).is_some_and(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).is_ok());
+        if !ok {
+            return Err(AppError::bad("that isn't a Telnyx public key: copy it from the Telnyx portal under Keys & Credentials → Public Key"));
+        }
+    }
+    let row: Option<(String, Option<String>)> = sqlx::query_as("SELECT sms_mode, sms_byo_credentials FROM accounts WHERE id = $1").bind(account_id).fetch_optional(&state.db).await?;
+    let creds = match row {
+        Some((mode, Some(enc))) if mode == "byo" => serde_json::from_str::<ByoCredentials>(&crate::crypto::decrypt(&state.cfg.secret_key, &enc)?).ok(),
+        _ => None,
+    };
+    let Some(ByoCredentials::Telnyx { api_key, messaging_profile_id, .. }) = creds else {
+        return Err(AppError::bad("a Telnyx public key is only needed when you connected your own Telnyx account in Settings → SMS"));
+    };
+    let creds = ByoCredentials::Telnyx { api_key, messaging_profile_id, public_key: key };
+    let enc = crate::crypto::encrypt(&state.cfg.secret_key, &serde_json::to_string(&creds)?)?;
+    sqlx::query("UPDATE accounts SET sms_byo_credentials = $2 WHERE id = $1").bind(account_id).bind(enc).execute(&state.db).await?;
+    Ok(())
+}
+
+/// The saved Telnyx public key, shortened (it's shown only as a hint).
+async fn telnyx_key_hint(state: &AppState, account_id: Uuid) -> AppResult<Option<String>> {
+    let key = crate::features::inbox::verify::telnyx_key(state, Some(account_id)).await?;
+    let own: bool = sqlx::query_scalar("SELECT COALESCE(sms_mode = 'byo' AND sms_byo_provider = 'telnyx', false) FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    Ok(key.filter(|_| own).map(|k| format!("{}…", k.chars().take(6).collect::<String>())))
+}
+
+/// Settings plus the account's members (for choosing who gets digests) and whether inbound texts
+/// can be verified (keywords, automatic replies and reply windows need that).
+pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+    let db = &state.db;
     let s = load(db, account_id).await?;
     let members: Vec<(Uuid, String, Option<String>)> =
         sqlx::query_as("SELECT u.id, u.email, u.name FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 100")
@@ -206,6 +317,14 @@ pub async fn settings_json(db: &PgPool, account_id: Uuid) -> AppResult<Value> {
     let mut v = serde_json::to_value(&s).unwrap_or_default();
     v["members"] = json!(members.iter().map(|(id, email, name)| json!({"id": id, "email": email, "name": name})).collect::<Vec<_>>());
     v["disclosure_ready"] = json!(!s.program_name.is_empty() && !s.message_frequency.is_empty());
+    v["support_ready"] = json!(!s.support_contact.is_empty());
+    v["verification"] = crate::features::inbox::verify::status(state, account_id).await?;
+    v["telnyx_public_key_hint"] = json!(telnyx_key_hint(state, account_id).await?);
+    v["max_budget_account"] = json!(MAX_BUDGET_ACCOUNT);
+    v["max_budget_number"] = json!(MAX_BUDGET_NUMBER);
+    // A budget that ran out this hour: automatic texts are paused until the next hour.
+    let hit_this_hour = s.auto_budget_hit_at.is_some_and(|t| t > Utc::now() - chrono::Duration::hours(1));
+    v["auto_paused"] = json!(hit_this_hour);
     Ok(v)
 }
 

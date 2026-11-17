@@ -191,6 +191,15 @@ pub async fn metric_id(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<U
     Ok(id)
 }
 
+/// Metrics only DumbMail records (texting activity and consent). Browsers can't send them, so a
+/// web page can't start a flow or change segments and consent history by faking them.
+const RESERVED_METRICS: &[&str] = &["Received SMS", "Received SMS Reply", "Subscribed to SMS", "Unsubscribed from SMS"];
+
+pub fn is_reserved_metric(name: &str) -> bool {
+    let n = name.trim();
+    RESERVED_METRICS.iter().any(|m| m.eq_ignore_ascii_case(n))
+}
+
 pub struct NewEvent<'a> {
     pub account_id: Uuid,
     pub profile_id: Uuid,

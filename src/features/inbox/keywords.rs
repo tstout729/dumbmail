@@ -6,9 +6,10 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::optout;
 use super::replies;
 use super::settings::{self, Settings};
-use super::store::{self, Received, HELP_WORDS};
+use super::store::{self, Received};
 use crate::audience::{self, NewEvent};
 use crate::error::{AppError, AppResult};
 use crate::models::Account;
@@ -28,16 +29,17 @@ pub struct Keyword {
     pub list_id: Option<Uuid>,
     pub reply: String,
     pub enabled: bool,
+    pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-const COLS: &str = "id, keyword, aliases, match_type, subscribe, double_opt_in, list_id, reply, enabled, created_at, updated_at";
+const COLS: &str = "id, keyword, aliases, match_type, subscribe, double_opt_in, list_id, reply, enabled, version, created_at, updated_at";
 
 /// Carrier words that keep their standard meaning (opt out, opt back in, help) and the "Y" that
 /// confirms a double opt-in. No keyword or alias may use them.
 pub fn reserved(word: &str) -> bool {
-    crate::public::STOP_WORDS.contains(&word) || crate::public::START_WORDS.contains(&word) || HELP_WORDS.contains(&word) || word == "y"
+    optout::STANDALONE_STOP.contains(&word) || optout::START_WORDS.contains(&word) || optout::HELP_WORDS.contains(&word) || word == "y" || optout::is_opt_out(word)
 }
 
 /// Keywords are one word of letters and digits, stored lowercase (matching ignores case).
@@ -61,13 +63,19 @@ pub async fn list(db: &PgPool, account_id: Uuid) -> AppResult<Vec<Keyword>> {
     Ok(sqlx::query_as::<_, Keyword>(&q).bind(account_id).fetch_all(db).await?)
 }
 
+/// A keyword by its stored word (enabled or not).
+pub async fn by_word(db: &PgPool, account_id: Uuid, word: &str) -> AppResult<Option<Keyword>> {
+    let q = format!("SELECT {COLS} FROM sms_keywords WHERE account_id = $1 AND keyword = $2");
+    Ok(sqlx::query_as::<_, Keyword>(&q).bind(account_id).bind(word).fetch_optional(db).await?)
+}
+
 async fn get(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Keyword> {
     let q = format!("SELECT {COLS} FROM sms_keywords WHERE id = $1 AND account_id = $2");
     sqlx::query_as::<_, Keyword>(&q).bind(id).bind(account_id).fetch_optional(db).await?.ok_or_else(|| AppError::not_found("keyword"))
 }
 
 /// The enabled keyword a text matches: exact matches on the keyword or an alias first, then
-/// "starts with" keywords (longest first).
+/// "starts with" keywords (longest first). Sign-up keywords only ever match exactly.
 pub async fn matching(db: &PgPool, account_id: Uuid, word: &str) -> AppResult<Option<Keyword>> {
     if word.is_empty() {
         return Ok(None);
@@ -75,7 +83,7 @@ pub async fn matching(db: &PgPool, account_id: Uuid, word: &str) -> AppResult<Op
     let q = format!(
         "SELECT {COLS} FROM sms_keywords WHERE account_id = $1 AND enabled AND (
             keyword = $2 OR $2 = ANY(aliases)
-            OR (match_type = 'starts_with' AND (starts_with($2, keyword) OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE starts_with($2, a))))
+            OR (match_type = 'starts_with' AND NOT subscribe AND (starts_with($2, keyword) OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE starts_with($2, a))))
          ) ORDER BY (keyword = $2 OR $2 = ANY(aliases)) DESC, length(keyword) DESC LIMIT 1"
     );
     Ok(sqlx::query_as::<_, Keyword>(&q).bind(account_id).bind(word).fetch_optional(db).await?)
@@ -159,13 +167,17 @@ pub async fn upsert(db: &PgPool, account: &Account, id: Option<Uuid>, v: &Value)
         }
         Some(_) => return Err(AppError::bad("list_id must be a list id or null")),
     };
-    if subscribe {
-        let s = settings::load(db, account.id).await?;
-        if s.program_name.is_empty() || s.message_frequency.is_empty() {
-            return Err(AppError::bad(
-                "set your program name and message frequency in the inbox settings first: sign-up confirmations must include them",
-            ));
-        }
+    if subscribe && match_type != "exact" {
+        return Err(AppError::bad("a keyword that subscribes people must match exactly, so ordinary texts that start with it don't sign anyone up"));
+    }
+    let s = settings::load(db, account.id).await?;
+    if subscribe && (s.program_name.is_empty() || s.message_frequency.is_empty()) {
+        return Err(AppError::bad(
+            "set your program name and message frequency in the inbox settings first: sign-up confirmations must include them",
+        ));
+    }
+    if enabled && s.support_contact.is_empty() {
+        return Err(AppError::bad("set how people reach support (an email or phone) in the inbox settings first: the answer to HELP must include it"));
     }
     if !subscribe && list_id.is_none() && reply.is_empty() {
         return Err(AppError::bad("a keyword needs something to do: subscribe the sender, add them to a list, or send a reply"));
@@ -187,7 +199,7 @@ pub async fn upsert(db: &PgPool, account: &Account, id: Option<Uuid>, v: &Value)
 
     let q = match id {
         Some(_) => format!(
-            "UPDATE sms_keywords SET keyword = $3, aliases = $4, match_type = $5, subscribe = $6, double_opt_in = $7, list_id = $8, reply = $9, enabled = $10, updated_at = now()
+            "UPDATE sms_keywords SET keyword = $3, aliases = $4, match_type = $5, subscribe = $6, double_opt_in = $7, list_id = $8, reply = $9, enabled = $10, version = version + 1, updated_at = now()
              WHERE id = $1 AND account_id = $2 RETURNING {COLS}"
         ),
         None => format!(
@@ -236,85 +248,214 @@ pub fn opt_in_request(s: &Settings) -> String {
     )
 }
 
-async fn subscribe_now(state: &AppState, rx: &Received, k: &Keyword, method: &str) -> AppResult<()> {
-    sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(rx.profile_id).execute(&state.db).await?;
-    // How and when they agreed, kept as the consent record.
-    audience::record_event(
-        &state.db,
-        NewEvent {
-            account_id: rx.account_id,
-            profile_id: rx.profile_id,
-            metric: "Subscribed to SMS",
-            properties: json!({"method": method, "keyword": k.keyword.to_uppercase(), "text": rx.text, "to": rx.to, "inbound_message_id": rx.id}),
-            value: None,
-            occurred_at: None,
-            unique_id: Some(format!("sms-optin:{}", rx.id)),
-            message_id: None,
-        },
+/// A double opt-in waiting for this number's "Y": the prompt was accepted by the provider within
+/// the last 7 days, it went from `ours`, and its keyword still subscribes people and is on.
+pub async fn pending_optin(conn: &mut sqlx::PgConnection, account_id: Uuid, theirs: &str, ours: &str) -> AppResult<Option<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT p.id FROM sms_pending_optins p JOIN sms_keywords k ON k.id = p.keyword_id
+         WHERE p.account_id = $1 AND p.phone_number = $2 AND p.our_number = $3
+           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days'
+           AND k.enabled AND k.subscribe AND k.double_opt_in",
     )
-    .await?;
-    Ok(())
+    .bind(account_id)
+    .bind(theirs)
+    .bind(ours)
+    .fetch_optional(conn)
+    .await?)
 }
 
-async fn add_to_list(state: &AppState, rx: &Received, k: &Keyword) -> AppResult<()> {
+async fn add_to_list(state: &AppState, account_id: Uuid, profile_id: Uuid, k: &Keyword) -> AppResult<()> {
     if let Some(list_id) = k.list_id {
-        audience::add_to_list(&state.db, rx.account_id, list_id, &[rx.profile_id]).await?;
+        audience::add_to_list(&state.db, account_id, list_id, &[profile_id]).await?;
     }
     Ok(())
 }
 
-/// Do what a matched keyword says.
+/// Do what a matched keyword says. Sign-ups subscribe nobody here: that happens only once the
+/// confirmation, with the full disclosure, has been accepted by the provider ([`subscribed`]).
 pub async fn run(state: &AppState, rx: &Received, k: &Keyword) -> AppResult<()> {
-    store::set_kind(&state.db, rx.id, "keyword", Some(&k.keyword)).await?;
     if !k.subscribe {
-        add_to_list(state, rx, k).await?;
+        add_to_list(state, rx.account_id, rx.profile_id, k).await?;
         if !k.reply.is_empty() {
-            replies::queue_auto(state, rx, &k.reply, false).await?;
+            replies::queue_auto(state, rx, "keyword_reply", &k.reply, Some(k), json!({})).await?;
         }
         return Ok(());
     }
     let s = settings::load(&state.db, rx.account_id).await?;
-    if rx.prior_consent != "subscribed" && k.double_opt_in {
-        // Nothing marketing goes out until they reply Y ('pending' gets no marketing texts).
-        sqlx::query("UPDATE profiles SET sms_consent = 'pending', updated_at = now() WHERE id = $1").bind(rx.profile_id).execute(&state.db).await?;
+    let consent: String = sqlx::query_scalar("SELECT sms_consent FROM profiles WHERE id = $1").bind(rx.profile_id).fetch_one(&state.db).await?;
+    if consent == "subscribed" {
+        // Already signed up: answer as a sign-up would, without a new consent record.
+        add_to_list(state, rx.account_id, rx.profile_id, k).await?;
+        return replies::queue_auto(state, rx, "keyword_reply", &confirmation(&s, k), Some(k), json!({})).await.map(|_| ());
+    }
+    let signup = json!({"signup_inbound_id": rx.id, "signup_provider_message_id": rx.provider_message_id});
+    if k.double_opt_in {
+        // Written first so the prompt's job always finds it; it counts once the prompt is accepted.
         sqlx::query(
-            "INSERT INTO sms_pending_optins (profile_id, account_id, keyword_id, inbound_id) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (profile_id) DO UPDATE SET keyword_id = $3, inbound_id = $4, created_at = now()",
+            "INSERT INTO sms_pending_optins (id, account_id, profile_id, phone_number, our_number, keyword_id, keyword_version, inbound_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (account_id, phone_number) DO UPDATE SET profile_id = $3, our_number = $5, keyword_id = $6, keyword_version = $7, inbound_id = $8,
+                 prompt_id = NULL, prompt_sent_at = NULL, created_at = now()",
         )
-        .bind(rx.profile_id)
+        .bind(Uuid::now_v7())
         .bind(rx.account_id)
+        .bind(rx.profile_id)
+        .bind(&rx.from)
+        .bind(&rx.to)
         .bind(k.id)
+        .bind(k.version)
         .bind(rx.id)
         .execute(&state.db)
         .await?;
-        return replies::queue_auto(state, rx, &opt_in_request(&s), false).await;
+        if replies::queue_auto(state, rx, "optin_request", &opt_in_request(&s), Some(k), signup).await?.is_none() {
+            sqlx::query("DELETE FROM sms_pending_optins WHERE account_id = $1 AND phone_number = $2 AND inbound_id = $3 AND prompt_sent_at IS NULL")
+                .bind(rx.account_id)
+                .bind(&rx.from)
+                .bind(rx.id)
+                .execute(&state.db)
+                .await?;
+        }
+        return Ok(());
     }
-    if rx.prior_consent != "subscribed" {
-        subscribe_now(state, rx, k, "keyword").await?;
-    }
-    add_to_list(state, rx, k).await?;
-    replies::queue_auto(state, rx, &confirmation(&s, k), false).await
+    replies::queue_auto(state, rx, "confirmation", &confirmation(&s, k), Some(k), signup).await.map(|_| ())
 }
 
-/// A "Y" (or START/YES) after a double opt-in request: subscribe, add to the list, confirm.
-/// `already_subscribed`: START already set consent and recorded it. Returns false when nothing was pending.
-pub async fn confirm_pending(state: &AppState, rx: &Received, already_subscribed: bool) -> AppResult<bool> {
-    let keyword_id: Option<Option<Uuid>> =
-        sqlx::query_scalar("DELETE FROM sms_pending_optins WHERE profile_id = $1 AND account_id = $2 AND created_at > now() - interval '7 days' RETURNING keyword_id")
-            .bind(rx.profile_id)
-            .bind(rx.account_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let Some(Some(keyword_id)) = keyword_id else { return Ok(false) };
+/// A "Y" or "YES" answering a double opt-in prompt that went out: queue the confirmation (with the
+/// disclosure); they're subscribed once it's accepted. Returns false when nothing was waiting.
+pub async fn confirm_pending(state: &AppState, rx: &Received) -> AppResult<bool> {
+    let row: Option<(Uuid, i32, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "DELETE FROM sms_pending_optins p USING sms_keywords k
+         WHERE k.id = p.keyword_id AND p.account_id = $1 AND p.phone_number = $2 AND p.our_number = $3
+           AND p.prompt_sent_at IS NOT NULL AND p.prompt_sent_at > now() - interval '7 days' AND k.enabled AND k.subscribe AND k.double_opt_in
+         RETURNING p.keyword_id, p.keyword_version, p.inbound_id, p.prompt_id",
+    )
+    .bind(rx.account_id)
+    .bind(&rx.from)
+    .bind(&rx.to)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((keyword_id, version, signup_inbound, prompt_id)) = row else { return Ok(false) };
     let Ok(k) = get(&state.db, rx.account_id, keyword_id).await else { return Ok(false) };
     store::set_kind(&state.db, rx.id, "confirm", Some(&k.keyword)).await?;
-    if !already_subscribed {
-        subscribe_now(state, rx, &k, "double_opt_in").await?;
-    }
-    add_to_list(state, rx, &k).await?;
+    let signup_pmid: Option<String> = match signup_inbound {
+        Some(id) => sqlx::query_scalar("SELECT provider_message_id FROM sms_inbound WHERE id = $1").bind(id).fetch_optional(&state.db).await?,
+        None => None,
+    };
+    let prompt_pmid: Option<String> = match prompt_id {
+        Some(id) => sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE id = $1").bind(id).fetch_optional(&state.db).await?.flatten(),
+        None => None,
+    };
     let s = settings::load(&state.db, rx.account_id).await?;
-    replies::queue_auto(state, rx, &confirmation(&s, &k), false).await?;
+    let context = json!({
+        "double_opt_in": true, "keyword_version": version,
+        "signup_inbound_id": signup_inbound, "signup_provider_message_id": signup_pmid,
+        "confirm_inbound_id": rx.id, "confirm_provider_message_id": rx.provider_message_id,
+        "prompt_message_id": prompt_id, "prompt_provider_message_id": prompt_pmid,
+    });
+    replies::queue_auto(state, rx, "confirmation", &confirmation(&s, &k), Some(&k), context).await?;
     Ok(true)
+}
+
+/// The provider accepted a sign-up confirmation (`message_id`, with the disclosure text as sent):
+/// now they're subscribed, with the evidence kept. Unless they opted out in the meantime.
+pub async fn subscribed(state: &AppState, auto: &replies::AutoSend, message_id: Uuid) -> AppResult<()> {
+    let Some(keyword_id) = auto.keyword_id else { return Ok(()) };
+    let Some(k) = by_id(&state.db, auto.account_id, keyword_id).await? else { return Ok(()) };
+    let (disclosure, provider_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT t.body, m.provider_message_id FROM sms_sent_texts t JOIN messages m ON m.id = t.message_id WHERE t.message_id = $1",
+    )
+    .bind(message_id)
+    .fetch_one(&state.db)
+    .await?;
+    let c = &auto.context;
+    let double = c["double_opt_in"].as_bool() == Some(true);
+    let uuid = |key: &str| c[key].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 64))").bind(auto.account_id).bind(&auto.to_number).execute(&mut *tx).await?;
+    if store::is_opted_out(&mut tx, auto.account_id, &auto.to_number).await? {
+        return Ok(());
+    }
+    sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(auto.profile_id).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO sms_consents (id, account_id, profile_id, method, phone_number, our_number, keyword_id, keyword, keyword_version, disclosure,
+             signup_inbound_id, signup_provider_message_id, confirm_inbound_id, confirm_provider_message_id, prompt_message_id, prompt_provider_message_id,
+             confirmation_message_id, confirmation_provider_message_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         ON CONFLICT (confirmation_message_id) DO NOTHING",
+    )
+    .bind(Uuid::now_v7())
+    .bind(auto.account_id)
+    .bind(auto.profile_id)
+    .bind(if double { "double_opt_in" } else { "keyword" })
+    .bind(&auto.to_number)
+    .bind(&auto.from_number)
+    .bind(k.id)
+    .bind(&k.keyword)
+    .bind(c["keyword_version"].as_i64().map(|v| v as i32).or(auto.keyword_version).unwrap_or(k.version))
+    .bind(&disclosure)
+    .bind(uuid("signup_inbound_id"))
+    .bind(c["signup_provider_message_id"].as_str())
+    .bind(uuid("confirm_inbound_id"))
+    .bind(c["confirm_provider_message_id"].as_str())
+    .bind(uuid("prompt_message_id"))
+    .bind(c["prompt_provider_message_id"].as_str())
+    .bind(message_id)
+    .bind(&provider_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let signup_text: Option<String> = match uuid("signup_inbound_id") {
+        Some(id) => sqlx::query_scalar("SELECT body FROM sms_inbound WHERE id = $1").bind(id).fetch_optional(&state.db).await?,
+        None => None,
+    };
+    // How and when they agreed, also as an event for segments and flows.
+    audience::record_event(
+        &state.db,
+        NewEvent {
+            account_id: auto.account_id,
+            profile_id: auto.profile_id,
+            metric: "Subscribed to SMS",
+            properties: json!({
+                "method": if double { "double_opt_in" } else { "keyword" }, "keyword": k.keyword.to_uppercase(), "keyword_version": k.version,
+                "text": signup_text, "to": auto.from_number, "disclosure": disclosure, "inbound_message_id": uuid("signup_inbound_id"),
+                "confirmation_message_id": message_id,
+            }),
+            value: None,
+            occurred_at: None,
+            unique_id: Some(format!("sms-optin:{}", auto.id)),
+            message_id: Some(message_id),
+        },
+    )
+    .await?;
+    add_to_list(state, auto.account_id, auto.profile_id, &k).await
+}
+
+/// The provider accepted a double opt-in prompt: from now, for 7 days, a "Y" counts.
+pub async fn prompt_sent(state: &AppState, auto: &replies::AutoSend) -> AppResult<()> {
+    sqlx::query("UPDATE sms_pending_optins SET prompt_sent_at = now(), prompt_id = $1 WHERE account_id = $2 AND phone_number = $3 AND our_number = $4 AND inbound_id = $5")
+        .bind(auto.id)
+        .bind(auto.account_id)
+        .bind(&auto.to_number)
+        .bind(&auto.from_number)
+        .bind(auto.inbound_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+async fn by_id(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Option<Keyword>> {
+    let q = format!("SELECT {COLS} FROM sms_keywords WHERE id = $1 AND account_id = $2");
+    Ok(sqlx::query_as::<_, Keyword>(&q).bind(id).bind(account_id).fetch_optional(db).await?)
+}
+
+/// Whether any keyword subscribes people (then the disclosure settings can't be cleared).
+pub async fn any_subscribing(db: &PgPool, account_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sms_keywords WHERE account_id = $1 AND subscribe)").bind(account_id).fetch_one(db).await?)
+}
+
+/// Whether any keyword is on (then the support contact can't be cleared).
+pub async fn any_enabled(db: &PgPool, account_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sms_keywords WHERE account_id = $1 AND enabled)").bind(account_id).fetch_one(db).await?)
 }
 
 #[cfg(test)]
@@ -325,7 +466,7 @@ mod tests {
     fn keywords_are_one_word_and_not_reserved() {
         assert_eq!(normalize(" Join ").unwrap(), "join");
         assert_eq!(normalize("VIP2026").unwrap(), "vip2026");
-        for bad in ["STOP", "help", "Info", "unstop", "y", "yes", "join now", "", "a-b"] {
+        for bad in ["STOP", "help", "Info", "unstop", "y", "yes", "join now", "", "a-b", "Revoke", "stopall", "optout", "subscribe", "start"] {
             assert!(normalize(bad).is_err(), "{bad}");
         }
     }
@@ -343,6 +484,7 @@ mod tests {
             list_id: None,
             reply: "Welcome! Here's 10% off: SAVE10".into(),
             enabled: true,
+            version: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

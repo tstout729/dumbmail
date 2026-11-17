@@ -150,8 +150,14 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
             "update_profile" => need("properties")?,
             "wait_for_reply" => {
                 let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
-                if amount <= 0.0 || !matches!(n.str("unit"), Some("minutes" | "hours" | "days")) {
-                    return Err(AppError::bad(format!("wait for reply {} needs a positive amount and a unit (minutes, hours or days)", n.id)));
+                let unit = match n.str("unit") {
+                    Some("minutes") => 60.0,
+                    Some("hours") => 3600.0,
+                    Some("days") => 86400.0,
+                    _ => 0.0,
+                };
+                if amount <= 0.0 || unit == 0.0 || amount * unit > 30.0 * 86400.0 {
+                    return Err(AppError::bad(format!("wait for reply {} needs a positive amount and a unit (minutes, hours or days), up to 30 days", n.id)));
                 }
             }
             "add_to_list" | "remove_from_list" => need("list_id")?,
@@ -576,10 +582,14 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "email" | "sms" => {
-                // Smart sending: skip if this person got any message in the last N hours (0 = off).
+                // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
+                // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 let recent: bool = hours > 0
-                    && sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND sent_at > now() - make_interval(hours => $3))")
+                    && sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND sent_at > now() - make_interval(hours => $3)
+                             AND NOT EXISTS (SELECT 1 FROM sms_sent_texts t WHERE t.message_id = messages.id AND t.kind <> 'marketing'))",
+                    )
                         .bind(run.profile_id)
                         .bind(&node.kind)
                         .bind(hours as i32)
@@ -628,28 +638,39 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }
-            // Wait until they text back (yes) or the time runs out (no); see `features::inbox`.
+            // Wait until they text back (yes) or the time runs out (no); see `features::inbox`. The
+            // start and deadline are saved with the job in one transaction, and the branch is decided
+            // only by replies between them, however late the job runs.
             "wait_for_reply" if !waited => {
                 let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(1.0);
-                let secs = amount * match node.str("unit") {
-                    Some("minutes") => 60.0,
-                    Some("hours") => 3600.0,
-                    _ => 86400.0,
-                };
+                let secs = (amount
+                    * match node.str("unit") {
+                        Some("minutes") => 60.0,
+                        Some("hours") => 3600.0,
+                        _ => 86400.0,
+                    })
+                .clamp(1.0, 30.0 * 86400.0);
+                let since = Utc::now();
+                let until = since + Duration::milliseconds((secs * 1000.0) as i64);
                 context["_waited"] = json!(node_id);
-                context["_reply_since"] = json!(Utc::now());
-                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&state.db).await?;
-                let at = Utc::now() + Duration::milliseconds((secs * 1000.0) as i64);
-                crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                context["_reply_since"] = json!(since);
+                context["_reply_until"] = json!(until);
+                let mut tx = state.db.begin().await?;
+                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&mut *tx).await?;
+                crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                tx.commit().await?;
                 return Ok(());
             }
             "wait_for_reply" => {
-                let since = context.get("_reply_since").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_else(Utc::now);
+                let at = |k: &str| context.get(k).and_then(|v| serde_json::from_value::<chrono::DateTime<Utc>>(v.clone()).ok());
+                let since = at("_reply_since").unwrap_or_else(Utc::now);
+                let until = at("_reply_until").unwrap_or_else(Utc::now).min(Utc::now());
                 if let Some(o) = context.as_object_mut() {
                     o.remove("_waited");
                     o.remove("_reply_since");
+                    o.remove("_reply_until");
                 }
-                let replied = crate::features::inbox::replied_since(&state.db, run.profile_id, since).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, until).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if replied { "yes" } else { "no" }).map(str::to_string);
             }
             "random_split" => {
