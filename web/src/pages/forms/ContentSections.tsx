@@ -1,3 +1,4 @@
+import { FormCouponField } from "../../features/coupons/FormCouponField";
 import { PartyPopper, Type } from "lucide-react";
 import { CollapsibleCard, Field, Input, SubHeading, Textarea } from "../../components/ui";
 import { contentDefaults } from "./formConfig";
@@ -92,6 +93,7 @@ export function SuccessSection({ ed, open, onToggle }: SectionProps) {
       <Field label="Discount code" hint="Shown in a box with a Copy button.">
         <Input maxLength={60} className="font-mono" {...versionText(ed, "discount_code", "e.g. WELCOME10")} />
       </Field>
+      <FormCouponField value={c.coupon} onChange={(coupon) => ed.set({ coupon })} />
       <SubHeading action={<AllVersions ed={ed} />}>Button and next step</SubHeading>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label="Button text" hint="Leave empty for no button.">

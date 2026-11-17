@@ -3,6 +3,7 @@ import { AlignCenter, AlignLeft, AlignRight, Bold, Italic, Link2, List } from "l
 import type { Align, EmailBlock } from "../../api";
 import { ColorInput, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 import { ProductsBlockFields } from "../../features/catalog/ProductsBlockFields";
+import { CouponBlockFields } from "../../features/coupons/CouponBlockFields";
 import { VariableMenu, insertAtCursor, wrapSelection } from "./VariableMenu";
 
 type Props<T extends EmailBlock> = { block: T; onChange: (b: EmailBlock) => void };
@@ -227,5 +228,7 @@ export function BlockFields({ block, onChange }: { block: EmailBlock; onChange: 
       return <HtmlFields block={block} onChange={onChange} />;
     case "products":
       return <ProductsBlockFields block={block} onChange={onChange} />;
+    case "coupon":
+      return <CouponBlockFields block={block} onChange={onChange} />;
   }
 }

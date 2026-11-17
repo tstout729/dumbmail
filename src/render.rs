@@ -158,6 +158,7 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
             )
         }
         "products" if depth == 0 => products_html(b, brand, font),
+        "coupon" => crate::features::coupons::template::block_html(b, brand, font),
         "html" => format!(r#"<tr><td style="{pad}">{}</td></tr>"#, s(b, "html")),
         _ => String::new(),
     }
@@ -248,6 +249,7 @@ fn block_text(b: &Value, out: &mut String) {
         }
         "button" => out.push_str(&format!("{}: {}\n\n", s(b, "text"), s(b, "href"))),
         "product" => out.push_str(&format!("{} {} {}\n\n", s(b, "title"), s(b, "price"), s(b, "href"))),
+        "coupon" => crate::features::coupons::template::block_text(b, out),
         "products" => {
             // Catalog text can't open a template tag in the plain-text part either.
             // A zero-width space after every brace: no sequence of them can open a tag.
@@ -321,8 +323,10 @@ pub fn render_str(source: &str, ctx: &Value, html: bool) -> AppResult<String> {
     if !source.contains("{{") && !source.contains("{%") {
         return Ok(source.to_string());
     }
+    // `{% coupon_code 'NAME' %}` becomes the code prepared for this message (see features::coupons).
+    let source = crate::features::coupons::template::resolve(source, ctx)?;
     env(html)
-        .render_str(source, ctx)
+        .render_str(&source, ctx)
         .map_err(|e| AppError::bad(format!("template error: {e}")))
 }
 
@@ -397,6 +401,26 @@ pub fn render_email(
     tracking: Option<&Tracking<'_>>,
 ) -> AppResult<RenderedEmail> {
     render_email_with(account, content, ctx, tracking, EmailOptions::default())
+}
+
+/// The template text an email renders: subject, preheader, then the body as HTML and as text
+/// (without the layout and footer, which never carry template tags). Features that must know what a
+/// message will show (coupon codes) read this, so they see what [`render_email_with`] renders.
+pub fn email_template_parts(content: &EmailContent) -> [String; 4] {
+    let (html, text) = match (&content.blocks, &content.html) {
+        (Some(blocks), _) if !blocks.is_empty() => {
+            let mut text = String::new();
+            blocks.iter().for_each(|b| block_text(b, &mut text));
+            (blocks.iter().map(|b| block_html(b, "#000000", "", 0)).collect(), text)
+        }
+        (_, Some(html)) if !html.trim().is_empty() => {
+            let mut text = String::new();
+            block_text(&json!({"type": "html", "html": html}), &mut text);
+            (html.clone(), text)
+        }
+        _ => (String::new(), String::new()),
+    };
+    [content.subject.clone(), content.preheader.clone().unwrap_or_default(), html, text]
 }
 
 pub fn render_email_with(
