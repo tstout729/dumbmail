@@ -2,9 +2,11 @@
 //! person joins the list, with the "Subscribed to List" event that starts welcome flows, only after
 //! confirming. Typos, fake addresses and bots never reach a campaign, so they can't bounce or complain.
 //!
-//! Confirmation emails aren't billed and don't count against the warm-up limit. They do count toward the
-//! bounce and complaint rates. One address gets at most one every 24 hours and an account at most
-//! `MAX_PER_HOUR`, so a bot filling in a form can't use DumbMail to flood someone's inbox.
+//! Confirmation emails aren't billed and don't count toward the warm-up limit (or raise it). They do count
+//! toward the bounce and complaint rates. One address gets at most one every 24 hours and an account at most
+//! `MAX_PER_HOUR`, so a bot filling in a form can't use DumbMail to flood someone's inbox. Addresses that
+//! bounced or complained before get none. When no confirmation can be sent, the sign-up is refused rather
+//! than let through unconfirmed.
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -25,7 +27,7 @@ const MAX_PER_HOUR: i64 = 200;
 pub enum Started {
     /// The person has to confirm (an email went out now or in the last day).
     Pending,
-    /// No confirmation can be sent (no verified sender, or sending is paused); sign them up directly.
+    /// No confirmation can be sent (no verified sender, or sending is paused). The sign-up is refused.
     Unavailable(String),
 }
 
@@ -51,6 +53,11 @@ pub async fn start(state: &AppState, account: &Account, profile_id: Uuid, email:
         if let Err(e) = crate::sending::check_sender_domain_name(account, &from_email) {
             return Ok(Started::Unavailable(e));
         }
+    }
+    // An address that hard bounced or reported spam gets no more email, a confirmation included.
+    let suppressed: bool = sqlx::query_scalar("SELECT email_suppressed_reason IS NOT NULL FROM profiles WHERE id = $1").bind(profile_id).fetch_one(&state.db).await?;
+    if suppressed {
+        return Ok(Started::Pending);
     }
     let waiting: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
@@ -113,7 +120,7 @@ pub async fn start(state: &AppState, account: &Account, profile_id: Uuid, email:
             .bind(&provider_id)
             .execute(&state.db)
             .await?;
-            crate::deliverability::record_send(&state.db, message_id, &provider_id, account.id, None).await?;
+            crate::deliverability::record_confirmation_send(&state.db, message_id, &provider_id, account.id).await?;
             Ok(Started::Pending)
         }
         Err(e) => {

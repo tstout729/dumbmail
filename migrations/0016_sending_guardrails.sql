@@ -7,6 +7,10 @@ ALTER TABLE accounts
     -- Skip campaign email to people who got many emails in the last 180 days and did nothing at all.
     ADD COLUMN email_sunset_enabled boolean NOT NULL DEFAULT true;
 
+-- Confirmation emails count toward bounce and complaint rates but not toward the warm-up limit, so
+-- sign-up forms (or a bot filling them in) can't raise it.
+ALTER TABLE email_sends ADD COLUMN counts_toward_limit boolean NOT NULL DEFAULT true;
+
 -- Double opt-in: a sign-up to a double opt-in list waits here until the person confirms by email.
 CREATE TABLE optin_confirmations (
     id           uuid PRIMARY KEY,

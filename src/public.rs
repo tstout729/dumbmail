@@ -595,9 +595,10 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
                 let msg = form.config["confirm_message"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("Almost done! Check your inbox and tap the link to confirm.");
                 return Ok(json!({"ok": true, "confirm": true, "message": msg}));
             }
+            // Never let someone onto a double opt-in list unconfirmed: ask them to try again.
             crate::optin::Started::Unavailable(why) => {
-                tracing::warn!(account = %account.id, form = %form.id, reason = %why, "double opt-in unavailable; signing up directly");
-                sqlx::query("UPDATE profiles SET email_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(p.id).execute(&state.db).await?;
+                tracing::warn!(account = %account.id, form = %form.id, reason = %why, "double opt-in confirmation couldn't be sent; sign-up refused");
+                return Err(AppError::Conflict("We couldn't send your confirmation email right now. Please try again later.".into()));
             }
         }
     }

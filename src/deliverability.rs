@@ -78,15 +78,26 @@ pub async fn campaign_outcomes(db: &sqlx::PgPool, account_id: Uuid, campaign_id:
     sqlx::query_as(&format!("{OUTCOMES_SELECT} AND s.campaign_id = $3")).bind(account_id).bind(WINDOW_DAYS).bind(campaign_id).fetch_one(db).await
 }
 
-/// The provider accepted a real email: count it toward the account's rates.
+/// The provider accepted a real email: count it toward the account's rates and its warm-up limit.
 pub async fn record_send(db: &sqlx::PgPool, message_id: Uuid, provider_message_id: &str, account_id: Uuid, campaign_id: Option<Uuid>) -> sqlx::Result<()> {
+    insert_send(db, message_id, provider_message_id, account_id, campaign_id, true).await
+}
+
+/// A double opt-in confirmation went out: it counts toward bounce and complaint rates, not the warm-up
+/// limit (so sign-up forms, or a bot filling them in, can't raise the limit).
+pub async fn record_confirmation_send(db: &sqlx::PgPool, message_id: Uuid, provider_message_id: &str, account_id: Uuid) -> sqlx::Result<()> {
+    insert_send(db, message_id, provider_message_id, account_id, None, false).await
+}
+
+async fn insert_send(db: &sqlx::PgPool, message_id: Uuid, provider_message_id: &str, account_id: Uuid, campaign_id: Option<Uuid>, counts: bool) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO email_sends (message_id, provider_message_id, account_id, campaign_id) VALUES ($1, $2, $3, $4) ON CONFLICT (message_id) DO NOTHING",
+        "INSERT INTO email_sends (message_id, provider_message_id, account_id, campaign_id, counts_toward_limit) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (message_id) DO NOTHING",
     )
     .bind(message_id)
     .bind(provider_message_id)
     .bind(account_id)
     .bind(campaign_id)
+    .bind(counts)
     .execute(db)
     .await?;
     Ok(())
@@ -355,8 +366,8 @@ pub async fn daily_limit(state: &AppState, account_id: Uuid) -> sqlx::Result<Dai
     let db = &state.db;
     let (fixed, sent_24h, peak): (Option<i32>, i64, i64) = sqlx::query_as(
         "SELECT a.email_daily_limit_override,
-            (SELECT count(*) FROM email_sends s WHERE s.account_id = a.id AND s.sent_at > now() - interval '24 hours')::bigint,
-            COALESCE((SELECT max(n) FROM (SELECT count(*) AS n FROM email_sends s WHERE s.account_id = a.id
+            (SELECT count(*) FROM email_sends s WHERE s.account_id = a.id AND s.counts_toward_limit AND s.sent_at > now() - interval '24 hours')::bigint,
+            COALESCE((SELECT max(n) FROM (SELECT count(*) AS n FROM email_sends s WHERE s.account_id = a.id AND s.counts_toward_limit
                 AND s.sent_at > now() - make_interval(days => $2)
                 AND (s.sent_at AT TIME ZONE a.timezone)::date < (now() AT TIME ZONE a.timezone)::date
                 GROUP BY (s.sent_at AT TIME ZONE a.timezone)::date) d), 0)::bigint
@@ -414,7 +425,7 @@ pub async fn take_daily_slot(state: &AppState, account_id: Uuid) -> anyhow::Resu
     }
     // Room opens up as the oldest sends in the window turn 24 hours old.
     let oldest: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT min(sent_at) FROM email_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'")
+        sqlx::query_scalar("SELECT min(sent_at) FROM email_sends WHERE account_id = $1 AND counts_toward_limit AND sent_at > now() - interval '24 hours'")
             .bind(account_id)
             .fetch_one(&state.db)
             .await?;

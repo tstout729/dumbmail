@@ -279,9 +279,10 @@ These protect the shared SES account's reputation along with the automatic pause
   Confirming sets `email_consent: "subscribed"`, records "Subscribed to List" (with
   `double_opt_in: true`) and adds them to the list, which starts list-triggered flows. People already
   subscribed to email join straight away. An address waiting to confirm gets no second email for 24 hours,
-  and an account sends at most 200 confirmations an hour. If the account can't send email (no verified
-  sender, or sending paused), the sign-up goes through without confirmation and a warning is logged.
-  Confirmation emails count toward bounce and complaint rates, and a bounce suppresses the address.
+  and an account sends at most 200 confirmations an hour. Addresses that bounced or complained before get
+  none. If the account can't send email (no verified sender, or sending paused), the sign-up is refused
+  with 409 ("try again later") rather than let through unconfirmed. Confirmation emails count toward bounce
+  and complaint rates (a bounce suppresses the address) but not toward the warm-up limit.
 
 ## Operator endpoints
 

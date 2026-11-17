@@ -2108,3 +2108,39 @@ async fn campaigns_skip_people_who_never_engage() {
     assert_eq!(est["count"], 3, "turned off, everyone is reachable");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn double_opt_in_never_lets_anyone_in_unconfirmed() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter", "double_opt_in": true}))).await;
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Popup", "list_id": list_id, "config": {"headline": "Join"}}))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "live"}))).await;
+    let subscribe = |email: &str| json!({"form_id": fid, "email": email}).to_string();
+
+    // No sender email: the confirmation can't go out, so the sign-up is refused, not let through.
+    sqlx::query("UPDATE accounts SET from_email = NULL").execute(&h.state.db).await.unwrap();
+    let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("nosender@x.test")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    let joined: i64 = sqlx::query_scalar("SELECT count(*) FROM list_members WHERE list_id = $1::uuid").bind(&list_id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(joined, 0);
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'nosender@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_ne!(consent, "subscribed");
+    sqlx::query("UPDATE accounts SET from_email = 'hello@acme.test'").execute(&h.state.db).await.unwrap();
+
+    // An address that hard bounced before gets no confirmation email.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bounced@x.test"}))).await;
+    sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce' WHERE email = 'bounced@x.test'").execute(&h.state.db).await.unwrap();
+    let (s, _, _) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("bounced@x.test")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.state.email.sent().into_iter().filter(|m| m.to == "bounced@x.test").count(), 0);
+
+    // Confirmation emails count toward bounce rates but never toward (or raise) the warm-up limit.
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("fresh@x.test")).await;
+    let (counted, total): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE counts_toward_limit), count(*) FROM email_sends").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((counted, total), (0, 1));
+    h.cleanup().await;
+}
