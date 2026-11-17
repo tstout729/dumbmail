@@ -138,6 +138,10 @@ async fn used_by_other_account(state: &AppState, account_id: Uuid, domain: &str)
 pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
     let domain = clean_domain(raw)?;
     let mf = mail_from_for(&domain);
+    // Checked before the transaction: every query inside it must use its one connection.
+    if verified_elsewhere(state, account_id, &domain).await? {
+        return Err(AppError::Conflict("that domain is already verified by another account".into()));
+    }
     // Claim the row under a per-account lock, so simultaneous adds can't get past the cap.
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('sending_domains:' || $1::text, 0))").bind(account_id).execute(&mut *tx).await?;
@@ -155,9 +159,6 @@ pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -
     }
     if count >= MAX_SENDING_DOMAINS {
         return Err(AppError::bad(format!("you can add up to {MAX_SENDING_DOMAINS} sending domains; remove one you no longer use first")));
-    }
-    if verified_elsewhere(state, account_id, &domain).await? {
-        return Err(AppError::Conflict("that domain is already verified by another account".into()));
     }
     sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status, mail_from_domain) VALUES ($1, $2, $3, 'pending', $4)")
         .bind(Uuid::now_v7())
