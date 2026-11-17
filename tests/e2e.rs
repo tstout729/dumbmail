@@ -1043,6 +1043,56 @@ async fn site_host_and_app_host_split() {
     h.cleanup().await;
 }
 
+#[tokio::test]
+async fn public_files_point_back_to_the_host_that_served_them() {
+    let Some(mut h) = Harness::with(|c| {
+        c.public_url = "https://app.pl.test".into();
+        c.site_url = Some("https://pl.test".into());
+    })
+    .await
+    else {
+        return;
+    };
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Page", "kind": "page", "list_id": list["id"]}))).await;
+    let form_id = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{form_id}"), Some(json!({"status": "live"}))).await;
+
+    // Served on the site host, everything points back to the site host only, so snippets installed
+    // before the app moved keep talking to dumbmail.ai alone.
+    for (host, base, other) in [("pl.test", "https://pl.test", "app.pl.test"), ("app.pl.test", "https://app.pl.test", "\"https://pl.test")] {
+        let (s, _, js) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(js.contains(&format!("\"{base}\"")) && !js.contains(other), "onsite.js on {host}");
+        let (s, _, js) = h.raw("GET", &format!("/f/{form_id}/embed.js"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(js.contains(&format!("\"{base}\"")) && !js.contains(other), "embed.js on {host}");
+        let (s, _, html) = h.raw("GET", &format!("/f/{form_id}"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK, "hosted form on {host}");
+        assert!(html.contains(&format!("{base}/client/subscribe?k={pk}")), "subscribe URL on {host}");
+        assert!(html.contains(&format!("<script src=\"{base}/client/form-render.js\">")), "renderer on {host}");
+        assert!(!html.contains(other), "hosted form on {host} only names {base}");
+    }
+    // Any other Host header gets PUBLIC_URL, never itself.
+    let (_, _, js) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[("host", "evil.test")], "").await;
+    assert!(js.contains("\"https://app.pl.test\"") && !js.contains("evil.test"));
+    let (_, _, html) = h.raw("GET", &format!("/f/{form_id}"), &[("host", "evil.test")], "").await;
+    assert!(html.contains("https://app.pl.test/client/form-render.js") && !html.contains("evil.test"));
+
+    // www. + the site host moves permanently to SITE_URL; other methods aren't redirected.
+    let (s, headers, _) = h.raw("GET", "/pricing?ref=x", &[("host", "www.pl.test")], "").await;
+    assert_eq!(s, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers["location"], "https://pl.test/pricing?ref=x");
+    let (s, headers, _) = h.raw("HEAD", "/", &[("host", "www.pl.test")], "").await;
+    assert_eq!(s, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers["location"], "https://pl.test/");
+    let (s, _, _) = h.raw("POST", "/webhooks/stripe", &[("host", "www.pl.test")], "{}").await;
+    assert_ne!(s, StatusCode::MOVED_PERMANENTLY);
+    h.cleanup().await;
+}
+
 // ---------- A/B tests ----------
 
 /// A list of `n` subscribed email profiles (ab0@x.test …), returning the list id.

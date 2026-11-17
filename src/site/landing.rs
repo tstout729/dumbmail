@@ -342,12 +342,13 @@ fn shot_size(name: &str) -> (u32, u32) {
 fn landing_page(state: &AppState) -> Html<String> {
     let c = &state.cfg;
     let l = links(c);
-    let app_host = c.public_host().unwrap_or_else(|| "dumbmail".into());
+    // The screenshots are of the hosted app, so the frame names its host whatever this server is called.
+    let app_host = "app.dumbmail.ai";
     let free = c.free_emails_per_month.max(0);
     let free_line = if free > 0 { format!("The first {} emails every month are free. No card needed to start.", thousands(free)) } else { "No card needed to start.".into() };
     let shot_of = |name: &str, alt: &str, eager: bool| {
         let (w, h) = shot_size(name);
-        shot(name, w, h, alt, &app_host, eager)
+        shot(name, w, h, alt, app_host, eager)
     };
 
     let hero = format!(

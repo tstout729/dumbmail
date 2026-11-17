@@ -32,7 +32,8 @@ pub(crate) fn request_host(headers: &HeaderMap) -> String {
 /// With SITE_URL set: on its host, the site pages and everything that must keep answering there (API,
 /// MCP, webhooks, tracking links, hosted forms, the snippet, Google sign-in and verification) stay,
 /// and other page visits go to the app at PUBLIC_URL. On PUBLIC_URL's host, the site pages go to
-/// SITE_URL. Both redirects are 302s that keep the path and query.
+/// SITE_URL. Both redirects are 302s that keep the path and query. `www.` + the site host moves
+/// permanently (301) to SITE_URL.
 pub async fn host_split(State(state): State<AppState>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let (Some(site_url), Some(site_host)) = (state.cfg.site_url(), state.cfg.site_host()) else {
         return next.run(req).await;
@@ -55,6 +56,8 @@ pub async fn host_split(State(state): State<AppState>, req: axum::extract::Reque
         if !stays {
             return found(format!("{}{path_and_query}", state.cfg.public_url()));
         }
+    } else if host.strip_prefix("www.") == Some(site_host.as_str()) {
+        return (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, format!("{site_url}{path_and_query}"))]).into_response();
     } else if Some(host) == state.cfg.public_host() && SITE_PAGES.contains(&path) {
         return found(format!("{site_url}{path_and_query}"));
     }

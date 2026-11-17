@@ -187,6 +187,16 @@ impl Config {
         self.site_url().and_then(host_of)
     }
 
+    /// Base URL that public files served on `host` (the website snippet, embeds, hosted forms) point
+    /// back to: SITE_URL on the site host, so installs made before the app moved keep talking only to
+    /// that host, else PUBLIC_URL. Only these two configured URLs are ever returned.
+    pub fn public_base_for(&self, host: &str) -> &str {
+        match (self.site_url(), self.site_host()) {
+            (Some(site), Some(h)) if h == host => site,
+            _ => self.public_url(),
+        }
+    }
+
     /// PUBLIC_URL's hostname (lowercase).
     pub fn public_host(&self) -> Option<String> {
         host_of(self.public_url())
