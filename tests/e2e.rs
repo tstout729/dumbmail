@@ -659,6 +659,36 @@ async fn billing_numbers_onsite_and_domains() {
         && r["value"].as_str().unwrap().starts_with("dumbmail-verify=")));
     assert_eq!(sd["email"]["status"], "pending", "not verified without the ownership record");
     assert_eq!(sd["email"]["mail_from_domain"], "send.acme-test-domain.example");
+    // Several sending domains: each is listed with its own records and status.
+    let sd = h.ok("POST", "/api/account/domains", Some(json!({"domain": "second-brand.example"}))).await;
+    let names: Vec<&str> = sd["email"]["domains"].as_array().unwrap().iter().map(|d| d["domain"].as_str().unwrap()).collect();
+    assert_eq!(names, ["acme-test-domain.example", "second-brand.example"]);
+    assert!(sd["email"]["domains"][1]["dns_records"].as_array().unwrap().iter().any(|r| r["name"] == "_dumbmail.second-brand.example"));
+    // Adding one that's already there just re-checks it.
+    let again = h.ok("POST", "/api/account/domains", Some(json!({"domain": "Second-Brand.example"}))).await;
+    assert_eq!(again["email"]["domains"].as_array().unwrap().len(), 2);
+    // Verified domains (and their subdomains) are what the account may send from.
+    sqlx::query("UPDATE sending_domains SET status = 'verified' WHERE domain = 'second-brand.example'").execute(&h.state.db).await.unwrap();
+    let acct_id: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM sending_domains WHERE domain = 'second-brand.example'").fetch_one(&h.state.db).await.unwrap();
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct_id).await.unwrap();
+    assert_eq!(account.verified_domains, ["second-brand.example"]);
+    assert!(dumbmail::sending::check_sender_domain_name(&account, "hi@news.second-brand.example").is_ok());
+    assert!(dumbmail::sending::check_sender_domain_name(&account, "hi@acme-test-domain.example").is_err());
+    let v = h.ok("POST", "/api/account/domains/second-brand.example/verify", None).await;
+    assert_eq!(v["email"]["domains"][1]["domain"], "second-brand.example");
+    // The old single-domain delete refuses to guess which one to remove.
+    let (s, _) = h.req("DELETE", "/api/account/domain", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // There's a cap per account.
+    sqlx::query("INSERT INTO sending_domains (id, account_id, domain) SELECT gen_random_uuid(), $1, 'filler' || g || '.example' FROM generate_series(1, 18) g")
+        .bind(acct_id).execute(&h.state.db).await.unwrap();
+    let (s, _) = h.req("POST", "/api/account/domains", Some(json!({"domain": "one-too-many.example"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    sqlx::query("DELETE FROM sending_domains WHERE domain LIKE 'filler%'").execute(&h.state.db).await.unwrap();
+    let rm = h.ok("DELETE", "/api/account/domains/second-brand.example", None).await;
+    assert_eq!(rm["email"]["domains"].as_array().unwrap().len(), 1);
+    let (s, _) = h.req("DELETE", "/api/account/domains/not-mine.example", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
     let ld = h.ok("POST", "/api/account/link-domain", Some(json!({"domain": "links.acme-test-domain.example"}))).await;
     assert_eq!(ld["link_domain"]["domain"], "links.acme-test-domain.example");
     assert_eq!(ld["link_domain"]["dns_records"][0]["value"], "pl.test");

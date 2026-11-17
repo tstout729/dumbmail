@@ -22,22 +22,18 @@ pub struct Account {
     pub social_links: Value,
     pub plan: String,
     pub onboarding: Value,
-    #[serde(skip)]
-    pub sending_domain: Option<String>,
-    #[serde(skip)]
-    pub sending_domain_status: String,
-    #[serde(skip)]
-    pub sending_domain_records: Value,
     pub conversion_metric: String,
     pub created_at: DateTime<Utc>,
-    #[serde(skip)]
-    pub mail_from_domain: Option<String>,
     #[serde(skip)]
     pub link_domain: Option<String>,
     #[serde(skip)]
     pub link_domain_status: String,
     #[serde(skip)]
     pub link_domain_records: Value,
+    /// Sending domains this account has verified (filled in by `load_account`; empty elsewhere).
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub verified_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

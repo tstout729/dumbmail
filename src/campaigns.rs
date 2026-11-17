@@ -198,7 +198,10 @@ pub async fn load(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Campaign
 }
 
 pub async fn load_account(db: &PgPool, id: Uuid) -> AppResult<Account> {
-    sqlx::query_as::<_, Account>("SELECT * FROM accounts WHERE id = $1")
+    sqlx::query_as::<_, Account>(
+        "SELECT a.*, ARRAY(SELECT d.domain FROM sending_domains d WHERE d.account_id = a.id AND d.status = 'verified' ORDER BY d.created_at) AS verified_domains
+         FROM accounts a WHERE a.id = $1",
+    )
         .bind(id)
         .fetch_optional(db)
         .await?

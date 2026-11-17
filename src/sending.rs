@@ -83,9 +83,8 @@ pub fn check_sender_domain(state: &AppState, account: &Account, from_email: &str
 
 pub fn check_sender_domain_name(account: &Account, from_email: &str) -> Result<(), String> {
     let from_domain = from_email.rsplit_once('@').map(|(_, d)| d.to_lowercase()).unwrap_or_default();
-    let ok = account.sending_domain_status == "verified"
-        && account.sending_domain.as_deref().is_some_and(|d| from_domain == d || from_domain.ends_with(&format!(".{d}")));
-    if ok { Ok(()) } else { Err(format!("Verify {from_domain} in Settings → Sending before sending from {from_email}")) }
+    let ok = account.verified_domains.iter().any(|d| from_domain == *d || from_domain.ends_with(&format!(".{d}")));
+    if ok { Ok(()) } else { Err(format!("Verify {from_domain} in Settings → Domains before sending from {from_email}")) }
 }
 
 pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) -> String {
@@ -303,15 +302,12 @@ mod tests {
             social_links: serde_json::json!({}),
             plan: "free".into(),
             onboarding: json!({}),
-            sending_domain: None,
-            sending_domain_status: String::new(),
-            sending_domain_records: json!([]),
             conversion_metric: "Placed Order".into(),
             created_at: chrono::Utc::now(),
-            mail_from_domain: None,
             link_domain: None,
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
+            verified_domains: Vec::new(),
         }
     }
 }

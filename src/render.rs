@@ -435,15 +435,12 @@ mod tests {
             social_links: serde_json::json!({}),
             plan: "free".into(),
             onboarding: json!({}),
-            sending_domain: None,
-            sending_domain_status: "not_started".into(),
-            sending_domain_records: json!([]),
             conversion_metric: "Placed Order".into(),
             created_at: chrono::Utc::now(),
-            mail_from_domain: None,
             link_domain: None,
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
+            verified_domains: Vec::new(),
         }
     }
 

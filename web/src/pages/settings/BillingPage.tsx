@@ -391,7 +391,7 @@ function PricesCard({ b }: { b: Billing }) {
         </tbody>
       </Table>
       <div className="border-t border-zinc-100 px-4 py-3 text-xs text-zinc-600">
-        <p>No plans or contact tiers. Klaviyo: about $150/mo for 10,000 contacts; DumbMail: you only pay per message.</p>
+        <p>No plans or contact tiers. Other providers charge about $150/mo just to keep 10,000 contacts; here you only pay for the messages you send.</p>
         <p className="mt-1 text-zinc-500">
           For example, 4 emails this month to each of 10,000 contacts ({formatNumber(exampleEmails)} emails) costs {formatCurrency(exampleCost, true)} here.
         </p>

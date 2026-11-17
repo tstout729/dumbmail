@@ -562,14 +562,30 @@ export type DnsRecord = {
   found?: string | null; // what public DNS returned
 };
 
+export type SendingDomain = {
+  domain: string;
+  status: DnsStatus;
+  mail_from_domain: string | null;
+  dns_records: DnsRecord[];
+  created_at: string;
+  verified_at: string | null;
+  /** The account's default sender email is on this domain. */
+  default_sender: boolean;
+};
+
 export type Sending = {
   email: {
     provider: string;
+    /** The main domain (the default sender's, else the first verified); see `domains` for all of them. */
     domain: string | null;
     from_email: string | null;
+    /** The default sender email is on a verified domain. */
+    from_email_verified: boolean;
     status: DnsStatus;
     mail_from_domain: string | null;
     dns_records: DnsRecord[];
+    domains: SendingDomain[];
+    max_domains: number;
   };
   sms: { provider: string; from_number: string | null; status: string };
   link_domain: { domain: string | null; status: LinkDomainStatus; dns_records: DnsRecord[]; url: string | null };

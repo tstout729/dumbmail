@@ -22,8 +22,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/account", axum::routing::patch(update_account))
         .route("/api/brand/import", post(brand_import))
         .route("/api/account/sending", get(sending))
-        .route("/api/account/domain", post(add_domain).delete(remove_domain))
+        .route("/api/account/domain", post(add_domain).delete(remove_only_domain))
         .route("/api/account/domain/verify", post(verify_domain))
+        .route("/api/account/domains", post(add_domain))
+        .route("/api/account/domains/{domain}", delete(remove_domain))
+        .route("/api/account/domains/{domain}/verify", post(verify_one_domain))
         .route("/api/account/link-domain", post(add_link_domain).delete(remove_link_domain))
         .route("/api/account/link-domain/verify", post(verify_link_domain))
         .route("/api/api-keys", get(list_keys).post(create_key))
@@ -349,13 +352,13 @@ async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     Ok(Json(patch_account(&state, ctx.account_id, b).await?))
 }
 
-pub fn sending_json(state: &AppState, a: &Account) -> Value {
-    crate::domains::sending_json(state, a)
+pub async fn sending_json(state: &AppState, a: &Account) -> AppResult<Value> {
+    crate::domains::sending_json(state, a).await
 }
 
 async fn sending_now(state: &AppState, account_id: Uuid) -> AppResult<Json<Value>> {
     let a = load_account(&state.db, account_id).await?;
-    Ok(Json(sending_json(state, &a)))
+    Ok(Json(sending_json(state, &a).await?))
 }
 
 async fn sending(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -368,7 +371,7 @@ struct DomainBody {
 }
 
 pub async fn set_domain(state: &AppState, account_id: Uuid, domain: &str) -> AppResult<Value> {
-    crate::domains::set_sending_domain(state, account_id, domain).await?;
+    crate::domains::add_sending_domain(state, account_id, domain).await?;
     Ok(sending_now(state, account_id).await?.0)
 }
 
@@ -376,13 +379,30 @@ async fn add_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson
     Ok(Json(set_domain(&state, ctx.account_id, &b.domain).await?))
 }
 
+/// Re-checks every sending domain.
 async fn verify_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    crate::domains::verify_sending_domain(&state, ctx.account_id).await?;
+    crate::domains::verify_sending_domains(&state, ctx.account_id, true).await?;
     sending_now(&state, ctx.account_id).await
 }
 
-async fn remove_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    crate::domains::remove_sending_domain(&state, ctx.account_id).await?;
+async fn verify_one_domain(State(state): State<AppState>, ctx: Ctx, Path(domain): Path<String>) -> AppResult<Json<Value>> {
+    crate::domains::verify_sending_domain(&state, ctx.account_id, &domain).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+async fn remove_domain(State(state): State<AppState>, ctx: Ctx, Path(domain): Path<String>) -> AppResult<Json<Value>> {
+    crate::domains::remove_sending_domain(&state, ctx.account_id, &domain).await?;
+    sending_now(&state, ctx.account_id).await
+}
+
+/// The old single-domain endpoint: removes the account's domain when it has exactly one.
+async fn remove_only_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    let domains: Vec<String> = sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1").bind(ctx.account_id).fetch_all(&state.db).await?;
+    match domains.as_slice() {
+        [] => {}
+        [only] => crate::domains::remove_sending_domain(&state, ctx.account_id, only).await?,
+        _ => return Err(AppError::bad("this account has several sending domains; use DELETE /api/account/domains/{domain}")),
+    }
     sending_now(&state, ctx.account_id).await
 }
 

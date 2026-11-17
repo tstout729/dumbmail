@@ -472,8 +472,7 @@ fn profile_from_token(state: &AppState, account_id: Uuid, token: &str) -> Option
 fn is_own_site(account: &Account, dest: &url::Url) -> bool {
     let Some(host) = dest.host_str().map(|h| h.trim_start_matches("www.").to_lowercase()) else { return false };
     let site = account.website.as_deref().and_then(|w| url::Url::parse(w).ok()).and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase()));
-    let candidates = [site, account.sending_domain.clone()];
-    candidates.iter().flatten().any(|d| host == *d || host.ends_with(&format!(".{d}")))
+    site.iter().chain(account.verified_domains.iter()).any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 // ---------- Forms ----------

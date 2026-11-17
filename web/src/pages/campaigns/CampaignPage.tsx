@@ -11,6 +11,7 @@ import {
   useScheduleCampaign,
   useSendCampaign,
   useSending,
+  isVerifiedSender,
   useSession,
   useTestCampaign,
   useUpdateCampaign,
@@ -118,7 +119,11 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
 
   const email = isEmail(current.content, campaign.channel) ? current.content : null;
   const sms = email ? null : (current.content as SmsContent);
-  const domainVerified = sending.data?.email.status === "verified";
+  // Every version's sender must be on a verified domain.
+  const domainVerified = versions.every((v) => {
+    const c = versionContent(current, v);
+    return isVerifiedSender(sending.data, (isEmail(c, campaign.channel) && c.from_email) || account.from_email);
+  });
   const shown = versionContent(current, version);
   const editVersion = (content: EmailContent | SmsContent) => setDraft(withVersionContent(current, version, content));
 
@@ -143,7 +148,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
     ...versionChecks,
     ...(email
       ? [
-          { ok: domainVerified, label: "Verify your sending domain for best deliverability", blocking: false },
+          { ok: domainVerified, label: "Send from an address on a verified domain (Settings → Domains)", blocking: false },
           { ok: Boolean(account.address), label: "Add a mailing address in Settings (required by CAN-SPAM)", blocking: true },
         ]
       : []),

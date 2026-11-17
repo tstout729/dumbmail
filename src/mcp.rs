@@ -160,8 +160,9 @@ fn tools() -> Vec<Value> {
             obj(json!({"name": {"type": "string"}, "website": {"type": "string"}, "from_name": {"type": "string"}, "from_email": {"type": "string"}, "reply_to": {"type": "string"}, "sms_from": {"type": "string"}, "timezone": {"type": "string"}, "address": {"type": "string"}, "brand_color": {"type": "string"}, "logo_url": {"type": "string"}, "social_links": {"type": "object", "additionalProperties": {"type": "string"}}, "conversion_metric": {"type": "string"}}), &[]), false, false),
         tool("import_brand", "Import brand from website", "Read the brand's website and return its name, logo URL, brand colors (best first), mailing address, a sender email on its domain and social profile links. With apply=true, saves the website, logo, brand color and social links, plus name and address if the account has none yet; sender email is never changed (it needs a verified domain). Show the user what was found.",
             obj(json!({"url": {"type": "string", "description": "e.g. acme.com"}, "apply": {"type": "boolean"}}), &["url"]), false, false),
-        tool("set_sending_domain", "Set up a sending domain", "Start authenticating a sending domain (DKIM). Returns the DNS records to add. Use check_sending_domain after DNS is updated.", obj(json!({"domain": {"type": "string", "description": "e.g. mail.yourbrand.com or yourbrand.com"}}), &["domain"]), false, false),
-        tool("check_sending_domain", "Check sending domain DNS", "Re-check the sending domain's DNS records and verification status.", obj(json!({}), &[]), false, false),
+        tool("set_sending_domain", "Add a sending domain", "Add a sending domain and start authenticating it (DKIM, return path, DMARC). An account can have several; emails can be sent from any address on a verified one. Returns the DNS records to add under sending.email.domains. Use check_sending_domain after DNS is updated.", obj(json!({"domain": {"type": "string", "description": "e.g. mail.yourbrand.com or yourbrand.com"}}), &["domain"]), false, false),
+        tool("check_sending_domain", "Check sending domain DNS", "Re-check a sending domain's DNS records and verification status (all domains when domain is omitted).", obj(json!({"domain": {"type": "string"}}), &[]), false, false),
+        tool("remove_sending_domain", "Remove a sending domain", "Remove a sending domain from the account. Without confirm=true it only describes what would happen.", obj(json!({"domain": {"type": "string"}, "confirm": {"type": "boolean"}}), &["domain"]), false, true),
         tool("set_link_domain", "Set a branded link domain", "Use the brand's own subdomain (e.g. links.brand.com) for tracking links, unsubscribe pages and hosted forms. Returns the DNS records to add.", obj(json!({"domain": {"type": "string"}}), &["domain"]), false, false),
         tool("check_link_domain", "Check link domain", "Re-check the branded link domain's DNS and certificate.", obj(json!({}), &[]), false, false),
         tool("get_billing", "Get balance and usage", "Prepaid balance, prices per email/SMS/number, free emails left this month, auto-recharge settings and recent charges.", obj(json!({}), &[]), true, false),
@@ -260,11 +261,11 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let mut missing = Vec::new();
             if account.from_email.is_none() { missing.push("sender email (update_account from_email)"); }
             if account.address.is_none() { missing.push("mailing address (update_account address; required in every marketing email)"); }
-            if account.sending_domain_status != "verified" { missing.push("verified sending domain (set_sending_domain) for best deliverability"); }
+            if account.verified_domains.is_empty() { missing.push("verified sending domain (set_sending_domain) for best deliverability"); }
             if account.sms_from.is_none() { missing.push("texting number (find_phone_numbers + claim_phone_number, or connect your own provider in Settings → SMS)"); }
             Ok(json!({
                 "account": account,
-                "sending": crate::api::account::sending_json(state, &account),
+                "sending": crate::api::account::sending_json(state, &account).await?,
                 "billing": crate::api::account::billing_json(state, acct).await?,
                 "counts": {"profiles": counts.0, "lists": counts.1, "segments": counts.2, "campaigns": counts.3, "flows": counts.4, "live_flows": counts.5},
                 "missing_setup": missing,
@@ -274,17 +275,26 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "import_brand" => crate::api::account::import_brand(state, acct, a["url"].as_str().unwrap_or(""), a["apply"].as_bool().unwrap_or(false)).await,
         "set_sending_domain" => crate::api::account::set_domain(state, acct, a["domain"].as_str().unwrap_or("")).await,
         "check_sending_domain" => {
-            crate::domains::verify_sending_domain(state, acct).await?;
-            let a2 = load_account(&state.db, acct).await?;
-            Ok(crate::api::account::sending_json(state, &a2))
+            match a["domain"].as_str().filter(|d| !d.trim().is_empty()) {
+                Some(d) => crate::domains::verify_sending_domain(state, acct, d).await?,
+                None => crate::domains::verify_sending_domains(state, acct, true).await?,
+            }
+            crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
+        }
+        "remove_sending_domain" => {
+            if a["confirm"].as_bool() != Some(true) {
+                return Ok(json!({"dry_run": true, "note": "Nothing removed. Emails from addresses on this domain stop sending until it's added and verified again. Call again with confirm=true once the user approves."}));
+            }
+            crate::domains::remove_sending_domain(state, acct, a["domain"].as_str().unwrap_or("")).await?;
+            crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
         }
         "set_link_domain" => {
             crate::domains::set_link_domain(state, acct, a["domain"].as_str().unwrap_or("")).await?;
-            Ok(crate::api::account::sending_json(state, &load_account(&state.db, acct).await?))
+            crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
         }
         "check_link_domain" => {
             crate::domains::verify_link_domain(state, acct).await?;
-            Ok(crate::api::account::sending_json(state, &load_account(&state.db, acct).await?))
+            crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
         }
         "get_billing" => crate::billing::billing_json(state, acct).await,
         "list_phone_numbers" => crate::api::account::numbers_json(state, acct).await,

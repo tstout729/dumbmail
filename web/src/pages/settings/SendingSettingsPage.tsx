@@ -10,6 +10,7 @@ export function SendingSettingsPage() {
   const { save, saving } = useSaveAccount();
   const sending = useSending();
   const email = sending.data?.email;
+  const verified = email?.domains.filter((d) => d.status === "verified").map((d) => d.domain) ?? [];
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const d = new FormData(e.currentTarget);
@@ -24,7 +25,7 @@ export function SendingSettingsPage() {
             <Field label="Sender name">
               <Input name="from_name" defaultValue={account.from_name ?? ""} placeholder={account.name} />
             </Field>
-            <Field label="Sender email" hint={email?.domain ? `Use an address on ${email.domain}.` : "Use an address on your sending domain."}>
+            <Field label="Sender email" hint={verified.length ? `Use an address on ${verified.join(", ")}.` : "Use an address on a domain you verify in Settings → Domains."}>
               <Input name="from_email" type="email" defaultValue={account.from_email ?? ""} placeholder="hello@yourdomain.com" />
             </Field>
             <Field label="Reply-to (optional)" className="sm:col-span-2">
@@ -43,12 +44,14 @@ export function SendingSettingsPage() {
         className="group flex items-center gap-3 rounded-lg border border-zinc-200 bg-white px-4 py-3 shadow-xs hover:border-zinc-300"
       >
         <span className="min-w-0 flex-1">
-          <span className="block text-sm font-semibold text-zinc-900">Sending domain</span>
+          <span className="block text-sm font-semibold text-zinc-900">Sending domains</span>
           <span className="block text-xs text-zinc-500">
-            {email?.domain ? `${email.domain}` : "Verify your domain so your emails land in the inbox."}
+            {email?.domains.length ? email.domains.map((d) => d.domain).join(", ") : "Verify your domain so your emails land in the inbox."}
           </span>
         </span>
-        {email && email.status !== "not_started" ? <StatusBadge status={email.status} /> : null}
+        {email && email.domains.length ? (
+          <StatusBadge status={verified.length === email.domains.length ? "verified" : "pending"} label={`${verified.length} of ${email.domains.length} verified`} />
+        ) : null}
         <ArrowRight className="size-4 text-zinc-300 group-hover:text-zinc-600" />
       </Link>
     </div>

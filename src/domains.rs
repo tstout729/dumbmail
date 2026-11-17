@@ -111,11 +111,14 @@ fn clean_domain(raw: &str) -> AppResult<String> {
     Ok(d)
 }
 
+/// Most people need one or two; the cap keeps a single account from filling the provider's identity limit.
+pub const MAX_SENDING_DOMAINS: i64 = 20;
+
 /// Another account has already proven ownership of this domain, a parent or a subdomain of it.
 async fn verified_elsewhere(state: &AppState, account_id: Uuid, domain: &str) -> AppResult<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id <> $2 AND sending_domain_status = 'verified' AND sending_domain IS NOT NULL
-           AND (sending_domain = $1 OR $1 LIKE '%.' || sending_domain OR sending_domain LIKE '%.' || $1))",
+        "SELECT EXISTS (SELECT 1 FROM sending_domains WHERE account_id <> $2 AND status = 'verified'
+           AND (domain = $1 OR $1 LIKE '%.' || domain OR domain LIKE '%.' || $1))",
     )
     .bind(domain)
     .bind(account_id)
@@ -123,36 +126,75 @@ async fn verified_elsewhere(state: &AppState, account_id: Uuid, domain: &str) ->
     .await?)
 }
 
-pub async fn set_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<()> {
+async fn used_by_other_account(state: &AppState, account_id: Uuid, domain: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sending_domains WHERE domain = $1 AND account_id <> $2)")
+        .bind(domain)
+        .bind(account_id)
+        .fetch_one(&state.db)
+        .await?)
+}
+
+/// Add a sending domain (or refresh its records if the account already has it). Returns the cleaned name.
+pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
     let domain = clean_domain(raw)?;
+    let (exists, count): (bool, i64) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM sending_domains WHERE account_id = $1 AND domain = $2), (SELECT count(*) FROM sending_domains WHERE account_id = $1)",
+    )
+    .bind(account_id)
+    .bind(&domain)
+    .fetch_one(&state.db)
+    .await?;
+    if exists {
+        verify_sending_domain(state, account_id, &domain).await?;
+        return Ok(domain);
+    }
+    if count >= MAX_SENDING_DOMAINS {
+        return Err(AppError::bad(format!("you can add up to {MAX_SENDING_DOMAINS} sending domains; remove one you no longer use first")));
+    }
     if verified_elsewhere(state, account_id, &domain).await? {
         return Err(AppError::Conflict("that domain is already verified by another account".into()));
     }
     let st = state.email.add_domain(&domain).await.map_err(|e| AppError::bad(format!("could not start domain setup: {e:#}")))?;
     let mf = mail_from_for(&domain);
     // Configure the shared provider identity only when no other account is using this domain.
-    let shared: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE sending_domain = $1 AND id <> $2)").bind(&domain).bind(account_id).fetch_one(&state.db).await?;
-    if !shared {
+    if !used_by_other_account(state, account_id, &domain).await? {
         if let Err(e) = state.email.set_mail_from(&domain, &mf).await {
             tracing::warn!(domain = %domain, error = %e, "could not set custom MAIL FROM");
         }
     }
     let mut records = sending_records(state, account_id, &domain, &st.records);
     annotate(state, &mut records).await;
-    sqlx::query("UPDATE accounts SET sending_domain = $2, sending_domain_status = $3, sending_domain_records = $4, mail_from_domain = $5 WHERE id = $1")
-        .bind(account_id)
-        .bind(&domain)
-        .bind(&st.status)
-        .bind(Value::Array(records))
-        .bind(&mf)
-        .execute(&state.db)
-        .await?;
-    Ok(())
+    sqlx::query(
+        "INSERT INTO sending_domains (id, account_id, domain, status, records, mail_from_domain) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (account_id, domain) DO NOTHING",
+    )
+    .bind(Uuid::now_v7())
+    .bind(account_id)
+    .bind(&domain)
+    // A provider "verified" only means some account proved it; this account still has to.
+    .bind(if st.status == "failed" { "failed" } else { "pending" })
+    .bind(Value::Array(records))
+    .bind(&mf)
+    .execute(&state.db)
+    .await?;
+    // The records may already be in place (e.g. the domain was removed and added back).
+    verify_sending_domain(state, account_id, &domain).await?;
+    Ok(domain)
 }
 
-pub async fn verify_sending_domain(state: &AppState, account_id: Uuid) -> AppResult<()> {
-    let a = crate::campaigns::load_account(&state.db, account_id).await?;
-    let domain = a.sending_domain.clone().ok_or_else(|| AppError::bad("add a sending domain first"))?;
+async fn account_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
+    let domain = raw.trim().trim_end_matches('.').to_lowercase();
+    sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1 AND domain = $2")
+        .bind(account_id)
+        .bind(&domain)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("sending domain"))
+}
+
+/// Re-check one domain's DNS records and its status with the email provider.
+pub async fn verify_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<()> {
+    let domain = account_domain(state, account_id, raw).await?;
     let st = state.email.domain_state(&domain).await.map_err(|e| AppError::bad(format!("could not check the domain: {e:#}")))?;
     let mut records = sending_records(state, account_id, &domain, &st.records);
     annotate(state, &mut records).await;
@@ -164,39 +206,51 @@ pub async fn verify_sending_domain(state: &AppState, account_id: Uuid) -> AppRes
     // Verified = this account proved ownership AND the provider (or, in dev, public DNS) accepts DKIM.
     let provider_ok = if state.email.name() == "log" { dkim_ok } else { st.status == "verified" };
     let status = if owns && provider_ok && !verified_elsewhere(state, account_id, &domain).await? {
-        "verified".to_string()
+        "verified"
     } else if st.status == "failed" {
-        "failed".to_string()
+        "failed"
     } else {
-        "pending".to_string()
+        "pending"
     };
-    sqlx::query("UPDATE accounts SET sending_domain_status = $2, sending_domain_records = $3 WHERE id = $1")
-        .bind(account_id)
-        .bind(&status)
-        .bind(Value::Array(records))
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE sending_domains SET status = $3, records = $4,
+            verified_at = CASE WHEN $3 = 'verified' THEN COALESCE(verified_at, now()) END
+         WHERE account_id = $1 AND domain = $2",
+    )
+    .bind(account_id)
+    .bind(&domain)
+    .bind(status)
+    .bind(Value::Array(records))
+    .execute(&state.db)
+    .await?;
     if status == "verified" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"sender\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
     Ok(())
 }
 
-pub async fn remove_sending_domain(state: &AppState, account_id: Uuid) -> AppResult<()> {
-    let a = crate::campaigns::load_account(&state.db, account_id).await?;
-    if let Some(d) = &a.sending_domain {
-        // Only delete the provider identity if no other account uses the same domain.
-        let shared: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE sending_domain = $1 AND id <> $2)").bind(d).bind(account_id).fetch_one(&state.db).await?;
-        if !shared {
-            if let Err(e) = state.email.remove_domain(d).await {
-                tracing::warn!(domain = %d, error = %e, "could not remove domain identity");
-            }
+/// Re-check every domain the account has that isn't verified yet (or all of them when `all`).
+pub async fn verify_sending_domains(state: &AppState, account_id: Uuid, all: bool) -> AppResult<()> {
+    let domains: Vec<String> = sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1 AND ($2 OR status <> 'verified') ORDER BY created_at")
+        .bind(account_id)
+        .bind(all)
+        .fetch_all(&state.db)
+        .await?;
+    for d in domains {
+        verify_sending_domain(state, account_id, &d).await?;
+    }
+    Ok(())
+}
+
+pub async fn remove_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<()> {
+    let domain = account_domain(state, account_id, raw).await?;
+    // Only delete the provider identity if no other account uses the same domain.
+    if !used_by_other_account(state, account_id, &domain).await? {
+        if let Err(e) = state.email.remove_domain(&domain).await {
+            tracing::warn!(domain = %domain, error = %e, "could not remove domain identity");
         }
     }
-    sqlx::query("UPDATE accounts SET sending_domain = NULL, sending_domain_status = 'not_started', sending_domain_records = '[]', mail_from_domain = NULL WHERE id = $1")
-        .bind(account_id)
-        .execute(&state.db)
-        .await?;
+    sqlx::query("DELETE FROM sending_domains WHERE account_id = $1 AND domain = $2").bind(account_id).bind(&domain).execute(&state.db).await?;
     Ok(())
 }
 
@@ -354,15 +408,57 @@ pub fn link_base(state: &AppState, account: &Account) -> String {
     }
 }
 
-pub fn sending_json(state: &AppState, a: &Account) -> Value {
-    json!({
+#[derive(sqlx::FromRow)]
+struct DomainRow {
+    domain: String,
+    status: String,
+    records: Value,
+    mail_from_domain: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    verified_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn covers(domain: &str, email_domain: &str) -> bool {
+    email_domain == domain || email_domain.ends_with(&format!(".{domain}"))
+}
+
+pub async fn sending_json(state: &AppState, a: &Account) -> AppResult<Value> {
+    let rows: Vec<DomainRow> = sqlx::query_as(
+        "SELECT domain, status, records, mail_from_domain, created_at, verified_at FROM sending_domains WHERE account_id = $1 ORDER BY created_at",
+    )
+    .bind(a.id)
+    .fetch_all(&state.db)
+    .await?;
+    let from_domain = a.from_email.as_deref().and_then(|e| e.rsplit_once('@')).map(|(_, d)| d.to_lowercase());
+    // The domain the default sender uses, else the first verified one, else the first added.
+    let primary = from_domain
+        .as_deref()
+        .and_then(|fd| rows.iter().find(|r| covers(&r.domain, fd)))
+        .or_else(|| rows.iter().find(|r| r.status == "verified"))
+        .or_else(|| rows.first());
+    let domains: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "domain": r.domain, "status": r.status, "mail_from_domain": r.mail_from_domain, "dns_records": r.records,
+                "created_at": r.created_at, "verified_at": r.verified_at,
+                "default_sender": from_domain.as_deref().is_some_and(|fd| covers(&r.domain, fd)),
+            })
+        })
+        .collect();
+    Ok(json!({
         "email": {
             "provider": state.email.name(),
-            "domain": a.sending_domain,
-            "status": a.sending_domain_status,
-            "mail_from_domain": a.mail_from_domain,
-            "dns_records": a.sending_domain_records,
+            // `domain`, `status`, `mail_from_domain` and `dns_records` describe the main domain, for older clients.
+            "domain": primary.map(|r| &r.domain),
+            "status": primary.map(|r| r.status.as_str()).unwrap_or("not_started"),
+            "mail_from_domain": primary.and_then(|r| r.mail_from_domain.as_ref()),
+            "dns_records": primary.map(|r| r.records.clone()).unwrap_or_else(|| json!([])),
+            "domains": domains,
+            "max_domains": MAX_SENDING_DOMAINS,
             "from_email": a.from_email,
+            // Whether the default sender's domain is verified (sending from it works).
+            "from_email_verified": from_domain.as_deref().is_some_and(|fd| rows.iter().any(|r| r.status == "verified" && covers(&r.domain, fd))),
         },
         "sms": {
             "provider": state.sms.name(),
@@ -375,5 +471,5 @@ pub fn sending_json(state: &AppState, a: &Account) -> Value {
             "dns_records": a.link_domain_records,
             "url": a.link_domain.as_ref().filter(|_| a.link_domain_status == "active").map(|d| format!("https://{d}")),
         },
-    })
+    }))
 }

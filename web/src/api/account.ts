@@ -7,9 +7,9 @@ export const accountApi = {
   update: (patch: AccountPatch) => api<Account>("PATCH", "/api/account", patch),
   importBrand: (url: string) => api<{ brand: BrandKit }>("POST", "/api/brand/import", { url }),
   sending: () => api<Sending>("GET", "/api/account/sending"),
-  setDomain: (domain: string) => api<Sending>("POST", "/api/account/domain", { domain }),
-  verifyDomain: () => api<Sending>("POST", "/api/account/domain/verify"),
-  removeDomain: () => api<Sending>("DELETE", "/api/account/domain"),
+  addDomain: (domain: string) => api<Sending>("POST", "/api/account/domains", { domain }),
+  verifyDomain: (domain: string) => api<Sending>("POST", `/api/account/domains/${encodeURIComponent(domain)}/verify`),
+  removeDomain: (domain: string) => api<Sending>("DELETE", `/api/account/domains/${encodeURIComponent(domain)}`),
   setLinkDomain: (domain: string) => api<Sending>("POST", "/api/account/link-domain", { domain }),
   verifyLinkDomain: () => api<Sending>("POST", "/api/account/link-domain/verify"),
   removeLinkDomain: () => api<Sending>("DELETE", "/api/account/link-domain"),
@@ -57,9 +57,16 @@ function useSendingMutation<V>(mutationFn: (vars: V) => Promise<Sending>) {
   return useMutation({ mutationFn, onSuccess: (data) => qc.setQueryData(keys.sending, data) });
 }
 
-export const useSetDomain = () => useSendingMutation<string>(accountApi.setDomain);
-export const useVerifyDomain = () => useSendingMutation<void>(accountApi.verifyDomain);
-export const useRemoveDomain = () => useSendingMutation<void>(accountApi.removeDomain);
+export const useAddDomain = () => useSendingMutation<string>(accountApi.addDomain);
+export const useVerifyDomain = () => useSendingMutation<string>(accountApi.verifyDomain);
+export const useRemoveDomain = () => useSendingMutation<string>(accountApi.removeDomain);
+
+/** Whether `email` is on one of the account's verified sending domains (or a subdomain of one). */
+export function isVerifiedSender(sending: Sending | undefined, email: string | null | undefined): boolean {
+  const host = email?.split("@")[1]?.toLowerCase();
+  if (!sending || !host) return false;
+  return sending.email.domains.some((d) => d.status === "verified" && (host === d.domain || host.endsWith(`.${d.domain}`)));
+}
 export const useSetLinkDomain = () => useSendingMutation<string>(accountApi.setLinkDomain);
 export const useVerifyLinkDomain = () => useSendingMutation<void>(accountApi.verifyLinkDomain);
 export const useRemoveLinkDomain = () => useSendingMutation<void>(accountApi.removeLinkDomain);

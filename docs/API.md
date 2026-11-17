@@ -304,15 +304,25 @@ In hosted mode `PATCH /api/account {sms_from}` only accepts one of the account's
 
 ### Domains
 
-`GET /api/account/sending` gains a `link_domain` field, and each DNS record gains `purpose`:
+An account can have up to 20 sending domains and may send from any address on a verified one (or a subdomain of it).
+`GET /api/account/sending` lists them under `email.domains`; `email.domain`, `status`, `mail_from_domain` and `dns_records`
+describe the main one (the default sender's domain, else the first verified), for older clients.
 
 ```ts
+type SendingDomain = {
+  domain: string; status: "pending" | "verified" | "failed"; mail_from_domain: string | null;
+  dns_records: DnsRecord[]; created_at: string; verified_at: string | null;
+  default_sender: boolean;  // the account's default from_email is on this domain
+};
 type Sending = {
   email: {
     provider: string; domain: string | null; from_email: string | null;
+    from_email_verified: boolean;  // the default from_email is on a verified domain
     status: "not_started" | "pending" | "verified" | "failed";
     mail_from_domain: string | null;
     dns_records: DnsRecord[];
+    domains: SendingDomain[];
+    max_domains: number;
   };
   sms: { provider: string; from_number: string | null; status: string };
   link_domain: { domain: string | null; status: "not_started" | "pending" | "active" | "failed"; dns_records: DnsRecord[]; url: string | null };
@@ -327,9 +337,12 @@ type DnsRecord = {
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| POST | `/api/account/domain` | `{domain}` | `Sending` (DKIM + custom MAIL FROM `send.<domain>` for SPF/DMARC alignment) |
-| POST | `/api/account/domain/verify` | – | `Sending` (re-checks public DNS per record and with the provider) |
-| DELETE | `/api/account/domain` | – | `Sending` |
+| POST | `/api/account/domains` | `{domain}` | `Sending` (adds the domain: DKIM, custom MAIL FROM `send.<domain>` for SPF/DMARC alignment, ownership TXT; re-checks it if already added) |
+| POST | `/api/account/domains/{domain}/verify` | – | `Sending` (re-checks public DNS per record and with the provider) |
+| DELETE | `/api/account/domains/{domain}` | – | `Sending` |
+| POST | `/api/account/domain` | `{domain}` | Same as `POST /api/account/domains` (older name) |
+| POST | `/api/account/domain/verify` | – | `Sending` (re-checks every domain) |
+| DELETE | `/api/account/domain` | – | `Sending`; removes the only domain, 400 when there are several |
 | POST | `/api/account/link-domain` | `{domain}` (e.g. `links.brand.com`) | `Sending` (branded tracking links, unsubscribe pages and hosted forms) |
 | POST | `/api/account/link-domain/verify` | – | `Sending` |
 | DELETE | `/api/account/link-domain` | – | `Sending` |
