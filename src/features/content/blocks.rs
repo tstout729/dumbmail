@@ -192,6 +192,13 @@ pub fn loop_source(b: &Value) -> Option<&str> {
     ok.then_some(src)
 }
 
+/// `src` as a loop source that's an empty list (not an error) when any part of the path is missing.
+fn guarded(src: &str) -> String {
+    let parts: Vec<&str> = src.split('.').collect();
+    let checks: Vec<String> = (1..=parts.len()).map(|i| format!("{} is defined", parts[..i].join("."))).collect();
+    format!("({src} if ({} and {src} is sequence) else [])", checks.join(" and "))
+}
+
 pub const TABLE_MAX_COLUMNS: usize = 6;
 pub const TABLE_MAX_ROWS: usize = 50;
 /// The most event items a table repeats a row for.
@@ -237,7 +244,7 @@ fn table_html(b: &Value, font: &str) -> String {
     }
     if let Some(src) = loop_source(b) {
         let cells = strings(b.get("loop").and_then(|l| l.get("cells")), TABLE_MAX_COLUMNS);
-        out.push_str(&format!("{{% for item in {src} %}}{{% if loop.index > {TABLE_MAX_LOOP} %}}{{% break %}}{{% endif %}}{}{{% endfor %}}", row(&cells, body)));
+        out.push_str(&format!("{{% for item in {} %}}{{% if loop.index > {TABLE_MAX_LOOP} %}}{{% break %}}{{% endif %}}{}{{% endfor %}}", guarded(src), row(&cells, body)));
     }
     for r in rows(b.get("footer")) {
         out.push_str(&row(&r, "font-weight:700;color:#111827;"));
@@ -426,7 +433,7 @@ pub fn text(b: &Value, out: &mut String) {
             }
             if let Some(src) = loop_source(b) {
                 let cells = strings(b.get("loop").and_then(|l| l.get("cells")), TABLE_MAX_COLUMNS);
-                out.push_str(&format!("{{% for item in {src} %}}{{% if loop.index > {TABLE_MAX_LOOP} %}}{{% break %}}{{% endif %}}{}\n{{% endfor %}}", cells.join(" | ")));
+                out.push_str(&format!("{{% for item in {} %}}{{% if loop.index > {TABLE_MAX_LOOP} %}}{{% break %}}{{% endif %}}{}\n{{% endfor %}}", guarded(src), cells.join(" | ")));
             }
             for r in rows(b.get("footer")) {
                 out.push_str(&format!("{}\n", r.join(" | ")));

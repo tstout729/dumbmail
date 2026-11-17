@@ -96,7 +96,8 @@ pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     Ok(json!({"data": data, "total": total}))
 }
 
-const USES_PATH: &str = r#"$.** ? (@.type == "saved").saved_block_id"#;
+// Strict mode: lax mode's `.**` visits list items twice and would count them twice.
+const USES_PATH: &str = r#"strict $.** ? (@.type == "saved" && exists(@.saved_block_id)).saved_block_id"#;
 
 /// How many places in unsent emails point at each saved block: templates, draft or scheduled
 /// campaigns (and their A/B versions) and flow emails.
