@@ -591,6 +591,8 @@ fn as_f64(v: &Value) -> Option<f64> {
 
 const TEXT_COLUMNS: &[&str] = &["email", "phone_number", "first_name", "last_name", "external_id", "email_consent", "sms_consent", "email_suppressed_reason"];
 const TIME_COLUMNS: &[&str] = &["created_at", "updated_at", "last_event_at"];
+/// True/false profile columns, compared as text ('true' / 'false').
+const BOOL_COLUMNS: &[&str] = &["marketing_hold"];
 
 /// The account's time zone, for calendar dates.
 const ACCOUNT_TZ: &str = "(SELECT a.timezone FROM accounts a WHERE a.id = p.account_id)";
@@ -607,7 +609,7 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         Source::Profile if TEXT_COLUMNS.contains(&field) => {
             qb.push(format!("p.{field}"));
         }
-        Source::Profile if TIME_COLUMNS.contains(&field) => {
+        Source::Profile if TIME_COLUMNS.contains(&field) || BOOL_COLUMNS.contains(&field) => {
             qb.push(format!("p.{field}::text"));
         }
         Source::Event if field == "value" => {
@@ -624,7 +626,7 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
 
 fn push_json_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str) -> bool {
     match src {
-        Source::Profile if !TEXT_COLUMNS.contains(&field) && !TIME_COLUMNS.contains(&field) => {
+        Source::Profile if !TEXT_COLUMNS.contains(&field) && !TIME_COLUMNS.contains(&field) && !BOOL_COLUMNS.contains(&field) => {
             qb.push("(p.properties->").push_bind(field.to_string()).push(")");
             true
         }
@@ -1007,7 +1009,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
                 qb.push("NOT ");
             }
             qb.push(match channel {
-                Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL)",
+                Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold)",
                 Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed')",
             });
         }

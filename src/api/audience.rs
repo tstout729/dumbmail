@@ -151,8 +151,8 @@ pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> App
         .map(|m| json!({"id": m.0, "channel": m.1, "subject": m.2, "status": m.3, "campaign_id": m.4, "flow_id": m.5, "sent_at": m.6, "opened_at": m.7, "clicked_at": m.8}))
         .collect();
     // Why email is suppressed, and which integration created the profile, if any.
-    let (suppressed, source, source_name): (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT p.email_suppressed_reason, p.source, i.name FROM profiles p
+    let (suppressed, source, source_name, hold): (Option<String>, Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT p.email_suppressed_reason, p.source, i.name, p.marketing_hold FROM profiles p
          LEFT JOIN integrations i ON p.source = 'integration:' || i.id::text AND i.account_id = p.account_id
          WHERE p.id = $1",
     )
@@ -160,7 +160,7 @@ pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> App
     .fetch_one(&state.db)
     .await?;
     Ok(json!({"profile": profile, "lists": lists, "segments": segs, "events": events, "messages": messages,
-        "email_suppressed_reason": suppressed, "source": source.map(|s| json!({"kind": s.split(':').next().unwrap_or(""), "id": s.split_once(':').map(|x| x.1), "name": source_name}))}))
+        "email_suppressed_reason": suppressed, "marketing_hold": hold, "source": source.map(|s| json!({"kind": s.split(':').next().unwrap_or(""), "id": s.split_once(':').map(|x| x.1), "name": source_name}))}))
 }
 
 async fn get_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

@@ -1,0 +1,346 @@
+{
+  "description": "The guests for a page of reservations: profiles and events are written, the cursor moves on, and the next page is asked for. Guest 2 isn't in the answer, so it is matched by Guesty guest id (or skipped).",
+  "expect": [
+    {
+      "email": "dana.whitfield@example.com",
+      "first_name": "Dana",
+      "last_name": "Whitfield",
+      "phone_number": "+15035550142",
+      "properties": {
+        "guesty_guest_id": "6g0000000000000000000000",
+        "last_check_in": "2026-12-10",
+        "last_listing": null
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000000",
+        "source_channel": "airbnb2",
+        "status": "confirmed"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000000:booked"
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000000",
+        "source_channel": "airbnb2",
+        "status": "confirmed",
+        "version": "2026-11-17T10:00:00.000Z"
+      },
+      "time": "2026-11-17T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000000:confirmed:2026-11-17T10:00:00.000Z"
+    },
+    {
+      "email": "abc123xyz@guest.airbnb.com",
+      "first_name": "Sam",
+      "last_name": "Ortiz",
+      "properties": {
+        "guesty_guest_id": "6g0000000000000000000001",
+        "last_check_in": "2026-12-10",
+        "last_listing": null
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00001",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000001",
+        "source_channel": "manual",
+        "status": "confirmed"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000001:booked"
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00001",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000001",
+        "source_channel": "manual",
+        "status": "confirmed",
+        "version": "2026-11-17T10:00:01.000Z"
+      },
+      "time": "2026-11-17T10:00:01.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000001:confirmed:2026-11-17T10:00:01.000Z"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "property": "guesty_guest_id",
+        "value": "6g0000000000000000000002"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00002",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000002",
+        "source_channel": "manual",
+        "status": "confirmed"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000002:booked"
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "property": "guesty_guest_id",
+        "value": "6g0000000000000000000002"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00002",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000002",
+        "source_channel": "manual",
+        "status": "confirmed",
+        "version": "2026-11-17T10:00:02.000Z"
+      },
+      "time": "2026-11-17T10:00:02.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000002:confirmed:2026-11-17T10:00:02.000Z"
+    },
+    {
+      "email": "lee@example.org",
+      "first_name": "Lee",
+      "last_name": "Park",
+      "properties": {
+        "guesty_guest_id": "6g0000000000000000000007",
+        "last_check_in": "2026-12-10",
+        "last_listing": null
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Cancelled",
+      "profile": {
+        "email": "lee@example.org"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00007",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000007",
+        "source_channel": "manual",
+        "status": "canceled",
+        "version": "2026-11-17T10:00:07.000Z"
+      },
+      "time": "2026-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000007:cancelled:2026-11-17T10:00:07.000Z"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "cursor": "2026-11-17T10:00:49.000Z",
+        "page_last": null,
+        "pending": null
+      }
+    },
+    {
+      "query": {
+        "columns": null,
+        "filter[lastUpdatedAt][gte]": "2026-11-17T10:00:49.000Z",
+        "filters": null,
+        "limit": 50,
+        "skip": 0,
+        "sort": "lastUpdatedAt"
+      },
+      "type": "next_request",
+      "url": "/v1/reservations-v3/search"
+    },
+    {
+      "message": "page 2: wrote 4 reservations",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "page": 2,
+    "payload": {
+      "results": [
+        {
+          "firstName": "Dana",
+          "fullName": "Dana Whitfield",
+          "guestEmail": "dana.whitfield@example.com",
+          "guestPhone": "+1 (503) 555-0142",
+          "id": "6g0000000000000000000000",
+          "lastName": "Whitfield"
+        },
+        {
+          "fullName": "Sam Ortiz",
+          "guestEmail": "abc123xyz@guest.airbnb.com",
+          "guestPhone": null,
+          "id": "6g0000000000000000000001"
+        },
+        {
+          "firstName": "Lee",
+          "guestEmail": "lee@example.org",
+          "id": "6g0000000000000000000007",
+          "lastName": "Park"
+        }
+      ],
+      "total": 3
+    },
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "limit",
+          "50"
+        ],
+        [
+          "columns",
+          "id firstName lastName fullName guestEmail guestPhone"
+        ],
+        [
+          "filters",
+          "{}"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/guests-crud"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-16T18:00:00.000Z",
+      "page_last": "2026-11-17T10:00:49.000Z",
+      "page_more": true,
+      "pending": [
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00000",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000000",
+          "guestsCount": 2,
+          "lastUpdatedAt": "2026-11-17T10:00:00.000Z",
+          "listingId": "66054019764cbb000f37c450",
+          "reservationId": "6a0000000000000000000000",
+          "source": "airbnb2",
+          "status": "confirmed"
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00001",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000001",
+          "guestsCount": 2,
+          "lastUpdatedAt": "2026-11-17T10:00:01.000Z",
+          "listingId": "66054019764cbb000f37c450",
+          "reservationId": "6a0000000000000000000001",
+          "source": "manual",
+          "status": "confirmed"
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00002",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000002",
+          "guestsCount": 2,
+          "lastUpdatedAt": "2026-11-17T10:00:02.000Z",
+          "listingId": "66054019764cbb000f37c450",
+          "reservationId": "6a0000000000000000000002",
+          "source": "manual",
+          "status": "confirmed"
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00007",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000007",
+          "guestsCount": 2,
+          "lastUpdatedAt": "2026-11-17T10:00:07.000Z",
+          "listingId": "66054019764cbb000f37c450",
+          "reservationId": "6a0000000000000000000007",
+          "source": "manual",
+          "status": "canceled"
+        }
+      ],
+      "skip": 0
+    }
+  }
+}

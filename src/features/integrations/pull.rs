@@ -1,10 +1,16 @@
 //! Pulls: fetching data from an app on a schedule (or for a backfill), declared as data.
 //!
 //! The request is a template (`{{secret.NAME}}`, `{{state.KEY}}`, `{{settings.KEY}}`, `{{now}}`,
-//! `{{since}}`, with `|` fallbacks), sent only to public internet addresses with pinned DNS, no
-//! redirects, a timeout and a response size cap. OAuth2 client-credentials tokens are cached
-//! encrypted and reused until shortly before they expire, and the number of tokens asked for in a
-//! day is capped, because some apps (Guesty) allow only a handful.
+//! `{{since}}`, with `|` fallbacks) whose **origin is fixed when it is saved**: the scheme, host and
+//! port are literal text (no placeholders, no user:password), HTTPS only. Pages a script asks for
+//! may change only the path and query. Credentials go only in the auth block, as secret references,
+//! and the access token is only ever sent to the origin it was configured for. Requests go only to
+//! public internet addresses with pinned DNS, no proxy, no redirects, a timeout and a size cap.
+//!
+//! OAuth2 client-credentials tokens are cached encrypted, keyed to everything that determines them
+//! (token URL, client, scope, audience, the pull's origin), reused until shortly before they expire,
+//! and capped per day because some apps (Guesty) allow only a handful. A refresh takes a short
+//! lease on the row so two runs never both ask, without holding a transaction over the network.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -26,6 +32,8 @@ use crate::state::AppState;
 pub const RESPONSE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
 pub const MIN_INTERVAL_MINUTES: u32 = 5;
+/// How long a token refresh may hold its lease.
+const LEASE_SECONDS: i64 = 45;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +58,9 @@ pub struct PullConfig {
     /// Pages one scheduled run may fetch (the script asks for more with `next_request`). Default 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pages: Option<u32>,
+    /// Pages one backfill run may fetch before it stops as "capped" (resume to continue). Default 5000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_max_pages: Option<u32>,
 }
 
 fn get() -> String {
@@ -63,6 +74,8 @@ pub enum BodyFormat {
     Form,
 }
 
+/// How a pull authenticates. Every credential field is a secret reference (`{{secret.NAME}}`),
+/// never the value itself, so the saved settings never hold a secret.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Auth {
@@ -80,6 +93,7 @@ pub enum Auth {
         value: String,
     },
     Oauth2ClientCredentials {
+        /// Literal URL on a fixed HTTPS origin (no placeholders).
         token_url: String,
         client_id: String,
         client_secret: String,
@@ -96,13 +110,45 @@ pub enum Auth {
     },
 }
 
+static PLACEHOLDER: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+static SECRET_REF: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"^\{\{\s*secret\.[A-Za-z0-9_-]{1,64}\s*\}\}$").unwrap());
+
+/// Headers neither the saved settings nor a script may set: they decide where a request goes, who
+/// it claims to be, or how it is framed. `Authorization` comes from the auth block.
+pub fn forbidden_header(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(n.as_str(), "host" | "authorization" | "forwarded" | "connection" | "transfer-encoding" | "content-length" | "cookie" | "te" | "upgrade" | "keep-alive")
+        || n.starts_with("proxy-")
+        || n.starts_with("x-forwarded-")
+}
+
+/// Header names that usually carry a credential: their value must be a secret reference.
+fn credential_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["key", "token", "secret", "auth", "password", "signature", "session"].iter().any(|w| n.contains(w))
+}
+
+fn is_secret_ref(v: &str) -> bool {
+    SECRET_REF.is_match(v.trim())
+}
+
+fn require_ref(field: &str, v: &str) -> AppResult<()> {
+    if is_secret_ref(v) {
+        Ok(())
+    } else {
+        Err(AppError::bad(format!(
+            "pull auth `{field}` must be a secret reference like {{{{secret.{field}}}}}, not the value itself; save the value under credentials"
+        )))
+    }
+}
+
 impl PullConfig {
     pub fn parse(v: &Value) -> AppResult<Self> {
         let c: PullConfig = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid pull settings: {e}")))?;
         if !matches!(c.method.as_str(), "GET" | "POST") {
             return Err(AppError::bad("pull method must be GET or POST"));
         }
-        check_url_shape(&c.url)?;
+        check_url(&c.url, "the pull URL")?;
         if let Some(i) = c.interval_minutes {
             if !(MIN_INTERVAL_MINUTES..=7 * 24 * 60).contains(&i) {
                 return Err(AppError::bad(format!("pull interval_minutes must be {MIN_INTERVAL_MINUTES} to 10080")));
@@ -110,6 +156,9 @@ impl PullConfig {
         }
         if c.max_pages.is_some_and(|p| !(1..=50).contains(&p)) {
             return Err(AppError::bad("pull max_pages must be 1 to 50"));
+        }
+        if c.backfill_max_pages.is_some_and(|p| !(1..=5000).contains(&p)) {
+            return Err(AppError::bad("pull backfill_max_pages must be 1 to 5000"));
         }
         if c.headers.len() > 30 || c.query.len() > 50 {
             return Err(AppError::bad("at most 30 headers and 50 query parameters"));
@@ -119,21 +168,52 @@ impl PullConfig {
                 return Err(AppError::bad(format!("pull header/query {k:?} must be a string, number or true/false")));
             }
         }
-        for k in c.headers.keys() {
+        for (k, v) in &c.headers {
             if axum::http::HeaderName::from_bytes(k.as_bytes()).is_err() {
                 return Err(AppError::bad(format!("{k:?} is not a valid header name")));
+            }
+            if forbidden_header(k) {
+                return Err(AppError::bad(format!("pull headers can't set {k:?}; credentials go in the auth block")));
+            }
+            let text = plain(v).unwrap_or_default();
+            if credential_header(k) && !text.contains("{{secret.") {
+                return Err(AppError::bad(format!("header {k:?} looks like a credential: save the value under credentials and use {{{{secret.NAME}}}} here")));
             }
         }
         if serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) > 32 * 1024 {
             return Err(AppError::bad("pull settings are over 32 KB"));
         }
-        if let Auth::Oauth2ClientCredentials { token_url, client_auth, max_tokens_per_day, .. } = &c.auth {
-            check_url_shape(token_url)?;
-            if client_auth.as_deref().is_some_and(|a| !matches!(a, "body" | "basic")) {
-                return Err(AppError::bad("oauth2 client_auth must be body or basic"));
+        match &c.auth {
+            Auth::None => {}
+            Auth::Bearer { token } => require_ref("token", token)?,
+            Auth::Basic { username, password } => {
+                require_ref("username", username)?;
+                require_ref("password", password)?;
             }
-            if max_tokens_per_day.is_some_and(|m| !(1..=100).contains(&m)) {
-                return Err(AppError::bad("oauth2 max_tokens_per_day must be 1 to 100"));
+            Auth::Header { name, value } => {
+                if axum::http::HeaderName::from_bytes(name.as_bytes()).is_err() || (forbidden_header(name) && !name.eq_ignore_ascii_case("authorization")) {
+                    return Err(AppError::bad(format!("{name:?} can't be the auth header")));
+                }
+                require_ref("value", value)?;
+            }
+            Auth::Oauth2ClientCredentials { token_url, client_id, client_secret, scope, audience, client_auth, max_tokens_per_day } => {
+                check_url(token_url, "the token URL")?;
+                if PLACEHOLDER.is_match(token_url) {
+                    return Err(AppError::bad("the token URL is fixed text; it can't use placeholders"));
+                }
+                require_ref("client_id", client_id)?;
+                require_ref("client_secret", client_secret)?;
+                for (f, v) in [("scope", scope), ("audience", audience)] {
+                    if v.as_deref().is_some_and(|s| PLACEHOLDER.is_match(s) || s.len() > 500) {
+                        return Err(AppError::bad(format!("oauth2 {f} is fixed text (no placeholders, up to 500 characters)")));
+                    }
+                }
+                if client_auth.as_deref().is_some_and(|a| !matches!(a, "body" | "basic")) {
+                    return Err(AppError::bad("oauth2 client_auth must be body or basic"));
+                }
+                if max_tokens_per_day.is_some_and(|m| !(1..=100).contains(&m)) {
+                    return Err(AppError::bad("oauth2 max_tokens_per_day must be 1 to 100"));
+                }
             }
         }
         Ok(c)
@@ -154,21 +234,36 @@ impl PullConfig {
         }
         out
     }
+
+    /// The origin the pull (and its access token) is bound to, e.g. `https://open-api.guesty.com`.
+    pub fn origin(&self) -> String {
+        url::Url::parse(&PLACEHOLDER.replace_all(&self.url, "x")).map(|u| u.origin().ascii_serialization()).unwrap_or_default()
+    }
 }
 
-fn check_url_shape(u: &str) -> AppResult<()> {
-    let base = PLACEHOLDER.replace_all(u, "x");
-    let parsed = url::Url::parse(&base).map_err(|_| AppError::bad(format!("{u:?} is not a valid URL")))?;
-    if parsed.scheme() != "https" && parsed.scheme() != "http" {
-        return Err(AppError::bad("pull URLs must be http(s)"));
-    }
+/// A saved URL template: literal scheme, host and port (no placeholders, no user:password), HTTPS
+/// (HTTP only for a local test server).
+fn check_url(u: &str, what: &str) -> AppResult<()> {
     if u.len() > 2000 {
-        return Err(AppError::bad("pull URL is too long"));
+        return Err(AppError::bad(format!("{what} is too long")));
     }
-    Ok(())
+    let Some((scheme, rest)) = u.split_once("://") else { return Err(AppError::bad(format!("{what} {u:?} is not a valid URL"))) };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if scheme.contains("{{") || authority.contains("{{") || authority.contains("}}") {
+        return Err(AppError::bad(format!("{what}'s site (scheme, host and port) is fixed text; placeholders may go only in the path or query")));
+    }
+    let base = PLACEHOLDER.replace_all(u, "x");
+    let parsed = url::Url::parse(&base).map_err(|_| AppError::bad(format!("{what} {u:?} is not a valid URL")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() || authority.contains('@') {
+        return Err(AppError::bad(format!("{what} can't include a user name or password; use the auth block")));
+    }
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_test_origin(&parsed) => Ok(()),
+        _ => Err(AppError::bad(format!("{what} must use https"))),
+    }
 }
-
-static PLACEHOLDER: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
 
 /// Values placeholders can use.
 pub struct Vars<'a> {
@@ -190,22 +285,14 @@ fn plain(v: &Value) -> Option<String> {
     }
 }
 
-/// How `{{state.KEY}}` renders. State comes from script output (and so from payloads), so in a URL
-/// it is percent-encoded and must never decide where the request goes.
-#[derive(Clone, Copy, PartialEq)]
-enum StateMode {
-    Plain,
-    Encoded,
-    Marker,
-}
-
 impl Vars<'_> {
-    fn lookup(&self, name: &str, mode: StateMode) -> Result<Option<String>, String> {
+    fn lookup(&self, name: &str, encode: bool) -> Result<Option<String>, String> {
         let name = name.trim();
         if let Some(lit) = name.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
             return Ok(Some(lit.to_string()));
         }
         let iso = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let enc = |v: String| if encode { url::form_urlencoded::byte_serialize(v.as_bytes()).collect() } else { v };
         Ok(match name {
             "now" => Some(iso(self.now)),
             "since" => Some(iso(self.since)),
@@ -215,17 +302,14 @@ impl Vars<'_> {
                 if let Some(k) = name.strip_prefix("secret.") {
                     match self.secrets.get(k).and_then(plain) {
                         Some(_) if self.redact => Some("•••".into()),
-                        Some(v) => Some(v),
+                        Some(v) => Some(enc(v)),
                         None => None,
                     }
                 } else if let Some(k) = name.strip_prefix("state.") {
-                    self.state.get(k).and_then(plain).map(|v| match mode {
-                        StateMode::Plain => v,
-                        StateMode::Encoded => url::form_urlencoded::byte_serialize(v.as_bytes()).collect(),
-                        StateMode::Marker => "statevalue".into(),
-                    })
+                    // State comes from script output (and so from payloads): in a URL it is percent-encoded.
+                    self.state.get(k).and_then(plain).map(enc)
                 } else if let Some(k) = name.strip_prefix("settings.") {
-                    self.settings.get(k).and_then(plain)
+                    self.settings.get(k).and_then(plain).map(enc)
                 } else {
                     return Err(format!("unknown placeholder {{{{{name}}}}} (use secret.NAME, state.KEY, settings.KEY, now, since or a 'quoted' fallback)"));
                 }
@@ -234,27 +318,27 @@ impl Vars<'_> {
     }
 
     pub fn render(&self, s: &str) -> Result<String, String> {
-        self.render_with(s, StateMode::Plain)
+        self.render_with(s, false)
     }
 
-    /// Render a URL template. Saved state is percent-encoded, and the scheme, host and port must be
-    /// the same whatever the state holds, so a payload can never send credentials to another site.
+    /// Render a URL template. Its site is literal text (checked when saved); values are
+    /// percent-encoded, and the result must still be on that site.
     pub fn render_url(&self, s: &str) -> Result<String, String> {
-        let real = self.render_with(s, StateMode::Encoded)?;
-        let probe = self.render_with(s, StateMode::Marker)?;
-        let origin = |u: &str| url::Url::parse(u).map(|u| u.origin().ascii_serialization()).map_err(|_| format!("{u:?} isn't a valid URL"));
-        if origin(&real)? != origin(&probe)? {
-            return Err("saved state ({{state.…}}) can't change a URL's site; use it only in the path or query".into());
+        let out = self.render_with(s, true)?;
+        let want = url::Url::parse(&PLACEHOLDER.replace_all(s, "x")).map(|u| u.origin()).map_err(|_| "the URL isn't valid".to_string())?;
+        let got = url::Url::parse(&out).map_err(|_| "the rendered URL isn't valid".to_string())?;
+        if got.origin() != want || !got.username().is_empty() || got.password().is_some() {
+            return Err("a placeholder can't change the URL's site".into());
         }
-        Ok(real)
+        Ok(out)
     }
 
-    fn render_with(&self, s: &str, mode: StateMode) -> Result<String, String> {
+    fn render_with(&self, s: &str, encode: bool) -> Result<String, String> {
         let mut err = None;
         let out = PLACEHOLDER.replace_all(s, |c: &regex::Captures<'_>| {
             let expr = &c[1];
             for alt in expr.split('|') {
-                match self.lookup(alt, mode) {
+                match self.lookup(alt, encode) {
                     Ok(Some(v)) => return v,
                     Ok(None) => {}
                     Err(e) => {
@@ -300,20 +384,35 @@ pub struct Request {
 }
 
 impl Request {
-    /// What the delivery log shows (secrets already redacted when rendered with `redact`).
+    /// What the delivery log shows (secrets already masked when rendered with `redact`; auth
+    /// headers are never shown).
     pub fn log_json(&self) -> Value {
-        let hidden = ["authorization", "cookie", "x-api-key", "api-key", "apikey"];
         let headers: Map<String, Value> = self
             .headers
             .iter()
-            .map(|(k, v)| (k.clone(), json!(if hidden.contains(&k.to_ascii_lowercase().as_str()) { "•••" } else { v.as_str() })))
+            .map(|(k, v)| (k.clone(), json!(if k.eq_ignore_ascii_case("authorization") || credential_header(k) { "•••" } else { v.as_str() })))
             .collect();
         json!({"method": self.method, "url": self.url, "query": self.query.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "headers": headers, "body": self.body})
     }
+
+    /// Where it went, for error messages: origin and path, with query values hidden.
+    pub fn place(&self) -> String {
+        place_of(&self.url, self.query.iter().map(|(k, _)| k.as_str()))
+    }
+}
+
+fn place_of<'a>(raw: &str, extra_keys: impl Iterator<Item = &'a str>) -> String {
+    let Ok(u) = url::Url::parse(raw) else { return "the app".into() };
+    let mut keys: Vec<String> = u.query_pairs().map(|(k, _)| k.into_owned()).collect();
+    keys.extend(extra_keys.map(String::from));
+    keys.dedup();
+    let q = if keys.is_empty() { String::new() } else { format!("?{}", keys.iter().map(|k| format!("{k}=…")).collect::<Vec<_>>().join("&")) };
+    format!("{}{}{q}", u.origin().ascii_serialization(), u.path())
 }
 
 /// Build the request for one page: the config's templates rendered, then the script's
-/// `next_request` changes applied as literal values (they never see or expand secrets).
+/// `next_request` changes applied as literal values (they never see or expand secrets). A script
+/// may change the path and query only; the site stays the saved one.
 pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Request, String> {
     let mut headers: Vec<(String, String)> = Vec::new();
     for (k, v) in &cfg.headers {
@@ -341,9 +440,12 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
     };
     if let Some(u) = &next.url {
         let base = url::Url::parse(&url).map_err(|_| "the pull URL isn't valid".to_string())?;
-        let joined = base.join(u).map_err(|_| format!("next_request url {u:?} isn't valid"))?;
-        if joined.origin() != base.origin() {
-            return Err(format!("next_request url must stay on {} (got {})", base.origin().ascii_serialization(), joined.origin().ascii_serialization()));
+        if u.contains('@') && (u.contains("://") || u.starts_with("//")) {
+            return Err("next_request url can't include a user name or password".into());
+        }
+        let joined = base.join(u).map_err(|_| "next_request url isn't valid".to_string())?;
+        if joined.origin() != base.origin() || !joined.username().is_empty() || joined.password().is_some() {
+            return Err(format!("next_request may change only the path and query; it must stay on {}", base.origin().ascii_serialization()));
         }
         // A full next-page URL carries its own query; the configured query still applies unless replaced.
         url = joined.to_string();
@@ -363,8 +465,8 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
     }
     if let Some(h) = &next.headers {
         for (k, v) in h {
-            if k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("host") {
-                return Err("next_request can't change the Authorization or Host header".into());
+            if forbidden_header(k) || axum::http::HeaderName::from_bytes(k.as_bytes()).is_err() {
+                return Err(format!("next_request can't set the {k:?} header"));
             }
             headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
             if let Some(s) = plain(v) {
@@ -378,28 +480,96 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
     Ok(Request { method, url, headers, query, body, form: cfg.body_format == Some(BodyFormat::Form) })
 }
 
+// ---------- Errors and redaction ----------
+
+/// Mask every secret value (credentials, signing secret, access token) wherever it appears in a
+/// message that is stored or shown.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    let mut list: Vec<&String> = secrets.iter().filter(|s| s.len() >= 4).collect();
+    list.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for s in list {
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "•••");
+        }
+    }
+    out
+}
+
+/// A short description of an HTTP status, for error messages (never the app's own text).
+pub fn status_class(status: u16) -> &'static str {
+    match status {
+        400 => "bad request",
+        401 => "unauthorized: check the credentials",
+        403 => "forbidden: the credentials lack permission",
+        404 => "not found: check the URL",
+        408 | 504 => "timed out",
+        409 => "conflict",
+        422 => "the app rejected the request",
+        429 => "rate limited: the app asked us to slow down",
+        500..=599 => "the app had an error",
+        _ => "unexpected answer",
+    }
+}
+
+fn reqwest_class(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "couldn't connect"
+    } else if e.is_body() || e.is_decode() {
+        "the answer was cut off"
+    } else {
+        "the request failed"
+    }
+}
+
 // ---------- Outbound HTTP ----------
 
 /// Addresses tests may reach despite being on loopback (a local mock of an app's API). Empty in production.
 static TEST_ADDRESSES: Lazy<Mutex<HashSet<SocketAddr>>> = Lazy::new(Default::default);
 
-/// Let requests reach one local test server. For tests only; production never calls this.
+/// Let requests reach one local test server (plain HTTP allowed there). For tests only; production never calls this.
 #[doc(hidden)]
 pub fn allow_test_address(addr: SocketAddr) {
     TEST_ADDRESSES.lock().unwrap().insert(addr);
 }
 
-/// The SSRF-safe address check (`flows::check_webhook_url`): public addresses only, pinned.
-async fn vet(url: &str) -> AppResult<(String, SocketAddr)> {
-    if let Ok(u) = url::Url::parse(url) {
-        if let (Some(url::Host::Ipv4(ip)), Some(port)) = (u.host(), u.port_or_known_default()) {
-            let addr = SocketAddr::new(ip.into(), port);
-            if TEST_ADDRESSES.lock().unwrap().contains(&addr) {
-                return Ok((ip.to_string(), addr));
-            }
+fn test_addr(u: &url::Url) -> Option<SocketAddr> {
+    if let (Some(url::Host::Ipv4(ip)), Some(port)) = (u.host(), u.port_or_known_default()) {
+        let addr = SocketAddr::new(ip.into(), port);
+        if TEST_ADDRESSES.lock().unwrap().contains(&addr) {
+            return Some(addr);
         }
     }
-    crate::flows::check_webhook_url(url).await.map_err(|_| AppError::bad("pull URLs must point to a public internet address"))
+    None
+}
+
+fn is_test_origin(u: &url::Url) -> bool {
+    test_addr(u).is_some()
+}
+
+/// The SSRF-safe address check (`flows::check_webhook_url`): public addresses only, pinned.
+async fn vet(u: &url::Url) -> AppResult<(String, SocketAddr)> {
+    if let Some(addr) = test_addr(u) {
+        return Ok((addr.ip().to_string(), addr));
+    }
+    if u.scheme() != "https" {
+        return Err(AppError::bad("pull URLs must use https"));
+    }
+    crate::flows::check_webhook_url(u.as_str()).await.map_err(|_| AppError::bad("pull URLs must point to a public internet address"))
+}
+
+fn client(host: &str, addr: SocketAddr) -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .resolve(host, addr)
+        .redirect(reqwest::redirect::Policy::none())
+        // No proxy: the pinned, checked address is the one connected to.
+        .no_proxy()
+        .timeout(TIMEOUT)
+        .user_agent("dumbmail-integrations/0.1")
+        .build()
+        .map_err(|e| AppError::Internal(e.into()))
 }
 
 pub struct Response {
@@ -414,21 +584,16 @@ impl Response {
     }
 }
 
-/// Send a request to a public address: pinned DNS, no redirects, a timeout and a size cap.
+/// Send a request to a public address: pinned DNS, no proxy, no redirects, a timeout and a size cap.
+/// `bearer` is the access token for this pull's own origin.
 pub async fn send(req: &Request, bearer: Option<&str>) -> AppResult<Response> {
     let mut url = url::Url::parse(&req.url).map_err(|_| AppError::bad("the pull URL isn't valid"))?;
     if !req.query.is_empty() {
         let keep: Vec<(String, String)> = url.query_pairs().filter(|(k, _)| !req.query.iter().any(|(q, _)| q == k)).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
         url.query_pairs_mut().clear().extend_pairs(keep).extend_pairs(req.query.iter());
     }
-    let (host, addr) = vet(url.as_str()).await?;
-    let client = reqwest::Client::builder()
-        .resolve(&host, addr)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(TIMEOUT)
-        .user_agent("dumbmail-integrations/0.1")
-        .build()
-        .map_err(|e| AppError::Internal(e.into()))?;
+    let (host, addr) = vet(&url).await?;
+    let client = client(&host, addr)?;
     let method = if req.method == "POST" { reqwest::Method::POST } else { reqwest::Method::GET };
     let mut b = client.request(method, url.clone()).header("accept", "application/json");
     for (k, v) in &req.headers {
@@ -445,29 +610,28 @@ pub async fn send(req: &Request, bearer: Option<&str>) -> AppResult<Response> {
             b.json(body)
         };
     }
-    let res = b.send().await.map_err(|e| AppError::bad(format!("couldn't reach {}: {}", url.host_str().unwrap_or(""), e.without_url())))?;
-    read(res).await
+    let res = b.send().await.map_err(|e| AppError::bad(format!("couldn't reach {} ({})", req.place(), reqwest_class(&e))))?;
+    read(res, &req.place()).await
 }
 
-async fn read(res: reqwest::Response) -> AppResult<Response> {
+async fn read(res: reqwest::Response, place: &str) -> AppResult<Response> {
     let status = res.status().as_u16();
     if res.status().is_redirection() {
-        let loc = res.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-        return Err(AppError::bad(format!("the app redirected to {loc:?}; use that address in the pull URL")));
+        return Err(AppError::bad(format!("{place} answered with a redirect (HTTP {status}); redirects aren't followed, so use the final address")));
     }
     let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining"];
     let headers: Map<String, Value> = res
         .headers()
         .iter()
         .filter(|(k, _)| keep.contains(&k.as_str()))
-        .map(|(k, v)| (k.as_str().to_string(), json!(v.to_str().unwrap_or(""))))
+        .map(|(k, v)| (k.as_str().to_string(), json!(v.to_str().unwrap_or("").chars().take(500).collect::<String>())))
         .collect();
     let mut body = Vec::new();
     let mut res = res;
-    while let Some(chunk) = res.chunk().await.map_err(|e| AppError::bad(format!("couldn't read the app's answer: {}", e.without_url())))? {
+    while let Some(chunk) = res.chunk().await.map_err(|e| AppError::bad(format!("couldn't read the answer from {place} ({})", reqwest_class(&e))))? {
         body.extend_from_slice(&chunk);
         if body.len() > RESPONSE_MAX_BYTES {
-            return Err(AppError::bad(format!("the app's answer is over {} MB; ask for smaller pages", RESPONSE_MAX_BYTES / (1024 * 1024))));
+            return Err(AppError::bad(format!("the answer from {place} is over {} MB; ask for smaller pages", RESPONSE_MAX_BYTES / (1024 * 1024))));
         }
     }
     Ok(Response { status, headers, body: String::from_utf8_lossy(&body).into_owned() })
@@ -475,99 +639,142 @@ async fn read(res: reqwest::Response) -> AppResult<Response> {
 
 // ---------- OAuth2 client credentials ----------
 
-/// A bearer token for an OAuth2 client-credentials pull: the cached one while it has more than
-/// five minutes left, otherwise a new one (unless today's cap is reached). The integration's row
-/// is locked while deciding, so two pulls at once never both ask for a token.
-pub async fn oauth_token(state: &AppState, integration_id: Uuid, auth: &Auth, vars: &Vars<'_>) -> AppResult<Option<String>> {
+/// Who is asking for a token: the integration, the version of its settings the run started with,
+/// and the origin its pull (and so the token) is for.
+pub struct TokenFor<'a> {
+    pub integration_id: Uuid,
+    pub auth_version: i64,
+    pub origin: &'a str,
+}
+
+fn sha256_hex(s: &str) -> String {
+    crate::auth::sha256_hex(s)
+}
+
+/// A bearer token for an OAuth2 client-credentials pull: the cached one when it was issued for
+/// exactly these settings and has more than five minutes left, otherwise a new one (unless today's
+/// cap is reached). Only one run refreshes at a time (a short lease on the row; nobody holds a
+/// transaction or a connection over the network), and a run whose settings changed meanwhile never
+/// writes its token into the cache.
+pub async fn oauth_token(state: &AppState, who: &TokenFor<'_>, auth: &Auth, vars: &Vars<'_>) -> AppResult<Option<String>> {
     let Auth::Oauth2ClientCredentials { token_url, client_id, client_secret, scope, audience, client_auth, max_tokens_per_day } = auth else { return Ok(None) };
-    let mut tx = state.db.begin().await?;
-    let (cached, expires, requests): (Option<String>, Option<DateTime<Utc>>, Vec<DateTime<Utc>>) =
-        sqlx::query_as("SELECT oauth_token_enc, oauth_token_expires_at, oauth_token_requests FROM integrations WHERE id = $1 FOR UPDATE")
-            .bind(integration_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if let (Some(enc), Some(exp)) = (&cached, expires) {
-        if exp > Utc::now() + chrono::Duration::minutes(5) {
-            tx.commit().await?;
-            return Ok(Some(crate::crypto::decrypt(&state.cfg.secret_key, enc)?));
-        }
-    }
-    let recent: Vec<DateTime<Utc>> = requests.into_iter().filter(|t| *t > Utc::now() - chrono::Duration::hours(24)).collect();
-    let cap = max_tokens_per_day.unwrap_or(4) as usize;
-    if recent.len() >= cap {
-        let next = recent.iter().min().map(|t| *t + chrono::Duration::hours(24)).unwrap_or_else(Utc::now);
-        return Err(AppError::Conflict(format!(
-            "already asked for {cap} access tokens in the last 24 hours (the daily cap); the next one can be requested after {}",
-            next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        )));
-    }
     let id = vars.render(client_id).map_err(AppError::BadRequest)?;
     let secret = vars.render(client_secret).map_err(AppError::BadRequest)?;
-    let mut form: Vec<(String, String)> = vec![("grant_type".into(), "client_credentials".into())];
+    let key = sha256_hex(&json!([token_url, id, sha256_hex(&secret), scope, audience, client_auth, who.origin]).to_string());
+    let lease = Uuid::now_v7();
+    let cap = max_tokens_per_day.unwrap_or(4) as usize;
+    let started = std::time::Instant::now();
+    loop {
+        let mut tx = state.db.begin().await?;
+        let row: (Option<String>, Option<DateTime<Utc>>, Option<String>, Vec<DateTime<Utc>>, Option<DateTime<Utc>>, i64) = sqlx::query_as(
+            "SELECT oauth_token_enc, oauth_token_expires_at, oauth_token_key, oauth_token_requests, oauth_lease_until, auth_version FROM integrations WHERE id = $1 FOR UPDATE",
+        )
+        .bind(who.integration_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let (cached, expires, cached_key, requests, lease_until, version) = row;
+        if version != who.auth_version {
+            tx.commit().await?;
+            return Err(AppError::Conflict("the pull settings changed while this run was starting; the next run uses the new settings".into()));
+        }
+        if let (Some(enc), Some(exp), Some(k)) = (&cached, expires, &cached_key) {
+            if *k == key && exp > Utc::now() + chrono::Duration::minutes(5) {
+                tx.commit().await?;
+                return Ok(Some(crate::crypto::decrypt(&state.cfg.secret_key, enc)?));
+            }
+        }
+        if lease_until.is_some_and(|t| t > Utc::now()) {
+            // Another run is asking for a token right now: wait for its answer.
+            tx.commit().await?;
+            if started.elapsed() > Duration::from_secs(LEASE_SECONDS as u64 + 5) {
+                return Err(AppError::Conflict("another run is still getting an access token; try again shortly".into()));
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        }
+        let recent: Vec<DateTime<Utc>> = requests.into_iter().filter(|t| *t > Utc::now() - chrono::Duration::hours(24)).collect();
+        if recent.len() >= cap {
+            tx.commit().await?;
+            let next = recent.iter().min().map(|t| *t + chrono::Duration::hours(24)).unwrap_or_else(Utc::now);
+            return Err(AppError::Conflict(format!(
+                "already asked for {cap} access tokens in the last 24 hours (the daily cap); the next one can be requested after {}",
+                next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )));
+        }
+        // Count the request before sending it: a token the app issued counts against its cap even if we never read the answer.
+        let mut all = recent;
+        all.push(Utc::now());
+        sqlx::query("UPDATE integrations SET oauth_token_requests = $2, oauth_lease_id = $3, oauth_lease_until = now() + make_interval(secs => $4) WHERE id = $1")
+            .bind(who.integration_id)
+            .bind(&all)
+            .bind(lease)
+            .bind(LEASE_SECONDS as f64)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        break;
+    }
+    let res = fetch_token(token_url, &id, &secret, scope.as_deref(), audience.as_deref(), client_auth.as_deref() == Some("basic")).await;
+    match res {
+        Ok((token, ttl)) => {
+            // Cache it only if this run still holds the lease and the settings haven't changed.
+            sqlx::query(
+                "UPDATE integrations SET oauth_token_enc = $3, oauth_token_expires_at = now() + make_interval(secs => $4), oauth_token_key = $5, oauth_lease_id = NULL, oauth_lease_until = NULL
+                 WHERE id = $1 AND oauth_lease_id = $2 AND auth_version = $6",
+            )
+            .bind(who.integration_id)
+            .bind(lease)
+            .bind(crate::crypto::encrypt(&state.cfg.secret_key, &token)?)
+            .bind(ttl as f64)
+            .bind(&key)
+            .bind(who.auth_version)
+            .execute(&state.db)
+            .await?;
+            Ok(Some(token))
+        }
+        Err(e) => {
+            sqlx::query("UPDATE integrations SET oauth_lease_id = NULL, oauth_lease_until = NULL WHERE id = $1 AND oauth_lease_id = $2").bind(who.integration_id).bind(lease).execute(&state.db).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn fetch_token(token_url: &str, id: &str, secret: &str, scope: Option<&str>, audience: Option<&str>, basic: bool) -> AppResult<(String, i64)> {
+    let mut form: Vec<(&str, &str)> = vec![("grant_type", "client_credentials")];
     if let Some(s) = scope {
-        form.push(("scope".into(), vars.render(s).map_err(AppError::BadRequest)?));
+        form.push(("scope", s));
     }
     if let Some(a) = audience {
-        form.push(("audience".into(), vars.render(a).map_err(AppError::BadRequest)?));
+        form.push(("audience", a));
     }
-    let basic = client_auth.as_deref() == Some("basic");
     if !basic {
-        form.push(("client_id".into(), id.clone()));
-        form.push(("client_secret".into(), secret.clone()));
+        form.push(("client_id", id));
+        form.push(("client_secret", secret));
     }
-    let token_url = vars.render_url(token_url).map_err(AppError::BadRequest)?;
-    // Count the request before sending it: a token the app issued counts against its cap even if we never read the answer.
-    let mut all = recent.clone();
-    all.push(Utc::now());
-    sqlx::query("UPDATE integrations SET oauth_token_requests = $2 WHERE id = $1").bind(integration_id).bind(&all).execute(&mut *tx).await?;
-    let (host, addr) = vet(&token_url).await?;
-    let client = reqwest::Client::builder()
-        .resolve(&host, addr)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(TIMEOUT)
-        .user_agent("dumbmail-integrations/0.1")
-        .build()
-        .map_err(|e| AppError::Internal(e.into()))?;
-    let mut b = client.post(&token_url).header("accept", "application/json").form(&form);
+    let url = url::Url::parse(token_url).map_err(|_| AppError::bad("the token URL isn't valid"))?;
+    let place = place_of(token_url, std::iter::empty());
+    let (host, addr) = vet(&url).await?;
+    let client = client(&host, addr)?;
+    let mut b = client.post(url).header("accept", "application/json").form(&form);
     if basic {
-        b = b.basic_auth(&id, Some(&secret));
+        b = b.basic_auth(id, Some(secret));
     }
-    let sent = b.send().await;
-    let res = match sent {
-        Ok(r) => read(r).await,
-        Err(e) => Err(AppError::bad(format!("couldn't reach the token URL: {}", e.without_url()))),
-    };
-    let res = match res {
-        Ok(r) => r,
-        Err(e) => {
-            tx.commit().await?;
-            return Err(e);
-        }
-    };
+    let res = b.send().await.map_err(|e| AppError::bad(format!("couldn't reach the token URL {place} ({})", reqwest_class(&e))))?;
+    let res = read(res, &place).await?;
     if !(200..300).contains(&res.status) {
-        tx.commit().await?;
-        let detail: String = res.body.chars().take(300).collect();
-        return Err(AppError::bad(format!("the token URL answered HTTP {}: {detail}", res.status)));
+        return Err(AppError::bad(format!("the token URL {place} answered HTTP {} ({})", res.status, status_class(res.status))));
     }
     let v = res.json();
     let Some(token) = v["access_token"].as_str().filter(|t| !t.is_empty()).map(String::from) else {
-        tx.commit().await?;
-        return Err(AppError::bad("the token URL's answer has no access_token"));
+        return Err(AppError::bad(format!("the answer from the token URL {place} has no access_token")));
     };
     let ttl = v["expires_in"].as_i64().or_else(|| v["expires_in"].as_str().and_then(|s| s.parse().ok())).unwrap_or(3600).clamp(60, 30 * 86400);
-    sqlx::query("UPDATE integrations SET oauth_token_enc = $2, oauth_token_expires_at = now() + make_interval(secs => $3) WHERE id = $1")
-        .bind(integration_id)
-        .bind(crate::crypto::encrypt(&state.cfg.secret_key, &token)?)
-        .bind(ttl as f64)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(Some(token))
+    Ok((token, ttl))
 }
 
 /// Forget a cached token the app no longer accepts.
 pub async fn drop_token(state: &AppState, integration_id: Uuid) -> AppResult<()> {
-    sqlx::query("UPDATE integrations SET oauth_token_enc = NULL, oauth_token_expires_at = NULL WHERE id = $1").bind(integration_id).execute(&state.db).await?;
+    sqlx::query("UPDATE integrations SET oauth_token_enc = NULL, oauth_token_expires_at = NULL, oauth_token_key = NULL WHERE id = $1").bind(integration_id).execute(&state.db).await?;
     Ok(())
 }
 
@@ -580,10 +787,14 @@ mod tests {
         Vars { secrets, state: st, settings, now, since: now - chrono::Duration::days(1), redact }
     }
 
+    fn obj(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
     #[test]
     fn renders_placeholders_with_fallbacks() {
-        let secrets = json!({"key": "sk_live_1"}).as_object().cloned().unwrap();
-        let st = json!({"cursor": "c9"}).as_object().cloned().unwrap();
+        let secrets = obj(json!({"key": "sk_live_1"}));
+        let st = obj(json!({"cursor": "c9"}));
         let empty = Map::new();
         let v = vars(&secrets, &st, &empty, false);
         assert_eq!(v.render("Bearer {{secret.key}}").unwrap(), "Bearer sk_live_1");
@@ -598,47 +809,86 @@ mod tests {
     }
 
     #[test]
-    fn next_request_stays_on_the_same_site_and_never_expands_secrets() {
+    fn the_site_is_fixed_text() {
+        let auth = json!({"type": "bearer", "token": "{{secret.key}}"});
+        for bad in [
+            "https://{{state.host}}/v1",
+            "https://{{settings.host}}/v1",
+            "https://{{secret.host}}/v1",
+            "{{settings.scheme}}://api.example.com/v1",
+            "https://api.example.com:{{settings.port}}/v1",
+            "https://api.example.com{{state.x}}/v1",
+            "https://user:pass@api.example.com/v1",
+            "https://user@api.example.com/v1",
+            "https://{{secret.u}}@api.example.com/v1",
+            "http://api.example.com/v1",
+            "ftp://api.example.com/v1",
+        ] {
+            assert!(PullConfig::parse(&json!({"url": bad, "auth": auth})).is_err(), "{bad}");
+        }
+        let ok = PullConfig::parse(&json!({"url": "https://api.example.com/v1/{{settings.region}}/items?x={{state.cursor|since}}", "auth": auth})).unwrap();
+        assert_eq!(ok.origin(), "https://api.example.com");
+        // A path value can't move the request to another site either.
+        let empty = Map::new();
+        let evil = obj(json!({"path": "x/../../@evil.example.net?a=1#", "page": "2"}));
+        let v = vars(&empty, &evil, &empty, false);
+        let u = v.render_url("https://api.example.com/v1/{{state.path}}").unwrap();
+        assert_eq!(url::Url::parse(&u).unwrap().host_str(), Some("api.example.com"), "{u}");
+        assert!(!u.contains('@') && !u.contains('#'), "{u}");
+    }
+
+    #[test]
+    fn credentials_are_references_only() {
+        let url = "https://api.example.com/v1";
+        assert!(PullConfig::parse(&json!({"url": url, "auth": {"type": "bearer", "token": "sk_live_literal"}})).unwrap_err().public_message().contains("secret reference"));
+        assert!(PullConfig::parse(&json!({"url": url, "auth": {"type": "bearer", "token": "x {{secret.key}}"}})).is_err());
+        assert!(PullConfig::parse(&json!({"url": url, "auth": {"type": "basic", "username": "{{secret.u}}", "password": "hunter2"}})).is_err());
+        assert!(PullConfig::parse(&json!({"url": url, "auth": {"type": "header", "name": "X-Api-Key", "value": "abc"}})).is_err());
+        assert!(PullConfig::parse(&json!({"url": url, "auth": {"type": "header", "name": "X-Api-Key", "value": "{{secret.key}}"}})).is_ok());
+        assert!(PullConfig::parse(&json!({"url": url, "headers": {"X-Api-Key": "literal"}})).is_err());
+        assert!(PullConfig::parse(&json!({"url": url, "headers": {"X-Api-Key": "{{secret.key}}"}})).is_ok());
+        let oauth = |cid: &str, turl: &str| json!({"url": url, "auth": {"type": "oauth2_client_credentials", "token_url": turl, "client_id": cid, "client_secret": "{{secret.client_secret}}"}});
+        assert!(PullConfig::parse(&oauth("literal-id", "https://api.example.com/token")).is_err());
+        assert!(PullConfig::parse(&oauth("{{secret.client_id}}", "https://api.example.com/{{settings.t}}")).is_err());
+        assert!(PullConfig::parse(&oauth("{{secret.client_id}}", "https://{{settings.h}}/token")).is_err());
+        let c = PullConfig::parse(&oauth("{{secret.client_id}}", "https://api.example.com/token")).unwrap();
+        assert_eq!(c.secret_names(), vec!["client_id", "client_secret"]);
+    }
+
+    #[test]
+    fn routing_headers_are_refused_everywhere() {
+        for h in ["Host", "authorization", "Proxy-Authorization", "Forwarded", "X-Forwarded-Host", "X-Forwarded-For", "Connection", "Transfer-Encoding", "Content-Length", "Cookie"] {
+            assert!(PullConfig::parse(&json!({"url": "https://api.example.com/v1", "headers": {h: "x"}})).is_err(), "{h}");
+            let cfg = PullConfig::parse(&json!({"url": "https://api.example.com/v1"})).unwrap();
+            let empty = Map::new();
+            let v = vars(&empty, &empty, &empty, false);
+            let next = NextRequest { headers: Some(obj(json!({h: "x"}))), ..Default::default() };
+            assert!(build(&cfg, &next, &v).is_err(), "{h}");
+        }
+    }
+
+    #[test]
+    fn next_request_changes_only_path_and_query() {
         let cfg = PullConfig::parse(&json!({"url": "https://api.example.com/v1/items", "query": {"limit": 100, "since": "{{since}}"}, "auth": {"type": "bearer", "token": "{{secret.key}}"}})).unwrap();
-        let secrets = json!({"key": "sk"}).as_object().cloned().unwrap();
+        let secrets = obj(json!({"key": "sk"}));
         let empty = Map::new();
         let v = vars(&secrets, &empty, &empty, false);
-        let next = NextRequest { query: Some(json!({"skip": 100, "since": "{{secret.key}}"}).as_object().cloned().unwrap()), ..Default::default() };
+        let next = NextRequest { query: Some(obj(json!({"skip": 100, "since": "{{secret.key}}"}))), ..Default::default() };
         let r = build(&cfg, &next, &v).unwrap();
         assert!(r.query.contains(&("skip".into(), "100".into())));
         assert!(r.query.contains(&("since".into(), "{{secret.key}}".into())), "literal, not expanded");
         assert!(r.headers.contains(&("Authorization".into(), "Bearer sk".into())));
-        let away = NextRequest { url: Some("https://evil.example.net/steal".into()), ..Default::default() };
-        assert!(build(&cfg, &away, &v).unwrap_err().contains("must stay on"));
+        for away in ["https://evil.example.net/steal", "//evil.example.net/x", "https://api.example.com:8443/x", "http://api.example.com/x", "https://u:p@api.example.com/x", "https://u@api.example.com/x"] {
+            let n = NextRequest { url: Some(away.into()), ..Default::default() };
+            assert!(build(&cfg, &n, &v).is_err(), "{away}");
+        }
         let rel = NextRequest { url: Some("/v1/items?page=2".into()), ..Default::default() };
         assert_eq!(build(&cfg, &rel, &v).unwrap().url, "https://api.example.com/v1/items?page=2");
-        let hdr = NextRequest { headers: Some(json!({"Authorization": "x"}).as_object().cloned().unwrap()), ..Default::default() };
-        assert!(build(&cfg, &hdr, &v).is_err());
     }
 
     #[test]
-    fn saved_state_never_picks_the_site() {
-        let empty = Map::new();
-        let evil = json!({"host": "evil.example.net", "path": "x/../../@evil.example.net?a=1#", "page": "2"}).as_object().cloned().unwrap();
-        let v = vars(&empty, &evil, &empty, false);
-        assert!(v.render_url("https://{{state.host}}/v1").unwrap_err().contains("can't change"));
-        assert!(v.render_url("https://api.example.com@{{state.host}}/v1").unwrap_err().contains("can't change"));
-        let u = v.render_url("https://api.example.com/v1/{{state.path}}").unwrap();
-        assert_eq!(url::Url::parse(&u).unwrap().host_str(), Some("api.example.com"), "{u}");
-        assert!(!u.contains('@') && !u.contains('#'), "{u}");
-        assert_eq!(v.render_url("https://api.example.com/v1?page={{state.page}}").unwrap(), "https://api.example.com/v1?page=2");
-        let cfg = PullConfig::parse(&json!({"url": "https://{{state.host}}/x", "auth": {"type": "bearer", "token": "t"}})).unwrap();
-        assert!(build(&cfg, &NextRequest::default(), &v).is_err());
-    }
-
-    #[test]
-    fn validates_config() {
-        assert!(PullConfig::parse(&json!({"url": "ftp://x.com"})).is_err());
-        assert!(PullConfig::parse(&json!({"url": "https://x.com", "interval_minutes": 1})).is_err());
-        assert!(PullConfig::parse(&json!({"url": "https://x.com", "method": "DELETE"})).is_err());
-        assert!(PullConfig::parse(&json!({"url": "https://x.com", "extra": 1})).is_err());
-        let c = PullConfig::parse(&json!({"url": "https://x.com/{{settings.region}}", "interval_minutes": 15,
-            "auth": {"type": "oauth2_client_credentials", "token_url": "https://x.com/token", "client_id": "{{secret.client_id}}", "client_secret": "{{secret.client_secret}}"}})).unwrap();
-        assert_eq!(c.secret_names(), vec!["client_id", "client_secret"]);
+    fn errors_hide_query_values_and_secrets() {
+        assert_eq!(place_of("https://api.example.com/v1/items?token=abc&page=2", std::iter::once("since")), "https://api.example.com/v1/items?token=…&page=…&since=…");
+        assert_eq!(redact("Bearer sk_live_123 and sk_live_123x", &["sk_live_123".into(), "ab".into()]), "Bearer ••• and •••x");
     }
 }

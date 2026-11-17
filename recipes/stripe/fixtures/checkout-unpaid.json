@@ -2,7 +2,7 @@
   "description": "delayed payment method, not paid yet",
   "expect": [
     {
-      "message": "checkout cs_test_unpaid isn't paid yet (unpaid)",
+      "message": "checkout cs_test_unpaid isn't paid yet (unpaid); it's recorded when checkout.session.async_payment_succeeded arrives",
       "type": "log"
     }
   ],

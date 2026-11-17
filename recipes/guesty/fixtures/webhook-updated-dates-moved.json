@@ -14,7 +14,7 @@
       "type": "upsert_profile"
     },
     {
-      "metric": "Reservation Confirmed",
+      "metric": "Reservation Booked",
       "profile": {
         "email": "dana.whitfield@example.com"
       },
@@ -24,19 +24,40 @@
         "confirmation_code": "GY-h5SdcsBL",
         "currency": "USD",
         "guests": 3,
-        "host_payout": 1210.2,
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
         "reservation_id": "66f1c4a1246e7d9f0f8da88a",
         "source_channel": "manual",
         "status": "confirmed",
-        "total": 1312.5,
-        "updated_booking": true
+        "total": 1312.5
       },
       "time": "2026-11-15T19:04:11.000Z",
       "type": "track_event",
-      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:confirmed:2026-12-19:2026-12-23"
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:booked",
+      "value": 1312.5
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-19",
+        "check_out": "2026-12-23",
+        "confirmation_code": "GY-h5SdcsBL",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "reservation_id": "66f1c4a1246e7d9f0f8da88a",
+        "source_channel": "manual",
+        "status": "confirmed",
+        "version": "2026-11-16T10:00:00.000Z"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:confirmed:2026-11-16T10:00:00.000Z"
     },
     {
       "metric": "Reservation Updated",
@@ -50,17 +71,9 @@
         ],
         "check_in": "2026-12-19",
         "check_out": "2026-12-23",
-        "confirmation_code": "GY-h5SdcsBL",
-        "currency": "USD",
-        "guests": 3,
-        "host_payout": 1210.2,
         "listing_id": "66054019764cbb000f37c450",
-        "listing_name": "Winery Villa",
-        "nights": 4,
         "reservation_id": "66f1c4a1246e7d9f0f8da88a",
-        "source_channel": "manual",
-        "status": "confirmed",
-        "total": 1312.5
+        "status": "confirmed"
       },
       "time": "2026-11-16T10:00:00.000Z",
       "type": "track_event",

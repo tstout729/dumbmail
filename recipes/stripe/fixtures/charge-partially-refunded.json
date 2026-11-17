@@ -11,21 +11,8 @@
       "type": "upsert_profile"
     },
     {
-      "metric": "Refunded Order",
-      "profile": {
-        "email": "jordan@example.com"
-      },
-      "properties": {
-        "amount_charged": 51.84,
-        "charge_id": "ch_3QabCdEfGh1234",
-        "currency": "usd",
-        "fully_refunded": false,
-        "payment_intent": "pi_3QabCdEfGh1234"
-      },
-      "time": "2025-11-17T18:00:00.000Z",
-      "type": "track_event",
-      "unique_id": "stripe:refund:ch_3QabCdEfGh1234:2000",
-      "value": 20
+      "message": "charge ch_3QabCdEfGh1234 doesn't list its refunds; each refund is recorded from refund.created",
+      "type": "log"
     }
   ],
   "input": {

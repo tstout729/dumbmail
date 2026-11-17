@@ -113,6 +113,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                 if suppressed.is_some() {
                     return Ok(Outcome::Skipped("suppressed"));
                 }
+                if crate::marketing_hold::blocks_email(&state.db, p.id, spec.flow_id).await? {
+                    return Ok(Outcome::Skipped(crate::marketing_hold::SKIP_REASON));
+                }
             }
             spec.to_override.clone().or_else(|| p.email.clone())
         }

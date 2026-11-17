@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::engine::{self, TestSample, BODY_MAX_BYTES};
+use super::engine::{self, NewDelivery, Refused, TestSample, BODY_MAX_BYTES};
 use super::model::{self, Changes};
 use super::{recipes, signature};
 use crate::api::ApiJson;
@@ -26,8 +26,10 @@ use crate::state::AppState;
 
 /// Webhooks one integration may receive per minute; past it the sender gets 429 and retries later.
 pub const RATE_PER_MINUTE: u32 = 300;
-/// Deliveries waiting to run before new ones are refused.
-const MAX_BACKLOG: i64 = 5000;
+/// Webhooks one account may receive per minute across its integrations.
+pub const ACCOUNT_RATE_PER_MINUTE: u32 = 1200;
+/// Rejected requests (bad signatures) logged per integration per minute; the rest are refused silently.
+const REJECTED_LOGGED_PER_MINUTE: u32 = 30;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -49,27 +51,54 @@ pub fn routes() -> Router<AppState> {
 
 // ---------- Inbound webhooks ----------
 
-static WINDOWS: Lazy<Mutex<HashMap<Uuid, (Instant, u32)>>> = Lazy::new(Default::default);
+/// Fixed one-minute windows, in memory: accepted webhooks per integration and per account, and
+/// rejected ones (bad signatures) per integration, counted separately so failures never use up
+/// the allowance real deliveries need.
+struct Windows {
+    accepted: HashMap<Uuid, (Instant, u32)>,
+    accounts: HashMap<Uuid, (Instant, u32)>,
+    rejected: HashMap<Uuid, (Instant, u32)>,
+}
 
-/// A fixed one-minute window per integration. Returns false once the window is full.
-fn take_slot(id: Uuid) -> bool {
-    let mut w = WINDOWS.lock().unwrap();
-    if w.len() > 10_000 {
-        w.retain(|_, (start, _)| start.elapsed().as_secs() < 60);
+static WINDOWS: Lazy<Mutex<Windows>> = Lazy::new(|| Mutex::new(Windows { accepted: HashMap::new(), accounts: HashMap::new(), rejected: HashMap::new() }));
+
+fn bump(map: &mut HashMap<Uuid, (Instant, u32)>, id: Uuid, cap: u32) -> bool {
+    if map.len() > 10_000 {
+        map.retain(|_, (start, _)| start.elapsed().as_secs() < 60);
     }
-    let e = w.entry(id).or_insert((Instant::now(), 0));
+    let e = map.entry(id).or_insert((Instant::now(), 0));
     if e.0.elapsed().as_secs() >= 60 {
         *e = (Instant::now(), 0);
     }
-    if e.1 >= RATE_PER_MINUTE {
+    if e.1 >= cap {
         return false;
     }
     e.1 += 1;
     true
 }
 
+/// Take an accepted-webhook slot for the integration and its account. False once either is full.
+fn take_slot(id: Uuid, account: Uuid) -> bool {
+    let mut w = WINDOWS.lock().unwrap();
+    let integ_ok = w.accepted.get(&id).is_none_or(|(t, n)| t.elapsed().as_secs() >= 60 || *n < RATE_PER_MINUTE);
+    let acct_ok = w.accounts.get(&account).is_none_or(|(t, n)| t.elapsed().as_secs() >= 60 || *n < ACCOUNT_RATE_PER_MINUTE);
+    if !(integ_ok && acct_ok) {
+        return false;
+    }
+    bump(&mut w.accepted, id, RATE_PER_MINUTE) && bump(&mut w.accounts, account, ACCOUNT_RATE_PER_MINUTE)
+}
+
+/// Count a rejected request; true while rejections are few enough to still be logged.
+fn note_rejected(id: Uuid) -> bool {
+    bump(&mut WINDOWS.lock().unwrap().rejected, id, REJECTED_LOGGED_PER_MINUTE)
+}
+
 fn reply(status: StatusCode, v: Value) -> Response {
     (status, Json(v)).into_response()
+}
+
+fn busy(msg: &str) -> Response {
+    (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")], Json(json!({"error": msg}))).into_response()
 }
 
 /// Headers a script may need. Credentials and cookies are never stored.
@@ -96,42 +125,47 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
         Err(e) => return AppError::from(e).into_response(),
     };
     let Some(id) = id else { return reply(StatusCode::NOT_FOUND, json!({"error": "unknown webhook URL"})) };
-    if !take_slot(id) {
-        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "60")], Json(json!({"error": format!("more than {RATE_PER_MINUTE} webhooks a minute; retry later")}))).into_response();
-    }
     let integ = match model::load_any(&state, id).await {
         Ok(Some(i)) => i,
         Ok(None) => return reply(StatusCode::NOT_FOUND, json!({"error": "unknown webhook URL"})),
         Err(e) => return e.into_response(),
     };
-    let backlog: i64 = sqlx::query_scalar("SELECT count(*) FROM integration_deliveries WHERE integration_id = $1 AND status = 'pending'").bind(id).fetch_one(&state.db).await.unwrap_or(0);
-    if backlog >= MAX_BACKLOG {
-        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "300")], Json(json!({"error": "too many webhooks are waiting to be processed; retry later"}))).into_response();
-    }
     let (parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(Body::new(body), BODY_MAX_BYTES).await {
         Ok(b) => b,
         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, json!({"error": "the body is over 1 MB"})),
     };
+    // The signature is checked before anything is spent: a caller without the secret never uses up
+    // the integration's allowance, and its failures are only logged while they are few.
     let sig = integ.signature();
     let secret = integ.secret(&state).ok().flatten();
     if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &bytes, Utc::now().timestamp()) {
-        let msg = format!("signature check failed: {why}");
-        let _ = engine::store_delivery(&state, &integ, "webhook", None, &json!({}), &json!({}), None, None, "error", Some(&msg), None).await;
-        let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+        if note_rejected(id) {
+            let msg = format!("signature check failed: {why}");
+            let _ = engine::store_delivery(&state, &integ, NewDelivery::log("webhook", "error", Some(&msg))).await;
+            let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+        }
         return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
+    }
+    if !take_slot(id, integ.account_id) {
+        return busy(&format!("more than {RATE_PER_MINUTE} webhooks a minute; retry later"));
     }
     if let Some(q) = sig.secret_query() {
         query.remove(q);
     }
+    let message_id = integ.message_id_of(&parts.headers, &bytes);
     let headers = keep_headers(&parts.headers, sig.secret_header().as_deref());
     let ct = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
     let body = String::from_utf8_lossy(&bytes).into_owned();
     let query = json!(query);
     let (status, note) = if integ.status == "enabled" { ("pending", None) } else { ("ignored", Some("the integration is turned off")) };
-    match engine::store_delivery(&state, &integ, "webhook", ct.as_deref(), &headers, &query, Some(&body), None, status, note, None).await {
+    let d = NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status, error: note, replay_of: None, message_id, applied: None };
+    match engine::store_delivery(&state, &integ, d).await {
         Ok(d) => reply(StatusCode::OK, json!({"ok": true, "delivery_id": d})),
-        Err(e) => e.into_response(),
+        // The app sent this message before (a retry): acknowledge it so it stops, and do nothing.
+        Err(Refused::Duplicate(first)) => reply(StatusCode::OK, json!({"ok": true, "duplicate": true, "delivery_id": first})),
+        Err(Refused::Busy(msg)) => busy(&msg),
+        Err(Refused::Error(e)) => e.into_response(),
     }
 }
 
@@ -345,13 +379,16 @@ async fn rotate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 struct PullBody {
     #[serde(default)]
     backfill_since: Option<String>,
+    /// Continue a backfill that stopped at its page limit or failed.
+    #[serde(default)]
+    resume_backfill: bool,
 }
 
 async fn pull_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, body: axum::body::Bytes) -> AppResult<Json<Value>> {
     let b: PullBody = if body.iter().all(u8::is_ascii_whitespace) { PullBody::default() } else { serde_json::from_slice(&body)? };
     let i = model::load(&state, ctx.account_id, id).await?;
     let since = b.backfill_since.as_deref().map(parse_since).transpose()?;
-    Ok(Json(engine::start_pull(&state, &i, since).await?))
+    Ok(Json(engine::start_pull(&state, &i, since, b.resume_backfill).await?))
 }
 
 async fn cancel_backfill_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

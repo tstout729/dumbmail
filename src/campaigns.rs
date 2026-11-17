@@ -163,6 +163,7 @@ pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }
+    crate::marketing_hold::push_campaign_filter(qb, channel);
 }
 
 pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<i64> {

@@ -34,6 +34,9 @@ pub struct Integration {
     pub credentials_enc: Option<String>,
     pub credential_hints: Value,
     pub oauth_token_expires_at: Option<DateTime<Utc>>,
+    pub auth_version: i64,
+    pub contacts_opted_in: bool,
+    pub message_id: Option<Value>,
     pub state: Value,
     pub backfill: Option<Value>,
     pub deliveries_ok: i64,
@@ -45,7 +48,7 @@ pub struct Integration {
     pub updated_at: DateTime<Utc>,
 }
 
-pub const COLS: &str = "id, account_id, name, recipe, status, token_enc, signature, signature_secret_enc, signature_secret_hint, script, settings, pull, pull_next_at, credentials_enc, credential_hints, oauth_token_expires_at, state, backfill, deliveries_ok, deliveries_failed, last_delivery_at, last_error, last_error_at, created_at, updated_at";
+pub const COLS: &str = "id, account_id, name, recipe, status, token_enc, signature, signature_secret_enc, signature_secret_hint, script, settings, pull, pull_next_at, credentials_enc, credential_hints, oauth_token_expires_at, auth_version, contacts_opted_in, message_id, state, backfill, deliveries_ok, deliveries_failed, last_delivery_at, last_error, last_error_at, created_at, updated_at";
 
 impl Integration {
     pub fn signature(&self) -> Signature {
@@ -78,6 +81,49 @@ impl Integration {
         }
     }
 
+    /// Every secret value this integration holds (credentials, signing secret, cached access
+    /// token), so stored and shown messages can be scrubbed of them.
+    pub async fn secret_values(&self, state: &AppState) -> Vec<String> {
+        let mut out: Vec<String> = self.credentials(state).map(|c| c.values().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        if let Ok(Some(s)) = self.secret(state) {
+            out.push(s);
+        }
+        let token: Option<Option<String>> = sqlx::query_scalar("SELECT oauth_token_enc FROM integrations WHERE id = $1").bind(self.id).fetch_optional(&state.db).await.ok();
+        if let Some(Some(enc)) = token {
+            if let Ok(t) = crate::crypto::decrypt(&state.cfg.secret_key, &enc) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// Scrub this integration's secret values from a message before it is stored or shown.
+    pub async fn redact(&self, state: &AppState, text: &str) -> String {
+        super::pull::redact(text, &self.secret_values(state).await)
+    }
+
+    /// Where the app's own message id is in a webhook, if set.
+    pub fn message_id_of(&self, headers: &axum::http::HeaderMap, body: &[u8]) -> Option<String> {
+        let cfg = self.message_id.as_ref()?;
+        let v = if let Some(h) = cfg["header"].as_str() {
+            headers.get(h).and_then(|v| v.to_str().ok()).map(String::from)
+        } else if let Some(f) = cfg["field"].as_str() {
+            let body: Value = serde_json::from_slice(body).ok()?;
+            let mut cur = &body;
+            for part in f.split('.') {
+                cur = cur.get(part)?;
+            }
+            match cur {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        v.map(|s| s.trim().chars().take(200).collect::<String>()).filter(|s| !s.is_empty())
+    }
+
     pub fn inbound_url(&self, state: &AppState) -> String {
         let token = crate::crypto::decrypt(&state.cfg.secret_key, &self.token_enc).unwrap_or_default();
         format!("{}/webhooks/in/{token}", state.cfg.public_url())
@@ -101,6 +147,7 @@ impl Integration {
             "signature_secret": self.signature_secret_hint.as_ref().map(|h| json!({"saved": true, "hint": h})).unwrap_or(json!({"saved": false})),
             "signature_ready": !sig.needs_secret() || self.signature_secret_enc.is_some(),
             "script": self.script, "settings": self.settings, "pull": self.pull,
+            "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id,
             "pull_next_at": self.pull_next_at,
             "credentials": self.credential_hints,
             "missing_credentials": self.missing_credentials(),
@@ -162,6 +209,31 @@ pub struct Changes {
     /// Saved state for the script (e.g. reset a cursor). Replaces the whole state.
     #[serde(default)]
     pub state: Option<Value>,
+    /// "Everyone this integration adds has agreed to get marketing email from us." Default false:
+    /// people it creates without an explicit opt-in are held back from marketing.
+    #[serde(default)]
+    pub contacts_opted_in: Option<bool>,
+    /// Where a webhook carries the app's own message id, so resends are ignored:
+    /// `{"header": "svix-id"}` or `{"field": "id"}` (dots reach nested keys). `null` removes it.
+    #[serde(default, deserialize_with = "some_value")]
+    pub message_id: Option<Value>,
+}
+
+fn check_message_id(v: &Value) -> AppResult<Option<Value>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let o = v.as_object().ok_or_else(|| AppError::bad("message_id must be {\"header\": name} or {\"field\": path}"))?;
+    let ok = o.len() == 1
+        && match (o.get("header").and_then(|h| h.as_str()), o.get("field").and_then(|f| f.as_str())) {
+            (Some(h), None) => axum::http::HeaderName::from_bytes(h.as_bytes()).is_ok() && h.len() <= 100,
+            (None, Some(f)) => !f.is_empty() && f.len() <= 100,
+            _ => false,
+        };
+    if !ok {
+        return Err(AppError::bad("message_id must be {\"header\": name} or {\"field\": path}"));
+    }
+    Ok(Some(v.clone()))
 }
 
 /// Keep an explicit `null` as `Some(Value::Null)` so it can mean "remove".
@@ -249,6 +321,10 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
     if let Some(s) = &c.state {
         check_object(s, "state", super::actions::MAX_STATE_BYTES)?;
     }
+    let (message_id, set_message_id) = match &c.message_id {
+        Some(v) => (check_message_id(v)?, true),
+        None => (None, false),
+    };
     let (pull, set_pull) = match &c.pull {
         Some(Value::Null) => (None, true),
         Some(v) => (Some(serde_json::to_value(PullConfig::parse(v)?)?), true),
@@ -301,10 +377,18 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
             credential_hints = COALESCE($15, credential_hints),
             oauth_token_enc = CASE WHEN $17 THEN NULL ELSE oauth_token_enc END,
             oauth_token_expires_at = CASE WHEN $17 THEN NULL ELSE oauth_token_expires_at END,
-            state = COALESCE($16, state), updated_at = now()
+            state = COALESCE($16, state),
+            contacts_opted_in = COALESCE($18, contacts_opted_in),
+            message_id = CASE WHEN $19 THEN $20 ELSE message_id END,
+            auth_version = auth_version + CASE WHEN $21 THEN 1 ELSE 0 END,
+            oauth_token_key = CASE WHEN $17 THEN NULL ELSE oauth_token_key END,
+            updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING {COLS}"
     );
-    // Changing credentials or the pull's auth drops the cached OAuth token; it may belong to the old client.
+    // Changing credentials or the pull (its site or auth) drops the cached OAuth token, and bumps the
+    // auth version so a run that started on the old settings can't write its token back.
+    let drop_token = creds_changed || (set_pull && cur.pull != pull);
+    let bump = drop_token || c.settings.is_some();
     let row = sqlx::query_as::<_, Integration>(&q)
         .bind(id)
         .bind(account_id)
@@ -322,14 +406,14 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
         .bind(creds_enc)
         .bind(hints)
         .bind(&c.state)
-        .bind(creds_changed || (set_pull && pull_auth_changed(&cur, pull.as_ref())))
+        .bind(drop_token)
+        .bind(c.contacts_opted_in)
+        .bind(set_message_id)
+        .bind(&message_id)
+        .bind(bump)
         .fetch_one(&state.db)
         .await?;
     Ok(row)
-}
-
-fn pull_auth_changed(cur: &Integration, new: Option<&Value>) -> bool {
-    cur.pull.as_ref().map(|p| &p["auth"]) != new.map(|p| &p["auth"])
 }
 
 pub async fn rotate_url(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Integration> {

@@ -4,6 +4,7 @@
     {
       "metric": "Subscription Cancelled",
       "profile": {
+        "if_missing": "retry",
         "property": "stripe_customer_id",
         "value": "cus_TQ1aBcD2eF3gHi"
       },

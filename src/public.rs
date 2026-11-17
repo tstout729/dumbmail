@@ -340,6 +340,9 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
+        if audience::is_server_only_metric(&state.db, a.id, metric).await? {
+            return Err(AppError::bad(format!("{metric:?} can only be recorded by a server (an integration or the private API)")));
+        }
         let input = public_profile(&state, a.id, &b["profile"])?;
         let p = match input.id {
             // Token-identified visitor: the profile must belong to this account.

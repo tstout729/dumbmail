@@ -115,12 +115,19 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                          WHERE p.id = $1 RETURNING {PROFILE_COLS}"
                     )
                 } else {
+                    // A match by id, phone or external id that brings a different email: the new
+                    // address never agreed to anything. Subscribed drops to never_subscribed
+                    // (unsubscribed stays), and a hard bounce, which belonged to the old address, is
+                    // cleared; a spam complaint stays.
+                    let changed = "($2::text IS NOT NULL AND p.email IS NOT NULL AND p.email <> $2::text)";
                     format!(
                         "UPDATE profiles p SET
                             email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
                             external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
                             last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = COALESCE($8, CASE WHEN {changed} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END),
+                            sms_consent = COALESCE($9, p.sms_consent),
+                            email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                             updated_at = now()
                          WHERE p.id = $1 RETURNING {PROFILE_COLS}"
                     )
@@ -245,7 +252,8 @@ pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uui
         .execute(db)
         .await?;
     let has_flow: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2)",
+        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND trigger->>'metric' = $2
+           AND ((status = 'live' AND trigger->>'type' = 'metric') OR trigger->>'type' = 'event_date'))",
     )
     .bind(ev.account_id)
     .bind(ev.metric)
@@ -411,4 +419,16 @@ pub async fn import_csv(
         }
     }
     Ok(out)
+}
+
+/// Whether a metric may only be recorded by a server (an integration's bookings and orders), so the
+/// public browser endpoint must refuse it: a forged "Reservation Confirmed" would start booking
+/// flows for any address.
+pub async fn is_server_only_metric(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT server_only FROM metrics WHERE account_id = $1 AND name = $2")
+        .bind(account_id)
+        .bind(name.trim())
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false))
 }

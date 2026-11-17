@@ -103,6 +103,10 @@ pub struct Who {
     pub property: Option<String>,
     #[serde(default)]
     pub value: Option<Value>,
+    /// With property + value: `skip` (default) when nobody matches, or `retry` to fail the
+    /// delivery so it runs again later (e.g. the order that names this customer hasn't arrived yet).
+    #[serde(default)]
+    pub if_missing: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -234,6 +238,11 @@ fn check_who(i: usize, kind: &str, w: &Who) -> Result<(), String> {
     check_phone(i, kind, &w.phone_number)?;
     short(i, kind, "external_id", &w.external_id, 200)?;
     let ids = [&w.email, &w.phone_number, &w.external_id].iter().any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    if let Some(m) = &w.if_missing {
+        if !matches!(m.as_str(), "skip" | "retry") || w.property.is_none() {
+            return Err(format!("action {i} ({kind}): profile.if_missing is skip or retry, and goes with property + value"));
+        }
+    }
     match (&w.property, ids) {
         (Some(p), false) => {
             if p.is_empty() || p.len() > 100 {
@@ -394,6 +403,11 @@ pub struct Source {
     pub integration_id: Uuid,
     pub account_id: Uuid,
     pub name: String,
+    /// The owner confirmed everyone this integration adds agreed to marketing email.
+    pub contacts_opted_in: bool,
+    /// The delivery this run belongs to (the original one, for replays): events without a
+    /// `unique_id` get one from it, so one delivery never records the same event twice.
+    pub delivery: Option<Uuid>,
 }
 
 impl Source {
@@ -414,6 +428,10 @@ pub struct Counts {
     pub suppressed: u32,
     pub consents: u32,
     pub skipped: u32,
+    /// New profiles held back from marketing (no opt-in).
+    pub held: u32,
+    /// Actions skipped on a retry or replay because they were already written.
+    pub already_written: u32,
 }
 
 impl Counts {
@@ -433,6 +451,18 @@ pub struct Outcome {
     pub state: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_request: Option<NextRequest>,
+    /// Actions written, by index, with a hash of each (saved with the delivery).
+    #[serde(skip)]
+    pub applied: Map<String, Value>,
+}
+
+/// A stable fingerprint of an action, leaving out its `time` (scripts often default it to now).
+pub fn fingerprint(raw: &Value) -> String {
+    let mut v = raw.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("time");
+    }
+    crate::auth::sha256_hex(&v.to_string())[..16].to_string()
 }
 
 const MAX_EFFECT_LINES: usize = 200;
@@ -480,9 +510,15 @@ async fn find_by_property(state: &AppState, account_id: Uuid, prop: &str, value:
 
 /// Mark a profile the integration just made, and suppress booking-site relay addresses (and any
 /// address the script marked `marketing: false`) from email. Never clears an existing suppression.
-async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, email: Option<&str>, no_marketing: bool) -> AppResult<Option<&'static str>> {
+async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, email: Option<&str>, no_marketing: bool, out: &mut Outcome) -> AppResult<Option<&'static str>> {
     if created {
         sqlx::query("UPDATE profiles SET source = $2 WHERE id = $1 AND account_id = $3 AND source IS NULL").bind(id).bind(src.tag()).bind(src.account_id).execute(&state.db).await?;
+        // A person this integration just added, with no opt-in: keep them out of marketing until
+        // they agree (an explicit consent block, a form, double opt-in). Never set on someone who existed.
+        if !src.contacts_opted_in {
+            crate::marketing_hold::hold_new_profile(&state.db, src.account_id, id).await?;
+            out.counts.held += 1;
+        }
     }
     let reason = match email {
         Some(e) if is_relay_address(e) => Some(REASON_RELAY),
@@ -507,7 +543,11 @@ async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, em
 /// Resolve `who` to a profile, creating it from identifiers if needed (a property lookup never creates).
 async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut Outcome) -> AppResult<Option<Found>> {
     if let (Some(p), Some(v)) = (&w.property, &w.value) {
-        return Ok(find_by_property(state, src.account_id, p, v).await?.map(|id| Found { id, created: false }));
+        let found = find_by_property(state, src.account_id, p, v).await?;
+        if found.is_none() && w.if_missing.as_deref() == Some("retry") && !dry {
+            return Err(AppError::bad(format!("no profile has {p} = {v} yet; this delivery will be tried again")));
+        }
+        return Ok(found.map(|id| Found { id, created: false }));
     }
     let input = input_for(w);
     if dry {
@@ -518,7 +558,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
     if up.created {
         out.counts.profiles_created += 1;
     }
-    after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), false).await?;
+    after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), false, out).await?;
     Ok(Some(Found { id: up.profile.id, created: up.created }))
 }
 
@@ -536,9 +576,17 @@ async fn resolve_list(state: &AppState, account_id: Uuid, a: &ListAction) -> App
 }
 
 /// Apply validated actions for `src`'s account. With `dry`, nothing is written and the outcome
-/// says what would happen. `current_state` is the integration's saved state before this run.
-pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_state: &Map<String, Value>, dry: bool) -> AppResult<Outcome> {
+/// says what would happen. `raw` is the script's result (one entry per action) and `skip` the
+/// actions a previous attempt already wrote (index → fingerprint): those are skipped. The outcome
+/// is returned even when an action fails, so the caller can save what was written.
+pub async fn apply(state: &AppState, src: &Source, actions: &[Action], raw: &[Value], skip: &Map<String, Value>, current_state: &Map<String, Value>, dry: bool) -> (Outcome, Option<AppError>) {
     let mut out = Outcome::default();
+    let err = apply_into(state, src, actions, raw, skip, current_state, dry, &mut out).await.err();
+    (out, err)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[Value], skip: &Map<String, Value>, current_state: &Map<String, Value>, dry: bool, out: &mut Outcome) -> AppResult<()> {
     // Lists must exist before anything is written, so a typo can't leave half a delivery behind.
     let mut lists = Vec::new();
     for (i, a) in actions.iter().enumerate() {
@@ -550,10 +598,18 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
     let list_for = |i: usize| lists.iter().find(|(j, _)| *j == i).map(|(_, l)| l.clone());
     let mut new_state = current_state.clone();
     for (i, a) in actions.iter().enumerate() {
+        let writes = !matches!(a, Action::SetState(_) | Action::Log(_) | Action::NextRequest(_));
+        let print = raw.get(i).map(fingerprint).unwrap_or_default();
+        if writes && !dry && skip.get(&i.to_string()).and_then(|v| v.as_str()) == Some(print.as_str()) {
+            out.counts.already_written += 1;
+            out.effect(i, "already written by an earlier attempt; skipped".into());
+            out.applied.insert(i.to_string(), json!(print));
+            continue;
+        }
         match a {
-            Action::UpsertProfile(p) => upsert(state, src, i, p, dry, &mut out).await?,
+            Action::UpsertProfile(p) => upsert(state, src, i, p, dry, out).await?,
             Action::TrackEvent(t) => {
-                let Some(found) = resolve(state, src, &t.profile, dry, &mut out).await? else {
+                let Some(found) = resolve(state, src, &t.profile, dry, out).await? else {
                     out.counts.skipped += 1;
                     out.effect(i, format!("skipped {}: no profile has {}", t.metric, who_label(&t.profile)));
                     continue;
@@ -579,6 +635,10 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
                     }
                     continue;
                 }
+                // Events an integration records are trusted by flows, so browsers may not forge them.
+                audience::metric_id(&state.db, src.account_id, t.metric.trim()).await?;
+                sqlx::query("UPDATE metrics SET server_only = true WHERE account_id = $1 AND name = $2 AND NOT server_only").bind(src.account_id).bind(t.metric.trim()).execute(&state.db).await?;
+                let unique_id = t.unique_id.clone().or_else(|| src.delivery.map(|d| format!("delivery:{d}:{i}:{print}")));
                 let recorded = audience::record_event(
                     &state.db,
                     NewEvent {
@@ -588,7 +648,7 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
                         properties: props,
                         value: t.value,
                         occurred_at: t.time.as_deref().and_then(parse_time),
-                        unique_id: t.unique_id.clone(),
+                        unique_id,
                         message_id: None,
                     },
                 )
@@ -604,7 +664,7 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
             Action::AddToList(l) | Action::RemoveFromList(l) => {
                 let adding = matches!(a, Action::AddToList(_));
                 let (list_id, list_name) = list_for(i).expect("resolved above");
-                let Some(found) = resolve(state, src, &l.profile, dry, &mut out).await? else {
+                let Some(found) = resolve(state, src, &l.profile, dry, out).await? else {
                     out.counts.skipped += 1;
                     out.effect(i, format!("skipped list change: no profile has {}", who_label(&l.profile)));
                     continue;
@@ -631,7 +691,7 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
                 out.effect(i, format!("{} {} {} {list_name:?}", if adding { "added" } else { "removed" }, who_label(&l.profile), if adding { "to" } else { "from" }));
             }
             Action::Unsubscribe(u) => {
-                let Some(found) = resolve(state, src, &u.profile, dry, &mut out).await? else {
+                let Some(found) = resolve(state, src, &u.profile, dry, out).await? else {
                     out.counts.skipped += 1;
                     out.effect(i, format!("skipped unsubscribe: no profile has {}", who_label(&u.profile)));
                     continue;
@@ -652,9 +712,9 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
                     out.effect(i, format!("would stop all marketing to {}", who_label(&who)));
                     continue;
                 }
-                let Some(found) = resolve(state, src, &who, dry, &mut out).await? else { continue };
+                let Some(found) = resolve(state, src, &who, dry, out).await? else { continue };
                 if s.email.is_some() {
-                    after_write(state, src, found.id, false, s.email.as_deref(), true).await?;
+                    after_write(state, src, found.id, false, s.email.as_deref(), true, out).await?;
                 }
                 if s.phone_number.is_some() {
                     unsubscribe(state, src, found.id, Channel::Sms).await?;
@@ -683,11 +743,14 @@ pub async fn apply(state: &AppState, src: &Source, actions: &[Action], current_s
                 out.effect(i, "fetch the next page".into());
             }
         }
+        if writes && !dry {
+            out.applied.insert(i.to_string(), json!(print));
+        }
     }
     if new_state != *current_state {
         out.state = new_state;
     }
-    Ok(out)
+    Ok(())
 }
 
 async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry: bool, out: &mut Outcome) -> AppResult<()> {
@@ -722,6 +785,11 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry
             out.counts.suppressed += 1;
             line.push_str(" and suppress it from marketing email (marketing: false)");
         }
+        let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
+        if existing.is_none() && !src.contacts_opted_in && !opts_in {
+            out.counts.held += 1;
+            line.push_str(" held back from marketing (no opt-in)");
+        }
         for c in &p.consent {
             out.counts.consents += 1;
             line.push_str(&format!("; {} {} consent (source: {})", if c.subscribed { "record" } else { "remove" }, if c.channel == Channel::Email { "email" } else { "SMS" }, c.source));
@@ -732,9 +800,16 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry
     let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
     let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });
-    if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing).await? {
+    let held_before = out.counts.held;
+    if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing, out).await? {
         out.counts.suppressed += 1;
         line.push_str(if r == REASON_RELAY { " and suppressed it from email (booking-site relay address)" } else { " and suppressed it from marketing email" });
+    }
+    let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
+    if out.counts.held > held_before && !opts_in {
+        line.push_str(", held back from marketing (no opt-in)");
+    } else if out.counts.held > held_before {
+        out.counts.held -= 1;
     }
     for c in &p.consent {
         line.push_str(&consent(state, src, up.profile.id, c).await?);

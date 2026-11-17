@@ -84,6 +84,7 @@ pub async fn create(state: &AppState, account_id: Uuid, key: &str, name: Option<
         signature: Some(m["signature"].clone()).filter(|v| !v.is_null()),
         settings: Some(m["settings"].clone()).filter(|v| v.is_object()),
         pull: Some(m["pull"].clone()).filter(|v| !v.is_null()),
+        message_id: Some(m["message_id"].clone()).filter(|v| !v.is_null()),
         ..Default::default()
     };
     let integ = model::create(state, account_id, Some(key), changes).await?;
@@ -124,6 +125,7 @@ mod tests {
                 crate::flows::parse_definition(&f["definition"]).unwrap_or_else(|e| panic!("{} flow {}: {}", r.key, f["name"], e.public_message()));
             }
             assert!(!fixtures(&r.key).is_empty(), "{} has no fixtures", r.key);
+            assert!(Files::get(&format!("{}/README.md", r.key)).is_some(), "{} has no README.md saying which docs each assumption comes from", r.key);
         }
     }
 
@@ -156,7 +158,8 @@ mod tests {
             for (name, f) in fixtures(&r.key) {
                 let input = fixture_input(&r, &f);
                 let pull = input["source"] == "pull";
-                let out = super::super::sandbox::run_blocking(&r.script, &input.to_string(), std::time::Duration::from_secs(5))
+                let out: Value = super::super::sandbox::run_engine(&r.script, &input.to_string(), std::time::Duration::from_secs(5))
+                    .map(|t| serde_json::from_str(&t).unwrap())
                     .unwrap_or_else(|e| panic!("{}/{name}: {e}", r.key));
                 super::super::actions::parse(&out, pull).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
                 // Long outputs are checked by their action counts and last two actions.

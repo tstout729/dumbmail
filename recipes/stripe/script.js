@@ -1,13 +1,19 @@
 // Stripe → DumbMail
 //
-// checkout.session.completed (one-time payments) and invoice.paid (subscription invoices) →
-// Placed Order; charge.refunded → Refunded Order; customer.subscription.created/deleted (and
-// first subscription invoices) → Subscription Started / Subscription Cancelled.
+// Placed Order: checkout.session.completed when the session is paid, otherwise
+//   checkout.session.async_payment_succeeded (delayed payment methods); both keyed by the Checkout
+//   Session id, so an order is recorded once. invoice.paid for subscription invoices.
+// Refunded Order: refund.created, once per refund (by refund id) with that refund's own amount.
+//   charge.refunded is used only when it lists its refunds (older API versions), with the same ids.
+// Subscription Started / Subscription Cancelled: customer.subscription.created/deleted (and first
+//   subscription invoices).
 //
 // Profiles are matched by email. The Stripe customer id is saved as the stripe_customer_id
-// property, so subscription events (which carry no email) find the same person. People are
-// subscribed to email only when they ticked Stripe Checkout's promotional-emails box
-// (consent_collection.promotions); otherwise consent is left alone.
+// property, so events without an email (subscriptions, refunds) find the same person; when that
+// customer isn't known yet (their invoice hasn't arrived), the delivery is retried later. People
+// are subscribed to email only when they ticked Stripe Checkout's promotional-emails box
+// (consent_collection.promotions); otherwise consent is left alone. See README.md for the doc
+// page behind each assumption.
 
 // Stripe amounts are in the smallest unit; these currencies have none.
 var ZERO_DECIMAL = ["bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"];
@@ -68,15 +74,25 @@ function clean(o) {
   return out;
 }
 
+function refunded(rf, who, when) {
+  return {
+    type: "track_event", metric: "Refunded Order", profile: who,
+    value: amount(rf.amount, rf.currency), time: when,
+    unique_id: "stripe:refund:" + rf.id,
+    properties: clean({ refund_id: rf.id, charge_id: customerId(rf.charge), payment_intent: customerId(rf.payment_intent), currency: rf.currency, reason: rf.reason || null }),
+  };
+}
+
 function handle(input) {
   var e = input.payload || {};
   if (!e.type || !e.data || !e.data.object) return [{ type: "log", message: "not a Stripe event" }];
   var o = e.data.object;
   var when = iso(e.created);
 
-  if (e.type === "checkout.session.completed") {
+  if (e.type === "checkout.session.completed" || e.type === "checkout.session.async_payment_succeeded") {
+    // A delayed payment method completes the session unpaid; the order counts when it succeeds.
     if (o.payment_status !== "paid" && o.payment_status !== "no_payment_required") {
-      return [{ type: "log", message: "checkout " + o.id + " isn't paid yet (" + o.payment_status + ")" }];
+      return [{ type: "log", message: "checkout " + o.id + " isn't paid yet (" + o.payment_status + "); it's recorded when checkout.session.async_payment_succeeded arrives" }];
     }
     var cd = o.customer_details || {};
     var email = cd.email || o.customer_email;
@@ -116,20 +132,26 @@ function handle(input) {
     return acts;
   }
 
+  if (e.type === "refund.created") {
+    if (o.status === "failed" || o.status === "canceled") return [{ type: "log", message: "refund " + o.id + " is " + o.status }];
+    var rc = customerId(o.customer);
+    if (!rc) return [{ type: "log", message: "refund " + o.id + " has no Stripe customer, so there's no profile to match (guest checkouts)" }];
+    return [refunded(o, { property: "stripe_customer_id", value: rc, if_missing: "retry" }, when)];
+  }
+
   if (e.type === "charge.refunded") {
     var bd = o.billing_details || {};
     var to = bd.email || o.receipt_email;
     if (!to) return [{ type: "log", message: "refunded charge " + o.id + " has no email" }];
-    return [
-      profile(to, bd.name, bd.phone, customerId(o.customer), null),
-      {
-        type: "track_event", metric: "Refunded Order", profile: { email: to },
-        value: amount(o.amount_refunded, o.currency), time: when,
-        // Each further partial refund is a new event.
-        unique_id: "stripe:refund:" + o.id + ":" + o.amount_refunded,
-        properties: clean({ charge_id: o.id, payment_intent: customerId(o.payment_intent), currency: o.currency, fully_refunded: !!o.refunded, amount_charged: amount(o.amount, o.currency) }),
-      },
-    ];
+    var acts2 = [profile(to, bd.name, bd.phone, customerId(o.customer), null)];
+    // The charge's amount_refunded is a running total, so it's never the refund's amount. Each
+    // refund is recorded once, from refund.created or from the charge's own list of refunds.
+    var list = (o.refunds && o.refunds.data) || [];
+    list.forEach(function (rf) {
+      if (rf.status !== "failed" && rf.status !== "canceled") acts2.push(refunded(rf, { email: to }, iso(rf.created) || when));
+    });
+    if (!list.length) acts2.push({ type: "log", message: "charge " + o.id + " doesn't list its refunds; each refund is recorded from refund.created" });
+    return acts2;
   }
 
   if (e.type === "customer.subscription.created" || e.type === "customer.subscription.deleted") {
@@ -143,7 +165,8 @@ function handle(input) {
     return [{
       type: "track_event", metric: started ? "Subscription Started" : "Subscription Cancelled",
       // No email on subscriptions: find the person by the customer id saved from checkout or invoices.
-      profile: { property: "stripe_customer_id", value: cust },
+      // Retried later if that customer's first invoice or checkout hasn't arrived yet.
+      profile: { property: "stripe_customer_id", value: cust, if_missing: "retry" },
       time: when, unique_id: "stripe:subscription:" + o.id + (started ? ":started" : ":cancelled"),
       properties: clean(props),
     }];

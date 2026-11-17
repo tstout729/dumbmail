@@ -8,7 +8,11 @@
     "https://developer.calendly.com/receive-data-from-scheduled-events-in-real-time-with-webhook-subscriptions",
     "https://developer.calendly.com/openapi/calendly-api.yaml"
   ],
-  "signature": { "type": "hmac", "header": "Calendly-Webhook-Signature", "format": "stripe" },
+  "signature": {
+    "type": "hmac",
+    "header": "Calendly-Webhook-Signature",
+    "format": "stripe"
+  },
   "signature_secret": {
     "label": "Calendly webhook signing key",
     "help": "The signing_key you choose when creating the webhook subscription. Calendly signs each webhook with it."
@@ -26,21 +30,46 @@
   "flows": [
     {
       "name": "Calendly: meeting reminder",
-      "description": "The day before a meeting at 9am, reminds the invitee with the cancel and reschedule links. Skipped if the meeting was cancelled or moved.",
-      "trigger": { "type": "event_date", "metric": "Meeting Scheduled", "field": "start_time", "offset_days": -1, "hour": 9, "key": "invitee_uri", "cancelled_by": ["Meeting Cancelled"] },
+      "description": "The day before a meeting at 9am, reminds the invitee with the cancel and reschedule links. Skipped if the meeting was cancelled or moved. A service message about their own meeting.",
+      "trigger": {
+        "type": "event_date",
+        "metric": "Meeting Scheduled",
+        "field": "start_time",
+        "offset_days": -1,
+        "hour": 9,
+        "key": "invitee_uri",
+        "cancelled_by": [
+          "Meeting Cancelled"
+        ]
+      },
       "definition": {
         "entry": "m1",
-        "settings": {},
+        "settings": {
+          "service_messages": true
+        },
         "nodes": [
           {
-            "id": "m1", "type": "email", "name": "Reminder", "next": null,
+            "id": "m1",
+            "type": "email",
+            "name": "Reminder",
+            "next": null,
             "content": {
               "subject": "Reminder: {{ event.properties.event_name|default('your meeting') }} tomorrow",
               "preheader": "Need to change it? Reschedule in one click",
               "blocks": [
-                { "type": "heading", "text": "See you tomorrow, {{ first_name|default('there') }}" },
-                { "type": "text", "html": "<p>Your <strong>{{ event.properties.event_name|default('meeting') }}</strong> starts {{ event.properties.start_time }}.</p><p>Where: {{ event.properties.location|default('see your calendar invite') }}</p>" },
-                { "type": "button", "text": "Reschedule", "href": "{{ event.properties.reschedule_url }}" }
+                {
+                  "type": "heading",
+                  "text": "See you tomorrow, {{ first_name|default('there') }}"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Your <strong>{{ event.properties.event_name|default('meeting') }}</strong> starts {{ event.properties.start_time }}.</p><p>Where: {{ event.properties.location|default('see your calendar invite') }}</p>"
+                },
+                {
+                  "type": "button",
+                  "text": "Reschedule",
+                  "href": "{{ event.properties.reschedule_url }}"
+                }
               ]
             }
           }
@@ -50,19 +79,38 @@
     {
       "name": "Calendly: follow-up",
       "description": "The day after a meeting at 10am, thanks the invitee. Skipped if the meeting was cancelled.",
-      "trigger": { "type": "event_date", "metric": "Meeting Scheduled", "field": "start_time", "offset_days": 1, "hour": 10, "key": "invitee_uri", "cancelled_by": ["Meeting Cancelled"] },
+      "trigger": {
+        "type": "event_date",
+        "metric": "Meeting Scheduled",
+        "field": "start_time",
+        "offset_days": 1,
+        "hour": 10,
+        "key": "invitee_uri",
+        "cancelled_by": [
+          "Meeting Cancelled"
+        ]
+      },
       "definition": {
         "entry": "f1",
         "settings": {},
         "nodes": [
           {
-            "id": "f1", "type": "email", "name": "Thanks for meeting", "next": null,
+            "id": "f1",
+            "type": "email",
+            "name": "Thanks for meeting",
+            "next": null,
             "content": {
               "subject": "Thanks for meeting, {{ first_name|default('there') }}",
               "preheader": "Here's what's next",
               "blocks": [
-                { "type": "heading", "text": "Thanks for your time" },
-                { "type": "text", "html": "<p>It was good to talk. Reply to this email with any questions, or book another time whenever you like.</p>" }
+                {
+                  "type": "heading",
+                  "text": "Thanks for your time"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>It was good to talk. Reply to this email with any questions, or book another time whenever you like.</p>"
+                }
               ]
             }
           }

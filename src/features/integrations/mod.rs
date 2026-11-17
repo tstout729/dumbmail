@@ -59,8 +59,10 @@ fn schema_fields() -> Value {
         "signature": {"type": "object", "description": "How to check webhooks: {type:'none'} | {type:'hmac', header, algorithm?:'sha256'|'sha1', format?:'plain'|'stripe'|'svix', encoding?:'hex'|'base64', prefix?, timestamp_header?, tolerance_seconds?, secret_encoding?} | {type:'shared_secret', header} | {type:'shared_secret', query}."},
         "signature_secret": {"type": "string", "description": "The signing secret (write-only; never returned). Empty string removes it."},
         "settings": {"type": "object", "description": "Non-secret settings the script reads as input.settings (e.g. a list name)."},
-        "pull": {"type": ["object", "null"], "description": "Scheduled fetch: {method?, url, headers?, query?, body?, body_format?, auth?, interval_minutes? (>=5), max_pages?}. Placeholders {{secret.NAME}}, {{state.KEY}}, {{settings.KEY}}, {{now}}, {{since}}, with | fallbacks. null removes it."},
+        "pull": {"type": ["object", "null"], "description": "Scheduled fetch: {method?, url, headers?, query?, body?, body_format?, auth?, interval_minutes? (>=5), max_pages?}. The URL's site (https, host, port) is fixed text; placeholders {{secret.NAME}}, {{state.KEY}}, {{settings.KEY}}, {{now}}, {{since}} (with | fallbacks) go in the path, query, headers and body. Auth credential fields must be {{secret.NAME}} references. null removes it."},
         "credentials": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "Secrets by name for pull placeholders (write-only). null removes one; others are kept."},
+        "contacts_opted_in": {"type": "boolean", "description": "Everyone this integration adds has agreed to get marketing email from us. Default false: people it adds without an explicit opt-in are held back from marketing (campaigns skip them; only flows marked service_messages reach them). Set true only when the user confirms it."},
+        "message_id": {"type": ["object", "null"], "description": "Where a webhook carries the app's own message id, so resends are ignored: {header: 'svix-id'} or {field: 'id'} (dots reach nested keys)."},
     })
 }
 
@@ -102,8 +104,8 @@ impl Feature for Module {
             tool("get_integration_delivery", "Get one delivery", "A delivery's payload, headers, query, the pull request made (secrets hidden), the result (counts, a line per action, logs) and any error.", obj(json!({"id": id, "delivery_id": {"type": "string"}}), &["id", "delivery_id"]), true, false),
             tool("replay_integration_deliveries", "Replay deliveries", "Run stored deliveries again with the current script: chosen ones (delivery_ids) or every delivery that failed for good (all_failed). Writes profiles and events and can start flows, so it needs confirm=true; without it you get a dry run with the count.",
                 obj(json!({"id": id, "delivery_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 500}, "all_failed": {"type": "boolean"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
-            tool("run_integration_pull", "Run a pull or backfill", "Fetch from the app now, or (with backfill_since, YYYY-MM-DD) import history from that date in pages until done; progress shows in get_integration.backfill. Writes profiles and events and can start flows, so it needs confirm=true; without it you get a dry run.",
-                obj(json!({"id": id, "backfill_since": {"type": "string", "description": "YYYY-MM-DD"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
+            tool("run_integration_pull", "Run a pull or backfill", "Fetch from the app now, or (with backfill_since, YYYY-MM-DD) import history from that date in pages until done; progress shows in get_integration.backfill (status running, done, capped, failed or cancelled). A capped or failed backfill continues from where it got to with resume_backfill: true. Writes profiles and events and can start flows, so it needs confirm=true; without it you get a dry run.",
+                obj(json!({"id": id, "backfill_since": {"type": "string", "description": "YYYY-MM-DD"}, "resume_backfill": {"type": "boolean"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
             tool("cancel_integration_backfill", "Cancel a backfill", "Stop a running backfill after the page it is on.", obj(json!({"id": id}), &["id"]), false, false),
             tool("set_integration_status", "Turn an integration on or off", "disabled keeps incoming webhooks (marked ignored, replayable later) but writes nothing and stops scheduled pulls; enabled resumes.", obj(json!({"id": id, "status": {"enum": ["enabled", "disabled"]}}), &["id", "status"]), false, false),
             tool("rotate_integration_url", "Rotate the inbound URL", "Give the integration a new secret webhook URL. The old URL stops working at once, so the app must be updated. Needs confirm=true.", obj(json!({"id": id, "confirm": {"type": "boolean"}}), &["id"]), false, true),
@@ -149,10 +151,11 @@ impl Feature for Module {
                     if !confirmed(a) {
                         i.pull_config().ok_or_else(|| AppError::bad("this integration has no pull settings; add a pull first"))?;
                         let missing = i.missing_credentials();
-                        return Ok(json!({"dry_run": true, "would_start": if since.is_some() { "backfill" } else { "pull" }, "backfill_since": since, "missing_credentials": missing,
+                        let what = if a["resume_backfill"].as_bool() == Some(true) { "resumed backfill" } else if since.is_some() { "backfill" } else { "pull" };
+                        return Ok(json!({"dry_run": true, "would_start": what, "backfill_since": since, "missing_credentials": missing,
                             "note": "Nothing ran. A pull writes profiles and events and can start flows. Use test_integration with pull: true to preview a page, then call again with confirm=true once the user approves."}));
                     }
-                    engine::start_pull(state, &i, since).await
+                    engine::start_pull(state, &i, since, a["resume_backfill"].as_bool() == Some(true)).await
                 }
                 "cancel_integration_backfill" => {
                     let i = model::load(state, acct, uuid_arg(a, "id")?).await?;

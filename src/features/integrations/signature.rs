@@ -169,7 +169,8 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
             let tolerance = tolerance_seconds.unwrap_or(300);
             let fresh = |ts: &str| -> Result<(), String> {
                 let t: i64 = ts.trim().parse().map_err(|_| "the signature timestamp isn't a number".to_string())?;
-                if (now - t).abs() > tolerance {
+                // Overflow-safe: an extreme timestamp is simply too old (or too new).
+                if now.checked_sub(t).and_then(i64::checked_abs).is_none_or(|d| d > tolerance) {
                     return Err(format!("the signature timestamp is more than {tolerance} seconds old (or in the future)"));
                 }
                 Ok(())
@@ -319,6 +320,15 @@ mod tests {
         let h = headers(&[("x-sig", &s), ("x-ts", "1000")]);
         assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1030).is_ok());
         assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1100).unwrap_err().contains("seconds"));
+        // Extreme timestamps fail cleanly instead of overflowing.
+        for ts in [i64::MIN.to_string(), i64::MAX.to_string()] {
+            let s = hex::encode(hmac256(b"k", format!("{ts}.body").as_bytes()));
+            let h = headers(&[("x-sig", &s), ("x-ts", &ts)]);
+            assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1030).unwrap_err().contains("seconds"));
+        }
+        let ts = i64::MIN.to_string();
+        let s = hex::encode(hmac256(b"k", format!("{ts}.body").as_bytes()));
+        assert!(verify(&sig, Some("k"), &headers(&[("x-sig", &s), ("x-ts", &ts)]), &HashMap::new(), b"body", i64::MAX).is_err());
     }
 
     #[test]

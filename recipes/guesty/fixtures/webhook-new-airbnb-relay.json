@@ -14,7 +14,7 @@
       "type": "upsert_profile"
     },
     {
-      "metric": "Reservation Confirmed",
+      "metric": "Reservation Booked",
       "profile": {
         "email": "sam-abc123xyz@guest.airbnb.com"
       },
@@ -24,7 +24,6 @@
         "confirmation_code": "HMABCD1234",
         "currency": "USD",
         "guests": 3,
-        "host_payout": 845,
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
@@ -35,8 +34,30 @@
       },
       "time": "2026-11-15T19:04:11.000Z",
       "type": "track_event",
-      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:confirmed:2026-12-17:2026-12-21",
+      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:booked",
       "value": 980
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "sam-abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "HMABCD1234",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "source_channel": "airbnb2",
+        "status": "confirmed",
+        "version": "2026-11-15T19:04:11.000Z"
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:confirmed:2026-11-15T19:04:11.000Z"
     }
   ],
   "input": {
