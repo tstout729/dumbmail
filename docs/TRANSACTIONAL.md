@@ -21,7 +21,7 @@ Transactional SMS isn't available.
 Transactional email is off for every account until the account owner turns it on in Settings → Transactional, signed in to the dashboard, and confirms it's only for email a person triggered. Until then every send is refused with 403. Anyone on the account can turn it off again (`PATCH /api/transactional/settings {"enabled": false}`).
 
 - **Self-hosted** (`HOSTED=false`): once it's on, everything below is allowed.
-- **dumbmail.ai**: it starts in **restricted mode**. Only saved transactional templates can be sent (`template_id`, no inline `content`), up to 200 emails a day (operators can change the default with `TRANSACTIONAL_RESTRICTED_DAILY_LIMIT`), and 120 a minute. **Full mode** adds inline content and the normal caps; ask support (the address is in `GET /api/transactional/settings` as `support_email`) with a line on what you send. Operators grant it with `POST /admin/transactional/mode {"account_id", "mode": "full"}` (or `"restricted"` to take it back).
+- **dumbmail.ai**: it starts in **restricted mode**. Only saved transactional templates can be sent, as saved: `template_id`, no inline `content` and no `subject` override, and each variable at most 500 characters (4 KB for all of them). Up to 200 emails a day (operators can change the default with `TRANSACTIONAL_RESTRICTED_DAILY_LIMIT`), and 120 a minute. **Full mode** adds inline content and the normal caps; ask support (the address is in `GET /api/transactional/settings` as `support_email`) with a line on what you send. Operators grant it with `POST /admin/transactional/mode {"account_id", "mode": "full"}` (or `"restricted"` to take it back).
 
 `GET /api/transactional/settings` shows whether it's on, the mode (`off`, `restricted` or `full`), the caps and how much of each is used.
 
@@ -60,12 +60,12 @@ Or with the content inline:
 | `to` | One recipient: an email address, or `{email, name?, first_name?, last_name?, external_id?, properties?}`. Lists and several addresses are refused. The email goes to exactly this address, every attempt. It's linked to the profile with this email, or to a new profile with just the email and name; an existing profile is never changed (identifiers, names, properties and consent stay as they are), and other identifiers never merge or move anything. Names and properties given here fill in this email only. |
 | `template_id` | A transactional template (see below). Give this or `content`. |
 | `content` | Full mode only. `{subject, preheader?, blocks? \| html? \| text?}`. Blocks are the same as campaigns (see `dumbmail://docs/email`). Raw `html` up to 512 KB; plain `text` up to 128 KB. With only `text`, the HTML part is made from it. |
-| `subject` | Replaces the template's or content's subject. |
-| `variables` | Values for `{{ tags }}` (up to 64 KB). Profile fields such as `{{ first_name }}` work too, and `{{ variables.x }}` reaches every variable. Variables are never stored in the clear or shown in the log (see [The log](#the-log)). |
-| `from_email`, `from_name`, `reply_to` | Default to the content's, then the account's sender. `from_email` must be on a verified sending domain; `reply_to` must be on one too, or be the account's own sender or reply-to address. Line breaks and other control characters are refused wherever they come from. |
+| `subject` | Replaces the template's or content's subject. Full mode only. The subject is stored with the send and shown in the log, so don't put secrets in it. |
+| `variables` | Values for `{{ tags }}` (up to 64 KB; in restricted mode at most 500 characters each and 4 KB in all). Profile fields such as `{{ first_name }}` work too, and `{{ variables.x }}` reaches every variable. Variables are never stored in the clear or shown in the log (see [The log](#the-log)). |
+| `from_email`, `from_name`, `reply_to` | Default to the content's, then the account's sender. `from_email` must be on a verified sending domain; the Reply-To that results, wherever it comes from (including the account's default reply-to address), must be on one too, or be this email's sender address. Line breaks and other control characters are refused wherever they come from. |
 | `idempotency_key` | Up to 255 characters. The same key within 24 hours returns the first result and sends nothing. Reusing a key for a different email is refused (409). After 24 hours the key can be used again. |
-| `metadata` | Your own fields (up to 50 keys, 8 KB), kept with the send and on the profile's timeline event. |
-| `track_clicks` | Rewrite links for click tracking. Default `false`. Leave it off for email with secret links (password resets): a tracked link's address is kept with its clicks. |
+| `metadata` | Your own fields (up to 50 keys, 8 KB), kept with the send and on the profile's timeline event. It's stored and shown as given, so don't put secrets in it. |
+| `track_clicks` | Rewrite links for click tracking. Default `false`. A click on a tracked link records that it happened, when, and the site it went to (`https://shop.example.com`), never the rest of the link, so a reset token isn't kept. Leaving it off sends links straight to your site. |
 | `track_opens` | Add the open pixel. Default `true`. |
 | `address_footer` | Add the account's name and postal address. Default `false`. |
 
@@ -82,14 +82,14 @@ The response is the send:
 
 `status` is one of:
 
-- `queued`: waiting for an attempt. The email provider was busy; it retries on its own, up to 6 attempts over about half an hour, then fails.
+- `queued`: waiting for an attempt. The email provider was busy; it retries on its own, up to 6 attempts over about half an hour, then fails. No attempt runs before its time.
 - `sending`: an attempt is handing it to the provider right now.
 - `sent`, `delivered`, `opened`, `clicked`, `bounced`, `complained`.
 - `skipped`: the address can't get email (`error` says why).
 - `failed`: not sent (`error` says why: for example the balance ran out, or the account was paused, before a retry).
-- `unknown`: an attempt was cut off while handing it to the provider, so it may or may not have gone out. It's never sent again automatically, so nobody gets a second password reset; send a new request if it matters.
+- `unknown`: possibly delivered. The hand-off to the provider ended without a clear answer (the provider didn't answer in time, the connection dropped, it had a server error, or the attempt was cut off), so it may or may not have gone out. It isn't charged, and it's never sent again automatically, so nobody gets a second password reset; send a new request if it matters. A retry with the same `idempotency_key` returns this result.
 
-Each attempt rechecks the pause, the caps, the balance and the address before it goes. An email is charged once, when it's sent. `replayed: true` means the idempotency key matched an earlier send.
+Each hand-off to the provider is a single try: the provider's client doesn't retry on its own. Each attempt rechecks the pause, the caps, the balance and the address before it goes, and the pause, whether transactional email is on and the address once more right before the hand-off. An email is charged once, when the provider accepts it. `replayed: true` means the idempotency key matched an earlier send.
 
 Errors use the API's usual shape (`{"error": {"code", "message"}}`): 400 for a bad request or content that reads like marketing, 402 when a cap is reached or the balance can't cover the email, 403 when transactional email is off or restricted mode doesn't allow the request, 409 when sending is paused or a key was reused for a different email.
 
@@ -140,7 +140,7 @@ curl https://dumbmail.ai/api/transactional/templates \
   -d '{"name": "Receipt", "content": {"subject": "Order {{ order_id }} confirmed", "blocks": [{"type": "text", "html": "<p>Thanks, {{ first_name|default(\"there\") }}. Total: {{ total }}</p>"}]}}'
 ```
 
-`GET /api/transactional/templates` lists them with what the review found. Edit one like any template (`PATCH /api/templates/{id}`); it's checked again every time it's sent.
+`GET /api/transactional/templates` lists them with what the review found. Edit one like any template (`PATCH /api/templates/{id}`): the new content is checked when you save it (an edit that reads like marketing is refused), and again every time it's sent.
 
 ## The log
 
@@ -156,7 +156,7 @@ The dashboard's Transactional page shows the same log with search.
 
 Transactional email skips marketing consent, so these rules keep marketing out of it:
 
-- **Content review.** Templates are checked when they're created and every email as it would go out. One clearly promotional thing blocks it with a 400:
+- **Content review.** Templates are checked when they're created and edited, and every email as it would go out: the final subject, sender name, HTML and plain-text parts. One clearly promotional thing blocks it with a 400:
   - discount or offer language: "20% off", "$10 off", "off your next order", "promo code" / "coupon code" / "use code X at checkout", "limited time", "flash sale" and other named sales, "don't miss out", "exclusive offer", "special offer", "save up to", "offer ends soon", "free shipping on orders over", "new arrivals";
   - "shop now" / "buy now" style calls to action;
   - links to 3 or more different product or collection pages;

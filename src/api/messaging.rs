@@ -98,6 +98,8 @@ async fn get_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
 }
 
 async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TemplateBody>) -> AppResult<Json<Template>> {
+    // A transactional template's new content must pass the same content check as when it was created.
+    crate::features::transactional::check_template_edit(&state.db, ctx.account_id, id, b.content.as_ref()).await?;
     let t: Option<Template> = sqlx::query_as(
         "UPDATE templates SET name = COALESCE($3, name), content = COALESCE($4, content), updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING id, name, channel, content, created_at, updated_at",
@@ -308,13 +310,16 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
     let set_send_options = b.send_options.is_some();
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
-    Ok(sqlx::query_as(
+    // Only from the state checked above. A failed or cancelled campaign goes back to draft and forgets
+    // its last attempt in the same transaction (see `campaigns::reset_for_relaunch`).
+    let mut tx = state.db.begin().await?;
+    let row: Option<CampaignRow> = sqlx::query_as(
         "UPDATE campaigns SET name = COALESCE($3, name), channel = COALESCE($4, channel), audience = COALESCE($5, audience),
             content = COALESCE($6, content), send_at = COALESCE($7, send_at), updated_at = now(),
             ab_test = CASE WHEN $8 THEN $9 ELSE ab_test END,
             send_options = CASE WHEN $10 THEN $11 ELSE send_options END,
             status = CASE WHEN status IN ('failed','cancelled') THEN 'draft' ELSE status END, error = NULL
-         WHERE id = $1 AND account_id = $2 RETURNING *",
+         WHERE id = $1 AND account_id = $2 AND status = $12 RETURNING *",
     )
     .bind(id)
     .bind(account_id)
@@ -327,8 +332,15 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     .bind(ab_test)
     .bind(set_send_options)
     .bind(send_options)
-    .fetch_one(&state.db)
-    .await?)
+    .bind(&c.status)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while saving; try again".into()))?;
+    if matches!(c.status.as_str(), "failed" | "cancelled") {
+        campaigns::reset_for_relaunch(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(row)
 }
 
 async fn patch_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<CampaignBody>) -> AppResult<Json<Value>> {
@@ -375,10 +387,17 @@ async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, A
 }
 
 /// Move a draft to scheduled (future time) or sending (now), after readiness and plan checks.
-pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Option<DateTime<Utc>>) -> AppResult<CampaignRow> {
-    let c = campaigns::load(&state.db, account_id, id).await?;
+/// `send_options` (Some, even null) replaces the campaign's, in the same statement as the move, so
+/// they're saved only if it launches, and checked as they will be used.
+pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Option<DateTime<Utc>>, send_options: Option<&Value>) -> AppResult<CampaignRow> {
+    let mut c = campaigns::load(&state.db, account_id, id).await?;
     if !matches!(c.status.as_str(), "draft" | "scheduled") {
         return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
+    }
+    let mut set_options = false;
+    if let Some(v) = send_options {
+        c.send_options = crate::features::sendtime::checked(Some(v))?;
+        set_options = true;
     }
     let account = load_account(&state.db, account_id).await?;
     let problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
@@ -413,13 +432,40 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     for content in versions {
         render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content, profile_id: None, event: None }).await?;
     }
-    // A local-time send starts when the first time zone reaches the hour on the chosen day.
-    let send_at = crate::features::sendtime::plan::launch_start(state, &account, &c, send_at).await?;
+    // A local-time send starts when the first time zone reaches the hour on the chosen day (recorded in the options).
+    let (send_at, dated) = crate::features::sendtime::plan::launch_start(state, &account, &c, send_at).await?;
+    if let Some(opts) = dated {
+        c.send_options = Some(opts);
+        set_options = true;
+    }
     let now = Utc::now();
+    let changed = || AppError::Conflict("the campaign changed while it was being sent; try again".into());
+    // Only from the state it was checked in; the send options go in the same statement.
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
-        Some(t) => sqlx::query_as("UPDATE campaigns SET status = 'scheduled', send_at = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(t).fetch_one(&state.db).await?,
+        Some(t) => sqlx::query_as(
+            "UPDATE campaigns SET status = 'scheduled', send_at = $2, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
+             WHERE id = $1 AND status = $3 RETURNING *",
+        )
+        .bind(id)
+        .bind(t)
+        .bind(&c.status)
+        .bind(set_options)
+        .bind(&c.send_options)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(changed)?,
         None => {
-            let r: CampaignRow = sqlx::query_as("UPDATE campaigns SET status = 'sending', send_at = now(), updated_at = now() WHERE id = $1 RETURNING *").bind(id).fetch_one(&state.db).await?;
+            let r: CampaignRow = sqlx::query_as(
+                "UPDATE campaigns SET status = 'sending', send_at = now(), send_options = CASE WHEN $3 THEN $4 ELSE send_options END, updated_at = now()
+                 WHERE id = $1 AND status = $2 RETURNING *",
+            )
+            .bind(id)
+            .bind(&c.status)
+            .bind(set_options)
+            .bind(&c.send_options)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(changed)?;
             crate::jobs::enqueue(&state.db, "campaign_send", json!({"campaign_id": id}), None).await?;
             r
         }
@@ -436,24 +482,11 @@ struct ScheduleBody {
     send_options: Option<Value>,
 }
 
-/// Save send options given with a send or schedule request, on a campaign that hasn't started.
-pub async fn apply_send_options(state: &AppState, account_id: Uuid, id: Uuid, send_options: Option<&Value>) -> AppResult<()> {
-    let Some(opts) = send_options else { return Ok(()) };
-    let c = campaigns::load(&state.db, account_id, id).await?;
-    if !matches!(c.status.as_str(), "draft" | "scheduled") {
-        return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
-    }
-    let opts = crate::features::sendtime::checked(Some(opts))?;
-    sqlx::query("UPDATE campaigns SET send_options = $3, updated_at = now() WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).bind(opts).execute(&state.db).await?;
-    Ok(())
-}
-
 async fn schedule_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ScheduleBody>) -> AppResult<Json<Value>> {
     if b.send_at < Utc::now() {
         return Err(AppError::bad("pick a time in the future, or send now"));
     }
-    apply_send_options(&state, ctx.account_id, id, b.send_options.as_ref()).await?;
-    let c = launch(&state, ctx.account_id, id, Some(b.send_at)).await?;
+    let c = launch(&state, ctx.account_id, id, Some(b.send_at), b.send_options.as_ref()).await?;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
@@ -471,8 +504,7 @@ async fn send_now_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
     } else {
         serde_json::from_slice(&body).map_err(|e| AppError::bad(format!("invalid body: {e}")))?
     };
-    apply_send_options(&state, ctx.account_id, id, b.send_options.as_ref()).await?;
-    let c = launch(&state, ctx.account_id, id, None).await?;
+    let c = launch(&state, ctx.account_id, id, None, b.send_options.as_ref()).await?;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 

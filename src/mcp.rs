@@ -588,11 +588,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let id = uuid_arg(&a, "campaign_id")?;
             let send_at: Option<DateTime<Utc>> = a["send_at"].as_str().map(|s| s.parse().map_err(|_| AppError::bad("send_at must be an ISO 8601 date-time"))).transpose()?;
             if let Some(opts) = a.get("send_options") {
-                if a["confirm"].as_bool() == Some(true) {
-                    msg::apply_send_options(state, acct, id, Some(opts)).await?;
-                } else {
-                    crate::features::sendtime::checked(Some(opts))?;
-                }
+                crate::features::sendtime::checked(Some(opts))?;
             }
             if a["confirm"].as_bool() != Some(true) {
                 let mut dry = campaign_with_readiness(state, acct, id).await?;
@@ -613,7 +609,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                     if send_at.is_some() { "schedule the campaign" } else { "send now" }, dry["estimated_recipients"]));
                 return Ok(dry);
             }
-            let c = msg::launch(state, acct, id, send_at).await?;
+            let c = msg::launch(state, acct, id, send_at, a.get("send_options")).await?;
             msg::campaign_json(state, &c).await
         }
         "cancel_campaign" => {

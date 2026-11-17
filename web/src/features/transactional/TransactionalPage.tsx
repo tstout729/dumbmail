@@ -102,7 +102,7 @@ function Limits() {
         </Notice>
       ) : s.data?.mode === "restricted" ? (
         <Notice tone="blue" title="Restricted mode">
-          Only saved transactional templates can be sent, up to {formatNumber(s.data.daily_limit)} a day.{" "}
+          Only saved transactional templates can be sent, as saved (no subject change, variables up to 500 characters), up to {formatNumber(s.data.daily_limit)} a day.{" "}
           <Link to="/settings/transactional" className="font-medium underline">
             How to get full mode
           </Link>
@@ -286,7 +286,7 @@ function SendDrawer({ id, onClose }: { id: string; onClose: () => void }) {
           {Object.keys(s.metadata).length ? <CodeBlock label="Metadata" code={JSON.stringify(s.metadata, null, 2)} /> : null}
           <p className="text-xs text-zinc-500">
             {s.status === "unknown"
-              ? "This send was cut off while it was being handed to the email provider, so it may have gone out. It's never sent again automatically. "
+              ? "The hand-off to the email provider ended without a clear answer, so it may have gone out. It isn't charged and is never sent again automatically. "
               : null}
             Variables and the email body aren't kept, since they can hold reset links and codes. To send it again, call the API again with fresh values.
           </p>

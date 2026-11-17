@@ -39,7 +39,7 @@ export function TransactionalSettingsCard({ settings }: { settings: Transactiona
                 <Link to="/transactional" className="font-medium underline">
                   transactional templates
                 </Link>{" "}
-                can be sent (no inline content), up to {formatNumber(s.daily_limit)} a day. For inline content and higher limits, ask{" "}
+                can be sent, as saved (no inline content or subject change, variables up to 500 characters), up to {formatNumber(s.daily_limit)} a day. For inline content and higher limits, ask{" "}
                 {s.support_email ? (
                   <a href={`mailto:${s.support_email}?subject=Transactional%20email%20full%20mode`} className="font-medium underline">
                     {s.support_email}

@@ -21,7 +21,9 @@ ALTER TABLE transactional_sends ADD COLUMN charged_at timestamptz;
 ALTER TABLE transactional_sends ADD COLUMN cost_micros bigint;
 CREATE INDEX transactional_sends_claimed_idx ON transactional_sends (claimed_at) WHERE status = 'sending';
 CREATE INDEX transactional_sends_payload_idx ON transactional_sends (created_at) WHERE payload_enc IS NOT NULL;
+-- Set when an attempt is put back to wait (the provider was busy): no attempt may claim the send
+-- before then, the reservation's backstop job included.
+ALTER TABLE transactional_sends ADD COLUMN next_attempt_at timestamptz;
 
--- Hard bounces and complaints by address, so a mailbox stays suppressed even if the profile that
--- bounced later changed its email.
-CREATE INDEX messages_bad_address_idx ON messages (account_id, to_address) WHERE status IN ('bounced', 'complained');
+-- Hard bounces and complaints are looked up by address on `messages`; that index is built in the
+-- background after startup, not here (see `INDEXES` in src/features/transactional/mod.rs).

@@ -787,3 +787,226 @@ async fn rest_send_and_schedule_take_send_options() {
     assert_eq!(s, StatusCode::CONFLICT);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_relaunched_campaign_goes_to_its_edited_audience_and_nobody_twice() {
+    let mut h = harness!();
+    h.signup().await;
+    let first = list(&mut h, "First").await;
+    for i in 0..4 {
+        person(&mut h, &first, &format!("a{i}@x.test"), json!({})).await;
+    }
+    // Spread over two hours: half go now, half in an hour. Cancel before the second half.
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(&first, "Relaunch", json!({"timing": "gradual", "spread_hours": 2})))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    let r = rows(&h, &cid).await;
+    let sent: Vec<String> = r.iter().filter(|x| x.3 == "sent").map(|x| x.0.clone()).collect();
+    let waiting: Vec<String> = r.iter().filter(|x| x.3 == "queued").map(|x| x.0.clone()).collect();
+    assert_eq!((sent.len(), waiting.len()), (2, 2), "{r:?}");
+    h.ok("POST", &format!("/api/campaigns/{cid}/cancel"), None).await;
+    // Edit: a new list with one person who got it, one who didn't yet, and someone new; send now.
+    let second = list(&mut h, "Second").await;
+    for e in [&sent[0], &waiting[0]] {
+        sqlx::query("INSERT INTO list_members (list_id, profile_id) SELECT $1::uuid, id FROM profiles WHERE email = $2").bind(&second).bind(e).execute(&h.state.db).await.unwrap();
+    }
+    person(&mut h, &second, "new@x.test", json!({})).await;
+    let edited = h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"audience": {"include": [{"type": "list", "id": second}]}, "send_options": null}))).await;
+    assert_eq!(edited["status"], "draft");
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    assert_eq!(received(&h, "new@x.test", "Relaunch"), 1, "the edited audience gets it");
+    assert_eq!(received(&h, &waiting[0], "Relaunch"), 1, "including someone the first attempt never reached");
+    assert_eq!(received(&h, &sent[0], "Relaunch"), 1, "nobody gets a second copy");
+    assert_eq!(received(&h, &sent[1], "Relaunch"), 1);
+    assert_eq!(received(&h, &waiting[1], "Relaunch"), 0, "no longer in the audience");
+    // The report counts each person who got it once, and nothing left over from the first attempt.
+    let r = rows(&h, &cid).await;
+    assert_eq!(r.len(), 4, "{r:?}");
+    assert!(r.iter().all(|x| x.3 == "sent"), "{r:?}");
+    let report = h.ok("GET", &format!("/api/campaigns/{cid}/report"), None).await;
+    assert_eq!(report["stats"]["recipients"], 4, "{report}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn send_jobs_hold_one_connection_each_even_on_a_tiny_pool() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let l = list(&mut h, "Pool").await;
+    people(&h, &l, "pool", 40).await;
+    // Several A/B campaigns (the test slice, its versions and the holdouts) and plain ones start at once.
+    let mut cids = Vec::new();
+    for i in 0..6 {
+        let mut body = campaign(&l, &format!("Pool {i}"), Value::Null);
+        if i % 2 == 0 {
+            body["ab_test"] = json!({"variants": [{"id": "b", "content": {"subject": "B", "blocks": [{"type": "text", "html": "<p>B</p>"}]}}], "test_percent": 25, "wait_hours": 1, "metric": "open_rate", "pick": "manual"});
+        }
+        let cid = h.ok("POST", "/api/campaigns", Some(body)).await["id"].as_str().unwrap().to_string();
+        h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+        sqlx::query("DELETE FROM jobs WHERE kind = 'campaign_send' AND payload->>'campaign_id' = $1").bind(&cid).execute(&h.state.db).await.unwrap();
+        cids.push(cid);
+    }
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).acquire_timeout(std::time::Duration::from_secs(5)).connect(&h.state.cfg.database_url).await.unwrap();
+    let s = &h.state;
+    let small = dumbmail::state::AppState(std::sync::Arc::new(dumbmail::state::Inner {
+        db: pool,
+        cfg: s.cfg.clone(),
+        email: s.email.clone(),
+        sms: s.sms.clone(),
+        http: s.http.clone(),
+        pending_checks: Default::default(),
+        daily_limits: Default::default(),
+    }));
+    let runs = cids.iter().map(|c| dumbmail::campaigns::prepare_send(&small, c.parse().unwrap()));
+    let results = tokio::time::timeout(std::time::Duration::from_secs(60), futures_util::future::join_all(runs)).await.expect("no stall");
+    for r in results {
+        r.unwrap();
+    }
+    // Each test slice and its holdouts come from one read: together exactly the audience, no overlap.
+    for (i, cid) in cids.iter().enumerate() {
+        let (msgs, holdouts, both): (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND NOT is_test),
+                    (SELECT count(*) FROM campaign_holdouts WHERE campaign_id = $1::uuid),
+                    (SELECT count(*) FROM campaign_holdouts h JOIN messages m ON m.profile_id = h.profile_id AND m.campaign_id = h.campaign_id WHERE h.campaign_id = $1::uuid)",
+        )
+        .bind(cid)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+        if i % 2 == 0 {
+            assert_eq!((msgs, holdouts, both), (10, 30, 0), "{cid}");
+            let versions: Vec<(String, i64)> = sqlx::query_as("SELECT variant, count(*) FROM messages WHERE campaign_id = $1::uuid GROUP BY 1 ORDER BY 1").bind(cid).fetch_all(&h.state.db).await.unwrap();
+            assert_eq!(versions, vec![("a".to_string(), 5), ("b".to_string(), 5)]);
+        } else {
+            assert_eq!((msgs, holdouts), (40, 0), "{cid}");
+        }
+    }
+    small.db.close().await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_unsubscribe_or_cancel_during_the_wait_for_a_send_slot_stops_the_email() {
+    // One email a second, so the second waits about a second for its turn.
+    let mut h = match Harness::with(|c| c.send_rate_per_sec = 1).await {
+        Some(h) => h,
+        None => return,
+    };
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct: uuid::Uuid = h.ok("GET", "/api/me", None).await["account"]["id"].as_str().unwrap().parse().unwrap();
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
+
+    // Two flow emails to one person; they unsubscribe while the second waits for its slot.
+    let pid = h.ok("POST", "/api/profiles", Some(json!({"email": "quit@x.test", "email_consent": "subscribed"}))).await["id"].as_str().unwrap().to_string();
+    let q = format!("SELECT {} FROM profiles p WHERE p.id = $1::uuid", dumbmail::models::PROFILE_COLS);
+    let profile: dumbmail::models::Profile = sqlx::query_as(&q).bind(&pid).fetch_one(&h.state.db).await.unwrap();
+    let content = json!({"subject": "Flow mail", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]});
+    let spec = || dumbmail::sending::SendSpec {
+        account: &account,
+        profile: &profile,
+        channel: "email",
+        content: &content,
+        campaign_id: None,
+        flow_id: None,
+        flow_node_id: None,
+        event: None,
+        is_test: false,
+        message_id: None,
+        to_override: None,
+    };
+    let unsubscribe = async {
+        // Both checked consent on the profile as read before sending. Once the first has gone, the
+        // second waits about a second for its slot: they unsubscribe then.
+        for _ in 0..1000 {
+            let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE profile_id = $1::uuid AND status = 'sent'").bind(&pid).fetch_one(&h.state.db).await.unwrap();
+            if sent == 1 {
+                sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed' WHERE id = $1::uuid").bind(&pid).execute(&h.state.db).await.unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the first email never went");
+    };
+    let (a, b, ()) = tokio::join!(dumbmail::sending::send(&h.state, spec()), dumbmail::sending::send(&h.state, spec()), unsubscribe);
+    let outcomes: Vec<dumbmail::sending::Outcome> = [a, b].into_iter().map(Result::unwrap).collect();
+    assert_eq!(outcomes.iter().filter(|o| matches!(o, dumbmail::sending::Outcome::Sent(_))).count(), 1, "{outcomes:?}");
+    assert!(outcomes.iter().any(|o| matches!(o, dumbmail::sending::Outcome::Skipped("not emailable"))), "{outcomes:?}");
+    assert_eq!(received(&h, "quit@x.test", "Flow mail"), 1);
+    let skipped: Vec<(String, Option<String>)> = sqlx::query_as("SELECT status, error FROM messages WHERE profile_id = $1::uuid AND status <> 'sent'").bind(&pid).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(skipped, vec![("skipped".to_string(), Some("not emailable".to_string()))], "stopped at the last check, and recorded");
+
+    // A campaign to two people, cancelled while the second email waits for its slot.
+    let l = list(&mut h, "Cancel mid-wait").await;
+    person(&mut h, &l, "c1@x.test", json!({})).await;
+    person(&mut h, &l, "c2@x.test", json!({})).await;
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Cancel me", Value::Null))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let cancel = async {
+        // Wait until one has gone and the other is claimed (waiting for its slot), then cancel.
+        for _ in 0..1000 {
+            let (sent, sending): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE status = 'sent'), count(*) FILTER (WHERE status = 'sending') FROM messages WHERE campaign_id = $1::uuid")
+                .bind(&cid)
+                .fetch_one(&h.state.db)
+                .await
+                .unwrap();
+            if sent == 1 && sending == 1 {
+                dumbmail::api::messaging::cancel(&h.state, acct, cid.parse().unwrap()).await.unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("never saw one sent and one waiting");
+    };
+    let ((), ()) = tokio::join!(h.drain(), cancel);
+    assert_eq!(received(&h, "c1@x.test", "Cancel me") + received(&h, "c2@x.test", "Cancel me"), 1, "the waiting email didn't go");
+    let stopped: (String, Option<String>, bool) =
+        sqlx::query_as("SELECT status, error, claimed_at IS NOT NULL FROM messages WHERE campaign_id = $1::uuid AND status <> 'sent'").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(stopped, ("skipped".to_string(), Some("campaign cancelled".to_string()), true), "it was in flight when the cancel landed");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_winner_send_is_planned_from_when_the_winner_was_picked() {
+    let mut h = harness!();
+    h.signup().await;
+    let l = list(&mut h, "Winner time").await;
+    for i in 0..10 {
+        person(&mut h, &l, &format!("w{i}@x.test"), json!({})).await;
+    }
+    let mut body = campaign(&l, "Version A", json!({"timing": "gradual", "spread_hours": 4}));
+    body["ab_test"] = json!({"variants": [{"id": "b", "content": {"subject": "Version B", "blocks": [{"type": "text", "html": "<p>B</p>"}]}}], "test_percent": 20, "wait_hours": 1, "metric": "open_rate", "pick": "manual"});
+    let cid = h.ok("POST", "/api/campaigns", Some(body)).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.fast_forward().await;
+    release(&h, &cid, None).await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "testing");
+    h.ok("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "b"}))).await;
+    let picked: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT ab_winner_at FROM campaigns WHERE id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    let picked = picked.expect("stored when picked");
+    h.drain().await;
+    let from: Vec<DateTime<Utc>> = sqlx::query_scalar("SELECT DISTINCT planned_from FROM messages WHERE campaign_id = $1::uuid AND variant IS NULL").bind(&cid).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(from, vec![picked], "every winner message planned from the pick");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn send_options_are_saved_only_when_the_campaign_launches() {
+    let mut h = harness!();
+    h.signup().await;
+    let l = list(&mut h, "Not ready").await;
+    person(&mut h, &l, "nr@x.test", json!({})).await;
+    let mut body = campaign(&l, "Not ready", Value::Null);
+    body["content"]["subject"] = json!("");
+    let cid = h.ok("POST", "/api/campaigns", Some(body)).await["id"].as_str().unwrap().to_string();
+    for (path, b) in [("send", json!({"send_options": {"timing": "gradual", "spread_hours": 3}})), ("schedule", json!({"send_at": Utc::now() + chrono::Duration::days(1), "send_options": {"smart_sending": true}}))] {
+        let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/{path}"), Some(b)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{path}: {v}");
+        let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+        assert_eq!((c["status"].as_str(), &c["send_options"]), (Some("draft"), &Value::Null), "{path}: not saved when it didn't launch: {c}");
+    }
+    h.cleanup().await;
+}

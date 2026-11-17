@@ -173,25 +173,42 @@ pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &A
 
 /// Appends `FROM profiles p WHERE ...` selecting a campaign's reachable recipients.
 pub async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+    let r = resolve_audience(db, account_id, channel, audience).await?;
+    push_audience(qb, account_id, channel, &r);
+    Ok(())
+}
+
+/// A campaign audience with its lists checked and segments loaded, ready to put into SQL with
+/// [`push_audience`] without another database round trip.
+pub struct ResolvedAudience {
+    include: Vec<Resolved>,
+    exclude: Vec<Resolved>,
+    sunset: bool,
+}
+
+pub async fn resolve_audience(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<ResolvedAudience> {
     if audience.include.is_empty() {
         return Err(AppError::bad("choose at least one list or segment to send to"));
     }
-    let inc = resolve(db, account_id, &audience.include).await?;
-    let exc = resolve(db, account_id, &audience.exclude).await?;
+    let include = resolve(db, account_id, &audience.include).await?;
+    let exclude = resolve(db, account_id, &audience.exclude).await?;
+    let sunset = channel == "email"
+        && sqlx::query_scalar::<_, bool>("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
+    Ok(ResolvedAudience { include, exclude, sunset })
+}
+
+/// Appends `FROM profiles p WHERE ...` for a resolved audience (see [`append_audience`]).
+pub fn push_audience(qb: &mut QueryBuilder<'_, Postgres>, account_id: Uuid, channel: &str, r: &ResolvedAudience) {
     qb.push(" FROM profiles p WHERE p.account_id = ").push_bind(account_id).push(" AND ");
-    push_any(qb, &inc);
-    if !exc.is_empty() {
+    push_any(qb, &r.include);
+    if !r.exclude.is_empty() {
         qb.push(" AND NOT ");
-        push_any(qb, &exc);
+        push_any(qb, &r.exclude);
     }
     push_eligible(qb, channel);
-    if channel == "email" {
-        let sunset: bool = sqlx::query_scalar("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
-        if sunset {
-            crate::deliverability::push_not_unengaged(qb);
-        }
+    if r.sunset {
+        crate::deliverability::push_not_unengaged(qb);
     }
-    Ok(())
 }
 
 pub async fn load(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<CampaignRow> {
@@ -279,11 +296,26 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
 /// With an A/B test and no winner yet, only the test slice gets rows (each with its version);
 /// once a winner is picked this runs again and adds everyone else.
 pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result<()> {
+    let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
+    // Look up the audience's lists and segments first: everything below runs on the one connection
+    // that holds the campaign lock, so busy workers can't each hold a lock while waiting for another.
+    let pre: Option<(Value, String, Uuid, String)> = sqlx::query_as("SELECT audience, status, account_id, channel FROM campaigns WHERE id = $1").bind(campaign_id).fetch_optional(&state.db).await?;
+    let Some((pre_audience, pre_status, account_id, channel)) = pre else { return Ok(()) };
+    if pre_status != "sending" {
+        return Ok(());
+    }
+    let audience: Audience = serde_json::from_value(pre_audience.clone())?;
+    // Only needed when this run adds recipients; a retry of a fixed audience mustn't fail on a list deleted since.
+    let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await;
+
     // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
     let mut tx = state.db.begin().await?;
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;
     if c.status != "sending" {
         return Ok(());
+    }
+    if c.audience != pre_audience || c.channel != channel {
+        anyhow::bail!("the campaign changed while its send was being prepared; retrying");
     }
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
@@ -292,37 +324,34 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             return Ok(());
         }
     }
-    let audience: Audience = serde_json::from_value(c.audience.clone())?;
     let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
     let ab = ab_test(&c);
     let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
     // Set once everyone who gets the campaign has a row (or a holdout row): a retried send job then adds
     // nobody who joined the audience since.
     let fixed: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut *tx).await?;
-    let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
     let mut fix = false;
     match (&ab, &c.ab_winner) {
         (Some(t), None) if !started => {
-            // Test slice: a random sample, dealt round-robin across the versions.
+            // One statement, so one consistent read: the audience, the test slice (a random sample dealt
+            // round-robin across the versions) and everyone else, who get the winner later even if they
+            // leave the list meanwhile.
+            let resolved = resolved.map_err(to_anyhow)?;
             let versions = t.versions();
             let n = versions.len() as i64;
-            let total = estimate(&state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
-            let size = if t.test_percent >= 100 { total } else { ((total * t.test_percent + 99) / 100).max(n).min(total) };
-            let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, variant) SELECT gen_random_uuid(), x.account_id, x.id, ");
-            qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", x.addr, (").push_bind(versions).push("::text[])[1 + ((row_number() OVER () - 1) % ").push_bind(n).push(")::int] FROM (SELECT p.account_id, p.id, ");
+            let mut qb = QueryBuilder::new("WITH aud AS (SELECT p.account_id, p.id, ");
             qb.push(addr).push(" AS addr");
-            append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
-            qb.push(" ORDER BY random() LIMIT ").push_bind(size).push(") x");
-            qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
+            push_audience(&mut qb, c.account_id, &c.channel, &resolved);
+            qb.push("), ranked AS (SELECT a.*, row_number() OVER (ORDER BY random()) AS rn, count(*) OVER () AS total FROM aud a),
+                     sized AS (SELECT r.*, CASE WHEN ").push_bind(t.test_percent).push(" >= 100 THEN r.total ELSE LEAST(GREATEST((r.total * ").push_bind(t.test_percent).push(" + 99) / 100, ").push_bind(n).push("), r.total) END AS size FROM ranked r),
+                     ins AS (INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, variant)
+                             SELECT gen_random_uuid(), x.account_id, x.id, ");
+            qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", x.addr, (").push_bind(versions).push("::text[])[1 + ((x.rn - 1) % ").push_bind(n).push(")::int]
+                             FROM sized x WHERE x.rn <= x.size
+                             ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING)
+                 INSERT INTO campaign_holdouts (campaign_id, profile_id) SELECT ");
+            qb.push_bind(c.id).push(", x.id FROM sized x WHERE x.rn > x.size ON CONFLICT DO NOTHING");
             qb.build().execute(&mut *tx).await?;
-            // Everyone else in the audience now gets the winner later, even if they leave the list meanwhile.
-            if t.test_percent < 100 {
-                let mut qb = QueryBuilder::new("INSERT INTO campaign_holdouts (campaign_id, profile_id) SELECT ");
-                qb.push_bind(c.id).push(", p.id");
-                append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
-                qb.push(" AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.campaign_id = ").push_bind(c.id).push(" AND m.profile_id = p.id AND NOT m.is_test) ON CONFLICT DO NOTHING");
-                qb.build().execute(&mut *tx).await?;
-            }
             fix = true;
         }
         // The test slice was already created (this job is a retry): just send what's queued.
@@ -331,7 +360,7 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         _ if fixed => {}
         // Everyone (no test), or everyone left after a test that started before audiences were fixed.
         _ => {
-            insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?;
+            insert_rest(&mut tx, &c, resolved).await.map_err(to_anyhow)?;
             fix = true;
         }
     }
@@ -365,8 +394,9 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
 
 /// Queue a message (with no version: the winner, or the only content) for every audience member who has none yet.
 /// After an A/B test whose audience was fixed when it started, that's the holdouts who can still be messaged.
-async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState, c: &CampaignRow) -> AppResult<()> {
-    let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
+/// Runs entirely on `tx`: the audience is resolved beforehand (and only used, so only has to have
+/// resolved, when there are no holdouts).
+async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, resolved: AppResult<ResolvedAudience>) -> AppResult<()> {
     let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
     let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
     qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
@@ -376,7 +406,7 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState,
         qb.push(" WHERE p.account_id = ").push_bind(c.account_id);
         push_eligible(&mut qb, &c.channel);
     } else {
-        append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await?;
+        push_audience(&mut qb, c.account_id, &c.channel, &resolved?);
     }
     qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
     qb.build().execute(&mut **tx).await?;
@@ -654,19 +684,40 @@ pub async fn pick_winner(state: &AppState, c: &CampaignRow, chosen: Option<&str>
             versions[leader(&t.metric, &stats).0].clone()
         }
     };
+    // Looked up before the transaction, which then holds the campaign row on one connection only.
+    let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
+    let resolved = resolve_audience(&state.db, c.account_id, &c.channel, &audience).await;
     // One transaction: record the winner, queue everyone else and the send job, so a crash can't leave
     // a campaign 'sending' with nothing queued, and no batch can mark it sent before the rest are queued.
     let mut tx = state.db.begin().await?;
-    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET ab_winner = $2, status = 'sending', updated_at = now() WHERE id = $1 AND status = 'testing' RETURNING *")
+    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET ab_winner = $2, ab_winner_at = now(), status = 'sending', updated_at = now() WHERE id = $1 AND status = 'testing' RETURNING *")
         .bind(c.id)
         .bind(&winner)
         .fetch_optional(&mut *tx)
         .await?;
     let row = row.ok_or_else(|| AppError::Conflict("the winner was already picked".into()))?;
-    insert_rest(&mut tx, state, &row).await?;
+    insert_rest(&mut tx, &row, resolved).await?;
     crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": c.id}), None).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// A failed or cancelled campaign that is edited goes back to draft: forget its last attempt, so the
+/// next send is planned afresh for the audience it has then. Messages that never reached the provider
+/// (queued, skipped, or failed without being claimed: a content error stops the rest unsent) are
+/// removed, with the fixed audience and A/B holdouts. Messages that went out, or may have (claimed and
+/// sent, failed or still sending), stay: those people are never sent the campaign again.
+pub async fn reset_for_relaunch(tx: &mut sqlx::Transaction<'_, Postgres>, campaign_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "DELETE FROM messages WHERE campaign_id = $1 AND NOT is_test
+           AND (status IN ('queued', 'skipped') OR (status = 'failed' AND claimed_at IS NULL))",
+    )
+    .bind(campaign_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM campaign_holdouts WHERE campaign_id = $1").bind(campaign_id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE campaigns SET audience_fixed_at = NULL WHERE id = $1").bind(campaign_id).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// How long a claimed campaign message can stay 'sending' before it counts as interrupted (a send takes seconds).

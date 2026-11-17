@@ -6,6 +6,10 @@
 //! can set it from a browser. A profile's time zone (its `timezone` property, or its location) can
 //! only narrow the hours, when the two share some. When they never do, the account chooses: use the
 //! phone number's hours (the default), or don't text them. Either way the message notes it.
+//!
+//! When the phone number's zone can't be worked out (a country with several zones and no known area
+//! code), the account's zone takes its place as the authority: a text must be inside the window in
+//! both the account's zone and the profile's, and if those never overlap, the account's zone decides.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -32,7 +36,15 @@ pub async fn sms_window(db: &PgPool, account_id: Uuid) -> sqlx::Result<(u32, u32
 pub async fn sms_settings(db: &PgPool, account_id: Uuid) -> sqlx::Result<((u32, u32), bool)> {
     let row: Option<(i32, i32, String)> =
         sqlx::query_as("SELECT sms_start_minute, sms_end_minute, sms_zone_conflict FROM send_settings WHERE account_id = $1").bind(account_id).fetch_optional(db).await?;
-    Ok(row.map_or((DEFAULT_SMS_WINDOW, false), |(s, e, c)| (clamp_window(s, e), c == "skip")))
+    Ok(match row {
+        Some((s, e, c)) => window_from(Some((s, e)), Some(&c)),
+        None => window_from(None, None),
+    })
+}
+
+/// [`sms_settings`] from a `send_settings` row read elsewhere (None: the account has none).
+pub fn window_from(window: Option<(i32, i32)>, conflict: Option<&str>) -> ((u32, u32), bool) {
+    (window.map_or(DEFAULT_SMS_WINDOW, |(s, e)| clamp_window(s, e)), conflict == Some("skip"))
 }
 
 /// Never outside the legal window, whatever is stored.
@@ -60,21 +72,22 @@ pub async fn sms_hours(db: &PgPool, account: &Account, profile: &Profile, now: D
     Ok(decide(&zones, now, s, e, skip_conflicts))
 }
 
-/// When a text to this person may next go out, or None if it may go now.
-pub async fn sms_quiet_until(db: &PgPool, account: &Account, profile: &Profile, now: DateTime<Utc>) -> sqlx::Result<Option<DateTime<Utc>>> {
-    Ok(sms_hours(db, account, profile, now).await?.wait)
-}
-
-/// The decision for `zones` (the phone's first, as from [`sms_zones`]).
-pub fn decide(zones: &[Tz], now: DateTime<Utc>, start: u32, end: u32, skip_conflicts: bool) -> SmsHours {
-    match (zones, joint_wait(zones, now, start, end)) {
+/// The decision for `zones` (from [`sms_zones`]).
+pub fn decide(zones: &SmsZones, now: DateTime<Utc>, start: u32, end: u32, skip_conflicts: bool) -> SmsHours {
+    let z = &zones.zones;
+    match (z.as_slice(), joint_wait(z, now, start, end)) {
         (_, Some(wait)) => SmsHours { wait, note: None, skip: false },
-        ([phone, profile, ..], None) => {
+        ([phone, profile, ..], None) if zones.phone_known => {
             let what = if skip_conflicts { "so they weren't texted" } else { "so the phone number's hours were used" };
             let note = format!("Their phone number's time zone ({}) and their profile's ({}) never share texting hours, {what}.", phone.name(), profile.name());
             SmsHours { wait: if skip_conflicts { None } else { window_wait(*phone, now, start, end) }, note: Some(note), skip: skip_conflicts }
         }
-        (_, None) => SmsHours { wait: zones.first().and_then(|z| window_wait(*z, now, start, end)), note: None, skip: false },
+        // No phone zone: the account's zone stands in for it, and decides alone when the two never overlap.
+        ([account, profile, ..], None) => {
+            let note = format!("Their phone number's time zone isn't known and their profile's ({}) never shares texting hours with the account's ({}), so the account's hours were used.", profile.name(), account.name());
+            SmsHours { wait: window_wait(*account, now, start, end), note: Some(note), skip: false }
+        }
+        (_, None) => SmsHours { wait: z.first().and_then(|z| window_wait(*z, now, start, end)), note: None, skip: false },
     }
 }
 
@@ -94,21 +107,32 @@ fn joint_wait(zones: &[Tz], now: DateTime<Utc>, start: u32, end: u32) -> Option<
     None
 }
 
-/// The zones a text must respect, the phone number's first. A `timezone` property can come from a
-/// browser, so it never makes quiet hours looser than the phone number's own zone: when both are
-/// known and differ, both count.
-pub fn sms_zones(props: &Value, phone: Option<&str>, account_tz: Tz) -> Vec<Tz> {
-    let (tz, _) = zone::resolve_parts(props, phone, account_tz);
+/// The zones a text must respect. The first is the authority: the phone number's zone, or the
+/// account's when the phone's can't be worked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmsZones {
+    pub zones: Vec<Tz>,
+    /// The first zone is the phone number's own.
+    pub phone_known: bool,
+}
+
+/// The zones a text must respect, the authority first. A `timezone` property can come from a
+/// browser, so it never makes quiet hours looser than the phone number's own zone (or, when that's
+/// unknown, the account's): when both are known and differ, both count.
+pub fn sms_zones(props: &Value, phone: Option<&str>, account_tz: Tz) -> SmsZones {
+    let (tz, source) = zone::resolve_parts(props, phone, account_tz);
     match phone.and_then(zone::phone_zone) {
-        Some(p) if p != tz => vec![p, tz],
-        _ => vec![tz],
+        Some(p) if p != tz => SmsZones { zones: vec![p, tz], phone_known: true },
+        Some(p) => SmsZones { zones: vec![p], phone_known: true },
+        None if source != zone::Source::Account && tz != account_tz => SmsZones { zones: vec![account_tz, tz], phone_known: false },
+        None => SmsZones { zones: vec![account_tz], phone_known: false },
     }
 }
 
-/// When a text may go so that it's inside the window in every one of `zones` (the first is the
-/// phone's). If their windows never overlap, the phone's zone alone decides (planning uses this; at
-/// delivery [`decide`] also applies the account's choice to skip such people).
-pub fn sms_wait(zones: &[Tz], now: DateTime<Utc>, start: u32, end: u32) -> Option<DateTime<Utc>> {
+/// When a text may go so that it's inside the window in every one of `zones`. If their windows never
+/// overlap, the first zone alone decides (planning uses this; at delivery [`decide`] also applies the
+/// account's choice to skip people whose phone and profile zones disagree).
+pub fn sms_wait(zones: &SmsZones, now: DateTime<Utc>, start: u32, end: u32) -> Option<DateTime<Utc>> {
     decide(zones, now, start, end, false).wait
 }
 
@@ -179,7 +203,7 @@ mod tests {
         let utc = |h: u32| Utc.with_ymd_and_hms(2026, 11, 20, h, 0, 0).unwrap();
         // New York number claiming Los Angeles: both count. 17:00 UTC = 12:00 NY, 09:00 LA: open in both.
         let z = sms_zones(&serde_json::json!({"timezone": "America/Los_Angeles"}), Some("+12125550100"), la);
-        assert_eq!(z.len(), 2);
+        assert_eq!(z.zones.len(), 2);
         assert_eq!(sms_wait(&z, utc(17), 540, 1200), None);
         // 02:00 UTC = 21:00 NY, 18:00 LA: closed in New York, so it waits for 09:00 LA (= 12:00 NY) tomorrow.
         assert_eq!(sms_wait(&z, utc(2), 540, 1200), Some(utc(17)));
@@ -196,8 +220,29 @@ mod tests {
         // Zones that do overlap carry no note.
         let z = sms_zones(&serde_json::json!({"timezone": "America/Los_Angeles"}), Some("+12125550100"), la);
         assert_eq!(decide(&z, utc(2), 540, 1200, true), SmsHours { wait: Some(utc(17)), note: None, skip: false });
-        // No phone zone: just the one.
-        assert_eq!(sms_zones(&serde_json::json!({"timezone": "Asia/Kolkata"}), Some("+18505550100"), la).len(), 1);
+    }
+
+    #[test]
+    fn without_a_phone_zone_the_account_and_profile_zones_both_count() {
+        use chrono::TimeZone;
+        let la: Tz = chrono_tz::America::Los_Angeles;
+        let utc = |h: u32| Utc.with_ymd_and_hms(2026, 11, 20, h, 0, 0).unwrap();
+        // +1 850 isn't a mapped area code, so the phone's zone is unknown: the account's (LA) stands in.
+        let z = sms_zones(&serde_json::json!({"timezone": "America/New_York"}), Some("+18505550100"), la);
+        assert_eq!(z, SmsZones { zones: vec![la, chrono_tz::America::New_York], phone_known: false });
+        // 15:00 UTC = 10:00 NY but 07:00 LA: closed in the account's zone, so it waits for 09:00 LA (= 12:00 NY).
+        assert_eq!(sms_wait(&z, utc(15), 540, 1200), Some(utc(17)));
+        // 02:00 UTC = 21:00 NY, 18:00 LA: closed in New York, so it waits for tomorrow 09:00 LA.
+        assert_eq!(sms_wait(&z, utc(2), 540, 1200), Some(utc(17)));
+        assert_eq!(sms_wait(&z, utc(18), 540, 1200), None, "10:00 LA, 13:00 NY: open in both");
+        // A profile in Dubai (12 hours ahead of LA) never overlaps: the account's zone decides, never skipped.
+        let z = sms_zones(&serde_json::json!({"timezone": "Asia/Dubai"}), Some("+18505550100"), la);
+        let d = decide(&z, utc(18), 540, 1200, true);
+        assert_eq!((d.wait, d.skip), (None, false), "10:00 in LA");
+        assert!(d.note.as_deref().unwrap().contains("Asia/Dubai"), "{d:?}");
+        assert_eq!(decide(&z, utc(6), 540, 1200, true).wait, Some(utc(17)), "22:00 in LA waits for 09:00 LA");
+        // No profile zone either: just the account's.
+        assert_eq!(sms_zones(&serde_json::json!({}), Some("+18505550100"), la), SmsZones { zones: vec![la], phone_known: false });
     }
 
     #[test]

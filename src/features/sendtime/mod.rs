@@ -3,7 +3,7 @@
 //!
 //! The send path calls in here: `campaigns::prepare_send` plans release times with
 //! [`plan::plan_campaign`], `campaigns::send_batch` applies smart sending with
-//! [`plan::recently_messaged`], `sending::send` asks [`settings::sms_quiet_until`] before a text,
+//! [`plan::recently_messaged`], `sending::send` asks [`settings::sms_hours`] before a text (and [`settings::decide`] again right before the hand-off),
 //! and `messaging::launch` asks [`plan::launch_start`] when a local-time campaign starts.
 
 pub mod clock;
@@ -32,7 +32,7 @@ use crate::state::AppState;
 
 pub use options::SendOptions;
 pub use plan::recently_messaged;
-pub use settings::{sms_hours, sms_quiet_until, SmsHours};
+pub use settings::{sms_hours, SmsHours};
 
 pub struct Module;
 

@@ -114,9 +114,10 @@ fn flaky(h: &Harness, busy: usize) -> (AppState, axum::Router, Arc<Flaky>) {
     (st.clone(), dumbmail::app(st), provider)
 }
 
-/// Make every waiting transactional retry due and run the queue on `state`.
+/// Make every waiting transactional retry due (its job, and the send's next allowed attempt) and run the queue on `state`.
 async fn run_retries(state: &AppState) {
     sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'transactional_retry' AND run_at <> 'infinity'").execute(&state.db).await.unwrap();
+    sqlx::query("UPDATE transactional_sends SET next_attempt_at = now() WHERE next_attempt_at > now()").execute(&state.db).await.unwrap();
     jobs::drain(state).await.unwrap();
 }
 
@@ -330,7 +331,14 @@ async fn abuse_rules_caps_pause_and_billing() {
     assert_eq!(t["transactional"], true);
     let v = h.ok("POST", "/api/transactional/send", Some(json!({"to": "a@x.test", "template_id": tid, "variables": {"order_id": "7"}}))).await;
     assert_eq!(v["subject"], "Order 7 shipped");
-    h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": promo}))).await;
+    // Editing it into a promotion is refused when saved...
+    let (s, v) = h.req("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": promo}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("reads like marketing"), "{v}");
+    let kept: Value = sqlx::query_scalar("SELECT content FROM templates WHERE id = $1::uuid").bind(&tid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(kept["subject"], "Order {{ order_id }} shipped", "the edit wasn't saved");
+    // ...and checked at every send (here, content saved before edits were checked).
+    sqlx::query("UPDATE templates SET content = $2 WHERE id = $1::uuid").bind(&tid).bind(&promo).execute(&h.state.db).await.unwrap();
     let (s, _) = h.req("POST", "/api/transactional/send", Some(json!({"to": "a@x.test", "template_id": tid}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "edits are checked at every send");
     // Marketing templates can't be sent through it.
@@ -599,7 +607,7 @@ async fn one_delivery_and_one_charge_across_retries_crashes_and_races() {
     assert_eq!((s, v["status"].as_str(), v["attempts"].as_i64()), (StatusCode::OK, Some("queued"), Some(1)), "{v}");
     let id = v["id"].as_str().unwrap().to_string();
     // Five workers pick it up at once (a duplicated retry job, a backstop job, ...): one attempt wins.
-    sqlx::query("UPDATE transactional_sends SET status = 'queued' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE transactional_sends SET status = 'queued', next_attempt_at = NULL WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
     provider.busy.store(0, Ordering::SeqCst);
     let uid: uuid::Uuid = id.parse().unwrap();
     let (a, b, c, d, e) = tokio::join!(tsend::retry(&st, uid), tsend::retry(&st, uid), tsend::retry(&st, uid), tsend::retry(&st, uid), tsend::retry(&st, uid));
@@ -794,4 +802,343 @@ async fn reply_to_and_sender_headers_are_checked_as_resolved() {
     assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("sent")), "{v}");
     assert_eq!(sent_to(&h, "lee@x.test")[0].reply_to.as_deref(), Some("help@acme.test"));
     h.cleanup().await;
+}
+
+/// An email provider whose hand-off ends without an answer: it may have accepted the email.
+struct LostAnswer {
+    inner: LogEmail,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl EmailProvider for LostAnswer {
+    fn name(&self) -> &'static str {
+        "log"
+    }
+    async fn send(&self, email: &OutgoingEmail) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // It went out, but the answer was lost on the way back.
+        self.inner.send(email).await?;
+        Err(anyhow::Error::new(dumbmail::providers::email::ProviderMaybeSent { reason: "the connection to SES failed".into() }))
+    }
+    async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState> {
+        self.inner.add_domain(domain).await
+    }
+    async fn domain_state(&self, domain: &str) -> anyhow::Result<DomainState> {
+        self.inner.domain_state(domain).await
+    }
+    fn sent(&self) -> Vec<OutgoingEmail> {
+        self.inner.sent()
+    }
+}
+
+#[tokio::test]
+async fn a_hand_off_that_may_have_gone_out_is_unknown_never_resent_or_charged_and_replays_as_unknown() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let acct: uuid::Uuid = account_id(&mut h).await.parse().unwrap();
+    sqlx::query("UPDATE accounts SET free_emails_used = 25, free_month = to_char(now() AT TIME ZONE timezone, 'YYYY-MM')").execute(&h.state.db).await.unwrap();
+    h.credit(1.0).await;
+    let before = dumbmail::billing::balance(&h.state.db, acct).await.unwrap();
+    let provider = Arc::new(LostAnswer { inner: LogEmail::new(), calls: AtomicUsize::new(0) });
+    let s = &h.state;
+    let st = AppState(Arc::new(Inner { db: s.db.clone(), cfg: s.cfg.clone(), email: provider.clone(), sms: s.sms.clone(), http: s.http.clone(), pending_checks: Default::default(), daily_limits: Default::default() }));
+    let router = dumbmail::app(st.clone());
+    let mut b = receipt(json!("una@x.test"));
+    b["idempotency_key"] = json!("reset-77");
+    let (s, v) = call(&router, &key, "POST", "/api/transactional/send", Some(b.clone())).await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("unknown")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("may have accepted"), "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    // Its backstop job and any retry find nothing to do; nothing is charged.
+    h.fast_forward().await;
+    run_retries(&st).await;
+    jobs::scheduler_tick(&st, 1).await.unwrap();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "handed over once");
+    let (status, attempts, payload, _) = row(&h, &id).await;
+    assert_eq!((status.as_str(), attempts, payload), ("unknown", 1, None));
+    assert_eq!(dumbmail::billing::balance(&h.state.db, acct).await.unwrap(), before, "not charged");
+    let charged: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT charged_at FROM transactional_sends WHERE id = $1::uuid").bind(&id).fetch_one(&h.state.db).await.unwrap();
+    assert!(charged.is_none());
+    // Replaying the key returns that result and sends nothing.
+    let (s, again) = call(&router, &key, "POST", "/api/transactional/send", Some(b)).await;
+    assert_eq!((s, again["id"].as_str(), again["status"].as_str(), again["replayed"].as_bool()), (StatusCode::OK, Some(id.as_str()), Some("unknown"), Some(true)), "{again}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_waiting_send_is_not_attempted_before_its_time_even_by_the_backstop() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let (st, router, provider) = flaky(&h, 1);
+    let (_, v) = call(&router, &key, "POST", "/api/transactional/send", Some(receipt(json!("val@x.test")))).await;
+    assert_eq!(v["status"], "queued", "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let next: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT next_attempt_at FROM transactional_sends WHERE id = $1::uuid").bind(&id).fetch_one(&h.state.db).await.unwrap();
+    assert!(next.unwrap() > chrono::Utc::now() + chrono::Duration::seconds(30), "busy: waits about a minute");
+    // A longer wait (a later attempt's backoff): the retry is due in 10 minutes, after the reservation's
+    // two-minute backstop job. When the backstop comes due it can't claim the send early.
+    sqlx::query("UPDATE transactional_sends SET next_attempt_at = now() + interval '10 minutes' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE jobs SET run_at = now() + interval '10 minutes' WHERE kind = 'transactional_retry' AND run_at < now() + interval '90 seconds'").execute(&h.state.db).await.unwrap();
+    let backstops = sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'transactional_retry' AND run_at < now() + interval '5 minutes'").execute(&h.state.db).await.unwrap().rows_affected();
+    assert_eq!(backstops, 1, "the backstop job");
+    jobs::drain(&st).await.unwrap();
+    let (status, attempts, _, _) = row(&h, &id).await;
+    assert_eq!((status.as_str(), attempts), ("queued", 1), "not attempted before next_attempt_at");
+    assert!(provider.sent().is_empty());
+    // At its time, it goes.
+    run_retries(&st).await;
+    let (status, attempts, _, _) = row(&h, &id).await;
+    assert_eq!((status.as_str(), attempts), ("sent", 2));
+    assert_eq!(provider.sent().len(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn following_a_link_in_a_transactional_email_stores_no_token() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let token = "RESET-TOKEN-5c1d2e";
+    let b = json!({"to": "wes@x.test", "track_clicks": true, "variables": {"link": format!("https://acme.test/reset?token={token}")},
+        "content": {"subject": "Reset your password", "blocks": [{"type": "button", "text": "Reset it", "href": "{{ link }}"}]}});
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(b)).await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("sent")), "{v}");
+    let m = &sent_to(&h, "wes@x.test")[0];
+    let link = find_link(&m.html, "https://pl.test/t/c/");
+    let (s, headers, _) = h.raw("GET", link.trim_start_matches("https://pl.test"), &[], "").await;
+    assert!(s.is_redirection(), "{s}");
+    assert!(headers["location"].to_str().unwrap().contains(token), "the person still reaches the page");
+    // Recorded: a click, when, and the site. Nowhere the token.
+    let got = h.ok("GET", &format!("/api/transactional/sends/{}", v["id"].as_str().unwrap()), None).await;
+    assert_eq!(got["status"], "clicked", "{got}");
+    let clicks: Vec<String> = sqlx::query_scalar("SELECT url FROM message_clicks").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(clicks, vec!["https://acme.test".to_string()]);
+    let everything: String = sqlx::query_scalar(
+        "SELECT concat((SELECT string_agg(row_to_json(e)::text, '') FROM events e), (SELECT string_agg(row_to_json(m)::text, '') FROM messages m),
+                       (SELECT string_agg(row_to_json(t)::text, '') FROM transactional_sends t), (SELECT string_agg(row_to_json(c)::text, '') FROM message_clicks c))",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    assert!(!everything.contains(token), "{everything}");
+    let events = h.ok("GET", &format!("/api/events?profile_id={}", got["profile_id"].as_str().unwrap()), None).await;
+    let click = events["data"].as_array().unwrap().iter().find(|e| e["metric"] == "Clicked Email").cloned().unwrap();
+    assert_eq!(click["properties"]["url"], "https://acme.test", "{click}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn restricted_mode_sends_saved_templates_as_saved() {
+    let mut h = harness!();
+    h.signup().await;
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "store"}))).await["key"].as_str().unwrap().to_string();
+    enable(&mut h, false).await;
+    let t = h.ok("POST", "/api/transactional/templates", Some(json!({"name": "Reset", "content": {"subject": "Reset your password",
+        "blocks": [{"type": "text", "html": "<p>Use {{ link }}.</p>"}], "text": "Use {{ link }}.\n\n{{ note }}"}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    let send = |extra: Value| {
+        let mut b = json!({"to": "xi@x.test", "template_id": tid, "variables": {"link": "https://acme.test/r/1"}});
+        b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        b
+    };
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(send(json!({})))).await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("sent")), "{v}");
+    // No subject override.
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(send(json!({"subject": "50% off today only"})))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("subject"), "{v}");
+    // Each variable at most 500 characters, all of them 4 KB.
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(send(json!({"variables": {"link": "x".repeat(501)}})))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    let many: serde_json::Map<String, Value> = (0..10).map(|i| (format!("v{i}"), json!("y".repeat(450)))).collect();
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(send(json!({"variables": many})))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("4 KB"), "{v}");
+    // The check reads the plain-text part exactly as it would go out.
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM transactional_sends").fetch_one(&h.state.db).await.unwrap();
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(send(json!({"variables": {"link": "https://acme.test/r/2", "note": "Take 20% off everything today. Shop now: https://acme.test/sale"}})))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("reads like marketing"), "{v}");
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM transactional_sends").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(after, before, "refused up front, nothing recorded");
+    // Editing the template into a promotion is refused when saved.
+    let (s, v) = h.req("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": {"subject": "20% off everything", "blocks": [{"type": "button", "text": "Shop now", "href": "https://acme.test"}]}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    // A plain edit is fine.
+    h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": {"subject": "Reset your password", "blocks": [{"type": "text", "html": "<p>Use {{ link }} within an hour.</p>"}]}}))).await;
+    assert_eq!(sent_to(&h, "xi@x.test").len(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_accounts_default_reply_to_is_verified_too() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let id = account_id(&mut h).await;
+    h.ok("PATCH", "/api/account", Some(json!({"reply_to": "inbox@elsewhere.test"}))).await;
+    let b = json!({"to": "yan@x.test", "content": {"subject": "Your receipt", "text": "Thanks."}});
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(b.clone())).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("Your account's reply-to address"), "{v}");
+    // The email's own sender address is always fine as Reply-To.
+    let mut own = b.clone();
+    own["reply_to"] = json!("hello@acme.test");
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(own)).await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("sent")), "{v}");
+    // Once the domain is verified, the default goes through.
+    h.ok("PATCH", "/api/account", Some(json!({"reply_to": "inbox@acme.test"}))).await;
+    sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status) VALUES (gen_random_uuid(), $1::uuid, 'acme.test', 'verified')").bind(&id).execute(&h.state.db).await.unwrap();
+    let (s, v) = api(&h, &key, "POST", "/api/transactional/send", Some(b)).await;
+    assert_eq!((s, v["status"].as_str()), (StatusCode::OK, Some("sent")), "{v}");
+    assert_eq!(sent_to(&h, "yan@x.test").last().unwrap().reply_to.as_deref(), Some("inbox@acme.test"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_key_accepted_while_this_request_was_checked_replays_instead_of_hitting_the_cap() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let id = account_id(&mut h).await;
+    let (s, _, _) = h.raw("POST", "/admin/transactional/limits", &[ADMIN, ("content-type", "application/json")], &json!({"account_id": id, "per_minute_limit": 1, "daily_limit": null}).to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    let mut b = receipt(json!("zed@x.test"));
+    b["idempotency_key"] = json!("order-9");
+    let (_, first) = api(&h, &key, "POST", "/api/transactional/send", Some(b.clone())).await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    // Stage the race: the first request is still inside its reservation (holding the account's lock,
+    // its key not yet committed) while a retry arrives and finds the per-minute cap used up.
+    sqlx::query("UPDATE transactional_sends SET idempotency_key = NULL WHERE id = $1::uuid").bind(&first_id).execute(&h.state.db).await.unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('transactional:' || $1::text, 0))").bind(&id).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE transactional_sends SET idempotency_key = 'order-9' WHERE id = $1::uuid").bind(&first_id).execute(&mut *tx).await.unwrap();
+    let finish = async {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        tx.commit().await.unwrap();
+    };
+    let ((s, v), ()) = tokio::join!(api(&h, &key, "POST", "/api/transactional/send", Some(b)), finish);
+    assert_eq!((s, v["id"].as_str(), v["replayed"].as_bool()), (StatusCode::OK, Some(first_id.as_str()), Some(true)), "{v}");
+    assert_eq!(sent_to(&h, "zed@x.test").len(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_bad_address_index_is_built_after_startup_not_in_a_migration() {
+    let mut h = harness!();
+    let key = setup(&mut h).await;
+    let state_sql = dumbmail::features::reports::indexes::STATE_SQL;
+    let exists: Option<bool> = sqlx::query_scalar(state_sql).bind("messages_bad_address_idx").fetch_optional(&h.state.db).await.unwrap();
+    assert_eq!(exists, None, "migrations don't build it");
+    // Without it, suppression still works.
+    let v = h.ok("POST", "/api/transactional/send", Some(receipt(json!("bad@x.test")))).await;
+    ses(&h, &provider_id(&h, &v).await, json!({"notificationType": "Bounce", "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}})).await;
+    let (_, v) = api(&h, &key, "POST", "/api/transactional/send", Some(receipt(json!("bad@x.test")))).await;
+    assert_eq!(v["status"], "skipped", "{v}");
+    // The background step after startup builds it.
+    use dumbmail::features::Feature;
+    dumbmail::features::transactional::Module.after_start(&h.state).await.unwrap();
+    let exists: Option<bool> = sqlx::query_scalar(state_sql).bind("messages_bad_address_idx").fetch_optional(&h.state.db).await.unwrap();
+    assert_eq!(exists, Some(true));
+    h.cleanup().await;
+}
+
+/// A stand-in for the SES v2 API that answers SendEmail with `status` (0: hang up without answering)
+/// and counts the requests it got.
+async fn fake_ses(status: u16) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                // Read the head and the body.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = match status {
+                    0 => return,
+                    200 => "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 21\r\n\r\n{\"MessageId\":\"ses-1\"}".to_string(),
+                    400 => {
+                        let body = r#"{"message":"Email address is not verified."}"#;
+                        format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nx-amzn-errortype: MessageRejected\r\ncontent-length: {}\r\n\r\n{body}", body.len())
+                    }
+                    s => {
+                        let body = r#"{"message":"Internal failure"}"#;
+                        format!("HTTP/1.1 {s} Internal Server Error\r\ncontent-type: application/json\r\nx-amzn-errortype: InternalFailure\r\ncontent-length: {}\r\n\r\n{body}", body.len())
+                    }
+                };
+                let _ = sock.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (url, hits)
+}
+
+fn ses_provider(url: &str) -> dumbmail::providers::email::SesEmail {
+    use aws_sdk_sesv2::config::{BehaviorVersion, Credentials, Region};
+    let conf = aws_sdk_sesv2::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new("AKIDTEST", "secret", None, None, "test"))
+        .endpoint_url(url)
+        .build();
+    dumbmail::providers::email::SesEmail::with_client(aws_sdk_sesv2::Client::from_conf(conf), None)
+}
+
+#[tokio::test]
+async fn ses_hand_offs_are_one_attempt_and_say_when_they_may_have_gone_out() {
+    use dumbmail::providers::email::{ProviderMaybeSent, SesEmail};
+    let email = OutgoingEmail {
+        message_id: uuid::Uuid::now_v7(),
+        to: "a@x.test".into(),
+        from_name: "Acme".into(),
+        from_email: "hello@acme.test".into(),
+        reply_to: None,
+        subject: "Receipt".into(),
+        html: "<p>Thanks</p>".into(),
+        text: "Thanks".into(),
+        unsubscribe_url: None,
+    };
+    let once = |p: SesEmail| {
+        let email = email.clone();
+        async move { tokio::time::timeout(std::time::Duration::from_secs(20), p.send_once(&email)).await.expect("answers") }
+    };
+    let (url, hits) = fake_ses(200).await;
+    assert_eq!(once(ses_provider(&url)).await.unwrap(), "ses-1");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // A definite rejection: failed, not "maybe".
+    let (url, hits) = fake_ses(400).await;
+    let e = once(ses_provider(&url)).await.unwrap_err();
+    assert!(e.downcast_ref::<ProviderMaybeSent>().is_none() && e.downcast_ref::<ProviderBusy>().is_none(), "{e:#}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    // A server error or a dropped connection: it may have gone out, and the SDK didn't try again.
+    for status in [500u16, 0] {
+        let (url, hits) = fake_ses(status).await;
+        let e = once(ses_provider(&url)).await.unwrap_err();
+        assert!(e.downcast_ref::<ProviderMaybeSent>().is_some(), "{status}: {e:#}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "{status}: one attempt");
+    }
+    // Campaign sending still lets the SDK retry a server error, as before.
+    let (url, hits) = fake_ses(500).await;
+    let p = ses_provider(&url);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), p.send(&email)).await.expect("answers");
+    assert!(hits.load(Ordering::SeqCst) > 1, "standard retries for campaign mail");
 }

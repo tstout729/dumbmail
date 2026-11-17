@@ -30,6 +30,9 @@ const MAX_VARIABLES: usize = 64 * 1024;
 const MAX_METADATA: usize = 8 * 1024;
 const MAX_METADATA_KEYS: usize = 50;
 const MAX_BLOCKS: usize = 200;
+/// Restricted mode: each variable at most this many characters, and all of them this many bytes.
+pub const RESTRICTED_VARIABLE_CHARS: usize = 500;
+pub const RESTRICTED_VARIABLES_BYTES: usize = 4 * 1024;
 
 /// Attempts before a send the provider keeps refusing as busy is given up.
 pub const MAX_ATTEMPTS: i32 = 6;
@@ -180,6 +183,36 @@ fn check_body(b: &SendBody) -> AppResult<()> {
     Ok(())
 }
 
+/// What this account's mode allows for this request. Restricted mode (hosted accounts without full
+/// mode) sends only saved transactional templates, as saved: no inline content, no subject override,
+/// and only short variables, so a template that passed the content check can't be turned into
+/// something else at send time.
+fn check_mode(state: &AppState, access: &Access, b: &SendBody) -> AppResult<()> {
+    access.allows(state, b.content.is_some())?;
+    if access.full {
+        return Ok(());
+    }
+    let restricted = |what: String| AppError::Forbidden(format!("This account's transactional email is in restricted mode: {what}."));
+    if b.subject.is_some() {
+        return Err(restricted("the subject comes from the saved template and can't be changed when sending".into()));
+    }
+    if let Some(vars) = &b.variables {
+        for (k, v) in vars {
+            let len = match v {
+                Value::String(s) => s.chars().count(),
+                other => other.to_string().chars().count(),
+            };
+            if len > RESTRICTED_VARIABLE_CHARS {
+                return Err(restricted(format!("each variable can be at most {RESTRICTED_VARIABLE_CHARS} characters, and {k:?} is {len}")));
+            }
+        }
+        if serde_json::to_string(vars)?.len() > RESTRICTED_VARIABLES_BYTES {
+            return Err(restricted("the variables together can be at most 4 KB".into()));
+        }
+    }
+    Ok(())
+}
+
 /// The content to send: the template's (it must be a transactional template) or the inline content,
 /// with the subject override applied, after the promotional-content review.
 async fn resolve_content(db: &PgPool, account_id: Uuid, b: &SendBody) -> AppResult<(Value, Option<Uuid>)> {
@@ -245,14 +278,17 @@ fn person(base: &Profile, r: &Recipient) -> Profile {
     p
 }
 
-/// Reply-To must be the account's own sender or reply-to address, or on one of its verified sending
-/// domains (on the hosted service and with SES), so replies can't be routed to an unrelated mailbox.
-fn check_reply_to(state: &AppState, account: &Account, addr: &str) -> AppResult<String> {
+/// Reply-To, wherever it came from (the request, the content or the account's default), must be the
+/// sender address of this email or on one of the account's verified sending domains (on the hosted
+/// service and with SES), so replies can't be routed to an unrelated mailbox. `from_email` has been
+/// checked already.
+fn check_reply_to(state: &AppState, account: &Account, addr: &str, from_email: &str) -> AppResult<String> {
     let n = mailbox(addr).ok_or_else(|| AppError::bad("reply_to is not a valid email address"))?;
-    let own = [&account.reply_to, &account.from_email].into_iter().flatten().any(|a| normalize_email(a).as_deref() == Some(n.as_str()));
-    if !own && (state.cfg.hosted || state.email.name() == "ses") && crate::sending::check_sender_domain_name(account, &n).is_err() {
+    if n != from_email && (state.cfg.hosted || state.email.name() == "ses") && crate::sending::check_sender_domain_name(account, &n).is_err() {
         let domain = n.rsplit_once('@').map_or("", |(_, d)| d);
-        return Err(AppError::bad(format!("reply_to {n} must be on one of your verified sending domains (verify {domain} in Settings → Domains), or be your account's own reply-to address")));
+        let own = account.reply_to.as_deref().and_then(normalize_email).as_deref() == Some(n.as_str());
+        let whose = if own { "Your account's reply-to address" } else { "reply_to" };
+        return Err(AppError::bad(format!("{whose} {n} must be on one of your verified sending domains (verify {domain} in Settings → Domains), or pass a reply_to that is")));
     }
     Ok(n)
 }
@@ -281,12 +317,12 @@ fn render_for(state: &AppState, account: &Account, base: &Profile, to: &Recipien
     let link_base = crate::domains::link_base(state, account);
     let tracking = Tracking { public_url: &link_base, secret: &state.cfg.secret_key, message_id, unsubscribe_url: String::new() };
     let footer = || if b.address_footer { Footer::Address } else { Footer::None };
-    // The content rules read the links as written, so review a copy without click tracking.
-    let plain = render::render_email_with(account, &ec, &ctx, None, EmailOptions { footer: footer(), track_clicks: false, track_opens: false })?;
-    check_review(&json!({"subject": plain.subject, "html": plain.html, "text": plain.text}))?;
+    // The content rules read the links as written, so they also review a copy without click tracking.
+    let mut plain = render::render_email_with(account, &ec, &ctx, None, EmailOptions { footer: footer(), track_clicks: false, track_opens: false })?;
     let mut r = render::render_email_with(account, &ec, &ctx, Some(&tracking), EmailOptions { footer: footer(), track_clicks: b.track_clicks, track_opens: b.track_opens })?;
     if let (Some(t), true) = (text_only, has_body) {
         r.text = render::render_str(t, &ctx, false)?;
+        plain.text = r.text.clone();
     }
     let from_email = b
         .from_email
@@ -302,10 +338,14 @@ fn render_for(state: &AppState, account: &Account, base: &Profile, to: &Recipien
         return Err(AppError::bad("from_name is invalid (at most 200 characters, one line)"));
     }
     let reply_to = match b.reply_to.clone().or(ec.reply_to.clone()).filter(|s| !s.trim().is_empty()).or_else(|| account.reply_to.clone()) {
-        Some(r) => Some(check_reply_to(state, account, &r)?),
+        Some(r) => Some(check_reply_to(state, account, &r, &from_email)?),
         None => None,
     };
-    Ok(OutgoingEmail { message_id, to: to.email.clone(), from_name, from_email, reply_to, subject: r.subject, html: r.html, text: r.text, unsubscribe_url: None })
+    let email = OutgoingEmail { message_id, to: to.email.clone(), from_name, from_email, reply_to, subject: r.subject, html: r.html, text: r.text, unsubscribe_url: None };
+    // The exact subject, sender name, HTML and plain text that will go out, and the HTML as written.
+    check_rendered(&email)?;
+    check_review(&json!({"subject": email.subject, "from_name": email.from_name, "html": plain.html, "text": plain.text}))?;
+    Ok(email)
 }
 
 /// The account's profile with exactly this email, if there is one.
@@ -353,16 +393,18 @@ fn unsaved_profile(account_id: Uuid, email: &str) -> Profile {
     }
 }
 
-/// Why this mailbox can't get email at all, if it can't: its profile is suppressed, or mail to this
-/// address hard bounced or drew a spam complaint (even under a profile that has since changed email).
-async fn suppressed_address(db: &PgPool, account_id: Uuid, email: &str) -> sqlx::Result<Option<String>> {
-    sqlx::query_scalar(
-        "SELECT COALESCE(
+/// Why mailbox $2 of account $1 can't get email (see [`suppressed_address`]), as an SQL expression.
+/// Fast with the background index `messages_bad_address_idx` (see `super::INDEXES`), correct without it.
+const SUPPRESSED: &str = "COALESCE(
             (SELECT email_suppressed_reason FROM profiles WHERE account_id = $1 AND email = $2),
             (SELECT CASE WHEN bool_or(status = 'complained') THEN 'complaint' ELSE 'hard_bounce' END FROM messages
              WHERE account_id = $1 AND to_address = $2 AND (status = 'complained' OR (status = 'bounced' AND bounce_type = 'Permanent'))
-             HAVING count(*) > 0))",
-    )
+             HAVING count(*) > 0))";
+
+/// Why this mailbox can't get email at all, if it can't: its profile is suppressed, or mail to this
+/// address hard bounced or drew a spam complaint (even under a profile that has since changed email).
+async fn suppressed_address(db: &PgPool, account_id: Uuid, email: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(&format!("SELECT {SUPPRESSED}"))
     .bind(account_id)
     .bind(email)
     .fetch_one(db)
@@ -404,19 +446,36 @@ pub async fn send(state: &AppState, ctx: &Ctx, b: SendBody, via: &str) -> AppRes
             return Ok((get(&state.db, account_id, prior).await?, true));
         }
     }
-    let access = guard::may_send_transactional(state, ctx).await?;
-    access.allows(state, b.content.is_some())?;
-    let account = crate::campaigns::load_account(&state.db, account_id).await?;
-    guard::check_open(state, &account, &access).await?;
-    let (content, template_id) = resolve_content(&state.db, account_id, &b).await?;
-    let to = parse_to(&b.to)?;
-    let profile = link_profile(&state.db, account_id, &to).await?;
-    let message_id = Uuid::now_v7();
-    let email = render_for(state, &account, &profile, &to, &b, &content, message_id)?;
-    let skipped = suppressed_address(&state.db, account_id, &to.email).await?.map(|r| suppressed_message(&r));
-    if skipped.is_none() && !balance_ok(state, account_id).await? {
-        return Err(AppError::LimitReached(NO_BALANCE.into()));
+    // Anything refused before the reservation (a cap, the pause, the balance) is checked against the
+    // key again under the reservation lock: a request accepted a moment ago is replayed, not refused.
+    let checked = async {
+        let access = guard::may_send_transactional(state, ctx).await?;
+        check_mode(state, &access, &b)?;
+        let account = crate::campaigns::load_account(&state.db, account_id).await?;
+        guard::check_open(state, &account, &access).await?;
+        let (content, template_id) = resolve_content(&state.db, account_id, &b).await?;
+        let to = parse_to(&b.to)?;
+        let profile = link_profile(&state.db, account_id, &to).await?;
+        let message_id = Uuid::now_v7();
+        let email = render_for(state, &account, &profile, &to, &b, &content, message_id)?;
+        let skipped = suppressed_address(&state.db, account_id, &to.email).await?.map(|r| suppressed_message(&r));
+        if skipped.is_none() && !balance_ok(state, account_id).await? {
+            return Err(AppError::LimitReached(NO_BALANCE.into()));
+        }
+        Ok((access, template_id, to, profile, message_id, email, skipped))
     }
+    .await;
+    let (access, template_id, to, profile, message_id, email, skipped) = match checked {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(key) = &b.idempotency_key {
+                if let Some(prior) = guard::find_key_locked(&state.db, account_id, key, &hash).await? {
+                    return Ok((get(&state.db, account_id, prior).await?, true));
+                }
+            }
+            return Err(e);
+        }
+    };
     let payload_enc = match skipped {
         None => Some(crate::crypto::encrypt(&state.cfg.secret_key, &serde_json::to_string(&b)?)?),
         Some(_) => None,
@@ -496,7 +555,7 @@ async fn prepare(state: &AppState, account_id: Uuid, profile_id: Option<Uuid>, t
         None => {
             let Some(enc) = payload else { return Ok(Ready::Fail("not sent: its content expired before it could go out".into())) };
             let b: SendBody = serde_json::from_str(&crate::crypto::decrypt(&state.cfg.secret_key, enc)?)?;
-            if let Err(e) = access.allows(state, b.content.is_some()) {
+            if let Err(e) = check_mode(state, &access, &b) {
                 return Ok(Ready::Fail(e.public_message()));
             }
             let to = parse_to(&b.to)?;
@@ -522,7 +581,8 @@ async fn prepare(state: &AppState, account_id: Uuid, profile_id: Option<Uuid>, t
     Ok(Ready::Send(Box::new((account, email, profile_id.unwrap_or_default()))))
 }
 
-/// End a claimed send without sending it: `status` is failed or skipped. The retry payload goes.
+/// End a claimed send without a confirmed hand-off: `status` is failed or skipped (not sent), or
+/// unknown (the provider may have accepted it; never sent again and not charged). The retry payload goes.
 async fn finish_unsent(db: &PgPool, id: Uuid, message_id: Uuid, status: &str, msg: &str) -> sqlx::Result<()> {
     let mut tx = db.begin().await?;
     sqlx::query("UPDATE transactional_sends SET status = $2, error = $3, payload_enc = NULL, claimed_at = NULL WHERE id = $1 AND status = 'sending'")
@@ -535,17 +595,20 @@ async fn finish_unsent(db: &PgPool, id: Uuid, message_id: Uuid, status: &str, ms
     tx.commit().await
 }
 
-/// Put a claimed send back in the queue with its retry job, in one transaction.
+/// Put a claimed send back in the queue with its retry job, in one transaction. No attempt can claim
+/// it before `next_attempt_at` (the reservation's backstop job included).
 async fn requeue(db: &PgPool, id: Uuid, wait: chrono::Duration, msg: &str) -> sqlx::Result<()> {
+    let at = Utc::now() + wait;
     let mut tx = db.begin().await?;
-    let n = sqlx::query("UPDATE transactional_sends SET status = 'queued', claimed_at = NULL, error = $2 WHERE id = $1 AND status = 'sending'")
+    let n = sqlx::query("UPDATE transactional_sends SET status = 'queued', claimed_at = NULL, next_attempt_at = $3, error = $2 WHERE id = $1 AND status = 'sending'")
         .bind(id)
         .bind(format!("waiting to retry: {msg}"))
+        .bind(at)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     if n == 1 {
-        crate::jobs::enqueue(&mut *tx, super::RETRY_JOB, json!({"send_id": id}), Some(Utc::now() + wait)).await?;
+        crate::jobs::enqueue(&mut *tx, super::RETRY_JOB, json!({"send_id": id}), Some(at)).await?;
     }
     tx.commit().await
 }
@@ -562,7 +625,8 @@ fn backoff(attempts: i32, asked: std::time::Duration) -> chrono::Duration {
 async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) -> AppResult<()> {
     let claimed: Option<(Uuid, Option<Uuid>, Option<Uuid>, String, i32, Option<String>, Value)> = sqlx::query_as(
         "UPDATE transactional_sends SET status = 'sending', claimed_at = now(), attempts = attempts + 1
-         WHERE id = $1 AND status = 'queued' RETURNING account_id, message_id, profile_id, to_email, attempts, payload_enc, metadata",
+         WHERE id = $1 AND status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+         RETURNING account_id, message_id, profile_id, to_email, attempts, payload_enc, metadata",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -580,7 +644,12 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
         Ready::Wait(_, msg) => return Ok(finish_unsent(&state.db, id, message_id, "failed", &format!("not sent after {attempts} attempts ({msg})")).await?),
     };
     crate::sending::throttle_email(state).await;
-    match state.email.send(&email).await {
+    // A pause, turning it off, or a bounce or complaint can land while waiting for a slot.
+    if let Some((status, msg)) = last_check(&state.db, account.id, &to_email).await? {
+        return Ok(finish_unsent(&state.db, id, message_id, status, &msg).await?);
+    }
+    // One hand-off, no automatic retries: a second try after a lost answer could deliver it twice.
+    match state.email.send_once(&email).await {
         Ok(provider_id) => {
             // Charged once per send id, in the same transaction that marks it sent.
             let mut tx = state.db.begin().await?;
@@ -625,11 +694,43 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
                 }
                 return Ok(requeue(&state.db, id, backoff(attempts, busy.retry_after), "the email provider is busy").await?);
             }
+            if let Some(maybe) = e.downcast_ref::<crate::providers::email::ProviderMaybeSent>() {
+                tracing::warn!(send = %id, reason = %maybe.reason, "transactional email may have gone out; not sending it again");
+                let msg = format!("{maybe}; it is not sent again and not charged");
+                return Ok(finish_unsent(&state.db, id, message_id, "unknown", &msg).await?);
+            }
             let msg = format!("{e:#}");
             tracing::warn!(send = %id, error = %msg, "transactional send failed");
             Ok(finish_unsent(&state.db, id, message_id, "failed", &msg).await?)
         }
     }
+}
+
+/// The last check before the hand-off, in one query against the current state: all email paused for
+/// the account, transactional email paused or turned off, or the mailbox suppressed. Returns the
+/// final status and why, or None to send.
+async fn last_check(db: &PgPool, account_id: Uuid, to_email: &str) -> sqlx::Result<Option<(&'static str, String)>> {
+    let (all_paused, off, paused, suppressed): (bool, bool, bool, Option<String>) = sqlx::query_as(&format!(
+        "SELECT COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true),
+                COALESCE((SELECT enabled_at IS NULL FROM transactional_settings WHERE account_id = $1), true),
+                COALESCE((SELECT paused_at IS NOT NULL FROM transactional_settings WHERE account_id = $1), false),
+                {SUPPRESSED}"
+    ))
+    .bind(account_id)
+    .bind(to_email)
+    .fetch_one(db)
+    .await?;
+    Ok(if let Some(reason) = suppressed {
+        Some(("skipped", suppressed_message(&reason)))
+    } else if all_paused {
+        Some(("failed", "not sent: email sending is paused for this account".into()))
+    } else if off {
+        Some(("failed", "not sent: transactional email was turned off".into()))
+    } else if paused {
+        Some(("failed", "not sent: transactional email is paused for this account".into()))
+    } else {
+        None
+    })
 }
 
 /// Job: an attempt for a send that's waiting (the provider was busy, or the request never got to it).
@@ -672,7 +773,7 @@ pub async fn dry_run(state: &AppState, ctx: &Ctx, b: SendBody, include_html: boo
     let account_id = ctx.account_id;
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
     let gate = match guard::may_send_transactional(state, ctx).await {
-        Ok(a) => match a.allows(state, b.content.is_some()) {
+        Ok(a) => match check_mode(state, &a, &b) {
             Ok(()) => guard::check_open(state, &account, &a).await.err(),
             Err(e) => Some(e),
         },
@@ -684,7 +785,6 @@ pub async fn dry_run(state: &AppState, ctx: &Ctx, b: SendBody, include_html: boo
     let blocked = suppressed_address(&state.db, account_id, &to.email).await?.map(|r| suppressed_message(&r));
     let profile = existing.unwrap_or_else(|| unsaved_profile(account_id, &to.email));
     let email = render_for(state, &account, &profile, &to, &b, &content, Uuid::nil())?;
-    check_rendered(&email)?;
     let mut out = json!({
         "dry_run": true,
         "to": email.to, "from": {"email": email.from_email, "name": email.from_name}, "reply_to": email.reply_to,

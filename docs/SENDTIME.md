@@ -17,7 +17,7 @@ Check what DumbMail uses for someone with `GET /api/profiles/{id}/timezone` (MCP
 
 ## Campaign send options
 
-Set `send_options` on a campaign (`POST /api/campaigns`, `PATCH /api/campaigns/{id}`, or with the send itself: `POST /api/campaigns/{id}/send` with `{"send_options": ...}`, `POST /api/campaigns/{id}/schedule` with `{"send_at", "send_options"}`, or MCP `create_campaign`, `update_campaign`, `send_campaign`). Options given with a send are checked and saved on the campaign first; unknown fields are refused. `null` or leaving it out sends to everyone at once with no smart sending, as before.
+Set `send_options` on a campaign (`POST /api/campaigns`, `PATCH /api/campaigns/{id}`, or with the send itself: `POST /api/campaigns/{id}/send` with `{"send_options": ...}`, `POST /api/campaigns/{id}/schedule` with `{"send_at", "send_options"}`, or MCP `create_campaign`, `update_campaign`, `send_campaign`). Options given with a send are checked and saved on the campaign with the send itself, so they're kept only if it goes out; unknown fields are refused. `null` or leaving it out sends to everyone at once with no smart sending, as before.
 
 | Field | Used with | Meaning |
 | --- | --- | --- |
@@ -62,8 +62,9 @@ With `smart_sending` on, each recipient is checked when their message is about t
 
 - The audience is fixed when sending starts: people who join a list or segment later don't get it, even if the send is retried. Unsubscribes, bounces and complaints are still checked for everyone just before their message goes.
 - Each person gets at most one message per campaign. Release times are computed from when the send was asked for, not from when the planning step happens to run, so a planning step that's interrupted and run again gives everyone the same time, and a gradual send keeps its equal batches.
-- A/B tests: the test group follows the same timing rule. The rest of the audience is fixed when the test starts (so someone who leaves the list during the test still gets the winner, if they can still be emailed), and planned when the winner is picked, by the same rule from that moment (for `local_time`, the next time it's that hour in their zone, or right away with `late: immediately`).
-- Cancelling stops everything not yet sent, including zones still waiting. A message a worker had already picked up when the cancel landed is either already on its way or skipped; it's never left waiting.
+- A/B tests: the test group follows the same timing rule. The rest of the audience is fixed when the test starts (so someone who leaves the list during the test still gets the winner, if they can still be emailed), and planned from when the winner is picked (stored, so a restart gives the same times), by the same rule (for `local_time`, the next time it's that hour in their zone, or right away with `late: immediately`). An A/B test that was already running when this was released has no stored rest of the audience: its winner goes to the audience as it is when the winner is picked.
+- Cancelling stops everything not yet sent, including zones still waiting. A message a worker had already picked up when the cancel landed is either already on its way or skipped; it's never left waiting. Each message is checked one last time right before it's handed to the provider (after any wait for a sending slot): an unsubscribe, a suppression, a cancel or a pause that landed meanwhile stops it.
+- Editing a cancelled or failed campaign returns it to draft and forgets its last attempt: the next send is planned afresh for the audience it has then. People who already got it (or whose message may have gone out) never get a second copy.
 - The warm-up limit, the automatic pause for bounces and complaints, billing, unsubscribes and suppressions apply as always.
 
 ## Estimates and progress
@@ -73,9 +74,9 @@ With `smart_sending` on, each recipient is checked when their message is about t
 
 ## SMS quiet hours
 
-Texts from campaigns and flows only go out between 9:00 and 20:00 in the recipient's own time zone. A text outside those hours waits until the window opens; the rest of the batch goes on. Hours are checked again just before each text is handed to the carrier, so one waiting for its turn never goes out after the window closes. Test sends aren't held.
+Texts from campaigns and flows only go out between 9:00 and 20:00 in the recipient's own time zone. A text outside those hours waits until the window opens; the rest of the batch goes on. Hours are checked again just before each text is handed to the carrier (the whole decision, including the setting below), so one waiting for its turn never goes out after the window closes. Test sends aren't held.
 
-Whose clock counts: the phone number's own zone (from its country, or its US or Canadian area code) is the authority, because carriers and regulators go by it and nobody can set it from a browser. The profile's zone (found as above) can only narrow the hours: when the two differ, a text waits until it's within the hours in both. When there's no zone from the phone number, the profile's zone (falling back to the account's) is used.
+Whose clock counts: the phone number's own zone (from its country, or its US or Canadian area code) is the authority, because carriers and regulators go by it and nobody can set it from a browser. The profile's zone (found as above) can only narrow the hours: when the two differ, a text waits until it's within the hours in both. When there's no zone from the phone number (a country with several zones and no known area code), the account's zone takes its place: a text waits until it's within the hours in both the account's zone and the profile's, and if those never share texting hours, the account's zone decides (and the message notes it).
 
 When the two zones never share texting hours (a New York number on a profile that says Manila), the account decides, in Settings → Send times or with `sms_zone_conflict`:
 

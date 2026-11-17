@@ -14,6 +14,9 @@ CREATE TABLE campaign_holdouts (
     PRIMARY KEY (campaign_id, profile_id)
 );
 
+-- When the A/B winner was picked: the winner send's release times are computed from it.
+ALTER TABLE campaigns ADD COLUMN ab_winner_at timestamptz;
+
 -- When this part of the send was asked for (the send, or the A/B winner). Release times and gradual
 -- positions are computed from it, so a restarted planning step gives everyone the same time.
 ALTER TABLE messages ADD COLUMN planned_from timestamptz;

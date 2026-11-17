@@ -27,6 +27,13 @@ use crate::state::AppState;
 pub struct Module;
 
 pub const RETRY_JOB: &str = "transactional_retry";
+
+/// Built in the background after startup (see `reports::indexes`), since `messages` is big: hard
+/// bounces and complaints by address, for the suppression check before every send. Sends are
+/// correct without it, only slower.
+pub const INDEXES: &[(&str, &str)] =
+    &[("messages_bad_address_idx", "CREATE INDEX CONCURRENTLY messages_bad_address_idx ON messages (account_id, to_address) WHERE status IN ('bounced', 'complained')")];
+const INDEX_LOCK_KEY: i64 = 0x0d4d_7472_616e_7378;
 const DOC: &str = include_str!("../../../docs/TRANSACTIONAL.md");
 
 async fn send_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<send::SendBody>) -> AppResult<Json<Value>> {
@@ -76,19 +83,13 @@ fn template_json(id: Uuid, name: &str, content: &Value, created: chrono::DateTim
 }
 
 /// Create a transactional template (an email template the transactional API may send). Content that
-/// reads like marketing is refused; edits later are checked again at every send.
+/// reads like marketing is refused; edits are checked again when saved, and at every send.
 async fn create_template(state: &AppState, account_id: Uuid, b: TemplateBody) -> AppResult<Value> {
     let name = b.name.trim();
     if name.is_empty() || name.chars().count() > 200 {
         return Err(AppError::bad("give the template a name (at most 200 characters)"));
     }
-    if !b.content.is_object() || serde_json::to_string(&b.content)?.len() > 600 * 1024 {
-        return Err(AppError::bad("content must be an email content object (at most 600 KB)"));
-    }
-    let r = review::review(&b.content);
-    if r.blocked {
-        return Err(AppError::bad(review::blocked_message(&r)));
-    }
+    check_template_content(&b.content)?;
     let row: (Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         "INSERT INTO templates (id, account_id, name, channel, content, transactional) VALUES ($1, $2, $3, 'email', $4, true) RETURNING id, created_at, updated_at",
     )
@@ -99,6 +100,28 @@ async fn create_template(state: &AppState, account_id: Uuid, b: TemplateBody) ->
     .fetch_one(&state.db)
     .await?;
     Ok(template_json(row.0, name, &b.content, row.1, row.2))
+}
+
+/// Editing a transactional template (through `PATCH /api/templates/{id}`): its new content passes the
+/// same check as a new one, or the edit is refused. Other templates aren't affected.
+pub async fn check_template_edit(db: &sqlx::PgPool, account_id: Uuid, id: Uuid, content: Option<&Value>) -> AppResult<()> {
+    let Some(content) = content else { return Ok(()) };
+    let transactional: Option<bool> = sqlx::query_scalar("SELECT transactional FROM templates WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).fetch_optional(db).await?;
+    if transactional != Some(true) {
+        return Ok(());
+    }
+    check_template_content(content)
+}
+
+fn check_template_content(content: &Value) -> AppResult<()> {
+    if !content.is_object() || serde_json::to_string(content)?.len() > 600 * 1024 {
+        return Err(AppError::bad("content must be an email content object (at most 600 KB)"));
+    }
+    let r = review::review(content);
+    if r.blocked {
+        return Err(AppError::bad(review::blocked_message(&r)));
+    }
+    Ok(())
 }
 
 async fn list_templates(state: &AppState, account_id: Uuid) -> AppResult<Value> {
@@ -287,6 +310,10 @@ impl Feature for Module {
             Some(id) => send::retry(state, id).await,
             None => Ok(()),
         })
+    }
+
+    async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
+        crate::features::reports::indexes::build(state, INDEX_LOCK_KEY, "transactional", INDEXES).await
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {

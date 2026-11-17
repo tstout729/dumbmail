@@ -115,7 +115,7 @@ pub struct Plan {
 impl Plan {
     /// When this recipient's message is released. `index`/`total` place them in a gradual send.
     pub fn release(&self, tz: Tz, index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
-        self.adjust(&[tz], self.slot(tz, index, total, personal))
+        self.adjust(&super::settings::SmsZones { zones: vec![tz], phone_known: true }, self.slot(tz, index, total, personal))
     }
 
     /// The release time before quiet hours.
@@ -141,7 +141,7 @@ impl Plan {
     }
 
     /// Texts never go out during the recipient's quiet hours (`sms_zones`: see `settings::sms_zones`).
-    pub fn adjust(&self, sms_zones: &[Tz], at: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn adjust(&self, sms_zones: &super::settings::SmsZones, at: DateTime<Utc>) -> DateTime<Utc> {
         match self.sms_window {
             Some((s, e)) => super::settings::sms_wait(sms_zones, at, s, e).unwrap_or(at),
             None => at,
@@ -264,8 +264,14 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
     let Some(opts) = options::of(c.send_options.as_ref()).filter(SendOptions::plans) else { return Ok(0) };
     let account = crate::campaigns::load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let now = Utc::now();
-    // When this part was asked for: the A/B winner pick (now), or the send itself (its send time).
-    let asked = if c.ab_winner.is_some() { now } else { c.send_at.map_or(now, |t| t.min(now)) };
+    // When this part was asked for: the A/B winner pick, or the send itself (its send time); for a
+    // winner send that was cancelled and sent again, that later send. All stored, so a re-run agrees.
+    let winner_at: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT ab_winner_at FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&state.db).await?;
+    let asked = match (&c.ab_winner, winner_at) {
+        (Some(_), Some(w)) => c.send_at.map_or(w, |t| t.max(w)).min(now),
+        (Some(_), None) => now,
+        (None, _) => c.send_at.map_or(now, |t| t.min(now)),
+    };
     let spread = if opts.timing == Timing::Gradual { opts.spread_hours().max(1) } else { 0 };
     // Step one, a single statement: stamp the new messages and fix gradual positions.
     sqlx::query(
@@ -335,9 +341,10 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
 
 /// When a campaign scheduled with these options should start. For local_time this is when the first
 /// time zone reaches the hour on the chosen day (the day of `send_at` in the account's zone, or today),
-/// and the day is recorded in the options. Returns the start (None: now) and the options to store.
-pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, send_at: Option<DateTime<Utc>>) -> AppResult<Option<DateTime<Utc>>> {
-    let Some(mut opts) = options::of(c.send_options.as_ref()) else { return Ok(send_at) };
+/// and the day is recorded in the options. Returns the start (None: now) and, when the day was
+/// recorded, the options to store (the caller stores them with the launch).
+pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, send_at: Option<DateTime<Utc>>) -> AppResult<(Option<DateTime<Utc>>, Option<Value>)> {
+    let Some(mut opts) = options::of(c.send_options.as_ref()) else { return Ok((send_at, None)) };
     if c.channel == "sms" {
         let (s, e) = super::settings::sms_window(&state.db, account.id).await?;
         if opts.timing == Timing::LocalTime && !(s..e).contains(&opts.local_minute()) {
@@ -349,7 +356,7 @@ pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, 
         }
     }
     if opts.timing != Timing::LocalTime {
-        return Ok(send_at);
+        return Ok((send_at, None));
     }
     let tz = crate::sending::account_tz(account);
     let now = Utc::now();
@@ -359,10 +366,9 @@ pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, 
         return Err(AppError::bad("pick today or a later day"));
     }
     opts.local_date = Some(day);
-    sqlx::query("UPDATE campaigns SET send_options = $2 WHERE id = $1").bind(c.id).bind(serde_json::to_value(&opts)?).execute(&state.db).await?;
     // The first place on Earth to reach the hour is UTC+14.
     let earliest = local_instant(chrono_tz::Pacific::Kiritimati, day, opts.local_minute());
-    Ok((earliest > now + Duration::seconds(30)).then_some(earliest))
+    Ok(((earliest > now + Duration::seconds(30)).then_some(earliest), Some(serde_json::to_value(&opts)?)))
 }
 
 /// Estimate when a send goes out: release times for a random sample of the audience, scaled to its

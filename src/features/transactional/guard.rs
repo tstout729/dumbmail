@@ -196,13 +196,28 @@ pub async fn find_key(conn: &mut sqlx::PgConnection, account_id: Uuid, key: &str
     Ok(Some(id))
 }
 
+/// [`find_key`] under the account's reservation lock (see [`reserve`]): a request that was accepted
+/// while this one was being checked is found.
+pub async fn find_key_locked(db: &PgPool, account_id: Uuid, key: &str, hash: &str) -> AppResult<Option<Uuid>> {
+    let mut tx = db.begin().await?;
+    lock_account(&mut tx, account_id).await?;
+    let found = find_key(&mut tx, account_id, key, hash).await?;
+    tx.commit().await?;
+    Ok(found)
+}
+
+async fn lock_account(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('transactional:' || $1::text, 0))").bind(account_id).execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Record a send, inside the caps, in one transaction with its message row and the job that sends it
 /// if this request never gets to (a crash right after). One reservation at a time per account, so
 /// concurrent requests can't overshoot a cap; the idempotency key is looked up under that lock, so a
 /// retry of an accepted request is answered with the first result, never refused by the cap.
 pub async fn reserve(state: &AppState, account_id: Uuid, a: &Access, r: Reservation<'_>) -> AppResult<Reserved> {
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('transactional:' || $1::text, 0))").bind(account_id).execute(&mut *tx).await?;
+    lock_account(&mut tx, account_id).await?;
     if let Some(key) = r.idempotency_key {
         if let Some(prior) = find_key(&mut tx, account_id, key, r.hash).await? {
             tx.commit().await?;
