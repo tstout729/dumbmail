@@ -674,3 +674,22 @@ async fn mcp_tools_dry_run_until_confirmed() {
     assert_eq!(log["requests"][0]["via"], "mcp");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn erasing_someone_waiting_in_a_suppress_job_keeps_them_suppressed() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "late@x.test", "email_consent": "subscribed"}))).await;
+    let mut many: Vec<String> = (0..300).map(|i| format!("s{i}@x.test")).collect();
+    many.push("late@x.test".into());
+    let r = h.ok("POST", "/api/people/suppressions", Some(json!({"addresses": many, "confirm": true}))).await;
+    assert_eq!(r["bulk_action"]["status"], "queued");
+    // Erased before the job reaches them.
+    h.ok("POST", "/api/people/privacy/delete", Some(json!({"email": "late@x.test", "confirm": true}))).await;
+    h.drain().await;
+    assert!(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM profiles WHERE email = 'late@x.test')").fetch_one(&h.state.db).await.unwrap(), "the job didn't bring them back");
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": "email\nlate@x.test\n", "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    let r: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE email = 'late@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(r.as_deref(), Some("manual"), "the suppression they were waiting for still applies");
+    h.cleanup().await;
+}

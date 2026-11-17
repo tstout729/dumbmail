@@ -6,6 +6,7 @@ import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../.
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
 import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { ConsentTimeline, ProfileSidePanels } from "../../features/people/ProfilePanels";
 
 export function ProfileDetailPage() {
   const { id = "" } = useParams();
@@ -105,8 +106,10 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
               </ul>
             )}
           </Card>
+          <ProfileSidePanels profileId={profile.id} email={profile.email} phone={profile.phone_number} tz={tz} />
         </div>
         <div className="space-y-4">
+          <ConsentTimeline profileId={profile.id} tz={tz} />
           <Card title="Activity" padded={false}>
             {events.length === 0 ? (
               <EmptyState icon={<Activity className="size-5" />} title="No activity yet" description="Events like Viewed Product and Placed Order appear here." />
@@ -179,7 +182,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
       {confirmDelete ? (
         <ConfirmDialog
           title="Delete this profile?"
-          body="Their events and message history are deleted too. This can't be undone."
+          body="Their events, messages and consent history are deleted too. This can't be undone. If they had unsubscribed, they stay unsubscribed if they're imported again."
           confirmLabel="Delete profile"
           danger
           loading={remove.isPending}

@@ -442,23 +442,45 @@ pub async fn delete_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
     .execute(&state.db)
     .await?
     .rows_affected();
-    // Bulk exports that include them, saved searches that name them, and pending bulk targets.
-    let bulk_files = sqlx::query("DELETE FROM people_files WHERE account_id = $1 AND kind = 'bulk_export' AND EXISTS (SELECT 1 FROM unnest($2::text[]) a WHERE position(convert_to(a, 'UTF8') IN bytes) > 0)")
+    // Bulk exports that include them: every row starts with the profile id, which is unique.
+    let rows: Vec<String> = p.profile_ids.iter().map(|id| format!("\n{id},")).collect();
+    let bulk_files = sqlx::query("DELETE FROM people_files WHERE account_id = $1 AND kind = 'bulk_export' AND EXISTS (SELECT 1 FROM unnest($2::text[]) r WHERE position(convert_to(r, 'UTF8') IN bytes) > 0)")
         .bind(account_id)
-        .bind(&addresses)
+        .bind(&rows)
         .execute(&state.db)
         .await?
         .rows_affected();
-    sqlx::query("UPDATE bulk_actions SET selection = selection - 'q' WHERE account_id = $1 AND EXISTS (SELECT 1 FROM unnest($2::text[]) a WHERE selection->>'q' ILIKE '%' || a || '%')")
+    // Saved searches that name them (a plain substring test, no LIKE wildcards).
+    sqlx::query("UPDATE bulk_actions SET selection = selection - 'q' WHERE account_id = $1 AND EXISTS (SELECT 1 FROM unnest($2::text[]) a WHERE position(lower(a) IN lower(selection->>'q')) > 0)")
         .bind(account_id)
         .bind(&addresses)
         .execute(&state.db)
         .await?;
+    // A pending "suppress these addresses" job that still lists them: keep the suppression as a
+    // one-way code first, so removing the address from the job can't leave them reachable.
+    let pending: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT t.address FROM bulk_action_targets t JOIN bulk_actions b ON b.id = t.bulk_id WHERE b.account_id = $1 AND t.address = ANY($2) AND t.seq > b.cursor_seq",
+    )
+    .bind(account_id)
+    .bind(&addresses)
+    .fetch_all(&state.db)
+    .await?;
+    let mut tx = state.db.begin().await?;
+    for a in &pending {
+        let ch = if a.contains('@') { "email" } else { "sms" };
+        sqlx::query("INSERT INTO suppression_tombstones (account_id, channel, address_hash, reason) VALUES ($1, $2, $3, 'manual') ON CONFLICT DO NOTHING")
+            .bind(account_id)
+            .bind(ch)
+            .bind(address_hash(&salt, ch, a))
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DELETE FROM bulk_action_targets t USING bulk_actions b WHERE b.id = t.bulk_id AND b.account_id = $1 AND t.address = ANY($2)")
         .bind(account_id)
         .bind(&addresses)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     let files = files + bulk_files;
     let id = log_request(&state.db, account_id, "delete", &p, src, json!({"deleted_profiles": removed.len(), "export_files_deleted": files})).await?;
     Ok(json!({"request_id": id, "deleted": removed.len(), "removed": removed, "export_files_deleted": files}))

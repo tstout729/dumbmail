@@ -9,6 +9,7 @@ import { Badge, Button, Checkbox, ConfirmDialog, Field, IconButton, Input, Menu,
 import { useDebouncedValue } from "../../lib/hooks";
 import { pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { BulkActionsBar } from "../../features/people/BulkActions";
 
 const limit = 50;
 
@@ -124,6 +125,14 @@ export function ListDetailPage() {
           </Button>
         ) : null}
       </div>
+      <BulkActionsBar
+        selected={selected}
+        onClearSelection={() => setSelected(new Set())}
+        filters={{ list_id: id, q: debouncedQ || undefined }}
+        total={profiles.data?.total ?? 0}
+        pageIds={(profiles.data?.data ?? []).map((p) => p.id)}
+        onSelectPage={() => setSelected(new Set([...selected, ...(profiles.data?.data ?? []).map((p) => p.id)]))}
+      />
       <ProfilesTable
         profiles={profiles.data?.data}
         total={profiles.data?.total ?? 0}

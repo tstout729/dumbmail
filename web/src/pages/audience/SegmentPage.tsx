@@ -6,7 +6,7 @@ import type { Segment, SegmentDefinition } from "../../api";
 import { useCreateSegment, useDeleteSegment, useSegment, useSegmentPreview, useUpdateSegment } from "../../api";
 import { ConditionBuilder } from "../../components/segments/ConditionBuilder";
 import { emptyDefinition, isDefinitionComplete } from "../../components/segments/conditions";
-import { Badge, Button, Card, ConfirmDialog, Page, PageHeader, Skeleton, StatusBadge, cx } from "../../components/ui";
+import { Badge, Button, ButtonLink, Card, ConfirmDialog, Page, PageHeader, Skeleton, StatusBadge, cx } from "../../components/ui";
 import { formatNumber, formatRelative, fullName } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
 import { toast } from "../../lib/toast";
@@ -104,6 +104,11 @@ function SegmentEditor({ segment }: { segment: Segment | null }) {
               <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
                 Delete
               </Button>
+            ) : null}
+            {segment && !dirty ? (
+              <ButtonLink to={`/audience/profiles?segment_id=${segment.id}`} variant="secondary">
+                Bulk actions
+              </ButtonLink>
             ) : null}
             <Button variant="primary" disabled={!canSave || !dirty} loading={saving} onClick={onSave}>
               {segment ? (dirty ? "Save" : "Saved") : "Create segment"}
