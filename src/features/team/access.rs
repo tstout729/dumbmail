@@ -162,10 +162,10 @@ pub enum Perm {
     TeamRead,
     TeamManage,
     ApiKeys,
-    /// Two-factor requirement and single sign-on. Browser sessions only.
+    /// The account's two-factor requirement. Browser sessions only.
     Security,
     AuditRead,
-    /// Transfer ownership. Browser sessions only.
+    /// Owners only, in a browser: transfer ownership and set up single sign-on.
     Ownership,
 }
 
@@ -699,6 +699,7 @@ mod tests {
     fn roles() {
         assert!(Role::Owner.has(Ownership));
         assert!(!Role::Admin.has(Ownership));
+        assert!(Role::Admin.has(Security));
         assert!(Role::Admin.has(TeamManage) && Role::Admin.has(BillingWrite));
         assert!(!Role::Manager.has(TeamManage) && !Role::Manager.has(BillingRead) && !Role::Manager.has(ApiKeys) && !Role::Manager.has(Domains));
         assert!(Role::Manager.has(CampaignSend) && Role::Manager.has(FlowLive));

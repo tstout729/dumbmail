@@ -178,11 +178,12 @@ async fn every_route_and_tool_has_a_permission_rule() {
 
     // Every protected rule matches a real route that refuses anonymous callers.
     let mut wrong = Vec::new();
+    let param = regex::Regex::new(r"\{[a-z_]+\}").unwrap();
     for r in access::all_route_rules() {
         if matches!(r.perm, access::Perm::Public) {
             continue;
         }
-        let path = regex::Regex::new(r"\{[a-z_]+\}").unwrap().replace_all(r.path, "0190a000-0000-7000-8000-000000000000").to_string();
+        let path = param.replace_all(r.path, "0190a000-0000-7000-8000-000000000000").to_string();
         let mut b = Request::builder().method(r.method).uri(&path);
         if matches!(r.method, "POST" | "PATCH" | "PUT") {
             b = b.header(header::CONTENT_TYPE, "application/json");
@@ -899,6 +900,9 @@ async fn single_sign_on_with_openid_connect() {
     let (st, err) = call(&h, &mut owner, "PUT", "/api/team/sso", Some(cfg.clone())).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
     sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status) VALUES ($1, $2::uuid, 'mail.acme.test', 'verified')").bind(Uuid::now_v7()).bind(&account_id).execute(&h.state.db).await.unwrap();
+    // A verified subdomain isn't enough: the exact domain must be verified.
+    assert_eq!(status(&h, &mut owner, "PUT", "/api/team/sso", Some(cfg.clone())).await, StatusCode::BAD_REQUEST);
+    sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status) VALUES ($1, $2::uuid, 'acme.test', 'verified')").bind(Uuid::now_v7()).bind(&account_id).execute(&h.state.db).await.unwrap();
     assert_eq!(status(&h, &mut owner, "PUT", "/api/team/sso", Some(json!({"issuer": "http://127.0.0.1:1", "client_id": "c", "client_secret": "s", "domains": ["acme.test"]}))).await, StatusCode::BAD_REQUEST, "a provider we can't reach isn't saved");
     let saved = ok(&h, &mut owner, "PUT", "/api/team/sso", Some(cfg.clone())).await;
     assert_eq!(saved["sso"]["client_secret_hint"], "…cret");
@@ -913,6 +917,15 @@ async fn single_sign_on_with_openid_connect() {
     // Members below admin can't see or change it; API keys never can.
     let (mut manager, _) = join(&h, &mut owner, "pat@acme.test", "manager").await;
     assert_eq!(status(&h, &mut manager, "GET", "/api/team/sso", None).await, StatusCode::FORBIDDEN);
+    // Only owners set it up: an admin could otherwise point it at a provider they run.
+    let (mut admin, _) = join(&h, &mut owner, "ad@other-mail.test", "admin").await;
+    assert_eq!(status(&h, &mut admin, "PUT", "/api/team/sso", Some(cfg.clone())).await, StatusCode::FORBIDDEN);
+    // A login on the domain that isn't a member here is never taken over by the provider.
+    let mut squatter = S::new("198.51.100.62");
+    signup(&h, &mut squatter, "ceo@acme.test", "Squatted").await;
+    assert_eq!(sso_round(&h, &idp, "ceo@acme.test", "idp-ceo", |_| {}).await.err().as_deref(), Some("sso_not_member"));
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM sso_identities WHERE subject = 'idp-ceo'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, 0);
 
     // Someone new signs in through the provider and joins with the default role.
     let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.expect("sso sign-in");

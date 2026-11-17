@@ -13,7 +13,7 @@ API and, for members, invites, API keys and the audit log, over MCP.
 | Role | Can |
 | --- | --- |
 | Owner | Everything, including billing and transferring ownership. |
-| Admin | Everything except transferring ownership. |
+| Admin | Everything except transferring ownership and setting up single sign-on. |
 | Manager | Campaigns (including sending), flows (including turning them live), forms, audience, content and account settings. No billing, team, API keys, domains or phone numbers. |
 | Analyst | Read everything except billing, team management and the audit log, and export. Changes nothing. |
 | Content | Edit templates, images and campaign drafts, and send tests. Can't send or schedule campaigns, change a scheduled campaign, see profiles or export. |
@@ -26,6 +26,7 @@ Rules for owners:
 - Only owners can make someone an owner, change an owner's role or remove an owner.
 - The last owner can't be removed or demoted. Make someone else an owner first, or transfer
   ownership (`POST /api/team/transfer`), which makes the other member the owner and you an admin.
+- Only owners set up single sign-on.
 
 ## Members and invites
 
@@ -140,7 +141,7 @@ details)`.
 
 ## Single sign-on (OpenID Connect)
 
-Owners and admins connect an OpenID Connect identity provider (Okta, Microsoft Entra ID, Google
+Owners connect an OpenID Connect identity provider (Okta, Microsoft Entra ID, Google
 Workspace, Auth0 and others) in Settings → Security, or with `PUT /api/team/sso`:
 
 ```json
@@ -150,8 +151,11 @@ Workspace, Auth0 and others) in Settings → Security, or with `PUT /api/team/ss
 
 - Register `redirect_uri` from the response (`https://<your DumbMail>/api/auth/sso/callback`) with
   the identity provider.
-- Each domain must be one of the account's verified sending domains (or their parent domain), and
-  only one account can use single sign-on for a domain.
+- Each domain must itself be one of the account's verified sending domains (add `acme.com` in
+  Settings → Domains even if you send from `mail.acme.com`), and only one account can use single
+  sign-on for a domain.
+- An existing DumbMail login is connected to its single sign-on identity only when it's already a
+  member of this account. People who have a login but aren't members yet need an invite first.
 - `auto_join` adds people from those domains the first time they sign in, as `default_role`
   (manager, analyst or content). Without it, only existing members can sign in this way.
 - `enforce` makes members on those domains sign in with single sign-on. Owners can still use

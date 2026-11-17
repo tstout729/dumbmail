@@ -3,8 +3,12 @@
 //! provider's published keys) and its issuer, audience, expiry and nonce.
 //!
 //! Trust is kept narrow:
-//! - each email domain an account's SSO covers must be one of its verified sending domains (or
-//!   their parent domain), and only one account can claim a domain;
+//! - only owners set it up;
+//! - each email domain an account's SSO covers must be one of its verified sending domains
+//!   (exactly), and only one account can claim a domain;
+//! - it links to an existing login only when that login is already a member of the account;
+//!   anyone else with a login is invited first. So an identity provider can't take over a login
+//!   it doesn't already share an account with, or one squatted before the company set it up;
 //! - an identity provider can only sign people in with emails on those domains;
 //! - a single sign-on session opens only that account. It can't open the person's other accounts
 //!   or change their password, two-factor or sessions (see `access::allows`).
@@ -215,13 +219,13 @@ pub async fn put_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<
         }
     }
     for d in &domains {
-        let verified: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sending_domains WHERE account_id = $1 AND status = 'verified' AND (domain = $2 OR domain LIKE '%.' || $2))")
+        let verified: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sending_domains WHERE account_id = $1 AND status = 'verified' AND domain = $2)")
             .bind(ctx.account_id)
             .bind(d)
             .fetch_one(&state.db)
             .await?;
         if !verified {
-            return Err(AppError::bad(format!("verify {d} as a sending domain first (Settings → Domains); that's how we know it's yours")));
+            return Err(AppError::bad(format!("verify {d} itself as a sending domain first (Settings → Domains); that's how we know it's yours")));
         }
         let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account_sso WHERE account_id <> $1 AND $2 = ANY(domains))").bind(ctx.account_id).bind(d).fetch_one(&state.db).await?;
         if taken {
@@ -428,7 +432,11 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     }
     let subject = claims.subject().as_str().to_string();
     let name = claims.name().and_then(|n| n.get(None)).map(|n| mail::plain(n.as_str(), 100)).filter(|n| !n.is_empty());
-    let user_id = link_user(state, &cfg.issuer, &subject, &email, name).await.map_err(|_| fail("sso_failed"))?;
+    let user_id = match link_user(state, &cfg, &subject, &email, name).await {
+        Ok(Some(uid)) => uid,
+        Ok(None) => return Err(fail("sso_not_member")),
+        Err(_) => return Err(fail("sso_failed")),
+    };
     let member: Option<String> = sqlx::query_scalar("SELECT role FROM memberships WHERE user_id = $1 AND account_id = $2").bind(user_id).bind(account_id).fetch_optional(&state.db).await.map_err(|_| fail("sso_failed"))?;
     if member.is_none() {
         if !cfg.auto_join {
@@ -446,21 +454,30 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     Ok((user_id, account_id, next))
 }
 
-/// The login for this identity: already linked, else the login with this email, else a new one.
-async fn link_user(state: &AppState, issuer: &str, subject: &str, email: &str, name: Option<String>) -> AppResult<Uuid> {
-    if let Some(uid) = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM sso_identities WHERE issuer = $1 AND subject = $2").bind(issuer).bind(subject).fetch_optional(&state.db).await? {
-        return Ok(uid);
+/// The login for this identity: one already linked to it; else the login with this email, but only
+/// when it's already a member of this account; else a new login (with auto-join). `None`: there's a
+/// login for this email outside the account (they need an invite first), or auto-join is off.
+async fn link_user(state: &AppState, cfg: &Config, subject: &str, email: &str, name: Option<String>) -> AppResult<Option<Uuid>> {
+    if let Some(uid) = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM sso_identities WHERE issuer = $1 AND subject = $2").bind(&cfg.issuer).bind(subject).fetch_optional(&state.db).await? {
+        return Ok(Some(uid));
     }
     let uid = match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1").bind(email).fetch_optional(&state.db).await? {
-        Some(uid) => uid,
-        None => {
+        Some(uid) => {
+            let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(uid).bind(cfg.account_id).fetch_one(&state.db).await?;
+            if !member {
+                return Ok(None);
+            }
+            uid
+        }
+        None if cfg.auto_join => {
             let uid = Uuid::now_v7();
             sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)").bind(uid).bind(email).bind(name).execute(&state.db).await?;
             uid
         }
+        None => return Ok(None),
     };
-    sqlx::query("INSERT INTO sso_identities (issuer, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING").bind(issuer).bind(subject).bind(uid).execute(&state.db).await?;
-    Ok(uid)
+    sqlx::query("INSERT INTO sso_identities (issuer, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING").bind(&cfg.issuer).bind(subject).bind(uid).execute(&state.db).await?;
+    Ok(Some(uid))
 }
 
 #[cfg(test)]
