@@ -182,7 +182,7 @@ Each route and tool needs a permission (see `dumbmail://docs/team`; API keys nee
 | `POST /api/content/starters/{key}/template`, `create_template_from_starter` | `content.write` |
 | `POST /api/content/video-thumbnail`, `make_video_thumbnail` (stores an image; requests the address) | `content.write` |
 | `DELETE /api/content/saved-blocks/{id}?confirm=true`, `delete_saved_block` with `confirm: true` (without it, a dry run that says where it's used) | `content.write`, like deleting a template |
-| `POST /api/content/check`, `check_email` | `content.write`; counting recipients and trying personalization and display rules on them also needs `profiles.read` (without it those findings are left out and `people_not_checked` says so) |
+| `POST /api/content/check`, `check_email` | `content.write`; checking a saved campaign or flow email (`campaign_id`, `flow_id`) also needs `messaging.read`; counting recipients and trying personalization and display rules on them also needs `profiles.read` (without it those findings are left out and `people_not_checked` says so) |
 | `/e/icons/{file}`, `/e/assets/{file}`, `/e/countdown/{file}` | none (images in sent email; countdown addresses are signed) |
 
 Previewing as a real person (`POST /api/render` with `profile_id`) needs `profiles.read`; without it the preview uses the sample person. Saved-block changes and templates made from starters are recorded in the audit log.

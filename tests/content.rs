@@ -838,6 +838,10 @@ async fn permissions_follow_the_table() {
     let r: Value = serde_json::from_str(&out).unwrap();
     let ids: Vec<&str> = r["findings"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"people_not_checked") && !ids.contains(&"personalization_empty") && r["recipients"].is_null(), "{r}");
+    // Checking a saved campaign reads it: that needs messaging.read too.
+    let camp = h.ok("POST", "/api/campaigns", Some(json!({"name": "C", "content": {"subject": "s", "blocks": [{"type": "text", "html": "<p>secret plan</p>"}]}}))).await;
+    let (s, _, out) = h.raw("POST", "/api/content/check", &[("authorization", &auth), ("content-type", "application/json")], &json!({"campaign_id": camp["id"], "skip_links": true}).to_string()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{out}");
     // The owner gets the counts.
     let r = h.ok("POST", "/api/content/check", Some(serde_json::from_str(&body).unwrap())).await;
     assert_eq!(r["recipients"], 1, "{r}");

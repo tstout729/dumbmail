@@ -240,8 +240,17 @@ async fn from_starter_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path
 
 // ---------- Checks, video thumbnails ----------
 
+/// Run the checks for `ctx`: checking a saved campaign or flow email reads it, so that needs
+/// messaging.read as well; recipients' data needs profiles.read (see [`check::run`]).
+async fn check_for(state: &AppState, ctx: &Ctx, b: check::Input) -> AppResult<Value> {
+    if b.campaign_id.is_some() || b.flow_id.is_some() {
+        ctx.require(Perm::MessagingRead)?;
+    }
+    check::run(state, ctx.account_id, b, ctx.can(Perm::ProfilesRead)).await
+}
+
 async fn check_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<check::Input>) -> AppResult<Json<Value>> {
-    Ok(Json(check::run(&state, ctx.account_id, b, ctx.can(Perm::ProfilesRead)).await?))
+    Ok(Json(check_for(&state, &ctx, b).await?))
 }
 
 #[derive(Deserialize)]
@@ -341,7 +350,7 @@ impl Feature for Module {
                     let key = a["key"].as_str().ok_or_else(|| AppError::bad("key is required"))?;
                     template_from_starter(state, ctx, key, a["name"].as_str().map(String::from)).await
                 }
-                "check_email" => check::run(state, acct, from(a.clone())?, ctx.can(Perm::ProfilesRead)).await,
+                "check_email" => check_for(state, ctx, from(a.clone())?).await,
                 "make_video_thumbnail" => video::thumbnail(state, acct, a["video_url"].as_str(), a["image_url"].as_str()).await,
                 _ => unreachable!("checked above"),
             }
