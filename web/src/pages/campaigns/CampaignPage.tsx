@@ -23,6 +23,7 @@ import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
+import { CouponSendCheck } from "../../features/coupons/CouponSendCheck";
 import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
 import {
   addVersion,
@@ -351,7 +352,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
       {confirmSend ? (
         <ConfirmDialog
           title="Send this campaign now?"
-          body={localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+          body={
+            <>
+              {localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+              <CouponSendCheck campaignId={campaign.id} />
+            </>
+          }
           confirmLabel="Send now"
           loading={send.isPending || update.isPending}
           onConfirm={async () => {
