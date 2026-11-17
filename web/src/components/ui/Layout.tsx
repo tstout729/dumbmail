@@ -165,28 +165,33 @@ type TabsProps<T extends string> = {
 };
 
 export function Tabs<T extends string>({ value, onChange, tabs }: TabsProps<T>) {
+  // The scroller and the underline are separate boxes. Each tab's -mb-px overlaps the inner box's own
+  // border, so nothing spills out of the scroller and it never grows a scrollbar for a 1px overflow.
+  // Many tabs on a narrow screen still swipe sideways; the scrollbar itself stays hidden.
   return (
-    <div className="mb-4 flex gap-1 overflow-x-auto border-b border-zinc-200" role="tablist">
-      {tabs.map((t) => (
-        <button
-          key={t.value}
-          role="tab"
-          type="button"
-          aria-selected={value === t.value}
-          onClick={() => onChange(t.value)}
-          className={cx(
-            "-mb-px flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-            value === t.value
-              ? "border-accent-700 text-zinc-950"
-              : "border-transparent text-zinc-500 hover:text-zinc-900",
-          )}
-        >
-          {t.label}
-          {t.count !== undefined ? (
-            <span className="rounded-full bg-zinc-100 px-1.5 text-[11px] text-zinc-600">{t.count}</span>
-          ) : null}
-        </button>
-      ))}
+    <div className="mb-4 min-w-0 max-w-full overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div className="flex w-max min-w-full gap-1 border-b border-zinc-200" role="tablist">
+        {tabs.map((t) => (
+          <button
+            key={t.value}
+            role="tab"
+            type="button"
+            aria-selected={value === t.value}
+            onClick={() => onChange(t.value)}
+            className={cx(
+              "-mb-px flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+              value === t.value
+                ? "border-accent-700 text-zinc-950"
+                : "border-transparent text-zinc-500 hover:text-zinc-900",
+            )}
+          >
+            {t.label}
+            {t.count !== undefined ? (
+              <span className="rounded-full bg-zinc-100 px-1.5 text-[11px] text-zinc-600">{t.count}</span>
+            ) : null}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

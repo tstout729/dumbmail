@@ -202,6 +202,20 @@ pub struct NewEvent<'a> {
     pub message_id: Option<Uuid>,
 }
 
+/// Fill a subscriber's `timezone` and `country` properties from their browser's time zone, keeping any
+/// values already set. Unknown zone names are ignored.
+pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str) -> AppResult<()> {
+    let tz = tz.trim();
+    let Some(country) = crate::tz_countries::country(tz) else { return Ok(()) };
+    sqlx::query("UPDATE profiles SET properties = jsonb_build_object('timezone', $2::text, 'country', $3::text) || properties WHERE id = $1")
+        .bind(profile_id)
+        .bind(tz)
+        .bind(country)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// Record an event and wake any live flows triggered by that metric. Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;

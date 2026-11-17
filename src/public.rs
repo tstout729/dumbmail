@@ -160,7 +160,7 @@ fn page(title: &str, body: &str, color: &str) -> Html<String> {
 <style>body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f4f5;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center}}
 .c{{background:#fff;border-radius:12px;padding:32px;max-width:420px;width:calc(100% - 32px);box-shadow:0 1px 3px rgba(0,0,0,.08)}}h1{{font-size:22px;margin:0 0 12px}}p{{color:#4b5563;line-height:1.5}}
 button,input[type=submit]{{background:{color};color:#fff;border:0;border-radius:8px;padding:12px 20px;font-size:16px;font-weight:600;cursor:pointer;width:100%}}
-input[type=email],input[type=tel],input[type=text]{{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:8px;font-size:16px;margin:0 0 10px}}label{{font-size:13px;color:#4b5563}}</style></head><body><div class="c">{body}</div></body></html>"#,
+input[type=email],input[type=tel],input[type=text]{{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:8px;font-size:16px;margin:0 0 10px}}label{{font-size:13px;color:#4b5563}}input[type=checkbox]{{accent-color:{color}}}</style></head><body><div class="c">{body}</div></body></html>"#,
         t = esc(title)
     ))
 }
@@ -178,6 +178,10 @@ async fn unsubscribe_page(State(state): State<AppState>, Path(token): Path<Strin
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+    // Email with preference lists: let them choose lists instead of only leaving everything.
+    if let Some(lists) = preference_lists(&state, &m).await {
+        return page("Email preferences", &crate::preferences::form_html(&name, &lists, None), &color).into_response();
+    }
     let what = if m.channel == "sms" { "text messages" } else { "marketing emails" };
     page(
         "Unsubscribe",
@@ -187,9 +191,36 @@ async fn unsubscribe_page(State(state): State<AppState>, Path(token): Path<Strin
     .into_response()
 }
 
-async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+/// The preference-page lists for this email's recipient, when there are any and they haven't already
+/// unsubscribed from all email. None means show the plain unsubscribe page.
+async fn preference_lists(state: &AppState, m: &Msg) -> Option<Vec<crate::preferences::PrefList>> {
+    if m.channel != "email" {
+        return None;
+    }
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE id = $1").bind(m.profile_id).fetch_optional(&state.db).await.ok()??;
+    if consent == "unsubscribed" {
+        return None;
+    }
+    let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.ok()?;
+    (!lists.is_empty()).then_some(lists)
+}
+
+async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>, body: Bytes) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
+    if let (crate::preferences::Choice::Save(keep), "email") = (crate::preferences::parse_choice(&body), m.channel.as_str()) {
+        let a = account_for_msg(&state, &m).await;
+        let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+        let notice = if m.is_test {
+            "This was a test email, so nothing changed."
+        } else if crate::preferences::save(&state.db, m.account_id, m.profile_id, &keep, Some((m.id, m.campaign_id, m.flow_id))).await.is_ok() {
+            "Saved. Your preferences are updated."
+        } else {
+            "Something went wrong. Please try again."
+        };
+        let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.unwrap_or_default();
+        return page("Email preferences", &crate::preferences::form_html(&name, &lists, Some(notice)), &color).into_response();
+    }
     let col = if m.channel == "sms" { "sms_consent" } else { "email_consent" };
     let changed: Result<Option<Uuid>, _> = sqlx::query_scalar(&format!(
         "UPDATE profiles SET {col} = 'unsubscribed', updated_at = now() WHERE id = $1 AND {col} <> 'unsubscribed' RETURNING id"
@@ -552,6 +583,9 @@ pub struct SubscribeBody {
     /// The A/B test version the visitor saw.
     #[serde(default)]
     variant: Option<String>,
+    /// The browser's IANA time zone; fills the profile's `timezone` and `country` when they're missing.
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 /// Count a view or sign-up for a form's A/B test version. Returns the version when the form is testing it.
@@ -599,6 +633,9 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     };
     let upserted = audience::upsert_profile_public(&state.db, account.id, &input).await?;
     let p = upserted.profile;
+    if let Some(tz) = &b.timezone {
+        audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
+    }
     // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
     if double_opt_in && upserted.created {
         sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;
@@ -646,6 +683,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 first_name: pairs.get("first_name").cloned(),
                 sms_consent: pairs.contains_key("sms_consent"),
                 variant: pairs.get("variant").cloned(),
+                timezone: None,
             }
         } else {
             serde_json::from_slice(&body)?

@@ -2361,3 +2361,212 @@ async fn email_links_use_the_shared_link_domain() {
     let (s, _) = h.req("POST", "/api/account/link-domain", Some(json!({"domain": "links.pl.test"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
+
+/// Emails of everyone matching segment rules, sorted (via the preview endpoint).
+async fn matching(h: &mut Harness, def: Value) -> Vec<String> {
+    let v = h.ok("POST", "/api/segments/preview", Some(json!({"definition": def}))).await;
+    let mut out: Vec<String> = v["sample"].as_array().unwrap().iter().map(|p| p["email"].as_str().unwrap().to_string()).collect();
+    out.sort();
+    assert_eq!(v["count"].as_u64().unwrap() as usize, out.len(), "sample covers every match in these small tests");
+    out
+}
+
+fn one(c: Value) -> Value {
+    json!({"match": "all", "conditions": [c]})
+}
+
+#[tokio::test]
+async fn smart_segment_rules() {
+    use chrono::{Datelike, Duration, Utc};
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let la = |d: i64| (Utc::now() + Duration::days(d)).with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
+    let order = |email: &str, days_ago: i64, value: f64, n: u32| {
+        json!({"metric": "Placed Order", "profile": {"email": email}, "value": value, "unique_id": format!("{email}-{n}"),
+               "time": (Utc::now() - Duration::days(days_ago)).to_rfc3339()})
+    };
+    // Ann: 3 orders, 30 days apart, last 40 days ago ($600). Bob: one order 10 days ago. Cat: one order 200 days ago.
+    for (i, (d, v)) in [(100, 100.0), (70, 200.0), (40, 300.0)].into_iter().enumerate() {
+        h.ok("POST", "/api/events", Some(order("ann@x.test", d, v, i as u32))).await;
+    }
+    h.ok("POST", "/api/events", Some(order("bob@x.test", 10, 50.0, 0))).await;
+    h.ok("POST", "/api/events", Some(order("cat@x.test", 200, 20.0, 0))).await;
+    let today = la(0);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "dan@x.test", "properties": {"birthday": format!("1990-{:02}-{:02}", today.month(), today.day()), "country": "CA"}}))).await;
+    let far = la(180);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ann@x.test", "properties": {"birthday": format!("1985-{:02}-{:02}", far.month(), far.day())}}))).await;
+
+    let ev = |extra: Value| {
+        let mut c = json!({"type": "event_value", "metric": "Placed Order", "aggregate": "sum"});
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        one(c)
+    };
+    assert_eq!(matching(&mut h, ev(json!({"op": "gte", "value": 500}))).await, ["ann@x.test"]);
+    assert_eq!(matching(&mut h, ev(json!({"op": "gt", "value": 0, "within_days": 30}))).await, ["bob@x.test"]);
+    assert_eq!(matching(&mut h, ev(json!({"aggregate": "average", "op": "between", "value": [150, 250]}))).await, ["ann@x.test"]);
+    assert_eq!(matching(&mut h, ev(json!({"op": "eq", "value": 0}))).await, ["dan@x.test"], "no orders sum to 0");
+
+    // Calendar window in the account's time zone: orders 75 to 35 days ago are Ann's last two.
+    let window = one(json!({"type": "event", "metric": "Placed Order", "op": "at_least", "count": 2, "since": la(-75).to_string(), "until": la(-35).to_string()}));
+    assert_eq!(matching(&mut h, window).await, ["ann@x.test"]);
+
+    let last = |op: &str, value: Value| one(json!({"type": "event_time", "metric": "Placed Order", "which": "last", "op": op, "value": value}));
+    assert_eq!(matching(&mut h, last("more_than_days_ago", json!(30))).await, ["ann@x.test", "cat@x.test"]);
+    assert_eq!(matching(&mut h, last("after", json!(la(-20).to_string()))).await, ["bob@x.test"]);
+    let first = one(json!({"type": "event_time", "metric": "Placed Order", "which": "first", "op": "between", "value": [la(-105).to_string(), la(-95).to_string()]}));
+    assert_eq!(matching(&mut h, first).await, ["ann@x.test"]);
+
+    let pred = |measure: &str, op: &str, value: Value| one(json!({"type": "prediction", "measure": measure, "op": op, "value": value}));
+    assert_eq!(matching(&mut h, pred("churn_risk", "eq", json!("high"))).await, ["cat@x.test"]);
+    assert_eq!(matching(&mut h, pred("churn_risk", "in", json!(["medium", "high"]))).await, ["ann@x.test", "cat@x.test"]);
+    assert_eq!(matching(&mut h, pred("churn_risk", "eq", json!("low"))).await, ["bob@x.test"], "one-time buyers use a 90-day gap");
+    assert_eq!(matching(&mut h, pred("expected_next_order_in_days", "lt", json!(0))).await, ["ann@x.test"]);
+    assert_eq!(matching(&mut h, pred("predicted_clv", "gt", json!(1000))).await, ["ann@x.test"]);
+    assert_eq!(matching(&mut h, pred("order_count", "eq", json!(0))).await, ["dan@x.test"]);
+    assert_eq!(matching(&mut h, pred("historic_clv", "between", json!([40, 60]))).await, ["bob@x.test"]);
+
+    let prop = |field: &str, op: &str, value: Value| one(json!({"type": "property", "field": field, "op": op, "value": value}));
+    assert_eq!(matching(&mut h, prop("birthday", "anniversary_within_days", json!(0))).await, ["dan@x.test"]);
+    assert_eq!(matching(&mut h, prop("country", "in", json!(["ca"]))).await, ["dan@x.test"]);
+    assert_eq!(matching(&mut h, prop("country", "not_in", json!(["CA"]))).await.len(), 3, "missing values aren't in the list");
+    assert_eq!(matching(&mut h, prop("email", "ends_with", json!("@X.TEST"))).await.len(), 4);
+    assert_eq!(matching(&mut h, prop("created_at", "between", json!([la(-1).to_string(), la(1).to_string()]))).await.len(), 4);
+
+    // Engagement and reachability.
+    let engaged = |engaged: bool| one(json!({"type": "engagement", "channel": "any", "engaged": engaged, "within_days": 30}));
+    assert_eq!(matching(&mut h, engaged(true)).await, ["bob@x.test"]);
+    assert_eq!(matching(&mut h, engaged(false)).await.len(), 3);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bob@x.test", "email_consent": "unsubscribed"}))).await;
+    assert_eq!(matching(&mut h, one(json!({"type": "can_receive", "channel": "email"}))).await, ["ann@x.test", "cat@x.test", "dan@x.test"]);
+    assert_eq!(matching(&mut h, one(json!({"type": "can_receive", "channel": "sms"}))).await.len(), 0);
+    assert_eq!(matching(&mut h, one(json!({"type": "suppressed"}))).await.len(), 0);
+
+    // Random samples are stable for a seed and cover everyone at 100%.
+    let sample = one(json!({"type": "random", "percent": 50, "seed": "s1"}));
+    let a = matching(&mut h, sample.clone()).await;
+    assert_eq!(a, matching(&mut h, sample).await);
+    assert_eq!(matching(&mut h, one(json!({"type": "random", "percent": 100}))).await.len(), 4);
+
+    // Segments inside segments, live; no self-reference; no deleting a segment another one uses.
+    let big = h.ok("POST", "/api/segments", Some(json!({"name": "Big spenders", "definition": ev(json!({"op": "gte", "value": 500}))}))).await;
+    let big_id = big["id"].as_str().unwrap().to_string();
+    assert_eq!(big["member_count"], 1);
+    assert_eq!(matching(&mut h, one(json!({"type": "segment", "segment_id": big_id, "op": "not_in"}))).await, ["bob@x.test", "cat@x.test", "dan@x.test"]);
+    let others = h.ok("POST", "/api/segments", Some(json!({"name": "Everyone else", "definition": one(json!({"type": "segment", "segment_id": big_id, "op": "not_in"}))}))).await;
+    assert_eq!(others["member_count"], 3);
+    let (s, v) = h.req("PATCH", &format!("/api/segments/{big_id}"), Some(json!({"definition": one(json!({"type": "segment", "segment_id": others["id"]}))}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a loop through another segment: {v}");
+    let (s, v) = h.req("DELETE", &format!("/api/segments/{big_id}"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    // Bob spends more: the outer segment follows the inner rules without a refresh.
+    h.ok("POST", "/api/events", Some(order("bob@x.test", 1, 600.0, 1))).await;
+    let others_id = others["id"].as_str().unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/segments/{others_id}"), None).await["member_count"], 2);
+    // The scheduler refreshes every segment.
+    sqlx::query("UPDATE segments SET refreshed_at = now() - interval '1 hour'").execute(&h.state.db).await.unwrap();
+    jobs::scheduler_tick(&h.state, 15).await.unwrap();
+    h.drain().await;
+    let refreshed: i64 = sqlx::query_scalar("SELECT count(*) FROM segments WHERE refreshed_at > now() - interval '1 minute'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(refreshed, 2);
+
+    // Sign-up forms: source and the browser's time zone.
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Footer", "kind": "embed", "list_id": list["id"]}))).await;
+    let form_id = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{form_id}"), Some(json!({"status": "live"}))).await;
+    let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")],
+        &json!({"form_id": form_id, "email": "eve@x.test", "timezone": "Asia/Calcutta"}).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(matching(&mut h, one(json!({"type": "form", "form_id": form_id, "within_days": 1}))).await, ["eve@x.test"]);
+    assert_eq!(matching(&mut h, one(json!({"type": "form"}))).await, ["eve@x.test"]);
+    assert_eq!(matching(&mut h, prop("country", "eq", json!("IN"))).await, ["eve@x.test"]);
+    assert_eq!(matching(&mut h, prop("timezone", "eq", json!("Asia/Calcutta"))).await, ["eve@x.test"]);
+
+    // Every rule type together runs as valid SQL.
+    let all = json!({"match": "any", "conditions": [
+        {"type": "message", "action": "clicked", "campaign_id": uuid::Uuid::now_v7()},
+        {"type": "message", "action": "received", "flow_id": uuid::Uuid::now_v7(), "op": "has_not", "within_days": 7},
+        {"type": "suppressed", "value": false}, {"type": "consent", "channel": "sms", "status": "pending"},
+        {"type": "event", "metric": "Opened Email", "op": "zero", "where": [{"field": "campaign_id", "op": "exists"}]},
+        {"type": "group", "match": "all", "conditions": [{"type": "list", "list_id": list["id"]}, {"type": "segment", "segment_id": big_id}]}]});
+    assert_eq!(matching(&mut h, all).await.len(), 5);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn preference_page_lets_people_choose_lists() {
+    let mut h = harness!();
+    h.signup().await;
+    let news = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter", "show_on_preferences": true, "description": "Every Friday"}))).await;
+    let drops = h.ok("POST", "/api/lists", Some(json!({"name": "New drops"}))).await;
+    let hidden = h.ok("POST", "/api/lists", Some(json!({"name": "Internal VIP"}))).await;
+    let drops_id = drops["id"].as_str().unwrap().to_string();
+    let drops = h.ok("PATCH", &format!("/api/lists/{drops_id}"), Some(json!({"show_on_preferences": true}))).await;
+    assert_eq!(drops["show_on_preferences"], true);
+    assert_eq!(news["description"], "Every Friday");
+    let ids = |v: &Value| v["id"].as_str().unwrap().to_string();
+    for l in [&news, &hidden] {
+        h.ok("POST", &format!("/api/lists/{}/members", ids(l)), Some(json!({"emails": ["bob@x.test"]}))).await;
+    }
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bob@x.test", "email_consent": "subscribed"}))).await;
+
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Hello", "channel": "email", "audience": {"include": [{"type": "list", "id": ids(&hidden)}], "exclude": []},
+        "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", ids(&c)), None).await;
+    h.drain().await;
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "bob@x.test").unwrap();
+    let unsub = mail.unsubscribe_url.unwrap().replace("https://pl.test", "");
+
+    let (s, _, body) = h.raw("GET", &unsub, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Email preferences") && body.contains("Newsletter") && body.contains("Every Friday") && body.contains("New drops"), "{body}");
+    assert!(!body.contains("Internal VIP"), "only preference lists are shown");
+
+    // Keep only New drops: leaves Newsletter, joins New drops, leaves hidden lists and consent alone.
+    let form = "content-type";
+    let (s, _, body) = h.raw("POST", &unsub, &[(form, "application/x-www-form-urlencoded")], &format!("action=save&list={drops_id}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Saved"), "{body}");
+    let count = |v: Value| v["member_count"].as_i64().unwrap();
+    assert_eq!(count(h.ok("GET", &format!("/api/lists/{}", ids(&news)), None).await), 0);
+    assert_eq!(count(h.ok("GET", &format!("/api/lists/{drops_id}"), None).await), 1);
+    assert_eq!(count(h.ok("GET", &format!("/api/lists/{}", ids(&hidden)), None).await), 1);
+    let bob = h.ok("GET", "/api/profiles?q=bob", None).await["data"][0].clone();
+    assert_eq!(bob["email_consent"], "subscribed");
+    let left = one(json!({"type": "event", "metric": "Unsubscribed from List", "op": "at_least", "count": 1, "where": [{"field": "list_id", "op": "eq", "value": ids(&news)}]}));
+    assert_eq!(matching(&mut h, left).await, ["bob@x.test"]);
+
+    // Mail apps' one-click unsubscribe still unsubscribes from all email; then the page is the plain one.
+    let (s, _, _) = h.raw("POST", &unsub, &[(form, "application/x-www-form-urlencoded")], "List-Unsubscribe=One-Click").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.ok("GET", "/api/profiles?q=bob", None).await["data"][0]["email_consent"], "unsubscribed");
+    let (_, _, body) = h.raw("GET", &unsub, &[], "").await;
+    assert!(!body.contains("Email preferences"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn healthz_reports_the_build() {
+    let h = harness!();
+    let (s, _, body) = h.raw("GET", "/healthz", &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["git_sha"].is_string());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn nested_segments_cannot_blow_up() {
+    let mut h = harness!();
+    h.signup().await;
+    // Each level includes the one below 30 times: 30, then 900 uses. The second level is refused.
+    let base = h.ok("POST", "/api/segments", Some(json!({"name": "Base", "definition": one(json!({"type": "consent", "channel": "email", "status": "subscribed"}))}))).await;
+    let many = |id: &Value| json!({"match": "any", "conditions": (0..30).map(|_| json!({"type": "segment", "segment_id": id})).collect::<Vec<_>>()});
+    let mid = h.ok("POST", "/api/segments", Some(json!({"name": "Mid", "definition": many(&base["id"])}))).await;
+    let (s, v) = h.req("POST", "/api/segments", Some(json!({"name": "Top", "definition": many(&mid["id"])}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("too many times"), "{v}");
+    h.cleanup().await;
+}

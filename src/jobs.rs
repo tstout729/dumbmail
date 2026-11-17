@@ -163,10 +163,17 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     sqlx::query("UPDATE jobs SET locked_at = NULL WHERE locked_at < now() - interval '15 minutes' AND run_at <> 'infinity'")
         .execute(&state.db)
         .await?;
-    // Every ~5 minutes: refresh segments used by live flows; hourly-ish: date property flows.
+    // Every ~5 minutes: refresh segments used by live flows, and every other segment once it's 15
+    // minutes old, so member counts stay current. Skips segments that already have a refresh queued.
+    // Hourly-ish: date property flows.
     if tick.is_multiple_of(15) {
         let segs: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT DISTINCT (trigger->>'segment_id')::uuid FROM flows WHERE status = 'live' AND trigger->>'type' = 'segment'",
+            "SELECT s.id FROM segments s
+             WHERE (s.refreshed_at IS NULL OR s.refreshed_at < now() - interval '15 minutes'
+                    OR EXISTS (SELECT 1 FROM flows f WHERE f.status = 'live' AND f.trigger->>'type' = 'segment' AND f.trigger->>'segment_id' = s.id::text))
+               AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'segment_refresh' AND j.payload->>'segment_id' = s.id::text AND j.run_at <> 'infinity')
+             ORDER BY s.refreshed_at NULLS FIRST
+             LIMIT 500",
         )
         .fetch_all(&state.db)
         .await?;

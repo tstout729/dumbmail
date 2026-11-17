@@ -929,6 +929,7 @@
       var form = e.target, d = { form_id: f.id, variant: f.version || null }, err = form.querySelector("[data-pl-err]"), btn = form.querySelector("button[type=submit]");
       ["email", "phone_number", "first_name"].forEach(function (n) { var i = form.querySelector("[name=" + n + "]"); if (i && i.value) d[n] = i.value.trim(); });
       var cb = form.querySelector("[name=sms_consent]"); d.sms_consent = !!(cb && cb.checked);
+      try { d.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { /* old browsers */ }
       if (form.querySelector("[name=email]") && !d.email) { err.textContent = "Enter your email address."; return; }
       if (d.phone_number && !d.sms_consent) { err.textContent = "Check the box to agree to texts, or leave the number blank."; return; }
       btn.disabled = true; btn.style.opacity = ".7"; err.textContent = "";

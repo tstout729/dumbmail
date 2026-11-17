@@ -1,11 +1,11 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState, type FormEvent } from "react";
 import { useNavigate, useParams } from "react-router";
-import { MoreHorizontal, Search, Trash2, Upload, UserPlus } from "lucide-react";
-import { useAddListMembers, useDeleteList, useList, useProfiles, useRemoveListMembers, useUpdateList } from "../../api";
+import { MoreHorizontal, Search, Settings2, Trash2, Upload, UserPlus } from "lucide-react";
+import { type List, useAddListMembers, useDeleteList, useList, useProfiles, useRemoveListMembers, useUpdateList } from "../../api";
 import { ImportDialog } from "../../components/audience/ImportDialog";
 import { ProfilesTable } from "../../components/audience/ProfilesTable";
-import { Badge, Button, ConfirmDialog, Field, IconButton, Input, Menu, Modal, Page, PageHeader, Skeleton, Textarea } from "../../components/ui";
+import { Badge, Button, Checkbox, ConfirmDialog, Field, IconButton, Input, Menu, Modal, Page, PageHeader, Skeleton, Textarea } from "../../components/ui";
 import { useDebouncedValue } from "../../lib/hooks";
 import { pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
@@ -19,7 +19,7 @@ export function ListDetailPage() {
   const debouncedQ = useDebouncedValue(q, 250);
   const [offset, setOffset] = useState(0);
   const profiles = useProfiles({ list_id: id, q: debouncedQ || undefined, limit, offset });
-  const [dialog, setDialog] = useState<"import" | "add" | "delete" | null>(null);
+  const [dialog, setDialog] = useState<"import" | "add" | "delete" | "settings" | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [name, setName] = useState<string | null>(null);
   const rename = useUpdateList(id);
@@ -64,6 +64,7 @@ export function ListDetailPage() {
             />
               <Badge tone="blue">List</Badge>
               {list.data.double_opt_in ? <Badge>Double opt-in</Badge> : null}
+              {list.data.show_on_preferences ? <Badge>On preference page</Badge> : null}
             </span>
           ) : (
             <Skeleton className="h-7 w-48" />
@@ -84,7 +85,10 @@ export function ListDetailPage() {
                   <MoreHorizontal className="size-4" />
                 </IconButton>
               )}
-              items={[{ label: "Delete list", icon: <Trash2 className="size-3.5" />, danger: true, onSelect: () => setDialog("delete") }]}
+              items={[
+                { label: "Settings", icon: <Settings2 className="size-3.5" />, onSelect: () => setDialog("settings") },
+                { label: "Delete list", icon: <Trash2 className="size-3.5" />, danger: true, onSelect: () => setDialog("delete") },
+              ]}
             />
           </>
         }
@@ -133,6 +137,7 @@ export function ListDetailPage() {
       />
       {dialog === "import" ? <ImportDialog listId={id} onClose={() => setDialog(null)} /> : null}
       {dialog === "add" ? <AddMembersDialog listId={id} onClose={() => setDialog(null)} /> : null}
+      {dialog === "settings" && list.data ? <ListSettingsDialog list={list.data} onClose={() => setDialog(null)} /> : null}
       {dialog === "delete" ? (
         <ConfirmDialog
           title="Delete this list?"
@@ -145,6 +150,56 @@ export function ListDetailPage() {
         />
       ) : null}
     </Page>
+  );
+}
+
+function ListSettingsDialog({ list, onClose }: { list: List; onClose: () => void }) {
+  const update = useUpdateList(list.id);
+  const [doubleOptIn, setDoubleOptIn] = useState(list.double_opt_in);
+  const [onPreferences, setOnPreferences] = useState(list.show_on_preferences);
+  const [description, setDescription] = useState(list.description);
+  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    update.mutate(
+      { double_opt_in: doubleOptIn, show_on_preferences: onPreferences, description: description.trim() },
+      {
+        onSuccess: () => {
+          toast.success("List settings saved");
+          onClose();
+        },
+      },
+    );
+  };
+  return (
+    <Modal title="List settings" onClose={onClose} size="sm">
+      <form onSubmit={onSubmit} className="space-y-4">
+        <Checkbox
+          checked={doubleOptIn}
+          onChange={(e) => setDoubleOptIn(e.target.checked)}
+          label="Double opt-in"
+          description="People who sign up through a form confirm by email before they join."
+        />
+        <Checkbox
+          checked={onPreferences}
+          onChange={(e) => setOnPreferences(e.target.checked)}
+          label="Show on the preference page"
+          description="The unsubscribe link in your emails opens a page where people can join or leave this list themselves, instead of only unsubscribing from everything."
+        />
+        {onPreferences ? (
+          <Field label="Description on the preference page" hint="Optional. Tell people what they'll get.">
+            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} placeholder="New arrivals every Friday" />
+          </Field>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="primary" loading={update.isPending}>
+            Save
+          </Button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 

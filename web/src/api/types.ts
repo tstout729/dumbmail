@@ -120,19 +120,38 @@ export type PropOp =
   | "contains"
   | "not_contains"
   | "starts_with"
+  | "ends_with"
   | "exists"
   | "not_exists"
   | "gt"
   | "gte"
   | "lt"
   | "lte"
+  | "between"
   | "in"
+  | "not_in"
   | "within_last_days"
-  | "more_than_days_ago";
+  | "more_than_days_ago"
+  | "anniversary_within_days";
 
 export type FieldFilter = { field: string; op: PropOp; value?: unknown };
 
 export type EventCountOp = "at_least" | "at_most" | "exactly" | "zero";
+export type CmpOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "between";
+export type TimeOp = "within_last_days" | "more_than_days_ago" | "before" | "after" | "between";
+export type HasOp = "has" | "has_not";
+export type Prediction =
+  | "historic_clv"
+  | "predicted_clv"
+  | "order_count"
+  | "average_order_value"
+  | "days_since_last_order"
+  | "average_days_between_orders"
+  | "expected_next_order_in_days"
+  | "churn_risk";
+
+/** Time window for event rules. since/until are YYYY-MM-DD days in the account's time zone. */
+export type EventWindow = { within_days?: number; since?: string; until?: string };
 
 export type PropertyCondition = { type: "property"; field: string; op: PropOp; value?: unknown };
 export type EventCondition = {
@@ -140,18 +159,65 @@ export type EventCondition = {
   metric: string;
   op: EventCountOp;
   count?: number;
-  within_days?: number;
+  where?: FieldFilter[];
+} & EventWindow;
+export type EventValueCondition = {
+  type: "event_value";
+  metric: string;
+  aggregate: "sum" | "average" | "min" | "max";
+  field?: string;
+  op: CmpOp;
+  value: number | [number, number];
+  where?: FieldFilter[];
+} & EventWindow;
+export type EventTimeCondition = {
+  type: "event_time";
+  metric: string;
+  which: "first" | "last";
+  op: TimeOp;
+  value: number | string | [string, string];
   where?: FieldFilter[];
 };
 export type ListCondition = { type: "list"; list_id: string; op: "in" | "not_in" };
+export type SegmentRefCondition = { type: "segment"; segment_id: string; op: "in" | "not_in" };
 export type ConsentCondition = { type: "consent"; channel: "email" | "sms"; status: Consent };
+export type CanReceiveCondition = { type: "can_receive"; channel: "email" | "sms"; value: boolean };
+export type SuppressedCondition = { type: "suppressed"; value: boolean };
+export type FormCondition = { type: "form"; form_id?: string; op: HasOp } & EventWindow;
+export type EngagementCondition = { type: "engagement"; channel: "email" | "sms" | "any"; engaged: boolean; within_days: number };
+export type MessageCondition = {
+  type: "message";
+  action: "received" | "opened" | "clicked";
+  campaign_id?: string;
+  flow_id?: string;
+  op: HasOp;
+  within_days?: number;
+};
+export type PredictionCondition = {
+  type: "prediction";
+  measure: Prediction;
+  op: CmpOp | "in";
+  value: number | [number, number] | string | string[];
+  metric?: string;
+};
+export type RandomCondition = { type: "random"; percent: number; seed?: string };
 export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: Condition[] };
 
 export type Condition =
   | PropertyCondition
   | EventCondition
+  | EventValueCondition
+  | EventTimeCondition
   | ListCondition
+  | SegmentRefCondition
   | ConsentCondition
+  | CanReceiveCondition
+  | SuppressedCondition
+  | FormCondition
+  | EngagementCondition
+  | MessageCondition
+  | PredictionCondition
+  | RandomCondition
   | GroupCondition;
 
 export type SegmentDefinition = { match: "all" | "any"; conditions: Condition[] };
@@ -372,6 +438,10 @@ export type List = {
   id: string;
   name: string;
   double_opt_in: boolean;
+  /** Listed on the preference page people reach from an email's unsubscribe link. */
+  show_on_preferences: boolean;
+  /** Shown under the name on the preference page. */
+  description: string;
   member_count: number;
   created_at: string;
 };

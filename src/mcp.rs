@@ -143,8 +143,27 @@ fn tools() -> Vec<Value> {
             "include": {"type": "array", "items": {"type": "object", "properties": {"type": {"enum": ["list", "segment"]}, "id": {"type": "string"}}, "required": ["type", "id"]}},
             "exclude": {"type": "array", "items": {"type": "object", "properties": {"type": {"enum": ["list", "segment"]}, "id": {"type": "string"}}, "required": ["type", "id"]}}
         }, "required": ["include"]});
-    let segment_def = json!({"type": "object", "description": "Segment rules: {match: 'all'|'any', conditions: [...]}. Condition types: property {field, op, value}, event {metric, op: at_least|at_most|exactly|zero, count, within_days, where:[{field, op, value}]}, list {list_id, op: in|not_in}, consent {channel: email|sms, status}, group {match, conditions}. Property ops: eq, neq, contains, not_contains, starts_with, exists, not_exists, gt, gte, lt, lte, in, within_last_days, more_than_days_ago. Read postlark://docs/segments for examples.",
+    let segment_def = json!({"type": "object", "description": "Segment rules: {match: 'all'|'any', conditions: [...]}. Condition types: \
+property {field, op, value}; \
+event {metric, op: at_least|at_most|exactly|zero, count, within_days?, since?, until? (YYYY-MM-DD), where?:[{field, op, value}]}; \
+event_value {metric, aggregate: sum|average|min|max, field? (default value = revenue), op: eq|neq|gt|gte|lt|lte|between, value, within_days?, since?, until?, where?}; \
+event_time {metric, which: first|last, op: within_last_days|more_than_days_ago|before|after|between, value}; \
+list {list_id, op: in|not_in}; segment {segment_id, op: in|not_in}; consent {channel: email|sms, status}; \
+can_receive {channel: email|sms, value?: bool}; suppressed {value?: bool}; \
+form {form_id? (any form if omitted), op?: has|has_not, within_days?, since?, until?}; \
+engagement {channel: email|sms|any, engaged?: bool, within_days}; \
+message {action: received|opened|clicked, campaign_id | flow_id, op?: has|has_not, within_days?}; \
+prediction {measure: historic_clv|predicted_clv|order_count|average_order_value|days_since_last_order|average_days_between_orders|expected_next_order_in_days|churn_risk, op, value, metric? (default Placed Order)}; \
+random {percent, seed?}; group {match, conditions}. \
+Property ops: eq, neq, contains, not_contains, starts_with, ends_with, exists, not_exists, gt, gte, lt, lte, between [low, high], in, not_in, within_last_days, more_than_days_ago, anniversary_within_days. \
+Read dumbmail://docs/segments for the details and examples.",
         "properties": {"match": {"enum": ["all", "any"]}, "conditions": {"type": "array", "items": {"type": "object"}}}, "required": ["conditions"]});
+    let list_props = json!({
+        "name": {"type": "string"},
+        "double_opt_in": {"type": "boolean", "description": "New sign-ups confirm by email before they join."},
+        "show_on_preferences": {"type": "boolean", "description": "List it on the preference page (from the unsubscribe link), where people can join or leave it themselves."},
+        "description": {"type": "string", "description": "A line about the list for the preference page."}
+    });
     let email_content = json!({"type": "object", "description": "Email: {subject, preheader?, from_name?, from_email?, reply_to?, blocks: [...]} or raw html. Block types: heading{text,level?,align?}, text{html}, image{src,alt?,href?}, button{text,href,color?}, divider, spacer{height?}, columns{columns:[[blocks],[blocks]]}, product{title,image?,price?,href,button_text?}, html{html}. SMS: {body, media_url?}. Jinja personalization: {{ first_name|default('there') }}, {{ person.properties.x }}, {{ event.properties.x }} in flows, {{ organization.name }}."});
     let profile_ref = json!({"type": "object", "description": "Who did it: email, phone_number (E.164) or external_id, plus optional first_name, last_name and custom properties.",
         "properties": {"email": {"type": "string"}, "phone_number": {"type": "string"}, "external_id": {"type": "string"}, "first_name": {"type": "string"}, "last_name": {"type": "string"}, "properties": {"type": "object"}}});
@@ -185,7 +204,8 @@ fn tools() -> Vec<Value> {
             obj(json!({"metric": {"type": "string"}, "measurement": {"enum": ["count", "unique_profiles", "sum_value"]}, "interval": {"enum": ["day", "week", "month"]}, "start": {"type": "string", "format": "date-time"}, "end": {"type": "string", "format": "date-time"}, "group_by": {"type": "string"}}), &["metric"]), true, false),
         tool("get_events", "Get recent events", "Recent raw events, optionally filtered by metric name or profile.", obj(json!({"metric": {"type": "string"}, "profile_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}), &[]), true, false),
         tool("list_lists", "List lists", "All lists with member counts.", obj(json!({}), &[]), true, false),
-        tool("create_list", "Create a list", "Create a static list (e.g. 'Newsletter', 'VIP').", obj(json!({"name": {"type": "string"}}), &["name"]), false, false),
+        tool("create_list", "Create a list", "Create a static list (e.g. 'Newsletter', 'VIP'). show_on_preferences lists it on the preference page people reach from the unsubscribe link, where they can join or leave it themselves instead of unsubscribing from all email.", obj(list_props.clone(), &["name"]), false, false),
+        tool("update_list", "Update a list", "Rename a list or change double opt-in, whether it's on the preference page (show_on_preferences) and its description there. Only the fields given change.", obj(json!({"id": {"type": "string"}, "name": list_props["name"].clone(), "double_opt_in": list_props["double_opt_in"].clone(), "show_on_preferences": list_props["show_on_preferences"].clone(), "description": list_props["description"].clone()}), &["id"]), false, false),
         tool("add_to_list", "Add profiles to a list", "Add existing profiles (profile_ids) or emails (created if needed) to a list. List-triggered flows start for new members.",
             obj(json!({"list_id": {"type": "string"}, "profile_ids": {"type": "array", "items": {"type": "string"}}, "emails": {"type": "array", "items": {"type": "string"}}}), &["list_id"]), false, false),
         tool("remove_from_list", "Remove profiles from a list", "Remove profiles from a list.", obj(json!({"list_id": {"type": "string"}, "profile_ids": {"type": "array", "items": {"type": "string"}}}), &["list_id", "profile_ids"]), false, true),
@@ -356,6 +376,14 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         }
         "list_lists" => Ok(json!({"lists": aud::lists(state, acct).await?})),
         "create_list" => Ok(serde_json::to_value(aud::create_list(state, acct, from(a)?).await?)?),
+        "update_list" => {
+            let id = uuid_arg(&a, "id")?;
+            let mut body = a.clone();
+            if let Some(o) = body.as_object_mut() {
+                o.remove("id");
+            }
+            Ok(serde_json::to_value(aud::update_list(state, acct, id, from(body)?).await?)?)
+        }
         "add_to_list" => {
             let list_id = uuid_arg(&a, "list_id")?;
             let added = aud::add_members(state, acct, list_id, from(json!({"profile_ids": a["profile_ids"].clone().as_array().cloned().unwrap_or_default(), "emails": a["emails"].as_array().cloned().unwrap_or_default()}))?).await?;
@@ -598,24 +626,67 @@ fn prompt(name: &str, args: &Value) -> Option<Value> {
 
 const SEGMENT_DOC: &str = r#"# Segment rules
 
+A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up to 4 levels, with at most 50 conditions per group. The same rules drive segments, campaign audiences and flow conditions, filters and exit conditions. Always try rules with `preview_segment` before saving.
+
 ```json
 {"match": "all", "conditions": [
-  {"type": "event", "metric": "Placed Order", "op": "at_least", "count": 2, "within_days": 365},
-  {"type": "event", "metric": "Placed Order", "op": "zero", "within_days": 60},
-  {"type": "property", "field": "city", "op": "eq", "value": "Portland"},
-  {"type": "consent", "channel": "email", "status": "subscribed"},
+  {"type": "event_value", "metric": "Placed Order", "aggregate": "sum", "op": "gte", "value": 500},
+  {"type": "event_time", "metric": "Placed Order", "which": "last", "op": "more_than_days_ago", "value": 60},
+  {"type": "can_receive", "channel": "email"},
+  {"type": "segment", "segment_id": "...", "op": "not_in"},
   {"type": "group", "match": "any", "conditions": [
     {"type": "property", "field": "tags", "op": "contains", "value": "vip"},
-    {"type": "event", "metric": "Placed Order", "op": "at_least", "count": 1, "where": [{"field": "value", "op": "gt", "value": 200}]}
+    {"type": "prediction", "measure": "churn_risk", "op": "in", "value": ["medium", "high"]}
   ]}
 ]}
 ```
 
-- `property.field`: built-ins `email`, `phone_number`, `first_name`, `last_name`, `external_id`, `created_at`, `last_event_at`, `email_consent`, `sms_consent`, or any custom property key.
-- Ops: `eq`, `neq` (case-insensitive), `contains` (substring or array element), `not_contains`, `starts_with`, `exists`, `not_exists`, `gt`/`gte`/`lt`/`lte` (numbers or dates), `in` (array), `within_last_days`, `more_than_days_ago` (dates).
-- `event.where.field`: `value` (the event's numeric value/revenue) or an event property key.
-- `list`: `{"type": "list", "list_id": "...", "op": "in" | "not_in"}`.
-- Common metrics: Placed Order, Started Checkout, Viewed Product, Active on Site, Received Email, Opened Email, Clicked Email, Received SMS, Clicked SMS, Unsubscribed, Subscribed to List.
+## Profile properties
+
+`{"type": "property", "field": "...", "op": "...", "value": ...}`
+
+- Built-in fields: `email`, `phone_number`, `first_name`, `last_name`, `external_id`, `created_at`, `updated_at`, `last_event_at`, `email_consent`, `sms_consent`, `email_suppressed_reason`. Anything else is a custom property.
+- Location uses the standard properties `country` (ISO code like `US`), `region`, `city`, `zip` and `timezone` (IANA, e.g. `America/Chicago`). Form sign-ups fill `timezone` and `country` from the visitor's browser when they're missing. Set the rest from imports, the API or your store.
+- Ops: `eq`, `neq` (case-insensitive), `contains` / `not_contains` (text or an array element such as tags), `starts_with`, `ends_with`, `exists`, `not_exists`, `gt` / `gte` / `lt` / `lte` (numbers or dates), `between` (`[low, high]`, inclusive; `YYYY-MM-DD` dates are whole days in the account's time zone), `in` / `not_in` (arrays), `within_last_days` / `more_than_days_ago` (dates), `anniversary_within_days` (month and day fall in the next N days, 0 = today, e.g. birthdays).
+
+## What someone has done
+
+- **Count:** `{"type": "event", "metric": "Placed Order", "op": "at_least" | "at_most" | "exactly" | "zero", "count": 2}`.
+- **Totals:** `{"type": "event_value", "metric": "Placed Order", "aggregate": "sum" | "average" | "min" | "max", "field": "value", "op": "gt", "value": 500}`. `field` defaults to `value` (the event's revenue) and can be a numeric event property. Ops: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `between` `[low, high]`. With no events, a sum is 0 and the others match nothing.
+- **First or last time:** `{"type": "event_time", "metric": "Placed Order", "which": "first" | "last", "op": "within_last_days" | "more_than_days_ago" | "before" | "after" | "between", "value": 30 | "2026-11-01" | ["2026-11-01", "2026-11-30"]}`. People who never did it don't match.
+- **Time window** (event and event_value): `within_days`, and/or `since` and `until` as `YYYY-MM-DD` (both days included, in the account's time zone).
+- **Event filters:** `"where": [{"field": "value" | "<event property>", "op": "...", "value": ...}]`. Email and SMS events carry `campaign_id`, `flow_id` and `message_id`. "Subscribed to List" carries `form_id`, `form`, `list_id` and `form_version`.
+- Built-in metrics: Placed Order, Started Checkout, Added to Cart, Viewed Product, Active on Site, Subscribed to List, Received Email, Opened Email, Clicked Email, Bounced Email, Marked Email as Spam, Unsubscribed, Received SMS, Clicked SMS, Received SMS Reply, Unsubscribed from SMS. Custom metrics work the same way (`list_metrics`).
+
+## Shortcuts
+
+- `{"type": "engagement", "channel": "email" | "sms" | "any", "engaged": true, "within_days": 90}`. Email counts opens and clicks (Apple Mail Privacy Protection can inflate opens). SMS counts clicks and replies. `any` adds site activity, product views, carts, checkouts, orders and sign-ups. `engaged: false` finds people with none of these.
+- `{"type": "message", "action": "received" | "opened" | "clicked", "campaign_id": "..." | "flow_id": "...", "op": "has" | "has_not", "within_days": 30}`.
+- `{"type": "form", "form_id": "...", "op": "has" | "has_not", "within_days": 30}`: signed up through a form (any form when `form_id` is left out). `since` and `until` work too.
+- `{"type": "can_receive", "channel": "email" | "sms", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, and no bounce or complaint suppression. SMS needs a phone and subscribed consent.
+- `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint.
+- `{"type": "consent", "channel": "email" | "sms", "status": "subscribed" | "unsubscribed" | "never_subscribed" | "pending"}`.
+
+## Lists and other segments
+
+- `{"type": "list", "list_id": "...", "op": "in" | "not_in"}`.
+- `{"type": "segment", "segment_id": "...", "op": "in" | "not_in"}` uses the other segment's current rules, live. A segment can't include itself, even through another segment. A segment can't be deleted while another segment or a running flow uses it. One set of rules can use other segments at most 50 times and expand to at most 1,000 rules in total, counting the rules inside them.
+
+## Predictions
+
+`{"type": "prediction", "measure": "...", "op": "...", "value": ..., "metric": "Placed Order"}` is computed from the order metric's events (`metric`, default Placed Order) and their values.
+
+- `historic_clv`: revenue so far.
+- `predicted_clv`: revenue so far, plus average order value × expected orders over the next 365 days. Expected orders are 365 ÷ the average days between orders, at most 52. One-time buyers and customers at high churn risk get nothing extra.
+- `order_count`, `average_order_value`, `days_since_last_order`.
+- `average_days_between_orders` and `expected_next_order_in_days` (negative when overdue) need 2+ orders.
+- `churn_risk`: `low`, `medium` or `high`. It compares days since the last order with the usual gap: the average gap with 2+ orders, else 90 days. Up to 1× the gap is low, up to 2× medium, beyond that high. Compare with `eq`, `neq` or `in` (`["medium", "high"]`).
+
+Numeric measures use `eq`, `neq`, `gt`, `gte`, `lt`, `lte` and `between`. People with no orders match only where a figure exists for them: `historic_clv` and `predicted_clv` are 0 and `order_count` is 0.
+
+## Random sample
+
+`{"type": "random", "percent": 10, "seed": "holdout-nov"}` keeps a stable share of profiles: the same seed always picks the same people. Use a seed per test, and pair it with `"op": "not_in"` on a saved segment (or a group) for the rest.
 "#;
 
 const EMAIL_DOC: &str = r#"# Email content

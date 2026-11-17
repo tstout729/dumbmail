@@ -52,7 +52,7 @@ pub async fn list_profiles(state: &AppState, account_id: Uuid, q: &ProfileQuery)
                 .fetch_optional(&state.db)
                 .await?
                 .ok_or_else(|| AppError::not_found("segment"))?;
-            Some(segments::parse(&d)?)
+            Some(segments::load(&state.db, account_id, &d, Some(id)).await?)
         }
         None => None,
     };
@@ -117,7 +117,7 @@ pub async fn load_profile(state: &AppState, account_id: Uuid, id: Uuid) -> AppRe
 pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
     let profile = load_profile(state, account_id, id).await?;
     let lists: Vec<List> = sqlx::query_as(
-        "SELECT l.id, l.name, l.double_opt_in, (SELECT count(*) FROM list_members x WHERE x.list_id = l.id) AS member_count, l.created_at
+        "SELECT l.id, l.name, l.double_opt_in, l.show_on_preferences, l.description, (SELECT count(*) FROM list_members x WHERE x.list_id = l.id) AS member_count, l.created_at
          FROM lists l JOIN list_members lm ON lm.list_id = l.id WHERE lm.profile_id = $1 ORDER BY l.name",
     )
     .bind(id)
@@ -127,7 +127,7 @@ pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> App
     let all: Vec<Segment> = sqlx::query_as("SELECT * FROM segments WHERE account_id = $1 ORDER BY name").bind(account_id).fetch_all(&state.db).await?;
     let mut segs = Vec::new();
     for s in all.into_iter().take(100) {
-        if let Ok(def) = segments::parse(&s.definition) {
+        if let Ok(def) = segments::load(&state.db, account_id, &s.definition, Some(s.id)).await {
             if segments::profile_matches(&state.db, id, &def).await.unwrap_or(false) {
                 segs.push(s);
             }
@@ -260,7 +260,7 @@ async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<I
 
 // ---------- Lists ----------
 
-const LIST_SELECT: &str = "SELECT l.id, l.name, l.double_opt_in, (SELECT count(*) FROM list_members lm WHERE lm.list_id = l.id) AS member_count, l.created_at FROM lists l";
+const LIST_SELECT: &str = "SELECT l.id, l.name, l.double_opt_in, l.show_on_preferences, l.description, (SELECT count(*) FROM list_members lm WHERE lm.list_id = l.id) AS member_count, l.created_at FROM lists l";
 
 pub async fn lists(state: &AppState, account_id: Uuid) -> AppResult<Vec<List>> {
     Ok(sqlx::query_as(&format!("{LIST_SELECT} WHERE l.account_id = $1 ORDER BY l.created_at DESC")).bind(account_id).fetch_all(&state.db).await?)
@@ -285,16 +285,22 @@ async fn lists_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Valu
 pub struct ListBody {
     pub name: Option<String>,
     pub double_opt_in: Option<bool>,
+    /// Let people join or leave this list themselves on the preference page (from the unsubscribe link).
+    pub show_on_preferences: Option<bool>,
+    /// A line about the list for the preference page, e.g. "New arrivals every Friday".
+    pub description: Option<String>,
 }
 
 pub async fn create_list(state: &AppState, account_id: Uuid, b: ListBody) -> AppResult<List> {
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the list a name"))?;
     let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO lists (id, account_id, name, double_opt_in) VALUES ($1, $2, $3, $4)")
+    sqlx::query("INSERT INTO lists (id, account_id, name, double_opt_in, show_on_preferences, description) VALUES ($1, $2, $3, $4, $5, $6)")
         .bind(id)
         .bind(account_id)
         .bind(name.trim())
         .bind(b.double_opt_in.unwrap_or(false))
+        .bind(b.show_on_preferences.unwrap_or(false))
+        .bind(b.description.as_deref().map(str::trim).unwrap_or(""))
         .execute(&state.db)
         .await?;
     get_list(state, account_id, id).await
@@ -308,16 +314,27 @@ async fn get_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
     Ok(Json(get_list(&state, ctx.account_id, id).await?))
 }
 
+/// Rename a list or change its settings (only the fields given change).
+pub async fn update_list(state: &AppState, account_id: Uuid, id: Uuid, b: ListBody) -> AppResult<List> {
+    get_list(state, account_id, id).await?;
+    sqlx::query(
+        "UPDATE lists SET name = COALESCE($3, name), double_opt_in = COALESCE($4, double_opt_in),
+                show_on_preferences = COALESCE($5, show_on_preferences), description = COALESCE($6, description)
+         WHERE id = $1 AND account_id = $2",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(b.name.filter(|n| !n.trim().is_empty()))
+    .bind(b.double_opt_in)
+    .bind(b.show_on_preferences)
+    .bind(b.description.as_deref().map(str::trim))
+    .execute(&state.db)
+    .await?;
+    get_list(state, account_id, id).await
+}
+
 async fn patch_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ListBody>) -> AppResult<Json<List>> {
-    get_list(&state, ctx.account_id, id).await?;
-    sqlx::query("UPDATE lists SET name = COALESCE($3, name), double_opt_in = COALESCE($4, double_opt_in) WHERE id = $1 AND account_id = $2")
-        .bind(id)
-        .bind(ctx.account_id)
-        .bind(b.name.filter(|n| !n.trim().is_empty()))
-        .bind(b.double_opt_in)
-        .execute(&state.db)
-        .await?;
-    Ok(Json(get_list(&state, ctx.account_id, id).await?))
+    Ok(Json(update_list(&state, ctx.account_id, id, b).await?))
 }
 
 async fn delete_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -392,7 +409,7 @@ async fn count_into(state: &AppState, account_id: Uuid, id: Uuid, def: &segments
 pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the segment a name"))?;
     let raw = b.definition.unwrap_or(json!({"match": "all", "conditions": []}));
-    let def = segments::parse(&raw)?;
+    let def = segments::load(&state.db, account_id, &raw, None).await?;
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO segments (id, account_id, name, definition) VALUES ($1, $2, $3, $4)")
         .bind(id)
@@ -406,7 +423,7 @@ pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) 
 
 pub async fn update_segment(state: &AppState, account_id: Uuid, id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let cur = get_segment(state, account_id, id).await?;
-    let def = segments::parse(&b.definition.unwrap_or(cur.definition))?;
+    let def = segments::load(&state.db, account_id, &b.definition.unwrap_or(cur.definition), Some(id)).await?;
     sqlx::query("UPDATE segments SET name = COALESCE($2, name), definition = $3, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(b.name.filter(|n| !n.trim().is_empty()))
@@ -422,7 +439,7 @@ async fn create_segment_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): A
 
 async fn get_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Segment>> {
     let s = get_segment(&state, ctx.account_id, id).await?;
-    let def = segments::parse(&s.definition)?;
+    let def = segments::load(&state.db, ctx.account_id, &s.definition, Some(id)).await?;
     Ok(Json(count_into(&state, ctx.account_id, id, &def).await?))
 }
 
@@ -439,6 +456,24 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
     if in_use {
         return Err(AppError::Conflict("a live or paused flow is triggered by this segment; change that flow first".into()));
     }
+    // Other segments that include this one would stop working.
+    let others: Vec<(String, Value)> = sqlx::query_as("SELECT name, definition FROM segments WHERE account_id = $1 AND id <> $2 AND definition::text LIKE '%' || $3 || '%'")
+        .bind(ctx.account_id)
+        .bind(id)
+        .bind(id.to_string())
+        .fetch_all(&state.db)
+        .await?;
+    if let Some((name, _)) = others.iter().find(|(_, d)| segments::referenced_segments(d).contains(&id)) {
+        return Err(AppError::Conflict(format!("the segment {name:?} uses this segment; change it first")));
+    }
+    let flow: Option<String> = sqlx::query_scalar("SELECT name FROM flows WHERE account_id = $1 AND status <> 'draft' AND definition::text LIKE '%' || $2 || '%' LIMIT 1")
+        .bind(ctx.account_id)
+        .bind(id.to_string())
+        .fetch_optional(&state.db)
+        .await?;
+    if let Some(name) = flow {
+        return Err(AppError::Conflict(format!("the flow {name:?} uses this segment in a condition; change it first")));
+    }
     let n = sqlx::query("DELETE FROM segments WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&state.db).await?.rows_affected();
     if n == 0 {
         return Err(AppError::not_found("segment"));
@@ -447,7 +482,7 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
 }
 
 pub async fn preview(state: &AppState, account_id: Uuid, definition: &Value) -> AppResult<Value> {
-    let def = segments::parse(definition)?;
+    let def = segments::load(&state.db, account_id, definition, None).await?;
     let (count, sample) = segments::preview(&state.db, account_id, &def, 10).await?;
     Ok(json!({"count": count, "sample": sample}))
 }
