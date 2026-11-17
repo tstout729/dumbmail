@@ -605,7 +605,7 @@ async fn a_batch_never_leaves_a_message_behind_between_its_reads() {
 async fn claimed_race(h: &mut Harness, l: &str) -> (uuid::Uuid, uuid::Uuid) {
     let cid = h.ok("POST", "/api/campaigns", Some(campaign(l, "Race", Value::Null))).await["id"].as_str().unwrap().to_string();
     h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
-    prepare(&h, &cid).await;
+    prepare(h, &cid).await;
     sqlx::query("DELETE FROM jobs WHERE kind = 'campaign_batch'").execute(&h.state.db).await.unwrap();
     let mid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
     let cid: uuid::Uuid = cid.parse().unwrap();
@@ -738,12 +738,9 @@ async fn a_text_waiting_for_its_turn_checks_quiet_hours_again_before_it_goes() {
         message_id: None,
         to_override: None,
     };
-    let first = dumbmail::sending::send(&h.state, spec()).await.unwrap();
-    assert!(matches!(first, dumbmail::sending::Outcome::Sent(_)), "{first:?}");
-    // The second waits for its turn; meanwhile the window closes.
-    let second = dumbmail::sending::send(&h.state, spec());
+    // Three texts at once take turns a second apart; the window closes while two of them wait.
     let close = async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         let window = if clock::local_minute(tz, Utc::now()) < 14 * 60 { ("19:00", "20:00") } else { ("08:00", "09:00") };
         sqlx::query("UPDATE send_settings SET sms_start_minute = $2, sms_end_minute = $3 WHERE account_id = $1")
             .bind(acct)
@@ -753,11 +750,12 @@ async fn a_text_waiting_for_its_turn_checks_quiet_hours_again_before_it_goes() {
             .await
             .unwrap();
     };
-    let (second, ()) = tokio::join!(second, close);
-    match second.unwrap() {
-        dumbmail::sending::Outcome::Deferred(until) => assert!(until > Utc::now(), "{until}"),
-        other => panic!("sent after the window closed: {other:?}"),
-    }
+    let (a, b, c, ()) = tokio::join!(dumbmail::sending::send(&h.state, spec()), dumbmail::sending::send(&h.state, spec()), dumbmail::sending::send(&h.state, spec()), close);
+    let outcomes: Vec<dumbmail::sending::Outcome> = [a, b, c].into_iter().map(Result::unwrap).collect();
+    let sent = outcomes.iter().filter(|o| matches!(o, dumbmail::sending::Outcome::Sent(_))).count();
+    let held: Vec<DateTime<Utc>> = outcomes.iter().filter_map(|o| if let dumbmail::sending::Outcome::Deferred(t) = o { Some(*t) } else { None }).collect();
+    assert_eq!((sent, held.len()), (1, 2), "only the one whose turn came before the window closed goes: {outcomes:?}");
+    assert!(held.iter().all(|t| *t > Utc::now()), "{held:?}");
     assert_eq!(h.state.sms.sent().iter().filter(|m| m.to == phone).count(), 1);
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE profile_id = $1::uuid").bind(&pid).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(left, 1, "the held text leaves no message behind (a flow re-runs it)");
