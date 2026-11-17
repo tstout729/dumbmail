@@ -22,7 +22,9 @@ import {
   Th,
   cx,
 } from "../../components/ui";
+import { parseRange } from "../../components/charts/RangePicker";
 import { formatNumber, formatPercent, formatRelative } from "../../lib/format";
+import { FormsSummary } from "./FormsSummary";
 
 export const formKinds: { value: FormKind; label: string; detail: string }[] = [
   { value: "popup", label: "Popup", detail: "Centered over the page" },
@@ -48,12 +50,20 @@ export function FormsPage() {
   const lists = useLists();
   const [params, setParams] = useSearchParams();
   const creating = params.get("create") === "1";
+  const days = parseRange(params.get("days"));
   const listName = (id: string | null) => (id ? (lists.data ?? []).find((l) => l.id === id)?.name ?? "—" : "—");
 
   const setCreating = (on: boolean) => {
     const next = new URLSearchParams(params);
     if (on) next.set("create", "1");
     else next.delete("create");
+    setParams(next, { replace: true });
+  };
+
+  const setDays = (d: number) => {
+    const next = new URLSearchParams(params);
+    if (d === 30) next.delete("days");
+    else next.set("days", String(d));
     setParams(next, { replace: true });
   };
 
@@ -68,6 +78,7 @@ export function FormsPage() {
           </Button>
         }
       />
+      {(forms.data ?? []).length > 0 ? <FormsSummary days={days} onDaysChange={setDays} /> : null}
       <Table>
         <thead>
           <tr>

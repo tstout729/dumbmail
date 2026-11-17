@@ -643,6 +643,22 @@ impl SubscribeBody {
     }
 }
 
+/// Count a view or sign-up on the form's all-time totals and in its hourly stats.
+async fn count_form(state: &AppState, form_id: Uuid, submit: bool) -> AppResult<()> {
+    sqlx::query(
+        "WITH f AS (UPDATE forms SET views = views + $2, submits = submits + $3 WHERE id = $1 RETURNING id, account_id)
+         INSERT INTO form_stats_hourly (form_id, account_id, hour, views, submits)
+         SELECT id, account_id, date_trunc('hour', now()), $2, $3 FROM f
+         ON CONFLICT (form_id, hour) DO UPDATE SET views = form_stats_hourly.views + EXCLUDED.views, submits = form_stats_hourly.submits + EXCLUDED.submits",
+    )
+    .bind(form_id)
+    .bind(i64::from(!submit))
+    .bind(i64::from(submit))
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
 /// Count a view or sign-up for a form's A/B test version. Returns the version when the form is testing it.
 async fn count_variant(state: &AppState, form: &FormRow, variant: Option<&str>, submit: bool) -> AppResult<Option<String>> {
     let Some(v) = variant.filter(|v| crate::api::messaging::form_versions(&form.config).contains(v)) else { return Ok(None) };
@@ -707,7 +723,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if double_opt_in && upserted.created {
         sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;
     }
-    sqlx::query("UPDATE forms SET submits = submits + 1 WHERE id = $1").bind(form.id).execute(&state.db).await?;
+    count_form(state, form.id, true).await?;
     let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
     if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
         props["form_version"] = json!(v);
@@ -857,7 +873,7 @@ struct ViewQuery {
 async fn form_view(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q): Query<ViewQuery>) -> Response {
     if let Ok((f, _)) = load_form(&state, id).await {
         if f.status == "live" {
-            let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
+            let _ = count_form(&state, id, false).await;
             let _ = count_variant(&state, &f, q.v.as_deref(), false).await;
         }
     }
@@ -949,7 +965,7 @@ async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q)
         Some(versions[rand::Rng::gen_range(&mut rand::thread_rng(), 0..versions.len())].to_string())
     };
     if !preview {
-        let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
+        let _ = count_form(&state, id, false).await;
         let _ = count_variant(&state, &f, version.as_deref(), false).await;
     }
     let mut config = version.as_deref().map(|v| crate::api::messaging::form_version_config(&f.config, v)).unwrap_or_else(|| f.config.clone());

@@ -18,9 +18,11 @@ type Props = {
   stacked?: boolean;
   /** Allow fractional Y ticks, e.g. for small dollar amounts. */
   allowDecimals?: boolean;
+  /** For callers that draw their own legend. */
+  hideLegend?: boolean;
 };
 
-export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocaleString(), height = 240, loading, xFormat, stacked, allowDecimals = false }: Props) {
+export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocaleString(), height = 240, loading, xFormat, stacked, allowDecimals = false, hideLegend }: Props) {
   if (loading)
     return (
       <div style={{ height }}>
@@ -68,7 +70,7 @@ export function TimeSeriesChart({ data, xKey, series, format = (n) => n.toLocale
             labelFormatter={(v) => fmtX(String(v))}
             formatter={(value) => format(Number(value))}
           />
-          {series.length > 1 ? <Legend verticalAlign="top" align="right" iconType="circle" iconSize={8} height={28} wrapperStyle={{ fontSize: 12, color: "#3f3f46" }} /> : null}
+          {series.length > 1 && !hideLegend ? <Legend verticalAlign="top" align="right" iconType="circle" iconSize={8} height={28} wrapperStyle={{ fontSize: 12, color: "#3f3f46" }} /> : null}
           {series.map((s, i) => (
             <Area
               key={s.key}

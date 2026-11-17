@@ -266,6 +266,27 @@ async fn signup_import_segment_campaign_tracking_unsubscribe() {
     let ov = h.ok("GET", "/api/analytics/overview?days=30", None).await;
     assert_eq!(ov["totals"]["campaign_revenue"], 120.5);
     assert_eq!(ov["totals"]["emails_sent"], 1);
+    assert_eq!(ov["totals"]["attributed_orders"], 1);
+    assert_eq!(ov["totals"]["email_clicks"], 1);
+    assert_eq!(ov["top_campaigns"][0]["orders"], 1);
+    // Nothing happened in the 30 days before, so the comparison window is empty.
+    assert_eq!(ov["previous"]["emails_sent"], 0);
+    assert_eq!(ov["previous"]["attributed_revenue"], 0.0);
+    assert_eq!(ov["series"].as_array().unwrap().last().unwrap()["campaign_revenue"], 120.5);
+    // The flows summary counts flow revenue only; this order belongs to the campaign.
+    let fa = h.ok("GET", "/api/analytics/flows?days=30", None).await;
+    assert_eq!(fa["totals"]["revenue"], 0.0);
+    assert_eq!(fa["totals"]["store_revenue"], 120.5);
+    assert_eq!(fa["totals"]["messages_sent"], 0);
+    let metrics = h.ok("GET", "/api/metrics", None).await;
+    let order = metrics["data"].as_array().unwrap().iter().find(|m| m["name"] == "Placed Order").unwrap().clone();
+    assert_eq!(order["has_value"], true);
+    assert_eq!(order["count_prev_30d"], 0);
+    let trend = order["trend"].as_array().unwrap();
+    assert_eq!(trend.len(), 30);
+    assert_eq!(trend[29], 1, "today's order lands in the last bucket");
+    let events = h.ok("GET", "/api/events?metric=Placed%20Order", None).await;
+    assert_eq!(events["data"][0]["profile_label"], "bob@x.test");
 
     // One-click unsubscribe (RFC 8058).
     let unsub = mail.unsubscribe_url.unwrap().replace("https://pl.test", "");
@@ -313,6 +334,11 @@ async fn welcome_and_abandoned_checkout_flows() {
     h.ok("POST", &format!("/api/lists/{list_id}/members"), Some(json!({"emails": ["new@x.test"]}))).await;
     h.drain().await;
     assert_eq!(h.ok("GET", &format!("/api/flows/{fid}/report"), None).await["total_runs"], 1);
+    let fa = h.ok("GET", "/api/analytics/flows?days=30", None).await;
+    assert_eq!(fa["totals"]["messages_sent"], 3);
+    assert_eq!(fa["totals"]["recipients"], 1);
+    assert_eq!(fa["previous"]["messages_sent"], 0);
+    assert_eq!(fa["series"].as_array().unwrap().iter().map(|d| d["messages_sent"].as_i64().unwrap()).sum::<i64>(), 3);
 
     // Abandoned checkout: exits when the person buys.
     let ac = h.ok("POST", "/api/flows/from-blueprint", Some(json!({"key": "abandoned_checkout"}))).await;
@@ -492,6 +518,10 @@ async fn mcp_server() {
     assert_eq!(perf["result"]["structuredContent"]["campaigns"].as_array().unwrap().len(), 1);
     let (_, an) = call(&h, tool(16, "get_analytics", json!({"days": 7}))).await;
     assert_eq!(an["result"]["structuredContent"]["totals"]["emails_sent"], 1);
+    let (_, fa) = call(&h, tool(16, "get_analytics", json!({"days": 7, "scope": "flows"}))).await;
+    assert!(fa["result"]["structuredContent"]["totals"]["revenue_per_recipient"].is_number(), "{fa}");
+    let (_, fo) = call(&h, tool(16, "get_analytics", json!({"days": 7, "scope": "forms"}))).await;
+    assert!(fo["result"]["structuredContent"]["totals"]["submit_rate"].is_number(), "{fo}");
     let (_, res) = call(&h, rpc(17, "resources/read", json!({"uri": "postlark://docs/flows"}))).await;
     assert!(res["result"]["contents"][0]["text"].as_str().unwrap().contains("exit_condition"));
     h.cleanup().await;
@@ -1309,6 +1339,12 @@ async fn form_ab_test() {
 
     let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
     assert_eq!(f["stats"], json!({"views": 5, "submits": 2}));
+    // The Forms page summary counts the same views and sign-ups, by day.
+    let fa = h.ok("GET", "/api/analytics/forms?days=7", None).await;
+    assert_eq!(fa["totals"], json!({"views": 5, "submits": 2, "submit_rate": 0.4}));
+    assert_eq!(fa["previous"]["views"], 0);
+    assert_eq!(fa["series"].as_array().unwrap().last().unwrap()["submits"], 2);
+    assert_eq!(fa["forms"][0]["id"], fid.as_str());
     assert_eq!(f["variant_stats"][0], json!({"id": "a", "views": 1, "submits": 0, "submit_rate": 0.0}));
     assert_eq!(f["variant_stats"][1], json!({"id": "b", "views": 2, "submits": 1, "submit_rate": 0.5}));
 

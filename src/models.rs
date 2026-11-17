@@ -164,6 +164,10 @@ pub struct EventRow {
     pub properties: Value,
     pub value: Option<f64>,
     pub occurred_at: DateTime<Utc>,
+    /// Email, phone or name of the person, where the query joins profiles (the events list).
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_label: Option<String>,
 }
 
 /// Aggregated delivery and engagement numbers for a campaign, flow or flow node.
