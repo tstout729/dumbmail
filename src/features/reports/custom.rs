@@ -1108,7 +1108,8 @@ fn compute(src: &SourceInfo, measures: &[String], raw: &HashMap<&'static str, f6
 fn sum_rows(rows: &[RawRow], src: &SourceInfo) -> HashMap<&'static str, f64> {
     let mut t = HashMap::new();
     for name in src.raw {
-        t.insert(*name, rows.iter().map(|r| r.raw.get(name).copied().unwrap_or(0.0)).sum());
+        // `+ 0.0`: an empty f64 sum is -0.0, which would show as "-$0.00".
+        t.insert(*name, rows.iter().map(|r| r.raw.get(name).copied().unwrap_or(0.0)).sum::<f64>() + 0.0);
     }
     t
 }
@@ -1327,5 +1328,13 @@ mod tests {
         assert_eq!(time_buckets("month", w, tz).unwrap(), vec!["2026-10-01", "2026-11-01"]);
         assert_eq!(static_label("weekday", "7").as_deref(), Some("Sun"));
         assert_eq!(static_label("hour", "09").as_deref(), Some("09:00"));
+    }
+
+    #[test]
+    fn empty_totals_are_positive_zero() {
+        let src = info("revenue").unwrap();
+        let t = sum_rows(&[], src);
+        assert!(t["revenue"].is_sign_positive());
+        assert_eq!(compute(src, &["revenue".to_string()], &t, None)["revenue"].to_string(), "0.0");
     }
 }
