@@ -518,6 +518,8 @@ async fn mcp_server() {
     assert_eq!(perf["result"]["structuredContent"]["campaigns"].as_array().unwrap().len(), 1);
     let (_, an) = call(&h, tool(16, "get_analytics", json!({"days": 7}))).await;
     assert_eq!(an["result"]["structuredContent"]["totals"]["emails_sent"], 1);
+    let (_, fa) = call(&h, tool(16, "get_analytics", json!({"days": 7, "scope": "flows"}))).await;
+    assert!(fa["result"]["structuredContent"]["totals"]["revenue_per_recipient"].is_number(), "{fa}");
     let (_, res) = call(&h, rpc(17, "resources/read", json!({"uri": "postlark://docs/flows"}))).await;
     assert!(res["result"]["contents"][0]["text"].as_str().unwrap().contains("exit_condition"));
     h.cleanup().await;

@@ -370,7 +370,7 @@ Read dumbmail://docs/segments for the details and examples.",
         tool("upload_image", "Upload an image", "Store a PNG, JPEG, GIF or WebP image (up to 5 MB) and get a permanent public URL for a form's image_url or an email image block. Give url to copy an image from the web, or data_base64 with the file's contents. Uploading the same file again returns the existing image. Each account keeps up to 500 images.",
             obj(json!({"url": {"type": "string", "description": "Public http(s) URL of the image"}, "data_base64": {"type": "string", "description": "Base64 file contents (a data: URL works too)"}}), &[]), false, false),
         tool("list_images", "List uploaded images", "The account's uploaded images, newest first (up to 200), with their public URLs.", obj(json!({}), &[]), true, false),
-        tool("get_analytics", "Analytics overview", "Dashboard for the last `days` (default 30): total and attributed revenue (campaigns vs flows) and orders, emails/SMS sent, open/click/unsubscribe/bounce/complaint rates, profile growth, the same totals for the previous `days` (`previous`) for comparison, a daily series and top campaigns and flows.", obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]), true, false),
+        tool("get_analytics", "Analytics overview", "Dashboard for the last `days` (default 30): total and attributed revenue (campaigns vs flows) and orders, emails/SMS sent, open/click/unsubscribe/bounce/complaint rates, profile growth, the same totals for the previous `days` (`previous`) for comparison, a daily series and top campaigns and flows. With scope=flows: flow-only revenue, orders, share of store revenue, messages sent, recipients, open/click rates and revenue per recipient, with `previous` and daily flow revenue and sends.", obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}, "scope": {"enum": ["overview", "flows"], "description": "Default overview."}}), &[]), true, false),
         tool("delete", "Delete something", "Delete a draft campaign, a non-live flow, a segment, a list, a template, a form, an uploaded image (anything still using its URL shows a broken image) or a profile. Permanent.", obj(json!({"type": {"enum": ["campaign", "flow", "segment", "list", "template", "form", "image", "profile"]}, "id": {"type": "string"}}), &["type", "id"]), false, true),
     ]
 }
@@ -681,7 +681,10 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let (images, total) = crate::api::images::list(state, acct).await?;
             Ok(json!({"images": images, "total": total}))
         }
-        "get_analytics" => analytics::overview(state, acct, a["days"].as_i64().unwrap_or(30)).await,
+        "get_analytics" => match a["scope"].as_str() {
+            Some("flows") => analytics::flows(state, acct, a["days"].as_i64().unwrap_or(30)).await,
+            _ => analytics::overview(state, acct, a["days"].as_i64().unwrap_or(30)).await,
+        },
         "delete" => delete(state, acct, a["type"].as_str().unwrap_or(""), uuid_arg(&a, "id")?).await,
         other => Err(AppError::bad(format!("unknown tool {other:?}"))),
     }
