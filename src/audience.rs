@@ -162,7 +162,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
         };
         match res {
-            Ok(u) => return Ok(u),
+            Ok(u) => {
+                crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), &u.profile).await;
+                return Ok(u);
+            }
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
@@ -216,7 +219,8 @@ pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str
     Ok(())
 }
 
-/// Record an event and wake any live flows triggered by that metric. Returns None for duplicates.
+/// Record an event and wake any live flows triggered by that metric (and features that asked to
+/// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
     let id = Uuid::now_v7();
@@ -251,7 +255,7 @@ pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uui
     .bind(ev.metric)
     .fetch_one(db)
     .await?;
-    if has_flow {
+    if has_flow || crate::features::wants_event(db, ev.account_id, ev.metric).await {
         crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await?;
     }
     Ok(Some(event_id))
@@ -272,8 +276,20 @@ pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_i
     .await?;
     if !added.is_empty() {
         crate::jobs::enqueue(db, "flow_list", json!({"list_id": list_id, "profile_ids": added}), None).await?;
+        crate::features::webhooks::list_changed(db, account_id, list_id, &added, true).await;
     }
     Ok(added.len() as u64)
+}
+
+/// Remove profiles from a list (the caller has checked the list is the account's).
+pub async fn remove_from_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
+    let removed: Vec<Uuid> = sqlx::query_scalar("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2) RETURNING profile_id")
+        .bind(list_id)
+        .bind(profile_ids)
+        .fetch_all(db)
+        .await?;
+    crate::features::webhooks::list_changed(db, account_id, list_id, &removed, false).await;
+    Ok(removed.len() as u64)
 }
 
 pub async fn list_belongs(db: &PgPool, account_id: Uuid, list_id: Uuid) -> AppResult<()> {

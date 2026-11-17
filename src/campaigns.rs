@@ -319,6 +319,9 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     }
     sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
     tx.commit().await?;
+    if c.sent_at.is_none() {
+        crate::features::webhooks::campaign_event(&state.db, c.id, "campaign.sent").await;
+    }
 
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY id")
         .bind(c.id)
@@ -346,7 +349,7 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState,
 }
 
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
+    let done: Option<String> = sqlx::query_scalar(
         // A test slice that has gone out waits for its results ('testing') before the winner send;
         // the wait starts when the last test message is handled (sends can be deferred, e.g. SMS quiet hours).
         "UPDATE campaigns SET
@@ -355,11 +358,15 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
            updated_at = now()
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'
-         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)",
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)
+         RETURNING status",
     )
     .bind(campaign_id)
-    .execute(db)
+    .fetch_optional(db)
     .await?;
+    if done.as_deref() == Some("sent") {
+        crate::features::webhooks::campaign_event(db, campaign_id, "campaign.finished").await;
+    }
     Ok(())
 }
 

@@ -1320,6 +1320,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "csv",
+ "flate2",
  "hex",
  "hmac 0.12.1",
  "http-body-util",

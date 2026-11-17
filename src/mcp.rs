@@ -533,7 +533,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let list_id = uuid_arg(&a, "list_id")?;
             crate::audience::list_belongs(&state.db, acct, list_id).await?;
             let ids: Vec<Uuid> = from(a["profile_ids"].clone())?;
-            let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(list_id).bind(&ids).execute(&state.db).await?.rows_affected();
+            let n = crate::audience::remove_from_list(&state.db, acct, list_id, &ids).await?;
             Ok(json!({"removed": n}))
         }
         "list_segments" => Ok(json!({"segments": aud::segments_list(state, acct).await?})),

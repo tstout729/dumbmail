@@ -1156,13 +1156,14 @@ pub async fn profile_matches(db: &sqlx::PgPool, profile_id: Uuid, def: &Definiti
 /// Recompute materialized membership. Returns profile ids that newly entered.
 pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def: &Definition) -> AppResult<Vec<Uuid>> {
     let mut tx = db.begin().await?;
+    let first_refresh: bool = sqlx::query_scalar("SELECT refreshed_at IS NULL FROM segments WHERE id = $1").bind(segment_id).fetch_optional(&mut *tx).await?.unwrap_or(true);
     let mut qb = QueryBuilder::new("CREATE TEMP TABLE seg_now ON COMMIT DROP AS SELECT p.id FROM profiles p WHERE p.account_id = ");
     qb.push_bind(account_id).push(" AND ");
     push_definition(&mut qb, def);
     qb.build().execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id)")
+    let left: Vec<Uuid> = sqlx::query_scalar("DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id) RETURNING profile_id")
         .bind(segment_id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
     let entered: Vec<Uuid> = sqlx::query_scalar("INSERT INTO segment_members (segment_id, profile_id) SELECT $1, id FROM seg_now ON CONFLICT DO NOTHING RETURNING profile_id")
         .bind(segment_id)
@@ -1173,6 +1174,10 @@ pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def:
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // The first refresh only records who is already in the segment.
+    if !first_refresh {
+        crate::features::webhooks::segment_changed(db, account_id, segment_id, &entered, &left).await;
+    }
     Ok(entered)
 }
 

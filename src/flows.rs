@@ -224,7 +224,9 @@ pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::Socket
         .await
         .map_err(|_| AppError::bad(format!("webhook host {host:?} doesn't resolve")))?
         .collect();
-    if addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip())) {
+    // Development and tests may allow localhost (WEBHOOKS_ALLOW_LOCALHOST); never private networks.
+    let local_ok = crate::features::webhooks::net::localhost_allowed() && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback());
+    if !local_ok && (addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip()))) {
         return Err(AppError::bad("webhook url must point to a public internet address"));
     }
     Ok((host, addrs[0]))
@@ -285,7 +287,8 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     Err(AppError::bad("that page redirects too many times"))
 }
 
-async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
+/// Signed with the account's flow webhook secret (see docs/WEBHOOKS.md); a GET signs an empty body.
+async fn call_webhook(state: &AppState, account_id: Uuid, url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
     let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let client = reqwest::Client::builder()
         .resolve(&host, addr)
@@ -293,7 +296,11 @@ async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<(
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("dumbmail-webhook/0.1")
         .build()?;
-    let req = if get { client.get(url) } else { client.post(url).json(payload) };
+    let body = if get { Vec::new() } else { serde_json::to_vec(payload)? };
+    let mut req = if get { client.get(url) } else { client.post(url).header("content-type", "application/json").body(body.clone()) };
+    for (k, v) in crate::features::webhooks::flow_signature_headers(state, account_id, &body).await {
+        req = req.header(k, v);
+    }
     req.send().await?.error_for_status()?;
     Ok(())
 }
@@ -644,7 +651,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     if node.kind == "add_to_list" {
                         crate::audience::add_to_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     } else {
-                        sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = $2").bind(list_id).bind(run.profile_id).execute(&state.db).await?;
+                        crate::audience::remove_from_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     }
                 }
             }
@@ -654,7 +661,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     "flow": {"id": flow.id, "name": flow.name}, "node_id": node_id,
                     "profile": person, "event": context.get("event"), "body": node.data.get("body"),
                 });
-                if let Err(e) = call_webhook(&url, node.str("method") == Some("GET"), &payload).await {
+                if let Err(e) = call_webhook(state, flow.account_id, &url, node.str("method") == Some("GET"), &payload).await {
                     tracing::warn!(run = %run.id, url = %url, error = %e, "flow webhook failed");
                 }
             }

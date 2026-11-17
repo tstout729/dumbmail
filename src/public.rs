@@ -734,6 +734,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
         props["form_version"] = json!(v);
     }
+    crate::features::webhooks::form_submitted(&state.db, account.id, form.id, p.id, props["form_version"].as_str()).await;
     // Already subscribed to email (they confirmed or opted in before): no need to ask again.
     if let (true, Some(list_id), Some(addr)) = (double_opt_in && p.email_consent != "subscribed", form.list_id, p.email.as_deref()) {
         match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone(), ip).await? {
@@ -1134,6 +1135,7 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     match kind {
         "Delivery" => {
             sqlx::query("UPDATE messages SET status = CASE WHEN status = 'sent' THEN 'delivered' ELSE status END, delivered_at = now() WHERE id = $1").bind(m.id).execute(&state.db).await?;
+            crate::features::webhooks::message_delivered(&state.db, m.id).await;
         }
         "Bounce" => {
             let permanent = msg["bounce"]["bounceType"].as_str() == Some("Permanent");
@@ -1192,12 +1194,17 @@ async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str
 
 async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, delivered: bool) -> AppResult<()> {
     let status = if delivered { "delivered" } else { "failed" };
-    sqlx::query("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3)")
+    let ids: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3) RETURNING id")
         .bind(provider_id)
         .bind(status)
         .bind(scope)
-        .execute(&state.db)
+        .fetch_all(&state.db)
         .await?;
+    if delivered {
+        for id in ids {
+            crate::features::webhooks::message_delivered(&state.db, id).await;
+        }
+    }
     Ok(())
 }
 
