@@ -12,13 +12,13 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::blocks::{network_label, ICON_STYLES, NETWORKS};
 use crate::error::{AppError, AppResult};
-use crate::models::{Account, CampaignRow, Profile};
+use crate::models::{Account, CampaignRow};
 use crate::state::AppState;
 
 /// The most blocks an email may have once saved blocks are filled in.
@@ -185,6 +185,8 @@ pub struct Prep<'a> {
     pub secret: &'a str,
     saved: HashMap<Uuid, (String, Value)>,
     count: usize,
+    /// Keep every block whatever its display rule says (for checks, which look at all of them).
+    all: bool,
 }
 
 impl Prep<'_> {
@@ -201,6 +203,7 @@ impl Prep<'_> {
                 Some(r) => Some(parse_rule(&r).map_err(|e| AppError::bad(format!("block {}: {e}", i + 1)))?),
             };
             let expr = match rule {
+                Some(_) if self.all => None,
                 Some(Rule::Simple { field, op, value }) => {
                     if !rule_matches(&field, &op, &value, self.ctx) {
                         continue;
@@ -305,6 +308,11 @@ impl Prep<'_> {
 
 /// `content` ready to render for the person and event in `ctx` (see the module docs).
 pub async fn prepare(state: &AppState, account: &Account, content: &Value, ctx: &Value) -> AppResult<Value> {
+    prepare_with(state, account, content, ctx, false).await
+}
+
+/// [`prepare`], optionally keeping every block regardless of display rules (`all`).
+pub async fn prepare_with(state: &AppState, account: &Account, content: &Value, ctx: &Value, all: bool) -> AppResult<Value> {
     let Some(blocks) = content.get("blocks").and_then(|b| b.as_array()).filter(|b| !b.is_empty()) else {
         return Ok(content.clone());
     };
@@ -313,21 +321,12 @@ pub async fn prepare(state: &AppState, account: &Account, content: &Value, ctx: 
     ids.sort();
     ids.dedup();
     let saved = load_saved(&state.db, account.id, &ids).await?;
-    let mut prep = Prep { account, ctx, public_url: state.cfg.public_url(), secret: &state.cfg.secret_key, saved, count: 0 };
+    let mut prep = Prep { account, ctx, public_url: state.cfg.public_url(), secret: &state.cfg.secret_key, saved, count: 0, all };
     let mut out = Vec::with_capacity(blocks.len());
     prep.expand(blocks, 0, &mut out)?;
     let mut content = content.clone();
     content["blocks"] = Value::Array(out);
     Ok(content)
-}
-
-/// [`prepare`] for a real send: the person's own data, and the triggering event in flows.
-pub async fn prepare_for_send(state: &AppState, account: &Account, profile: &Profile, event: Option<&Value>, content: &Value) -> AppResult<Value> {
-    if content.get("blocks").is_none() {
-        return Ok(content.clone());
-    }
-    let ctx = crate::render::context(account, Some(profile), event, "");
-    prepare(state, account, content, &ctx).await
 }
 
 /// Copy saved blocks' current content into `content`, marking each reference `frozen`.
@@ -406,11 +405,6 @@ pub async fn freeze_campaign(db: &mut PgConnection, c: &CampaignRow) -> anyhow::
         .execute(&mut *db)
         .await?;
     Ok(())
-}
-
-/// The block list the countdown and icon code read; exposed for tests.
-pub fn empty_ctx() -> Value {
-    Value::Object(Map::new())
 }
 
 /// Parse an RFC 3339 time (`2026-12-01T08:00:00-08:00`).

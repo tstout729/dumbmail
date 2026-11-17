@@ -163,8 +163,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    // Saved blocks, display rules and hosted images are worked out per recipient (see features::content).
+    let prepared = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await?;
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
-    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,

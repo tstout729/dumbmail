@@ -366,7 +366,7 @@ mod tests {
         assert!(running.starts_with(b"GIF89a"));
         let mut d = gif::DecodeOptions::new();
         d.set_color_output(gif::ColorOutput::Indexed);
-        let mut r = d.read_info(running.as_slice()).unwrap();
+        let mut r = d.clone().read_info(running.as_slice()).unwrap();
         let mut frames = 0;
         while r.read_next_frame().unwrap().is_some() {
             frames += 1;

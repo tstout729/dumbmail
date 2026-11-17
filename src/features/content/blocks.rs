@@ -164,7 +164,7 @@ fn video_html(b: &Value, font: &str) -> String {
         ),
         // No thumbnail yet: a dark panel with a play link still works everywhere.
         None => format!(
-            r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#111827" style="background:#111827;border-radius:{r}px;padding:64px 16px;"><a href="{href}" style="font-family:{font};font-size:18px;font-weight:700;color:#ffffff;text-decoration:none;">&#9654;&nbsp; {alt}</a></td></tr></table>"#
+            r##"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#111827" style="background:#111827;border-radius:{r}px;padding:64px 16px;"><a href="{href}" style="font-family:{font};font-size:18px;font-weight:700;color:#ffffff;text-decoration:none;">&#9654;&nbsp; {alt}</a></td></tr></table>"##
         ),
     };
     let caption = if s(b, "caption").trim().is_empty() {
@@ -271,7 +271,7 @@ fn quote_html(b: &Value, brand: &str, font: &str) -> String {
         esc(s(b, "text"))
     );
     let inner = if card {
-        format!(r#"<td align="center" bgcolor="#f9fafb" style="background:#f9fafb;border-radius:8px;padding:24px;">{quote}</td>"#)
+        format!(r##"<td align="center" bgcolor="#f9fafb" style="background:#f9fafb;border-radius:8px;padding:24px;">{quote}</td>"##)
     } else {
         let bar = safe_color(s(b, "color"), brand);
         format!(r#"<td align="{a}" style="border-left:4px solid {bar};padding:4px 0 4px 16px;">{quote}</td>"#)

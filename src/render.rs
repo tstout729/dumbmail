@@ -103,9 +103,10 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
         "image" => {
             let w = b.get("width").and_then(|v| v.as_u64()).unwrap_or(552).min(552);
             let img = format!(
-                r#"<img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:6px;">"#,
+                r#"<img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:{r}px;">"#,
                 src = esc(s(b, "src")),
-                alt = esc(s(b, "alt"))
+                alt = esc(s(b, "alt")),
+                r = b.get("radius").and_then(|v| v.as_u64()).unwrap_or(6).min(40)
             );
             let inner = if s(b, "href").is_empty() { img } else { format!(r#"<a href="{}">{img}</a>"#, esc(s(b, "href"))) };
             format!(r#"<tr><td style="{pad}" align="center">{inner}</td></tr>"#)
@@ -159,6 +160,9 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
         }
         "products" if depth == 0 => products_html(b, brand, font),
         "html" => format!(r#"<tr><td style="{pad}">{}</td></tr>"#, s(b, "html")),
+        // A saved block that wasn't filled in before rendering shows the copy stored with it.
+        "saved" => b.get("blocks").and_then(|v| v.as_array()).map(|bs| bs.iter().filter(|x| s(x, "type") != "saved").map(|x| block_html(x, brand, font, depth)).collect()).unwrap_or_default(),
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" | "if_open" | "if_close" => crate::features::content::blocks::html(b, brand, font),
         _ => String::new(),
     }
 }
@@ -270,6 +274,12 @@ fn block_text(b: &Value, out: &mut String) {
                 }
             }
         }
+        "saved" => {
+            for x in b.get("blocks").and_then(|v| v.as_array()).into_iter().flatten().filter(|x| s(x, "type") != "saved") {
+                block_text(x, out);
+            }
+        }
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" | "if_open" | "if_close" => crate::features::content::blocks::text(b, out),
         _ => {}
     }
 }

@@ -172,7 +172,7 @@ pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &A
 }
 
 /// Appends `FROM profiles p WHERE ...` selecting a campaign's reachable recipients.
-async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+pub async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
     if audience.include.is_empty() {
         return Err(AppError::bad("choose at least one list or segment to send to"));
     }
@@ -285,6 +285,8 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     if c.status != "sending" {
         return Ok(());
     }
+    // Copy in the saved blocks it uses, so editing one later doesn't change what this campaign sends.
+    crate::features::content::prepare::freeze_campaign(&mut tx, &c).await?;
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
             tx.commit().await?;
