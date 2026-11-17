@@ -216,7 +216,7 @@ async fn an_empty_pool_pauses_the_campaign_and_alerts_until_codes_arrive() {
     h.drain().await;
     let c = h.ok("GET", &format!("/api/campaigns/{camp}"), None).await;
     assert_eq!(c["status"], "sending", "{c}");
-    assert!(c["error"].as_str().unwrap().contains("coupon \"SPRING\" has no codes left"), "{c}");
+    assert!(c["error"].as_str().unwrap().contains("Coupon \"SPRING\" has no codes left"), "{c}");
     let sent: Vec<_> = h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("Your code")).collect();
     assert_eq!(sent.len(), 1, "one went out with the one code; nobody got a blank code");
     assert!(!sent.iter().any(|m| code_in(&m.subject).is_empty()));

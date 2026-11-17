@@ -232,7 +232,7 @@ function SettingsCard({ c }: { c: Coupon }) {
   );
 }
 
-const pageSize = 50;
+const pageSize = 25;
 
 function CodesCard({ c, timeZone }: { c: Coupon; timeZone: string }) {
   const [search, setSearch] = useState("");

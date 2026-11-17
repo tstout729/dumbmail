@@ -271,7 +271,12 @@ pub async fn prepare_send(
             _ => return Err(AppError::bad(format!("there's no coupon named {name:?}; create it under Content → Coupons or fix the message"))),
         };
         match give_code(&state.db, &c, profile.id, Via::Message(message_id), None).await? {
-            Some(g) => out.entries.push((name, g)),
+            Some(g) => {
+                if c.out_of_codes_at.is_some() {
+                    unhold(state, &c, campaign_id, flow_id).await?;
+                }
+                out.entries.push((name, g))
+            }
             None => {
                 hold(state, &c, campaign_id, flow_id).await?;
                 return Ok(Prepared::Hold(Utc::now() + chrono::Duration::minutes(HOLD_MINUTES)));
@@ -305,12 +310,34 @@ async fn hold(state: &AppState, c: &Coupon, campaign_id: Option<Uuid>, flow_id: 
     .execute(&mut *tx)
     .await?;
     if let Some(id) = campaign_id {
-        let msg = format!("Paused: coupon {:?} has no codes left. Add codes under Content → Coupons and the campaign carries on within {HOLD_MINUTES} minutes.", c.name);
+        let msg = format!("Coupon {:?} has no codes left. Add codes under Content → Coupons and the campaign carries on within {HOLD_MINUTES} minutes.", c.name);
         sqlx::query("UPDATE campaigns SET error = $2, updated_at = now() WHERE id = $1 AND status = 'sending' AND error IS DISTINCT FROM $2")
             .bind(id)
             .bind(&msg)
             .execute(&mut *tx)
             .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Codes are coming out of the pool again (added, or returned from unsent messages): lift the alert
+/// and this sender's hold.
+async fn unhold(state: &AppState, c: &Coupon, campaign_id: Option<Uuid>, flow_id: Option<Uuid>) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE coupons SET out_of_codes_at = NULL WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
+    let subject = match (campaign_id, flow_id) {
+        (Some(id), _) => format!("campaign:{id}"),
+        (None, Some(id)) => format!("flow:{id}"),
+        (None, None) => String::new(),
+    };
+    let held: Option<Option<Uuid>> = sqlx::query_scalar("DELETE FROM coupon_holds WHERE coupon_id = $1 AND subject = $2 RETURNING campaign_id")
+        .bind(c.id)
+        .bind(&subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(Some(id)) = held {
+        sqlx::query("UPDATE campaigns SET error = NULL, updated_at = now() WHERE id = $1 AND status = 'sending'").bind(id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(())

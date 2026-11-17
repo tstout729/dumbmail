@@ -96,7 +96,10 @@ function CouponRow({ c, timeZone }: { c: Coupon; timeZone: string }) {
         <StockBadge c={c} />
       </Td>
       <Td className="hidden tabular-nums text-zinc-700 sm:table-cell">{formatNumber(c.stock.assigned + c.stock.redeemed)}</Td>
-      <Td className="hidden tabular-nums text-zinc-700 sm:table-cell">{formatNumber(c.stock.redeemed)}</Td>
+      <Td className="hidden tabular-nums text-zinc-700 sm:table-cell">
+        {formatNumber(c.stock.redeemed - c.stock.redeemed_unverified)}
+        {c.stock.redeemed_unverified ? <span className="text-xs text-zinc-400"> +{formatNumber(c.stock.redeemed_unverified)} unverified</span> : null}
+      </Td>
       <Td className="hidden whitespace-nowrap text-zinc-600 md:table-cell">{expiryText(c, timeZone)}</Td>
     </RowLink>
   );
