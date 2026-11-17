@@ -194,8 +194,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
-    // Unique coupon codes are given out now, before rendering; an empty pool holds the message (see features::coupons).
-    let coupons = match crate::features::coupons::assign::prepare_send(state, spec.account, p, spec.content, spec.campaign_id, spec.flow_id, message_id, spec.is_test).await? {
+    // Unique coupon codes are claimed here, after the checks above and just before rendering; a code
+    // stays the person's if a later check skips or defers this attempt. An empty pool holds the
+    // message. Messages without coupons do no coupon work (see features::coupons).
+    let coupons = match crate::features::coupons::assign::prepare_send(state, &spec, message_id).await? {
         crate::features::coupons::Prepared::Ready(c) => c,
         crate::features::coupons::Prepared::Hold(until) => return Ok(Outcome::Deferred(until)),
     };

@@ -1116,23 +1116,22 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             qb.push(")");
         }
         Condition::Coupon { coupon_id, action, op, within_days } => {
+            // A coupon that isn't this account's (deleted, or a wrong id) matches nobody, either way round.
+            qb.push("(EXISTS (SELECT 1 FROM coupons c WHERE c.id = ").push_bind(*coupon_id).push(" AND c.account_id = p.account_id AND c.deleted_at IS NULL) AND ");
             if *op == HasOp::HasNot {
                 qb.push("NOT ");
             }
+            // Given: a message carrying the code was sent, or a form showed it. Redeemed: a verified order.
             let at = match action {
                 CouponAction::Given => "cc.delivered_at",
                 CouponAction::Redeemed => "cc.redeemed_at",
             };
-            qb.push("EXISTS (SELECT 1 FROM coupon_codes cc JOIN coupons c ON c.id = cc.coupon_id AND c.deleted_at IS NULL WHERE cc.profile_id = p.id AND cc.coupon_id = ")
-                .push_bind(*coupon_id);
-            qb.push(match action {
-                CouponAction::Given => " AND cc.delivered_at IS NOT NULL",
-                CouponAction::Redeemed => " AND cc.status = 'redeemed' AND cc.redeemed_verified",
-            });
+            qb.push("EXISTS (SELECT 1 FROM coupon_codes cc WHERE cc.coupon_id = ").push_bind(*coupon_id).push(" AND cc.profile_id = p.id");
+            qb.push(format!(" AND {at} IS NOT NULL"));
             if let Some(d) = within_days {
                 qb.push(format!(" AND {at} >= now() - make_interval(days => ")).push_bind(*d as i32).push(")");
             }
-            qb.push(")");
+            qb.push("))");
         }
         Condition::Message { action, campaign_id, flow_id, op, within_days } => {
             let names: Vec<String> = match action {
@@ -1363,6 +1362,22 @@ mod tests {
         assert!(sql.contains("p.properties->>$1"));
         assert!(sql.contains("FROM events e"));
         assert!(!sql.contains("Portland"), "values must be bound, not inlined");
+    }
+
+    #[test]
+    fn coupon_rules_need_the_coupon_either_way_round() {
+        for (action, op) in [("given", "has"), ("given", "has_not"), ("redeemed", "has"), ("redeemed", "has_not")] {
+            let def = parse(&json!({"conditions": [{"type": "coupon", "coupon_id": "0190a8a2-0000-7000-8000-000000000004", "action": action, "op": op, "within_days": 7}]})).unwrap();
+            let mut qb = QueryBuilder::<Postgres>::new("SELECT 1 FROM profiles p WHERE ");
+            push_definition(&mut qb, &def);
+            let sql = qb.sql();
+            // The coupon must exist in the person's account before "has not" can match anyone.
+            let exists = sql.find("FROM coupons c WHERE c.id = $1 AND c.account_id = p.account_id AND c.deleted_at IS NULL").expect(sql);
+            assert!(exists < sql.find("FROM coupon_codes").unwrap(), "{sql}");
+            assert_eq!(sql.contains("NOT EXISTS (SELECT 1 FROM coupon_codes"), op == "has_not", "{sql}");
+            assert!(sql.contains(if action == "given" { "cc.delivered_at IS NOT NULL" } else { "cc.redeemed_at IS NOT NULL" }), "{sql}");
+            assert!(!sql.contains("0190a8a2"), "values are bound");
+        }
     }
 
     #[test]

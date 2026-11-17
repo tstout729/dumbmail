@@ -117,6 +117,8 @@ fn check_template_content(content: &Value) -> AppResult<()> {
     if !content.is_object() || serde_json::to_string(content)?.len() > 600 * 1024 {
         return Err(AppError::bad("content must be an email content object (at most 600 KB)"));
     }
+    // Coupon codes are marketing: not supported in transactional email (see docs/COUPONS.md).
+    crate::features::coupons::template::forbid(content)?;
     let r = review::review(content);
     if r.blocked {
         return Err(AppError::bad(review::blocked_message(&r)));

@@ -79,15 +79,7 @@ pub trait Feature: Send + Sync {
         Ok(())
     }
 
-    /// Whether this feature's `on_event` needs to see the account's events of `metric`. Events
-    /// reach `on_event` only when a live flow or some feature wants them, so keep this cheap (an
-    /// `EXISTS`, cached briefly).
-    async fn wants_event(&self, _db: &sqlx::PgPool, _account_id: Uuid, _metric: &str) -> bool {
-        false
-    }
-
-    /// Called once for each recorded event that a live flow or [`Feature::wants_event`] asked
-    /// for, after flows have seen it.
+    /// Called once for each recorded event, after flows have seen it.
     async fn on_event(&self, _state: &AppState, _event_id: Uuid) -> anyhow::Result<()> {
         Ok(())
     }
@@ -170,16 +162,6 @@ pub fn spawn_after_start(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
-}
-
-/// Whether any feature wants to see this event (see [`Feature::wants_event`]).
-pub async fn wants_event(db: &sqlx::PgPool, account_id: Uuid, metric: &str) -> bool {
-    for f in ALL {
-        if f.wants_event(db, account_id, metric).await {
-            return true;
-        }
-    }
-    false
 }
 
 /// Errors are logged, not returned: the event's flows already ran and must not run again on a retry.
