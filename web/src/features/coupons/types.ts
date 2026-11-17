@@ -1,7 +1,7 @@
 export type CouponAlphabet = "letters_digits" | "letters" | "digits";
 export type CouponPattern = { prefix?: string; length: number; alphabet?: CouponAlphabet };
 
-export type CouponStock = { total: number; available: number; assigned: number; redeemed: number; redeemed_unverified: number };
+export type CouponStock = { total: number; available: number; assigned: number; redeemed: number; redeemed_unverified: number; generating: number };
 
 export type CouponWaiting = { type: "campaign" | "flow"; id: string; name: string | null; since: string };
 
@@ -22,7 +22,7 @@ export type Coupon = {
   updated_at: string;
   stock: CouponStock;
   alerts: { out_of_codes: boolean; out_of_codes_since: string | null; low_stock: boolean; waiting: CouponWaiting[] };
-  usage: { tag: string };
+  usage: { tag: string; expiry_tag: string };
 };
 
 export type CouponInput = {
@@ -48,17 +48,32 @@ export type CouponCode = {
   given_at: string | null;
   delivered_at: string | null;
   expires_at: string | null;
+  /** Set only by a verified order (the API, MCP or a store integration). */
   redeemed_at: string | null;
-  redeemed_verified: boolean | null;
   order_value: number | null;
-  given_via: "message" | "form" | null;
+  /** An order recorded by the website script: unverified, so it doesn't count as redeemed. */
+  unverified_order_at: string | null;
+  given_via: "message" | "form" | "store" | null;
 };
 
-export type CouponCodeQuery = { q?: string; status?: CouponCodeStatus | ""; limit?: number; offset?: number };
-export type CouponCodePage = { data: CouponCode[]; total: number; total_capped: boolean };
+export type CouponCodeQuery = { q?: string; status?: CouponCodeStatus | ""; limit?: number; cursor?: number };
+export type CouponCodePage = { data: CouponCode[]; total: number; total_capped: boolean; next_cursor: number | null };
 
-export type AddCodesResult = { added: number; duplicates: number; refused: number; coupon: Coupon };
-export type GenerateResult = { added: number; coupon: Coupon };
+export type AddCodesResult = {
+  added: number;
+  duplicates: number;
+  refused: number;
+  refused_lines: { line: number; reason: string }[];
+  /** Set when the upload stopped at a limit; what came before it was added. */
+  stopped: string | null;
+  coupon: Coupon;
+};
+export type GenerateResult = { added: number; queued: number; coupon: Coupon };
+
+export type ExportFormat = "codes" | "csv";
+
+/** A campaign's coupon check: problems stop the send, warnings are worth knowing. */
+export type CouponCampaignCheck = { problems: string[]; warnings: string[] };
 
 export type CouponReport = {
   given: number;

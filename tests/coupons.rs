@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use common::*;
 
+type At = chrono::DateTime<chrono::Utc>;
+
 async fn account_id(h: &Harness) -> Uuid {
     sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap()
 }
@@ -663,7 +665,7 @@ async fn double_opt_in_gives_the_code_earned_at_sign_up_once_and_old_links_show_
         }
     };
     let link_for = |h: &Harness, to: &str| {
-        let mail = h.state.email.sent().into_iter().filter(|m| m.to == to).last().unwrap();
+        let mail = h.state.email.sent().into_iter().rfind(|m| m.to == to).unwrap();
         find_link(&mail.html, "https://pl.test/c/").trim_start_matches("https://pl.test").to_string()
     };
 
@@ -729,8 +731,7 @@ async fn redemptions_are_matched_once_and_browser_orders_stay_unverified() {
     let row = |h: &Harness, code: &str| {
         let (db, code) = (h.state.db.clone(), code.to_string());
         async move {
-            let r: (Option<chrono::DateTime<chrono::Utc>>, Option<f64>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
-                sqlx::query_as("SELECT redeemed_at, order_value, browser_order_at, delivered_at FROM coupon_codes WHERE code = $1").bind(code).fetch_one(&db).await.unwrap();
+            let r: (Option<At>, Option<f64>, Option<At>, Option<At>) = sqlx::query_as("SELECT redeemed_at, order_value, browser_order_at, delivered_at FROM coupon_codes WHERE code = $1").bind(code).fetch_one(&db).await.unwrap();
             r
         }
     };
