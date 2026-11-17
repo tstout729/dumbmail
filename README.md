@@ -2,12 +2,12 @@
 
 Open-source email and SMS marketing: campaigns, automated flows, live segments, sign-up forms, revenue attribution and a full MCP server, in one Rust binary with Postgres.
 
-It covers the core of what Klaviyo does at a fraction of the cost. Self-host it for free, or use the hosted service and pay only for what you send. There's no monthly plan and no per-contact fee:
+It covers the core of what Klaviyo does at a fraction of the cost. Self-host it for free, or use the hosted service and pay only for what you send, with an optional monthly email plan. There's no per-contact fee:
 
 | | Hosted DumbMail | Klaviyo |
 | --- | --- | --- |
 | Email | $0.40 per 1,000 (first 1,000 a month free) | $150/mo for 10,000 contacts, $720/mo for 50,000 |
-| SMS (US, carrier fees included) | $0.012 per segment | about $0.011–0.015 per message, plus carrier fees |
+| SMS (US, carrier fees included) | $0.015 per segment | about $0.011–0.015 per message, plus carrier fees |
 | MMS (US, carrier fees included) | $0.03 | more than an SMS, plus carrier fees |
 | Texting number | $2.20 a month, or connect your own Telnyx/Twilio account and texts are free | not listed |
 

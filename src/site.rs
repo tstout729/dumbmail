@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn prices_read_naturally() {
         assert_eq!(money(0.40), "$0.40");
-        assert_eq!(money(0.012), "$0.012");
+        assert_eq!(money(0.015), "$0.015");
         assert_eq!(money(0.03), "$0.03");
         assert_eq!(money(2.20), "$2.20");
         assert_eq!(money(2.0), "$2.00");

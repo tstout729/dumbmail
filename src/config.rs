@@ -76,14 +76,15 @@ pub struct Config {
     pub stripe_api_base: String,
 
     /// Customer prices in USD. Each covers the worst-case provider cost plus Stripe's fee on the
-    /// smallest ($10) top-up (5.9%) and still leaves a margin.
-    /// Email: SES costs $0.10 (à la carte) to $0.16 (Essentials plan) per 1,000, plus about
-    /// $0.02 for data, so at most ~$0.18.
+    /// smallest ($25) top-up (4.1%) and still leaves a margin.
+    /// Email: SES costs $0.10 per 1,000 on the à la carte plan (the account uses it), plus about
+    /// $0.02 for data, so about $0.12.
     #[arg(long, env = "PRICE_EMAIL_PER_1000", default_value_t = 0.40)]
     pub price_email_per_1000: f64,
     /// SMS per segment, carrier fees included. Telnyx toll-free: $0.0055 plus up to $0.0045 in
-    /// carrier fees = $0.01 worst case, plus unbilled inbound replies.
-    #[arg(long, env = "PRICE_SMS_SEGMENT", default_value_t = 0.012)]
+    /// carrier fees = $0.01 worst case, plus unbilled inbound replies. $0.015 keeps about a third
+    /// as margin in that worst case.
+    #[arg(long, env = "PRICE_SMS_SEGMENT", default_value_t = 0.015)]
     pub price_sms_segment: f64,
     /// MMS, carrier fees included. Telnyx toll-free: $0.016 plus up to $0.01 = $0.026 worst case.
     #[arg(long, env = "PRICE_MMS", default_value_t = 0.03)]
