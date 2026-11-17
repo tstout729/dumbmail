@@ -1,10 +1,42 @@
 {%- comment -%}
   DumbMail's website snippet on every page. DumbMail saves the script's address (with the store's
   public key) in this app's settings when the store connects; nothing to type here.
+
+  It loads only once Shopify's Customer Privacy API says the visitor allows analytics. Recognising
+  visitors by the email they type (identification) also needs marketing to be allowed; without it
+  the snippet loads with email capture off. If the visitor gives consent later, it loads then. If
+  the Customer Privacy API can't load, the snippet doesn't either.
 {%- endcomment -%}
 {%- assign dumbmail_src = app.metafields.dumbmail.script_url.value -%}
 {%- if dumbmail_src != blank -%}
-  <script async src="{{ dumbmail_src | escape }}"></script>
+  <script>
+    (function () {
+      var src = {{ dumbmail_src | json }};
+      var loaded = false;
+      function load(marketing) {
+        if (loaded) return;
+        loaded = true;
+        var s = document.createElement("script");
+        s.async = true;
+        s.src = src;
+        if (!marketing) s.setAttribute("data-capture-emails", "false");
+        document.head.appendChild(s);
+      }
+      function check() {
+        var p = window.Shopify && window.Shopify.customerPrivacy;
+        if (p && p.analyticsProcessingAllowed()) load(p.marketingAllowed());
+      }
+      document.addEventListener("visitorConsentCollected", function (e) {
+        var d = (e && e.detail) || {};
+        if (d.analyticsAllowed) load(!!d.marketingAllowed);
+      });
+      if (window.Shopify && typeof window.Shopify.loadFeatures === "function") {
+        window.Shopify.loadFeatures([{ name: "consent-tracking-api", version: "1.0" }], function (error) {
+          if (!error) check();
+        });
+      }
+    })();
+  </script>
 {%- endif -%}
 
 {% schema %}

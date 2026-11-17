@@ -78,9 +78,10 @@ pub const SERVER_METRICS: &[&str] = &["Ordered Product", "Fulfilled Order", "Ful
 
 pub struct Module;
 
-/// Job: the account's Shopify worker. Does whatever is waiting, most urgent first, for one slice,
-/// then hands back to the queue: webhook deliveries, then items to read again, then unsubscribes to
-/// write back, then the import.
+/// Job: the account's Shopify worker. Each run gives each kind of work its own share of the slice,
+/// most urgent first, so one busy queue can't starve the others: privacy requests, then
+/// unsubscribes to write back, then webhook deliveries (and the items they ask to read again), then
+/// the import. Then it hands back to the queue.
 async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
     let Some(lease) = shop::acquire(state, account_id).await? else { return Ok(()) };
     let (more, delay) = match work_inner(state, account_id, &lease).await {
@@ -94,56 +95,29 @@ async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
     shop::release(state, &lease, more, delay).await
 }
 
+/// Seconds of each slice for each kind of work (what one leaves unused, the later ones get).
+const PRIVACY_SECS: u64 = 3;
+const WRITEBACK_SECS: u64 = 3;
+const WEBHOOK_SECS: u64 = 6;
+
 async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> anyhow::Result<(bool, Option<chrono::Duration>)> {
     let Some(s) = shop::load(&state.db, account_id).await? else { return Ok((false, None)) };
-    if s.status != "connected" {
+    if s.status != "connected" || s.generation != lease.generation {
         return Ok((false, None));
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(shop::SLICE_SECS);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(shop::SLICE_SECS);
+    let until = |secs: u64| (std::time::Instant::now() + std::time::Duration::from_secs(secs)).min(deadline);
     let mut metrics = events::Metrics::default();
     let mut wait: Option<chrono::Duration> = None;
+    let mut more = false;
 
-    let mut cx = orders::Ctx { state, account_id, metrics: &mut metrics, quiet: false };
-    let mut more = webhooks::drain(state, &mut cx, deadline).await?;
+    // 1. Privacy requests.
+    privacy::run_until(state, account_id, until(PRIVACY_SECS)).await?;
 
-    // Items to read again: products, then customers, a batch at a time.
-    while std::time::Instant::now() < deadline {
-        let batch: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT kind, shopify_id FROM shopify_refresh WHERE account_id = $1 ORDER BY kind DESC, queued_at LIMIT 50",
-        )
-        .bind(account_id)
-        .fetch_all(&state.db)
-        .await?;
-        if batch.is_empty() {
-            break;
-        }
-        let kind = batch[0].0.clone();
-        let ids: Vec<i64> = batch.iter().filter(|(k, _)| *k == kind).map(|(_, i)| *i).take(if kind == "product" { products::PER_QUERY } else { 50 }).collect();
-        let r = if kind == "product" { products::refresh(state, &s, &ids).await } else { customers::refresh(state, &s, &ids).await };
-        match r {
-            Ok(()) => {
-                sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
-            }
-            Err(e) => match e.retry_after() {
-                Some(secs) => {
-                    wait = Some(chrono::Duration::seconds(secs as i64));
-                    more = true;
-                    break;
-                }
-                None => {
-                    // Not worth retrying (permission, gone): drop them and say so.
-                    sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
-                    shop::note_error(&state.db, account_id, Some(&format!("Reading {kind}s from Shopify failed: {e}."))).await?;
-                }
-            },
-        }
-        shop::renew(state, lease).await?;
-    }
-    let refresh_left: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_refresh WHERE account_id = $1)").bind(account_id).fetch_one(&state.db).await?;
-    more |= refresh_left && wait.is_none();
-
-    if wait.is_none() && std::time::Instant::now() < deadline {
-        match customers::write_back(state, &s, 20).await {
+    // 2. Unsubscribes to write back.
+    if shop::renew(state, lease).await? {
+        match customers::write_back(state, &s, 20, until(WRITEBACK_SECS)).await {
             Ok(n) if n >= 20 => more = true,
             Ok(_) => {}
             Err(e) => {
@@ -154,10 +128,62 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
                 }
             }
         }
+    } else {
+        return Ok((false, None));
     }
 
-    if wait.is_none() && std::time::Instant::now() < deadline {
-        match import::step(state, &s, &mut metrics, deadline).await? {
+    // 3. Webhook deliveries, then the items they asked to read again.
+    let hooks_until = until(WEBHOOK_SECS);
+    let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, metrics: &mut metrics, quiet: false };
+    more |= webhooks::drain(state, &mut cx, lease, hooks_until).await?;
+    while wait.is_none() && std::time::Instant::now() < hooks_until.max(until(2)) {
+        if !shop::renew(state, lease).await? {
+            return Ok((false, None));
+        }
+        let batch: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT kind, shopify_id FROM shopify_refresh WHERE account_id = $1 ORDER BY kind DESC, queued_at LIMIT 50",
+        )
+        .bind(account_id)
+        .fetch_all(&state.db)
+        .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let kind = batch[0].0.clone();
+        let per = match kind.as_str() {
+            "product" => products::PER_QUERY,
+            "order" => orders::REFUNDS_PER_QUERY,
+            _ => 50,
+        };
+        let ids: Vec<i64> = batch.iter().filter(|(k, _)| *k == kind).map(|(_, i)| *i).take(per).collect();
+        let r = match kind.as_str() {
+            "product" => products::refresh(state, &s, &ids).await,
+            "order" => orders::refresh_refunds(&mut cx, &s, &ids).await,
+            _ => customers::refresh(state, &s, &ids).await,
+        };
+        match r {
+            Ok(()) => {
+                sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
+            }
+            Err(e) => match e.retry_after() {
+                Some(secs) => {
+                    wait = Some(chrono::Duration::seconds(secs as i64));
+                    more = true;
+                }
+                None => {
+                    // Not worth retrying (permission, gone): drop them and say so.
+                    sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
+                    shop::note_error(&state.db, account_id, Some(&format!("Reading {kind}s from Shopify failed: {e}."))).await?;
+                }
+            },
+        }
+    }
+    let refresh_left: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_refresh WHERE account_id = $1)").bind(account_id).fetch_one(&state.db).await?;
+    more |= refresh_left && wait.is_none();
+
+    // 4. The import, with what's left of the slice.
+    if wait.is_none() && std::time::Instant::now() < deadline && shop::renew(state, lease).await? {
+        match import::step(state, &s, lease, &mut metrics, deadline).await? {
             import::Step::More => more = true,
             import::Step::Wait(d) => wait = Some(d),
             import::Step::Idle => {}
@@ -207,7 +233,7 @@ impl Feature for Module {
                 Err(e) => Err(e),
             },
             "shopify_setup" => match account() {
-                Ok(a) => oauth::setup(state, a).await,
+                Ok(a) => oauth::setup(state, a, payload["generation"].as_i64().map(|g| g as i32)).await,
                 Err(e) => Err(e),
             },
             "shopify_privacy" => match account() {
@@ -224,6 +250,8 @@ impl Feature for Module {
             for account_id in customers::writeback_due(&state.db).await? {
                 shop::kick_now(&state.db, account_id).await?;
             }
+            privacy::queue_due(&state.db).await?;
+            oauth::setup_due(&state.db).await?;
             sqlx::query("DELETE FROM shopify_oauth_states WHERE created_at < now() - interval '1 hour'").execute(&state.db).await?;
         }
         if tick.is_multiple_of(30) {

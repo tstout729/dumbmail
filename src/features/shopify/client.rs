@@ -285,8 +285,24 @@ pub fn result_url_ok(state: &AppState, raw: &str) -> bool {
     u.scheme() == "https" && u.host_str().is_some_and(|h| RESULT_HOSTS.contains(&h))
 }
 
+/// Most bytes skipped from the start of a result file when its server ignores byte ranges. Past
+/// this the import stops with a clear error instead of reading an ever longer prefix on every slice.
+pub const MAX_SKIP: u64 = 64 * 1024 * 1024;
+
+/// `bytes start-end/total` from a Content-Range header.
+fn content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = v.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (a, b) = range.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, total.trim().parse().ok()))
+}
+
 /// One read of a result file from byte `offset`, at most `max` bytes (the caller keeps whole lines
 /// and asks again from where it stopped). `Ok(None)`: the link expired or vanished.
+///
+/// A partial response must say it starts exactly at `offset` (`Content-Range`), or the read fails.
+/// A server that ignores `Range` sends the whole file: the bytes before `offset` are skipped once,
+/// up to [`MAX_SKIP`]; beyond that the import fails with a plain error.
 pub async fn result_chunk(state: &AppState, url: &str, offset: u64, max: usize) -> Result<Option<(Vec<u8>, bool)>, ApiError> {
     if !result_url_ok(state, url) {
         return Err(ApiError::Graph("unexpected result host".into()));
@@ -304,14 +320,19 @@ pub async fn result_chunk(state: &AppState, url: &str, offset: u64, max: usize) 
         403 | 404 | 410 => return Ok(None),
         s => return Err(ApiError::Http(s)),
     }
-    // A server that ignores Range sends the whole file: skip to the offset ourselves, still capped.
+    let range = res.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(content_range);
     let full = status == 200;
-    let total = res
-        .headers()
-        .get("content-range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('/').next())
-        .and_then(|n| n.parse::<u64>().ok());
+    let total = if full {
+        if offset > MAX_SKIP {
+            return Err(ApiError::Graph("Shopify's result file server ignored byte ranges, so the import can't continue past this point".into()));
+        }
+        res.content_length()
+    } else {
+        match range {
+            Some((start, end, total)) if start == offset && end >= start => total,
+            _ => return Err(ApiError::Graph("the result file answered with the wrong byte range".into())),
+        }
+    };
     let mut out = Vec::new();
     let mut seen: u64 = 0;
     let mut res = res;

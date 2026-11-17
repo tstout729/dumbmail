@@ -417,6 +417,13 @@ enum Saved {
 /// Save products from an authoritative source (not events). Problems with one product are
 /// reported in the summary and don't stop the rest. Products saved here count as verified.
 pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInput], origin: Origin) -> AppResult<UpsertSummary> {
+    upsert_products_with(db, account_id, inputs, origin, false).await
+}
+
+/// [`upsert_products`], optionally `quiet`: prices and stock are saved (and their history) but no
+/// back-in-stock or price-drop alerts are queued. For a first load or a history import, where a
+/// "change" is only the catalog catching up, not something that happened in the store.
+pub async fn upsert_products_with(db: &PgPool, account_id: Uuid, inputs: &[ProductInput], origin: Origin, quiet: bool) -> AppResult<UpsertSummary> {
     if inputs.len() > MAX_BATCH && !matches!(origin, Origin::Feed(_) | Origin::Csv | Origin::Shopify) {
         return Err(AppError::bad(format!("send at most {MAX_BATCH} products per call")));
     }
@@ -429,7 +436,7 @@ pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInp
                 continue;
             }
         };
-        match upsert_one(db, account_id, &c, origin).await {
+        match upsert_one(db, account_id, &c, origin, quiet).await {
             Ok(Saved::Created(id)) => {
                 out.created += 1;
                 out.ids.push(id);
@@ -460,7 +467,7 @@ struct Existing {
     missing_since: Option<DateTime<Utc>>,
 }
 
-async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin) -> AppResult<Saved> {
+async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, quiet: bool) -> AppResult<Saved> {
     let hash = crate::auth::sha256_hex(&serde_json::to_string(c).map_err(|e| AppError::Internal(e.into()))?);
     let mut tx = db.begin().await?;
     let existing: Option<Existing> = sqlx::query_as(
@@ -654,7 +661,7 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin) ->
             .await?;
     }
     // Restocks and price drops are queued in this transaction: they're saved exactly when the change is.
-    if let Some(e) = &existing {
+    if let Some(e) = existing.as_ref().filter(|_| !quiet) {
         let mut changes = Vec::new();
         for (vid, was, now) in &variant_ids {
             if !*was && *now {

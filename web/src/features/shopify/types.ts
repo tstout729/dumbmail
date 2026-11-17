@@ -1,4 +1,4 @@
-export type ShopifyHealthState = "server" | "quiet" | "waiting" | "browser_only" | "none";
+export type ShopifyHealthState = "server" | "quiet" | "waiting" | "incomplete" | "browser_only" | "none";
 
 export type ShopifyConnection = {
   shop: string;
@@ -17,6 +17,9 @@ export type ShopifyConnection = {
   last_error_at: string | null;
   web_pixel_installed: boolean;
   storefront_error: string | null;
+  missing_topics: string[];
+  cleanup_error: string | null;
+  dropped_payloads: number;
 };
 
 export type ShopifyImportStatus = "running" | "paused" | "cancelled" | "done" | "failed";
@@ -37,7 +40,14 @@ export type ShopifyImport = {
   updated_at: string;
 };
 
-export type ShopifyDataRequest = { id: string; customer_email: string | null; created_at: string; downloaded_at: string | null };
+export type ShopifyDataRequest = {
+  id: string;
+  shopify_customer_id: string | null;
+  shopify_request_id: string | null;
+  shop: string | null;
+  created_at: string;
+  downloaded_at: string | null;
+};
 
 export type ShopifyStatus = {
   available: boolean;
@@ -45,7 +55,8 @@ export type ShopifyStatus = {
   connection: ShopifyConnection | null;
   health: { state: ShopifyHealthState; message: string };
   syncing: string[];
-  counts: { linked_customers: number; products: number; webhooks_waiting: number };
+  counts: { linked_customers: number; products: number; webhooks_waiting: number; privacy_requests_waiting: number; unsubscribes_to_write_back: number };
+  problems: string[];
   import: ShopifyImport | null;
   products_sync: ShopifyImport | null;
   storefront: { embed_link: string | null; pixel_installed: boolean; error: string | null };

@@ -68,11 +68,16 @@ pub struct ShopRow {
     pub last_order_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub last_error_at: Option<DateTime<Utc>>,
+    pub generation: i32,
+    pub missing_topics: Vec<String>,
+    pub catalog_loaded_at: Option<DateTime<Utc>>,
+    pub cleanup_error: Option<String>,
+    pub dropped_payloads: i32,
 }
 
 const SHOP_COLS: &str = "account_id, shop_domain, status, scopes, access_token_enc, token_expires_at, refresh_token_enc, token_hint, shop_name, currency,
     primary_url, shop_timezone, webhook_ids, web_pixel_id, storefront_error, connected_at, disconnected_at, last_webhook_at, last_webhook_topic,
-    last_order_at, last_error, last_error_at";
+    last_order_at, last_error, last_error_at, generation, missing_topics, catalog_loaded_at, cleanup_error, dropped_payloads";
 
 pub async fn load(db: &PgPool, account_id: Uuid) -> AppResult<Option<ShopRow>> {
     Ok(sqlx::query_as::<_, ShopRow>(&format!("SELECT {SHOP_COLS} FROM shopify_shops WHERE account_id = $1"))
@@ -138,24 +143,40 @@ pub struct Lease {
     pub account_id: Uuid,
     pub token: Uuid,
     pub slot: i32,
+    /// The install this run works for. A reinstall bumps the shop's generation and clears the
+    /// lease, so a run that outlives either loses the right to write.
+    pub generation: i32,
 }
+
+/// Is this run still the account's worker, for the same install? Checked before each piece of
+/// work; state writes also check it in the same statement (see [`LEASE_GUARD`]).
+pub async fn still_mine(db: &PgPool, lease: &Lease) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!("SELECT {LEASE_GUARD}"))
+        .bind(lease.account_id)
+        .bind(lease.token)
+        .bind(lease.generation)
+        .fetch_one(db)
+        .await
+}
+
+/// SQL condition, with `$1` account, `$2` lease token and `$3` generation bound: the lease is held
+/// by this run for this install and the store is connected.
+pub const LEASE_GUARD: &str = "EXISTS (SELECT 1 FROM shopify_shops WHERE account_id = $1 AND lease_token = $2 AND generation = $3 AND status = 'connected' AND lease_until > now())";
 
 /// Take the account's lease and one global lane. `Ok(None)`: someone else holds the lease (they will
 /// see the queued flag when they finish) or every lane is busy (the job is queued again shortly).
 pub async fn acquire(state: &AppState, account_id: Uuid) -> anyhow::Result<Option<Lease>> {
     let token = Uuid::now_v7();
-    let got: Option<Uuid> = sqlx::query_scalar(
+    let got: Option<i32> = sqlx::query_scalar(
         "UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $2), lease_token = $3, work_queued_at = NULL
-         WHERE account_id = $1 AND (lease_until IS NULL OR lease_until < now()) RETURNING account_id",
+         WHERE account_id = $1 AND (lease_until IS NULL OR lease_until < now()) RETURNING generation",
     )
     .bind(account_id)
     .bind(LEASE_SECS as f64)
     .bind(token)
     .fetch_optional(&state.db)
     .await?;
-    if got.is_none() {
-        return Ok(None);
-    }
+    let Some(generation) = got else { return Ok(None) };
     let slot: Option<i32> = sqlx::query_scalar(
         "UPDATE shopify_lanes SET account_id = $1, lease_until = now() + make_interval(secs => $2)
          WHERE slot = (SELECT slot FROM shopify_lanes WHERE lease_until IS NULL OR lease_until < now() ORDER BY slot LIMIT 1 FOR UPDATE SKIP LOCKED)
@@ -175,7 +196,7 @@ pub async fn acquire(state: &AppState, account_id: Uuid) -> anyhow::Result<Optio
         crate::jobs::enqueue(&state.db, "shopify_work", json!({"account_id": account_id}), Some(Utc::now() + Duration::seconds(5))).await?;
         return Ok(None);
     };
-    Ok(Some(Lease { account_id, token, slot }))
+    Ok(Some(Lease { account_id, token, slot, generation }))
 }
 
 /// Give the lease and lane back. With `more` (work left, or a wait such as a bulk operation still
@@ -205,12 +226,14 @@ pub async fn release(state: &AppState, lease: &Lease, more: bool, delay: Option<
     Ok(())
 }
 
-/// Keep the lease while a run is still inside its slice.
+/// Keep the lease while a run is still inside its slice. False: the lease or the install is gone
+/// (a reinstall, a disconnect, or the run outlived its lease); stop without writing more.
 pub async fn renew(state: &AppState, lease: &Lease) -> anyhow::Result<bool> {
-    let n = sqlx::query("UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $3) WHERE account_id = $1 AND lease_token = $2")
+    let n = sqlx::query("UPDATE shopify_shops SET lease_until = now() + make_interval(secs => $3) WHERE account_id = $1 AND lease_token = $2 AND generation = $4 AND status = 'connected'")
         .bind(lease.account_id)
         .bind(lease.token)
         .bind(LEASE_SECS as f64)
+        .bind(lease.generation)
         .execute(&state.db)
         .await?
         .rows_affected();
@@ -265,6 +288,9 @@ pub fn status_json(s: &ShopRow) -> Value {
         "last_error_at": s.last_error_at,
         "web_pixel_installed": s.web_pixel_id.is_some(),
         "storefront_error": s.storefront_error,
+        "missing_topics": s.missing_topics,
+        "cleanup_error": s.cleanup_error,
+        "dropped_payloads": s.dropped_payloads,
     })
 }
 

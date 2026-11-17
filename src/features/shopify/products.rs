@@ -12,13 +12,14 @@ use uuid::Uuid;
 use super::client::{self, ApiError};
 use super::customers::{amount, gid, num_id};
 use super::shop::ShopRow;
+use super::customers::parse_time;
 use crate::features::catalog::store::{self as catalog, Origin, ProductInput, VariantInput};
 use crate::state::AppState;
 
 /// Products read per `nodes` query (keeps the query under Shopify's 1,000-point cost limit).
 pub const PER_QUERY: usize = 4;
 
-pub const PRODUCT_FIELDS: &str = "id title handle descriptionHtml vendor productType tags status onlineStoreUrl publishedAt";
+pub const PRODUCT_FIELDS: &str = "id updatedAt title handle descriptionHtml vendor productType tags status onlineStoreUrl publishedAt";
 pub const VARIANT_FIELDS: &str = "id title sku price compareAtPrice inventoryQuantity availableForSale inventoryItem { id tracked } selectedOptions { name value }";
 
 pub async fn queue_refresh<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid, kind: &str, id: i64) -> sqlx::Result<()> {
@@ -144,19 +145,86 @@ pub async fn remember_inventory_items(db: &PgPool, account_id: Uuid, nodes: &[No
     Ok(())
 }
 
-/// Save products into the catalog. Returns how many were saved.
-pub async fn save(db: &PgPool, shop: &ShopRow, nodes: &[Node]) -> anyhow::Result<u64> {
-    let inputs: Vec<ProductInput> = nodes.iter().filter_map(|n| to_input(n, shop.currency.as_deref(), shop.primary_url.as_deref())).collect();
-    remember_inventory_items(db, shop.account_id, nodes).await?;
+/// How a batch of products is being saved.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SaveMode {
+    /// Queue no back-in-stock or price-drop alerts (a history import, or the store's first load).
+    pub quiet: bool,
+    /// A full product scan (bulk snapshot taken when it started): a product Shopify updated or
+    /// deleted after its snapshot is left as the webhook made it. `Some(scan id)` records it as seen.
+    pub scan: Option<Uuid>,
+}
+
+/// Save products into the catalog, recording which store each came from. Returns how many were saved.
+pub async fn save(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode) -> anyhow::Result<u64> {
+    let quiet = mode.quiet || shop.catalog_loaded_at.is_none();
+    let mut keep: Vec<&Node> = Vec::new();
+    for n in nodes {
+        let Some(pid) = num_id(&n.product["id"]) else { continue };
+        let at = parse_time(n.product["updatedAt"].as_str());
+        if mode.scan.is_some() {
+            // Newer than this snapshot (a webhook read it since, or it was deleted since): skip.
+            let newer: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM shopify_products WHERE account_id = $1 AND product_id = $2 AND shop_domain = $3
+                   AND ((shopify_updated_at IS NOT NULL AND $4::timestamptz IS NOT NULL AND shopify_updated_at > $4) OR (deleted_at IS NOT NULL AND ($4::timestamptz IS NULL OR deleted_at > $4))))",
+            )
+            .bind(shop.account_id)
+            .bind(pid)
+            .bind(&shop.shop_domain)
+            .bind(at)
+            .fetch_one(db)
+            .await?;
+            if newer {
+                sqlx::query("UPDATE shopify_products SET seen_by = $3 WHERE account_id = $1 AND product_id = $2").bind(shop.account_id).bind(pid).bind(mode.scan).execute(db).await?;
+                continue;
+            }
+        }
+        sqlx::query(
+            "INSERT INTO shopify_products (account_id, product_id, shop_domain, shopify_updated_at, seen_by, deleted_at, touched_at) VALUES ($1, $2, $3, $4, $5, NULL, now())
+             ON CONFLICT (account_id, product_id) DO UPDATE SET shop_domain = EXCLUDED.shop_domain, shopify_updated_at = COALESCE(EXCLUDED.shopify_updated_at, shopify_products.shopify_updated_at),
+                seen_by = COALESCE(EXCLUDED.seen_by, shopify_products.seen_by), deleted_at = NULL, touched_at = now()",
+        )
+        .bind(shop.account_id)
+        .bind(pid)
+        .bind(&shop.shop_domain)
+        .bind(at)
+        .bind(mode.scan)
+        .execute(db)
+        .await?;
+        keep.push(n);
+    }
+    let owned: Vec<Node> = keep.into_iter().cloned().collect();
+    let inputs: Vec<ProductInput> = owned.iter().filter_map(|n| to_input(n, shop.currency.as_deref(), shop.primary_url.as_deref())).collect();
+    remember_inventory_items(db, shop.account_id, &owned).await?;
     let mut saved = 0;
     for chunk in inputs.chunks(200) {
-        let r = catalog::upsert_products(db, shop.account_id, chunk, Origin::Shopify).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let r = catalog::upsert_products_with(db, shop.account_id, chunk, Origin::Shopify, quiet).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
         saved += r.created + r.updated + r.unchanged;
         for e in r.errors.iter().take(3) {
             tracing::warn!(account = %shop.account_id, error = %e, "a Shopify product couldn't be saved");
         }
     }
     Ok(saved)
+}
+
+/// A full scan of the store's products finished: products of this store it didn't see, and that
+/// nothing touched since the scan started, are gone from Shopify. Unpublish them. Returns how many.
+pub async fn finish_scan(db: &PgPool, shop: &ShopRow, scan: Uuid, started: chrono::DateTime<chrono::Utc>) -> sqlx::Result<u64> {
+    let gone: Vec<i64> = sqlx::query_scalar(
+        "UPDATE shopify_products SET deleted_at = now() WHERE account_id = $1 AND shop_domain = $2 AND deleted_at IS NULL
+           AND seen_by IS DISTINCT FROM $3 AND touched_at < $4 RETURNING product_id",
+    )
+    .bind(shop.account_id)
+    .bind(&shop.shop_domain)
+    .bind(scan)
+    .bind(started)
+    .fetch_all(db)
+    .await?;
+    for id in &gone {
+        unpublish(db, shop.account_id, *id).await?;
+    }
+    sqlx::query("UPDATE shopify_shops SET catalog_loaded_at = COALESCE(catalog_loaded_at, now()) WHERE account_id = $1 AND shop_domain = $2").bind(shop.account_id).bind(&shop.shop_domain).execute(db).await?;
+    Ok(gone.len() as u64)
 }
 
 fn nodes_of(v: &Value) -> Vec<Value> {
@@ -201,11 +269,26 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
             images: nodes_of(&p["media"]).iter().filter_map(|m| text(&m["image"]["url"])).collect(),
         });
     }
-    save(&state.db, shop, &nodes).await.map_err(|_| ApiError::Network("database"))?;
+    save(&state.db, shop, &nodes, SaveMode::default()).await.map_err(|_| ApiError::Network("database"))?;
     for id in ids.iter().filter(|i| !found.contains(i)) {
-        unpublish(&state.db, shop.account_id, *id).await.map_err(|_| ApiError::Network("database"))?;
+        mark_deleted(&state.db, shop, *id).await.map_err(|_| ApiError::Network("database"))?;
     }
     Ok(())
+}
+
+/// Shopify deleted the product (a webhook, or a read that no longer finds it): remembered, so an
+/// older snapshot never brings it back, and unpublished.
+pub async fn mark_deleted(db: &PgPool, shop: &ShopRow, product_id: i64) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO shopify_products (account_id, product_id, shop_domain, deleted_at) VALUES ($1, $2, $3, now())
+         ON CONFLICT (account_id, product_id) DO UPDATE SET deleted_at = now(), touched_at = now()",
+    )
+    .bind(shop.account_id)
+    .bind(product_id)
+    .bind(&shop.shop_domain)
+    .execute(db)
+    .await?;
+    unpublish(db, shop.account_id, product_id).await
 }
 
 /// The store deleted the product: it stops showing in emails (its history stays).

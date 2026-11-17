@@ -16,7 +16,7 @@ use super::customers::{self, Customer};
 use super::events::Metrics;
 use super::orders::{self, Order};
 use super::products::{self, Node};
-use super::shop::ShopRow;
+use super::shop::{Lease, ShopRow};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -45,9 +45,10 @@ pub struct ImportRow {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    pub generation: Option<i32>,
 }
 
-const COLS: &str = "id, account_id, kind, status, phases, phase, orders_since, bulk_id, bulk_status, result_url_enc, result_offset, counts, error, started_at, finished_at, updated_at";
+const COLS: &str = "id, account_id, kind, status, phases, phase, orders_since, bulk_id, bulk_status, result_url_enc, result_offset, counts, error, started_at, finished_at, updated_at, generation";
 
 pub fn to_json(i: &ImportRow) -> Value {
     json!({
@@ -83,13 +84,13 @@ pub async fn active(db: &sqlx::PgPool, account_id: Uuid) -> sqlx::Result<Option<
 
 /// Start a history import (or a product reconcile with `kind = "products"`). One at a time.
 pub async fn start(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, kind: &str, order_days: Option<i64>) -> AppResult<ImportRow> {
-    super::shop::connected(&state.db, account_id).await?;
+    let shop = super::shop::connected(&state.db, account_id).await?;
     let phases: Vec<String> = if kind == "products" { vec!["products".into()] } else { vec!["customers".into(), "products".into(), "orders".into()] };
     let days = order_days.unwrap_or(DEFAULT_ORDER_YEARS * 365).clamp(1, 20 * 365);
     let mut tx = state.db.begin().await?;
     let r = sqlx::query_as::<_, ImportRow>(&format!(
-        "INSERT INTO shopify_imports (id, account_id, kind, status, phases, phase, orders_since, started_by, counts)
-         VALUES ($1, $2, $3, 'running', $4, $5, now() - make_interval(days => $6), $7, '{{}}') RETURNING {COLS}"
+        "INSERT INTO shopify_imports (id, account_id, kind, status, phases, phase, orders_since, started_by, counts, generation, shop_domain)
+         VALUES ($1, $2, $3, 'running', $4, $5, now() - make_interval(days => $6), $7, '{{}}', $8, $9) RETURNING {COLS}"
     ))
     .bind(Uuid::now_v7())
     .bind(account_id)
@@ -98,6 +99,8 @@ pub async fn start(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, ki
     .bind(&phases[0])
     .bind(days as i32)
     .bind(user_id)
+    .bind(shop.generation)
+    .bind(&shop.shop_domain)
     .fetch_one(&mut *tx)
     .await;
     let row = match r {
@@ -161,10 +164,10 @@ fn query_for(phase: &str, since: DateTime<Utc>) -> String {
         _ => format!(
             "{{ orders(query: \"created_at:>={}\") {{ edges {{ node {{ id name createdAt processedAt updatedAt cancelledAt cancelReason test email phone currencyCode
                 displayFinancialStatus displayFulfillmentStatus discountCodes
-                totalPriceSet {{ shopMoney {{ amount }} }} subtotalPriceSet {{ shopMoney {{ amount }} }} totalDiscountsSet {{ shopMoney {{ amount }} }}
+                totalPriceSet {{ shopMoney {{ amount currencyCode }} }} subtotalPriceSet {{ shopMoney {{ amount }} }} totalDiscountsSet {{ shopMoney {{ amount }} }}
                 totalShippingPriceSet {{ shopMoney {{ amount }} }} totalTaxSet {{ shopMoney {{ amount }} }}
                 customer {{ id firstName lastName }}
-                refunds {{ id createdAt totalRefundedSet {{ shopMoney {{ amount }} }} }}
+                refunds {{ id }}
                 fulfillments {{ id createdAt status }}
                 lineItems {{ edges {{ node {{ id title variantTitle sku vendor quantity originalUnitPriceSet {{ shopMoney {{ amount }} }}
                     totalDiscountSet {{ shopMoney {{ amount }} }} product {{ id }} variant {{ id }} image {{ url }} }} }} }} }} }} }} }}",
@@ -182,13 +185,20 @@ pub enum Step {
     Idle,
 }
 
-async fn save(db: &sqlx::PgPool, i: &ImportRow) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE shopify_imports SET phase = $2, bulk_id = $3, bulk_status = $4, result_url_enc = $5, result_offset = $6, counts = $7, error = $8,
-            status = CASE WHEN status = 'running' THEN $9 ELSE status END, finished_at = CASE WHEN $9 IN ('done', 'failed') AND status = 'running' THEN now() ELSE finished_at END,
+/// Save the import's progress, only while this run still holds the account's lease for the install
+/// the import belongs to (checked in the same statement), so a run that outlived its lease or an
+/// import from an earlier install can't write. False: it couldn't.
+async fn save(db: &sqlx::PgPool, i: &ImportRow, lease: &Lease) -> sqlx::Result<bool> {
+    let n = sqlx::query(&format!(
+        "UPDATE shopify_imports SET phase = $5, bulk_id = $6, bulk_status = $7, result_url_enc = $8, result_offset = $9, counts = $10, error = $11,
+            status = CASE WHEN status = 'running' THEN $12 ELSE status END, finished_at = CASE WHEN $12 IN ('done', 'failed') AND status = 'running' THEN now() ELSE finished_at END,
             updated_at = now()
-         WHERE id = $1",
-    )
+         WHERE id = $4 AND generation = $3 AND {}",
+        super::shop::LEASE_GUARD
+    ))
+    .bind(lease.account_id)
+    .bind(lease.token)
+    .bind(lease.generation)
     .bind(i.id)
     .bind(&i.phase)
     .bind(&i.bulk_id)
@@ -199,8 +209,9 @@ async fn save(db: &sqlx::PgPool, i: &ImportRow) -> sqlx::Result<()> {
     .bind(&i.error)
     .bind(&i.status)
     .execute(db)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(n == 1)
 }
 
 fn bump(counts: &mut Value, k: &str, by: u64) {
@@ -224,39 +235,47 @@ fn next_phase(i: &mut ImportRow) {
 }
 
 /// Do one step of the running import, within `deadline`.
-pub async fn step(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, deadline: std::time::Instant) -> anyhow::Result<Step> {
+pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut Metrics, deadline: std::time::Instant) -> anyhow::Result<Step> {
     let Some(mut i) = active(&state.db, shop.account_id).await? else { return Ok(Step::Idle) };
     if i.status != "running" {
         return Ok(Step::Idle);
     }
-    match step_inner(state, shop, metrics, &mut i, deadline).await {
+    if i.generation != Some(lease.generation) {
+        // Queued for an earlier install of the app: it can't write to this one.
+        sqlx::query("UPDATE shopify_imports SET status = 'cancelled', finished_at = now(), result_url_enc = NULL, updated_at = now() WHERE id = $1 AND status IN ('running', 'paused')")
+            .bind(i.id)
+            .execute(&state.db)
+            .await?;
+        return Ok(Step::More);
+    }
+    match step_inner(state, shop, lease, metrics, &mut i, deadline).await {
         Ok(s) => {
             // A pause or cancel that came in meanwhile is kept (save only changes a running import's status).
-            save(&state.db, &i).await?;
+            save(&state.db, &i, lease).await?;
             Ok(s)
         }
         Err(e) => match e.retry_after() {
             Some(secs) => {
-                save(&state.db, &i).await?;
+                save(&state.db, &i, lease).await?;
                 Ok(Step::Wait(Duration::seconds(secs as i64)))
             }
             None => {
                 i.status = "failed".into();
                 i.error = Some(format!("The import stopped: {e}. Start it again from Settings → Shopify; nothing is brought in twice."));
-                save(&state.db, &i).await?;
+                save(&state.db, &i, lease).await?;
                 Ok(Step::Idle)
             }
         },
     }
 }
 
-async fn step_inner(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, i: &mut ImportRow, deadline: std::time::Instant) -> Result<Step, ApiError> {
+async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut Metrics, i: &mut ImportRow, deadline: std::time::Instant) -> Result<Step, ApiError> {
     // 1. Start this phase's bulk query.
     let Some(bulk_id) = i.bulk_id.clone() else {
         let d = client::graphql(
             state,
             shop,
-            "mutation($q: String!) { bulkOperationRunQuery(query: $q) { bulkOperation { id status } userErrors { field message code } } }",
+            "mutation($q: String!) { bulkOperationRunQuery(query: $q, groupObjects: true) { bulkOperation { id status } userErrors { field message code } } }",
             json!({"q": query_for(&i.phase, i.orders_since)}),
         )
         .await?;
@@ -305,6 +324,10 @@ async fn step_inner(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, i: 
     let url = crate::crypto::decrypt(&state.cfg.secret_key, i.result_url_enc.as_deref().unwrap_or("")).map_err(|_| ApiError::Graph("result link unreadable".into()))?;
     let mut buf: Vec<u8> = Vec::new();
     while std::time::Instant::now() < deadline {
+        if !super::shop::renew(state, lease).await.map_err(|_| ApiError::Network("database"))? {
+            // Lost the lease (or the install changed): stop without writing.
+            return Err(ApiError::Busy);
+        }
         let Some((bytes, at_end)) = client::result_chunk(state, &url, i.result_offset as u64 + buf.len() as u64, CHUNK).await? else {
             // The link expired (results last a week): run the phase's query again. Nothing is duplicated.
             i.bulk_id = None;
@@ -317,9 +340,15 @@ async fn step_inner(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, i: 
         if consumed > 0 {
             i.result_offset += consumed as i64;
             buf.drain(..consumed);
-            save(&state.db, i).await.map_err(|_| ApiError::Network("database"))?;
+            if !save(&state.db, i, lease).await.map_err(|_| ApiError::Network("database"))? {
+                return Err(ApiError::Busy);
+            }
         }
         if at_end {
+            if i.phase == "products" {
+                let gone = products::finish_scan(&state.db, shop, i.id, i.started_at).await.map_err(|_| ApiError::Network("database"))?;
+                bump(&mut i.counts, "products_removed", gone);
+            }
             next_phase(i);
             return Ok(Step::More);
         }
@@ -328,6 +357,31 @@ async fn step_inner(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, i: 
         }
     }
     Ok(Step::More)
+}
+
+/// Group result lines under their parents. With `groupObjects` Shopify puts each object's children
+/// right after it, but every child is still checked: it joins the parent its `__parentId` names
+/// (looked up by id among the records in this read), never simply the record before it. A child
+/// whose parent isn't in this read is counted and left out.
+pub fn group(lines: Vec<(usize, Value)>) -> (Vec<(usize, Value, Vec<Value>)>, u64) {
+    let mut groups: Vec<(usize, Value, Vec<Value>)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut orphans = 0;
+    for (off, v) in lines {
+        match v.get("__parentId").and_then(|p| p.as_str()).map(String::from) {
+            Some(parent) => match index.get(&parent) {
+                Some(&g) => groups[g].2.push(v),
+                None => orphans += 1,
+            },
+            None => {
+                if let Some(id) = v["id"].as_str() {
+                    index.insert(id.to_string(), groups.len());
+                }
+                groups.push((off, v, Vec::new()));
+            }
+        }
+    }
+    (groups, orphans)
 }
 
 /// Process the whole records in `bytes` (a parent and the child lines that follow it). Returns how
@@ -353,15 +407,9 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
     }
     // Group: a top-level line (no __parentId) and its children. The last group may continue in the
     // next chunk unless this is the end of the file.
-    let mut groups: Vec<(usize, Value, Vec<Value>)> = Vec::new();
-    for (off, v) in lines {
-        if v.get("__parentId").is_some() {
-            if let Some(g) = groups.last_mut() {
-                g.2.push(v);
-            }
-        } else {
-            groups.push((off, v, Vec::new()));
-        }
+    let (mut groups, orphans) = group(lines);
+    if orphans > 0 {
+        bump(&mut i.counts, "skipped_children", orphans);
     }
     let used = if at_end {
         complete_end
@@ -371,13 +419,13 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
             None => 0,
         }
     };
-    let mut cx = orders::Ctx { state, account_id: shop.account_id, metrics, quiet: true };
+    let mut cx = orders::Ctx { state, account_id: shop.account_id, shop: &shop.shop_domain, metrics, quiet: true };
     match i.phase.as_str() {
         "customers" => {
             let mut n = 0;
             for (_, v, _) in &groups {
                 if let Some(c) = Customer::from_graphql(v) {
-                    customers::apply(&state.db, shop.account_id, &c).await?;
+                    customers::apply(&state.db, shop.account_id, &shop.shop_domain, &c).await?;
                     n += 1;
                 }
             }
@@ -396,7 +444,10 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
                     }
                 })
                 .collect();
-            let n = products::save(&state.db, shop, &nodes).await?;
+            // A history import never queues back-in-stock or price-drop alerts; a reconcile does
+            // (it's catching changes a webhook missed), except on the store's first load.
+            let mode = products::SaveMode { quiet: i.kind == "history", scan: Some(i.id) };
+            let n = products::save(&state.db, shop, &nodes, mode).await?;
             bump(&mut i.counts, "products", n);
         }
         _ => {
@@ -426,8 +477,9 @@ pub async fn queue_reconciles(db: &sqlx::PgPool) -> anyhow::Result<()> {
     for account_id in due {
         let mut tx = db.begin().await?;
         let r = sqlx::query(
-            "INSERT INTO shopify_imports (id, account_id, kind, status, phases, phase, orders_since, counts)
-             VALUES ($1, $2, 'products', 'running', ARRAY['products'], 'products', now(), '{}') ON CONFLICT DO NOTHING",
+            "INSERT INTO shopify_imports (id, account_id, kind, status, phases, phase, orders_since, counts, generation, shop_domain)
+             SELECT $1, $2, 'products', 'running', ARRAY['products'], 'products', now(), '{}', generation, shop_domain FROM shopify_shops WHERE account_id = $2
+             ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::now_v7())
         .bind(account_id)

@@ -14,7 +14,9 @@ const CALLBACK_ERRORS: Record<string, string> = {
   signature: "That link wasn't signed by Shopify. Start again from this page.",
   expired: "That install link expired or was already used. Start again from this page.",
   shop: "Shopify sent back a different store than the one you entered. Start again.",
-  signin: "Finish connecting in a browser signed in to this DumbMail account. Sign in, then connect again.",
+  signin: "Finish connecting in a browser signed in to DumbMail as the person who started it. Sign in, then connect again.",
+  browser: "Finish connecting in the same browser you started in. Start again from this page.",
+  role: "Only an owner or admin of this account can connect a store.",
   denied: "Shopify didn't approve the connection. Try again, and approve the app in Shopify.",
   shopify: "Shopify didn't answer. Try again in a minute.",
   scopes: "The app needs access to customers, orders and products. Connect again and approve all of it.",
@@ -108,8 +110,9 @@ function CallbackNotice() {
 }
 
 function HealthLine({ s }: { s: ShopifyStatus }) {
-  const tone = s.health.state === "server" ? "green" : s.health.state === "browser_only" || s.health.state === "quiet" ? "amber" : "gray";
-  const icon = s.health.state === "server" ? <CheckCircle2 /> : s.health.state === "browser_only" ? <AlertTriangle /> : <CircleDashed />;
+  const st = s.health.state;
+  const tone = st === "server" ? "green" : st === "incomplete" ? "red" : st === "browser_only" || st === "quiet" ? "amber" : "gray";
+  const icon = st === "server" ? <CheckCircle2 /> : st === "browser_only" || st === "incomplete" ? <AlertTriangle /> : <CircleDashed />;
   return <Notice tone={tone} icon={icon} title={s.health.message} />;
 }
 
@@ -184,6 +187,9 @@ function ConnectedCard({ s }: { s: ShopifyStatus }) {
           </span>
         </div>
         <HealthLine s={s} />
+        {s.problems.map((p) => (
+          <Notice key={p} tone="amber" icon={<AlertTriangle />} title={p} />
+        ))}
         {c.last_error ? (
           <Notice tone="amber" icon={<AlertTriangle />} title="Something needs attention">
             {c.last_error}
@@ -413,7 +419,7 @@ function DataRequestsCard({ s }: { s: ShopifyStatus }) {
           {s.data_requests.map((r) => (
             <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 text-sm">
               <div className="min-w-0">
-                <div className="truncate font-medium text-zinc-900">{r.customer_email ?? "A customer"}</div>
+                <div className="truncate font-medium text-zinc-900">{r.shopify_customer_id ? `Shopify customer ${r.shopify_customer_id}` : "A customer"}</div>
                 <div className="text-xs text-zinc-500">
                   Asked {formatDate(r.created_at, account.timezone)}
                   {r.downloaded_at ? ` · downloaded ${formatRelative(r.downloaded_at)}` : " · not downloaded yet"}

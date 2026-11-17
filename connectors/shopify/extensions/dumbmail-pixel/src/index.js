@@ -42,6 +42,9 @@ register(({ analytics, browser, settings }) => {
   }
 
   async function report(metric, event, uniqueId) {
+    // Without an order id or checkout token the event can't be matched to Shopify's own copy, so it
+    // would be counted twice: send nothing.
+    if (!uniqueId) return false;
     const checkout = event.data.checkout || {};
     const origin = event.context && event.context.document && event.context.document.location ? event.context.document.location.origin : undefined;
     const list = items(checkout, origin);

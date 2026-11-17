@@ -51,7 +51,8 @@ fn keep(topic: &str, body: &Value) -> Option<Value> {
 }
 
 /// POST /webhooks/shopify. Bad signature: 401 (Shopify's requirement). Anything else verified: 200,
-/// even if we have no use for it, so Shopify doesn't retry.
+/// even if we have no use for it, so Shopify doesn't retry. A privacy request whose signed body
+/// names a different store than the header: 400, nothing stored.
 pub async fn receive(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> StatusCode {
     let Some(secret) = state.cfg.shopify.secret() else { return StatusCode::NOT_FOUND };
     let Some(sig) = header(&headers, "x-shopify-hmac-sha256") else { return StatusCode::UNAUTHORIZED };
@@ -66,7 +67,16 @@ pub async fn receive(State(state): State<AppState>, headers: HeaderMap, body: By
     }
     let topic = topic.to_ascii_lowercase();
     let Ok(parsed) = serde_json::from_slice::<Value>(&body) else { return StatusCode::OK };
-    match store(&state, &topic, &domain, webhook_id, &parsed).await {
+    if PRIVACY_TOPICS.contains(&topic.as_str()) {
+        // The store a privacy request is about comes from the signed body, and must be the header's.
+        let signed = parsed["shop_domain"].as_str().and_then(valid_shop);
+        if signed.as_deref() != Some(domain.as_str()) {
+            tracing::error!(topic, "a Shopify privacy request named a different store in its body than in its header; refused");
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+    let triggered = header(&headers, "x-shopify-triggered-at").and_then(|t| super::customers::parse_time(Some(t)));
+    match store(&state, &topic, &domain, webhook_id, &parsed, triggered).await {
         Ok(()) => StatusCode::OK,
         Err(e) => {
             tracing::error!(topic, error = %format!("{e:#}"), "couldn't store a Shopify webhook");
@@ -76,64 +86,88 @@ pub async fn receive(State(state): State<AppState>, headers: HeaderMap, body: By
     }
 }
 
-async fn store(state: &AppState, topic: &str, domain: &str, webhook_id: &str, body: &Value) -> anyhow::Result<()> {
+async fn store(state: &AppState, topic: &str, domain: &str, webhook_id: &str, body: &Value, triggered: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<()> {
     let Some(kept) = keep(topic, body) else { return Ok(()) };
-    // Privacy requests concern every account that has held this store's data; everything else goes
-    // only to the account the store is connected to now.
-    let accounts: Vec<Uuid> = if PRIVACY_TOPICS.contains(&topic) {
-        let only_gone = topic == "shop/redact";
-        sqlx::query_scalar("SELECT account_id FROM shopify_shops WHERE shop_domain = $1 AND (NOT $2 OR status <> 'connected')")
-            .bind(domain)
-            .bind(only_gone)
-            .fetch_all(&state.db)
-            .await?
+    // Privacy requests concern every account that has ever held this store's data (kept in
+    // `shopify_installs`, which outlives the connection); everything else goes only to the account
+    // the store is connected to now, for its current install.
+    let targets: Vec<(Uuid, Option<i32>)> = if PRIVACY_TOPICS.contains(&topic) {
+        sqlx::query_as("SELECT DISTINCT account_id, NULL::int FROM shopify_installs WHERE shop_domain = $1").bind(domain).fetch_all(&state.db).await?
     } else {
-        sqlx::query_scalar("SELECT account_id FROM shopify_shops WHERE shop_domain = $1 AND status = 'connected'").bind(domain).fetch_all(&state.db).await?
+        sqlx::query_as("SELECT account_id, generation FROM shopify_shops WHERE shop_domain = $1 AND status = 'connected'").bind(domain).fetch_all(&state.db).await?
     };
-    for account_id in accounts {
-        if topic == "app/uninstalled" {
-            // Stop using the token now; Shopify has already removed the webhooks.
-            super::oauth::forget(&state.db, account_id, "uninstalled").await?;
-            shop::note_error(&state.db, account_id, Some("The DumbMail app was uninstalled from the store in Shopify. Connect it again to resume.")).await?;
-            continue;
-        }
+    for (account_id, generation) in targets {
         let mut tx = state.db.begin().await?;
+        let uninstall = topic == "app/uninstalled";
+        // Every topic, uninstalls included, is stored once per delivery id: a redelivery does nothing.
         let new: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload) VALUES ($1, $2, $3, $4) ON CONFLICT (account_id, webhook_id) DO NOTHING RETURNING id",
+            "INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, generation, shop_domain, done_at)
+             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7 THEN now() END)
+             ON CONFLICT (account_id, webhook_id) DO NOTHING RETURNING id",
         )
         .bind(account_id)
         .bind(webhook_id)
         .bind(topic)
-        .bind(&kept)
+        .bind(if uninstall { None } else { Some(&kept) })
+        .bind(generation)
+        .bind(domain)
+        .bind(uninstall)
         .fetch_optional(&mut *tx)
         .await?;
-        if new.is_some() {
-            sqlx::query("UPDATE shopify_shops SET last_webhook_at = now(), last_webhook_topic = $2 WHERE account_id = $1").bind(account_id).bind(topic).execute(&mut *tx).await?;
-            if PRIVACY_TOPICS.contains(&topic) {
-                // A store that's gone has no worker; privacy work runs as its own job.
-                crate::jobs::enqueue(&mut *tx, "shopify_privacy", json!({"account_id": account_id}), None).await?;
-            } else {
-                shop::kick(&mut tx, account_id).await?;
+        if new.is_none() {
+            tx.commit().await?;
+            continue;
+        }
+        sqlx::query("UPDATE shopify_shops SET last_webhook_at = now(), last_webhook_topic = $2 WHERE account_id = $1 AND shop_domain = $3").bind(account_id).bind(topic).bind(domain).execute(&mut *tx).await?;
+        if uninstall {
+            // Stop using the token now; Shopify has already removed the webhooks. Only for the install
+            // this was sent for: one Shopify triggered before the current install began is stale.
+            let stale: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_shops WHERE account_id = $1 AND $2::timestamptz IS NOT NULL AND connected_at > $2)")
+                .bind(account_id)
+                .bind(triggered)
+                .fetch_one(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            if stale {
+                tracing::info!(account = %account_id, "ignored an app/uninstalled webhook sent before the current install");
+            } else if super::oauth::forget(&state.db, account_id, "uninstalled", generation).await? {
+                shop::note_error(&state.db, account_id, Some("The DumbMail app was uninstalled from the store in Shopify. Connect it again to resume.")).await?;
             }
+            continue;
+        }
+        if PRIVACY_TOPICS.contains(&topic) {
+            // A store that's gone has no worker; privacy work also runs as its own job.
+            crate::jobs::enqueue(&mut *tx, "shopify_privacy", json!({"account_id": account_id}), None).await?;
+        } else {
+            shop::kick(&mut tx, account_id).await?;
         }
         tx.commit().await?;
     }
     Ok(())
 }
 
-/// Process waiting deliveries for the account, oldest first, until `deadline`. Returns true when
-/// more are waiting. Each delivery is processed on its own; one that keeps failing is set aside
-/// after 5 tries so it can't hold the rest up.
-pub async fn drain(state: &AppState, cx: &mut super::orders::Ctx<'_>, deadline: std::time::Instant) -> anyhow::Result<bool> {
+/// Process waiting deliveries for the account's current install, oldest first, until `deadline`.
+/// Returns true when more are waiting. Each delivery is processed on its own; one that keeps failing
+/// is set aside after 5 tries so it can't hold the rest up. Before each one the run checks it still
+/// holds the lease for this install, and marking it done checks again in the same statement.
+pub async fn drain(state: &AppState, cx: &mut super::orders::Ctx<'_>, lease: &shop::Lease, deadline: std::time::Instant) -> anyhow::Result<bool> {
+    // Deliveries for an earlier install of the app are dropped with their data.
+    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic <> ALL($2) AND generation IS DISTINCT FROM $3")
+        .bind(cx.account_id)
+        .bind(PRIVACY_TOPICS)
+        .bind(lease.generation)
+        .execute(&state.db)
+        .await?;
     loop {
         if std::time::Instant::now() >= deadline {
             return Ok(true);
         }
         let batch: Vec<(i64, String, Value)> = sqlx::query_as(
-            "SELECT id, topic, payload FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic <> ALL($2) ORDER BY id LIMIT 50",
+            "SELECT id, topic, payload FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic <> ALL($2) AND generation = $3 ORDER BY id LIMIT 50",
         )
         .bind(cx.account_id)
         .bind(PRIVACY_TOPICS)
+        .bind(lease.generation)
         .fetch_all(&state.db)
         .await?;
         if batch.is_empty() {
@@ -143,10 +177,19 @@ pub async fn drain(state: &AppState, cx: &mut super::orders::Ctx<'_>, deadline: 
             if std::time::Instant::now() >= deadline {
                 return Ok(true);
             }
+            if !shop::still_mine(&state.db, lease).await? {
+                return Ok(false);
+            }
             let r = process(state, cx, &topic, &payload).await;
             match r {
                 Ok(()) => {
-                    sqlx::query("UPDATE shopify_webhooks SET done_at = now(), payload = NULL, error = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+                    sqlx::query(&format!("UPDATE shopify_webhooks SET done_at = now(), payload = NULL, error = NULL WHERE id = $4 AND {}", shop::LEASE_GUARD))
+                        .bind(lease.account_id)
+                        .bind(lease.token)
+                        .bind(lease.generation)
+                        .bind(id)
+                        .execute(&state.db)
+                        .await?;
                 }
                 Err(e) => {
                     tracing::warn!(account = %cx.account_id, topic, error = %format!("{e:#}"), "couldn't process a Shopify webhook");
@@ -197,7 +240,9 @@ async fn process(state: &AppState, cx: &mut super::orders::Ctx<'_>, topic: &str,
         "products/delete" => {
             if let Some(id) = id() {
                 sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = 'product' AND shopify_id = $2").bind(account_id).bind(id).execute(db).await?;
-                super::products::unpublish(db, account_id, id).await?;
+                if let Some(s) = shop::load(db, account_id).await? {
+                    super::products::mark_deleted(db, &s, id).await?;
+                }
             }
         }
         "inventory_levels/update" => {
@@ -211,9 +256,22 @@ async fn process(state: &AppState, cx: &mut super::orders::Ctx<'_>, topic: &str,
     Ok(())
 }
 
-/// Old delivery records (kept a week to recognise redeliveries).
+/// Old delivery records (kept a week to recognise redeliveries), and bodies never processed: after
+/// 30 days an unprocessed body (an order, a refund, a privacy request) is deleted and counted on the
+/// connection, so nothing a store sent is kept indefinitely.
 pub async fn prune(db: &sqlx::PgPool) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM shopify_webhooks WHERE done_at < now() - interval '7 days'").execute(db).await?;
+    let dropped: Vec<(Uuid, i64)> = sqlx::query_as(
+        "WITH d AS (UPDATE shopify_webhooks SET payload = NULL, done_at = now(), error = 'expired unprocessed'
+                    WHERE done_at IS NULL AND received_at < now() - interval '30 days' RETURNING account_id)
+         SELECT account_id, count(*) FROM d GROUP BY account_id",
+    )
+    .fetch_all(db)
+    .await?;
+    for (account_id, n) in dropped {
+        tracing::error!(account = %account_id, count = n, "deleted Shopify webhook bodies left unprocessed for 30 days");
+        sqlx::query("UPDATE shopify_shops SET dropped_payloads = dropped_payloads + $2 WHERE account_id = $1").bind(account_id).bind(n as i32).execute(db).await?;
+    }
     Ok(())
 }
 

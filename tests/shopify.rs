@@ -34,14 +34,33 @@ struct Shopify {
     granted_scope: String,
     customers: HashMap<i64, Value>,
     products: HashMap<i64, Value>,
+    /// Orders as the GraphQL Admin API returns them to a `nodes` read (refunds with transactions).
+    orders: HashMap<i64, Value>,
     files: HashMap<String, String>,
     bulk_ops: Vec<String>,
+    /// Whether each bulk operation asked for `groupObjects: true`.
+    grouped: Vec<bool>,
+    /// Serve result files exactly as given, even when grouping was asked for.
+    ignore_grouping: bool,
+    /// Answer ranged file requests with the whole file (200, no Content-Range).
+    ignore_range: bool,
+    /// Answer ranged file requests with a 206 that starts at byte 0 whatever was asked.
+    wrong_range: bool,
     /// Most bytes served per file request, whatever range was asked for (forces many slices).
     max_chunk: usize,
     webhooks_created: Vec<String>,
+    /// Topics Shopify refuses to subscribe (a userError).
+    refuse_topics: HashSet<String>,
     deletes: u32,
+    metafield_deletes: u32,
+    /// The pixel delete answers with a userError.
+    pixel_delete_fails: bool,
     consent_updates: Vec<Value>,
-    discounts: HashSet<String>,
+    /// The next consent updates answer with a userError.
+    consent_fail: u32,
+    /// Discounts made, by code, with the input they were made from.
+    discounts: HashMap<String, Value>,
+    discount_inputs: Vec<Value>,
     discount_calls: u32,
     node_reads: Vec<String>,
     throttle_next: u32,
@@ -51,18 +70,23 @@ struct Shopify {
 type Mock = Arc<Mutex<Shopify>>;
 
 fn customer(id: i64, email: Option<&str>, state: &str, phone: Option<&str>, sms: &str) -> Value {
+    customer_at(id, email, state, phone, sms, "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z")
+}
+
+/// A customer with Shopify's own update time and the time of its consent.
+fn customer_at(id: i64, email: Option<&str>, state: &str, phone: Option<&str>, sms: &str, updated: &str, consent_at: &str) -> Value {
     json!({
-        "id": format!("gid://shopify/Customer/{id}"), "firstName": "Ann", "lastName": format!("Lee{id}"), "tags": ["vip"],
+        "id": format!("gid://shopify/Customer/{id}"), "updatedAt": updated, "firstName": "Ann", "lastName": format!("Lee{id}"), "tags": ["vip"],
         "numberOfOrders": "2", "amountSpent": {"amount": "150.00", "currencyCode": "USD"}, "createdAt": "2024-01-01T00:00:00Z",
-        "defaultEmailAddress": email.map(|e| json!({"emailAddress": e, "marketingState": state, "marketingOptInLevel": "SINGLE_OPT_IN", "marketingUpdatedAt": "2025-01-01T00:00:00Z"})),
-        "defaultPhoneNumber": phone.map(|p| json!({"phoneNumber": p, "smsMarketingConsent": {"state": sms, "optInLevel": "SINGLE_OPT_IN", "updatedAt": "2025-01-01T00:00:00Z"}})),
+        "defaultEmailAddress": email.map(|e| json!({"emailAddress": e, "marketingState": state, "marketingOptInLevel": "SINGLE_OPT_IN", "marketingUpdatedAt": consent_at})),
+        "defaultPhoneNumber": phone.map(|p| json!({"phoneNumber": p, "smsMarketingConsent": {"state": sms, "optInLevel": "SINGLE_OPT_IN", "updatedAt": consent_at}})),
         "defaultAddress": {"city": "Portland", "province": "Oregon", "countryCodeV2": "US", "zip": "97201"}
     })
 }
 
 fn product(id: i64, title: &str, qty: i64, price: &str) -> Value {
     json!({
-        "id": format!("gid://shopify/Product/{id}"), "title": title, "handle": title.to_lowercase(), "descriptionHtml": "<p>Good</p>", "vendor": "Acme",
+        "id": format!("gid://shopify/Product/{id}"), "updatedAt": chrono::Utc::now().to_rfc3339(), "title": title, "handle": title.to_lowercase(), "descriptionHtml": "<p>Good</p>", "vendor": "Acme",
         "productType": "Kitchen", "tags": ["gift"], "status": "ACTIVE", "onlineStoreUrl": format!("https://acme.test/products/{}", title.to_lowercase()), "publishedAt": "2025-01-01T00:00:00Z",
         "variants": {"nodes": [{"id": format!("gid://shopify/ProductVariant/{id}1"), "title": "Default Title", "sku": format!("SKU{id}"), "price": price, "compareAtPrice": null,
             "inventoryQuantity": qty, "availableForSale": qty > 0, "inventoryItem": {"id": format!("gid://shopify/InventoryItem/{id}9"), "tracked": true}, "selectedOptions": []}],
@@ -72,8 +96,26 @@ fn product(id: i64, title: &str, qty: i64, price: &str) -> Value {
     })
 }
 
+/// One refund as the Admin API reports it: its transactions and refunded lines (shop money).
+fn refund(id: i64, at: &str, txs: &[(&str, &str)], lines: &[(i64, &str)]) -> Value {
+    json!({
+        "id": format!("gid://shopify/Refund/{id}"), "createdAt": at,
+        "transactions": {"nodes": txs.iter().map(|(status, amount)| json!({"kind": "REFUND", "status": status, "amountSet": {"shopMoney": {"amount": amount, "currencyCode": "USD"}}})).collect::<Vec<_>>()},
+        "refundLineItems": {"nodes": lines.iter().map(|(l, a)| json!({"lineItem": {"id": format!("gid://shopify/LineItem/{l}")}, "subtotalSet": {"shopMoney": {"amount": a}}})).collect::<Vec<_>>()}
+    })
+}
+
+fn gql_order(id: i64, updated: &str, refunds: Vec<Value>) -> Value {
+    json!({"id": format!("gid://shopify/Order/{id}"), "updatedAt": updated, "refunds": refunds})
+}
+
 fn gql_ok(data: Value) -> (StatusCode, axum::Json<Value>) {
     (StatusCode::OK, axum::Json(json!({"data": data, "extensions": {"cost": {"requestedQueryCost": 10, "actualQueryCost": 5, "throttleStatus": {"maximumAvailable": 2000, "currentlyAvailable": 1990, "restoreRate": 100}}}})))
+}
+
+/// The GraphQL aliases (`w0:`, `px:`) a combined mutation asks for.
+fn aliases(q: &str, prefix: &str) -> Vec<String> {
+    q.split_whitespace().filter(|w| w.ends_with(':') && w.starts_with(prefix)).map(|w| w.trim_end_matches(':').to_string()).collect()
 }
 
 async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> (StatusCode, axum::Json<Value>) {
@@ -89,12 +131,33 @@ async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): ax
         return (StatusCode::OK, axum::Json(json!({"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
             "extensions": {"cost": {"requestedQueryCost": 300, "throttleStatus": {"maximumAvailable": 2000, "currentlyAvailable": 100, "restoreRate": 100}}}})));
     }
+    if q.contains("webhookSubscriptionDelete") || q.contains("metafieldsDelete") {
+        // Disconnect: one request with an alias per thing removed.
+        if q.contains("webhookSubscriptionDelete") {
+            m.deletes += 1;
+        }
+        let mut out = serde_json::Map::new();
+        for a in aliases(&q, "w") {
+            out.insert(a.clone(), json!({"deletedWebhookSubscriptionId": vars[&a], "userErrors": []}));
+        }
+        if q.contains("webPixelDelete") {
+            out.insert("px".into(), if m.pixel_delete_fails { json!({"deletedWebPixelId": null, "userErrors": [{"field": ["id"], "message": "Web pixel not found", "code": "NOT_FOUND"}]}) } else { json!({"deletedWebPixelId": vars["px"], "userErrors": []}) });
+        }
+        if q.contains("metafieldsDelete") {
+            m.metafield_deletes += 1;
+            out.insert("mf".into(), json!({"deletedMetafields": [{"key": "script_url", "namespace": "dumbmail", "ownerId": "gid://shopify/AppInstallation/1"}], "userErrors": []}));
+        }
+        return gql_ok(Value::Object(out));
+    }
     if q.contains("currentAppInstallation") {
         return gql_ok(json!({"shop": {"name": "Acme Goods", "currencyCode": "USD", "ianaTimezone": "America/Los_Angeles", "primaryDomain": {"url": "https://acme.test"}},
             "currentAppInstallation": {"id": "gid://shopify/AppInstallation/1"}, "webhookSubscriptions": {"nodes": []}}));
     }
     if q.contains("webhookSubscriptionCreate") {
         let topic = vars["topic"].as_str().unwrap_or("").to_string();
+        if m.refuse_topics.contains(&topic) {
+            return gql_ok(json!({"webhookSubscriptionCreate": {"webhookSubscription": null, "userErrors": [{"field": ["webhookSubscription"], "message": "Topic not allowed"}]}}));
+        }
         m.webhooks_created.push(topic);
         let id = format!("gid://shopify/WebhookSubscription/{}", m.webhooks_created.len());
         return gql_ok(json!({"webhookSubscriptionCreate": {"webhookSubscription": {"id": id}, "userErrors": []}}));
@@ -105,20 +168,17 @@ async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): ax
     if q.contains("webPixelCreate") {
         return gql_ok(json!({"webPixelCreate": {"webPixel": {"id": "gid://shopify/WebPixel/1"}, "userErrors": []}}));
     }
-    if q.contains("webhookSubscriptionDelete") {
-        m.deletes += 1;
-        return gql_ok(json!({}));
-    }
     if q.contains("bulkOperationRunQuery") {
         let bq = vars["q"].as_str().unwrap_or("");
         let phase = if bq.contains("customers {") { "customers" } else if bq.contains("products {") { "products" } else { "orders" };
         m.bulk_ops.push(phase.to_string());
+        m.grouped.push(q.contains("groupObjects: true"));
         return gql_ok(json!({"bulkOperationRunQuery": {"bulkOperation": {"id": format!("gid://shopify/BulkOperation/{}", m.bulk_ops.len()), "status": "CREATED"}, "userErrors": []}}));
     }
     if q.contains("on BulkOperation") {
         let n: usize = vars["id"].as_str().unwrap_or("").rsplit('/').next().unwrap().parse().unwrap();
         let phase = m.bulk_ops[n - 1].clone();
-        let url = m.files.get(&phase).filter(|f| !f.is_empty()).map(|_| format!("{}/files/{phase}.jsonl", m.files["__base"]));
+        let url = m.files.get(&phase).filter(|f| !f.is_empty()).map(|_| format!("{}/files/{phase}.jsonl?op={n}", m.files["__base"]));
         return gql_ok(json!({"node": {"id": vars["id"], "status": "COMPLETED", "errorCode": null, "objectCount": "3", "url": url}}));
     }
     if q.contains("nodes(ids:") {
@@ -128,27 +188,45 @@ async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): ax
             .iter()
             .map(|g| {
                 let id: i64 = g.rsplit('/').next().unwrap().parse().unwrap();
-                if g.contains("/Customer/") { m.customers.get(&id).cloned().unwrap_or(Value::Null) } else { m.products.get(&id).cloned().unwrap_or(Value::Null) }
+                let found = if g.contains("/Customer/") {
+                    m.customers.get(&id)
+                } else if g.contains("/Order/") {
+                    m.orders.get(&id)
+                } else {
+                    m.products.get(&id)
+                };
+                found.cloned().unwrap_or(Value::Null)
             })
             .collect();
         return gql_ok(json!({"nodes": nodes}));
     }
     if q.contains("customerEmailMarketingConsentUpdate") || q.contains("customerSmsMarketingConsentUpdate") {
-        m.consent_updates.push(vars["input"].clone());
         let key = if q.contains("Email") { "customerEmailMarketingConsentUpdate" } else { "customerSmsMarketingConsentUpdate" };
+        if m.consent_fail > 0 {
+            m.consent_fail -= 1;
+            return gql_ok(json!({key: {"customer": null, "userErrors": [{"field": ["input", "customerId"], "message": "Customer is invalid", "code": "INVALID"}]}}));
+        }
+        m.consent_updates.push(vars["input"].clone());
         return gql_ok(json!({key: {"customer": {"id": vars["input"]["customerId"]}, "userErrors": []}}));
     }
     if q.contains("discountCodeBasicCreate") {
         m.discount_calls += 1;
         let code = vars["d"]["code"].as_str().unwrap_or("").to_string();
-        if !m.discounts.insert(code) {
+        m.discount_inputs.push(vars["d"].clone());
+        if m.discounts.contains_key(&code) {
             return gql_ok(json!({"discountCodeBasicCreate": {"codeDiscountNode": null, "userErrors": [{"field": ["basicCodeDiscount", "code"], "message": "Code must be unique.", "code": "TAKEN"}]}}));
         }
+        m.discounts.insert(code, vars["d"].clone());
         return gql_ok(json!({"discountCodeBasicCreate": {"codeDiscountNode": {"id": format!("gid://shopify/DiscountCodeNode/{}", m.discount_calls)}, "userErrors": []}}));
     }
     if q.contains("codeDiscountNodeByCode") {
-        let found = m.discounts.contains(vars["c"].as_str().unwrap_or(""));
-        return gql_ok(json!({"codeDiscountNodeByCode": if found { json!({"id": "gid://shopify/DiscountCodeNode/99"}) } else { Value::Null }}));
+        let node = m.discounts.get(vars["c"].as_str().unwrap_or("")).map(|d| {
+            let value = &d["customerGets"]["value"];
+            let v = if value["percentage"].is_null() { json!({"amount": {"amount": value["discountAmount"]["amount"], "currencyCode": "USD"}}) } else { json!({"percentage": value["percentage"]}) };
+            json!({"id": "gid://shopify/DiscountCodeNode/99", "codeDiscount": {"title": d["title"], "usageLimit": d["usageLimit"], "appliesOncePerCustomer": d["appliesOncePerCustomer"],
+                "combinesWith": d["combinesWith"], "customerGets": {"value": v}}})
+        });
+        return gql_ok(json!({"codeDiscountNodeByCode": node}));
     }
     gql_ok(json!({}))
 }
@@ -177,11 +255,43 @@ async fn token(State(m): State<Mock>, axum::Form(f): axum::Form<HashMap<String, 
     (StatusCode::OK, axum::Json(v))
 }
 
-async fn file(State(m): State<Mock>, Path(name): Path<String>, headers: HeaderMap) -> (StatusCode, HeaderMap, String) {
+/// Shopify's grouped output: each object's children right after it (by `__parentId`).
+fn group_jsonl(content: &str) -> String {
+    let lines: Vec<Value> = content.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+    let mut out = String::new();
+    fn emit(v: &Value, all: &[Value], out: &mut String) {
+        out.push_str(&v.to_string());
+        out.push('\n');
+        if let Some(id) = v["id"].as_str() {
+            for c in all.iter().filter(|c| c["__parentId"].as_str() == Some(id)) {
+                emit(c, all, out);
+            }
+        }
+    }
+    for v in lines.iter().filter(|v| v.get("__parentId").is_none()) {
+        emit(v, &lines, &mut out);
+    }
+    // Children whose parent isn't in the file stay at the end.
+    for v in lines.iter().filter(|v| v["__parentId"].as_str().is_some_and(|p| !lines.iter().any(|o| o["id"].as_str() == Some(p)))) {
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+async fn file(State(m): State<Mock>, Path(name): Path<String>, axum::extract::Query(qs): axum::extract::Query<HashMap<String, String>>, headers: HeaderMap) -> (StatusCode, HeaderMap, String) {
     let m = m.lock().unwrap();
     let phase = name.trim_end_matches(".jsonl");
-    let content = m.files.get(phase).cloned().unwrap_or_default();
+    let mut content = m.files.get(phase).cloned().unwrap_or_default();
+    let op: usize = qs.get("op").and_then(|o| o.parse().ok()).unwrap_or(0);
+    if !m.ignore_grouping && op > 0 && m.grouped.get(op - 1) == Some(&true) {
+        content = group_jsonl(&content);
+    }
     let bytes = content.as_bytes();
+    let mut h = HeaderMap::new();
+    if m.ignore_range {
+        return (StatusCode::OK, h, content.clone());
+    }
     let (start, end) = headers
         .get("range")
         .and_then(|r| r.to_str().ok())
@@ -191,7 +301,7 @@ async fn file(State(m): State<Mock>, Path(name): Path<String>, headers: HeaderMa
             (a.parse::<usize>().unwrap(), b.parse::<usize>().ok().unwrap_or(bytes.len().saturating_sub(1)))
         })
         .unwrap_or((0, bytes.len().saturating_sub(1)));
-    let mut h = HeaderMap::new();
+    let start = if m.wrong_range { 0 } else { start };
     if start >= bytes.len() {
         h.insert("content-range", format!("bytes */{}", bytes.len()).parse().unwrap());
         return (StatusCode::RANGE_NOT_SATISFIABLE, h, String::new());
@@ -251,17 +361,23 @@ fn signed_query(pairs: &[(&str, &str)]) -> String {
     q.finish()
 }
 
-/// GET with an explicit cookie (or none); returns status and Location.
-async fn get_redirect(h: &Harness, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+/// GET with an explicit cookie header (or none); returns status, Location and the cookies it set.
+async fn get_full(h: &Harness, path: &str, cookie: Option<&str>) -> (StatusCode, String, Vec<String>) {
     let mut b = Request::builder().method("GET").uri(path);
     if let Some(c) = cookie {
         b = b.header(header::COOKIE, c);
     }
     let res = h.router.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
     let loc = res.headers().get(header::LOCATION).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+    let set: Vec<String> = res.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string()).collect();
     let status = res.status();
     let _ = res.into_body().collect().await;
-    (status, loc)
+    (status, loc, set)
+}
+
+async fn get_redirect(h: &Harness, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let (s, l, _) = get_full(h, path, cookie).await;
+    (s, l)
 }
 
 /// One scheduler pass for the Shopify feature (tick 0 runs every periodic task).
@@ -274,18 +390,54 @@ fn now_ts() -> String {
     chrono::Utc::now().timestamp().to_string()
 }
 
-/// Start an install as the signed-in account and finish Shopify's callback in the same browser.
+fn state_of(url: &str) -> String {
+    url::Url::parse(url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string()
+}
+
+/// Start an install as the signed-in person: open DumbMail's install link (which sets the install
+/// cookie and sends the browser to Shopify). Returns the state and the browser's cookies.
+async fn begin_install(h: &mut Harness, shop: &str) -> (String, String) {
+    let v = h.ok("POST", "/api/shopify/connect", Some(json!({"shop": shop}))).await;
+    let link = v["url"].as_str().unwrap().to_string();
+    assert!(link.starts_with("https://pl.test/api/shopify/install?state="), "{link}");
+    let path = link.trim_start_matches("https://pl.test");
+    let session = h.cookie.clone().unwrap();
+    let (s, loc, set) = get_full(h, path, Some(&session)).await;
+    assert!(s.is_redirection(), "{s} {loc}");
+    let to = url::Url::parse(&loc).unwrap();
+    assert_eq!(to.path(), "/admin/oauth/authorize", "{loc}");
+    let nonce = set.iter().find(|c| c.starts_with("dm_shopify_install=")).cloned().expect("install cookie");
+    (state_of(&loc), format!("{session}; {nonce}"))
+}
+
+async fn finish_install(h: &Harness, shop: &str, state: &str, cookies: Option<&str>) -> String {
+    let q = signed_query(&[("code", "good-code"), ("shop", shop), ("state", state), ("timestamp", &now_ts())]);
+    get_redirect(h, &format!("/api/shopify/callback?{q}"), cookies).await.1
+}
+
+/// Let the history import that connecting starts run to the end.
+async fn settle_imports(h: &Harness) {
+    for _ in 0..60 {
+        h.fast_forward().await;
+        let running: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_imports WHERE status = 'running')").fetch_one(&h.state.db).await.unwrap();
+        if !running {
+            return;
+        }
+    }
+}
+
+/// Connect the store as the signed-in account (install link, Shopify's callback in the same
+/// browser), and let the setup and first import finish.
 async fn connect(h: &mut Harness) -> String {
-    let v = h.ok("POST", "/api/shopify/connect", Some(json!({"shop": "acme-goods"}))).await;
-    let url = url::Url::parse(v["url"].as_str().unwrap()).unwrap();
-    assert_eq!(url.host_str(), Some(SHOP));
-    let state = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
-    let q = signed_query(&[("code", "good-code"), ("shop", SHOP), ("state", &state), ("timestamp", &now_ts())]);
-    let cookie = h.cookie.clone();
-    let (s, loc) = get_redirect(h, &format!("/api/shopify/callback?{q}"), cookie.as_deref()).await;
-    assert!(s.is_redirection(), "{s}");
+    connect_shop(h, SHOP).await
+}
+
+async fn connect_shop(h: &mut Harness, shop: &str) -> String {
+    let (state, cookies) = begin_install(h, shop).await;
+    let loc = finish_install(h, shop, &state, Some(&cookies)).await;
     assert!(loc.ends_with("/settings/shopify?connected=1"), "{loc}");
     h.drain().await;
+    settle_imports(h).await;
     state
 }
 
@@ -296,24 +448,31 @@ fn webhook_sig(body: &str) -> String {
 }
 
 async fn hook(h: &Harness, topic: &str, id: &str, body: &Value) -> StatusCode {
+    hook_with(h, topic, id, body, &[]).await
+}
+
+async fn hook_with(h: &Harness, topic: &str, id: &str, body: &Value, extra: &[(&str, &str)]) -> StatusCode {
     let b = body.to_string();
-    let (s, _, _) = h
-        .raw("POST", "/webhooks/shopify", &[("content-type", "application/json"), ("x-shopify-hmac-sha256", &webhook_sig(&b)), ("x-shopify-topic", topic), ("x-shopify-shop-domain", SHOP), ("x-shopify-webhook-id", id)], &b)
-        .await;
+    let sig = webhook_sig(&b);
+    let mut headers = vec![("content-type", "application/json"), ("x-shopify-hmac-sha256", sig.as_str()), ("x-shopify-topic", topic), ("x-shopify-shop-domain", SHOP), ("x-shopify-webhook-id", id)];
+    headers.extend_from_slice(extra);
+    let (s, _, _) = h.raw("POST", "/webhooks/shopify", &headers, &b).await;
     s
 }
 
 fn order_body(id: i64, customer_id: i64, email: &str, created: chrono::DateTime<chrono::Utc>) -> Value {
+    let m = |a: &str| json!({"shop_money": {"amount": a, "currency_code": "USD"}, "presentment_money": {"amount": a, "currency_code": "USD"}});
     json!({
         "id": id, "admin_graphql_api_id": format!("gid://shopify/Order/{id}"), "name": format!("#{}", id - 4000), "order_number": id - 4000,
         "email": email, "created_at": created.to_rfc3339(), "processed_at": created.to_rfc3339(), "updated_at": created.to_rfc3339(), "cancelled_at": null,
-        "currency": "USD", "total_price": "100.00", "subtotal_price": "90.00", "total_discounts": "10.00", "total_tax": "5.00",
+        "currency": "USD", "presentment_currency": "USD", "total_price": "100.00", "subtotal_price": "90.00", "total_discounts": "10.00", "total_tax": "5.00",
+        "total_price_set": m("100.00"), "subtotal_price_set": m("90.00"), "total_discounts_set": m("10.00"), "total_tax_set": m("5.00"), "total_shipping_price_set": m("0.00"),
         "financial_status": "paid", "fulfillment_status": null, "test": false, "order_status_url": "https://acme.test/status",
         "discount_codes": [{"code": "WELCOME10", "amount": "10.00", "type": "percentage"}],
         "customer": {"id": customer_id, "email": email, "first_name": "Ann", "last_name": "Lee"},
         "line_items": [
-            {"id": 11, "product_id": 101, "variant_id": 1011, "title": "Mug", "variant_title": "Default Title", "sku": "SKU101", "vendor": "Acme", "quantity": 2, "price": "30.00", "total_discount": "0.00"},
-            {"id": 12, "product_id": 102, "variant_id": 1021, "title": "Bowl", "variant_title": "Blue", "sku": "SKU102", "vendor": "Acme", "quantity": 1, "price": "40.00", "total_discount": "10.00"}
+            {"id": 11, "product_id": 101, "variant_id": 1011, "title": "Mug", "variant_title": "Default Title", "sku": "SKU101", "vendor": "Acme", "quantity": 2, "price": "30.00", "price_set": m("30.00"), "total_discount": "0.00", "total_discount_set": m("0.00")},
+            {"id": 12, "product_id": 102, "variant_id": 1021, "title": "Bowl", "variant_title": "Blue", "sku": "SKU102", "vendor": "Acme", "quantity": 1, "price": "40.00", "price_set": m("40.00"), "total_discount": "10.00", "total_discount_set": m("10.00")}
         ],
         "refunds": [], "fulfillments": []
     })
@@ -332,6 +491,10 @@ async fn event(h: &Harness, metric: &str, unique: &str) -> Option<(Option<f64>, 
         .unwrap()
 }
 
+async fn value(h: &Harness, metric: &str, unique: &str) -> Option<f64> {
+    event(h, metric, unique).await.and_then(|e| e.0)
+}
+
 async fn count_events(h: &Harness, metric: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = $1").bind(metric).fetch_one(&h.state.db).await.unwrap()
 }
@@ -339,6 +502,51 @@ async fn count_events(h: &Harness, metric: &str) -> i64 {
 async fn consent(h: &Harness, email: &str) -> (String, String, Value) {
     sqlx::query_as("SELECT email_consent, sms_consent, properties FROM profiles WHERE email = $1").bind(email).fetch_one(&h.state.db).await.unwrap()
 }
+
+async fn sms_consent(h: &Harness, phone: &str) -> String {
+    sqlx::query_scalar("SELECT sms_consent FROM profiles WHERE phone_number = $1").bind(phone).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn profile_id_of(h: &Harness, email: &str) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM profiles WHERE email = $1").bind(email).fetch_optional(&h.state.db).await.unwrap()
+}
+
+async fn count(h: &Harness, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(&h.state.db).await.unwrap()
+}
+
+/// A live flow on this metric (to see which events start flows).
+async fn live_flow(h: &mut Harness, metric: &str) {
+    h.ok("POST", "/api/flows", Some(json!({"name": format!("On {metric}"), "trigger": {"type": "metric", "metric": metric}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
+    sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
+}
+
+async fn flow_runs(h: &Harness) -> i64 {
+    count(h, "SELECT count(*) FROM flow_runs").await
+}
+
+fn jsonl(lines: &[Value]) -> String {
+    lines.iter().map(|l| l.to_string() + "\n").collect()
+}
+
+/// Another person in the same account, signed in: their session cookie.
+async fn teammate(h: &Harness, role: &str) -> (Uuid, String) {
+    let acct = account_id(h).await;
+    let uid = Uuid::now_v7();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')").bind(uid).bind(format!("{uid}@acme.test")).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, $3)").bind(uid).bind(acct).bind(role).execute(&h.state.db).await.unwrap();
+    let token = format!("tok{}", uid.simple());
+    sqlx::query("INSERT INTO sessions (token_hash, user_id, account_id, expires_at) VALUES ($1, $2, $3, now() + interval '1 day')")
+        .bind(dumbmail::auth::sha256_hex(&token))
+        .bind(uid)
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    (uid, format!("{}={token}", dumbmail::auth::SESSION_COOKIE))
+}
+
+// ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn not_available_without_app_credentials() {
@@ -367,33 +575,32 @@ async fn connecting_a_store() {
         let (s, _) = h.req("POST", "/api/shopify/connect", Some(json!({"shop": bad}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
     }
+    let (state, cookies) = begin_install(&mut h, "acme-goods").await;
     let v = h.ok("POST", "/api/shopify/connect", Some(json!({"shop": "acme-goods"}))).await;
-    let url = url::Url::parse(v["url"].as_str().unwrap()).unwrap();
-    let qp: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(v["shop"], SHOP);
+    // The install link went on to Shopify with the app's id, scopes and redirect.
+    let session = h.cookie.clone().unwrap();
+    let link = v["url"].as_str().unwrap().trim_start_matches("https://pl.test").to_string();
+    let (_, loc, _) = get_full(&h, &link, Some(&session)).await;
+    let qp: HashMap<String, String> = url::Url::parse(&loc).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(url::Url::parse(&loc).unwrap().host_str(), Some(SHOP));
     assert_eq!(qp["client_id"], KEY);
     assert_eq!(qp["redirect_uri"], "https://pl.test/api/shopify/callback");
     assert!(qp["scope"].contains("write_customers") && qp["scope"].contains("read_all_orders"));
-    let state = qp["state"].clone();
-    let cookie = h.cookie.clone();
 
     // A forged callback (bad signature, another shop, stale timestamp, unknown state) gets nowhere.
     let good = |state: &str| signed_query(&[("code", "good-code"), ("shop", SHOP), ("state", state), ("timestamp", &now_ts())]);
     let tampered = good(&state).replace("good-code", "evil-code");
-    assert!(get_redirect(&h, &format!("/api/shopify/callback?{tampered}"), cookie.as_deref()).await.1.ends_with("error=signature"));
+    assert!(get_redirect(&h, &format!("/api/shopify/callback?{tampered}"), Some(&cookies)).await.1.ends_with("error=signature"));
     let other_shop = signed_query(&[("code", "good-code"), ("shop", "other.myshopify.com"), ("state", &state), ("timestamp", &now_ts())]);
-    assert!(get_redirect(&h, &format!("/api/shopify/callback?{other_shop}"), cookie.as_deref()).await.1.ends_with("error=shop"));
+    assert!(get_redirect(&h, &format!("/api/shopify/callback?{other_shop}"), Some(&cookies)).await.1.ends_with("error=shop"));
     // That consumed the state: it's single use.
-    assert!(get_redirect(&h, &format!("/api/shopify/callback?{}", good(&state)), cookie.as_deref()).await.1.ends_with("error=expired"));
+    assert!(get_redirect(&h, &format!("/api/shopify/callback?{}", good(&state)), Some(&cookies)).await.1.ends_with("error=expired"));
     let old = signed_query(&[("code", "good-code"), ("shop", SHOP), ("state", "x"), ("timestamp", "1000")]);
-    assert!(get_redirect(&h, &format!("/api/shopify/callback?{old}"), cookie.as_deref()).await.1.ends_with("error=expired"));
-
-    // A link started by this account, finished in a browser that isn't signed in to it, is refused.
-    let v = h.ok("POST", "/api/shopify/connect", Some(json!({"shop": SHOP}))).await;
-    let state = url::Url::parse(v["url"].as_str().unwrap()).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
-    assert!(get_redirect(&h, &format!("/api/shopify/callback?{}", good(&state)), None).await.1.ends_with("error=signin"));
+    assert!(get_redirect(&h, &format!("/api/shopify/callback?{old}"), Some(&cookies)).await.1.ends_with("error=expired"));
     assert_eq!(mock.lock().unwrap().tokens_issued, 0, "no code was exchanged");
 
-    // The real thing.
+    // The real thing; connecting also starts the history import.
     connect(&mut h).await;
     {
         let m = mock.lock().unwrap();
@@ -407,6 +614,7 @@ async fn connecting_a_store() {
     assert_eq!(v["connection"]["name"], "Acme Goods");
     assert_eq!(v["connection"]["token_hint"], "…ken1");
     assert_eq!(v["connection"]["web_pixel_installed"], true);
+    assert_eq!(v["health"]["state"], "waiting");
     assert!(v["storefront"]["embed_link"].as_str().unwrap().contains("activateAppId=test-client-id/dumbmail"));
     assert!(!v.to_string().contains("shpat_"), "the token never leaves the server: {v}");
     let enc: String = sqlx::query_scalar("SELECT access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
@@ -427,15 +635,59 @@ async fn connecting_a_store() {
     assert!(get_redirect(&h, &format!("/api/shopify/app?{fresh}"), None).await.1.ends_with("/settings/shopify?shop=new-store.myshopify.com"));
     assert!(get_redirect(&h, "/api/shopify/app?shop=acme-goods.myshopify.com&hmac=00", None).await.1.ends_with("error=signature"));
 
-    // Disconnect: a dry run first, then webhooks and the pixel removed and the token forgotten.
+    // Disconnect: a dry run first, then webhooks, pixel and the embed's settings removed and the token forgotten.
     h.cookie = mine;
     let v = h.ok("POST", "/api/shopify/disconnect", Some(json!({}))).await;
     assert_eq!(v["dry_run"], true);
     let v = h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
-    assert_eq!(v["webhooks_removed"], true);
+    assert_eq!(v["cleaned_up"], true, "{v}");
     assert_eq!(mock.lock().unwrap().deletes, 1, "one request removes every webhook");
+    assert_eq!(mock.lock().unwrap().metafield_deletes, 1, "the theme embed's settings are cleared");
     let (status, tok): (String, Option<String>) = sqlx::query_as("SELECT status, access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((status.as_str(), tok), ("disconnected", None));
+    h.cleanup().await;
+}
+
+/// Item 11: the callback finishes only in the browser that opened the install link, signed in as
+/// the person who started it, who may still manage integrations.
+#[tokio::test]
+async fn install_is_tied_to_the_person_who_started_it() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    // The link opened in a browser that isn't signed in: back to settings, no cookie.
+    let v = h.ok("POST", "/api/shopify/connect", Some(json!({"shop": SHOP}))).await;
+    let path = v["url"].as_str().unwrap().trim_start_matches("https://pl.test").to_string();
+    let (_, loc, set) = get_full(&h, &path, None).await;
+    assert!(loc.ends_with("error=signin") && set.is_empty(), "{loc}");
+    // A teammate opening the owner's link is refused.
+    let (_, mate) = teammate(&h, "admin").await;
+    assert!(get_full(&h, &path, Some(&mate)).await.1.ends_with("error=signin"));
+
+    // The owner opens it; the callback is then forwarded to the teammate (same account, signed in,
+    // but without the owner's install cookie): refused.
+    let (state, owner_cookies) = begin_install(&mut h, SHOP).await;
+    assert!(finish_install(&h, SHOP, &state, Some(&mate)).await.ends_with("error=browser"));
+    // Even with the owner's install cookie copied over, the teammate isn't the person who started it.
+    let (state, owner_cookies2) = begin_install(&mut h, SHOP).await;
+    let nonce = owner_cookies2.split("; ").find(|c| c.starts_with("dm_shopify_install=")).unwrap();
+    assert!(finish_install(&h, SHOP, &state, Some(&format!("{mate}; {nonce}"))).await.ends_with("error=signin"));
+    // The owner lost the right to manage integrations before finishing: refused.
+    let (state, cookies) = begin_install(&mut h, SHOP).await;
+    sqlx::query("UPDATE memberships SET role = 'analyst' WHERE role = 'owner'").execute(&h.state.db).await.unwrap();
+    assert!(finish_install(&h, SHOP, &state, Some(&cookies)).await.ends_with("error=role"));
+    sqlx::query("UPDATE memberships SET role = 'owner' WHERE role = 'analyst'").execute(&h.state.db).await.unwrap();
+    assert_eq!(mock.lock().unwrap().tokens_issued, 0, "no code was exchanged");
+    let _ = owner_cookies;
+    // An analyst can't start one.
+    let (_, analyst) = teammate(&h, "analyst").await;
+    let mine = h.cookie.replace(analyst);
+    let (s, _) = h.req("POST", "/api/shopify/connect", Some(json!({"shop": SHOP}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    h.cookie = mine;
+    // The owner, in their own browser: connected.
+    connect(&mut h).await;
+    assert_eq!(mock.lock().unwrap().tokens_issued, 1);
     h.cleanup().await;
 }
 
@@ -458,15 +710,13 @@ async fn webhooks_are_verified_and_deduplicated() {
     // Signed, but the body was changed after signing.
     let (s, _, _) = h.raw("POST", "/webhooks/shopify", &[("x-shopify-hmac-sha256", &webhook_sig(&b)), ("x-shopify-topic", "orders/create"), ("x-shopify-shop-domain", SHOP), ("x-shopify-webhook-id", "w1")], &b.replace("100.00", "1.00")).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_webhooks").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks").await, 0);
 
     // The same delivery three times is stored and processed once.
     for _ in 0..3 {
         assert_eq!(hook(&h, "orders/create", "w1", &body).await, StatusCode::OK);
     }
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_webhooks").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks").await, 1);
     // A store that isn't connected anywhere: acknowledged, ignored.
     let b2 = body.to_string();
     let (s, _, _) = h.raw("POST", "/webhooks/shopify", &[("x-shopify-hmac-sha256", &webhook_sig(&b2)), ("x-shopify-topic", "orders/create"), ("x-shopify-shop-domain", "stranger.myshopify.com"), ("x-shopify-webhook-id", "w9")], &b2).await;
@@ -488,14 +738,12 @@ async fn webhooks_are_verified_and_deduplicated() {
 
 #[tokio::test]
 async fn orders_become_trusted_events_once() {
-    let (_mock, base) = mock_shopify().await;
+    let (mock, base) = mock_shopify().await;
     let mut h = shopify_harness!(base);
     h.signup().await;
     let acct = account_id(&h).await;
     let pk: String = sqlx::query_scalar("SELECT public_key FROM accounts WHERE id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
-    // A live flow on Placed Order, to see which orders start it.
-    h.ok("POST", "/api/flows", Some(json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
-    sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
+    live_flow(&mut h, "Placed Order").await;
     connect(&mut h).await;
 
     // The browser pixel reports order 5001 first (with a made-up total).
@@ -509,24 +757,25 @@ async fn orders_become_trusted_events_once() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{metric}: {body}");
     }
     h.drain().await;
-    let flow_runs = || async { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM flow_runs").fetch_one(&h.state.db).await.unwrap() };
-    assert_eq!(flow_runs().await, 1, "the browser's order started the flow, as it does today");
+    assert_eq!(flow_runs(&h).await, 1, "the browser's order started the flow, as it does today");
 
     // Then Shopify's webhook: the same event, now with the real amounts, trusted.
     hook(&h, "orders/create", "w1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
     h.drain().await;
     assert_eq!(count_events(&h, "Placed Order").await, 1, "one order, one event");
-    let (value, props, from_browser, _) = event(&h, "Placed Order", "order:5001").await.unwrap();
-    assert_eq!(value, Some(100.0));
+    let (value_, props, from_browser, _) = event(&h, "Placed Order", "order:5001").await.unwrap();
+    assert_eq!(value_, Some(100.0));
     assert_eq!(from_browser, Some(false));
     assert_eq!(props["tracked_by"], "shopify");
     assert_eq!(props["order_name"], "#1001");
     assert_eq!(props["items"][0]["product_id"], "101");
     assert_eq!(props["items"][1]["variant"], "Blue");
     assert_eq!(props["discount_codes"], json!(["WELCOME10"]));
-    assert_eq!(flow_runs().await, 1, "upgrading the browser's copy doesn't start the flow again");
+    assert_eq!(props["shopify_customer_id"], "1");
+    assert_eq!(props["shopify_shop"], SHOP);
+    assert_eq!(flow_runs(&h).await, 1, "upgrading the browser's copy doesn't start the flow again");
     assert_eq!(count_events(&h, "Ordered Product").await, 2);
-    assert_eq!(event(&h, "Ordered Product", "order:5001:12").await.unwrap().0, Some(30.0));
+    assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(30.0));
     // The order doesn't touch consent.
     assert_eq!(consent(&h, "ann@example.com").await.0, "never_subscribed");
 
@@ -537,48 +786,51 @@ async fn orders_become_trusted_events_once() {
         &json!({"metric": "Placed Order", "profile": {"email": "bob@example.com"}, "value": 1, "unique_id": "order:5002"}).to_string()).await;
     h.drain().await;
     assert_eq!(count_events(&h, "Placed Order").await, 2);
-    assert_eq!(event(&h, "Placed Order", "order:5002").await.unwrap().0, Some(100.0));
-    assert_eq!(flow_runs().await, 2);
+    assert_eq!(value(&h, "Placed Order", "order:5002").await, Some(100.0));
+    assert_eq!(flow_runs(&h).await, 2);
 
     // An old order seen for the first time (an edit to last week's order) is history: no flow.
     hook(&h, "orders/updated", "w3", &order_body(5003, 3, "cat@example.com", chrono::Utc::now() - chrono::Duration::days(7))).await;
     h.drain().await;
     assert_eq!(count_events(&h, "Placed Order").await, 3);
-    assert_eq!(flow_runs().await, 2, "history doesn't start flows");
+    assert_eq!(flow_runs(&h).await, 2, "history doesn't start flows");
 
-    // Refunds take value off once, whichever webhook says so and however often.
-    let refund = json!({"id": 900, "order_id": 5001, "created_at": chrono::Utc::now().to_rfc3339(),
-        "transactions": [{"kind": "refund", "status": "success", "amount": "30.00"}], "refund_line_items": [{"line_item_id": 12, "quantity": 1, "subtotal": 30.0}]});
-    hook(&h, "refunds/create", "w4", &refund).await;
-    hook(&h, "refunds/create", "w5", &refund).await; // a second delivery of the same refund
+    // A refund: read from the Admin API (shop money, successful transactions), applied once
+    // however many webhooks mention it.
+    let now = chrono::Utc::now().to_rfc3339();
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &now, vec![refund(900, &now, &[("SUCCESS", "30.00")], &[(12, "30.00")])]));
+    let refund_hook = json!({"id": 900, "order_id": 5001, "created_at": now, "transactions": [{"kind": "refund", "status": "success", "amount": "30.00"}], "refund_line_items": [{"line_item_id": 12, "quantity": 1, "subtotal": 30.0}]});
+    hook(&h, "refunds/create", "w4", &refund_hook).await;
+    hook(&h, "refunds/create", "w5", &refund_hook).await; // a second delivery of the same refund
     h.drain().await;
-    assert_eq!(event(&h, "Placed Order", "order:5001").await.unwrap().0, Some(70.0));
-    assert_eq!(event(&h, "Ordered Product", "order:5001:12").await.unwrap().0, Some(0.0));
-    assert_eq!(event(&h, "Ordered Product", "order:5001:11").await.unwrap().0, Some(60.0));
-    assert_eq!(event(&h, "Refunded Order", "refund:900").await.unwrap().0, Some(30.0));
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(70.0));
+    assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(0.0));
+    assert_eq!(value(&h, "Ordered Product", "order:5001:11").await, Some(60.0));
+    assert_eq!(value(&h, "Refunded Order", "refund:900").await, Some(30.0));
     let mut updated = order_body(5001, 1, "ann@example.com", chrono::Utc::now());
-    updated["refunds"] = json!([refund]);
+    updated["refunds"] = json!([refund_hook]);
     hook(&h, "orders/updated", "w6", &updated).await;
-    // An older payload without the refund arrives late: the refund stays counted.
+    // An order payload without the refund (orders/paid) keeps it counted.
     hook(&h, "orders/paid", "w7", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
     h.drain().await;
-    assert_eq!(event(&h, "Placed Order", "order:5001").await.unwrap().0, Some(70.0));
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(70.0));
     assert_eq!(count_events(&h, "Refunded Order").await, 1);
 
     // Cancelled: revenue goes to 0 and a Cancelled Order event is recorded.
-    let mut cancelled = updated.clone();
+    let mut cancelled = order_body(5001, 1, "ann@example.com", chrono::Utc::now());
+    cancelled["refunds"] = json!([refund_hook]);
     cancelled["cancelled_at"] = json!(chrono::Utc::now().to_rfc3339());
     cancelled["cancel_reason"] = json!("customer");
     hook(&h, "orders/cancelled", "w8", &cancelled).await;
     h.drain().await;
-    assert_eq!(event(&h, "Placed Order", "order:5001").await.unwrap().0, Some(0.0));
-    assert_eq!(event(&h, "Cancelled Order", "order:5001").await.unwrap().0, Some(100.0));
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(0.0));
+    assert_eq!(value(&h, "Cancelled Order", "order:5001").await, Some(100.0));
     // Revenue as the overview and reports count it: the sum of Placed Order values.
     let revenue: f64 = sqlx::query_scalar("SELECT sum(e.value) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Placed Order'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(revenue, 200.0);
 
     // Shipments.
-    let mut partial = order_body(5002, 1, "ann@example.com", chrono::Utc::now());
+    let mut partial = order_body(5002, 2, "bob@example.com", chrono::Utc::now());
     partial["fulfillment_status"] = json!("partial");
     partial["fulfillments"] = json!([{"id": 61, "status": "success", "created_at": chrono::Utc::now().to_rfc3339()}]);
     hook(&h, "orders/partially_fulfilled", "w9", &partial).await;
@@ -600,6 +852,56 @@ async fn orders_become_trusted_events_once() {
     h.cleanup().await;
 }
 
+/// Item 1: an order or checkout goes to the contact in that event, never a stale linked profile;
+/// one with no contact is recorded for the linked profile but starts nothing.
+#[tokio::test]
+async fn events_go_to_the_events_own_contact() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    live_flow(&mut h, "Placed Order").await;
+    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "NOT_SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    h.drain().await;
+    let old = profile_id_of(&h, "ann@example.com").await.unwrap();
+
+    // Customer 1 orders with a new address: the order is the new address's, and the link moves.
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann.new@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    let new = profile_id_of(&h, "ann.new@example.com").await.unwrap();
+    let (_, props, _, owner) = event(&h, "Placed Order", "order:5001").await.unwrap();
+    assert_eq!(owner, new, "not the old address's profile");
+    assert_ne!(owner, old);
+    assert_eq!(event(&h, "Ordered Product", "order:5001:11").await.unwrap().3, new);
+    assert_eq!(props["shopify_customer_id"], "1");
+    let linked: Uuid = sqlx::query_scalar("SELECT profile_id FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, new, "the link moved to the order's contact");
+    assert_eq!(flow_runs(&h).await, 1);
+    let runs_for_old: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs WHERE profile_id = $1").bind(old).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(runs_for_old, 0);
+
+    // A checkout with yet another address goes to that address.
+    let checkout = json!({"token": "tok1", "email": "ann.third@example.com", "completed_at": null, "created_at": chrono::Utc::now().to_rfc3339(), "currency": "USD", "presentment_currency": "USD",
+        "total_price": "64.00", "customer": {"id": 1, "email": "ann@example.com"}, "line_items": []});
+    hook(&h, "checkouts/create", "k1", &checkout).await;
+    h.drain().await;
+    assert_eq!(event(&h, "Started Checkout", "checkout:tok1").await.unwrap().3, profile_id_of(&h, "ann.third@example.com").await.unwrap());
+
+    // No email or phone on the order: recorded for the linked profile, marked, and no flow starts.
+    let mut anon = order_body(5002, 1, "", chrono::Utc::now());
+    anon["email"] = Value::Null;
+    anon["customer"] = json!({"id": 1});
+    hook(&h, "orders/create", "o2", &anon).await;
+    h.drain().await;
+    let (_, props, _, owner) = event(&h, "Placed Order", "order:5002").await.unwrap();
+    let linked: Uuid = sqlx::query_scalar("SELECT profile_id FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(owner, linked);
+    assert_eq!(props["$no_contact"], true);
+    assert_eq!(flow_runs(&h).await, 1, "an order without a contact starts nothing");
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn checkouts_match_the_pixel() {
     let (_mock, base) = mock_shopify().await;
@@ -609,7 +911,7 @@ async fn checkouts_match_the_pixel() {
     connect(&mut h).await;
     h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
         &json!({"metric": "Started Checkout", "profile": {"email": "ann@example.com"}, "value": 5, "unique_id": "checkout:tok123"}).to_string()).await;
-    let checkout = json!({"token": "tok123", "email": "ann@example.com", "completed_at": null, "created_at": chrono::Utc::now().to_rfc3339(), "currency": "USD", "total_price": "64.00",
+    let checkout = json!({"token": "tok123", "email": "ann@example.com", "completed_at": null, "created_at": chrono::Utc::now().to_rfc3339(), "currency": "USD", "presentment_currency": "USD", "total_price": "64.00",
         "abandoned_checkout_url": "https://acme.test/checkouts/tok123/recover", "line_items": [{"product_id": 101, "variant_id": 1011, "title": "Mug", "quantity": 2, "price": "32.00"}]});
     hook(&h, "checkouts/create", "c1", &checkout).await;
     let mut done = checkout.clone();
@@ -620,12 +922,21 @@ async fn checkouts_match_the_pixel() {
     anonymous["token"] = json!("tok555");
     anonymous["email"] = Value::Null;
     hook(&h, "checkouts/create", "c3", &anonymous).await;
+    // Paid in another currency: recorded without a value (shop money isn't in the payload).
+    let mut euro = checkout.clone();
+    euro["token"] = json!("tok777");
+    euro["presentment_currency"] = json!("EUR");
+    hook(&h, "checkouts/create", "c4", &euro).await;
     h.drain().await;
-    assert_eq!(count_events(&h, "Started Checkout").await, 1);
-    let (value, props, from_browser, _) = event(&h, "Started Checkout", "checkout:tok123").await.unwrap();
-    assert_eq!((value, from_browser), (Some(64.0), Some(false)));
+    assert_eq!(count_events(&h, "Started Checkout").await, 2);
+    let (v, props, from_browser, _) = event(&h, "Started Checkout", "checkout:tok123").await.unwrap();
+    assert_eq!((v, from_browser), (Some(64.0), Some(false)));
     assert_eq!(props["checkout_url"], "https://acme.test/checkouts/tok123/recover");
     assert_eq!(props["item_count"], 2);
+    let (v, props, _, _) = event(&h, "Started Checkout", "checkout:tok777").await.unwrap();
+    assert_eq!(v, None);
+    assert_eq!(props["currency"], "USD");
+    assert!(props.get("total").is_none());
     h.cleanup().await;
 }
 
@@ -670,7 +981,7 @@ async fn customers_and_consent() {
     assert_eq!(mock.lock().unwrap().node_reads.len(), 5);
 
     // Ann changes her email in Shopify; the new address hasn't subscribed. Nothing carries over.
-    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann.new@example.com"), "NOT_SUBSCRIBED", Some("+15035550101"), "SUBSCRIBED"));
+    mock.lock().unwrap().customers.insert(1, customer_at(1, Some("ann.new@example.com"), "NOT_SUBSCRIBED", Some("+15035550101"), "SUBSCRIBED", "2025-02-01T00:00:00Z", "2025-01-01T00:00:00Z"));
     hook(&h, "customers/update", "c6", &json!({"id": 1})).await;
     h.drain().await;
     assert_eq!(consent(&h, "ann.new@example.com").await.0, "never_subscribed");
@@ -678,36 +989,140 @@ async fn customers_and_consent() {
     let phone_on_new: Option<String> = sqlx::query_scalar("SELECT phone_number FROM profiles WHERE email = 'ann.new@example.com'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(phone_on_new, None, "the number stays with the profile that has it");
 
-    // Unsubscribes in DumbMail are written back to Shopify: Dee unsubscribed here while Shopify
-    // still has her subscribed. Ann's old address isn't Shopify's any more (customer 1 has the new
-    // one), so unsubscribing it here writes nothing.
+    // Unsubscribes in DumbMail are written back to Shopify, by address and number: Dee unsubscribed
+    // here while Shopify still has her subscribed; Ann's old profile, which holds customer 1's SMS
+    // number, unsubscribed from texts (the number is still customer 1's in Shopify). Ann's old email
+    // isn't Shopify's any more (customer 1 has the new one), so that unsubscribe writes nothing.
     sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed', sms_consent = 'unsubscribed' WHERE email = 'ann@example.com'").execute(&h.state.db).await.unwrap();
     tick(&h).await;
     h.drain().await;
     {
         let m = mock.lock().unwrap();
-        assert_eq!(m.consent_updates.len(), 1, "{:?}", m.consent_updates);
-        assert_eq!(m.consent_updates[0]["customerId"], "gid://shopify/Customer/4");
-        assert_eq!(m.consent_updates[0]["emailMarketingConsent"]["marketingState"], "UNSUBSCRIBED");
+        assert_eq!(m.consent_updates.len(), 2, "{:?}", m.consent_updates);
+        let email = m.consent_updates.iter().find(|u| u.get("emailMarketingConsent").is_some()).unwrap();
+        assert_eq!(email["customerId"], "gid://shopify/Customer/4");
+        assert_eq!(email["emailMarketingConsent"]["marketingState"], "UNSUBSCRIBED");
+        let sms = m.consent_updates.iter().find(|u| u.get("smsMarketingConsent").is_some()).unwrap();
+        assert_eq!(sms["customerId"], "gid://shopify/Customer/1");
     }
     // Written once.
     tick(&h).await;
     h.drain().await;
-    assert_eq!(mock.lock().unwrap().consent_updates.len(), 1);
+    assert_eq!(mock.lock().unwrap().consent_updates.len(), 2);
     // Bob unsubscribes from an email here: written back on the next pass.
     sqlx::query("UPDATE shopify_customers SET email_state = 'SUBSCRIBED' WHERE customer_id = 2").execute(&h.state.db).await.unwrap();
     sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed' WHERE email = 'bob@example.com'").execute(&h.state.db).await.unwrap();
     tick(&h).await;
     h.drain().await;
-    assert_eq!(mock.lock().unwrap().consent_updates.len(), 2);
+    assert_eq!(mock.lock().unwrap().consent_updates.len(), 3);
     sqlx::query("UPDATE profiles SET email_consent = 'never_subscribed' WHERE email = 'bob@example.com'").execute(&h.state.db).await.unwrap();
 
-    // Shopify deleting a customer drops the link only.
+    // Shopify deleting a customer stops write-backs but keeps the link for privacy requests.
     hook(&h, "customers/delete", "c8", &json!({"id": 2})).await;
     h.drain().await;
-    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_customers WHERE customer_id = 2").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(links, 0);
+    let deleted: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT deleted_at FROM shopify_customers WHERE customer_id = 2").fetch_one(&h.state.db).await.unwrap();
+    assert!(deleted.is_some());
     assert_eq!(consent(&h, "bob@example.com").await.0, "never_subscribed");
+    h.cleanup().await;
+}
+
+/// Item 2: an opt-out is never lost, and Shopify's consent only applies when it's newer.
+#[tokio::test]
+async fn opt_outs_are_never_lost() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+
+    // Shopify refuses the first write-back (a userError): not marked done, retried, then confirmed.
+    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    h.drain().await;
+    sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed' WHERE email = 'ann@example.com'").execute(&h.state.db).await.unwrap();
+    mock.lock().unwrap().consent_fail = 1;
+    tick(&h).await;
+    h.drain().await;
+    let (state, attempts): (String, i32) = sqlx::query_as("SELECT email_state, email_wb_attempts FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((state.as_str(), attempts), ("SUBSCRIBED", 1), "a refused write-back stays queued");
+    let v = h.ok("GET", "/api/shopify", None).await;
+    assert_eq!(v["counts"]["unsubscribes_to_write_back"], 1);
+    assert!(v["problems"].to_string().contains("haven't been accepted by Shopify"), "{v}");
+    // Not before its backoff…
+    tick(&h).await;
+    h.drain().await;
+    assert!(mock.lock().unwrap().consent_updates.is_empty());
+    // …then it goes through.
+    sqlx::query("UPDATE shopify_customers SET email_wb_after = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
+    tick(&h).await;
+    h.drain().await;
+    assert_eq!(mock.lock().unwrap().consent_updates.len(), 1);
+    let state: String = sqlx::query_scalar("SELECT email_state FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(state, "UNSUBSCRIBED");
+
+    // A customer whose SMS number belongs to a different (phone-only) profile: its text unsubscribe
+    // is still written back.
+    let phone_profile = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, phone_number, sms_consent) VALUES ($1, $2, '+15035550102', 'never_subscribed')").bind(phone_profile).bind(acct).execute(&h.state.db).await.unwrap();
+    mock.lock().unwrap().customers.insert(2, customer(2, Some("bob@example.com"), "NOT_SUBSCRIBED", Some("+15035550102"), "SUBSCRIBED"));
+    hook(&h, "customers/update", "c2", &json!({"id": 2})).await;
+    h.drain().await;
+    assert_eq!(sms_consent(&h, "+15035550102").await, "subscribed");
+    sqlx::query("UPDATE profiles SET sms_consent = 'unsubscribed' WHERE id = $1").bind(phone_profile).execute(&h.state.db).await.unwrap();
+    tick(&h).await;
+    h.drain().await;
+    assert!(mock.lock().unwrap().consent_updates.iter().any(|u| u["customerId"] == "gid://shopify/Customer/2" && u.get("smsMarketingConsent").is_some()));
+
+    // A changed number gets a profile and its own consent (not left unlinked).
+    mock.lock().unwrap().customers.insert(2, customer_at(2, Some("bob@example.com"), "NOT_SUBSCRIBED", Some("+15035550199"), "SUBSCRIBED", "2025-03-01T00:00:00Z", "2025-03-01T00:00:00Z"));
+    hook(&h, "customers/update", "c3", &json!({"id": 2})).await;
+    h.drain().await;
+    assert_eq!(sms_consent(&h, "+15035550199").await, "subscribed");
+    assert_eq!(sms_consent(&h, "+15035550102").await, "unsubscribed", "the old number keeps its own");
+
+    // Consent applies only when newer: a late report from before the last applied one changes nothing.
+    mock.lock().unwrap().customers.insert(3, customer_at(3, Some("cat@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-05-01T00:00:00Z", "2025-05-01T00:00:00Z"));
+    hook(&h, "customers/update", "c4", &json!({"id": 3})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "cat@example.com").await.0, "subscribed");
+    let late = customer_at(3, Some("cat@example.com"), "UNSUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-06-01T00:00:00Z", "2025-04-01T00:00:00Z");
+    mock.lock().unwrap().customers.insert(3, late);
+    hook(&h, "customers/update", "c5", &json!({"id": 3})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "cat@example.com").await.0, "subscribed", "an older consent time doesn't apply");
+    // A bulk snapshot older than what's saved changes neither consent nor the link.
+    let snapshot = customer_at(3, Some("cat.old@example.com"), "UNSUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-01-15T00:00:00Z", "2025-07-01T00:00:00Z");
+    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[snapshot]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    assert_eq!(consent(&h, "cat@example.com").await.0, "subscribed");
+    assert!(profile_id_of(&h, "cat.old@example.com").await.is_none(), "an older snapshot makes no profile");
+    let email: String = sqlx::query_scalar("SELECT email FROM shopify_customers WHERE customer_id = 3").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(email, "cat@example.com");
+
+    // INVALID and REDACTED never leave an address subscribed.
+    mock.lock().unwrap().customers.insert(3, customer_at(3, Some("cat@example.com"), "INVALID", None, "NOT_SUBSCRIBED", "2025-08-01T00:00:00Z", "2025-08-01T00:00:00Z"));
+    hook(&h, "customers/update", "c6", &json!({"id": 3})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "cat@example.com").await.0, "unsubscribed");
+    mock.lock().unwrap().customers.insert(4, customer_at(4, Some("dee@example.com"), "SUBSCRIBED", Some("+15035550104"), "SUBSCRIBED", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"));
+    hook(&h, "customers/update", "c7", &json!({"id": 4})).await;
+    h.drain().await;
+    mock.lock().unwrap().customers.insert(4, customer_at(4, Some("dee@example.com"), "REDACTED", Some("+15035550104"), "REDACTED", "2025-09-01T00:00:00Z", "2025-09-01T00:00:00Z"));
+    hook(&h, "customers/update", "c8", &json!({"id": 4})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "dee@example.com").await.0, "unsubscribed");
+    assert_eq!(sms_consent(&h, "+15035550104").await, "unsubscribed");
+
+    // Shopify's consent for one address never lands on another address's profile: customer 5's
+    // link moves to the profile of an order's contact, and its subscribed address stays its own.
+    mock.lock().unwrap().customers.insert(5, customer(5, Some("eve@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "orders/create", "o1", &order_body(5005, 5, "eve.other@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    hook(&h, "customers/update", "c9", &json!({"id": 5})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "eve@example.com").await.0, "subscribed");
+    assert_eq!(consent(&h, "eve.other@example.com").await.0, "never_subscribed");
     h.cleanup().await;
 }
 
@@ -745,10 +1160,6 @@ async fn products_stay_current() {
     h.cleanup().await;
 }
 
-fn jsonl(lines: &[Value]) -> String {
-    lines.iter().map(|l| l.to_string() + "\n").collect()
-}
-
 #[tokio::test]
 async fn history_import() {
     let (mock, base) = mock_shopify().await;
@@ -773,7 +1184,7 @@ async fn history_import() {
             "id": format!("gid://shopify/Order/{id}"), "name": format!("#{}", id - 4000), "createdAt": ago(days), "processedAt": ago(days), "updatedAt": ago(days),
             "cancelledAt": if cancelled { json!(ago(days)) } else { Value::Null }, "cancelReason": null, "test": false, "email": email, "phone": null, "currencyCode": "USD",
             "displayFinancialStatus": "PAID", "displayFulfillmentStatus": "FULFILLED", "discountCodes": [],
-            "totalPriceSet": {"shopMoney": {"amount": "50.00"}}, "subtotalPriceSet": {"shopMoney": {"amount": "50.00"}}, "totalDiscountsSet": {"shopMoney": {"amount": "0.0"}},
+            "totalPriceSet": {"shopMoney": {"amount": "50.00", "currencyCode": "USD"}}, "subtotalPriceSet": {"shopMoney": {"amount": "50.00"}}, "totalDiscountsSet": {"shopMoney": {"amount": "0.0"}},
             "totalShippingPriceSet": {"shopMoney": {"amount": "0.0"}}, "totalTaxSet": {"shopMoney": {"amount": "0.0"}},
             "customer": {"id": format!("gid://shopify/Customer/{cust}"), "firstName": "A", "lastName": "B"},
             "refunds": refunds, "fulfillments": [{"id": format!("gid://shopify/Fulfillment/{id}"), "createdAt": ago(days), "status": "SUCCESS"}]
@@ -782,13 +1193,15 @@ async fn history_import() {
             "originalUnitPriceSet": {"shopMoney": {"amount": "50.00"}}, "totalDiscountSet": {"shopMoney": {"amount": "0.00"}}, "product": {"id": "gid://shopify/Product/101"},
             "variant": {"id": "gid://shopify/ProductVariant/1011"}, "image": {"url": "https://cdn.shopify.com/m.jpg"}, "__parentId": format!("gid://shopify/Order/{order}")});
         m.files.insert("orders".into(), jsonl(&[
-            order(5001, 1, "ann@example.com", 300, false, json!([{"id": "gid://shopify/Refund/9", "createdAt": ago(299), "totalRefundedSet": {"shopMoney": {"amount": "20.00"}}}])),
+            order(5001, 1, "ann@example.com", 300, false, json!([{"id": "gid://shopify/Refund/9"}])),
             line(5001, 1),
             order(5002, 2, "bob@example.com", 200, true, json!([])),
             line(5002, 2),
             order(5003, 1, "ann@example.com", 2, false, json!([])),
             line(5003, 3),
         ]));
+        // The refund's own amounts come from the Admin API.
+        m.orders.insert(5001, gql_order(5001, &ago(299), vec![refund(9, &ago(299), &[("SUCCESS", "20.00")], &[])]));
         // Serve at most 200 bytes per request, so records span many reads.
         m.max_chunk = 200;
     }
@@ -800,6 +1213,7 @@ async fn history_import() {
     sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
     dumbmail::flows::refresh_segment(&h.state, seg_id.parse().unwrap()).await.unwrap();
 
+    let ops_before = mock.lock().unwrap().bulk_ops.len();
     let v = h.ok("POST", "/api/shopify/import", Some(json!({}))).await;
     assert_eq!(v["dry_run"], true);
     let v = h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
@@ -814,14 +1228,14 @@ async fn history_import() {
             break;
         }
     }
+    h.fast_forward().await;
     let v = h.ok("GET", "/api/shopify/import", None).await;
     assert_eq!(v["import"]["status"], "done", "{v}");
     assert_eq!(v["import"]["counts"]["customers"], 2);
     assert_eq!(v["import"]["counts"]["orders"], 3);
-    assert_eq!(mock.lock().unwrap().bulk_ops, vec!["customers", "products", "orders"]);
+    assert_eq!(mock.lock().unwrap().bulk_ops[ops_before..], ["customers", "products", "orders"]);
     dumbmail::flows::refresh_segment(&h.state, seg_id.parse().unwrap()).await.unwrap();
-    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(runs, 0, "imported history starts no flows, metric or segment");
+    assert_eq!(flow_runs(&h).await, 0, "imported history starts no flows, metric or segment");
     let members: i32 = sqlx::query_scalar("SELECT member_count FROM segments").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(members, 2, "but people are in the segment");
     // A later refresh (after someone new enters for real) triggers again.
@@ -830,9 +1244,9 @@ async fn history_import() {
 
     assert_eq!(consent(&h, "ann@example.com").await.0, "subscribed");
     assert_eq!(consent(&h, "bob@example.com").await.0, "never_subscribed");
-    assert_eq!(event(&h, "Placed Order", "order:5001").await.unwrap().0, Some(30.0), "less the refund");
-    assert_eq!(event(&h, "Placed Order", "order:5002").await.unwrap().0, Some(0.0), "cancelled");
-    assert_eq!(event(&h, "Refunded Order", "refund:9").await.unwrap().0, Some(20.0));
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(30.0), "less the refund");
+    assert_eq!(value(&h, "Placed Order", "order:5002").await, Some(0.0), "cancelled");
+    assert_eq!(value(&h, "Refunded Order", "refund:9").await, Some(20.0));
     assert_eq!(count_events(&h, "Fulfilled Order").await, 3);
     // Imported events carry their own time and don't count as fresh activity.
     let last: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT last_event_at FROM profiles WHERE email = 'bob@example.com'").fetch_one(&h.state.db).await.unwrap();
@@ -843,16 +1257,29 @@ async fn history_import() {
     assert_eq!(p["inventory"], 4);
 
     // Running it again adds nothing twice.
-    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM events").fetch_one(&h.state.db).await.unwrap();
+    let before = count(&h, "SELECT count(*) FROM events").await;
     h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
-    for _ in 0..40 {
-        h.fast_forward().await;
-        if h.ok("GET", "/api/shopify/import", None).await["import"]["status"] != "running" {
-            break;
-        }
-    }
-    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM events").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(before, after);
+    settle_imports(&h).await;
+    assert_eq!(before, count(&h, "SELECT count(*) FROM events").await);
+    h.cleanup().await;
+}
+
+/// Item 13: connecting starts the history import.
+#[tokio::test]
+async fn connecting_starts_the_history_import() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")]));
+    connect(&mut h).await;
+    let v = h.ok("GET", "/api/shopify/import", None).await;
+    assert_eq!(v["import"]["status"], "done", "{v}");
+    assert_eq!(v["import"]["counts"]["customers"], 1);
+    assert_eq!(consent(&h, "ann@example.com").await.0, "subscribed");
+    // Setup running again (a retry) doesn't start a second one.
+    let (acct, generation): (Uuid, i32) = sqlx::query_as("SELECT account_id, generation FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::features::shopify::oauth::setup(&h.state, acct, Some(generation)).await.unwrap();
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_imports WHERE kind = 'history'").await, 1);
     h.cleanup().await;
 }
 
@@ -876,29 +1303,16 @@ async fn import_pauses_resumes_and_replays_safely() {
     h.fast_forward().await;
     assert_eq!(mock.lock().unwrap().queries, reads, "paused: nothing runs");
     h.ok("POST", "/api/shopify/import/resume", None).await;
-    for _ in 0..60 {
-        h.fast_forward().await;
-        if h.ok("GET", "/api/shopify/import", None).await["import"]["status"] != "running" {
-            break;
-        }
-    }
+    settle_imports(&h).await;
     assert_eq!(h.ok("GET", "/api/shopify/import", None).await["import"]["status"], "done");
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 30);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles").await, 30);
     // A crash that lost the saved position, so the customers are read again from the start: nothing doubles.
-    sqlx::query("UPDATE shopify_imports SET status = 'running', phase = 'customers', bulk_id = NULL, result_offset = 0, finished_at = NULL").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE shopify_imports SET status = 'running', phase = 'customers', bulk_id = NULL, result_offset = 0, finished_at = NULL WHERE kind = 'history' AND id = (SELECT id FROM shopify_imports ORDER BY started_at DESC LIMIT 1)").execute(&h.state.db).await.unwrap();
     sqlx::query("UPDATE shopify_shops SET work_queued_at = NULL").execute(&h.state.db).await.unwrap();
     dumbmail::features::shopify::shop::kick_now(&h.state.db, account_id(&h).await).await.unwrap();
-    for _ in 0..60 {
-        h.fast_forward().await;
-        if h.ok("GET", "/api/shopify/import", None).await["import"]["status"] != "running" {
-            break;
-        }
-    }
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 30);
-    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_customers").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(linked, 30);
+    settle_imports(&h).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles").await, 30);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers").await, 30);
     // Throttled by Shopify: the worker waits and carries on.
     mock.lock().unwrap().throttle_next = 1;
     let v = h.ok("POST", "/api/shopify/products/resync", None).await;
@@ -914,6 +1328,147 @@ async fn import_pauses_resumes_and_replays_safely() {
     assert_eq!(v["status"], "cancelled");
     let (s, _) = h.req("POST", "/api/shopify/import/cancel", None).await;
     assert_eq!(s, StatusCode::CONFLICT);
+    h.cleanup().await;
+}
+
+/// Item 4: bulk results ask Shopify to group children under their parents, and every child still
+/// joins the parent its `__parentId` names, never the record before it.
+#[tokio::test]
+async fn bulk_children_join_their_own_parent() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    assert!(mock.lock().unwrap().grouped.iter().all(|g| *g), "every bulk operation asks for groupObjects");
+    let variant = |p: i64, price: &str| json!({"id": format!("gid://shopify/ProductVariant/{p}1"), "title": "Default Title", "price": price, "inventoryQuantity": 1, "availableForSale": true,
+        "inventoryItem": {"id": format!("gid://shopify/InventoryItem/{p}9"), "tracked": true}, "__parentId": format!("gid://shopify/Product/{p}")});
+    let prod = |p: i64| json!({"id": format!("gid://shopify/Product/{p}"), "title": format!("P{p}"), "handle": format!("p{p}"), "status": "ACTIVE", "publishedAt": "2025-01-01T00:00:00Z", "tags": []});
+    // Interleaved: P1, P2, then P1's variant, P2's variant, and a child of a product not in the file.
+    let interleaved = jsonl(&[prod(1), prod(2), variant(1, "11.00"), variant(2, "22.00"), variant(9, "99.00")]);
+    for ignore_grouping in [false, true] {
+        {
+            let mut m = mock.lock().unwrap();
+            m.files.insert("products".into(), interleaved.clone());
+            m.ignore_grouping = ignore_grouping;
+        }
+        h.ok("POST", "/api/shopify/products/resync", None).await;
+        settle_imports(&h).await;
+        assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["price"], 11.0, "grouping ignored: {ignore_grouping}");
+        assert_eq!(h.ok("GET", "/api/catalog/products/2", None).await["price"], 22.0);
+        let v = h.ok("GET", "/api/shopify/import", None).await;
+        assert_eq!(v["products_sync"]["counts"]["skipped_children"], 1, "{v}");
+    }
+    let (s, _) = h.req("GET", "/api/catalog/products/9", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    h.cleanup().await;
+}
+
+/// Item 5: the history import (and the store's first catalog load) queues no back-in-stock or
+/// price-drop alerts; a later reconcile still does.
+#[tokio::test]
+async fn history_import_queues_no_alerts() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    // Every alert queued is remembered (the jobs themselves run and go).
+    sqlx::query("CREATE TABLE seen_jobs (kind text)").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE FUNCTION see_job() RETURNS trigger AS $$ BEGIN INSERT INTO seen_jobs VALUES (NEW.kind); RETURN NEW; END $$ LANGUAGE plpgsql").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER see_job AFTER INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION see_job()").execute(&h.state.db).await.unwrap();
+    // The product was already in the catalog (from a feed or the API), dearer and out of stock.
+    h.ok("POST", "/api/catalog/products", Some(json!({"products": [{"id": "101", "title": "Mug", "price": 20.0, "available": false, "inventory": 0}]}))).await;
+    let prod = |price: &str, qty: i64| jsonl(&[
+        json!({"id": "gid://shopify/Product/101", "updatedAt": chrono::Utc::now().to_rfc3339(), "title": "Mug", "handle": "mug", "status": "ACTIVE", "publishedAt": "2025-01-01T00:00:00Z", "tags": []}),
+        json!({"id": "gid://shopify/ProductVariant/1011", "title": "Default Title", "price": price, "inventoryQuantity": qty, "availableForSale": qty > 0, "inventoryItem": {"id": "gid://shopify/InventoryItem/1019", "tracked": true}, "__parentId": "gid://shopify/Product/101"}),
+    ]);
+    mock.lock().unwrap().files.insert("products".into(), prod("12.00", 5));
+    connect(&mut h).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/101", None).await["price"], 12.0);
+    let alerts = || count(&h, "SELECT count(*) FROM seen_jobs WHERE kind IN ('catalog_price_drop', 'catalog_back_in_stock')");
+    assert_eq!(alerts().await, 0, "the history import is quiet");
+    // A reconcile after the first load is how a missed webhook's price drop is caught: it alerts.
+    mock.lock().unwrap().files.insert("products".into(), prod("10.00", 5));
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM seen_jobs WHERE kind = 'catalog_price_drop'").await, 1);
+    h.cleanup().await;
+}
+
+/// Item 6: refunds count only money that moved, a fuller later read corrects an earlier one, older
+/// reads and older order snapshots change nothing, and amounts are the shop's, unrounded.
+#[tokio::test]
+async fn refunds_are_right_and_can_be_corrected() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let t = |mins: i64| (chrono::Utc::now() + chrono::Duration::minutes(mins)).to_rfc3339();
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now() - chrono::Duration::minutes(30))).await;
+    h.drain().await;
+    let refund_hook = |id: i64| json!({"id": id, "order_id": 5001, "created_at": t(0), "transactions": [], "refund_line_items": []});
+
+    // A pending refund subtracts nothing.
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &t(-20), vec![refund(900, &t(-20), &[("PENDING", "30.00")], &[(12, "30.00")])]));
+    hook(&h, "refunds/create", "r1", &refund_hook(900)).await;
+    h.drain().await;
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(100.0));
+    assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(30.0));
+    assert!(event(&h, "Refunded Order", "refund:900").await.is_none());
+    // It succeeds, partly: 10 now…
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &t(-15), vec![refund(900, &t(-20), &[("SUCCESS", "10.00"), ("FAILURE", "20.00")], &[(12, "10.00")])]));
+    hook(&h, "refunds/create", "r2", &refund_hook(900)).await;
+    h.drain().await;
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(90.0));
+    assert_eq!(value(&h, "Refunded Order", "refund:900").await, Some(10.0));
+    // …and a fuller later read corrects it (the same refund id, now 30).
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &t(-10), vec![refund(900, &t(-20), &[("SUCCESS", "10.00"), ("SUCCESS", "20.00")], &[(12, "30.00")])]));
+    hook(&h, "orders/updated", "o2", &{
+        let mut o = order_body(5001, 1, "ann@example.com", chrono::Utc::now() - chrono::Duration::minutes(30));
+        o["updated_at"] = json!(t(-10));
+        o["refunds"] = json!([refund_hook(900)]);
+        o
+    })
+    .await;
+    h.drain().await;
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(70.0));
+    assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(0.0));
+    assert_eq!(value(&h, "Refunded Order", "refund:900").await, Some(30.0));
+    // An older read (Shopify's updatedAt before the one applied) changes nothing.
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &t(-12), vec![refund(900, &t(-20), &[("SUCCESS", "5.00")], &[])]));
+    hook(&h, "refunds/create", "r3", &refund_hook(900)).await;
+    h.drain().await;
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(70.0));
+    // An older order snapshot (orders/paid delayed) doesn't overwrite the newer one.
+    let mut stale = order_body(5001, 1, "ann@example.com", chrono::Utc::now() - chrono::Duration::minutes(30));
+    stale["updated_at"] = json!(t(-25));
+    stale["total_price_set"] = json!({"shop_money": {"amount": "50.00", "currency_code": "USD"}});
+    hook(&h, "orders/paid", "o3", &stale).await;
+    h.drain().await;
+    let (v, props, _, _) = event(&h, "Placed Order", "order:5001").await.unwrap();
+    assert_eq!((v, props["total"].as_f64()), (Some(70.0), Some(100.0)));
+
+    // Order and lines move together: a crash after the order's value was written but before its
+    // lines' (simulated) is put right by the next delivery.
+    sqlx::query("UPDATE events SET value = 30 WHERE unique_id = 'order:5001:12'").execute(&h.state.db).await.unwrap();
+    mock.lock().unwrap().orders.insert(5001, gql_order(5001, &t(-5), vec![refund(900, &t(-20), &[("SUCCESS", "30.00")], &[(12, "30.00")])]));
+    hook(&h, "refunds/create", "r4", &refund_hook(900)).await;
+    h.drain().await;
+    assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(0.0));
+
+    // Shop money, exactly: the buyer paid in another currency; the shop's amounts (3 decimals) are used.
+    let mut kwd = order_body(5002, 2, "bob@example.com", chrono::Utc::now());
+    let both = |shop: &str, buyer: &str| json!({"shop_money": {"amount": shop, "currency_code": "KWD"}, "presentment_money": {"amount": buyer, "currency_code": "USD"}});
+    kwd["currency"] = json!("KWD");
+    kwd["presentment_currency"] = json!("USD");
+    kwd["total_price_set"] = both("19.995", "65.00");
+    kwd["total_price"] = json!("19.995");
+    kwd["line_items"] = json!([{"id": 21, "product_id": 101, "title": "Mug", "quantity": 1, "price": "65.00", "price_set": both("19.995", "65.00"), "total_discount_set": both("0.000", "0.00")}]);
+    hook(&h, "orders/create", "o4", &kwd).await;
+    h.drain().await;
+    let (v, props, _, _) = event(&h, "Placed Order", "order:5002").await.unwrap();
+    assert_eq!(v, Some(19.995));
+    assert_eq!(props["currency"], "KWD");
+    assert_eq!(props["items"][0]["price"], 19.995);
+    assert_eq!(value(&h, "Ordered Product", "order:5002:21").await, Some(19.995));
     h.cleanup().await;
 }
 
@@ -940,14 +1495,15 @@ async fn discount_codes() {
     connect(&mut h).await;
     let code = create_discount_code(&h.state, acct, &t, pid, "m1").await.unwrap();
     assert!(code.starts_with("HELLO"));
+    // The template's stacking rules, as configured: no stacking at all.
+    assert_eq!(mock.lock().unwrap().discount_inputs[0]["combinesWith"], json!({"orderDiscounts": false, "productDiscounts": false, "shippingDiscounts": false}));
     // The same grant again: the same code, no second call.
     assert_eq!(create_discount_code(&h.state, acct, &t, pid, "m1").await.unwrap(), code);
     assert_eq!(mock.lock().unwrap().discount_calls, 1);
     // Shopify made the code but we crashed before saving it: the retry finds it and keeps it.
     sqlx::query("DELETE FROM shopify_discount_codes").execute(&h.state.db).await.unwrap();
     assert_eq!(create_discount_code(&h.state, acct, &t, pid, "m1").await.unwrap(), code);
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_discount_codes").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_discount_codes").await, 1);
     // Another account's person can't get one.
     let stranger = Uuid::now_v7();
     assert!(create_discount_code(&h.state, acct, &t, stranger, "m2").await.is_err());
@@ -973,6 +1529,49 @@ async fn discount_codes() {
     h.cleanup().await;
 }
 
+/// Item 7: a saved code belongs to one store, template, person and grant.
+#[tokio::test]
+async fn discount_codes_belong_to_one_shop_and_grant() {
+    use dumbmail::features::shopify::{create_discount_code, DiscountTemplate, DiscountValue};
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let t = DiscountTemplate { key: "coupon-1".into(), title: "$5 off".into(), value: DiscountValue::FixedAmount(5.0), minimum_subtotal: None, expires_after_days: None, ends_at: None, collection_ids: vec![], prefix: "".into(), combines_with_other_discounts: true };
+    let ann: Uuid = sqlx::query_scalar("INSERT INTO profiles (id, account_id, email) VALUES ($1, $2, 'ann@example.com') RETURNING id").bind(Uuid::now_v7()).bind(acct).fetch_one(&h.state.db).await.unwrap();
+    let bob: Uuid = sqlx::query_scalar("INSERT INTO profiles (id, account_id, email) VALUES ($1, $2, 'bob@example.com') RETURNING id").bind(Uuid::now_v7()).bind(acct).fetch_one(&h.state.db).await.unwrap();
+    connect(&mut h).await;
+    let a = create_discount_code(&h.state, acct, &t, ann, "welcome").await.unwrap();
+    // Another person with the same grant key gets their own code.
+    let b = create_discount_code(&h.state, acct, &t, bob, "welcome").await.unwrap();
+    assert_ne!(a, b);
+    assert_eq!(mock.lock().unwrap().discount_inputs[0]["combinesWith"], json!({"orderDiscounts": true, "productDiscounts": true, "shippingDiscounts": true}));
+
+    // Crash recovery accepts a code only if Shopify's discount under it has this template's terms.
+    let other = DiscountTemplate { title: "Something else".into(), ..t.clone() };
+    sqlx::query("DELETE FROM shopify_discount_codes").execute(&h.state.db).await.unwrap();
+    {
+        // Shopify has the code, but made from different terms.
+        let mut m = mock.lock().unwrap();
+        let d = m.discounts.get_mut(&a).unwrap();
+        d["title"] = json!("Something else");
+    }
+    assert!(create_discount_code(&h.state, acct, &t, ann, "welcome").await.is_err(), "not this template's discount");
+    let _ = other;
+
+    // Reconnecting a different store never hands out the first store's code.
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect_shop(&mut h, "second-store.myshopify.com").await;
+    let b2 = create_discount_code(&h.state, acct, &t, bob, "welcome").await.unwrap();
+    assert_ne!(b2, b, "a new code for the new store");
+    let shop: String = sqlx::query_scalar("SELECT shop_domain FROM shopify_discount_codes WHERE code = $1").bind(&b2).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(shop, "second-store.myshopify.com");
+    // A code row made for another grant is never returned for this one.
+    sqlx::query("UPDATE shopify_discount_codes SET grant_key = 'someone-else' WHERE code = $1").bind(&b2).execute(&h.state.db).await.unwrap();
+    assert!(create_discount_code(&h.state, acct, &t, bob, "welcome").await.is_err());
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn privacy_webhooks() {
     let (_mock, base) = mock_shopify().await;
@@ -984,17 +1583,23 @@ async fn privacy_webhooks() {
     h.drain().await;
 
     // Data request: an export the owner can download, and only for this customer.
-    hook(&h, "customers/data_request", "p1", &json!({"shop_id": 1, "shop_domain": SHOP, "orders_requested": [5001], "customer": {"id": 1, "email": "ann@example.com", "phone": null}, "data_request": {"id": 77}})).await;
-    hook(&h, "customers/data_request", "p1", &json!({"shop_id": 1})).await; // redelivery
+    let req = json!({"shop_id": 1, "shop_domain": SHOP, "orders_requested": [5001], "customer": {"id": 1, "email": "ann@example.com", "phone": null}, "data_request": {"id": 77}});
+    hook(&h, "customers/data_request", "p1", &req).await;
+    hook(&h, "customers/data_request", "p1", &req).await; // redelivery
     h.drain().await;
     let v = h.ok("GET", "/api/shopify", None).await;
     let reqs = v["data_requests"].as_array().unwrap();
     assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0]["shopify_customer_id"], "1");
+    assert!(!v.to_string().contains("ann@example.com"), "status names no customer emails: {v}");
     let id = reqs[0]["id"].as_str().unwrap();
     let export = h.ok("GET", &format!("/api/shopify/data-requests/{id}"), None).await;
     assert_eq!(export["profiles"][0]["email"], "ann@example.com");
     assert!(export["events"].as_array().unwrap().len() >= 3);
     assert!(!export.to_string().contains("bob@example.com"));
+    // The notice went to the account's Owner.
+    let sent = h.state.email.sent();
+    assert!(sent.iter().any(|e| e.to == "owner@acme.test" && e.subject.contains("asked your Shopify store")), "{:?}", sent.iter().map(|e| &e.to).collect::<Vec<_>>());
     // Another account can't read it.
     let mine = h.cookie.clone();
     h.cookie = None;
@@ -1006,18 +1611,15 @@ async fn privacy_webhooks() {
     // Redact: the customer's profile and events are gone; others stay.
     hook(&h, "customers/redact", "p2", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1, "email": "ann@example.com", "phone": null}, "orders_to_redact": [5001]})).await;
     h.drain().await;
-    let ann: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE email = 'ann@example.com'").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(ann, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'ann@example.com'").await, 0);
     assert!(event(&h, "Placed Order", "order:5001").await.is_none());
     assert!(event(&h, "Placed Order", "order:5002").await.is_some());
-    let exports: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_data_requests").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(exports, 0, "the export made for them goes too");
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests").await, 0, "the export made for them goes too");
 
     // Shop redact while still connected: ignored.
     hook(&h, "shop/redact", "p3", &json!({"shop_id": 1, "shop_domain": SHOP})).await;
     h.drain().await;
-    let shops: i64 = sqlx::query_scalar("SELECT count(*) FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(shops, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_shops").await, 1);
     // Uninstalled from Shopify's side: the token goes at once.
     hook(&h, "app/uninstalled", "u1", &json!({"id": 1, "domain": SHOP})).await;
     let (status, tok): (String, Option<String>) = sqlx::query_as("SELECT status, access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
@@ -1026,15 +1628,295 @@ async fn privacy_webhooks() {
     hook(&h, "orders/create", "o3", &order_body(5003, 2, "bob@example.com", chrono::Utc::now())).await;
     h.drain().await;
     assert!(event(&h, "Placed Order", "order:5003").await.is_none());
-    // 48 hours later, shop redact: the connection's data goes; the account's profiles stay.
+    // 48 hours later, shop redact: everything from the store goes, including profiles it made that
+    // have nothing else on them.
     hook(&h, "shop/redact", "p4", &json!({"shop_id": 1, "shop_domain": SHOP})).await;
     h.drain().await;
-    for table in ["shopify_shops", "shopify_customers", "shopify_webhooks"] {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(&h.state.db).await.unwrap();
-        assert_eq!(n, 0, "{table}");
+    for table in ["shopify_shops", "shopify_customers", "shopify_customer_profiles"] {
+        assert_eq!(count(&h, &format!("SELECT count(*) FROM {table}")).await, 0, "{table}");
     }
-    let bob: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE email = 'bob@example.com'").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(bob, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks WHERE payload IS NOT NULL").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'bob@example.com'").await, 0);
+    assert!(event(&h, "Placed Order", "order:5002").await.is_none());
+    h.cleanup().await;
+}
+
+/// Item 3: privacy requests act on Shopify's ids and the store's provenance, never on a reused
+/// email; erasures stick; the store is found after its connection is gone.
+#[tokio::test]
+async fn privacy_requests_use_shopify_ids() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    let acct = account_id(&h).await;
+    connect(&mut h).await;
+    // Someone who merely shares an address with a Shopify customer: their own profile, their own data.
+    let shared: Uuid = sqlx::query_scalar("INSERT INTO profiles (id, account_id, email, properties) VALUES ($1, $2, 'shared@example.com', '{\"note\": \"mine\"}') RETURNING id").bind(Uuid::now_v7()).bind(acct).fetch_one(&h.state.db).await.unwrap();
+    // Ann: a Shopify customer, also on a list of the account's own.
+    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
+    // A guest order (no customer) by someone else.
+    let mut guest = order_body(5005, 0, "guest@example.com", chrono::Utc::now());
+    guest["customer"] = Value::Null;
+    hook(&h, "orders/create", "o2", &guest).await;
+    h.drain().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
+    let ann = profile_id_of(&h, "ann@example.com").await.unwrap();
+    sqlx::query("INSERT INTO list_members (list_id, profile_id) VALUES ($1, $2)").bind(list["id"].as_str().unwrap().parse::<Uuid>().unwrap()).bind(ann).execute(&h.state.db).await.unwrap();
+
+    // The signed body must name the store in the header.
+    let other = json!({"shop_id": 1, "shop_domain": "other.myshopify.com", "customer": {"id": 1}, "orders_to_redact": []});
+    assert_eq!(hook(&h, "customers/redact", "x1", &other).await, StatusCode::BAD_REQUEST);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks WHERE webhook_id = 'x1'").await, 0);
+
+    // A request for a Shopify customer we never linked, with the shared address: nothing of theirs.
+    hook(&h, "customers/data_request", "d1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 99, "email": "shared@example.com"}, "orders_requested": [], "data_request": {"id": 1}})).await;
+    h.drain().await;
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM shopify_data_requests").fetch_one(&h.state.db).await.unwrap();
+    let export = h.ok("GET", &format!("/api/shopify/data-requests/{id}"), None).await;
+    assert_eq!(export["profiles"], json!([]), "a shared email isn't a match");
+    hook(&h, "customers/redact", "r1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 99, "email": "shared@example.com"}, "orders_to_redact": []})).await;
+    h.drain().await;
+    let still: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE id = $1").bind(shared).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(still["note"], "mine");
+
+    // Redact Ann, and the guest order by id: Shopify data goes; Ann's profile stays (it's on a list
+    // of the account's own) without the Shopify properties; the guest's profile, made only for
+    // that order, goes.
+    hook(&h, "customers/redact", "r2", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1, "email": "ann@example.com"}, "orders_to_redact": [5001, 5005]})).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5001").await.is_none());
+    assert!(event(&h, "Placed Order", "order:5005").await.is_none());
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers WHERE customer_id = 1").await, 0);
+    let props: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE id = $1").bind(ann).fetch_one(&h.state.db).await.unwrap();
+    assert!(props.get("shopify_customer_id").is_none() && props.get("city").is_none(), "{props}");
+    assert!(profile_id_of(&h, "guest@example.com").await.is_none());
+
+    // Erased stays erased: a late webhook and an import skip them.
+    hook(&h, "orders/updated", "o3", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5001").await.is_none());
+    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers WHERE customer_id = 1").await, 0);
+
+    // A product from the store, then the store is uninstalled and its connection row is gone.
+    mock.lock().unwrap().products.insert(101, product(101, "Mug", 1, "12.00"));
+    hook(&h, "products/update", "pu", &json!({"id": 101})).await;
+    hook(&h, "orders/create", "o4", &order_body(5006, 2, "bob@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    hook(&h, "app/uninstalled", "u1", &json!({})).await;
+    sqlx::query("DELETE FROM shopify_shops").execute(&h.state.db).await.unwrap();
+    // A body left unprocessed for 30 days is deleted and counted.
+    hook(&h, "shop/redact", "s1", &json!({"shop_id": 1, "shop_domain": SHOP})).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5006").await.is_none(), "found the account through its past installs");
+    let (s, _) = h.req("GET", "/api/catalog/products/101", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the store's products leave the catalog");
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE id = $1".replace("$1", &format!("'{shared}'")).as_str()).await, 1, "the shared-address profile is untouched");
+    h.cleanup().await;
+}
+
+/// Item 3 (retention) and item 9 (privacy first, failures retried without blocking the rest).
+#[tokio::test]
+async fn privacy_requests_are_retried_without_blocking_others() {
+    let (_mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    // One request that keeps failing (a database error on its export), and one behind it.
+    sqlx::query(
+        "CREATE FUNCTION fail_request() RETURNS trigger AS $$ BEGIN IF NEW.shopify_request_id = 666 THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER fail_request BEFORE INSERT ON shopify_data_requests FOR EACH ROW EXECUTE FUNCTION fail_request()").execute(&h.state.db).await.unwrap();
+    hook(&h, "customers/data_request", "d1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 5}, "orders_requested": [], "data_request": {"id": 666}})).await;
+    hook(&h, "customers/data_request", "d2", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 6}, "orders_requested": [], "data_request": {"id": 667}})).await;
+    h.drain().await;
+    let (attempts, next): (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as("SELECT attempts, next_at FROM shopify_webhooks WHERE webhook_id = 'd1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(attempts, 1);
+    assert!(next.is_some_and(|n| n > chrono::Utc::now()), "retried later");
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests WHERE shopify_request_id = 667").await, 1, "the one behind it went ahead");
+    // Failing for over 7 days: shown as a problem.
+    sqlx::query("UPDATE shopify_webhooks SET received_at = now() - interval '8 days' WHERE webhook_id = 'd1'").execute(&h.state.db).await.unwrap();
+    let v = h.ok("GET", "/api/shopify", None).await;
+    assert!(v["problems"].to_string().contains("failing for over 7 days"), "{v}");
+    // The worker does privacy requests first, even with no privacy job queued.
+    sqlx::query("DROP TRIGGER fail_request ON shopify_data_requests").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE shopify_webhooks SET next_at = NULL WHERE webhook_id = 'd1'").execute(&h.state.db).await.unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'shopify_privacy'").execute(&h.state.db).await.unwrap();
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
+    sqlx::query("DELETE FROM jobs WHERE kind = 'shopify_privacy'").execute(&h.state.db).await.unwrap();
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests WHERE shopify_request_id = 666").await, 1);
+
+    // Retention: a body never processed is deleted after 30 days and counted.
+    sqlx::query("INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, received_at, generation, shop_domain) SELECT account_id, 'old', 'orders/create', '{\"id\": 1}', now() - interval '31 days', -1, $1 FROM shopify_shops")
+        .bind(SHOP)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    tick(&h).await;
+    let kept: Option<Value> = sqlx::query_scalar("SELECT payload FROM shopify_webhooks WHERE webhook_id = 'old'").fetch_one(&h.state.db).await.unwrap();
+    assert!(kept.is_none());
+    let v = h.ok("GET", "/api/shopify", None).await;
+    assert_eq!(v["connection"]["dropped_payloads"], 1);
+    // The export tool is not described as read-only.
+    let tool = dumbmail::features::shopify::api::tools().into_iter().find(|t| t["name"] == "get_shopify_data_request").unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], false);
+    h.cleanup().await;
+}
+
+/// Item 8: work belongs to one install.
+#[tokio::test]
+async fn work_belongs_to_one_install() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    let (gen1, connected_at): (i32, chrono::DateTime<chrono::Utc>) = sqlx::query_as("SELECT generation, connected_at FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    // The setup job was queued with the connection, for this install.
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_installs").await, 1);
+
+    // A worker run for this install holds the lease; then the app is reinstalled.
+    let lease = dumbmail::features::shopify::shop::acquire(&h.state, acct).await.unwrap().unwrap();
+    assert!(dumbmail::features::shopify::shop::still_mine(&h.state.db, &lease).await.unwrap());
+    sqlx::query("UPDATE shopify_shops SET lease_until = NULL, lease_token = NULL").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE shopify_lanes SET account_id = NULL, lease_until = NULL").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect(&mut h).await;
+    let gen2: i32 = sqlx::query_scalar("SELECT generation FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(gen2, gen1 + 1);
+    // The old run can't write any more.
+    assert!(!dumbmail::features::shopify::shop::still_mine(&h.state.db, &lease).await.unwrap());
+    assert!(!dumbmail::features::shopify::shop::renew(&h.state, &lease).await.unwrap());
+    // A delivery stored for the first install (it was in flight) is never processed for this one.
+    sqlx::query("INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, generation, shop_domain) VALUES ($1, 'old-gen', 'orders/create', $2, $3, $4)")
+        .bind(acct)
+        .bind(order_body(7001, 1, "old@example.com", chrono::Utc::now()))
+        .bind(gen1)
+        .bind(SHOP)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    hook(&h, "orders/create", "new-gen", &order_body(7002, 1, "new@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:7001").await.is_none());
+    assert!(event(&h, "Placed Order", "order:7002").await.is_some());
+
+    // A delayed app/uninstalled from the first install (triggered before this install began) doesn't
+    // disconnect the fresh one…
+    let before = (connected_at + chrono::Duration::milliseconds(10)).to_rfc3339();
+    hook_with(&h, "app/uninstalled", "u-old", &json!({}), &[("x-shopify-triggered-at", &before)]).await;
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], true);
+    // …a real one does, once, however often it's delivered.
+    let now = chrono::Utc::now().to_rfc3339();
+    hook_with(&h, "app/uninstalled", "u-new", &json!({}), &[("x-shopify-triggered-at", &now)]).await;
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], false);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks WHERE webhook_id = 'u-new'").await, 1);
+    connect(&mut h).await;
+    hook_with(&h, "app/uninstalled", "u-new", &json!({}), &[("x-shopify-triggered-at", &chrono::Utc::now().to_rfc3339())]).await;
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], true, "a redelivered uninstall does nothing");
+
+    // A refused webhook subscription: connected, but shown as not receiving it, and setup retries.
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    mock.lock().unwrap().refuse_topics.insert("REFUNDS_CREATE".into());
+    connect(&mut h).await;
+    let v = h.ok("GET", "/api/shopify", None).await;
+    assert_eq!(v["health"]["state"], "incomplete", "{v}");
+    assert!(v["health"]["message"].as_str().unwrap().contains("refunds/create"));
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_imports WHERE generation = (SELECT generation FROM shopify_shops) AND kind = 'history'").await, 0, "no import until setup is complete");
+    mock.lock().unwrap().refuse_topics.clear();
+    sqlx::query("UPDATE shopify_shops SET setup_after = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
+    tick(&h).await;
+    h.fast_forward().await;
+    settle_imports(&h).await;
+    let v = h.ok("GET", "/api/shopify", None).await;
+    assert_ne!(v["health"]["state"], "incomplete", "{v}");
+    assert_eq!(v["connection"]["missing_topics"], json!([]));
+    assert!(mock.lock().unwrap().webhooks_created.iter().filter(|t| *t == "REFUNDS_CREATE").count() >= 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_imports WHERE generation = (SELECT generation FROM shopify_shops) AND kind = 'history'").await, 1);
+    h.cleanup().await;
+}
+
+/// Item 10: disconnect clears the embed's settings and reports what Shopify didn't confirm.
+#[tokio::test]
+async fn disconnect_reports_unfinished_cleanup() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    mock.lock().unwrap().pixel_delete_fails = true;
+    let v = h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    assert_eq!(v["cleaned_up"], false);
+    assert_eq!(v["not_removed"], json!(["the checkout pixel"]));
+    assert_eq!(mock.lock().unwrap().metafield_deletes, 1);
+    let s = h.ok("GET", "/api/shopify", None).await;
+    assert!(s["connection"]["cleanup_error"].as_str().unwrap().contains("the checkout pixel"));
+    h.cleanup().await;
+}
+
+/// Item 12: a result file must answer the byte range asked for; one that ignores ranges is read
+/// once by skipping; a full product scan unpublishes products the store no longer has, and an
+/// older snapshot never brings back one a webhook updated or deleted since.
+#[tokio::test]
+async fn bulk_downloads_and_product_scans() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let old = "2025-01-01T00:00:00Z";
+    let prod = |p: i64, at: &str, price: &str| vec![
+        json!({"id": format!("gid://shopify/Product/{p}"), "updatedAt": at, "title": format!("P{p}"), "handle": format!("p{p}"), "status": "ACTIVE", "publishedAt": old, "tags": []}),
+        json!({"id": format!("gid://shopify/ProductVariant/{p}1"), "title": "Default Title", "price": price, "inventoryQuantity": 1, "availableForSale": true, "inventoryItem": {"id": format!("gid://shopify/InventoryItem/{p}9"), "tracked": true}, "__parentId": format!("gid://shopify/Product/{p}")}),
+    ];
+    // A first scan with three products.
+    mock.lock().unwrap().files.insert("products".into(), jsonl(&[prod(1, old, "1.00"), prod(2, old, "2.00"), prod(3, old, "3.00")].concat()));
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/3", None).await["published"], true);
+    // Since then: product 1 was updated (webhook read, newer), product 2 deleted, product 3 removed.
+    let mut p1 = product(1, "P1", 1, "9.00");
+    p1["updatedAt"] = json!("2026-06-01T00:00:00Z");
+    mock.lock().unwrap().products.insert(1, p1);
+    hook(&h, "products/update", "pu1", &json!({"id": 1})).await;
+    hook(&h, "products/delete", "pd2", &json!({"id": 2})).await;
+    h.drain().await;
+    // A scan whose snapshot is older than those changes, without product 3.
+    mock.lock().unwrap().files.insert("products".into(), jsonl(&[prod(1, old, "1.00"), prod(2, old, "2.00")].concat()));
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["price"], 9.0, "the older snapshot didn't overwrite the webhook's");
+    assert_eq!(h.ok("GET", "/api/catalog/products/2", None).await["published"], false, "deleted stays deleted");
+    assert_eq!(h.ok("GET", "/api/catalog/products/3", None).await["published"], false, "gone from the store: unpublished");
+
+    // A server that ignores Range: read once, by skipping.
+    {
+        let mut m = mock.lock().unwrap();
+        m.files.insert("products".into(), jsonl(&[prod(4, "2026-07-01T00:00:00Z", "4.00"), prod(5, "2026-07-01T00:00:00Z", "5.00")].concat()));
+        m.ignore_range = true;
+    }
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(h.ok("GET", "/api/shopify/import", None).await["products_sync"]["status"], "done");
+    assert_eq!(h.ok("GET", "/api/catalog/products/5", None).await["price"], 5.0);
+    // A partial answer that doesn't start where asked: the import fails with a plain error.
+    {
+        let mut m = mock.lock().unwrap();
+        m.ignore_range = false;
+        m.wrong_range = true;
+        m.max_chunk = 150;
+    }
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    let v = h.ok("GET", "/api/shopify/import", None).await;
+    assert_eq!(v["products_sync"]["status"], "failed", "{v}");
+    assert!(v["products_sync"]["error"].as_str().unwrap().contains("wrong byte range"));
     h.cleanup().await;
 }
 
@@ -1053,10 +1935,7 @@ async fn expiring_tokens_refresh_once() {
     assert_eq!(mock.lock().unwrap().refreshes, 1);
     assert_eq!(consent(&h, "ann@example.com").await.0, "subscribed");
     // Shopify revoked it (401): one refresh and retry, then it works again.
-    {
-        let mut m = mock.lock().unwrap();
-        m.token = "shpat_rotated_elsewhere".into();
-    }
+    mock.lock().unwrap().token = "shpat_rotated_elsewhere".into();
     hook(&h, "customers/update", "c2", &json!({"id": 1})).await;
     h.drain().await;
     assert_eq!(mock.lock().unwrap().refreshes, 2);
@@ -1069,25 +1948,120 @@ async fn one_worker_per_account_and_bounded_lanes() {
     let mut h = shopify_harness!(base);
     h.signup().await;
     connect(&mut h).await;
-    let acct = account_id(&h).await;
     mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    let reads = mock.lock().unwrap().node_reads.len();
     // Every lane busy (other stores working): the job steps aside and comes back.
     sqlx::query("UPDATE shopify_lanes SET account_id = gen_random_uuid(), lease_until = now() + interval '1 minute'").execute(&h.state.db).await.unwrap();
     hook(&h, "customers/create", "c1", &json!({"id": 1})).await;
     h.drain().await;
-    assert!(mock.lock().unwrap().node_reads.is_empty());
-    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'shopify_work'").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(waiting, 1, "queued again for a few seconds later");
+    assert_eq!(mock.lock().unwrap().node_reads.len(), reads);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'shopify_work'").await, 1, "queued again for a few seconds later");
     // The account's own lease held by another worker: this one exits without doing anything.
     sqlx::query("UPDATE shopify_lanes SET account_id = NULL, lease_until = NULL").execute(&h.state.db).await.unwrap();
     sqlx::query("UPDATE shopify_shops SET lease_until = now() + interval '1 minute', lease_token = gen_random_uuid()").execute(&h.state.db).await.unwrap();
     h.fast_forward().await;
-    assert!(mock.lock().unwrap().node_reads.is_empty());
+    assert_eq!(mock.lock().unwrap().node_reads.len(), reads);
     // The other worker died: once its lease runs out, the scheduler's safety net picks the work up.
     sqlx::query("UPDATE shopify_shops SET lease_until = now() - interval '1 second', work_queued_at = now() - interval '5 minutes'").execute(&h.state.db).await.unwrap();
     tick(&h).await;
     h.drain().await;
-    assert_eq!(mock.lock().unwrap().node_reads.len(), 1);
-    let _ = acct;
+    assert_eq!(mock.lock().unwrap().node_reads.len(), reads + 1);
     h.cleanup().await;
+}
+
+// ---------- The storefront extensions (run with Node, as Shopify would run them in a browser) ----------
+
+fn node_available() -> bool {
+    std::process::Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+fn run_node(script: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("dm-shopify-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.mjs");
+    std::fs::write(&file, script).unwrap();
+    let out = std::process::Command::new("node").arg(&file).output().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Item 14: the pixel sends nothing it can't match to Shopify's own copy (no order id or token).
+#[test]
+fn pixel_skips_events_it_cannot_dedupe() {
+    if !node_available() {
+        eprintln!("node not installed; skipping");
+        return;
+    }
+    let src = include_str!("../connectors/shopify/extensions/dumbmail-pixel/src/index.js").replace("import { register } from \"@shopify/web-pixels-extension\";", "");
+    let script = format!(
+        r#"
+const posts = [];
+globalThis.fetch = (url, opts) => {{ posts.push(JSON.parse(opts.body)); return Promise.resolve({{}}); }};
+const store = () => {{ const m = new Map(); return {{ getItem: async (k) => m.has(k) ? m.get(k) : null, setItem: async (k, v) => m.set(k, v), removeItem: async (k) => m.delete(k) }}; }};
+const subs = {{}};
+function register(fn) {{ fn({{ analytics: {{ subscribe: (n, cb) => subs[n] = cb }}, browser: {{ localStorage: store(), sessionStorage: store() }}, settings: {{ base: "https://dm.test", key: "pk" }} }}); }}
+{src}
+const checkout = (extra) => ({{ data: {{ checkout: Object.assign({{ email: "ann@example.com", lineItems: [], totalPrice: {{ amount: 10, currencyCode: "USD" }} }}, extra) }}, context: {{ document: {{ location: {{ href: "https://shop.test/c", origin: "https://shop.test" }} }} }} }});
+await subs.checkout_completed(checkout({{ order: {{}} }}));
+await subs.checkout_started(checkout({{}}));
+await new Promise((r) => setTimeout(r, 10));
+const before = posts.length;
+await subs.checkout_completed(checkout({{ order: {{ id: "gid://shopify/Order/5" }} }}));
+await new Promise((r) => setTimeout(r, 10));
+console.log(JSON.stringify({{ before, after: posts.map((p) => p.unique_id) }}));
+"#
+    );
+    let out: Value = serde_json::from_str(&run_node(&script)).unwrap();
+    assert_eq!(out["before"], 0, "no order id, no checkout token: nothing sent");
+    assert_eq!(out["after"], json!(["order:5"]));
+}
+
+/// Item 10: the theme embed loads the snippet only once Shopify's Customer Privacy API allows
+/// analytics, with email capture off unless marketing is allowed too, and loads it when consent
+/// arrives later.
+#[test]
+fn theme_embed_waits_for_consent() {
+    if !node_available() {
+        eprintln!("node not installed; skipping");
+        return;
+    }
+    let liquid = include_str!("../connectors/shopify/extensions/dumbmail-embed/blocks/dumbmail.liquid");
+    let js = liquid.split("<script>").nth(1).unwrap().split("</script>").next().unwrap().replace("{{ dumbmail_src | json }}", "\"https://dm.test/onsite.js?k=pk\"");
+    let script = format!(
+        r#"
+function run(consent, apiLoads) {{
+  const added = [];
+  const listeners = {{}};
+  globalThis.document = {{
+    createElement: () => ({{ attrs: {{}}, setAttribute(k, v) {{ this.attrs[k] = v; }} }}),
+    head: {{ appendChild: (s) => added.push(s) }},
+    addEventListener: (n, cb) => listeners[n] = cb,
+  }};
+  globalThis.window = {{ Shopify: apiLoads ? {{
+    loadFeatures: (f, cb) => {{ window.Shopify.customerPrivacy = {{ analyticsProcessingAllowed: () => consent.analytics, marketingAllowed: () => consent.marketing }}; cb(false); }},
+  }} : {{}} }};
+  {js}
+  return {{ added, listeners }};
+}}
+const none = run({{ analytics: false, marketing: false }}, true);
+const before = none.added.length;
+none.listeners.visitorConsentCollected({{ detail: {{ analyticsAllowed: true, marketingAllowed: false }} }});
+const analyticsOnly = run({{ analytics: true, marketing: false }}, true);
+const both = run({{ analytics: true, marketing: true }}, true);
+const noApi = run({{ analytics: true, marketing: true }}, false);
+console.log(JSON.stringify({{
+  before, later: none.added.map((s) => s.attrs["data-capture-emails"] || "on"),
+  analyticsOnly: analyticsOnly.added.map((s) => s.attrs["data-capture-emails"] || "on"),
+  both: both.added.map((s) => s.attrs["data-capture-emails"] || "on"),
+  noApi: noApi.added.length,
+}}));
+"#
+    );
+    let out: Value = serde_json::from_str(&run_node(&script)).unwrap();
+    assert_eq!(out["before"], 0, "no analytics consent: not loaded");
+    assert_eq!(out["later"], json!(["false"]), "loaded when consent arrives, without email capture");
+    assert_eq!(out["analyticsOnly"], json!(["false"]));
+    assert_eq!(out["both"], json!(["on"]));
+    assert_eq!(out["noApi"], 0, "without the Customer Privacy API, nothing loads");
 }
