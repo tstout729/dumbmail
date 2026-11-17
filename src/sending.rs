@@ -614,7 +614,7 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
         Some(Stop::Skip("opted out", None))
     } else if consent.is_none() {
         Some(Stop::Skip("profile deleted", None))
-    } else if spec.campaign_id.is_some() && campaign.as_deref() != Some("sending") {
+    } else if !spec.is_test && spec.campaign_id.is_some() && campaign.as_deref() != Some("sending") {
         Some(Stop::Skip(if matches!(campaign.as_deref(), Some("cancelled") | None) { "campaign cancelled" } else { "campaign stopped" }, None))
     } else if let Some(c) = conversational {
         crate::features::inbox::store::reply_allowed(c, consent.as_deref().unwrap_or_default(), phone.as_deref(), from_ours, window_start, Utc::now()).err().map(|why| Stop::Skip(why, None))

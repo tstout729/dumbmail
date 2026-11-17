@@ -1128,3 +1128,111 @@ async fn digests_and_mcp_tools() {
     assert!(docs.contains("Text JOIN to subscribe"));
     h.cleanup().await;
 }
+
+/// A number whose own time zone (as its country and area code say) is in the middle of the day
+/// now, so marketing texts to it aren't held for quiet hours. `n` keeps numbers distinct.
+fn daytime_number(n: u32) -> String {
+    let candidates = [
+        format!("+1808555{:04}", n), format!("+1503555{:04}", n), format!("+1303555{:04}", n), format!("+1312555{:04}", n), format!("+1212555{:04}", n),
+        format!("+4420794{:05}", n), format!("+9198123{:05}", n), format!("+97798123{:04}", n), format!("+8190123{:05}", n),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| {
+            dumbmail::features::sendtime::zone::phone_zone(c)
+                .is_some_and(|tz| (11..17).contains(&chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&tz))))
+        })
+        .expect("some zone is in the middle of the day")
+}
+
+async fn message_status_to(h: &Harness, phone: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT status, error FROM messages WHERE channel = 'sms' AND to_address = $1 ORDER BY created_at").bind(phone).fetch_all(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_stop_that_lands_while_a_text_waits_for_its_turn_stops_it() {
+    use dumbmail::sending::LimiterPause;
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    let acct = account_id(&h).await;
+
+    // A campaign text, held right after its rate-limiter wait while the STOP commits.
+    let camp = daytime_number(1);
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Campaign"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": camp, "sms_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Sale", "channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"body": "Sale today. Reply STOP to opt out."}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.drain().await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    pause.arrived().await;
+    telnyx(&h, "rl-1", &camp, &ours, "STOP").await;
+    pause.release(acct);
+    worker.await.unwrap();
+    assert!(texts_to(&h, &camp).is_empty(), "{:?}", texts_to(&h, &camp));
+    assert_eq!(message_status_to(&h, &camp).await, vec![("skipped".to_string(), Some("opted out".to_string()))]);
+
+    // A flow text.
+    let flow_person = daytime_number(2);
+    let fl = h.ok("POST", "/api/lists", Some(json!({"name": "Flow"}))).await;
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "Welcome", "trigger": {"type": "list", "list_id": fl["id"]}, "definition": {"entry": "s", "nodes": [
+        {"id": "s", "type": "sms", "content": {"body": "Welcome! Reply STOP to opt out."}, "next": null}
+    ]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": flow_person, "sms_consent": "subscribed", "list_ids": [fl["id"]]}))).await;
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    pause.arrived().await;
+    twilio(&h, "rl-2", &flow_person, &ours, "Stop texting me").await;
+    pause.release(acct);
+    worker.await.unwrap();
+    assert!(texts_to(&h, &flow_person).is_empty());
+    assert_eq!(message_status_to(&h, &flow_person).await, vec![("skipped".to_string(), Some("opted out".to_string()))], "the STOP's mark isn't overwritten");
+
+    // A reply typed in the inbox.
+    let asker = "+15035552001";
+    telnyx(&h, "rl-3", asker, &ours, "Do you have it in blue?").await;
+    h.drain().await;
+    let conv: Uuid = conversation_for(&mut h, asker).await["id"].as_str().unwrap().parse().unwrap();
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let reply = tokio::spawn(async move { dumbmail::features::inbox::replies::send_reply(&st, acct, conv, "Yes, we do!", None, true).await });
+    pause.arrived().await;
+    telnyx(&h, "rl-4", asker, &ours, "unsubscribe").await;
+    pause.release(acct);
+    let out = reply.await.unwrap();
+    assert!(matches!(&out, Err(e) if e.public_message().contains("opted out")), "{:?}", out.map_err(|e| e.public_message()));
+    assert!(texts_to(&h, asker).is_empty());
+
+    // A test send typed in another format than the provider uses for the number.
+    let tester = "+15035552002";
+    let draft = dumbmail::campaigns::load(&h.state.db, acct, cid.parse().unwrap()).await.unwrap();
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let test_send = tokio::spawn(async move { dumbmail::campaigns::send_test(&st, &account, &draft, &["(503) 555-2002".to_string()], None).await });
+    pause.arrived().await;
+    telnyx(&h, "rl-5", tester, &ours, "STOP").await;
+    pause.release(acct);
+    assert_eq!(test_send.await.unwrap().map_err(|e| e.public_message()).unwrap(), 0);
+    assert!(texts_to(&h, tester).is_empty() && texts_to(&h, "(503) 555-2002").is_empty());
+    assert_eq!(message_status_to(&h, tester).await, vec![("skipped".to_string(), Some("opted out".to_string()))]);
+
+    // Without a STOP, a held text goes out once it's released.
+    let fine = "+15035552003";
+    telnyx(&h, "rl-6", fine, &ours, "hello?").await;
+    h.drain().await;
+    let conv: Uuid = conversation_for(&mut h, fine).await["id"].as_str().unwrap().parse().unwrap();
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let reply = tokio::spawn(async move { dumbmail::features::inbox::replies::send_reply(&st, acct, conv, "Hi!", None, true).await });
+    pause.arrived().await;
+    pause.release(acct);
+    assert!(reply.await.unwrap().is_ok());
+    assert_eq!(texts_to(&h, fine).len(), 1);
+    assert_eq!(message_status_to(&h, fine).await[0].0, "sent");
+    h.cleanup().await;
+}
