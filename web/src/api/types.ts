@@ -408,6 +408,8 @@ export type FlowSettings = {
   exit_condition?: SegmentDefinition;
   profile_filter?: SegmentDefinition;
   smart_sending_hours?: number;
+  /** Also send to people held back from marketing (added by an integration without an opt-in). */
+  service_messages?: boolean;
 };
 
 export type FlowDefinition = { entry: string | null; nodes: FlowNode[]; settings?: FlowSettings };
@@ -484,6 +486,8 @@ export type ProfileDetail = {
   messages: ProfileMessage[];
   /** Why email to this profile is suppressed: hard_bounce, complaint, booking_relay or no_marketing. */
   email_suppressed_reason?: string | null;
+  /** Held back from marketing: added (e.g. by an integration) without agreeing to it. */
+  marketing_hold?: boolean;
   /** Set when an integration created the profile. */
   source?: { kind: string; id: string | null; name: string | null } | null;
 };

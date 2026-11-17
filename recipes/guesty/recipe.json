@@ -3,6 +3,13 @@
   "name": "Guesty",
   "category": "Vacation rentals",
   "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once, with the total when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Reservations import through Guesty's current Open API.",
+  "metrics": [
+    "Reservation Booked",
+    "Reservation Confirmed",
+    "Reservation Cancelled",
+    "Reservation Updated",
+    "Inquiry Received"
+  ],
   "docs": [
     "https://open-api-docs.guesty.com/docs/reservation-webhooks-migration-guide",
     "https://open-api-docs.guesty.com/docs/reservation-migration",

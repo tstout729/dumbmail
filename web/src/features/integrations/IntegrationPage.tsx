@@ -3,10 +3,10 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { AlertTriangle, RotateCw, Trash2 } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import { useSession } from "../../api";
-import { Button, Card, ConfirmDialog, CopyField, InlineError, Notice, Page, PageHeader, Skeleton, Stat, Tabs, Toggle } from "../../components/ui";
+import { Button, Card, Checkbox, ConfirmDialog, CopyField, InlineError, Notice, Page, PageHeader, Skeleton, Stat, Tabs, Toggle } from "../../components/ui";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
-import { useDeleteIntegration, useIntegration, useRecipes, useRotateIntegrationUrl, useSetIntegrationStatus } from "./api";
+import { useDeleteIntegration, useIntegration, useRecipes, useRotateIntegrationUrl, useSetIntegrationStatus, useUpdateIntegration } from "./api";
 import { DeliveriesTab } from "./DeliveriesTab";
 import { IntegrationStatusBadge } from "./parts";
 import { PullTab } from "./PullTab";
@@ -170,6 +170,7 @@ function SetupTab({ integration: i }: { integration: Integration }) {
         <CopyField value={i.inbound_url} />
       </Card>
       <SignatureCard key={i.updated_at} integration={i} secretHelp={recipe?.signature_secret ?? null} />
+      <ConsentCard integration={i} />
       {recipe ? (
         <Card title={`${recipe.name} setup`}>
           <ol className="list-decimal space-y-1.5 pl-5 text-sm text-zinc-700">
@@ -185,7 +186,7 @@ function SetupTab({ integration: i }: { integration: Integration }) {
               {recipe.docs.map((d, n) => (
                 <span key={d}>
                   {n > 0 ? ", " : ""}
-                  <a href={d} target="_blank" rel="noreferrer" className="text-accent-700 hover:underline">
+                  <a href={d} target="_blank" rel="noreferrer" className="break-all text-accent-700 hover:underline">
                     {new URL(d).hostname.replace(/^www\./, "")}
                     {new URL(d).pathname.length > 1 ? new URL(d).pathname : ""}
                   </a>
@@ -214,5 +215,45 @@ function SetupTab({ integration: i }: { integration: Integration }) {
         />
       ) : null}
     </div>
+  );
+}
+
+function ConsentCard({ integration: i }: { integration: Integration }) {
+  const update = useUpdateIntegration(i.id);
+  const [confirming, setConfirming] = useState(false);
+  const set = (on: boolean) =>
+    update.mutate(
+      { contacts_opted_in: on },
+      {
+        onSuccess: () => {
+          setConfirming(false);
+          toast.success(on ? "People it adds can get marketing" : "People it adds are held back from marketing");
+        },
+        onError: (e) => toast.error(errorMessage(e)),
+      },
+    );
+  return (
+    <Card title="Marketing consent">
+      <p className="mb-3 text-sm text-zinc-600">
+        People this integration adds are held back from marketing unless they opted in: campaigns skip them, and only flows marked as service messages (like a booking confirmation) reach them. Signing up through a form clears the hold.
+      </p>
+      <Checkbox
+        checked={i.contacts_opted_in}
+        disabled={update.isPending}
+        onChange={(e) => (e.target.checked ? setConfirming(true) : set(false))}
+        label="Everyone this integration adds has agreed to get marketing email from us."
+        description="Only tick this if it's true for every person the app sends. It applies to people it adds from now on."
+      />
+      {confirming ? (
+        <ConfirmDialog
+          title="Did everyone agree to marketing email?"
+          body="People this integration adds will get campaigns and every flow. Only confirm if each of them agreed to get marketing email from you."
+          confirmLabel="Yes, they all agreed"
+          loading={update.isPending}
+          onClose={() => setConfirming(false)}
+          onConfirm={() => set(true)}
+        />
+      ) : null}
+    </Card>
   );
 }

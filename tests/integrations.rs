@@ -454,7 +454,7 @@ async fn mock_guesty(total: usize) -> (Arc<MockGuesty>, String) {
                 };
                 m.seen.lock().unwrap().push((auth, "guests".into(), filters.clone()));
                 assert!(q.get("columns").is_some_and(|c| c.contains("guestEmail")), "{q:?}");
-                assert!(q.get("sort").is_none() && q.get("filter[lastUpdatedAt][gte]").is_none(), "the search's own query isn't sent here: {q:?}");
+                assert!(!q.contains_key("sort") && !q.contains_key("filter[lastUpdatedAt][gte]"), "the search's own query isn't sent here: {q:?}");
                 let f: Value = serde_json::from_str(&filters).unwrap_or(json!({}));
                 let ids: Vec<String> = f["id"]["@in"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
                 let results: Vec<Value> = ids
@@ -540,7 +540,7 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 150, "a reservation seen twice (the cursor's own row) counts once");
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email_suppressed_reason = 'booking_relay'").await, 1);
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE marketing_hold").await, 150, "guests didn't opt in: all held from marketing");
-    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE server_only").await, 2, "an integration's metrics can't be forged from a browser");
+    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE server_only").await, 5, "the recipe's metrics can't be forged from a browser, from the moment it's set up");
     assert_eq!(mock.tokens.load(Ordering::SeqCst), 1);
     let got = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
     assert_eq!(got["state"]["cursor"], mock_updated_at(149), "{}", got["state"]);
@@ -1172,6 +1172,10 @@ async fn browsers_cant_forge_an_integrations_events() {
     assert!(r.contains("server"), "{r}");
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &ev("Viewed Product")).await;
     assert_eq!(s, StatusCode::OK, "other metrics still work from the browser");
+    // A recipe's metrics are refused from the moment it's set up, before any real event arrives.
+    h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "stripe", "create_flows": false}))).await;
+    let (s, _, r) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &ev("Placed Order")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{r}");
     // The private API may still record it.
     h.ok("POST", "/api/events", Some(json!({"metric": "Reservation Confirmed", "profile": {"email": "staff@example.com"}}))).await;
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'victim@example.com'").await, 1, "only the allowed event made the profile");
@@ -1281,9 +1285,12 @@ async fn guesty_reminders_follow_the_newest_version_and_stop_on_cancellation() {
     h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
     assert_eq!(f["definition"]["settings"]["service_messages"], true, "booking messages reach guests who haven't agreed to marketing");
     h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
-    // Guests Guesty already gave us (v2 webhooks only carry their Guesty id).
-    h.ok("POST", "/api/profiles", Some(json!({"email": "ana@example.com", "properties": {"guesty_guest_id": "gA"}}))).await;
-    h.ok("POST", "/api/profiles", Some(json!({"email": "ben@example.com", "properties": {"guesty_guest_id": "gB"}}))).await;
+    // Guests Guesty already gave us (v2 webhooks only carry their Guesty id); the integration wrote their ids.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ana@example.com"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ben@example.com"}))).await;
+    sqlx::query("UPDATE profiles SET integration_keys = jsonb_build_object('guesty_guest_id', CASE email WHEN 'ana@example.com' THEN 'gA' ELSE 'gB' END)").execute(&h.state.db).await.unwrap();
+    // Someone claiming Ana's Guesty id through an ordinary property (as a browser could) gets nothing.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "mallory@example.com", "properties": {"guesty_guest_id": "gA"}}))).await;
 
     let today = chrono::Utc::now().with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
     let day = |d: i64| (today + chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
@@ -1480,7 +1487,7 @@ async fn stripe_orders_refunds_and_late_customers() {
     h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Subscription Cancelled'").await, 1);
     // Two partial refunds record their own amounts, once each, however they arrive.
-    sqlx::query("UPDATE profiles SET properties = properties || '{\"stripe_customer_id\": \"cus_Qa1B2c3D4e5F6g\"}' WHERE email = 'jordan@example.com'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE profiles SET integration_keys = integration_keys || '{\"stripe_customer_id\": \"cus_Qa1B2c3D4e5F6g\"}' WHERE email = 'jordan@example.com'").execute(&h.state.db).await.unwrap();
     for name in ["refund-created-10.json", "refund-created-20.json", "charge-refunded-with-list.json", "charge-partially-refunded.json"] {
         let (s, r) = stripe_post(&mut h, &path, name).await;
         assert_eq!(s, StatusCode::OK, "{name}: {r}");

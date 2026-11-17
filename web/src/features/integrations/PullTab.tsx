@@ -5,7 +5,7 @@ import { useSession } from "../../api";
 import { Badge, Button, Card, ConfirmDialog, Field, IconButton, InlineError, Input, Textarea } from "../../components/ui";
 import { formatDateTime, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
-import { useCancelBackfill, useRecipes, useRunPull, useTestIntegration, useUpdateIntegration } from "./api";
+import { useCancelBackfill, useRecipes, useResumeBackfill, useRunPull, useTestIntegration, useUpdateIntegration } from "./api";
 import { monoTextarea, parseJson } from "./parts";
 import { TestResultView } from "./ScriptTab";
 import type { Integration } from "./types";
@@ -153,6 +153,7 @@ function RunCard({ integration: i }: { integration: Integration }) {
   const { account } = useSession();
   const run = useRunPull(i.id);
   const cancel = useCancelBackfill(i.id);
+  const resume = useResumeBackfill(i.id);
   const test = useTestIntegration(i.id);
   const [since, setSince] = useState("");
   const [confirm, setConfirm] = useState<"now" | "backfill" | null>(null);
@@ -210,11 +211,29 @@ function RunCard({ integration: i }: { integration: Integration }) {
         )}
         {b && b.status !== "running" ? (
           <p className="mt-2 text-xs text-zinc-500">
-            Last import (since {b.since.slice(0, 10)}): {b.status}, {b.pages} {b.pages === 1 ? "page" : "pages"}
+            Last import (since {b.since.slice(0, 10)}): {b.status === "capped" ? "stopped at its page limit" : b.status}, {b.pages} {b.pages === 1 ? "page" : "pages"}
             {b.finished_at ? `, ${formatRelative(b.finished_at)}` : ""}
             {b.error ? `. ${b.error}` : ""}
-            {b.note ? `. ${b.note}` : ""}
+            {b.note && b.status !== "capped" ? `. ${b.note}` : ""}
           </p>
+        ) : null}
+        {b && (b.status === "capped" || b.status === "failed") ? (
+          <div className="mt-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={resume.isPending}
+              onClick={() =>
+                resume.mutate(undefined, {
+                  onSuccess: () => toast.success("Import resumed"),
+                  onError: (e) => toast.error(errorMessage(e)),
+                })
+              }
+            >
+              Resume import
+            </Button>
+            <p className="mt-1 text-xs text-zinc-500">Picks up from the last page it finished.</p>
+          </div>
         ) : null}
       </div>
       {confirm ? (

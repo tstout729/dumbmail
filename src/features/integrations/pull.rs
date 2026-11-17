@@ -486,8 +486,16 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
 /// message that is stored or shown.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_string();
-    let mut list: Vec<&String> = secrets.iter().filter(|s| s.len() >= 4).collect();
+    // Each secret as it is and as it appears in a URL (percent-encoded), longest first.
+    let mut list: Vec<String> = Vec::new();
+    for s in secrets.iter().filter(|s| s.len() >= 4) {
+        list.push(s.clone());
+        let form: String = url::form_urlencoded::byte_serialize(s.as_bytes()).collect();
+        list.push(form.clone());
+        list.push(form.replace('+', "%20"));
+    }
     list.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    list.dedup();
     for s in list {
         if out.contains(s.as_str()) {
             out = out.replace(s.as_str(), "•••");
@@ -890,5 +898,7 @@ mod tests {
     fn errors_hide_query_values_and_secrets() {
         assert_eq!(place_of("https://api.example.com/v1/items?token=abc&page=2", std::iter::once("since")), "https://api.example.com/v1/items?token=…&page=…&since=…");
         assert_eq!(redact("Bearer sk_live_123 and sk_live_123x", &["sk_live_123".into(), "ab".into()]), "Bearer ••• and •••x");
+        // A secret in a URL path is percent-encoded there; it's masked too.
+        assert_eq!(redact("https://api.example.com/v1/k%2Fx%3Dy%20z/items", &["k/x=y z".into()]), "https://api.example.com/v1/•••/items");
     }
 }

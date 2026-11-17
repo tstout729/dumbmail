@@ -827,7 +827,8 @@ A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up 
 - `{"type": "engagement", "channel": "email" | "sms" | "any", "engaged": true, "within_days": 90}`. Email counts opens and clicks (Apple Mail Privacy Protection can inflate opens). SMS counts clicks and replies. `any` adds site activity, product views, carts, checkouts, orders and sign-ups. `engaged: false` finds people with none of these.
 - `{"type": "message", "action": "received" | "opened" | "clicked", "campaign_id": "..." | "flow_id": "...", "op": "has" | "has_not", "within_days": 30}`.
 - `{"type": "form", "form_id": "...", "op": "has" | "has_not", "within_days": 30}`: signed up through a form (any form when `form_id` is left out). `since` and `until` work too.
-- `{"type": "can_receive", "channel": "email" | "sms", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, and no bounce or complaint suppression. SMS needs a phone and subscribed consent.
+- `{"type": "can_receive", "channel": "email" | "sms", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, no bounce or complaint suppression, and no marketing hold (see `marketing_hold`). SMS needs a phone and subscribed consent.
+- `{"type": "property", "field": "marketing_hold", "op": "eq", "value": true}`: people held back from marketing (added by an integration or import without an opt-in). Campaigns skip them; only flows marked `service_messages` reach them.
 - `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint, or by an integration (a booking-site relay address, or one marked not for marketing).
 - `{"type": "consent", "channel": "email" | "sms", "status": "subscribed" | "unsubscribed" | "never_subscribed" | "pending"}`.
 
@@ -907,6 +908,7 @@ Triggers: `{"type": "metric", "metric": "Started Checkout", "filters": [{"field"
 - `exit_condition`: checked before every step; people who match leave the flow (e.g. they purchased).
 - `profile_filter`: only people matching it enter.
 - `smart_sending_hours`: skip a message if the person got one on that channel in the last N hours.
+- `service_messages: true`: also email people held back from marketing (`marketing_hold`: added by an integration without an opt-in). Only for messages about the person's own booking or order, never promotions. Unsubscribed and suppressed people still get nothing.
 - `random_split {percent, yes, no}`: an A/B test inside a flow. Each person goes down `yes` (path A) with `percent`% chance, otherwise `no` (path B). Compare the paths' steps in get_flow's per-step stats, then replace the split with the winning path.
 - Other steps: `update_profile {properties}`, `add_to_list`/`remove_from_list {list_id}`, `webhook {url, method, body}`.
 - In metric-triggered and event-date flows, `{{ event.properties.* }}` is the triggering event (e.g. cart items, checkout_url, check_in).

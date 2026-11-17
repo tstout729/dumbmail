@@ -14,6 +14,20 @@ Ready-made integrations (*recipes*) exist for Guesty, Stripe and Calendly. Start
 
 For apps without webhooks, or to import history, add a `pull` (see Pulls) and test it with `test_integration` and `pull: true`.
 
+## Consent: people an integration adds are held back from marketing
+
+An integration usually learns about people because they booked or bought, not because they asked for marketing. So a person an integration **creates** without an explicit opt-in is put on a *marketing hold*:
+
+- Campaigns never email them, and segments' `can_receive` email rule is false for them.
+- Flows email them only when the flow is marked as service messages (`definition.settings.service_messages: true`): messages about their own booking or order, like a booking confirmation or arrival details. Never use it for promotions.
+- Unsubscribed and suppressed people get nothing, service messages or not.
+- The hold clears the moment they subscribe by any route: a sign-up form, double opt-in, the API, or a `consent` block from the integration.
+- It's never set on someone who already existed, and the profile page says "Hasn't agreed to marketing. Added by <integration>."
+
+If everyone the app sends really did agree to marketing email from this business (for example a newsletter tool), set `contacts_opted_in: true` on the integration. Only do this when the user confirms it.
+
+Events an integration records are trusted by flows, so their metrics become *server-only*: the public browser endpoint (`/client/events`) refuses them for that account. The private API and MCP can still record them.
+
 ## The script
 
 The script defines `function handle(input)` and returns an array of actions. It runs in a sandbox with no network, files, timers or modules: it only turns data into actions. Plain ES2023 JavaScript; `async` is not allowed.
@@ -52,7 +66,7 @@ Return `[]` (or nothing) when there's nothing to do; the delivery is logged as `
 
 Every action is checked before anything is written. If one is invalid, the delivery fails with a message naming it (for example `action 2 (track_event): unknown field "colour"`) and nothing is written. Unknown fields are rejected.
 
-Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `external_id`; the profile is created if missing) or a lookup by a custom property, `{"property": "stripe_customer_id", "value": "cus_123"}`, which never creates and skips the action when nobody matches.
+Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `external_id`; the profile is created if missing) or a lookup by a custom property, `{"property": "stripe_customer_id", "value": "cus_123"}`, which never creates and skips the action when nobody matches. Add `"if_missing": "retry"` to fail the delivery instead, so it runs again later (after 1, 5, 30 and 120 minutes), for example when a subscription event arrives before the order that tells us who the customer is.
 
 ### upsert_profile
 
@@ -68,7 +82,8 @@ Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `e
 - **Consent never changes unless you send a `consent` block**, which must name the `channel` (`email` or `sms`), `subscribed` (`true` or `false`) and the `source` of the opt-in. Use it only when the person actually opted in through the app. Subscribing never overrides an earlier unsubscribe. A subscription records a "Subscribed to Email Marketing" (or SMS) event with the source.
 - `marketing: false` suppresses the email address from all marketing email, with a reason shown on the profile. Use it for addresses that must never get marketing.
 - Booking-site relay addresses (Airbnb `@guest.airbnb.com`, Booking.com `@guest.booking.com`, Vrbo/HomeAway, Expedia and others) are detected automatically on every profile an integration writes and suppressed from email, with the reason "booking-site relay address". Their terms forbid marketing to them.
-- Profiles an integration creates are marked with it as their source (shown on the profile).
+- Profiles an integration creates are marked with it as their source (shown on the profile), and held back from marketing unless the action opts them in or the integration has `contacts_opted_in` (see Consent).
+- A match by phone or external id that brings a different email changes the address. The new address hasn't agreed to anything, so a subscribed profile becomes `never_subscribed`. Unsubscribed stays unsubscribed, a hard bounce (it belonged to the old address) is cleared, and a spam complaint stays.
 
 ### track_event
 
@@ -80,7 +95,8 @@ Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `e
 
 - `metric` up to 128 characters. Events start metric-triggered flows and power segments.
 - `value` is revenue (a number). `time` is ISO 8601 (default now).
-- Always set `unique_id`: the same metric and unique id is recorded once, so a resent webhook or an overlapping pull never counts twice.
+- Always set `unique_id`: the same metric and unique id is recorded once, so a resent webhook or an overlapping pull never counts twice. Without one, the event gets an id from its delivery and position, so one delivery (with its retries and replays) still never records it twice.
+- For something that changes over time (a booking's dates), record a new event per version, with `time` set to the app's own update time and the version in the `unique_id`. Flows keyed on the thing follow the newest by time, so a late, older version never replaces a newer one. Count revenue on a separate event that has one `unique_id` per order or booking, so a change never counts it again.
 
 ### add_to_list / remove_from_list
 
@@ -131,7 +147,7 @@ A note in the delivery log.
 {"type": "next_request", "url": "/v1/items?page=3"}
 ```
 
-Fetch another page. `query` and `headers` merge into the previous request; `url`, `method` and `body` replace it. The URL must stay on the same site as the pull's URL, and the values are used as they are (placeholders and secrets are not expanded), so a payload can't steer credentials elsewhere.
+Fetch another page. `query` and `headers` merge into the previous request (`null` removes a query parameter); `url`, `method` and `body` replace it. A `url` may change only the path and query: the site (scheme, host, port) stays the pull's own, and it can't carry a user name or password. Values are used as they are (placeholders and secrets are not expanded), and the same headers as in the pull settings are refused, so a payload can't steer the request or its credentials elsewhere.
 
 ## Signatures
 
@@ -151,6 +167,10 @@ Fetch another page. `query` and `headers` merge into the previous request; `url`
 
 Other options for `hmac`: `secret_encoding: "base64"` when the secret is base64 (plain format), `tolerance_seconds` 10 to 86400. All comparisons are constant-time.
 
+The signature is checked before anything else, so requests without the secret never use up the integration's allowance. Rejected requests are logged only while they're few (30 a minute per integration); the rest are refused without a log line.
+
+**Resends.** Most apps retry a webhook with the same message id. Set `message_id` to where it is, `{"header": "svix-id"}` or `{"field": "id"}` (dots reach nested keys), and a second delivery with the same id is answered 200 with `"duplicate": true` and not run again.
+
 ## Pulls
 
 A pull fetches from the app's API and runs the script on each page. It's declared as data:
@@ -164,10 +184,12 @@ A pull fetches from the app's API and runs the script on each page. It's declare
 ```
 
 - `interval_minutes` (5 or more) runs it on a schedule. Leave it out to pull only on request or for a backfill.
-- `max_pages` caps pages per scheduled run (default 10, up to 50).
+- `max_pages` caps pages per scheduled run (default 10, up to 50). `backfill_max_pages` caps a backfill run (default 5,000).
 - `body` (JSON, or a form with `body_format: "form"`) for POST requests.
 
-**Placeholders** in the URL, query, headers, body and auth:
+**The site is fixed.** The URL's scheme, host and port are plain text, written when you save it: no placeholders there, no `user:password@`, and `https` only. Placeholders go in the path, query, headers and body.
+
+**Placeholders** in the URL's path and query, headers, body and auth:
 
 | Placeholder | Value |
 | --- | --- |
@@ -178,36 +200,41 @@ A pull fetches from the app's API and runs the script on each page. It's declare
 | `{{since}}`, `{{since_unix}}` | In a backfill, its start date; otherwise 24 hours ago |
 | `{{a\|b\|'text'}}` | The first one that has a value: `{{state.cursor\|since}}` |
 
-**Auth:**
+**Auth.** Credentials live only in `credentials` (encrypted, write-only) and are referenced, never written into the settings: every auth field must be exactly a reference like `{{secret.api_key}}` (saving a literal value is refused), and a custom header whose name looks like a credential (`…key`, `…token`, `…secret`, `…auth…`) must use one too. The settings are returned with the references, never the values. These headers can't be set at all, here or by `next_request`: `Host`, `Authorization` (it comes from `auth`), `Proxy-*`, `Forwarded`, `X-Forwarded-*`, `Connection`, `Transfer-Encoding`, `Content-Length`, `Cookie`.
 
 - `{"type": "bearer", "token": "{{secret.api_key}}"}`
 - `{"type": "basic", "username": "{{secret.user}}", "password": "{{secret.password}}"}`
 - `{"type": "header", "name": "X-Api-Key", "value": "{{secret.api_key}}"}`
-- `{"type": "oauth2_client_credentials", "token_url": "https://…/oauth2/token", "client_id": "{{secret.client_id}}", "client_secret": "{{secret.client_secret}}", "scope": "…", "audience": "…", "client_auth": "body" | "basic", "max_tokens_per_day": 4}`
+- `{"type": "oauth2_client_credentials", "token_url": "https://…/oauth2/token", "client_id": "{{secret.client_id}}", "client_secret": "{{secret.client_secret}}", "scope": "…", "audience": "…", "client_auth": "body" | "basic", "max_tokens_per_day": 4}`. The token URL, scope and audience are plain text (no placeholders).
 
-OAuth2 tokens are cached (encrypted) and reused until five minutes before they expire. A new token is requested only when no valid one is cached, and never more than `max_tokens_per_day` in 24 hours (default 4; Guesty allows 5). Changing the credentials or the pull's auth drops the cached token; re-saving the same values keeps it. If the app answers 401 or 403, the token is dropped and the next run gets a new one.
+OAuth2 tokens are cached (encrypted) and reused until five minutes before they expire. The cache is tied to everything that decides the token: the token URL, client id, client secret, scope, audience and the pull's site. Change any of them and the cached token is dropped; a token is only ever sent to the site it was configured for. Re-saving the same values keeps it. A new token is requested only when no matching one is cached, only one run asks at a time, and never more than `max_tokens_per_day` in 24 hours (default 4; Guesty allows 5). A run that started before the settings changed stops instead of caching its token. If the app answers 401 or 403, the token is dropped and the next run gets a new one.
 
-**Safety:** saved state comes from what scripts return (and so from payloads), so in a URL it's percent-encoded and can never change the site (scheme, host or port); use `{{state.KEY}}` only in the path, query, headers or body. Requests go only to public internet addresses (no private, loopback, link-local or cloud metadata addresses), the address is pinned after it's checked, redirects aren't followed, each request times out after 20 seconds, and answers over 5 MB are refused.
+**Safety:** saved state, settings and secrets are percent-encoded in a URL and can't change its site. Requests go only to public internet addresses (no private, loopback, link-local or cloud metadata addresses), the address is pinned after it's checked, no proxy is used, redirects aren't followed, each request times out after 20 seconds, and answers over 5 MB are refused. Errors that are stored or shown give the site and path (query values hidden), the HTTP status and a short reason, never the app's own error text, and any saved secret is masked wherever it would appear.
 
-**Paging:** the script decides. Return `next_request` to fetch the next page. Hold a cursor steady while paging: save the newest time seen as `pending_cursor` on each page and commit it as `cursor` on the last page, so the query doesn't change mid-way.
+**Paging:** the script decides. Return `next_request` to fetch the next page. Move the cursor forward on every page (for example "changed at or after the last row's update time"), so a run that stops at its page limit picks up where it left off.
 
-**Backfill:** `run_integration_pull` with `backfill_since: "2025-01-01"` (and `confirm: true`) imports history: the same pull with `{{since}}` set to that date and its own empty state, run in pages as chained jobs until the script stops asking for more (up to 5,000 pages). `get_integration` shows `backfill` progress (`running`, `done`, `cancelled`, `failed`, pages). `cancel_integration_backfill` stops it. A backfill never moves the live cursor.
+**Backfill:** `run_integration_pull` with `backfill_since: "2025-01-01"` (and `confirm: true`) imports history: the same pull with `{{since}}` set to that date and its own empty state, run in pages as chained jobs until the script stops asking for more. Progress (pages, state and the next request) is saved after every page, and only by the run that owns it. `get_integration` shows `backfill` (`running`, `done`, `capped`, `failed`, `cancelled`, pages). A run that reaches `backfill_max_pages` stops as `capped`, not `done`; `run_integration_pull` with `resume_backfill: true` (also after `failed`) continues from where it got to. `cancel_integration_backfill` stops it. A backfill never moves the live cursor.
 
 ## Deliveries, retries and replays
 
-Every webhook, pull page and replay is a *delivery* with its time, source (`webhook`, `pull`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload. They're kept 30 days.
+Every webhook, pull page and replay is a *delivery* with its time, source (`webhook`, `pull`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload.
 
-- A webhook is checked, stored and answered with 200 in milliseconds; the script runs right after in the background.
+- A webhook is checked, stored and queued in one step, and answered with 200 in milliseconds; the script runs right after in the background.
 - A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again.
-- `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`.
+- Each delivery remembers which actions it already wrote. A retry or replay skips those (`already_written` in the counts), so a half-written delivery never repeats its first half.
+- `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`. Replays count against the same limits as new webhooks.
 - While an integration is turned off, webhooks are still stored (as `ignored`) so they can be replayed later.
+- **Payloads may contain personal data** (names, addresses, booking notes, door codes). Only signed-in members of the account and its API keys can read them. They're kept at most 30 days, and each account keeps at most 256 MB of payloads: past that the oldest finished deliveries lose their payload (the log line stays).
+- Scripts run in their own short-lived process with no network, files or environment. At most 2 run at once per account (8 in total by default); work over that waits a few seconds in the queue.
 
 ## Flows from integration events
 
 Events from integrations start flows like any other events, and `{{ event.properties.* }}` works in the emails.
 
 - **Metric trigger with cancellation:** `{"type": "metric", "metric": "Reservation Confirmed", "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"]}`. People leave the flow before the next step if a "Reservation Cancelled" with the same `reservation_id` comes later, or a newer "Reservation Confirmed" with the same id replaces this one.
-- **Event date trigger:** `{"type": "event_date", "metric": "Reservation Confirmed", "field": "check_in", "offset_days": -2, "hour": 10, "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"], "filters": []}` starts the flow 2 days before each event's `check_in`, at 10am in the account's time zone. Each event starts it once, so a guest with two bookings gets both. A plain date (`2026-12-17`) is used as is; a date-time is read in the account's time zone. The same cancellation and replacement rules apply, checked when it fires and again before each step. `offset_days` is -365 to 365; `hour` 0-23 (default 9).
+- **Event date trigger:** `{"type": "event_date", "metric": "Reservation Confirmed", "field": "check_in", "offset_days": -2, "hour": 10, "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"], "filters": []}` starts the flow 2 days before each event's `check_in`, at 10am in the account's time zone. Each event starts it once, so a guest with two bookings gets both. A plain date (`2026-12-17`) is used as is; a date-time is read in the account's time zone. The same cancellation and replacement rules apply, checked when it fires and again before each step. `offset_days` is -365 to 365; `hour` 0-23 (default 9); at most 20 filters.
+- Each event is scheduled when it's recorded (and existing events when the flow goes live or its trigger changes). If the scheduler was down, anything due in the last 24 hours still goes out; older ones are marked `missed` instead of sending a stale reminder. `get_flow_report` shows the counts under `event_dates` (`pending`, `started`, `superseded`, `cancelled`, `filtered`, `missed`).
+- Mark flows that are about the person's own booking or order `"service_messages": true` in `definition.settings`, so they reach guests held back from marketing (see Consent).
 - Mark old records you import (for example `historical: true` in the event's properties) and filter them out of "right after it happened" flows with `{"field": "historical", "op": "neq", "value": true}`, so a backfill doesn't email everyone about old bookings.
 
 ## Limits
@@ -215,34 +242,36 @@ Events from integrations start flows like any other events, and `{{ event.proper
 | Limit | Value |
 | --- | --- |
 | Webhook body | 1 MB (larger: 413) |
-| Webhooks per integration | 300 a minute (more: 429 with `Retry-After`), and 5,000 waiting at once |
+| Webhooks per integration | 300 a minute (more: 429 with `Retry-After`), and 5,000 waiting to run at once, retries and replays included |
+| Webhooks per account | 1,200 a minute, and 20,000 waiting to run at once |
 | Script size | 256 KB |
-| Script run | 2 seconds, 64 MB of memory, 512 KB of stack; stopped when exceeded |
+| Script run | 2 seconds, 64 MB of memory, 512 KB of stack; its process is killed when exceeded |
+| Scripts at once | 2 per account, 8 in total (`INTEGRATION_SCRIPT_SLOTS`) |
 | Script result | 1 MB, 500 actions |
 | Properties per action | 200 keys, 64 KB |
 | Saved state | 64 KB |
 | Pull answer | 5 MB, 20-second timeout |
 | Pull interval | 5 minutes or more |
 | Integrations per account | 50 |
-| Delivery log | 30 days |
+| Delivery log | 30 days; 256 MB of payloads per account |
 
 ## Recipes
 
 A recipe is a ready-made integration kept in the DumbMail repository under `recipes/<key>/`: `recipe.json` (name, description, signature, pull, settings, the credentials it needs, setup steps and suggested flows), `script.js`, and `fixtures/` with sample payloads and the actions they must produce. `create_integration_from_recipe` copies it into the account and creates the suggested flows as drafts (nothing sends until someone turns them on). Add one by pull request; the test suite runs every fixture.
 
-- **guesty**: reservation webhooks and the Open API → Reservation Confirmed / Cancelled / Updated and Inquiry Received, guests as profiles (relay addresses suppressed), history import with client-credentials (token reuse), and draft booking confirmation, pre-arrival and review request flows.
-- **stripe**: Checkout, invoices, refunds and subscriptions → Placed Order, Refunded Order, Subscription Started / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed.
+- **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Confirmed (one per version), Reservation Cancelled, Reservation Updated and Inquiry Received; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); and draft booking confirmation, pre-arrival and review request flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
+- **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order, Refunded Order (once per refund, its own amount), Subscription Started / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
 - **calendly**: bookings and cancellations → Meeting Scheduled / Meeting Cancelled, with draft reminder and follow-up flows.
 
 ## Worked example: "connect my Guesty"
 
 1. `create_integration_from_recipe` with `{"recipe": "guesty"}`. Note `integration.inbound_url` and the `setup` steps.
 2. Ask the person for their Guesty Open API client ID and secret (Guesty → Integrations → API & Webhooks), then `update_integration` with `{"id": …, "credentials": {"client_id": "…", "client_secret": "…"}}`.
-3. Subscribe the inbound URL in Guesty. With their Open API token: `POST https://open-api.guesty.com/v1/webhooks` with `{"url": "<inbound_url>", "events": ["reservation.new", "reservation.updated"]}`. (These carry the guest's details; Guesty retires them on 1 March 2027, after which the 15-minute pull fills in guest details for v2 events.)
+3. Subscribe the inbound URL in Guesty. With their Open API token: `POST https://open-api.guesty.com/v1/webhooks` with `{"url": "<inbound_url>", "events": ["reservation.created.v2", "reservation.updated.v2"]}`. These update guests DumbMail already knows at once (cancellations too); the 15-minute pull adds new guests.
 4. Get the signing secret (`GET https://open-api.guesty.com/v1/webhooks-v2/secret`, starts with `whsec_`) and `update_integration` with `{"signature_secret": "whsec_…"}`.
-5. `test_integration` with `{"pull": true}`. Check `effects`: one profile and one "Reservation Confirmed" per reservation, relay guests marked suppressed.
+5. `test_integration` with `{"pull": true}`. The first page is changed reservations, and the answer asks for their guests next (`next_request` to `/v1/guests-crud`). If Guesty answers 400, the reservation filter needs adjusting (see the recipe's README).
 6. With the person's go-ahead, `run_integration_pull` with `{"backfill_since": "<a year ago>", "confirm": true}`. Watch `get_integration` until `backfill.status` is `done`.
-7. Show them the three draft flows (`list_flows`), adjust the emails to their voice, `render_preview`, and turn them on with `set_flow_status` once they approve.
+7. Show them the three draft flows (`list_flows`), adjust the emails to their voice, `render_preview`, and turn them on with `set_flow_status` once they approve. They're service messages, so they reach guests who haven't agreed to marketing; keep them about the stay.
 
 ## Writing a script for a new app
 
@@ -251,3 +280,4 @@ A recipe is a ready-made integration kept in the DumbMail repository under `reci
 - Check fields exist before using them, and skip or `log` what you don't handle instead of throwing.
 - Clean phone numbers to E.164 before sending them (an invalid one fails the whole delivery).
 - Never subscribe anyone without an explicit opt-in in the payload, and say where it came from in `source`.
+- Set `message_id` when the app gives each webhook an id, so its retries are ignored.

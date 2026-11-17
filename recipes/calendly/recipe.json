@@ -3,6 +3,10 @@
   "name": "Calendly",
   "category": "Scheduling",
   "description": "Calendly bookings become events: Meeting Scheduled when someone books, Meeting Cancelled when they cancel or reschedule. Use them for reminders and follow-ups that skip cancelled meetings.",
+  "metrics": [
+    "Meeting Scheduled",
+    "Meeting Cancelled"
+  ],
   "docs": [
     "https://developer.calendly.com/api-docs/overview/webhooks/webhook-signatures",
     "https://developer.calendly.com/receive-data-from-scheduled-events-in-real-time-with-webhook-subscriptions",

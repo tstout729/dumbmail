@@ -498,14 +498,55 @@ fn input_for(w: &Who) -> ProfileInput {
     }
 }
 
-async fn find_by_property(state: &AppState, account_id: Uuid, prop: &str, value: &Value) -> AppResult<Option<Uuid>> {
+/// Find the one profile an integration gave this property value. Only values integrations wrote
+/// count (not ordinary properties, which a browser can set too), and two profiles with the same
+/// value match neither.
+async fn find_by_property(state: &AppState, account_id: Uuid, prop: &str, value: &Value) -> AppResult<Lookup> {
     let mut m = Map::new();
-    m.insert(prop.to_string(), value.clone());
-    Ok(sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND properties @> $2 ORDER BY updated_at DESC LIMIT 1")
+    m.insert(prop.to_string(), Value::String(key_text(value)));
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND integration_keys <> '{}' AND integration_keys @> $2 LIMIT 2")
         .bind(account_id)
         .bind(Value::Object(m))
-        .fetch_optional(&state.db)
-        .await?)
+        .fetch_all(&state.db)
+        .await?;
+    Ok(match ids.as_slice() {
+        [one] => Lookup::Found(*one),
+        [] => Lookup::Missing,
+        _ => Lookup::Ambiguous,
+    })
+}
+
+enum Lookup {
+    Found(Uuid),
+    Missing,
+    Ambiguous,
+}
+
+fn key_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Remember the plain property values an integration wrote, so later lookups by them can trust them.
+async fn save_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, props: &Map<String, Value>) -> AppResult<()> {
+    let keys: Map<String, Value> = props
+        .iter()
+        .filter(|(_, v)| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)))
+        .map(|(k, v)| (k.clone(), Value::String(key_text(v))))
+        .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200))
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE profiles SET integration_keys = integration_keys || $3 WHERE id = $1 AND account_id = $2")
+        .bind(profile_id)
+        .bind(account_id)
+        .bind(Value::Object(keys))
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 /// Mark a profile the integration just made, and suppress booking-site relay addresses (and any
@@ -543,11 +584,12 @@ async fn after_write(state: &AppState, src: &Source, id: Uuid, created: bool, em
 /// Resolve `who` to a profile, creating it from identifiers if needed (a property lookup never creates).
 async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut Outcome) -> AppResult<Option<Found>> {
     if let (Some(p), Some(v)) = (&w.property, &w.value) {
-        let found = find_by_property(state, src.account_id, p, v).await?;
-        if found.is_none() && w.if_missing.as_deref() == Some("retry") && !dry {
-            return Err(AppError::bad(format!("no profile has {p} = {v} yet; this delivery will be tried again")));
-        }
-        return Ok(found.map(|id| Found { id, created: false }));
+        return match find_by_property(state, src.account_id, p, v).await? {
+            Lookup::Found(id) => Ok(Some(Found { id, created: false })),
+            Lookup::Ambiguous => Err(AppError::bad(format!("more than one profile has {p} = {v}; not guessing which one"))),
+            Lookup::Missing if w.if_missing.as_deref() == Some("retry") && !dry => Err(AppError::bad(format!("no profile has {p} = {v} yet; this delivery will be tried again"))),
+            Lookup::Missing => Ok(None),
+        };
     }
     let input = input_for(w);
     if dry {
@@ -799,6 +841,9 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry
     }
     let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
+    if let Some(props) = &p.properties {
+        save_keys(state, src.account_id, up.profile.id, props).await?;
+    }
     let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });
     let held_before = out.counts.held;
     if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing, out).await? {

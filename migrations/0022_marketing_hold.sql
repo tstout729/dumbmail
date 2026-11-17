@@ -20,3 +20,9 @@ CREATE TRIGGER profiles_clear_marketing_hold BEFORE INSERT OR UPDATE OF email_co
 -- Events only a server may record (an integration's bookings and orders): the public browser
 -- endpoint refuses them, so nobody can start a booking flow from a web page.
 ALTER TABLE metrics ADD COLUMN IF NOT EXISTS server_only boolean NOT NULL DEFAULT false;
+
+-- Values an integration itself wrote on a profile (e.g. guesty_guest_id, stripe_customer_id).
+-- Integrations find people by these, never by ordinary properties, which a browser can also set:
+-- otherwise anyone could claim a guest's id and receive their booking emails.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS integration_keys jsonb NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS profiles_integration_keys_idx ON profiles USING gin (integration_keys jsonb_path_ops) WHERE integration_keys <> '{}';

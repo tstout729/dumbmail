@@ -19,7 +19,7 @@ export type Signature =
 
 export type Backfill = {
   id: string;
-  status: "running" | "done" | "cancelled" | "failed";
+  status: "running" | "done" | "capped" | "cancelled" | "failed";
   since: string;
   started_at: string;
   finished_at?: string;
@@ -57,6 +57,10 @@ export type Integration = IntegrationSummary & {
   oauth_token_cached_until: string | null;
   state: Record<string, unknown>;
   backfill: Backfill | null;
+  /** Everyone this integration adds has agreed to get marketing email. */
+  contacts_opted_in: boolean;
+  /** Where a webhook carries the app's own message id, so resends are ignored. */
+  message_id: { header: string } | { field: string } | null;
   updated_at: string;
 };
 
@@ -69,6 +73,7 @@ export type IntegrationChanges = {
   pull?: Record<string, unknown> | null;
   credentials?: Record<string, string | null>;
   state?: Record<string, unknown>;
+  contacts_opted_in?: boolean;
 };
 
 export type RecipeCredential = { name: string; label: string; help?: string };

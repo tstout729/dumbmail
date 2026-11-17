@@ -88,6 +88,13 @@ pub async fn create(state: &AppState, account_id: Uuid, key: &str, name: Option<
         ..Default::default()
     };
     let integ = model::create(state, account_id, Some(key), changes).await?;
+    // The recipe's events are trusted by flows: from now on a browser can't send them for this
+    // account, even before the first real one arrives.
+    let names: Vec<String> = m["metrics"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+    for n in &names {
+        crate::audience::metric_id(&state.db, account_id, n).await?;
+    }
+    sqlx::query("UPDATE metrics SET server_only = true WHERE account_id = $1 AND name = ANY($2)").bind(account_id).bind(&names).execute(&state.db).await?;
     let mut flows = Vec::new();
     if create_flows {
         for f in m["flows"].as_array().into_iter().flatten() {
@@ -107,6 +114,7 @@ mod tests {
     fn recipes_are_complete_and_valid() {
         let all = all();
         assert!(all.len() >= 3, "{}", all.len());
+        let metric_re = regex::Regex::new(r#"metric: "([^"]+)""#).unwrap();
         for r in &all {
             let m = &r.manifest;
             assert_eq!(m["key"], r.key.as_str());
@@ -114,6 +122,11 @@ mod tests {
                 assert!(m[k].as_str().is_some_and(|s| !s.is_empty()), "{}: {k}", r.key);
             }
             assert!(m["setup"].as_array().is_some_and(|s| !s.is_empty()), "{}: setup", r.key);
+            // Every metric the script records is listed, so it's server-only from the start.
+            let listed: Vec<&str> = m["metrics"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            for cap in metric_re.captures_iter(&r.script) {
+                assert!(listed.contains(&&cap[1]), "{}: metric {:?} isn't in recipe.json's metrics", r.key, &cap[1]);
+            }
             if !m["signature"].is_null() {
                 super::super::signature::Signature::parse(&m["signature"]).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
             }

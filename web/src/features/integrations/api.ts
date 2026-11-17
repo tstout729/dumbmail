@@ -22,6 +22,7 @@ export const integrationsApi = {
   rotateUrl: (id: string) => api<Integration>("POST", `/api/integrations/${id}/rotate-url`),
   test: (id: string, input: TestInput) => api<TestResult>("POST", `/api/integrations/${id}/test`, input),
   pull: (id: string, backfillSince?: string) => api<Record<string, unknown>>("POST", `/api/integrations/${id}/pull`, backfillSince ? { backfill_since: backfillSince } : {}),
+  resumeBackfill: (id: string) => api<Record<string, unknown>>("POST", `/api/integrations/${id}/pull`, { resume_backfill: true }),
   cancelBackfill: (id: string) => api<{ cancelled: boolean }>("POST", `/api/integrations/${id}/backfill/cancel`),
   deliveries: (id: string, status: DeliveryStatus | "") => api<{ data: Delivery[]; total: number }>("GET", withQuery(`/api/integrations/${id}/deliveries`, { status, limit: 100 })),
   delivery: (id: string, deliveryId: string) => api<DeliveryDetail>("GET", `/api/integrations/${id}/deliveries/${deliveryId}`),
@@ -89,6 +90,10 @@ function useRefreshing<V, R>(id: string, fn: (v: V) => Promise<R>) {
 
 export function useRunPull(id: string) {
   return useRefreshing(id, (since: string | undefined) => integrationsApi.pull(id, since));
+}
+
+export function useResumeBackfill(id: string) {
+  return useRefreshing(id, () => integrationsApi.resumeBackfill(id));
 }
 
 export function useCancelBackfill(id: string) {

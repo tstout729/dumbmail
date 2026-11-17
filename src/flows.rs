@@ -164,7 +164,9 @@ async fn event_date_stale(db: &PgPool, account_id: Uuid, event_id: Uuid, key: Op
     let Some((metric_id, value, at)) = row else { return Ok(Some("event deleted")) };
     let (Some(key), Some(value)) = (key, value) else { return Ok(None) };
     let superseded: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM events n WHERE n.account_id = $1 AND n.metric_id = $2 AND n.properties #>> $3 = $4 AND (n.occurred_at, n.id) > ($5, $6))",
+        // A browser event of a server-only metric (recorded before it became one) never counts.
+        "SELECT EXISTS (SELECT 1 FROM events n JOIN metrics nm ON nm.id = n.metric_id WHERE n.account_id = $1 AND n.metric_id = $2 AND n.properties #>> $3 = $4 AND (n.occurred_at, n.id) > ($5, $6)
+           AND NOT (n.from_browser IS TRUE AND nm.server_only))",
     )
     .bind(account_id)
     .bind(metric_id)
@@ -182,7 +184,8 @@ async fn event_date_stale(db: &PgPool, account_id: Uuid, event_id: Uuid, key: Op
     }
     let cancelled: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM events c JOIN metrics m ON m.id = c.metric_id
-          WHERE c.account_id = $1 AND m.account_id = $1 AND m.name = ANY($2) AND c.properties #>> $3 = $4 AND c.occurred_at >= $5)",
+          WHERE c.account_id = $1 AND m.account_id = $1 AND m.name = ANY($2) AND c.properties #>> $3 = $4 AND c.occurred_at >= $5
+            AND NOT (c.from_browser IS TRUE AND m.server_only))",
     )
     .bind(account_id)
     .bind(cancelled_by)
@@ -478,7 +481,8 @@ pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
     .await?;
     let Some((account_id, profile_id, metric, props, value, at, from_browser)) = row else { return Ok(()) };
     // Message, consent and alert metrics start flows only when DumbMail recorded them itself.
-    if from_browser == Some(true) && crate::audience::is_reserved_metric(&metric) {
+    // The same for an account's server-only metrics (an integration's bookings and orders).
+    if from_browser == Some(true) && (crate::audience::is_reserved_metric(&metric) || crate::audience::is_account_server_only_metric(&state.db, account_id, &metric).await.map_err(|e| anyhow::anyhow!(e.public_message()))?) {
         return Ok(());
     }
     schedule_event_dates(&state.db, event_id).await?;
@@ -745,12 +749,18 @@ async fn fire_one_event_date(state: &AppState) -> anyhow::Result<bool> {
 /// Checks and start for one event-date fire, inside the claiming transaction.
 async fn event_date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, event_id: Uuid) -> anyhow::Result<Result<Uuid, &'static str>> {
     let Ok(Trigger::EventDate { metric, field, filters, key, cancelled_by, .. }) = parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
-    let row: Option<(Uuid, Value, Option<f64>, chrono::DateTime<Utc>)> = sqlx::query_as("SELECT profile_id, properties, value, occurred_at FROM events WHERE id = $1 AND account_id = $2")
-        .bind(event_id)
-        .bind(f.account_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    let Some((profile_id, props, value, at)) = row else { return Ok(Err("not_started")) };
+    let row: Option<(Uuid, Value, Option<f64>, chrono::DateTime<Utc>, bool)> = sqlx::query_as(
+        "SELECT e.profile_id, e.properties, e.value, e.occurred_at, (e.from_browser IS TRUE AND m.server_only) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1 AND e.account_id = $2",
+    )
+    .bind(event_id)
+    .bind(f.account_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((profile_id, props, value, at, forged)) = row else { return Ok(Err("not_started")) };
+    // A browser event of a server-only metric (recorded before it became one) never starts it.
+    if forged {
+        return Ok(Err("not_started"));
+    }
     let mut obj = props.clone();
     if let (Some(v), Some(o)) = (value, obj.as_object_mut()) {
         o.entry("value").or_insert(json!(v));

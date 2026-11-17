@@ -94,6 +94,14 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
           </Notice>
         </div>
       ) : null}
+      {detail.marketing_hold && !detail.email_suppressed_reason ? (
+        <div className="mb-4">
+          <Notice tone="gray" icon={<Mail />} title="Hasn't agreed to marketing">
+            {detail.source?.kind === "integration" && detail.source.name ? `Added by ${detail.source.name}. ` : ""}
+            Campaigns skip this person; only flows marked as service messages reach them. Signing up through a form clears this.
+          </Notice>
+        </div>
+      ) : null}
       {detail.source?.kind === "integration" ? (
         <p className="-mt-2 mb-4 text-xs text-zinc-500">
           {detail.source.id && detail.source.name ? (
