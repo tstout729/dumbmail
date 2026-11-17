@@ -205,6 +205,9 @@ pub struct CampaignBody {
     /// Missing: leave as is. `null`: remove the A/B test. An object: set it (see `campaigns::AbTest`).
     #[serde(default, deserialize_with = "present")]
     pub ab_test: Option<Value>,
+    /// Missing: leave as is. `null`: send everyone at once. An object: see `features::sendtime::SendOptions`.
+    #[serde(default, deserialize_with = "present")]
+    pub send_options: Option<Value>,
 }
 
 /// Deserializes a present field (even `null`) as Some, so a missing field stays None.
@@ -265,7 +268,8 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let audience = normalize_audience(&b.audience.unwrap_or(json!({})))?;
     let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
     let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
-    Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *")
+    let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
+    Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test, send_options) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
         .bind(name.trim())
@@ -273,6 +277,7 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
         .bind(audience)
         .bind(content)
         .bind(ab_test)
+        .bind(send_options)
         .fetch_one(&state.db)
         .await?)
 }
@@ -300,10 +305,13 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     let channel = b.channel.as_deref().unwrap_or(&c.channel);
     let set_ab = b.ab_test.is_some() || b.channel.is_some();
     let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
+    let set_send_options = b.send_options.is_some();
+    let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
     Ok(sqlx::query_as(
         "UPDATE campaigns SET name = COALESCE($3, name), channel = COALESCE($4, channel), audience = COALESCE($5, audience),
             content = COALESCE($6, content), send_at = COALESCE($7, send_at), updated_at = now(),
             ab_test = CASE WHEN $8 THEN $9 ELSE ab_test END,
+            send_options = CASE WHEN $10 THEN $11 ELSE send_options END,
             status = CASE WHEN status IN ('failed','cancelled') THEN 'draft' ELSE status END, error = NULL
          WHERE id = $1 AND account_id = $2 RETURNING *",
     )
@@ -316,6 +324,8 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     .bind(b.send_at)
     .bind(set_ab)
     .bind(ab_test)
+    .bind(set_send_options)
+    .bind(send_options)
     .fetch_one(&state.db)
     .await?)
 }
@@ -402,6 +412,8 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     for content in versions {
         render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content, profile_id: None, event: None }).await?;
     }
+    // A local-time send starts when the first time zone reaches the hour on the chosen day.
+    let send_at = crate::features::sendtime::plan::launch_start(state, &account, &c, send_at).await?;
     let now = Utc::now();
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
         Some(t) => sqlx::query_as("UPDATE campaigns SET status = 'scheduled', send_at = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(t).fetch_one(&state.db).await?,
@@ -450,7 +462,7 @@ async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None, ab_test: c.ab_test }).await?;
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None, ab_test: c.ab_test, send_options: c.send_options }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 
@@ -492,6 +504,7 @@ pub async fn report(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<V
     Ok(json!({
         "campaign": {"id": c.id, "name": c.name, "channel": c.channel, "status": c.status, "sent_at": c.sent_at},
         "ab_test": ab_test,
+        "send_progress": crate::features::sendtime::plan::progress(&state.db, account_id, id).await?,
         "stats": stats,
         "links": links.into_iter().map(|(url, clicks, unique)| json!({"url": url, "clicks": clicks, "unique_clicks": unique})).collect::<Vec<_>>(),
         "series": series.into_iter().map(|(hour, opens, clicks)| json!({"hour": hour, "opens": opens, "clicks": clicks})).collect::<Vec<_>>(),

@@ -172,7 +172,7 @@ pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &A
 }
 
 /// Appends `FROM profiles p WHERE ...` selecting a campaign's reachable recipients.
-async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+pub async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
     if audience.include.is_empty() {
         return Err(AppError::bad("choose at least one list or segment to send to"));
     }
@@ -320,15 +320,23 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
     tx.commit().await?;
 
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY id")
-        .bind(c.id)
-        .fetch_all(&state.db)
-        .await?;
-    if ids.is_empty() {
+    // Send options (local time, best time, gradual): give each new recipient a release time.
+    crate::features::sendtime::plan::plan_campaign(state, &c).await?;
+    // One batch job per release time, run when it comes; claims keep a re-run from sending twice.
+    let rows: Vec<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as("SELECT id, send_after FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY send_after NULLS FIRST, id")
+            .bind(c.id)
+            .fetch_all(&state.db)
+            .await?;
+    if rows.is_empty() {
         finish_if_done(&state.db, c.id).await?;
     }
-    for chunk in ids.chunks(100) {
-        crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": chunk}), None).await?;
+    for group in rows.chunk_by(|a, b| a.1 == b.1) {
+        let at = group[0].1;
+        let ids: Vec<Uuid> = group.iter().map(|r| r.0).collect();
+        for chunk in ids.chunks(100) {
+            crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": chunk}), at).await?;
+        }
     }
     Ok(())
 }
@@ -379,18 +387,39 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     let ab = ab_test(&c);
-    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
+    let smart_hours = crate::features::sendtime::options::of(c.send_options.as_ref()).and_then(|o| o.smart_hours());
+    // Only messages whose release time has come; a batch for a later time zone waits for its own job.
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' AND (send_after IS NULL OR send_after <= now()) ORDER BY id")
         .bind(ids)
         .fetch_all(&state.db)
         .await?;
+    // Texts held for their recipient's quiet hours, by when each may go.
+    let mut held: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, Vec<Uuid>> = Default::default();
+    // Messages in this batch whose release time hasn't come yet wait for it in a batch of their own.
+    let later: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as("SELECT id, send_after FROM messages WHERE id = ANY($1) AND status = 'queued' AND send_after > now()")
+        .bind(ids)
+        .fetch_all(&state.db)
+        .await?;
+    for (id, at) in later {
+        held.entry(at).or_default().push(id);
+    }
     for (i, mid) in rows.iter().enumerate() {
         // Claim the message so a duplicate or retried batch can't send it again. A crash mid-send leaves it
         // 'sending'; release_abandoned_claims fails it later instead of retrying: at most once, never twice.
-        let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING profile_id, variant")
+        let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            "UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1 AND status = 'queued' AND (send_after IS NULL OR send_after <= now()) RETURNING profile_id, variant",
+        )
             .bind(mid)
             .fetch_optional(&state.db)
             .await?;
         let Some((pid, variant)) = claimed else { continue };
+        // Smart sending: skip people who just got a message on this channel.
+        if let Some(hours) = smart_hours {
+            if crate::features::sendtime::recently_messaged(&state.db, pid, &c.channel, hours).await? {
+                sqlx::query("UPDATE messages SET status = 'skipped', error = 'smart sending' WHERE id = $1").bind(mid).execute(&state.db).await?;
+                continue;
+            }
+        }
         let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
         let Some(profile) = sqlx::query_as::<_, Profile>(&q).bind(pid).fetch_optional(&state.db).await? else {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'profile deleted' WHERE id = $1").bind(mid).execute(&state.db).await?;
@@ -416,8 +445,16 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         )
         .await;
         match outcome {
+            // A text outside its recipient's hours waits alone; everyone else in the batch goes on.
+            Ok(Outcome::Deferred(until)) if c.channel == "sms" => {
+                sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL, send_after = $2 WHERE id = $1 AND status = 'sending'").bind(mid).bind(until).execute(&state.db).await?;
+                held.entry(until).or_default().push(*mid);
+            }
             Ok(Outcome::Deferred(until)) => {
                 sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(mid).execute(&state.db).await?;
+                for (at, ids) in &held {
+                    crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(*at)).await?;
+                }
                 let rest: Vec<Uuid> = rows[i..].to_vec();
                 crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": rest}), Some(until)).await?;
                 return Ok(());
@@ -439,6 +476,9 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
             }
         }
     }
+    for (at, ids) in held {
+        crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(at)).await?;
+    }
     finish_if_done(&state.db, c.id).await
 }
 
@@ -451,7 +491,7 @@ pub const ATTRIBUTION_SQL: &str = "
     JOIN accounts a ON a.id = e.account_id AND mt.name = a.conversion_metric
     LEFT JOIN LATERAL (
         SELECT m.campaign_id, m.flow_id, m.flow_node_id, m.variant FROM messages m
-        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND (
+        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND NOT m.transactional AND (
             (m.channel = 'email' AND GREATEST(m.opened_at, m.clicked_at) BETWEEN e.occurred_at - interval '5 days' AND e.occurred_at)
             OR (m.channel = 'sms' AND m.clicked_at BETWEEN e.occurred_at - interval '1 day' AND e.occurred_at))
         ORDER BY GREATEST(m.opened_at, m.clicked_at) DESC LIMIT 1

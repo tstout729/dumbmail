@@ -1247,7 +1247,7 @@ async fn stripe_webhook(State(state): State<AppState>, headers: HeaderMap, body:
 }
 
 /// Operator endpoints need `Authorization: Bearer ADMIN_TOKEN`; they don't exist when it's unset or short.
-fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+pub fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     let want = state.cfg.admin_token.as_deref().filter(|t| t.len() >= 32).ok_or_else(|| AppError::NotFound("not found".into()))?;
     let got = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     if got.len() != want.len() || got.bytes().zip(want.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {

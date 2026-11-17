@@ -120,8 +120,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
+            // Quiet hours in the recipient's own time zone (the account's when we can't tell).
             if !spec.is_test {
-                if let Some(until) = sms_quiet_until(spec.account, Utc::now()) {
+                if let Some(until) = crate::features::sendtime::sms_quiet_until(&state.db, spec.account, p, Utc::now()).await? {
                     return Ok(Outcome::Deferred(until));
                 }
             }
