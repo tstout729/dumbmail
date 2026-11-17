@@ -562,8 +562,8 @@ function SyncCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
           <div>
             <div className="font-medium text-zinc-800">Keep syncing from Klaviyo every hour</div>
             <p className="text-xs text-zinc-500">
-              Pulls new and changed profiles (unsubscribes first), new list members and new events until you switch over. Turning it off deletes the
-              stored key.
+              Every hour, pulls opt-outs and suppressions first, then changed profiles, list joins and removals, and new events, until you switch
+              over. Turning it off deletes the stored key.
             </p>
           </div>
         </div>
