@@ -120,6 +120,17 @@ async fn login(h: &Harness, s: &mut S, email: &str, password: &str) -> Value {
 }
 
 /// The newest invite link token sent to `to`.
+/// Rate limits count in fixed windows that start on the clock (every 10 or 15 minutes). If one
+/// is about to start, wait until it has, so attempts counted over the next `need_secs` aren't
+/// reset halfway through and the assertions on them don't fail at random.
+async fn clear_of_rate_window(need_secs: u64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let left = 300 - now % 300;
+    if left <= need_secs {
+        tokio::time::sleep(std::time::Duration::from_secs(left + 1)).await;
+    }
+}
+
 fn invite_token(h: &Harness, to: &str) -> String {
     let sent = h.state.email.sent();
     let m = sent.iter().rev().find(|e| e.to == to && e.text.contains("/invite/")).unwrap_or_else(|| panic!("no invite email to {to}"));
@@ -543,6 +554,7 @@ async fn two_factor_login() {
     assert_eq!(ok(&h, &mut s, "GET", "/api/me/two-factor", None).await["recovery_codes_left"], 9);
 
     // Wrong codes are limited.
+    clear_of_rate_window(15).await;
     let mut last = StatusCode::OK;
     for _ in 0..8 {
         last = status(&h, &mut s4, "POST", "/api/auth/two-factor", Some(json!({"code": "999999"}))).await;
@@ -635,6 +647,7 @@ async fn sessions_passwords_and_resets() {
     login(&h, &mut s1, "owner@acme.test", "reset password").await;
 
     // Strangers guessing from many addresses only slow sign-in down: the right password still works.
+    clear_of_rate_window(75).await;
     for i in 0..11 {
         let st = status(&h, &mut S::new(&format!("192.0.2.{i}")), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "bad guess!"}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -1832,6 +1845,7 @@ async fn the_right_password_gets_in_from_an_address_where_others_failed() {
     signup(&h, &mut setup, "owner@acme.test", "Acme").await;
     // An office address: some colleagues mistype, and someone sprays guesses at many emails.
     let mut office = S::new("203.0.113.77");
+    clear_of_rate_window(45).await;
     for i in 0..34 {
         let (st, v) = call(&h, &mut office, "POST", "/api/auth/login", Some(json!({"email": format!("guess{i}@acme.test"), "password": "nope"}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{i}: {v}");
