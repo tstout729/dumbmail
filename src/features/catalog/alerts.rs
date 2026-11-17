@@ -32,7 +32,9 @@ const MAX_PER_VISITOR_HOUR: i64 = 30;
 /// enough that a real store never meets it; it only stops a flood.
 const MAX_NEW_PER_ACCOUNT_HOUR: i64 = 5000;
 /// Requests an account takes per hour from visitors it can't vouch for. Each one sends an unbilled
-/// confirmation email to an address a stranger typed, so this matches the double opt-in limit.
+/// confirmation email to an address a stranger typed, so this matches the double opt-in limit. It
+/// counts confirmation emails sent in the hour (so asking again for an old request counts too) and
+/// requests still waiting for one.
 const MAX_UNCONFIRMED_PER_ACCOUNT_HOUR: i64 = 200;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -619,7 +621,8 @@ pub async fn subscribe(state: &AppState, account: &crate::models::Account, r: &R
     if !trusted {
         let unvouched: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM catalog_stock_subscriptions
-             WHERE account_id = $1 AND created_at > now() - interval '1 hour' AND (confirm_sent_at IS NOT NULL OR confirmed_at IS NULL)",
+             WHERE account_id = $1
+               AND (confirm_sent_at > now() - interval '1 hour' OR (confirmed_at IS NULL AND created_at > now() - interval '1 hour'))",
         )
         .bind(account_id)
         .fetch_one(&mut *tx)
