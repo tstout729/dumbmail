@@ -56,6 +56,11 @@ pub struct Config {
     #[arg(long, env = "SEND_RATE_PER_SEC", default_value_t = 14)]
     pub send_rate_per_sec: u32,
 
+    /// Hosted service: emails a new account may send in its first 24 hours. The limit then grows with
+    /// clean sending (see `deliverability`).
+    #[arg(long, env = "WARMUP_START_DAILY", default_value_t = 500)]
+    pub warmup_start_daily: i64,
+
     /// Number of concurrent worker tasks.
     #[arg(long, env = "WORKERS", default_value_t = 4)]
     pub workers: usize,

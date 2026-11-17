@@ -2,7 +2,8 @@ import type { FormEvent } from "react";
 import { Link } from "react-router";
 import { ArrowRight } from "lucide-react";
 import { useSending, useSession } from "../../api";
-import { Button, Card, Field, Input, StatusBadge } from "../../components/ui";
+import { Button, Card, Field, Input, StatusBadge, Toggle } from "../../components/ui";
+import { formatNumber } from "../../lib/format";
 import { formString, useSaveAccount } from "./shared";
 
 export function SendingSettingsPage() {
@@ -39,6 +40,27 @@ export function SendingSettingsPage() {
           </div>
         </Card>
       </form>
+      <Card title="Sending health">
+        <div className="space-y-4">
+          {sending.data?.email_limit ? <DailyLimit limit={sending.data.email_limit} /> : null}
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-zinc-900">Skip people who never engage</div>
+              <p className="text-xs text-zinc-500">
+                Campaigns skip anyone who got {sending.data?.unengaged_skip.min_emails ?? 10} or more emails in the last{" "}
+                {sending.data?.unengaged_skip.days ?? 180} days and didn't open, click, visit or buy. Mailing them is what slowly moves a domain to the spam
+                folder. Flows still reach them.
+              </p>
+            </div>
+            <Toggle
+              checked={account.email_sunset_enabled}
+              onChange={(v) => save({ email_sunset_enabled: v })}
+              label="Skip people who never engage"
+              disabled={saving}
+            />
+          </div>
+        </div>
+      </Card>
       <Link
         to="/settings/domains"
         className="group flex items-center gap-3 rounded-lg border border-zinc-200 bg-white px-4 py-3 shadow-xs hover:border-zinc-300"
@@ -54,6 +76,30 @@ export function SendingSettingsPage() {
         ) : null}
         <ArrowRight className="size-4 text-zinc-300 group-hover:text-zinc-600" />
       </Link>
+    </div>
+  );
+}
+
+type Limit = { limit: number; sent_last_24h: number; remaining: number; fixed: boolean; start: number };
+
+function DailyLimit({ limit }: { limit: Limit }) {
+  const used = Math.min(100, limit.limit > 0 ? (limit.sent_last_24h / limit.limit) * 100 : 100);
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-sm font-medium text-zinc-900">Emails in the last 24 hours</span>
+        <span className="text-sm tabular-nums text-zinc-700">
+          {formatNumber(limit.sent_last_24h)} of {formatNumber(limit.limit)}
+        </span>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-100" aria-hidden="true">
+        <div className="h-full rounded-full bg-accent-600" style={{ width: `${used}%` }} />
+      </div>
+      <p className="mt-2 text-xs text-zinc-500">
+        {limit.fixed
+          ? "Your limit was set by DumbMail support."
+          : `New accounts start at ${formatNumber(limit.start)} emails a day. Each day your limit becomes twice your busiest recent day, as long as few emails bounce or get marked as spam. Emails past the limit wait and go out as room opens up.`}
+      </p>
     </div>
   );
 }

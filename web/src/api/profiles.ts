@@ -4,7 +4,14 @@ import { keys } from "./keys";
 import type { Consent, ImportResult, ListResponse, Profile, ProfileDetail, ProfileInput } from "./types";
 
 export type ProfileQuery = { q?: string; list_id?: string; segment_id?: string; limit?: number; offset?: number };
-export type ImportInput = { csv: string; list_id?: string; email_consent?: Consent; sms_consent?: Consent };
+export type ImportInput = {
+  csv: string;
+  list_id?: string;
+  email_consent?: Consent;
+  sms_consent?: Consent;
+  /** Everyone in the file agreed to get email (required unless importing them as unsubscribed). */
+  permission_confirmed?: boolean;
+};
 
 export const profilesApi = {
   list: (params: ProfileQuery) => api<ListResponse<Profile>>("GET", withQuery("/api/profiles", params)),

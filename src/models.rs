@@ -28,6 +28,11 @@ pub struct Account {
     /// `deliverability`); campaigns, flows and tests send no email until an operator lifts it.
     pub sending_paused_at: Option<DateTime<Utc>>,
     pub sending_paused_reason: Option<String>,
+    /// Operator-set 24-hour email limit in place of the automatic warm-up (see `deliverability`).
+    #[serde(skip)]
+    pub email_daily_limit_override: Option<i32>,
+    /// Campaign email skips people who haven't engaged in months (see `deliverability::SUNSET_DAYS`).
+    pub email_sunset_enabled: bool,
     #[serde(skip)]
     pub link_domain: Option<String>,
     #[serde(skip)]
@@ -229,8 +234,9 @@ pub fn normalize_phone(p: &str) -> Option<String> {
     }
 }
 
+/// `pending`: signed up through a double opt-in form and hasn't confirmed yet; gets no email but the confirmation.
 pub fn valid_consent(s: &str) -> bool {
-    matches!(s, "subscribed" | "unsubscribed" | "never_subscribed")
+    matches!(s, "subscribed" | "unsubscribed" | "never_subscribed" | "pending")
 }
 
 #[cfg(test)]

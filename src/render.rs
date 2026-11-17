@@ -439,6 +439,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             sending_paused_at: None,
             sending_paused_reason: None,
+            email_daily_limit_override: None,
+            email_sunset_enabled: true,
             link_domain: None,
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),

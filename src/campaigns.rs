@@ -161,7 +161,7 @@ pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
     if channel == "sms" {
         qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
     } else {
-        qb.push(" AND p.email IS NOT NULL AND p.email_consent <> 'unsubscribed' AND p.email_suppressed_reason IS NULL");
+        qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }
 }
 
@@ -185,6 +185,12 @@ async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, accou
         push_any(qb, &exc);
     }
     push_eligible(qb, channel);
+    if channel == "email" {
+        let sunset: bool = sqlx::query_scalar("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
+        if sunset {
+            crate::deliverability::push_not_unengaged(qb);
+        }
+    }
     Ok(())
 }
 

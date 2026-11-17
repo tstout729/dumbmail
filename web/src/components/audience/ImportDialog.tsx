@@ -3,7 +3,7 @@ import { FileUp } from "lucide-react";
 import type { Consent, ImportResult } from "../../api";
 import { useImportProfiles, useLists } from "../../api";
 import { formatNumber } from "../../lib/format";
-import { Button, Field, InlineError, Modal, Select, Textarea, cx } from "../ui";
+import { Button, Checkbox, Field, InlineError, Modal, Select, Textarea, cx } from "../ui";
 
 type Props = { onClose: () => void; listId?: string };
 
@@ -16,6 +16,8 @@ export function ImportDialog({ onClose, listId }: Props) {
   const [emailConsent, setEmailConsent] = useState<Consent>("subscribed");
   const [smsConsent, setSmsConsent] = useState<Consent | "">("");
   const [result, setResult] = useState<ImportResult | null>(null);
+  const [permission, setPermission] = useState(false);
+  const needsPermission = emailConsent !== "unsubscribed";
   const [dragging, setDragging] = useState(false);
 
   const readFile = async (file: File | undefined) => {
@@ -26,7 +28,13 @@ export function ImportDialog({ onClose, listId }: Props) {
 
   const run = () =>
     importer.mutate(
-      { csv, list_id: targetList || undefined, email_consent: emailConsent, sms_consent: smsConsent || undefined },
+      {
+        csv,
+        list_id: targetList || undefined,
+        email_consent: emailConsent,
+        sms_consent: smsConsent || undefined,
+        permission_confirmed: needsPermission ? permission : undefined,
+      },
       { onSuccess: setResult },
     );
 
@@ -46,7 +54,7 @@ export function ImportDialog({ onClose, listId }: Props) {
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="primary" disabled={!csv.trim()} loading={importer.isPending} onClick={run}>
+            <Button variant="primary" disabled={!csv.trim() || (needsPermission && !permission)} loading={importer.isPending} onClick={run}>
               Import
             </Button>
           </>
@@ -127,7 +135,16 @@ export function ImportDialog({ onClose, listId }: Props) {
               </Select>
             </Field>
           </div>
-          <p className="text-xs text-zinc-500">Only mark people subscribed if they agreed to hear from you.</p>
+          {needsPermission ? (
+            <Checkbox
+              checked={permission}
+              onChange={(e) => setPermission(e.target.checked)}
+              label="Everyone in this file agreed to get email from me"
+              description="For example, they signed up on your site or opted in at checkout. Bought, rented or scraped lists aren't allowed and get sending paused. Shared inboxes like info@ and throwaway addresses are skipped."
+            />
+          ) : (
+            <p className="text-xs text-zinc-500">These people will be marked unsubscribed and won't get marketing email.</p>
+          )}
           <InlineError message={importer.error?.message} />
         </div>
       )}

@@ -287,6 +287,7 @@ pub async fn import_csv(
     list_id: Option<Uuid>,
     email_consent: Option<String>,
     sms_consent: Option<String>,
+    skip_risky: bool,
 ) -> AppResult<ImportResult> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).trim(csv::Trim::All).from_reader(csv_text.as_bytes());
     let headers: Vec<String> = rdr
@@ -309,6 +310,7 @@ pub async fn import_csv(
     let roles: Vec<Option<&str>> = headers.iter().map(|h| role(h)).collect();
     let mut out = ImportResult { created: 0, updated: 0, skipped: 0, errors: Vec::new() };
     let mut ids = Vec::new();
+    let (mut roles_skipped, mut disposable_skipped) = (0u64, 0u64);
     for (i, rec) in rdr.records().enumerate() {
         let line = i + 2;
         let rec = match rec {
@@ -347,6 +349,23 @@ pub async fn import_csv(
                 }
             }
         }
+        if skip_risky {
+            let risk = input.email.as_deref().and_then(crate::models::normalize_email).and_then(|e| crate::deliverability::risky_address(&e));
+            match risk {
+                Some("role") => roles_skipped += 1,
+                Some(_) => disposable_skipped += 1,
+                None => {}
+            }
+            // Leave the address out; the rest of the row (a phone number, an id) still imports.
+            if risk.is_some() {
+                input.email = None;
+                input.email_consent = None;
+                if input.phone_number.is_none() && input.external_id.is_none() {
+                    out.skipped += 1;
+                    continue;
+                }
+            }
+        }
         if input.sms_consent.as_deref() == Some("subscribed") && input.phone_number.is_none() {
             input.sms_consent = None;
         }
@@ -363,6 +382,14 @@ pub async fn import_csv(
                 }
             }
         }
+    }
+    if roles_skipped > 0 {
+        let what = if roles_skipped == 1 { "shared inbox address" } else { "shared inbox addresses" };
+        out.errors.insert(0, format!("Skipped {roles_skipped} {what} like info@ or sales@. Nobody in particular signed up with them, and they bounce and report spam more often."));
+    }
+    if disposable_skipped > 0 {
+        let what = if disposable_skipped == 1 { "throwaway address" } else { "throwaway addresses" };
+        out.errors.insert(0, format!("Skipped {disposable_skipped} {what} (like mailinator.com). They stop working within hours and bounce."));
     }
     if let Some(list_id) = list_id {
         for chunk in ids.chunks(5000) {
