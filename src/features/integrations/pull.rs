@@ -190,8 +190,17 @@ fn plain(v: &Value) -> Option<String> {
     }
 }
 
+/// How `{{state.KEY}}` renders. State comes from script output (and so from payloads), so in a URL
+/// it is percent-encoded and must never decide where the request goes.
+#[derive(Clone, Copy, PartialEq)]
+enum StateMode {
+    Plain,
+    Encoded,
+    Marker,
+}
+
 impl Vars<'_> {
-    fn lookup(&self, name: &str) -> Result<Option<String>, String> {
+    fn lookup(&self, name: &str, mode: StateMode) -> Result<Option<String>, String> {
         let name = name.trim();
         if let Some(lit) = name.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
             return Ok(Some(lit.to_string()));
@@ -210,7 +219,11 @@ impl Vars<'_> {
                         None => None,
                     }
                 } else if let Some(k) = name.strip_prefix("state.") {
-                    self.state.get(k).and_then(plain)
+                    self.state.get(k).and_then(plain).map(|v| match mode {
+                        StateMode::Plain => v,
+                        StateMode::Encoded => url::form_urlencoded::byte_serialize(v.as_bytes()).collect(),
+                        StateMode::Marker => "statevalue".into(),
+                    })
                 } else if let Some(k) = name.strip_prefix("settings.") {
                     self.settings.get(k).and_then(plain)
                 } else {
@@ -221,11 +234,27 @@ impl Vars<'_> {
     }
 
     pub fn render(&self, s: &str) -> Result<String, String> {
+        self.render_with(s, StateMode::Plain)
+    }
+
+    /// Render a URL template. Saved state is percent-encoded, and the scheme, host and port must be
+    /// the same whatever the state holds, so a payload can never send credentials to another site.
+    pub fn render_url(&self, s: &str) -> Result<String, String> {
+        let real = self.render_with(s, StateMode::Encoded)?;
+        let probe = self.render_with(s, StateMode::Marker)?;
+        let origin = |u: &str| url::Url::parse(u).map(|u| u.origin().ascii_serialization()).map_err(|_| format!("{u:?} isn't a valid URL"));
+        if origin(&real)? != origin(&probe)? {
+            return Err("saved state ({{state.…}}) can't change a URL's site; use it only in the path or query".into());
+        }
+        Ok(real)
+    }
+
+    fn render_with(&self, s: &str, mode: StateMode) -> Result<String, String> {
         let mut err = None;
         let out = PLACEHOLDER.replace_all(s, |c: &regex::Captures<'_>| {
             let expr = &c[1];
             for alt in expr.split('|') {
-                match self.lookup(alt) {
+                match self.lookup(alt, mode) {
                     Ok(Some(v)) => return v,
                     Ok(None) => {}
                     Err(e) => {
@@ -304,7 +333,7 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
     for (k, v) in &cfg.query {
         query.push((k.clone(), vars.render(&plain(v).unwrap_or_default())?));
     }
-    let mut url = vars.render(&cfg.url)?;
+    let mut url = vars.render_url(&cfg.url)?;
     let mut method = cfg.method.clone();
     let mut body = match &cfg.body {
         Some(b) => Some(vars.render_value(b)?),
@@ -486,7 +515,7 @@ pub async fn oauth_token(state: &AppState, integration_id: Uuid, auth: &Auth, va
         form.push(("client_id".into(), id.clone()));
         form.push(("client_secret".into(), secret.clone()));
     }
-    let token_url = vars.render(token_url).map_err(AppError::BadRequest)?;
+    let token_url = vars.render_url(token_url).map_err(AppError::BadRequest)?;
     // Count the request before sending it: a token the app issued counts against its cap even if we never read the answer.
     let mut all = recent.clone();
     all.push(Utc::now());
@@ -585,6 +614,21 @@ mod tests {
         assert_eq!(build(&cfg, &rel, &v).unwrap().url, "https://api.example.com/v1/items?page=2");
         let hdr = NextRequest { headers: Some(json!({"Authorization": "x"}).as_object().cloned().unwrap()), ..Default::default() };
         assert!(build(&cfg, &hdr, &v).is_err());
+    }
+
+    #[test]
+    fn saved_state_never_picks_the_site() {
+        let empty = Map::new();
+        let evil = json!({"host": "evil.example.net", "path": "x/../../@evil.example.net?a=1#", "page": "2"}).as_object().cloned().unwrap();
+        let v = vars(&empty, &evil, &empty, false);
+        assert!(v.render_url("https://{{state.host}}/v1").unwrap_err().contains("can't change"));
+        assert!(v.render_url("https://api.example.com@{{state.host}}/v1").unwrap_err().contains("can't change"));
+        let u = v.render_url("https://api.example.com/v1/{{state.path}}").unwrap();
+        assert_eq!(url::Url::parse(&u).unwrap().host_str(), Some("api.example.com"), "{u}");
+        assert!(!u.contains('@') && !u.contains('#'), "{u}");
+        assert_eq!(v.render_url("https://api.example.com/v1?page={{state.page}}").unwrap(), "https://api.example.com/v1?page=2");
+        let cfg = PullConfig::parse(&json!({"url": "https://{{state.host}}/x", "auth": {"type": "bearer", "token": "t"}})).unwrap();
+        assert!(build(&cfg, &NextRequest::default(), &v).is_err());
     }
 
     #[test]

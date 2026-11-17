@@ -187,7 +187,7 @@ A pull fetches from the app's API and runs the script on each page. It's declare
 
 OAuth2 tokens are cached (encrypted) and reused until five minutes before they expire. A new token is requested only when no valid one is cached, and never more than `max_tokens_per_day` in 24 hours (default 4; Guesty allows 5). Changing the credentials or the pull's auth drops the cached token; re-saving the same values keeps it. If the app answers 401 or 403, the token is dropped and the next run gets a new one.
 
-**Safety:** requests go only to public internet addresses (no private, loopback, link-local or cloud metadata addresses), the address is pinned after it's checked, redirects aren't followed, each request times out after 20 seconds, and answers over 5 MB are refused.
+**Safety:** saved state comes from what scripts return (and so from payloads), so in a URL it's percent-encoded and can never change the site (scheme, host or port); use `{{state.KEY}}` only in the path, query, headers or body. Requests go only to public internet addresses (no private, loopback, link-local or cloud metadata addresses), the address is pinned after it's checked, redirects aren't followed, each request times out after 20 seconds, and answers over 5 MB are refused.
 
 **Paging:** the script decides. Return `next_request` to fetch the next page. Hold a cursor steady while paging: save the newest time seen as `pending_cursor` on each page and commit it as `cursor` on the last page, so the query doesn't change mid-way.
 
