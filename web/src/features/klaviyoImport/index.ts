@@ -1,4 +1,6 @@
 import type { DashboardFeature } from "../types";
 
-// Not built yet. This feature's pages, API hooks and types live in this folder.
-export const feature: DashboardFeature = {};
+export const feature: DashboardFeature = {
+  settingsRoutes: [{ path: "klaviyo", lazy: () => import("./KlaviyoImportPage").then((m) => ({ Component: m.KlaviyoImportPage })) }],
+  settingsTabs: [{ label: "Move from Klaviyo", title: "Move from Klaviyo", to: "/settings/klaviyo" }],
+};
