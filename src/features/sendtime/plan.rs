@@ -446,15 +446,17 @@ pub fn push_recently_messaged(qb: &mut QueryBuilder<'_, sqlx::Postgres>, channel
         .push_bind(channel.to_string())
         .push(" AND rm.status IN ('sent','delivered') AND NOT rm.is_test AND NOT rm.transactional AND rm.sent_at > now() - make_interval(hours => ")
         .push_bind(hours as i32)
-        .push("))");
+        .push(") AND NOT EXISTS (SELECT 1 FROM sms_sent_texts st WHERE st.message_id = rm.id AND st.kind <> 'marketing'))");
 }
 
 /// Smart sending: did this person get a marketing message on this channel in the last `hours`?
-/// Transactional mail and tests don't count. Used by campaigns and flows.
+/// Transactional mail, tests and conversational texts (inbox replies, HELP answers, sign-up texts;
+/// see `features::inbox`) don't count. Used by campaigns and flows.
 pub async fn recently_messaged(db: &PgPool, profile_id: Uuid, channel: &str, hours: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND NOT transactional
-                        AND sent_at > now() - make_interval(hours => $3))",
+                        AND sent_at > now() - make_interval(hours => $3)
+                        AND NOT EXISTS (SELECT 1 FROM sms_sent_texts t WHERE t.message_id = messages.id AND t.kind <> 'marketing'))",
     )
     .bind(profile_id)
     .bind(channel)

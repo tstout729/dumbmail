@@ -47,7 +47,13 @@ pub fn row_json(r: &PhoneNumberRow) -> Value {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum ByoCredentials {
-    Telnyx { api_key: String, messaging_profile_id: Option<String> },
+    Telnyx {
+        api_key: String,
+        messaging_profile_id: Option<String>,
+        /// Webhook signing key (Telnyx portal → Keys & Credentials → Public Key), for verifying inbound texts.
+        #[serde(default)]
+        public_key: Option<String>,
+    },
     Twilio { account_sid: String, auth_token: String },
 }
 
@@ -80,7 +86,7 @@ pub async fn sender(state: &AppState, account_id: Uuid) -> AppResult<(Arc<dyn Sm
         let creds: ByoCredentials = serde_json::from_str(&crate::crypto::decrypt(&state.cfg.secret_key, &enc)?)
             .map_err(|_| AppError::bad("reconnect your SMS provider in Settings → SMS"))?;
         let p: Arc<dyn SmsProvider> = match creds {
-            ByoCredentials::Telnyx { api_key, messaging_profile_id } => Arc::new(TelnyxSms::new(state.http.clone(), api_key, messaging_profile_id)),
+            ByoCredentials::Telnyx { api_key, messaging_profile_id, .. } => Arc::new(TelnyxSms::new(state.http.clone(), api_key, messaging_profile_id)),
             ByoCredentials::Twilio { account_sid, auth_token } => Arc::new(TwilioSms::new(state.http.clone(), account_sid, auth_token)),
         };
         return Ok((p, from, true));
@@ -358,6 +364,9 @@ pub struct ConnectBody {
     pub account_sid: Option<String>,
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Telnyx only: the webhook signing public key, so inbound texts can be verified.
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 /// Connect the customer's own provider: verify the credentials own the number, then store them encrypted.
@@ -371,7 +380,7 @@ pub async fn connect(state: &AppState, account_id: Uuid, b: ConnectBody) -> AppR
                 return Err(AppError::bad(format!("{phone} isn't in that Telnyx account")));
             }
             let profile = b.messaging_profile_id.filter(|p| !p.trim().is_empty()).or_else(|| found["data"][0]["messaging_profile_id"].as_str().map(String::from));
-            ByoCredentials::Telnyx { api_key: key.trim().to_string(), messaging_profile_id: profile }
+            ByoCredentials::Telnyx { api_key: key.trim().to_string(), messaging_profile_id: profile, public_key: b.public_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()) }
         }
         "twilio" => {
             let sid = b.account_sid.filter(|s| s.starts_with("AC")).ok_or_else(|| AppError::bad("enter your Twilio Account SID (starts with AC)"))?;

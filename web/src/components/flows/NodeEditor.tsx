@@ -65,6 +65,23 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
         </fieldset>
       );
+    case "wait_for_reply":
+      return (
+        <fieldset disabled={readOnly} className="min-w-0 space-y-3">
+          <p className="text-sm text-zinc-600">
+            Wait for them to text back. If they reply in time they go down <b>replied</b> right away; otherwise <b>no reply</b> when the time is up. STOP and HELP don't
+            count as replies.
+          </p>
+          <div className="flex gap-2">
+            <Input type="number" min={1} value={node.amount} onChange={(e) => onChange({ ...node, amount: Math.max(1, Number(e.target.value) || 1) })} className="w-24" aria-label="Amount" />
+            <Select value={node.unit} onChange={(e) => onChange({ ...node, unit: e.target.value as DelayUnit })} className="w-32" aria-label="Unit">
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+              <option value="days">days</option>
+            </Select>
+          </div>
+        </fieldset>
+      );
     case "random_split":
       return <RandomSplitEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
     case "update_profile":
