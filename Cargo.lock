@@ -1324,6 +1324,7 @@ dependencies = [
  "hmac 0.12.1",
  "http-body-util",
  "image",
+ "md-5",
  "mime_guess",
  "minijinja",
  "once_cell",

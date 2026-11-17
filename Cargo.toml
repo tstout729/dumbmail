@@ -24,6 +24,7 @@ hex = "0.4.3"
 hmac = "0.12"
 http-body-util = "0.1.5"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "ico"] }
+md-5 = "0.10"
 mime_guess = "2.0.5"
 minijinja = { version = "2", features = ["json", "urlencode", "loop_controls"] }
 once_cell = "1.21.4"

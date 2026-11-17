@@ -81,6 +81,14 @@ impl Harness {
             site_url: None,
             cookie_domain: None,
             google_redirect_base: None,
+            meta_app_id: None,
+            meta_app_secret: None,
+            google_ads_client_id: None,
+            google_ads_client_secret: None,
+            google_ads_developer_token: None,
+            tiktok_app_id: None,
+            tiktok_app_secret: None,
+            ad_platform_api_base: None,
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();
