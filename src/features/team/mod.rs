@@ -44,7 +44,7 @@ static ROUTE_RULES: &[RouteRule] = &[
     rule("DELETE", "/api/team/members/{user_id}/sso", Ownership),
     rule("POST", "/api/team/leave", OwnLogin),
     rule("POST", "/api/team/transfer", Ownership),
-    rule("GET", "/api/team/security", TeamRead),
+    rule("GET", "/api/team/security", TeamSecurityRead),
     rule("PATCH", "/api/team/security", Security),
     rule("GET", "/api/team/sso", Ownership),
     rule("PUT", "/api/team/sso", Ownership),
@@ -148,7 +148,7 @@ impl Feature for Module {
         let roles = json!({"enum": ["owner", "admin", "manager", "analyst", "content"], "description": "owner: everything; admin: everything but ownership; manager: campaigns, flows, forms, audience and content; analyst: read-only plus exports; content: templates and campaign drafts, no sending."});
         let scopes = json!({"type": "array", "maxItems": 20, "items": {"enum": access::valid_scopes()}, "description": "full (default), read (everything read-only except the team and audit log), an area (audience, messaging, content, analytics, account) for read and write, <area>:read, or transactional.send."});
         vec![
-            tool("list_team", "List team members", "Members of this account with their roles, two-factor status and last activity, plus open invites.", obj(json!({}), &[]), true, false),
+            tool("list_team", "List team members", "Members of this account with their roles. For admins and owners also their two-factor and single sign-on status, last activity, and open invites.", obj(json!({}), &[]), true, false),
             tool("invite_member", "Invite a team member", "Email someone an invite to join this account with a role. Without confirm=true it only checks the invite and describes it. Owner invites can only be sent from the dashboard by an owner who just confirmed their password or code, never through MCP.",
                 obj(json!({"email": {"type": "string", "maxLength": 254}, "role": roles.clone(), "confirm": {"type": "boolean"}}), &["email", "role"]), false, true),
             tool("resend_invite", "Resend an invite", "Send an open invite again with a new link (the old link stops working) and another 7 days. Requires confirm=true.",
@@ -172,7 +172,7 @@ impl Feature for Module {
     async fn mcp_call(&self, state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<AppResult<Value>> {
         let a = a.clone();
         Some(match name {
-            "list_team" => members::team_json(state, ctx.account_id).await,
+            "list_team" => members::team_json(state, ctx).await,
             "invite_member" => match from::<members::InviteBody>(json!({"email": a["email"], "role": a["role"]})) {
                 Ok(b) => members::invite(state, ctx, b, !confirmed(&a)).await,
                 Err(e) => Err(e),

@@ -34,7 +34,7 @@ import {
   useTeamSession,
   useTransferOwnership,
 } from "./api";
-import { ConfirmIdentityModal } from "./ConfirmIdentity";
+import { ConfirmIdentityModal, useGoogleConfirmResult } from "./ConfirmIdentity";
 import { roleDescriptions, roleLabels, roles, type Invite, type InviteResult, type Member, type Role } from "./types";
 
 /** A role change that makes or demotes an owner, waiting for the password or code. */
@@ -44,6 +44,9 @@ export function TeamPage() {
   const { user, account } = useSession();
   const { role: myRole } = useTeamSession();
   const canManage = useCan("team.manage");
+  // Two-factor status and sign-in activity are for admins and owners.
+  const details = useCan("team.security_read");
+  useGoogleConfirmResult();
   const team = useTeam();
   const changeRole = useChangeRole();
   const resend = useResendInvite();
@@ -88,14 +91,14 @@ export function TeamPage() {
               <tr>
                 <Th>Person</Th>
                 <Th>Role</Th>
-                <Th className="hidden sm:table-cell">Two-factor</Th>
-                <Th className="hidden md:table-cell">Last active</Th>
+                {details ? <Th className="hidden sm:table-cell">Two-factor</Th> : null}
+                {details ? <Th className="hidden md:table-cell">Last active</Th> : null}
                 <Th className="w-10" />
               </tr>
             </thead>
             <tbody>
               {team.isPending ? (
-                <SkeletonRows cols={5} rows={2} />
+                <SkeletonRows cols={details ? 5 : 3} rows={2} />
               ) : (
                 members.map((m) => (
                   <tr key={m.user_id}>
@@ -128,14 +131,16 @@ export function TeamPage() {
                         <Badge tone={m.role === "owner" ? "green" : "gray"}>{roleLabels[m.role]}</Badge>
                       )}
                     </Td>
-                    <Td className="hidden sm:table-cell">{m.two_factor ? <Badge tone="green">On</Badge> : <span className="text-sm text-zinc-500">Off</span>}</Td>
-                    <Td className="hidden text-zinc-600 md:table-cell">{formatRelative(m.last_active_at)}</Td>
+                    {details ? (
+                      <Td className="hidden sm:table-cell">{m.two_factor ? <Badge tone="green">On</Badge> : <span className="text-sm text-zinc-500">Off</span>}</Td>
+                    ) : null}
+                    {details ? <Td className="hidden text-zinc-600 md:table-cell">{formatRelative(m.last_active_at ?? null)}</Td> : null}
                     <Td>
                       <MemberMenu
                         member={m}
                         canRemove={canEdit(m)}
                         canTransfer={myRole === "owner" && m.user_id !== user.id}
-                        canResetSso={myRole === "owner" && m.sso_linked}
+                        canResetSso={myRole === "owner" && m.sso_linked === true}
                         onRemove={() => setRemoving(m)}
                         onTransfer={() => setTransferring(m)}
                         onResetSso={() => setResettingSso(m)}

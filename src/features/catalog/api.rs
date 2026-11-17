@@ -173,7 +173,15 @@ async fn feeds_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Valu
 }
 
 async fn create_feed_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<feeds::FeedInput>) -> AppResult<Json<Value>> {
-    Ok(Json(json!(feeds::create(&state.db, ctx.account_id, b).await?)))
+    let f = feeds::create(&state.db, ctx.account_id, b).await?;
+    feed_changed(&state, &ctx, "product_feed.create", &f).await;
+    Ok(Json(json!(f)))
+}
+
+/// A feed was added or changed: its id, name, format and schedule (never its URL, which may hold
+/// a token).
+pub async fn feed_changed(state: &AppState, ctx: &Ctx, action: &str, f: &feeds::Feed) {
+    crate::features::team::audit(state, ctx, action, Some(&f.id.to_string()), json!({"name": f.name, "format": f.format, "interval_hours": f.interval_hours, "enabled": f.enabled})).await;
 }
 
 async fn get_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -181,7 +189,9 @@ async fn get_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
 }
 
 async fn update_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<feeds::FeedInput>) -> AppResult<Json<Value>> {
-    Ok(Json(json!(feeds::update(&state.db, ctx.account_id, id, b).await?)))
+    let f = feeds::update(&state.db, ctx.account_id, id, b).await?;
+    feed_changed(&state, &ctx, "product_feed.update", &f).await;
+    Ok(Json(json!(f)))
 }
 
 async fn delete_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

@@ -82,6 +82,7 @@ export function useTeamSession(): TeamSessionInfo {
     restriction_message: s.restriction_message ?? null,
     sign_in_method: s.sign_in_method ?? null,
     two_factor_enabled: s.two_factor_enabled ?? false,
+    login_methods: s.login_methods ?? { password: true, google: false },
     accounts: s.accounts ?? [],
   };
 }

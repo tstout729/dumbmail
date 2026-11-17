@@ -7,11 +7,21 @@
 //! - anything else resolves the caller (session cookie or API key), checks the rule, and hands the
 //!   checked [`Ctx`] to the handler, so the `Ctx` extractor never resolves a caller on its own.
 //!
-//! It also refuses browser writes from a tab that still shows another account (see
-//! [`ACCOUNT_HEADER`]).
+//! It also guards writes made with the session cookie (any method but GET, HEAD and OPTIONS),
+//! because other hosts under the same site (`book.dumbmail.ai`) count as same-site and the
+//! browser sends them `SameSite=Lax` cookies on a form post:
+//! - the request must come from the app itself: an `Origin` (or, without one, a `Referer`) whose
+//!   host is exactly PUBLIC_URL's. Anything else, or neither header, is refused;
+//! - it must carry [`ACCOUNT_HEADER`], which a form on another site can't add. Writes to the open
+//!   account must name that account; writes about the login itself just have to send it.
+//!
+//! API keys don't use the cookie and aren't affected. The public sign-in routes (sign-in,
+//! sign-up, password reset, accepting an invite, signing out) refuse a request whose `Origin` or
+//! `Referer` names another host; when they're made with a session cookie (accepting an invite,
+//! signing out) they need the header too.
 
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderName, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -51,6 +61,9 @@ pub async fn layer(State(state): State<AppState>, mut req: Request, next: Next) 
     };
     req.extensions_mut().insert(RouteAccess(rule));
     if rule.perm == Perm::Public {
+        if let Some(r) = public_write_refused(&state, req.headers().clone(), &method, &path).await {
+            return r;
+        }
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();
@@ -59,7 +72,7 @@ pub async fn layer(State(state): State<AppState>, mut req: Request, next: Next) 
             if let Err(e) = access::require(&ctx, rule.perm) {
                 return e.into_response();
             }
-            if let Some(r) = stale_account(&state, &parts.headers, &ctx, &method, &path).await {
+            if let Some(r) = cookie_write_refused(&state, &parts.headers, &ctx, &method, &path) {
                 return r;
             }
             parts.extensions.insert(Authorized(ctx));
@@ -74,28 +87,89 @@ pub async fn layer(State(state): State<AppState>, mut req: Request, next: Next) 
 /// Writes that are about the login, not the open account, so a tab showing another account may
 /// still make them (switching, starting an account, finishing sign-in, your own login settings).
 fn account_independent(path: &str) -> bool {
-    matches!(path, "/api/accounts" | "/api/accounts/switch" | "/api/auth/two-factor") || path.starts_with("/api/me/")
+    matches!(path, "/api/accounts" | "/api/accounts/switch" | "/api/auth/two-factor" | "/api/auth/logout" | "/api/invites/{token}/accept") || path.starts_with("/api/me/")
 }
 
-async fn stale_account(state: &AppState, headers: &axum::http::HeaderMap, ctx: &Ctx, method: &Method, path: &str) -> Option<Response> {
-    if ctx.via_api_key || ctx.session_id.is_none() || matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) || account_independent(path) {
+fn is_write(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// Public routes that sign people in or out. They refuse requests from other sites; the ones that
+/// use an existing session also need [`ACCOUNT_HEADER`] when one is signed in.
+fn sign_in_route(path: &str) -> bool {
+    matches!(path, "/api/auth/login" | "/api/auth/signup" | "/api/auth/logout" | "/api/auth/password/forgot" | "/api/auth/password/reset" | "/api/invites/{token}/accept")
+}
+
+/// The host a browser says the request came from: `Origin`, else `Referer`. `Some(None)`: a header
+/// was sent but names no host (`Origin: null` from a sandboxed frame, a bad URL).
+fn sender_host(headers: &HeaderMap) -> Option<Option<String>> {
+    let header = |n: header::HeaderName| headers.get(n).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    let raw = header(header::ORIGIN).or_else(|| header(header::REFERER))?;
+    Some(url::Url::parse(raw).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)))
+}
+
+fn from_app(state: &AppState, headers: &HeaderMap) -> Option<bool> {
+    let app = state.cfg.public_host();
+    sender_host(headers).map(|h| h.is_some() && h == app)
+}
+
+fn other_site(state: &AppState) -> Response {
+    AppError::Forbidden(format!(
+        "this request didn't come from the DumbMail app, so it was refused; open {} and try again",
+        state.cfg.public_url()
+    ))
+    .into_response()
+}
+
+fn reload_needed(sent: bool) -> Response {
+    let message = if sent {
+        "This page was opened for another account. Reload to see the account you're in now."
+    } else {
+        "This page is out of date. Reload the page, then try again."
+    };
+    (StatusCode::CONFLICT, Json(json!({"error": {"code": "account_changed", "message": message}}))).into_response()
+}
+
+/// Whether this request uses the session cookie rather than an API key.
+fn uses_session_cookie(headers: &HeaderMap) -> bool {
+    headers.get(header::AUTHORIZATION).is_none() && axum_extra::extract::CookieJar::from_headers(headers).get(crate::auth::SESSION_COOKIE).is_some()
+}
+
+/// A write on a public sign-in route: refused when it names another site; when a session cookie
+/// signs it in (signing out, accepting an invite), it needs the app's own `Origin` and the header.
+async fn public_write_refused(state: &AppState, headers: HeaderMap, method: &Method, path: &str) -> Option<Response> {
+    if !is_write(method) || !sign_in_route(path) {
         return None;
     }
-    let sent = headers.get(HeaderName::from_static(ACCOUNT_HEADER)).and_then(|v| v.to_str().ok()).map(str::trim);
-    let stale = match sent {
-        Some(id) => id.parse::<uuid::Uuid>().ok() != Some(ctx.account_id),
-        // Scripts and pages from before this header existed don't send it. That's only safe when
-        // the login has one account, so there's no other account the write could be meant for.
-        None => {
-            let uid = ctx.user_id?;
-            sqlx::query_scalar::<_, bool>("SELECT count(*) > 1 FROM memberships WHERE user_id = $1").bind(uid).fetch_one(&state.db).await.unwrap_or(true)
-        }
+    if from_app(state, &headers) == Some(false) {
+        return Some(other_site(state));
+    }
+    if !uses_session_cookie(&headers) || !matches!(path, "/api/auth/logout" | "/api/invites/{token}/accept") {
+        return None;
+    }
+    // Only a cookie that still signs someone in needs the checks; a stale one is just cleared.
+    let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+    parts.headers = headers;
+    let ctx = crate::auth::resolve(&parts, state).await.ok()?;
+    cookie_write_refused(state, &parts.headers, &ctx, method, path)
+}
+
+/// The checks on a write made with the session cookie (see the module docs).
+fn cookie_write_refused(state: &AppState, headers: &HeaderMap, ctx: &Ctx, method: &Method, path: &str) -> Option<Response> {
+    if ctx.via_api_key || ctx.session_id.is_none() || !is_write(method) {
+        return None;
+    }
+    if from_app(state, headers) != Some(true) {
+        return Some(other_site(state));
+    }
+    let sent = headers.get(HeaderName::from_static(ACCOUNT_HEADER)).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    let Some(sent) = sent else {
+        // Pages from before this header existed don't send it: they're told to reload.
+        return Some(reload_needed(false));
     };
-    stale.then(|| {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({"error": {"code": "account_changed", "message": "This page was opened for another account. Reload to see the account you're in now."}})),
-        )
-            .into_response()
-    })
+    let named = sent.parse::<uuid::Uuid>().ok();
+    if named.is_none() || (!account_independent(path) && named != Some(ctx.account_id)) {
+        return Some(reload_needed(true));
+    }
+    None
 }

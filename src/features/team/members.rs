@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::access::{require_fresh_sign_in, Role};
+use super::access::{require_fresh_for_ownership_invite, require_fresh_sign_in, Perm, Role};
 use super::audit::{audit, record};
 use super::login::{self, ReqMeta};
 use super::{mail, ratelimit};
@@ -35,29 +35,40 @@ fn mask_email(email: &str) -> String {
 
 // ---- Listing ----
 
-pub async fn team_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+/// Who's on the team. Invites, sign-in activity and two-factor and single sign-on status are only
+/// for people who can see the team's security details (admins and owners).
+pub async fn team_json(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
+    let account_id = ctx.account_id;
+    let security = ctx.can(Perm::TeamSecurityRead);
     let members: Vec<(Uuid, String, Option<String>, String, DateTime<Utc>, bool, Option<DateTime<Utc>>, bool)> = sqlx::query_as(
         "SELECT u.id, u.email, u.name, m.role, m.created_at, u.totp_enabled_at IS NOT NULL,
                 (SELECT max(s.last_seen_at) FROM sessions s WHERE s.user_id = u.id AND s.account_id = m.account_id),
-                EXISTS (SELECT 1 FROM sso_identities i WHERE i.user_id = u.id)
+                EXISTS (SELECT 1 FROM sso_identities i WHERE i.user_id = u.id AND i.account_id = m.account_id)
          FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1
          ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'manager' THEN 2 WHEN 'analyst' THEN 3 ELSE 4 END, lower(u.email) LIMIT 500",
     )
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
-    let invites: Vec<(Uuid, String, String, Option<String>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT i.id, i.email, i.role, u.email, i.created_at, i.sent_at, i.expires_at FROM team_invites i LEFT JOIN users u ON u.id = i.invited_by
-         WHERE i.account_id = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL ORDER BY i.created_at DESC LIMIT 200",
-    )
-    .bind(account_id)
-    .fetch_all(&state.db)
-    .await?;
+    let invites: Vec<(Uuid, String, String, Option<String>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> = if security {
+        sqlx::query_as(
+            "SELECT i.id, i.email, i.role, u.email, i.created_at, i.sent_at, i.expires_at FROM team_invites i LEFT JOIN users u ON u.id = i.invited_by
+             WHERE i.account_id = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL ORDER BY i.created_at DESC LIMIT 200",
+        )
+        .bind(account_id)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        Vec::new()
+    };
     let now = Utc::now();
     Ok(json!({
-        "members": members.into_iter().map(|(id, email, name, role, joined, tfa, seen, sso)| json!({
-            "user_id": id, "email": email, "name": name, "role": role, "joined_at": joined, "two_factor": tfa, "last_active_at": seen, "sso_linked": sso,
-        })).collect::<Vec<_>>(),
+        "members": members.into_iter().map(|(id, email, name, role, joined, tfa, seen, sso)| if security {
+            json!({"user_id": id, "email": email, "name": name, "role": role, "joined_at": joined, "two_factor": tfa, "last_active_at": seen, "sso_linked": sso})
+        } else {
+            json!({"user_id": id, "email": email, "name": name, "role": role, "joined_at": joined})
+        }).collect::<Vec<_>>(),
+        "security_details": security,
         "invites": invites.into_iter().map(|(id, email, role, by, created, sent, expires)| json!({
             "id": id, "email": email, "role": role, "invited_by": by, "created_at": created, "sent_at": sent, "expires_at": expires, "expired": expires < now,
         })).collect::<Vec<_>>(),
@@ -66,7 +77,7 @@ pub async fn team_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
 }
 
 pub async fn team_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(team_json(&state, ctx.account_id).await?))
+    Ok(Json(team_json(&state, &ctx).await?))
 }
 
 // ---- Invites ----
@@ -190,8 +201,9 @@ pub async fn invite(state: &AppState, ctx: &Ctx, b: InviteBody, dry_run: bool) -
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
+    // Recorded as soon as the invite exists, before sending it can fail.
+    audit(state, ctx, "team.invite", Some(&email), json!({"role": role.as_str()})).await;
     let sent = send_invite(state, ctx, &email, role, &token).await?;
-    audit(state, ctx, "team.invite", Some(&email), json!({"role": role.as_str(), "email_sent": sent})).await;
     Ok(invite_result(state, id, &email, role, expires, sent, &token))
 }
 
@@ -227,8 +239,8 @@ pub async fn resend(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
     .await?;
     let expires = expires.ok_or_else(|| AppError::not_found("invite"))?;
     tx.commit().await?;
+    audit(state, ctx, "team.invite_resend", Some(&email), json!({"role": role.as_str()})).await;
     let sent = send_invite(state, ctx, &email, role, &token).await?;
-    audit(state, ctx, "team.invite_resend", Some(&email), json!({"role": role.as_str(), "email_sent": sent})).await;
     Ok(invite_result(state, id, &email, role, expires, sent, &token))
 }
 
@@ -293,9 +305,12 @@ pub async fn show_invite_h(State(state): State<AppState>, headers: HeaderMap, ct
         Some(uid) => sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(uid).fetch_optional(&state.db).await?,
         None => None,
     };
+    // An owner invite accepted from a session that hasn't proved who it is lately: the page asks
+    // for the password, a code or Google first.
+    let confirm_first = inv.role == Role::Owner.as_str() && session_user(&ctx).is_some_and(|c| require_fresh_for_ownership_invite(c).is_err());
     Ok(Json(json!({
         "account_name": inv.account_name, "email": inv.email, "role": inv.role, "invited_by": inv.invited_by, "expires_at": inv.expires_at,
-        "has_login": has_login, "signed_in_as": signed_in_as,
+        "has_login": has_login, "signed_in_as": signed_in_as, "confirm_identity_first": confirm_first,
     })))
 }
 
@@ -350,7 +365,7 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
     // Invited back: single sign-on may let them in again.
     sqlx::query(
         "DELETE FROM team_removals WHERE account_id = $1
-           AND (email = $2 OR (issuer, subject) IN (SELECT issuer, subject FROM sso_identities WHERE user_id = $3))",
+           AND (email = $2 OR (issuer, subject) IN (SELECT issuer, subject FROM sso_identities WHERE user_id = $3 AND account_id = $1))",
     )
     .bind(inv.account_id)
     .bind(&inv.email)
@@ -390,6 +405,10 @@ pub async fn accept_h(
         let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
         if !login::same(&email, &inv.email) {
             return Err(AppError::Forbidden(format!("this invite was sent to {}; sign in with that email to accept it", mask_email(&inv.email))));
+        }
+        // Becoming an owner takes the same fresh proof as making one.
+        if inv.role == Role::Owner.as_str() {
+            require_fresh_for_ownership_invite(c)?;
         }
         if !join(&state, &inv, uid).await? {
             return Err(gone());
@@ -526,7 +545,7 @@ pub async fn remove(state: &AppState, ctx: &Ctx, user_id: Uuid, dry_run: bool) -
     sqlx::query(
         "INSERT INTO team_removals (id, account_id, email, issuer, subject, removed_by)
          SELECT gen_random_uuid(), $1, $2, NULL, NULL, $3
-         UNION ALL SELECT gen_random_uuid(), $1, $2, i.issuer, i.subject, $3 FROM sso_identities i WHERE i.user_id = $4",
+         UNION ALL SELECT gen_random_uuid(), $1, $2, i.issuer, i.subject, $3 FROM sso_identities i WHERE i.user_id = $4 AND i.account_id = $1",
     )
     .bind(ctx.account_id)
     .bind(&email)
@@ -579,25 +598,24 @@ pub async fn transfer_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(me).execute(&mut *tx).await?;
     tx.commit().await?;
     audit(&state, &ctx, "team.ownership_transfer", Some(&email), json!({"previous_owner_now": "admin"})).await;
-    Ok(Json(team_json(&state, ctx.account_id).await?))
+    Ok(Json(team_json(&state, &ctx).await?))
 }
 
 /// `DELETE /api/team/members/{user_id}/sso`: unlink a member from this account's identity
 /// provider (owners only), so their next single sign-on links by email again, for example after
-/// the provider gave them a new identity. Their single sign-on sessions here end.
+/// the provider gave them a new identity. Their single sign-on sessions here end. Only this
+/// account's link changes: another account using the same provider keeps its own.
 pub async fn reset_sso_h(State(state): State<AppState>, ctx: Ctx, Path(user_id): Path<Uuid>) -> AppResult<Json<Value>> {
     let mut tx = state.db.begin().await?;
     let (email, _) = member_row(&mut tx, ctx.account_id, user_id).await?;
-    let issuer: Option<String> = sqlx::query_scalar("SELECT issuer FROM account_sso WHERE account_id = $1").bind(ctx.account_id).fetch_optional(&mut *tx).await?;
-    let issuer = issuer.ok_or_else(|| AppError::not_found("single sign-on settings"))?;
-    let n = sqlx::query("DELETE FROM sso_identities WHERE user_id = $1 AND issuer = $2").bind(user_id).bind(&issuer).execute(&mut *tx).await?.rows_affected();
+    let n = sqlx::query("DELETE FROM sso_identities WHERE user_id = $1 AND account_id = $2").bind(user_id).bind(ctx.account_id).execute(&mut *tx).await?.rows_affected();
     let ended = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND sso_account_id = $2").bind(user_id).bind(ctx.account_id).execute(&mut *tx).await?.rows_affected();
     tx.commit().await?;
     if n == 0 {
         return Err(AppError::NotFound(format!("{email} isn't linked to the identity provider")));
     }
     audit(&state, &ctx, "team.sso_link_reset", Some(&email), json!({"sessions_ended": ended})).await;
-    Ok(Json(team_json(&state, ctx.account_id).await?))
+    Ok(Json(team_json(&state, &ctx).await?))
 }
 
 // ---- Several accounts per login ----

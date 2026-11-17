@@ -3,6 +3,13 @@
 //! The browser goes to `/api/auth/google`, which remembers a random `state` and PKCE verifier in
 //! a short-lived signed cookie and sends it to Google. Google sends it back to the callback with a
 //! code, which we trade (with our client secret) for an ID token naming the person.
+//!
+//! With `?reauth=1` a signed-in person who uses Google confirms it's them instead of signing in:
+//! Google is asked to make them sign in again (`max_age=0`) and to say when they did
+//! (`auth_time`). The callback checks it's the same Google account as the login's, that the
+//! sign-in happened in the last few minutes, and that the browser still holds the session that
+//! asked; then it marks that session as just confirmed (as `POST /api/me/reauth` does), without
+//! starting a new one.
 
 use axum::extract::{Query, State};
 use axum::response::Redirect;
@@ -78,13 +85,42 @@ fn safe_next(next: Option<&str>) -> String {
 #[derive(Deserialize)]
 struct StartQuery {
     next: Option<String>,
+    /// Confirm it's you with Google instead of signing in.
+    reauth: Option<String>,
 }
 
-async fn start(State(state): State<AppState>, jar: CookieJar, Query(q): Query<StartQuery>) -> AppResult<(CookieJar, Redirect)> {
+/// How long ago Google's sign-in may have been for it to confirm it's you.
+const REAUTH_MAX_AGE_SECS: i64 = 300;
+
+/// The signed-in session asking to confirm with Google: its id, and the login's Google account.
+async fn reauth_session(state: &AppState, jar: &CookieJar, headers: &axum::http::HeaderMap) -> Option<(Uuid, String, String)> {
+    let token = jar.get(auth::SESSION_COOKIE)?.value().to_string();
+    let meta = crate::features::team::login::ReqMeta::from_headers(headers);
+    let ctx = crate::features::team::login::session_ctx(state, &token, &meta).await.ok()?;
+    if ctx.restriction.is_some() || ctx.sso_session {
+        return None;
+    }
+    let (sid, uid) = (ctx.session_id?, ctx.user_id?);
+    let (sub, email): (Option<String>, String) = sqlx::query_as("SELECT google_sub, email FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await.ok()?;
+    Some((sid, sub?, email))
+}
+
+async fn start(State(state): State<AppState>, headers: axum::http::HeaderMap, jar: CookieJar, Query(q): Query<StartQuery>) -> AppResult<(CookieJar, Redirect)> {
     let (client_id, _) = client(&state).ok_or_else(|| AppError::NotFound("Google sign-in isn't set up on this server".into()))?;
+    let next = safe_next(q.next.as_deref());
+    let reauth = match q.reauth.as_deref() {
+        Some("1" | "true") => match reauth_session(&state, &jar, &headers).await {
+            Some(r) => Some(r),
+            None => return Ok((jar, Redirect::to(&with_param(&next, "confirm_error", "google_unavailable")))),
+        },
+        _ => None,
+    };
     let st = auth::random_token(24);
     let verifier = auth::random_token(48);
-    let payload = format!("{st}|{verifier}|{}", B64.encode(safe_next(q.next.as_deref())));
+    let mut payload = format!("{st}|{verifier}|{}", B64.encode(&next));
+    if let Some((sid, sub, _)) = &reauth {
+        payload.push_str(&format!("|{}", B64.encode(format!("{sid}:{sub}"))));
+    }
     let cookie = Cookie::build((OAUTH_COOKIE, auth::sign(&state.cfg.secret_key, &payload)))
         .path(OAUTH_COOKIE_PATH)
         .http_only(true)
@@ -104,6 +140,13 @@ async fn start(State(state): State<AppState>, jar: CookieJar, Query(q): Query<St
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("prompt", "select_account");
+    if let Some((_, _, email)) = &reauth {
+        // Make them sign in to Google again, and tell us when they did.
+        url.query_pairs_mut()
+            .append_pair("max_age", "0")
+            .append_pair("claims", r#"{"id_token":{"auth_time":{"essential":true}}}"#)
+            .append_pair("login_hint", email);
+    }
     Ok((jar.add(cookie), Redirect::to(url.as_str())))
 }
 
@@ -114,10 +157,27 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+/// `path` with one more query parameter.
+fn with_param(path: &str, k: &str, v: &str) -> String {
+    format!("{path}{}{k}={v}", if path.contains('?') { '&' } else { '?' })
+}
+
 async fn callback(State(state): State<AppState>, headers: axum::http::HeaderMap, jar: CookieJar, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
     let meta = crate::features::team::login::ReqMeta::from_headers(&headers);
     let cookie = jar.get(OAUTH_COOKIE).map(|c| c.value().to_string());
     let jar = jar.remove(with_cookie_domain(&state, Cookie::build(OAUTH_COOKIE).path(OAUTH_COOKIE_PATH).build()));
+    // Confirming it's you: no new session, back to the page that asked.
+    if let Some((flow, sid, sub)) = cookie.as_deref().and_then(|c| reauth_payload(&state, c)) {
+        let next = flow.next.clone();
+        let (dest, ok) = match confirm(&state, &jar, &meta, &flow, q, sid, &sub).await {
+            Ok(()) => (with_param(&next, "confirmed", "google"), true),
+            Err(code) => (with_param(&next, "confirm_error", code), false),
+        };
+        if !ok {
+            tracing::info!("Google confirmation refused");
+        }
+        return (jar, Redirect::to(&app_location(&state, &dest)));
+    }
     // Errors go back to the login page as a short code it explains, never as free text, so a
     // crafted link can't put arbitrary words on our login page.
     let fail = |jar: CookieJar, code: &str| (jar, Redirect::to(&app_location(&state, &format!("/login?error={code}"))));
@@ -133,31 +193,65 @@ async fn callback(State(state): State<AppState>, headers: axum::http::HeaderMap,
     }
 }
 
-/// Finish the sign-in. Errors are codes the login page explains:
-/// cancelled, expired, unavailable, google, unverified, conflict, closed, failed.
-async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> Result<(Uuid, Uuid, String), &'static str> {
-    if let Some(e) = q.error {
-        return Err(if e == "access_denied" { "cancelled" } else { "google" });
-    }
+/// What the signed sign-in cookie remembers.
+struct Flow {
+    state: String,
+    verifier: String,
+    next: String,
+    /// For confirming it's you: "<session id>:<Google subject>".
+    reauth: Option<String>,
+}
+
+fn read_flow(state: &AppState, cookie: &str) -> Option<Flow> {
+    let payload = auth::verify(&state.cfg.secret_key, cookie)?;
+    let parts: Vec<&str> = payload.split('|').collect();
+    let (st, verifier, next, reauth) = match parts.as_slice() {
+        [st, verifier, next] => (st, verifier, next, None),
+        [st, verifier, next, who] => (st, verifier, next, Some(String::from_utf8(B64.decode(who).ok()?).ok()?)),
+        _ => return None,
+    };
+    let next = B64.decode(next).ok().and_then(|b| String::from_utf8(b).ok()).map(|n| safe_next(Some(&n))).unwrap_or_else(|| "/".into());
+    Some(Flow { state: st.to_string(), verifier: verifier.to_string(), next, reauth })
+}
+
+/// The flow, the session and the Google account, when the sign-in cookie is for confirming it's you.
+fn reauth_payload(state: &AppState, cookie: &str) -> Option<(Flow, Uuid, String)> {
+    let flow = read_flow(state, cookie)?;
+    let (sid, sub) = flow.reauth.as_deref()?.split_once(':')?;
+    let (sid, sub) = (sid.parse().ok()?, sub.to_string());
+    Some((flow, sid, sub))
+}
+
+static TOKEN_URL_FOR_TESTS: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Tests stand in for Google's token endpoint. Only test code calls this; there's no setting.
+#[doc(hidden)]
+pub fn use_token_url_for_tests(url: &str) {
+    *TOKEN_URL_FOR_TESTS.write().expect("token url lock") = Some(url.to_string());
+}
+
+fn token_url() -> String {
+    TOKEN_URL_FOR_TESTS.read().ok().and_then(|u| u.clone()).unwrap_or_else(|| "https://oauth2.googleapis.com/token".into())
+}
+
+/// Check the returned state, trade the code for Google's ID token and read it. Also returns the
+/// token's claims as sent, for the ones `GoogleClaims` leaves out (`auth_time`).
+async fn exchange(state: &AppState, flow: &Flow, q: &CallbackQuery) -> Result<(GoogleClaims, Value), &'static str> {
     let (client_id, secret) = client(state).ok_or("unavailable")?;
-    let payload = cookie.and_then(|c| auth::verify(&state.cfg.secret_key, &c)).ok_or("expired")?;
-    let mut parts = payload.splitn(3, '|');
-    let (Some(st), Some(verifier), Some(next)) = (parts.next(), parts.next(), parts.next()) else { return Err("expired") };
-    if q.state.as_deref() != Some(st) {
+    if q.state.as_deref() != Some(flow.state.as_str()) {
         return Err("expired");
     }
-    let next = B64.decode(next).ok().and_then(|b| String::from_utf8(b).ok()).map(|n| safe_next(Some(&n))).unwrap_or_else(|| "/".into());
-    let code = q.code.ok_or("expired")?;
+    let code = q.code.as_deref().ok_or("expired")?;
     let res = state
         .http
-        .post("https://oauth2.googleapis.com/token")
+        .post(token_url())
         .form(&[
-            ("code", code.as_str()),
+            ("code", code),
             ("client_id", client_id),
             ("client_secret", secret),
             ("redirect_uri", &redirect_uri(state)),
             ("grant_type", "authorization_code"),
-            ("code_verifier", verifier),
+            ("code_verifier", flow.verifier.as_str()),
         ])
         .send()
         .await
@@ -169,6 +263,53 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> R
     let body: Value = res.json().await.map_err(|_| "google")?;
     let id_token = body["id_token"].as_str().ok_or("google")?;
     let claims = parse_id_token(id_token, client_id, chrono::Utc::now().timestamp()).map_err(|e| if e.contains("verified") { "unverified" } else { "google" })?;
+    let raw = id_token.split('.').nth(1).and_then(|p| B64.decode(p.trim_end_matches('=')).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    Ok((claims, raw))
+}
+
+/// Trade the code, check it's the login's Google account and a sign-in from the last few minutes,
+/// and mark the session that asked (still held by this browser) as just confirmed.
+async fn confirm(state: &AppState, jar: &CookieJar, meta: &crate::features::team::login::ReqMeta, flow: &Flow, q: CallbackQuery, sid: Uuid, sub: &str) -> Result<(), &'static str> {
+    if q.error.is_some() {
+        return Err("google_cancelled");
+    }
+    let held = match jar.get(auth::SESSION_COOKIE) {
+        Some(c) => crate::features::team::login::session_ctx(state, c.value(), meta).await.ok(),
+        None => None,
+    };
+    let Some(ctx) = held.filter(|c| c.session_id == Some(sid) && c.restriction.is_none()) else { return Err("google_session") };
+    let (claims, raw) = exchange(state, flow, &q).await.map_err(|_| "google_failed")?;
+    if claims.sub != sub {
+        return Err("google_other_account");
+    }
+    let now = chrono::Utc::now().timestamp();
+    if !raw["auth_time"].as_i64().is_some_and(|t| t >= now - REAUTH_MAX_AGE_SECS && t <= now + 60) {
+        return Err("google_not_fresh");
+    }
+    let n = sqlx::query("UPDATE sessions s SET reauth_at = now() FROM users u WHERE s.id = $1 AND u.id = s.user_id AND u.google_sub = $2 AND s.expires_at > now()")
+        .bind(sid)
+        .bind(sub)
+        .execute(&state.db)
+        .await
+        .map_err(|_| "google_failed")?
+        .rows_affected();
+    if n != 1 {
+        return Err("google_session");
+    }
+    crate::features::team::audit(state, &ctx, "login.reauth", None, json!({"method": "google"})).await;
+    Ok(())
+}
+
+/// Finish the sign-in. Errors are codes the login page explains:
+/// cancelled, expired, unavailable, google, unverified, conflict, closed, failed.
+async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> Result<(Uuid, Uuid, String), &'static str> {
+    if let Some(e) = &q.error {
+        return Err(if e == "access_denied" { "cancelled" } else { "google" });
+    }
+    client(state).ok_or("unavailable")?;
+    let flow = cookie.and_then(|c| read_flow(state, &c)).ok_or("expired")?;
+    let (claims, _) = exchange(state, &flow, &q).await?;
+    let next = flow.next;
     // Coming back from an invite link with no login yet: join that account instead of starting one.
     let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE google_sub = $1 OR email = $2)").bind(&claims.sub).bind(&claims.email).fetch_one(&state.db).await.map_err(|_| "failed")?;
     if !known {

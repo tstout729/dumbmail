@@ -72,11 +72,24 @@ export function onUnauthorized(handler: () => void): () => void {
   };
 }
 
+/**
+ * Headers every write adds: the account this page shows. The server refuses writes made with the
+ * session cookie that don't say it. For requests that can't go through `api` (uploads, downloads).
+ */
+export function writeHeaders(): Record<string, string> {
+  return boundAccount ? { "X-DumbMail-Account": boundAccount } : {};
+}
+
+/** The server said this page shows another account (or is out of date): reload it. */
+export function reloadIfAccountChanged(status: number, code: string | undefined) {
+  if (status === 409 && code === "account_changed") window.location.reload();
+}
+
 export async function api<T>(method: Method, path: string, body?: unknown): Promise<T> {
   let res: Response;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (method !== "GET" && boundAccount) headers["X-DumbMail-Account"] = boundAccount;
+  if (method !== "GET") Object.assign(headers, writeHeaders());
   try {
     res = await fetch(path, {
       method,
@@ -103,7 +116,7 @@ export async function api<T>(method: Method, path: string, body?: unknown): Prom
     const code = err?.code ?? (res.status === 401 ? "unauthorized" : res.status === 404 ? "not_found" : "internal");
     const message = err?.message ?? `Request failed (${res.status})`;
     if (res.status === 401 && !path.startsWith("/api/auth/") && path !== "/api/me") unauthorizedHandler?.();
-    if (res.status === 409 && code === "account_changed") window.location.reload();
+    reloadIfAccountChanged(res.status, code);
     throw new ApiError(res.status, code, message);
   }
 

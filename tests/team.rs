@@ -32,6 +32,10 @@ impl S {
 
 async fn send(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value, axum::http::HeaderMap) {
     let mut b = Request::builder().method(method).uri(path).header("x-real-ip", &s.ip).header(header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Firefox/130.0");
+    // The dashboard's own pages: requests come from the app's host.
+    if method != "GET" {
+        b = b.header(header::ORIGIN, h.state.cfg.public_url());
+    }
     if let Some(c) = &s.cookie {
         b = b.header(header::COOKIE, c);
     }

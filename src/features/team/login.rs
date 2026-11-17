@@ -70,6 +70,9 @@ pub struct SessionStart {
     pub mfa_ok: bool,
     /// The person just typed their password, which counts as confirming it's them.
     pub entered_password: bool,
+    /// For single sign-on: the provider settings revision the sign-in ran under. The session is
+    /// only made while it's still the current one (and single sign-on is still on).
+    pub sso_revision: Option<i32>,
 }
 
 /// Start a browser session. `method` is password, google or sso (`sso_account` is the account
@@ -83,9 +86,11 @@ pub async fn start_session_with(state: &AppState, user_id: Uuid, account_id: Uui
     // One statement, holding the login's row: a reset that changed the password after it was
     // checked (or is changing it right now) leaves no row to insert from.
     let n = sqlx::query(
-        "INSERT INTO sessions (id, token_hash, user_id, account_id, expires_at, auth_method, sso_account_id, ip, user_agent, mfa_ok, reauth_at)
-         SELECT $1, $2, u.id, $4, now() + interval '30 days', $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END
-         FROM users u WHERE u.id = $3 AND ($11::int IS NULL OR u.credential_version = $11) FOR SHARE",
+        "INSERT INTO sessions (id, token_hash, user_id, account_id, expires_at, auth_method, sso_account_id, ip, user_agent, mfa_ok, reauth_at, sso_revision)
+         SELECT $1, $2, u.id, $4, now() + interval '30 days', $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END, $12
+         FROM users u WHERE u.id = $3 AND ($11::int IS NULL OR u.credential_version = $11)
+           AND ($12::int IS NULL OR EXISTS (SELECT 1 FROM account_sso c WHERE c.account_id = $6 AND c.enabled AND c.revision = $12))
+         FOR SHARE OF u",
     )
     .bind(Uuid::now_v7())
     .bind(auth::sha256_hex(&token))
@@ -98,10 +103,14 @@ pub async fn start_session_with(state: &AppState, user_id: Uuid, account_id: Uui
     .bind(how.mfa_ok)
     .bind(how.entered_password)
     .bind(how.credential_version)
+    .bind(how.sso_revision)
     .execute(&state.db)
     .await?
     .rows_affected();
     if n != 1 {
+        if how.sso_revision.is_some() {
+            return Err(AppError::Conflict("the single sign-on settings changed while you were signing in; sign in again".into()));
+        }
         return Err(AppError::BadRequest("your password just changed; sign in again with the new one".into()));
     }
     sqlx::query("UPDATE users SET last_account_id = $2 WHERE id = $1").bind(user_id).bind(account_id).execute(&state.db).await?;
@@ -144,6 +153,9 @@ struct SessionRow {
     sso_account_id: Option<Uuid>,
     last_seen_at: DateTime<Utc>,
     reauth_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    sso_revision: Option<i32>,
+    sso_current_revision: Option<i32>,
     role: Option<String>,
     require_two_factor: bool,
     totp_on: bool,
@@ -168,8 +180,8 @@ pub async fn ctx_for_session_id(state: &AppState, sid: Uuid, meta: &ReqMeta) -> 
 
 async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<Uuid>, meta: &ReqMeta) -> AppResult<Ctx> {
     let row: Option<SessionRow> = sqlx::query_as(
-        "SELECT s.id, s.token_hash, s.user_id, s.account_id, s.auth_method, s.mfa_ok, s.sso_account_id, s.last_seen_at, s.reauth_at,
-                m.role, a.require_two_factor, (u.totp_enabled_at IS NOT NULL) AS totp_on, u.email,
+        "SELECT s.id, s.token_hash, s.user_id, s.account_id, s.auth_method, s.mfa_ok, s.sso_account_id, s.last_seen_at, s.reauth_at, s.created_at,
+                s.sso_revision, CASE WHEN sso.enabled THEN sso.revision END AS sso_current_revision, m.role, a.require_two_factor, (u.totp_enabled_at IS NOT NULL) AS totp_on, u.email,
                 COALESCE(sso.enabled AND sso.enforce, false) AS sso_enforced, COALESCE(sso.domains, '{}') AS sso_domains
          FROM sessions s
          JOIN users u ON u.id = s.user_id
@@ -185,7 +197,9 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
     let r = row.ok_or(AppError::Unauthorized)?;
     let role = r.role.as_deref().and_then(Role::parse).ok_or(AppError::Unauthorized)?;
     let sso_session = r.auth_method == "sso";
-    if sso_session && r.sso_account_id != Some(r.account_id) {
+    // A single sign-on session works only in its own account, and only while the provider
+    // settings it started under are still the current ones (and still on).
+    if sso_session && (r.sso_account_id != Some(r.account_id) || r.sso_revision.is_none() || r.sso_revision != r.sso_current_revision) {
         return Err(AppError::Unauthorized);
     }
     // Sessions from before session ids existed get one the first time they're used.
@@ -222,6 +236,8 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
         sso_session,
         restriction,
         reauth_at: r.reauth_at,
+        // A Google sign-in made this session; for accepting an owner invite right after it.
+        google_sign_in_at: (r.auth_method == "google").then_some(r.created_at),
         ip: meta.ip.clone(),
         user_agent: meta.user_agent.clone(),
     })
@@ -268,6 +284,7 @@ pub async fn key_ctx(state: &AppState, key: &str, meta: &ReqMeta) -> AppResult<C
         sso_session: false,
         restriction: None,
         reauth_at: None,
+        google_sign_in_at: None,
         ip: meta.ip.clone(),
         user_agent: meta.user_agent.clone(),
     })
@@ -295,9 +312,9 @@ pub async fn me_json(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
         }
         None => Vec::new(),
     };
-    let two_factor: bool = match ctx.user_id {
-        Some(uid) => sqlx::query_scalar("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?,
-        None => false,
+    let (two_factor, has_password, has_google): (bool, bool, bool) = match ctx.user_id {
+        Some(uid) => sqlx::query_as("SELECT totp_enabled_at IS NOT NULL, password_hash IS NOT NULL, google_sub IS NOT NULL FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?,
+        None => (false, false, false),
     };
     let key = match ctx.api_key_id {
         Some(id) => sqlx::query_as::<_, (String, String, Vec<String>)>("SELECT name, prefix, scopes FROM api_keys WHERE id = $1")
@@ -318,6 +335,7 @@ pub async fn me_json(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
         "restriction_message": ctx.restriction.map(|r| r.message()),
         "sign_in_method": if ctx.via_api_key { None } else if ctx.sso_session { Some("sso") } else { Some("other") },
         "two_factor_enabled": two_factor,
+        "login_methods": {"password": has_password, "google": has_google},
         "accounts": accounts,
         "api_key": key,
         "support_email": state.cfg.support_email,
@@ -346,30 +364,105 @@ pub fn login_delay(failures: i32) -> std::time::Duration {
     std::time::Duration::from_millis((failures.saturating_sub(5).max(0) as u64 * 200).min(3000))
 }
 
+/// The wait before checking a password from an address that's had `failures` wrong guesses
+/// (across every email) lately: nothing for the first 30, then 200 ms more for each, up to 8
+/// seconds. Shared addresses (an office, a phone network) are slowed down, never locked out.
+pub fn ip_login_delay(failures: i32) -> std::time::Duration {
+    std::time::Duration::from_millis((failures.saturating_sub(30).max(0) as u64 * 200).min(8000))
+}
+
+/// Password checks one address may have running at once, so waiting can't be used to pile up work.
+const LOGIN_IN_FLIGHT_PER_IP: i32 = 4;
+/// How long an in-flight count lasts if a server stops halfway; longer than any wait.
+const IN_FLIGHT_WINDOW: i64 = 60;
+
 /// Check an email and password and start a session. The answer is the same for an unknown email,
 /// a wrong password and a login that only uses Google.
 ///
-/// Throttling only ever counts failures: per address (30 in 15 minutes) and per email from one
-/// address (10 in 15 minutes) they're refused; per email from everywhere they only slow the next
-/// check down ([`login_delay`]). The right password is never refused because of other people's
-/// wrong guesses.
+/// Throttling only ever counts failures. Only the pair (email, address) is refused: 10 wrong
+/// passwords in 15 minutes. Failures per email from everywhere ([`login_delay`]) and per address
+/// across emails ([`ip_login_delay`]) only slow the next check down, and an address can have only
+/// a few checks running at once. So the right password always gets in once its wait is over,
+/// whatever other people at the same address typed.
 pub async fn password_login(state: &AppState, email: &str, password: &str, meta: &ReqMeta) -> AppResult<String> {
     let email = email.trim().to_lowercase();
     let ip = meta.ip.as_deref().unwrap_or("unknown");
     // Counted up front and given back on success, so parallel guesses can't slip past.
-    let ip_bucket = format!("login:ip:{ip}");
     let pair_bucket = format!("login:email-ip:{email}|{ip}");
+    let ip_fail_bucket = format!("login:fail-ip:{ip}");
     let email_bucket = format!("login:email:{email}");
-    let ip_limit = if meta.ip.is_some() { 30 } else { 600 };
-    ratelimit::hit(state, &ip_bucket, ip_limit, LOGIN_WINDOW).await?;
-    if let Err(e) = ratelimit::hit(state, &pair_bucket, 10, LOGIN_WINDOW).await {
-        ratelimit::refund(state, &ip_bucket, LOGIN_WINDOW).await?;
-        return Err(e);
+    let in_flight = format!("login:in-flight:{ip}");
+    ratelimit::hit(state, &pair_bucket, 10, LOGIN_WINDOW).await?;
+    let in_flight_limit = if meta.ip.is_some() { LOGIN_IN_FLIGHT_PER_IP } else { LOGIN_IN_FLIGHT_PER_IP * 20 };
+    let slot = InFlight { state: state.clone(), bucket: in_flight };
+    if ratelimit::hit(state, &slot.bucket, in_flight_limit, IN_FLIGHT_WINDOW).await.is_err() {
+        slot.release().await;
+        ratelimit::refund(state, &pair_bucket, LOGIN_WINDOW).await?;
+        return Err(AppError::Busy("Too many sign-ins from your network at once. Try again in a moment.".into()));
     }
-    let failures = ratelimit::count(state, &email_bucket, LOGIN_WINDOW).await?;
-    tokio::time::sleep(login_delay(failures)).await;
+    let checked = check_password(state, &email, password, &email_bucket, &ip_fail_bucket, meta.ip.is_some()).await;
+    slot.release().await;
+    let row = checked?;
     let bad = || AppError::BadRequest("that email and password don't match (if you signed up with Google, use Continue with Google)".into());
-    let row: Option<(Uuid, Option<String>, i32)> = sqlx::query_as("SELECT id, password_hash, credential_version FROM users WHERE email = $1").bind(&email).fetch_optional(&state.db).await?;
+    let (user_id, version) = match row {
+        Ok((uid, version)) => {
+            ratelimit::refund(state, &pair_bucket, LOGIN_WINDOW).await?;
+            (uid, version)
+        }
+        Err(Some(uid)) => {
+            for account_id in user_accounts(state, uid).await? {
+                record(state, account_id, &meta.actor(Some(uid)), "login.failed", Some(&email), json!({"method": "password"})).await;
+            }
+            return Err(bad());
+        }
+        Err(None) => return Err(bad()),
+    };
+    let account_id = pick_account(state, user_id).await?.ok_or_else(|| AppError::Forbidden("this login isn't part of any account anymore; ask a teammate to invite you again".into()))?;
+    let how = SessionStart { credential_version: Some(version), mfa_ok: false, entered_password: true, ..Default::default() };
+    let token = start_session_with(state, user_id, account_id, "password", None, meta, how).await?;
+    record(state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "password"})).await;
+    Ok(token)
+}
+
+/// One running password check from an address, given back when it ends, even if the request is
+/// dropped halfway (a closed connection).
+struct InFlight {
+    state: AppState,
+    bucket: String,
+}
+
+impl InFlight {
+    async fn release(mut self) {
+        let bucket = std::mem::take(&mut self.bucket);
+        if let Err(e) = ratelimit::refund(&self.state, &bucket, IN_FLIGHT_WINDOW).await {
+            tracing::warn!(error = %e, "couldn't release a sign-in slot");
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.bucket.is_empty() {
+            return;
+        }
+        let (state, bucket) = (self.state.clone(), std::mem::take(&mut self.bucket));
+        tokio::spawn(async move {
+            if let Err(e) = ratelimit::refund(&state, &bucket, IN_FLIGHT_WINDOW).await {
+                tracing::warn!(error = %e, "couldn't release a sign-in slot");
+            }
+        });
+    }
+}
+
+/// Wait out the delays, then check the password. `Ok`: the login and its credential version;
+/// `Err(Some(user))`: a wrong password for a login; `Err(None)`: no such login (or no password).
+/// Failures are counted for the email and the address.
+async fn check_password(state: &AppState, email: &str, password: &str, email_bucket: &str, ip_bucket: &str, known_ip: bool) -> AppResult<Result<(Uuid, i32), Option<Uuid>>> {
+    let email_failures = ratelimit::count(state, email_bucket, LOGIN_WINDOW).await?;
+    let ip_failures = ratelimit::count(state, ip_bucket, LOGIN_WINDOW).await?;
+    let ip_failures = if known_ip { ip_failures } else { ip_failures / 20 };
+    tokio::time::sleep(login_delay(email_failures).max(ip_login_delay(ip_failures))).await;
+    let row: Option<(Uuid, Option<String>, i32)> = sqlx::query_as("SELECT id, password_hash, credential_version FROM users WHERE email = $1").bind(email).fetch_optional(&state.db).await?;
     let ok = match &row {
         Some((_, Some(hash), _)) => auth::verify_password(password, hash),
         _ => {
@@ -378,27 +471,14 @@ pub async fn password_login(state: &AppState, email: &str, password: &str, meta:
         }
     };
     if !ok {
-        ratelimit::hit(state, &email_bucket, i32::MAX, LOGIN_WINDOW).await?;
+        ratelimit::hit(state, email_bucket, i32::MAX, LOGIN_WINDOW).await?;
+        ratelimit::hit(state, ip_bucket, i32::MAX, LOGIN_WINDOW).await?;
     }
-    let (user_id, version) = match row {
-        Some((uid, _, version)) if ok => {
-            ratelimit::refund(state, &ip_bucket, LOGIN_WINDOW).await?;
-            ratelimit::refund(state, &pair_bucket, LOGIN_WINDOW).await?;
-            (uid, version)
-        }
-        Some((uid, _, _)) => {
-            for account_id in user_accounts(state, uid).await? {
-                record(state, account_id, &meta.actor(Some(uid)), "login.failed", Some(&email), json!({"method": "password"})).await;
-            }
-            return Err(bad());
-        }
-        None => return Err(bad()),
-    };
-    let account_id = pick_account(state, user_id).await?.ok_or_else(|| AppError::Forbidden("this login isn't part of any account anymore; ask a teammate to invite you again".into()))?;
-    let how = SessionStart { credential_version: Some(version), mfa_ok: false, entered_password: true };
-    let token = start_session_with(state, user_id, account_id, "password", None, meta, how).await?;
-    record(state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "password"})).await;
-    Ok(token)
+    Ok(match row {
+        Some((uid, _, version)) if ok => Ok((uid, version)),
+        Some((uid, _, _)) => Err(Some(uid)),
+        None => Err(None),
+    })
 }
 
 async fn user_accounts(state: &AppState, user_id: Uuid) -> AppResult<Vec<Uuid>> {
@@ -646,8 +726,10 @@ pub async fn enable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJs
     }
     code_ok(&state, uid).await?;
     let codes = new_recovery_codes(&state, uid).await?;
+    // Setting up a factor finishes a sign-in that was waiting for one, but it doesn't confirm
+    // it's you: nothing already known was checked (see `reauth_h`).
     if let Some(sid) = ctx.session_id {
-        sqlx::query("UPDATE sessions SET mfa_ok = true, reauth_at = now() WHERE id = $1").bind(sid).execute(&state.db).await?;
+        sqlx::query("UPDATE sessions SET mfa_ok = true WHERE id = $1").bind(sid).execute(&state.db).await?;
     }
     // Password sessions elsewhere haven't entered a code; they sign in again with one.
     let signed_out = revoke_unverified_sessions(&state, uid, ctx.session_id).await?;
@@ -712,6 +794,12 @@ pub struct ReauthBody {
 
 /// `POST /api/me/reauth`: re-enter your password or a two-factor code. For the next
 /// `access::FRESH_SIGN_IN_MINUTES` minutes this session may make, remove or demote owners.
+///
+/// Only something that was already there counts: the current password, or a code from a factor
+/// turned on before this session last confirmed it's you (signing in with a code counts). A
+/// factor this session just set up proves nothing, so its codes don't count until the person
+/// signs in again. People who sign in with Google can confirm with Google instead
+/// (`GET /api/auth/google?reauth=1`).
 pub async fn reauth_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ReauthBody>) -> AppResult<Json<Value>> {
     let uid = need_user(&ctx)?;
     let sid = ctx.session_id.ok_or(AppError::Unauthorized)?;
@@ -724,7 +812,16 @@ pub async fn reauth_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJs
                 None => return Err(AppError::bad("your login has no password; enter a two-factor code instead")),
             }
         }
-        (_, Some(code)) => check_code(&state, uid, code).await?,
+        (_, Some(code)) => {
+            let enabled_at: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT totp_enabled_at FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
+            let older = matches!((enabled_at, ctx.reauth_at), (Some(on), Some(last)) if on <= last);
+            if !older {
+                return Err(AppError::bad(
+                    "two-factor login was turned on after this session last confirmed it's you, so its codes don't count here yet; use your password (or Continue with Google), or sign out and back in with a code",
+                ));
+            }
+            check_code(&state, uid, code).await?
+        }
         _ => return Err(AppError::bad("enter your password or a code from your authenticator app")),
     };
     if !ok {

@@ -184,7 +184,11 @@ pub enum Perm {
     Domains,
     BillingRead,
     BillingWrite,
+    /// Who's on the team: names, emails and roles.
     TeamRead,
+    /// The team's security details: open invites, sign-in activity, two-factor and single sign-on
+    /// status, and the account's security settings. Admins and owners.
+    TeamSecurityRead,
     TeamManage,
     ApiKeys,
     /// The account's two-factor requirement. Browser sessions only.
@@ -196,7 +200,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    pub const ALL: [Perm; 37] = [
+    pub const ALL: [Perm; 38] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -229,6 +233,7 @@ impl Perm {
         Perm::BillingRead,
         Perm::BillingWrite,
         Perm::TeamRead,
+        Perm::TeamSecurityRead,
         Perm::TeamManage,
         Perm::ApiKeys,
         Perm::Security,
@@ -272,6 +277,7 @@ impl Perm {
             BillingRead => "billing.read",
             BillingWrite => "billing.write",
             TeamRead => "team.read",
+            TeamSecurityRead => "team.security_read",
             TeamManage => "team.manage",
             ApiKeys => "api_keys.manage",
             Security => "security.manage",
@@ -285,15 +291,16 @@ impl Perm {
         use Perm::*;
         Some(match self {
             Public | Me | Mcp | OwnLogin | TwoFactorStep | SwitchAccount | ConfirmIdentity | Security | Ownership | TransactionalSend => return None,
-            AudienceRead | ProfilesRead | Export => (Area::Audience, false),
-            AudienceWrite => (Area::Audience, true),
+            AudienceRead | ProfilesRead => (Area::Audience, false),
+            // An export copies people's data out, so a read-only key can't start or fetch one.
+            AudienceWrite | Export => (Area::Audience, true),
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),
             ContentWrite | FormsWrite | CatalogWrite | CatalogDelete => (Area::Content, true),
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
-            AccountRead | BillingRead | TeamRead | AuditRead => (Area::Account, false),
+            AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead => (Area::Account, false),
             SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys => (Area::Account, true),
         })
     }
@@ -307,6 +314,19 @@ impl Perm {
     pub fn before_full_sign_in(self) -> bool {
         matches!(self, Perm::Public | Perm::Me | Perm::TwoFactorStep | Perm::SwitchAccount)
     }
+}
+
+/// Refuse a report or metric query that would show people's own values (a raw event or profile
+/// property, which can hold an email address) unless the caller may read profiles. `what` names
+/// the grouping for the message. Totals and time series never need it.
+pub fn require_people_values(ctx: &Ctx, what: &str) -> AppResult<()> {
+    if allows(ctx, ProfilesRead) {
+        return Ok(());
+    }
+    let who = if ctx.via_api_key { "this API key" } else { "your role" };
+    Err(AppError::Forbidden(format!(
+        "grouping by {what} shows people's own values (an email address, say), which needs permission to see profiles; {who} can see totals and time series, or groups like day, campaign or channel"
+    )))
 }
 
 /// Whether this caller may send transactional messages (for the transactional sending module).
@@ -372,7 +392,7 @@ pub fn scopes_allow(scopes: &[String], perm: Perm) -> bool {
     let Some((area, write)) = perm.area() else { return true };
     // The team and the audit log are about people, not marketing data: plain `read` doesn't
     // include them; they need the account scope.
-    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::AuditRead);
+    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::TeamSecurityRead | Perm::AuditRead);
     scopes.iter().any(|s| {
         let s = s.as_str();
         s == area.as_str() || (!write && (s.strip_suffix(":read") == Some(area.as_str()) || (broad_read_ok && s == "read")))
@@ -702,7 +722,7 @@ fn denied(ctx: &Ctx, perm: Perm) -> AppError {
     if ctx.via_api_key && !ctx.scopes.as_deref().is_some_and(|s| scopes_allow(s, perm)) {
         let need = match perm {
             TransactionalSend => TRANSACTIONAL_SCOPE.to_string(),
-            TeamRead | AuditRead => "account:read".into(),
+            TeamRead | TeamSecurityRead | AuditRead => "account:read".into(),
             _ => perm.area().map(|(a, w)| if w { a.as_str().to_string() } else { format!("{}:read", a.as_str()) }).unwrap_or_else(|| "full".into()),
         };
         return AppError::Forbidden(format!("this API key's scopes don't allow that (it needs the {need} scope)"));
@@ -745,6 +765,23 @@ pub fn granted(ctx: &Ctx) -> Vec<&'static str> {
 /// How recently a session must have re-entered its password or a code to change ownership.
 pub const FRESH_SIGN_IN_MINUTES: i64 = 10;
 
+fn within_fresh_window(t: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    t.is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::minutes(FRESH_SIGN_IN_MINUTES))
+}
+
+/// Refuse unless this browser session proved who it is in the last [`FRESH_SIGN_IN_MINUTES`]
+/// minutes to accept an owner invite: it confirmed it's you (as for [`require_fresh_sign_in`]), or
+/// a Google sign-in just started it. Signing in with a password stamps the confirmation itself.
+pub fn require_fresh_for_ownership_invite(ctx: &Ctx) -> AppResult<()> {
+    if ctx.via_api_key || ctx.session_id.is_none() {
+        return Err(AppError::Forbidden("sign in to the dashboard to accept this invite".into()));
+    }
+    if within_fresh_window(ctx.reauth_at) || within_fresh_window(ctx.google_sign_in_at) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden("this invite makes you an owner, so confirm it's you first: enter your password or a two-factor code (or continue with Google), then accept again".into()))
+}
+
 /// Refuse unless this is a browser session that re-entered its password or a two-factor code in
 /// the last [`FRESH_SIGN_IN_MINUTES`] minutes. Anything that makes, removes or demotes an owner
 /// needs it, so a stolen API key or an unattended browser can't take an account over.
@@ -752,8 +789,7 @@ pub fn require_fresh_sign_in(ctx: &Ctx) -> AppResult<()> {
     if ctx.via_api_key || ctx.session_id.is_none() {
         return Err(AppError::Forbidden("only an owner signed in to the dashboard can make, remove or demote owners; API keys and MCP can't".into()));
     }
-    let fresh = ctx.reauth_at.is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::minutes(FRESH_SIGN_IN_MINUTES));
-    if !fresh {
+    if !within_fresh_window(ctx.reauth_at) {
         return Err(AppError::Forbidden("confirm it's you first: enter your password or a two-factor code, then try again".into()));
     }
     Ok(())
@@ -795,6 +831,8 @@ mod tests {
         assert!(!Role::Content.has(CampaignSend) && !Role::Content.has(Export) && !Role::Content.has(ProfilesRead) && !Role::Content.has(TransactionalSend));
         assert!(Role::Manager.has(ReportsManage) && Role::Manager.has(CatalogWrite) && !Role::Manager.has(CatalogDelete) && Role::Admin.has(CatalogDelete));
         assert!(!Role::Analyst.has(ReportsManage) && !Role::Content.has(CatalogWrite) && Role::Content.has(ContentRead));
+        assert!(Role::Owner.has(TeamSecurityRead) && Role::Admin.has(TeamSecurityRead));
+        assert!(Role::Manager.has(TeamRead) && !Role::Manager.has(TeamSecurityRead) && !Role::Analyst.has(TeamSecurityRead) && !Role::Content.has(TeamSecurityRead));
     }
 
     #[test]
@@ -807,6 +845,9 @@ mod tests {
     fn scopes() {
         assert!(scopes_allow(&s(&["full"]), CampaignSend));
         assert!(scopes_allow(&s(&["read"]), ProfilesRead));
+        // Exports copy people's data out: never with a read-only key.
+        assert!(!scopes_allow(&s(&["read"]), Export) && !scopes_allow(&s(&["audience:read"]), Export) && !scopes_allow(&s(&["analytics"]), Export));
+        assert!(scopes_allow(&s(&["audience"]), Export) && scopes_allow(&s(&["full"]), Export));
         assert!(!scopes_allow(&s(&["read"]), AudienceWrite));
         assert!(scopes_allow(&s(&["audience"]), AudienceWrite));
         assert!(!scopes_allow(&s(&["audience"]), MessagingRead));

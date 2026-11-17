@@ -12,14 +12,18 @@
 //!   a login is invited first. So an identity provider can't take over a login it doesn't already
 //!   share an account with, or one squatted before the company set it up;
 //! - a login linked to one identity at a provider is never moved to another by an email match;
-//!   an owner resets the link first (`DELETE /api/team/members/{user_id}/sso`);
+//!   an owner resets the link first (`DELETE /api/team/members/{user_id}/sso`). Links belong to
+//!   the account: the same provider used by another account has its own links;
 //! - someone removed from the account isn't added back by just-in-time joining until an owner
 //!   or admin invites them again (`team_removals`);
 //! - when the account requires two-factor login, a sign-in counts only if the ID token's `amr`
-//!   claim shows a second factor, or the owner said the provider enforces one; otherwise the
-//!   person also enters their DumbMail code;
-//! - turning single sign-on off, removing it, or pointing it at another provider (issuer or
-//!   client) ends every session it started;
+//!   claim shows two factors (`mfa`, or two different kinds, see [`amr_shows_second_factor`]),
+//!   or the owner said the provider enforces one; otherwise the person also enters their
+//!   DumbMail code;
+//! - the settings carry a revision that goes up whenever something that decides who gets in
+//!   changes (provider, client, secret, domains, turning it off, the verified-email and two-step
+//!   promises). A sign-in started under an older revision gets no session, and sessions started
+//!   under one stop working; removing single sign-on ends them too;
 //! - an identity provider can only sign people in with emails on those domains;
 //! - a single sign-on session opens only that account. It can't open the person's other accounts
 //!   or change their password, two-factor or sessions (see `access::allows`).
@@ -154,11 +158,12 @@ struct Config {
     default_role: String,
     verified_emails_only: bool,
     idp_enforces_mfa: bool,
+    revision: i32,
 }
 
 async fn load(state: &AppState, account_id: Uuid) -> AppResult<Option<Config>> {
     Ok(sqlx::query_as(
-        "SELECT account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role, verified_emails_only, idp_enforces_mfa
+        "SELECT account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role, verified_emails_only, idp_enforces_mfa, revision
          FROM account_sso WHERE account_id = $1",
     )
         .bind(account_id)
@@ -268,14 +273,27 @@ pub async fn put_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<
     if meta.token_endpoint().is_none() {
         return Err(AppError::bad("that identity provider doesn't list a token endpoint"));
     }
-    // Off, or another provider: sessions the old settings started end in the same transaction.
-    let replaced = existing.as_ref().is_some_and(|c| c.issuer != issuer || c.client_id != client_id || (c.enabled && !b.enabled));
+    // Anything that decides who gets in: a new revision, so sign-ins started under the old
+    // settings get no session and sessions they started end (in the same transaction). Only the
+    // enforcement, joining and default-role settings change without one.
+    let replaced = existing.as_ref().is_some_and(|c| {
+        let plain = |enc: &str| crate::crypto::decrypt(&state.cfg.secret_key, enc).ok();
+        let new_secret = c.client_secret_enc != secret_enc && plain(&c.client_secret_enc).zip(plain(&secret_enc)).is_none_or(|(old, new)| !login::same(&old, &new));
+        c.issuer != issuer
+            || c.client_id != client_id
+            || new_secret
+            || c.enabled != b.enabled
+            || c.domains != domains
+            || c.verified_emails_only != b.verified_emails_only
+            || c.idp_enforces_mfa != b.idp_enforces_mfa
+    });
     let mut tx = state.db.begin().await?;
     sqlx::query(
         "INSERT INTO account_sso (account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role, verified_emails_only, idp_enforces_mfa)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (account_id) DO UPDATE SET enabled = $2, issuer = $3, client_id = $4, client_secret_enc = $5, secret_hint = $6, domains = $7,
-            enforce = $8, auto_join = $9, default_role = $10, verified_emails_only = $11, idp_enforces_mfa = $12, updated_at = now()",
+            enforce = $8, auto_join = $9, default_role = $10, verified_emails_only = $11, idp_enforces_mfa = $12, updated_at = now(),
+            revision = account_sso.revision + CASE WHEN $13 THEN 1 ELSE 0 END",
     )
     .bind(ctx.account_id)
     .bind(b.enabled)
@@ -289,6 +307,7 @@ pub async fn put_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<
     .bind(role.as_str())
     .bind(b.verified_emails_only)
     .bind(b.idp_enforces_mfa)
+    .bind(replaced)
     .execute(&mut *tx)
     .await?;
     let ended = if replaced { end_sso_sessions(&mut tx, ctx.account_id).await? } else { 0 };
@@ -379,7 +398,7 @@ pub async fn start_h(State(state): State<AppState>, headers: HeaderMap, jar: Coo
     }
     let (url, csrf, nonce) = req.url();
     let next = B64.encode(safe_next(q.next.as_deref()));
-    let payload = format!("{}|{}|{}|{}|{next}", cfg.account_id, csrf.secret(), nonce.secret(), verifier.secret());
+    let payload = format!("{}|{}|{}|{}|{next}|{}", cfg.account_id, csrf.secret(), nonce.secret(), verifier.secret(), cfg.revision);
     let cookie = Cookie::build((SSO_COOKIE, auth::sign(&state.cfg.secret_key, &payload)))
         .path(SSO_COOKIE_PATH)
         .http_only(true)
@@ -406,7 +425,17 @@ pub async fn callback_h(State(state): State<AppState>, headers: HeaderMap, jar: 
         return (jar, login_error(&state, "sso_busy"));
     }
     match finish(&state, cookie, q, &meta).await {
-        Ok(Done { user_id, account_id, next, mfa }) => match login::start_session_with(&state, user_id, account_id, "sso", Some(account_id), &meta, login::SessionStart { mfa_ok: mfa, ..Default::default() }).await {
+        Ok(Done { user_id, account_id, next, mfa, revision }) => match login::start_session_with(
+            &state,
+            user_id,
+            account_id,
+            "sso",
+            Some(account_id),
+            &meta,
+            login::SessionStart { mfa_ok: mfa, sso_revision: Some(revision), ..Default::default() },
+        )
+        .await
+        {
             Ok(token) => {
                 record(&state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "sso", "second_factor": mfa})).await;
                 (jar.add(session_cookie(&state, token)), Redirect::to(&format!("{}{next}", state.cfg.public_url())))
@@ -430,20 +459,39 @@ struct Done {
     next: String,
     /// The sign-in had a second factor (by the `amr` claim, or the owner's word for the provider).
     mfa: bool,
+    /// The settings revision the sign-in started (and finished) under.
+    revision: i32,
 }
 
-/// `amr` values (RFC 8176) that mean more than a password was used.
-const SECOND_FACTOR_AMR: [&str; 14] = ["mfa", "mca", "otp", "hwk", "swk", "sc", "pop", "sms", "tel", "fpt", "face", "iris", "retina", "vbm"];
+/// `amr` values (RFC 8176) by the kind of factor they are: something known, something held,
+/// something you are.
+const KNOWN_AMR: [&str; 3] = ["pwd", "pin", "kba"];
+const HELD_AMR: [&str; 7] = ["otp", "hwk", "swk", "sms", "tel", "sc", "pop"];
+const INHERENT_AMR: [&str; 5] = ["fpt", "face", "iris", "retina", "vbm"];
 
+/// Whether an ID token's `amr` shows two factors: `mfa` itself, or at least two different kinds
+/// (a password and a one-time code, say). One method on its own, even a code or a security key,
+/// isn't proof of two.
 pub fn amr_shows_second_factor<'a>(amr: impl IntoIterator<Item = &'a str>) -> bool {
-    amr.into_iter().any(|v| SECOND_FACTOR_AMR.contains(&v.trim().to_ascii_lowercase().as_str()))
+    let (mut known, mut held, mut inherent) = (false, false, false);
+    for v in amr {
+        let v = v.trim().to_ascii_lowercase();
+        if v == "mfa" {
+            return true;
+        }
+        known |= KNOWN_AMR.contains(&v.as_str());
+        held |= HELD_AMR.contains(&v.as_str());
+        inherent |= INHERENT_AMR.contains(&v.as_str());
+    }
+    [known, held, inherent].iter().filter(|k| **k).count() >= 2
 }
 
 async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _meta: &ReqMeta) -> Result<Done, Fail> {
     let payload = cookie.and_then(|c| auth::verify(&state.cfg.secret_key, &c)).ok_or(("sso_expired", None))?;
     let parts: Vec<&str> = payload.split('|').collect();
-    let [account, csrf, nonce, verifier, next] = parts.as_slice() else { return Err(("sso_expired", None)) };
+    let [account, csrf, nonce, verifier, next, revision] = parts.as_slice() else { return Err(("sso_expired", None)) };
     let account_id: Uuid = account.parse().map_err(|_| ("sso_expired", None))?;
+    let revision: i32 = revision.parse().map_err(|_| ("sso_expired", None))?;
     if q.error.is_some() {
         return Err(("sso_cancelled", Some(account_id)));
     }
@@ -454,6 +502,10 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     let next = B64.decode(next).ok().and_then(|b| String::from_utf8(b).ok()).map(|n| safe_next(Some(&n))).unwrap_or_else(|| "/".into());
     let fail = |c: &'static str| (c, Some(account_id));
     let cfg = load(state, account_id).await.ok().flatten().filter(|c| c.enabled).ok_or(fail("sso_unavailable"))?;
+    // The settings changed after this sign-in started: start again under the new ones.
+    if cfg.revision != revision {
+        return Err(fail("sso_changed"));
+    }
     let secret = crate::crypto::decrypt(&state.cfg.secret_key, &cfg.client_secret_enc).map_err(|_| fail("sso_failed"))?;
     let meta = discover(&cfg.issuer).await.map_err(|_| fail("sso_failed"))?;
     let redirect = RedirectUrl::new(redirect_uri(state)).map_err(|_| fail("sso_failed"))?;
@@ -498,7 +550,7 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     let subject = claims.subject().as_str().to_string();
     let name = claims.name().and_then(|n| n.get(None)).map(|n| mail::plain(n.as_str(), 100)).filter(|n| !n.is_empty());
     match sign_in(state, &cfg, &subject, &email, verified, name).await {
-        Ok(Ok(user_id)) => Ok(Done { user_id, account_id, next, mfa }),
+        Ok(Ok(user_id)) => Ok(Done { user_id, account_id, next, mfa, revision }),
         Ok(Err(code)) => Err(fail(code)),
         Err(e) => {
             tracing::warn!(account = %account_id, error = %e, "SSO sign-in failed");
@@ -516,7 +568,12 @@ async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, ver
     let mut tx = state.db.begin().await?;
     // One sign-in per email at a time, and never alongside a removal of the same person.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("team-member:{}:{email}", cfg.account_id)).execute(&mut *tx).await?;
-    let linked: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sso_identities WHERE issuer = $1 AND subject = $2").bind(&cfg.issuer).bind(subject).fetch_optional(&mut *tx).await?;
+    let linked: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sso_identities WHERE account_id = $1 AND issuer = $2 AND subject = $3")
+        .bind(cfg.account_id)
+        .bind(&cfg.issuer)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
     // An open invite for this verified email counts as being let in (even after a removal).
     // Owner invites are accepted through their link only.
     let invite: Option<(Uuid, String)> = if verified {
@@ -546,7 +603,12 @@ async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, ver
                     if !member {
                         return Ok(Err("sso_not_member"));
                     }
-                    let other: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sso_identities WHERE issuer = $1 AND user_id = $2)").bind(&cfg.issuer).bind(uid).fetch_one(&mut *tx).await?;
+                    let other: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sso_identities WHERE account_id = $1 AND issuer = $2 AND user_id = $3)")
+                        .bind(cfg.account_id)
+                        .bind(&cfg.issuer)
+                        .bind(uid)
+                        .fetch_one(&mut *tx)
+                        .await?;
                     if other {
                         return Ok(Err("sso_relink"));
                     }
@@ -570,9 +632,10 @@ async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, ver
         }
     };
     if linked.is_none() {
-        // The primary key (issuer, subject) and the unique (issuer, user_id) settle a race: whoever
-        // loses inserts nothing and is refused.
-        let n = sqlx::query("INSERT INTO sso_identities (issuer, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        // The primary key (account, issuer, subject) and the unique (account, issuer, user_id)
+        // settle a race: whoever loses inserts nothing and is refused.
+        let n = sqlx::query("INSERT INTO sso_identities (account_id, issuer, subject, user_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+            .bind(cfg.account_id)
             .bind(&cfg.issuer)
             .bind(subject)
             .bind(uid)
@@ -639,8 +702,15 @@ mod tests {
     #[test]
     fn second_factor_from_amr() {
         assert!(super::amr_shows_second_factor(["pwd", "mfa"]));
+        assert!(super::amr_shows_second_factor(["mfa"]));
         assert!(super::amr_shows_second_factor(["pwd", "OTP"]));
-        assert!(super::amr_shows_second_factor(["hwk"]));
+        assert!(super::amr_shows_second_factor(["hwk", "fpt"]));
+        assert!(super::amr_shows_second_factor(["pin", "face"]));
+        // One method alone isn't two factors, nor are two of the same kind.
+        assert!(!super::amr_shows_second_factor(["otp"]));
+        assert!(!super::amr_shows_second_factor(["hwk"]));
+        assert!(!super::amr_shows_second_factor(["otp", "sms"]));
+        assert!(!super::amr_shows_second_factor(["mca"]));
         assert!(!super::amr_shows_second_factor(["pwd"]));
         assert!(!super::amr_shows_second_factor(["pwd", "kba", "pin"]));
         assert!(!super::amr_shows_second_factor(Vec::<&str>::new()));

@@ -64,6 +64,8 @@ pub struct Ctx {
     pub restriction: Option<Restriction>,
     /// When this browser session last re-entered its password or a two-factor code.
     pub reauth_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a Google sign-in started this browser session (None for other sign-ins and keys).
+    pub google_sign_in_at: Option<chrono::DateTime<chrono::Utc>>,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
 }
@@ -92,6 +94,7 @@ impl Ctx {
             sso_session: false,
             restriction: None,
             reauth_at: None,
+            google_sign_in_at: None,
             ip: None,
             user_agent: None,
         }

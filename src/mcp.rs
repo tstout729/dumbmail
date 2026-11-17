@@ -537,7 +537,11 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         }
         "track_event" => aud::track(state, acct, from(a)?).await,
         "list_metrics" => aud::metrics(state, acct).await,
-        "query_metric" => aud::query_metric(state, acct, from(a)?).await,
+        "query_metric" => {
+            let q: aud::MetricQuery = from(a)?;
+            q.check_access(ctx)?;
+            aud::query_metric(state, acct, q).await
+        }
         "get_events" => {
             let q = aud::EventsQuery { metric: a["metric"].as_str().map(String::from), profile_id: opt_uuid(&a, "profile_id")?, limit: Some(a["limit"].as_i64().unwrap_or(50)), offset: None };
             let (rows, total) = aud::events(state, acct, &q).await?;

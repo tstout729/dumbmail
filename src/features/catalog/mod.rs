@@ -193,8 +193,16 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
             Ok(json!({"ok": true, "deleted": p.id}))
         }
         "list_product_feeds" => Ok(json!({"data": feeds::list(&state.db, acct).await?})),
-        "create_product_feed" => Ok(json!(feeds::create(&state.db, acct, feed_input(a)?).await?)),
-        "update_product_feed" => Ok(json!(feeds::update(&state.db, acct, id_arg(a, "id")?, feed_input(a)?).await?)),
+        "create_product_feed" => {
+            let f = feeds::create(&state.db, acct, feed_input(a)?).await?;
+            api::feed_changed(state, ctx, "product_feed.create", &f).await;
+            Ok(json!(f))
+        }
+        "update_product_feed" => {
+            let f = feeds::update(&state.db, acct, id_arg(a, "id")?, feed_input(a)?).await?;
+            api::feed_changed(state, ctx, "product_feed.update", &f).await;
+            Ok(json!(f))
+        }
         "sync_product_feed" => api::sync_feed(state, acct, id_arg(a, "id")?).await,
         "delete_product_feed" => {
             let id = id_arg(a, "id")?;

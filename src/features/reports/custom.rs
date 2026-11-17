@@ -92,6 +92,27 @@ pub struct Spec {
     pub limit: Option<i64>,
 }
 
+impl Spec {
+    /// The grouping that would show people's own values (a raw event or profile property), if any.
+    pub fn people_values(&self) -> Option<&'static str> {
+        if self.group_by.iter().any(|g| g == "property") {
+            Some("an event property")
+        } else if self.group_by.iter().any(|g| g == "country") {
+            Some("a profile property (country)")
+        } else {
+            None
+        }
+    }
+}
+
+/// Refuse a spec whose groups show people's own values unless `ctx` may read profiles.
+pub fn check_access(ctx: &crate::auth::Ctx, spec: &Spec) -> AppResult<()> {
+    match spec.people_values() {
+        Some(what) => crate::features::team::access::require_people_values(ctx, what),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Source {
     Campaigns,

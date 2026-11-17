@@ -695,6 +695,18 @@ pub async fn query_metric(state: &AppState, account_id: Uuid, q: MetricQuery) ->
     Ok(json!({"metric": q.metric, "interval": interval, "start": start, "end": end, "series": series, "total": total}))
 }
 
+impl MetricQuery {
+    /// Grouping by an event property shows people's own values, so it needs permission to read
+    /// profiles; totals and the campaign and flow groupings don't.
+    pub fn check_access(&self, ctx: &Ctx) -> AppResult<()> {
+        match self.group_by.as_deref().filter(|g| !g.is_empty()) {
+            None | Some("campaign" | "flow") => Ok(()),
+            Some(_) => crate::features::team::access::require_people_values(ctx, "an event property"),
+        }
+    }
+}
+
 async fn query_metric_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<MetricQuery>) -> AppResult<Json<Value>> {
+    b.check_access(&ctx)?;
     Ok(Json(query_metric(&state, ctx.account_id, b).await?))
 }

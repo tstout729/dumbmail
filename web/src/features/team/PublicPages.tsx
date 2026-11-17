@@ -5,6 +5,7 @@ import { Button, ButtonLink, Field, InlineError, Input, Skeleton } from "../../c
 import { AuthLayout } from "../../pages/auth/AuthLayout";
 import { GoogleSignIn } from "../../pages/auth/GoogleButton";
 import { useAcceptInvite, useForgotPassword, usePublicInvite, useResetPassword } from "./api";
+import { ConfirmIdentityModal, useGoogleConfirmResult } from "./ConfirmIdentity";
 import { roleLabels } from "./types";
 
 const backToLogin = (
@@ -20,6 +21,8 @@ export function InvitePage() {
   const me = useMe();
   const accept = useAcceptInvite();
   const logout = useLogout();
+  const [confirming, setConfirming] = useState(false);
+  useGoogleConfirmResult();
   const next = `/invite/${token}`;
 
   if (invite.isPending || me.isPending) {
@@ -48,9 +51,23 @@ export function InvitePage() {
         {same ? (
           <div className="space-y-3">
             <InlineError message={accept.error ? errorMessage(accept.error) : null} />
-            <Button variant="primary" className="w-full" loading={accept.isPending} onClick={() => accept.mutate({ token })}>
+            <Button
+              variant="primary"
+              className="w-full"
+              loading={accept.isPending}
+              onClick={() => (inv.confirm_identity_first ? setConfirming(true) : accept.mutate({ token }))}
+            >
               Accept and open {inv.account_name}
             </Button>
+            {confirming ? (
+              <ConfirmIdentityModal
+                title="Confirm it's you"
+                body={<p>This invite makes you an owner of {inv.account_name}. Confirm it's you first.</p>}
+                confirmLabel="Accept"
+                onConfirmed={() => accept.mutateAsync({ token })}
+                onClose={() => setConfirming(false)}
+              />
+            ) : null}
           </div>
         ) : (
           <div className="space-y-3 text-sm text-zinc-600">

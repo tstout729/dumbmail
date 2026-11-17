@@ -186,7 +186,9 @@ fn row_json(r: Row) -> Value {
     })
 }
 
-pub async fn start(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, r: Request) -> AppResult<Value> {
+/// Start an export for `ctx` (recorded in the audit log as soon as it's queued).
+pub async fn start(state: &AppState, ctx: &crate::auth::Ctx, r: Request) -> AppResult<Value> {
+    let (account_id, user_id) = (ctx.account_id, ctx.user_id);
     let (params, filename) = validate(state, account_id, &r).await?;
     let id = Uuid::now_v7();
     let mut tx = state.db.begin().await?;
@@ -205,6 +207,7 @@ pub async fn start(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, r:
     }
     crate::jobs::enqueue(&mut *tx, "reports_export", json!({"export_id": id}), None).await?;
     tx.commit().await?;
+    crate::features::team::audit(state, ctx, "export.start", Some(&id.to_string()), json!({"kind": r.kind})).await;
     get(state, account_id, id).await
 }
 

@@ -168,24 +168,28 @@ async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Str
 }
 
 async fn run_h(State(state): State<AppState>, ctx: Ctx, ApiJson(spec): ApiJson<custom::Spec>) -> AppResult<Json<Value>> {
+    custom::check_access(&ctx, &spec)?;
     Ok(Json(custom::run(&state, ctx.account_id, spec, query::Mode::Request).await?))
 }
 
 async fn run_csv_h(State(state): State<AppState>, ctx: Ctx, ApiJson(spec): ApiJson<custom::Spec>) -> AppResult<Response> {
+    custom::check_access(&ctx, &spec)?;
     let name = format!("report-{}.csv", spec.source);
     let result = custom::run(&state, ctx.account_id, spec, query::Mode::Request).await?;
     Ok(csv_response(&name, saved::result_csv(&result)))
 }
 
-async fn run_saved(state: &AppState, account_id: Uuid, id: &str) -> AppResult<Value> {
+async fn run_saved(state: &AppState, ctx: &Ctx, id: &str) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let report = saved::get(state, account_id, id).await?;
     let spec: custom::Spec = serde_json::from_value(report["spec"].clone())?;
+    custom::check_access(ctx, &spec)?;
     let result = custom::run(state, account_id, spec, query::Mode::Request).await?;
     Ok(json!({"report": report, "result": result}))
 }
 
 async fn run_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<String>) -> AppResult<Json<Value>> {
-    Ok(Json(run_saved(&state, ctx.account_id, &id).await?))
+    Ok(Json(run_saved(&state, &ctx, &id).await?))
 }
 
 async fn members_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -210,6 +214,7 @@ async fn cohorts_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Coho
 }
 
 async fn funnel_h(State(state): State<AppState>, ctx: Ctx, ApiJson(q): ApiJson<cohorts::FunnelQuery>) -> AppResult<Json<Value>> {
+    q.check_access(&ctx)?;
     Ok(Json(cohorts::funnel(&state, ctx.account_id, q).await?))
 }
 
@@ -228,13 +233,8 @@ async fn benchmarks_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<B
 
 // ---------- Exports ----------
 
-async fn export_started(state: &AppState, ctx: &Ctx, v: &Value) {
-    crate::features::team::audit(state, ctx, "export.start", v["id"].as_str(), json!({"kind": v["kind"]})).await;
-}
-
 async fn start_export_h(State(state): State<AppState>, ctx: Ctx, ApiJson(r): ApiJson<exports::Request>) -> AppResult<(StatusCode, Json<Value>)> {
-    let v = exports::start(&state, ctx.account_id, ctx.user_id, r).await?;
-    export_started(&state, &ctx, &v).await;
+    let v = exports::start(&state, &ctx, r).await?;
     Ok((StatusCode::ACCEPTED, Json(v)))
 }
 
@@ -367,9 +367,13 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
     let str_arg = |k: &str| a[k].as_str().map(str::to_string);
     match name {
         "get_report_catalog" => Ok(custom::catalog()),
-        "run_report" => custom::run(state, acct, from(a["spec"].clone())?, query::Mode::Request).await,
+        "run_report" => {
+            let spec: custom::Spec = from(a["spec"].clone())?;
+            custom::check_access(ctx, &spec)?;
+            custom::run(state, acct, spec, query::Mode::Request).await
+        }
         "list_reports" => saved::list(state, acct).await,
-        "get_report" => run_saved(state, acct, &str_arg("id").unwrap_or_default()).await,
+        "get_report" => run_saved(state, ctx, &str_arg("id").unwrap_or_default()).await,
         "save_report" => {
             let mut body = a.clone();
             let confirmed = body.get("confirm").and_then(Value::as_bool) == Some(true);
@@ -405,7 +409,11 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
         }
         "list_report_recipients" => Ok(json!({"data": saved::members(state, acct).await?})),
         "cohort_report" => cohorts::cohorts(state, acct, from(a.clone())?).await,
-        "funnel_report" => cohorts::funnel(state, acct, from(a.clone())?).await,
+        "funnel_report" => {
+            let q: cohorts::FunnelQuery = from(a.clone())?;
+            q.check_access(ctx)?;
+            cohorts::funnel(state, acct, q).await
+        }
         "deliverability_report" => delivery::report(state, acct, from(a.clone())?).await,
         "benchmark_report" => delivery::benchmarks(state, acct, a["industry"].as_str()).await,
         "get_attribution_settings" => Ok(attribution::to_json(&attribution::load(&state.db, acct).await?)),
@@ -426,9 +434,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
             Ok(saved)
         }
         "start_export" => {
-            let v = exports::start(state, acct, ctx.user_id, from(a.clone())?).await?;
-            export_started(state, ctx, &v).await;
-            Ok(v)
+            exports::start(state, ctx, from(a.clone())?).await
         }
         "list_exports" => Ok(json!({"data": exports::list(state, acct).await?})),
         "get_export" => exports::get(state, acct, str_arg("id").unwrap_or_default().parse().map_err(|_| AppError::not_found("export"))?).await,

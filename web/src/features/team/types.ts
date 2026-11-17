@@ -33,6 +33,8 @@ export type TeamSessionInfo = {
   restriction_message: string | null;
   sign_in_method: "sso" | "other" | null;
   two_factor_enabled: boolean;
+  /** How this login can sign in, for confirming it's you. */
+  login_methods: { password: boolean; google: boolean };
   accounts: AccountChoice[];
 };
 
@@ -44,9 +46,10 @@ export type Member = {
   name: string | null;
   role: Role;
   joined_at: string;
-  two_factor: boolean;
-  last_active_at: string | null;
-  sso_linked: boolean;
+  /** Sign-in details, for admins and owners only. */
+  two_factor?: boolean;
+  last_active_at?: string | null;
+  sso_linked?: boolean;
 };
 
 export type Invite = {
@@ -60,7 +63,7 @@ export type Invite = {
   expired: boolean;
 };
 
-export type Team = { members: Member[]; invites: Invite[] };
+export type Team = { members: Member[]; invites: Invite[]; security_details?: boolean };
 
 export type InviteResult = { invite: { id: string; email: string; role: Role; expires_at: string }; email_sent: boolean; invite_url?: string };
 
@@ -72,6 +75,8 @@ export type PublicInvite = {
   expires_at: string;
   has_login: boolean;
   signed_in_as: string | null;
+  /** An owner invite, and the signed-in session has to confirm it's you before accepting. */
+  confirm_identity_first?: boolean;
 };
 
 export type TwoFactorStatus = { enabled: boolean; enabled_at: string | null; setup_started: boolean; recovery_codes_left: number; required_by: string[] };
