@@ -1,6 +1,7 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
-export type Consent = "subscribed" | "unsubscribed" | "never_subscribed";
+/** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
+export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
 
 export type ListResponse<T> = { data: T[]; total: number };
 

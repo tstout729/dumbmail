@@ -4,7 +4,8 @@
 //!
 //! Confirmation emails aren't billed and don't count toward the warm-up limit (or raise it). They do count
 //! toward the bounce and complaint rates. One address gets at most one every 24 hours and an account at most
-//! `MAX_PER_HOUR`, so a bot filling in a form can't use DumbMail to flood someone's inbox. Addresses that
+//! `MAX_PER_HOUR` (one visitor `MAX_PER_IP_HOUR`), so a bot filling in a form can't use DumbMail to flood
+//! someone's inbox; `+tags` and Gmail dots don't make an address new. Addresses that
 //! bounced or complained before get none. When no confirmation can be sent, the sign-up is refused rather
 //! than let through unconfirmed.
 
@@ -23,6 +24,8 @@ pub const LINK_DAYS: i32 = 7;
 const RESEND_AFTER_HOURS: i32 = 24;
 /// Most confirmation emails one account sends in an hour.
 const MAX_PER_HOUR: i64 = 200;
+/// Most confirmation emails one visitor (IP address) can trigger in an hour, across all accounts.
+const MAX_PER_IP_HOUR: i64 = 5;
 
 pub enum Started {
     /// The person has to confirm (an email went out now or in the last day).
@@ -43,8 +46,30 @@ pub fn id_from_token(state: &AppState, token: &str) -> Option<Uuid> {
     crate::auth::verify(&state.cfg.secret_key, token)?.strip_prefix('c')?.parse().ok()
 }
 
-/// Ask `email` to confirm joining `list_id`. `properties` are kept for the sign-up event.
-pub async fn start(state: &AppState, account: &Account, profile_id: Uuid, email: &str, list_id: Uuid, form_id: Uuid, properties: Value) -> AppResult<Started> {
+/// The inbox an address reaches: lowercased, `+tag` removed, and for Gmail the dots too, so
+/// `v.ictim+1@gmail.com` and `victim@googlemail.com` count as the same person.
+pub fn email_key(email: &str) -> String {
+    let e = email.trim().to_lowercase();
+    let Some((local, domain)) = e.rsplit_once('@') else { return e };
+    let local = local.split('+').next().unwrap_or(local);
+    let domain = if domain == "googlemail.com" { "gmail.com" } else { domain };
+    let local = if domain == "gmail.com" { local.replace('.', "") } else { local.to_string() };
+    format!("{local}@{domain}")
+}
+
+/// Ask `email` to confirm joining `list_id`. `properties` are kept for the sign-up event; `ip` is the
+/// visitor's address, for the per-visitor limit.
+#[allow(clippy::too_many_arguments)]
+pub async fn start(
+    state: &AppState,
+    account: &Account,
+    profile_id: Uuid,
+    email: &str,
+    list_id: Uuid,
+    form_id: Uuid,
+    properties: Value,
+    ip: Option<&str>,
+) -> AppResult<Started> {
     if account.sending_paused_at.is_some() {
         return Ok(Started::Unavailable("email sending is paused".into()));
     }
@@ -59,37 +84,58 @@ pub async fn start(state: &AppState, account: &Account, profile_id: Uuid, email:
     if suppressed {
         return Ok(Started::Pending);
     }
+    let key = email_key(email);
+    let ip_hash = ip.filter(|s| !s.is_empty()).map(crate::auth::sha256_hex);
+
+    // Checked and recorded under a lock on the inbox, so simultaneous sign-ups can't both send.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("optin:{}:{key}", account.id)).execute(&mut *tx).await?;
     let waiting: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
+        "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email_key = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
     )
     .bind(account.id)
-    .bind(email)
+    .bind(&key)
     .bind(RESEND_AFTER_HOURS)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
     if waiting {
         return Ok(Started::Pending);
     }
+    if let Some(h) = &ip_hash {
+        let from_ip: i64 = sqlx::query_scalar("SELECT count(*) FROM optin_confirmations WHERE ip_hash = $1 AND created_at > now() - interval '1 hour'")
+            .bind(h)
+            .fetch_one(&mut *tx)
+            .await?;
+        if from_ip >= MAX_PER_IP_HOUR {
+            tracing::warn!(account = %account.id, "double opt-in: per-visitor limit reached; not sending another");
+            return Ok(Started::Pending);
+        }
+    }
     let last_hour: i64 = sqlx::query_scalar("SELECT count(*) FROM optin_confirmations WHERE account_id = $1 AND created_at > now() - interval '1 hour'")
         .bind(account.id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await?;
     if last_hour >= MAX_PER_HOUR {
-        tracing::warn!(account = %account.id, "double opt-in: hourly confirmation limit reached; not sending another");
-        return Ok(Started::Pending);
+        // Tell the visitor to try later rather than claim an email is on its way.
+        return Ok(Started::Unavailable("hourly confirmation limit reached".into()));
     }
 
     let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO optin_confirmations (id, account_id, profile_id, list_id, form_id, email, properties) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-        .bind(id)
-        .bind(account.id)
-        .bind(profile_id)
-        .bind(list_id)
-        .bind(form_id)
-        .bind(email)
-        .bind(&properties)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "INSERT INTO optin_confirmations (id, account_id, profile_id, list_id, form_id, email, email_key, ip_hash, properties) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(id)
+    .bind(account.id)
+    .bind(profile_id)
+    .bind(list_id)
+    .bind(form_id)
+    .bind(email)
+    .bind(&key)
+    .bind(&ip_hash)
+    .bind(&properties)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     let url = format!("{}/c/{}", crate::domains::link_base(state, account), token(state, id));
     let message_id = Uuid::now_v7();
@@ -105,6 +151,7 @@ pub async fn start(state: &AppState, account: &Account, profile_id: Uuid, email:
         text,
         unsubscribe_url: None,
     };
+    crate::sending::throttle_email(state).await;
     match state.email.send(&outgoing).await {
         Ok(provider_id) => {
             // Kept like any sent email, so a bounce or complaint suppresses the address and counts.
@@ -227,6 +274,14 @@ pub async fn confirm(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_inbox_one_key() {
+        assert_eq!(email_key("V.ictim+1@Gmail.com"), "victim@gmail.com");
+        assert_eq!(email_key("victim@googlemail.com"), "victim@gmail.com");
+        assert_eq!(email_key("jane.doe+news@shop.test"), "jane.doe@shop.test");
+        assert_ne!(email_key("jane.doe@shop.test"), email_key("janedoe@shop.test"), "dots only matter outside Gmail");
+    }
 
     #[test]
     fn confirmation_email_escapes_tenant_text() {

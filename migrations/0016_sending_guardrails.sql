@@ -11,6 +11,17 @@ ALTER TABLE accounts
 -- sign-up forms (or a bot filling them in) can't raise it.
 ALTER TABLE email_sends ADD COLUMN counts_toward_limit boolean NOT NULL DEFAULT true;
 
+-- The warm-up looks back 30 days, but email_sends was filled with only 7 days when it was created. Add the
+-- older sends, so established accounts keep the limit their history earned instead of starting over at 500.
+INSERT INTO email_sends (message_id, provider_message_id, account_id, campaign_id, sent_at, hard_bounce, complaint)
+SELECT id, provider_message_id, account_id, campaign_id, COALESCE(sent_at, created_at),
+       status = 'bounced' AND bounce_type = 'Permanent' AND error IS DISTINCT FROM 'OnAccountSuppressionList',
+       status = 'complained'
+FROM messages
+WHERE channel = 'email' AND NOT is_test AND status IN ('sent','delivered','bounced','complained')
+  AND COALESCE(sent_at, created_at) > now() - interval '30 days'
+ON CONFLICT (message_id) DO NOTHING;
+
 -- Double opt-in: a sign-up to a double opt-in list waits here until the person confirms by email.
 CREATE TABLE optin_confirmations (
     id           uuid PRIMARY KEY,
@@ -19,10 +30,15 @@ CREATE TABLE optin_confirmations (
     list_id      uuid NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
     form_id      uuid,
     email        text NOT NULL,
+    -- The address with +tags (and Gmail dots) removed: one inbox gets one confirmation a day however it's spelled.
+    email_key    text NOT NULL,
+    -- SHA-256 of the sign-up's IP address, for the per-visitor limit.
+    ip_hash      text,
     -- The sign-up event's properties (form, version), recorded when the person confirms.
     properties   jsonb NOT NULL DEFAULT '{}',
     created_at   timestamptz NOT NULL DEFAULT now(),
     confirmed_at timestamptz
 );
-CREATE INDEX optin_confirmations_email_idx ON optin_confirmations (account_id, email, created_at DESC);
+CREATE INDEX optin_confirmations_email_idx ON optin_confirmations (account_id, email_key, created_at DESC);
+CREATE INDEX optin_confirmations_ip_idx ON optin_confirmations (ip_hash, created_at DESC) WHERE ip_hash IS NOT NULL;
 CREATE INDEX optin_confirmations_recent_idx ON optin_confirmations (account_id, created_at DESC);

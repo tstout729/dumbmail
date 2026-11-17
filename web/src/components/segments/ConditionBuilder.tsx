@@ -189,6 +189,7 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
             <option value="subscribed">subscribed</option>
             <option value="unsubscribed">unsubscribed</option>
             <option value="never_subscribed">never subscribed</option>
+            <option value="pending">waiting to confirm</option>
           </Select>
         </>
       );

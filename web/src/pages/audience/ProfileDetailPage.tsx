@@ -316,6 +316,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
               <option value="subscribed">Subscribed</option>
               <option value="unsubscribed">Unsubscribed</option>
               <option value="never_subscribed">Never subscribed</option>
+              <option value="pending">Waiting to confirm (double opt-in)</option>
             </Select>
           </Field>
           <Field label="SMS consent">

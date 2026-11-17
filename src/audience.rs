@@ -356,9 +356,14 @@ pub async fn import_csv(
                 Some(_) => disposable_skipped += 1,
                 None => {}
             }
+            // Leave the address out; the rest of the row (a phone number, an id) still imports.
             if risk.is_some() {
-                out.skipped += 1;
-                continue;
+                input.email = None;
+                input.email_consent = None;
+                if input.phone_number.is_none() && input.external_id.is_none() {
+                    out.skipped += 1;
+                    continue;
+                }
             }
         }
         if input.sms_consent.as_deref() == Some("subscribed") && input.phone_number.is_none() {

@@ -388,11 +388,16 @@ pub async fn daily_limit(state: &AppState, account_id: Uuid) -> sqlx::Result<Dai
 pub struct CachedLimit {
     read_at: Instant,
     limit: DailyLimit,
-    /// Sends counted in this process since `read_at`.
+    /// Sends recorded since `read_at` (not yet in `limit.sent_24h`).
     since: i64,
+    /// Slots taken for emails still being sent (not yet recorded). Kept across re-reads.
+    inflight: i64,
+    /// Re-read on the next send whatever its age (an operator changed the limit).
+    stale: bool,
 }
 
-/// Per account: the last limit read and the sends since (lives in `AppState`).
+/// Per account: the last limit read and the sends since (lives in `AppState`). This counts within one
+/// process; the hosted service runs a single instance.
 pub type LimitCache = Mutex<HashMap<Uuid, CachedLimit>>;
 
 /// Take one email from the account's 24-hour limit. Ok(()) means send it; Err(when) means the limit is
@@ -403,18 +408,22 @@ pub async fn take_daily_slot(state: &AppState, account_id: Uuid) -> anyhow::Resu
     }
     let fresh = {
         let map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
-        map.get(&account_id).is_some_and(|c| c.read_at.elapsed() < LIMIT_CACHE)
+        map.get(&account_id).is_some_and(|c| !c.stale && c.read_at.elapsed() < LIMIT_CACHE)
     };
     if !fresh {
         let limit = daily_limit(state, account_id).await?;
         let mut map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
-        map.insert(account_id, CachedLimit { read_at: Instant::now(), limit, since: 0 });
+        let c = map.entry(account_id).or_insert(CachedLimit { read_at: Instant::now(), limit, since: 0, inflight: 0, stale: false });
+        c.read_at = Instant::now();
+        c.limit = limit;
+        c.since = 0;
+        c.stale = false;
     }
     let allowed = {
         let mut map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
         let Some(c) = map.get_mut(&account_id) else { return Ok(Ok(())) };
-        if c.limit.sent_24h + c.since < c.limit.limit {
-            c.since += 1;
+        if c.limit.sent_24h + c.since + c.inflight < c.limit.limit {
+            c.inflight += 1;
             true
         } else {
             false
@@ -434,19 +443,31 @@ pub async fn take_daily_slot(state: &AppState, account_id: Uuid) -> anyhow::Resu
     Ok(Err(when))
 }
 
-/// Give back a slot taken for an email that then wasn't sent (it failed, or the provider was busy).
-pub fn return_daily_slot(state: &AppState, account_id: Uuid) {
+/// The email that took a slot was sent and recorded.
+pub fn complete_daily_slot(state: &AppState, account_id: Uuid) {
     if let Ok(mut map) = state.daily_limits.lock() {
         if let Some(c) = map.get_mut(&account_id) {
-            c.since = (c.since - 1).max(0);
+            c.inflight = (c.inflight - 1).max(0);
+            c.since += 1;
         }
     }
 }
 
-/// Forget cached limits (an operator changed one).
+/// Give back a slot taken for an email that then wasn't sent (it failed, or the provider was busy).
+pub fn return_daily_slot(state: &AppState, account_id: Uuid) {
+    if let Ok(mut map) = state.daily_limits.lock() {
+        if let Some(c) = map.get_mut(&account_id) {
+            c.inflight = (c.inflight - 1).max(0);
+        }
+    }
+}
+
+/// Re-read the limit on the next send (an operator changed it). Emails mid-send stay counted.
 pub fn forget_daily_limit(state: &AppState, account_id: Uuid) {
     if let Ok(mut map) = state.daily_limits.lock() {
-        map.remove(&account_id);
+        if let Some(c) = map.get_mut(&account_id) {
+            c.stale = true;
+        }
     }
 }
 

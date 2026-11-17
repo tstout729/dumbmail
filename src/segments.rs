@@ -139,7 +139,7 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
             }
             Condition::Consent { status, .. } => {
                 if !crate::models::valid_consent(status) {
-                    return Err(AppError::bad("consent status must be subscribed, unsubscribed or never_subscribed"));
+                    return Err(AppError::bad("consent status must be subscribed, unsubscribed, never_subscribed or pending"));
                 }
             }
             Condition::Group { conditions, .. } => validate(conditions, depth + 1)?,

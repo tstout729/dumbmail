@@ -202,6 +202,14 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
     page("Unsubscribed", &format!("<h1>You're unsubscribed</h1><p>You won't get marketing messages from {} anymore.</p>", esc(&name)), &color).into_response()
 }
 
+/// The visitor's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For entry (the
+/// one the proxy added; earlier entries come from the visitor and can be made up).
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
+    let real = get("x-real-ip").map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    real.or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+}
+
 /// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
 /// scanners that open every link in an email can't subscribe anyone.
 async fn confirm_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -556,7 +564,8 @@ async fn count_variant(state: &AppState, form: &FormRow, variant: Option<&str>, 
     Ok(Some(v.to_string()))
 }
 
-pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -> AppResult<Value> {
+/// A form sign-up. `ip` is the visitor's address (for the double opt-in per-visitor limit).
+pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, ip: Option<&str>) -> AppResult<Value> {
     let (form, _) = load_form(state, b.form_id).await?;
     if form.account_id != account.id || form.status != "live" {
         return Err(AppError::not_found("form"));
@@ -582,7 +591,12 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
     };
-    let p = audience::upsert_profile_public(&state.db, account.id, &input).await?.profile;
+    let upserted = audience::upsert_profile_public(&state.db, account.id, &input).await?;
+    let p = upserted.profile;
+    // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
+    if double_opt_in && upserted.created {
+        sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;
+    }
     sqlx::query("UPDATE forms SET submits = submits + 1 WHERE id = $1").bind(form.id).execute(&state.db).await?;
     let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
     if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
@@ -590,7 +604,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
     }
     // Already subscribed to email (they confirmed or opted in before): no need to ask again.
     if let (true, Some(list_id), Some(addr)) = (double_opt_in && p.email_consent != "subscribed", form.list_id, p.email.as_deref()) {
-        match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone()).await? {
+        match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone(), ip).await? {
             crate::optin::Started::Pending => {
                 let msg = form.config["confirm_message"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("Almost done! Check your inbox and tap the link to confirm.");
                 return Ok(json!({"ok": true, "confirm": true, "message": msg}));
@@ -630,7 +644,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
         } else {
             serde_json::from_slice(&body)?
         };
-        subscribe(&state, &a, &b).await
+        subscribe(&state, &a, &b, client_ip(&headers).as_deref()).await
     }
     .await;
     if is_form {

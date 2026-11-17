@@ -1966,6 +1966,15 @@ async fn import_requires_permission_and_skips_risky_addresses() {
     assert!(errors.contains("Skipped 2 shared inbox addresses"), "{errors}");
     assert!(errors.contains("Skipped 1 throwaway address "), "{errors}");
 
+    // A shared inbox is left out but the rest of its row (here an SMS subscriber) still imports.
+    let imp = h
+        .ok("POST", "/api/profiles/import", Some(json!({"csv": "email,phone\nsales@shop.test,+15035550142\n", "sms_consent": "subscribed", "permission_confirmed": true})))
+        .await;
+    assert_eq!(imp["created"], 1, "{imp}");
+    let (email, sms): (Option<String>, String) =
+        sqlx::query_as("SELECT email, sms_consent FROM profiles WHERE phone_number = '+15035550142'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((email, sms.as_str()), (None, "subscribed"));
+
     // A suppression file needs no confirmation and keeps every address, so they're never emailed.
     let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "unsubscribed"}))).await;
     assert_eq!(imp["created"].as_i64().unwrap() + imp["updated"].as_i64().unwrap(), 4, "{imp}");
@@ -2017,7 +2026,12 @@ async fn double_opt_in_form_confirms_before_joining() {
     assert!(v["message"].as_str().unwrap().contains("Check your inbox"));
     assert!(!member("new@x.test").await, "not on the list until they confirm");
     let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
-    assert_ne!(consent, "subscribed");
+    assert_eq!(consent, "pending");
+    // Waiting to confirm, they get no email from anything else either (here: a campaign to another list).
+    let other = h.ok("POST", "/api/lists", Some(json!({"name": "Everyone"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@x.test", "list_ids": [other["id"]]}))).await;
+    let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": other["id"]}]}}))).await;
+    assert_eq!(est["count"], 0, "a pending sign-up isn't reachable");
 
     let mails: Vec<_> = h.state.email.sent().into_iter().filter(|m| m.to == "new@x.test").collect();
     assert_eq!(mails.len(), 1);
@@ -2142,5 +2156,23 @@ async fn double_opt_in_never_lets_anyone_in_unconfirmed() {
     h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("fresh@x.test")).await;
     let (counted, total): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE counts_toward_limit), count(*) FROM email_sends").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((counted, total), (0, 1));
+
+    // One inbox, however it's spelled, gets one confirmation a day.
+    for e in ["Victim+1@gmail.com", "v.ictim+2@gmail.com", "victim@googlemail.com"] {
+        let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe(e)).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+    }
+    let to_victim = h.state.email.sent().into_iter().filter(|m| m.to.contains("ictim")).count();
+    assert_eq!(to_victim, 1);
+
+    // One visitor can trigger at most 5 confirmations an hour.
+    for i in 0..7 {
+        let (s, _, _) = h
+            .raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json"), ("x-real-ip", "203.0.113.9")], &subscribe(&format!("bot{i}@x.test")))
+            .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let to_bots = h.state.email.sent().into_iter().filter(|m| m.to.starts_with("bot")).count();
+    assert_eq!(to_bots, 5);
     h.cleanup().await;
 }

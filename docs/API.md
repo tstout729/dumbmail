@@ -158,7 +158,7 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | GET | `/api/profiles/:id` | – | `{profile, lists: List[], segments: Segment[], events: EventRow[], messages: {id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at}[]}` |
 | PATCH | `/api/profiles/:id` | partial Profile | `Profile` |
 | DELETE | `/api/profiles/:id` | – | `{ok: true}` |
-| POST | `/api/profiles/import` | `{csv: string, list_id?: string, email_consent?: Consent, sms_consent?: Consent, permission_confirmed?: boolean}` | `{created, updated, skipped, errors: string[]}`. On the hosted service `permission_confirmed: true` (everyone in the file agreed to get email) is required unless `email_consent` is `unsubscribed`; without it the import is refused with 400. Unless importing as unsubscribed, shared inboxes (info@, sales@, no-reply@ …) and throwaway addresses (mailinator.com …) are skipped and summarized at the top of `errors` |
+| POST | `/api/profiles/import` | `{csv: string, list_id?: string, email_consent?: Consent, sms_consent?: Consent, permission_confirmed?: boolean}` | `{created, updated, skipped, errors: string[]}`. On the hosted service `permission_confirmed: true` (everyone in the file agreed to get email) is required unless `email_consent` is `unsubscribed`; without it the import is refused with 400. Unless importing as unsubscribed, shared inboxes (info@, sales@, no-reply@ …) and throwaway addresses (mailinator.com …) are left out and summarized at the top of `errors`; a row with nothing else to match on (phone, external id) is skipped, otherwise the rest of it imports |
 | GET | `/api/lists` | – | `{data: List[], total}` |
 | POST | `/api/lists` | `{name, double_opt_in?}` | `List`. With `double_opt_in`, people who sign up through a form get a confirmation email and join only after confirming (see "Sending guardrails") |
 | GET/PATCH/DELETE | `/api/lists/:id` | `{name?}` | `List` |
@@ -274,12 +274,14 @@ These protect the shared SES account's reputation along with the automatic pause
   leave out anyone who got 10 or more emails in the last 180 days and had no other event in that time:
   no open, click, sign-up, order or site activity. Flows aren't affected.
 - **Imports** need `permission_confirmed` and skip role and throwaway addresses (see `/api/profiles/import`).
-- **Double opt-in.** A form sign-up to a double opt-in list sets no email consent and doesn't join the list.
+- **Double opt-in.** A form sign-up to a double opt-in list doesn't join the list. Someone new gets
+  `email_consent: "pending"`, which no campaign or flow emails, until they confirm.
   A confirmation email (from the account's sender, not billed, no unsubscribe header) links to `/c/:token`.
   Confirming sets `email_consent: "subscribed"`, records "Subscribed to List" (with
   `double_opt_in: true`) and adds them to the list, which starts list-triggered flows. People already
-  subscribed to email join straight away. An address waiting to confirm gets no second email for 24 hours,
-  and an account sends at most 200 confirmations an hour. Addresses that bounced or complained before get
+  subscribed to email join straight away. An inbox waiting to confirm gets no second email for 24 hours (`+tags` and Gmail dots
+  don't make an address new), one visitor (IP address) triggers at most 5 an hour, and an account sends at
+  most 200 an hour (past that, sign-ups get 409 "try again later"). Addresses that bounced or complained before get
   none. If the account can't send email (no verified sender, or sending paused), the sign-up is refused
   with 409 ("try again later") rather than let through unconfirmed. Confirmation emails count toward bounce
   and complaint rates (a bounce suppresses the address) but not toward the warm-up limit.

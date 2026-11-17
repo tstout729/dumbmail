@@ -43,7 +43,7 @@ pub enum Outcome {
 
 static LIMITER: Lazy<Mutex<HashMap<&'static str, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-async fn throttle(channel: &'static str, per_sec: f64) {
+pub(crate) async fn throttle(channel: &'static str, per_sec: f64) {
     let gap = Duration::from_secs_f64(1.0 / per_sec.max(0.1));
     let wait = {
         let mut m = LIMITER.lock().await;
@@ -55,6 +55,12 @@ async fn throttle(channel: &'static str, per_sec: f64) {
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
     }
+}
+
+/// Wait for the next email slot: never faster than the provider allows (SES's rate for the account), nor than configured.
+pub async fn throttle_email(state: &AppState) {
+    let configured = f64::from(state.cfg.send_rate_per_sec.max(1));
+    throttle("email", state.email.max_send_rate().map_or(configured, |r| r.min(configured))).await;
 }
 
 pub fn account_tz(account: &Account) -> chrono_tz::Tz {
@@ -95,7 +101,8 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let p = spec.profile;
     let to = match spec.channel {
         "email" => {
-            if !spec.is_test && (p.email_consent == "unsubscribed" || p.email.is_none()) {
+            // `pending`: a double opt-in sign-up that hasn't confirmed gets nothing until it does.
+            if !spec.is_test && (p.email_consent == "unsubscribed" || p.email_consent == "pending" || p.email.is_none()) {
                 return Ok(Outcome::Skipped("not emailable"));
             }
             if !spec.is_test {
@@ -256,9 +263,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
 
     let result = match &rendered {
         Rendered::Email(e) => {
-            // Never faster than the provider allows (SES's rate for the account), nor than configured.
-            let configured = f64::from(state.cfg.send_rate_per_sec.max(1));
-            throttle("email", state.email.max_send_rate().map_or(configured, |r| r.min(configured))).await;
+            throttle_email(state).await;
             state.email.send(e).await
         }
         Rendered::Sms(s, provider, _) => {
@@ -276,8 +281,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                 .bind(cost)
                 .execute(&state.db)
                 .await?;
-            if spec.channel == "email" && !spec.is_test {
+            if limited {
                 crate::deliverability::record_send(&state.db, message_id, &provider_id, spec.account.id, spec.campaign_id).await?;
+                crate::deliverability::complete_daily_slot(state, spec.account.id);
             }
             if !spec.is_test {
                 let metric = if spec.channel == "email" { "Received Email" } else { "Received SMS" };

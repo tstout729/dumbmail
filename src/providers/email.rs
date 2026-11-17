@@ -196,6 +196,10 @@ enum SesFailure {
 
 fn classify_ses_error(code: Option<&str>, message: &str) -> SesFailure {
     let m = message.to_lowercase();
+    // The quota message wins over the code: a used-up daily quota can come back as a throttling error.
+    if m.contains("daily message quota") {
+        return SesFailure::Busy;
+    }
     match code.unwrap_or("") {
         "TooManyRequestsException" | "Throttling" | "ThrottlingException" => SesFailure::SlowDown,
         "LimitExceededException" if m.contains("rate") => SesFailure::SlowDown,
@@ -362,6 +366,7 @@ mod ses_error_tests {
         assert_eq!(classify_ses_error(Some("TooManyRequestsException"), "Too many requests"), SesFailure::SlowDown);
         assert_eq!(classify_ses_error(Some("LimitExceededException"), "Maximum sending rate exceeded."), SesFailure::SlowDown);
         assert_eq!(classify_ses_error(Some("LimitExceededException"), "Daily message quota exceeded."), SesFailure::Busy);
+        assert_eq!(classify_ses_error(Some("Throttling"), "Daily message quota exceeded."), SesFailure::Busy);
         assert_eq!(classify_ses_error(Some("SendingPausedException"), "Sending is paused for this account"), SesFailure::Busy);
         assert_eq!(classify_ses_error(Some("MessageRejected"), "Email address is not verified."), SesFailure::Fail);
         assert_eq!(classify_ses_error(None, "dispatch failure"), SesFailure::Fail);

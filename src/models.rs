@@ -234,8 +234,9 @@ pub fn normalize_phone(p: &str) -> Option<String> {
     }
 }
 
+/// `pending`: signed up through a double opt-in form and hasn't confirmed yet; gets no email but the confirmation.
 pub fn valid_consent(s: &str) -> bool {
-    matches!(s, "subscribed" | "unsubscribed" | "never_subscribed")
+    matches!(s, "subscribed" | "unsubscribed" | "never_subscribed" | "pending")
 }
 
 #[cfg(test)]
