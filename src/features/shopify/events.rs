@@ -69,11 +69,14 @@ pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: Serve
         .fetch_optional(db)
         .await?;
         if let Some((id, from_browser, old_props, old_value, old_profile)) = existing {
+            let browser = from_browser != Some(false);
+            // A browser's copy is never merged from: anything it carries (amounts, server-only
+            // state) could be forged. The server's facts replace it whole.
             let (props, value) = match merge {
-                Some(f) => f(&old_props),
+                Some(f) if !browser => f(&old_props),
+                Some(f) => f(&Value::Object(Default::default())),
                 None => (ev.properties.clone(), ev.value),
             };
-            let browser = from_browser != Some(false);
             if !browser && props == old_props && value == old_value && old_profile == ev.profile_id {
                 return Ok(Put::Unchanged);
             }

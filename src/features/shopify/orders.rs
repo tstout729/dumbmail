@@ -354,7 +354,7 @@ fn placed_value(total: Decimal, refunded: Decimal, cancelled: bool) -> f64 {
 /// Rewrite the order's value and every line's value from the refund state on its Placed Order event,
 /// in the caller's transaction (the order's row is locked first, then its lines).
 async fn recompute(tx: &mut sqlx::PgConnection, account_id: Uuid, placed_metric: Uuid, line_metric: Uuid, order_id: i64) -> sqlx::Result<()> {
-    let row: Option<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 FOR UPDATE")
+    let row: Option<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false FOR UPDATE")
         .bind(account_id)
         .bind(placed_metric)
         .bind(format!("order:{order_id}"))
@@ -381,7 +381,7 @@ async fn recompute(tx: &mut sqlx::PgConnection, account_id: Uuid, placed_metric:
     // No per-line detail and everything refunded: every line counts 0.
     let all_refunded_unknown_lines = line_refunds.is_empty() && total > Decimal::ZERO && refunded >= total;
     let ids: Vec<String> = st["line_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).take(MAX_LINES).map(|l| format!("order:{order_id}:{l}")).collect()).unwrap_or_default();
-    let lines: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = ANY($3) ORDER BY id FOR UPDATE")
+    let lines: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = ANY($3) AND from_browser = false ORDER BY id FOR UPDATE")
         .bind(account_id)
         .bind(line_metric)
         .bind(&ids)
@@ -413,7 +413,7 @@ async fn recompute_now(cx: &mut Ctx<'_>, order_id: i64) -> anyhow::Result<()> {
 async fn applied_at(cx: &mut Ctx<'_>, order_id: i64) -> anyhow::Result<Option<DateTime<Utc>>> {
     let db = &cx.state.db;
     let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
-    let st: Option<Option<Value>> = sqlx::query_scalar("SELECT properties->'shopify_state' FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3")
+    let st: Option<Option<Value>> = sqlx::query_scalar("SELECT properties->'shopify_state' FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false")
         .bind(cx.account_id)
         .bind(placed)
         .bind(format!("order:{order_id}"))
@@ -613,7 +613,7 @@ pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<Dat
     let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
     let line = cx.metrics.id(db, cx.account_id, "Ordered Product").await?;
     let mut tx = db.begin().await?;
-    let row: Option<(Uuid, Uuid, Value)> = sqlx::query_as("SELECT id, profile_id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 FOR UPDATE")
+    let row: Option<(Uuid, Uuid, Value)> = sqlx::query_as("SELECT id, profile_id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false FOR UPDATE")
         .bind(cx.account_id)
         .bind(placed)
         .bind(format!("order:{order_id}"))

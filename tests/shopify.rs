@@ -746,9 +746,11 @@ async fn orders_become_trusted_events_once() {
     live_flow(&mut h, "Placed Order").await;
     connect(&mut h).await;
 
-    // The browser pixel reports order 5001 first (with a made-up total).
+    // The browser pixel reports order 5001 first (with a made-up total, and forged server-only
+    // state that would hide later updates and fake a refund if it were trusted).
+    let forged = json!({"total": "9999", "updated_at": "2099-01-01T00:00:00Z", "refunds": {"1": "50"}, "refunds_read_at": "2099-01-01T00:00:00Z", "line_ids": ["11", "12"]});
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
-        &json!({"metric": "Placed Order", "profile": {"email": "ann@example.com"}, "properties": {"tracked_by": "shopify_pixel", "total": 9999}, "value": 9999, "unique_id": "order:5001"}).to_string()).await;
+        &json!({"metric": "Placed Order", "profile": {"email": "ann@example.com"}, "properties": {"tracked_by": "shopify_pixel", "total": 9999, "shopify_state": forged}, "value": 9999, "unique_id": "order:5001"}).to_string()).await;
     assert_eq!(s, StatusCode::OK);
     // Server-only metrics can't be forged from a browser.
     for metric in ["Refunded Order", "Fulfilled Order", "Cancelled Order", "Ordered Product", "Fulfilled Partial Order"] {
@@ -773,6 +775,7 @@ async fn orders_become_trusted_events_once() {
     assert_eq!(props["discount_codes"], json!(["WELCOME10"]));
     assert_eq!(props["shopify_customer_id"], "1");
     assert_eq!(props["shopify_shop"], SHOP);
+    assert_eq!(props["refunded_total"], 0.0, "nothing from the browser's copy is kept");
     assert_eq!(flow_runs(&h).await, 1, "upgrading the browser's copy doesn't start the flow again");
     assert_eq!(count_events(&h, "Ordered Product").await, 2);
     assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(30.0));
