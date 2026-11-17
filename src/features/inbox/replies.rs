@@ -43,11 +43,11 @@ impl ReplyFacts {
 
     /// Why this person can't be texted a reply right now, or None when they can.
     pub fn block(&self, now: DateTime<Utc>) -> Option<String> {
-        if self.target.is_none() {
-            return Some("They haven't texted you anything you can reply to.".into());
-        }
         if self.opted_out {
             return Some("They opted out (texted STOP), so they can't get texts until they text START again.".into());
+        }
+        if self.target.is_none() {
+            return Some("They haven't texted you anything you can reply to.".into());
         }
         if self.consent == "unsubscribed" {
             return Some("They unsubscribed from texts, so they can't get replies.".into());
@@ -83,7 +83,11 @@ pub async fn reply_facts(db: &sqlx::PgPool, account_id: Uuid, conversation_id: U
                 .await?;
             (store::is_opted_out(&mut conn, account_id, theirs).await?, store::window_start(&mut conn, account_id, theirs, ours).await?, latest_verified == Some(false))
         }
-        None => (false, None, false),
+        // Only an opt-out (or texts while opted out) so far: their number is the profile's.
+        None => match &profile.phone_number {
+            Some(phone) => (store::is_opted_out(&mut conn, account_id, phone).await?, None, false),
+            None => (false, None, false),
+        },
     };
     Ok(ReplyFacts { consent: profile.sms_consent.clone(), phone: profile.phone_number.clone(), target, opted_out, window_start, latest_unverified })
 }
