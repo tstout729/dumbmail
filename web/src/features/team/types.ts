@@ -15,7 +15,7 @@ export const roleDescriptions: Record<Role, string> = {
   admin: "Everything except transferring ownership.",
   manager: "Campaigns, flows, forms, audience and content, including sending. No billing, team, API keys or domains.",
   analyst: "Sees everything except billing and team settings, and can export. Changes nothing.",
-  content: "Edits templates and campaign drafts. Can't send, schedule or see profiles.",
+  content: "Edits templates and campaign drafts, and sends test emails to teammates. Can't send, schedule or see profiles.",
 };
 
 export const roles: Role[] = ["owner", "admin", "manager", "analyst", "content"];

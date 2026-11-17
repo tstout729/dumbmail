@@ -264,7 +264,7 @@ function AccountSecurityCard() {
         <div className="text-sm">
           <div className="font-medium text-zinc-900">Require two-factor login for everyone</div>
           <p className="text-zinc-600">
-            Members without it set it up the next time they use {account.name}. This includes people who sign in with Google. Single sign-on counts on its own.
+            Members without it set it up the next time they use {account.name}. This includes people who sign in with Google. Single sign-on counts only when your identity provider confirms a second step (see Single sign-on below).
           </p>
           {s && s.members_without_two_factor > 0 ? (
             <p className="mt-1 text-xs text-zinc-500">{s.members_without_two_factor === 1 ? "1 member doesn't" : `${s.members_without_two_factor} members don't`} have it yet.</p>
