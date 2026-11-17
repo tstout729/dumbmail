@@ -679,11 +679,12 @@ pub(super) async fn rotate_flow_secret(state: &AppState, ctx: &Ctx) -> AppResult
 }
 
 /// The API key a request was made with (REST hooks belong to the key that made them). Dashboard
-/// sessions can't make REST hooks.
+/// sessions can't use REST hooks: a 400 (the permission itself is checked by the route's rule,
+/// which answers 403).
 pub(super) fn key_of(ctx: &Ctx) -> AppResult<Uuid> {
     match (ctx.via_api_key, ctx.api_key_id) {
         (true, Some(k)) => Ok(k),
-        _ => Err(AppError::Forbidden("REST hooks are made with an API key (Zapier, Make or your own code); in the dashboard, use Settings → Webhooks".into())),
+        _ => Err(AppError::bad("REST hooks are made with an API key (Zapier, Make or your own code); in the dashboard, use Settings → Webhooks")),
     }
 }
 

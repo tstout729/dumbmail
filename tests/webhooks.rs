@@ -765,8 +765,9 @@ async fn rest_hooks_belong_to_the_key_that_made_them() {
     assert_eq!(s, 404);
     assert_eq!(h.ok("GET", "/api/webhooks", None).await["total"], 2);
     // REST hooks are for API keys, not dashboard sessions.
-    let (s, _) = h.req("POST", "/api/hooks", Some(json!({"hookUrl": format!("{base}/x"), "topic": "profile.created"}))).await;
-    assert_eq!(s, 403);
+    let (s, v) = h.req("POST", "/api/hooks", Some(json!({"hookUrl": format!("{base}/x"), "topic": "profile.created"}))).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("API key"), "{v}");
     // Revoking the key removes its hooks.
     let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE name = 'Zapier'").fetch_one(&h.state.db).await.unwrap();
     h.ok("DELETE", &format!("/api/api-keys/{key_id}"), None).await;

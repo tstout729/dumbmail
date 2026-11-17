@@ -329,8 +329,8 @@ A hook belongs to the API key that made it. Only that key, or someone signed in 
 who may manage webhooks, can see or change it, on every route and MCP tool; other API keys don't
 see it at all. A key can never touch another key's hooks or an endpoint made in the dashboard
 through `/api/hooks`. Revoking the key (or the key it was made from), or its expiry, stops its
-hooks' deliveries at once and removes the hooks. `/api/hooks` takes only API keys, not dashboard
-sessions, and needs the `webhooks.manage` permission (an admin's or owner's key with the `full`
+hooks' deliveries at once and removes the hooks. `/api/hooks` takes only API keys (a dashboard
+session gets a 400), and needs the `webhooks.manage` permission (an admin's or owner's key with the `full`
 or `account` scope).
 
 **The hook URL is the credential.** Zapier and Make give each hook a long random URL and accept
