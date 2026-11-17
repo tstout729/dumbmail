@@ -47,6 +47,7 @@ impl Harness {
             sms_provider: "log".into(),
             telnyx_api_key: None,
             telnyx_messaging_profile_id: None,
+            telnyx_public_key: None,
             twilio_account_sid: None,
             twilio_auth_token: None,
             webhook_secret: "hooksecret".into(),
