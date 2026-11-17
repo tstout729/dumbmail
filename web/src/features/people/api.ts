@@ -185,9 +185,14 @@ export function usePrivacyRequests() {
 
 /** One privacy request, refreshed until its export is built. */
 export function usePrivacyRequest(id: string | null) {
+  const qc = useQueryClient();
   return useQuery({
     queryKey: [...peopleKeys.requests, id],
-    queryFn: () => api<PrivacyRequest>("GET", `/api/people/privacy/requests/${id}`),
+    queryFn: async () => {
+      const r = await api<PrivacyRequest>("GET", `/api/people/privacy/requests/${id}`);
+      if (r.status !== "building") void qc.invalidateQueries({ queryKey: peopleKeys.requests, exact: true });
+      return r;
+    },
     enabled: id !== null,
     refetchInterval: (q) => (q.state.data?.status === "building" || !q.state.data ? 1500 : false),
   });
