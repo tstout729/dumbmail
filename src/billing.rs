@@ -14,6 +14,10 @@ use crate::state::AppState;
 
 pub const MICROS: f64 = 1_000_000.0;
 
+/// Smallest card top-up. Stripe takes 2.9% + 30¢ per payment, so the fixed 30¢ makes small
+/// top-ups expensive: 5.9% at $10, 4.1% at $25.
+pub const MIN_TOPUP_USD: f64 = 25.0;
+
 pub fn to_micros(usd: f64) -> i64 {
     (usd * MICROS).round() as i64
 }
@@ -74,7 +78,11 @@ pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: 
     let p = prices(state);
     Ok(match channel {
         "email" => {
-            if free_emails_remaining(state, account_id).await? > 0 { 0 } else { p.email }
+            if free_emails_remaining(state, account_id).await? > 0 || crate::subscription::emails_remaining(&state.db, account_id).await? > 0 {
+                0
+            } else {
+                p.email
+            }
         }
         _ if own_provider => 0,
         _ if mms => p.mms,
@@ -105,7 +113,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     }
     let p = prices(state);
     let cost = if channel == "email" {
-        (recipients - free_emails_remaining(state, account_id).await?).max(0) * p.email
+        let covered = free_emails_remaining(state, account_id).await? + crate::subscription::emails_remaining(&state.db, account_id).await?;
+        (recipients - covered).max(0) * p.email
     } else if !sms_billed(state, account_id).await? {
         0
     } else if mms {
@@ -117,7 +126,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     Ok(cost)
 }
 
-/// Record a sent message: use the free allowance for email, otherwise charge the balance.
+/// Record a sent message: email uses the free allowance, then the monthly plan; everything else
+/// is charged to the balance.
 /// Returns the amount charged.
 pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, segments: i64, mms: bool, own_provider: bool) -> AppResult<i64> {
     if !state.cfg.hosted {
@@ -134,8 +144,9 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
         .bind(&month)
         .fetch_one(&state.db)
         .await?;
-        let free = used as i64 <= state.cfg.free_emails_per_month;
-        ("email", 1i64, if free { 0 } else { p.email })
+        // Free allowance first, then the monthly plan, then prepaid credit.
+        let covered = used as i64 <= state.cfg.free_emails_per_month || crate::subscription::use_email(&state.db, account_id).await?;
+        ("email", 1i64, if covered { 0 } else { p.email })
     } else if own_provider {
         return Ok(0);
     } else if mms {
@@ -178,6 +189,13 @@ pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, am
 /// One-off charge or credit with a unique reference (idempotent). Positive amount = credit.
 pub async fn post_entry(db: &PgPool, account_id: Uuid, kind: &str, amount: i64, description: &str, reference: &str) -> AppResult<bool> {
     let mut tx = db.begin().await?;
+    let posted = post_entry_tx(&mut tx, account_id, kind, amount, description, reference).await?;
+    tx.commit().await?;
+    Ok(posted)
+}
+
+/// `post_entry` inside the caller's transaction.
+pub async fn post_entry_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind: &str, amount: i64, description: &str, reference: &str) -> AppResult<bool> {
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO ledger (id, account_id, kind, quantity, amount_micros, description, reference) VALUES ($1, $2, $3, 1, $4, $5, $6)
          ON CONFLICT (kind, reference) WHERE reference IS NOT NULL AND day IS NULL DO NOTHING RETURNING id",
@@ -194,7 +212,6 @@ pub async fn post_entry(db: &PgPool, account_id: Uuid, kind: &str, amount: i64, 
         return Ok(false);
     }
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros + $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -241,6 +258,10 @@ pub async fn billing_json(state: &AppState, account_id: Uuid) -> AppResult<Value
         "usage": daily.into_iter().map(|(d, k, q, a)| json!({"date": d, "kind": k, "quantity": q, "amount": to_usd(a)})).collect::<Vec<_>>(),
         "ledger": ledger.into_iter().map(|(id, k, d, a, t)| json!({"id": id, "kind": k, "description": d, "amount": to_usd(a), "created_at": t})).collect::<Vec<_>>(),
         "limits": {"profiles": Value::Null},
+        "plan": crate::subscription::plan_json(&state.db, account_id).await?,
+        "plan_options": crate::subscription::options_json(prices(state).email),
+        "plan_payments": crate::subscription::payments_json(&state.db, account_id).await?,
+        "min_topup": MIN_TOPUP_USD,
     }))
 }
 
@@ -250,16 +271,20 @@ fn stripe_key(state: &AppState) -> AppResult<&str> {
     state.cfg.stripe_secret_key.as_deref().ok_or_else(|| AppError::bad("card payments aren't configured on this server"))
 }
 
-async fn stripe_post(state: &AppState, path: &str, form: &[(String, String)]) -> AppResult<Value> {
+pub(crate) async fn stripe_post(state: &AppState, path: &str, form: &[(String, String)]) -> AppResult<Value> {
+    stripe_post_idem(state, path, form, None).await
+}
+
+/// POST to Stripe. 4xx answers (a declined card, a bad request) come back as `BadRequest`;
+/// network and 5xx failures as `Internal`, so callers can tell a definite "no" from "unknown".
+/// With an idempotency key, retrying an unknown outcome can't charge twice.
+pub(crate) async fn stripe_post_idem(state: &AppState, path: &str, form: &[(String, String)], idempotency_key: Option<&str>) -> AppResult<Value> {
     let key = stripe_key(state)?;
-    let res = state
-        .http
-        .post(format!("https://api.stripe.com/v1/{path}"))
-        .basic_auth(key, Some(""))
-        .form(form)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+    let mut req = state.http.post(format!("{}/{path}", state.cfg.stripe_api_base)).basic_auth(key, Some("")).form(form);
+    if let Some(k) = idempotency_key {
+        req = req.header("Idempotency-Key", k);
+    }
+    let res = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     let status = res.status();
     let v: Value = res.json().await.map_err(|e| AppError::Internal(e.into()))?;
     if !status.is_success() {
@@ -269,15 +294,15 @@ async fn stripe_post(state: &AppState, path: &str, form: &[(String, String)]) ->
     Ok(v)
 }
 
-async fn stripe_get(state: &AppState, path: &str) -> AppResult<Value> {
+pub(crate) async fn stripe_get(state: &AppState, path: &str) -> AppResult<Value> {
     let key = stripe_key(state)?;
-    let res = state.http.get(format!("https://api.stripe.com/v1/{path}")).basic_auth(key, Some("")).send().await.map_err(|e| AppError::Internal(e.into()))?;
+    let res = state.http.get(format!("{}/{path}", state.cfg.stripe_api_base)).basic_auth(key, Some("")).send().await.map_err(|e| AppError::Internal(e.into()))?;
     res.json().await.map_err(|e| AppError::Internal(e.into()))
 }
 
 /// True when Stripe says a saved customer doesn't exist under the current key: one saved in test
 /// mode before the server switched to live keys, or one deleted in the Dashboard.
-fn customer_gone(v: &Value) -> bool {
+pub(crate) fn customer_gone(v: &Value) -> bool {
     v["error"]["code"] == "resource_missing" || v["deleted"] == true
 }
 
@@ -288,7 +313,7 @@ async fn forget_stripe_customer(state: &AppState, account_id: Uuid) -> AppResult
     Ok(())
 }
 
-async fn ensure_customer(state: &AppState, account_id: Uuid) -> AppResult<String> {
+pub(crate) async fn ensure_customer(state: &AppState, account_id: Uuid) -> AppResult<String> {
     let (existing, name): (Option<String>, String) = sqlx::query_as("SELECT stripe_customer_id, name FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
     if let Some(c) = existing {
         if !customer_gone(&stripe_get(state, &format!("customers/{c}")).await?) {
@@ -316,13 +341,13 @@ pub async fn checkout(state: &AppState, account_id: Uuid, amount_usd: f64) -> Ap
     if !state.cfg.hosted {
         return Err(AppError::bad("self-hosted installs don't use billing"));
     }
-    if !(10.0..=5000.0).contains(&amount_usd) {
-        return Err(AppError::bad("top-ups are between $10 and $5,000"));
+    if !(MIN_TOPUP_USD..=5000.0).contains(&amount_usd) {
+        return Err(AppError::bad("top-ups are between $25 and $5,000"));
     }
     let cents = (amount_usd * 100.0).round() as i64;
     let customer = ensure_customer(state, account_id).await?;
     let base = state.cfg.public_url();
-    let form: Vec<(String, String)> = vec![
+    let mut form: Vec<(String, String)> = vec![
         ("mode".into(), "payment".into()),
         ("customer".into(), customer),
         ("client_reference_id".into(), account_id.to_string()),
@@ -338,8 +363,25 @@ pub async fn checkout(state: &AppState, account_id: Uuid, amount_usd: f64) -> Ap
         ("success_url".into(), format!("{base}/settings/billing?topup=success")),
         ("cancel_url".into(), format!("{base}/settings/billing?topup=cancelled")),
     ];
+    cards_only(&mut form);
     let s = stripe_post(state, "checkout/sessions", &form).await?;
     s["url"].as_str().map(String::from).ok_or_else(|| AppError::Internal(anyhow::anyhow!("Stripe returned no checkout url")))
+}
+
+/// Payment methods Checkout must not offer. The card saved at checkout is charged later without the
+/// customer present (auto-recharge, plan renewals), which needs a card or Link: bank debits, buy now
+/// pay later and wallets like Cash App can't be confirmed on the spot. (Checkout no longer takes an
+/// allow-list, so this excludes the non-card methods Stripe offers US accounts;
+/// `save_payment_method` also refuses anything else that slips through.)
+const NON_CARD_METHODS: &[&str] = &[
+    "affirm", "afterpay_clearpay", "alipay", "amazon_pay", "cashapp", "crypto", "customer_balance", "klarna", "pay_by_bank", "paypal",
+    "revolut_pay", "sunbit", "us_bank_account", "wechat_pay", "zip",
+];
+
+pub(crate) fn cards_only(form: &mut Vec<(String, String)>) {
+    for (i, t) in NON_CARD_METHODS.iter().enumerate() {
+        form.push((format!("excluded_payment_method_types[{i}]"), (*t).into()));
+    }
 }
 
 /// Verify a Stripe-Signature header (t=...,v1=...) within a 5 minute tolerance.
@@ -372,24 +414,20 @@ pub async fn handle_stripe_event(state: &AppState, ev: &Value) -> AppResult<()> 
     let obj = &ev["data"]["object"];
     match ev["type"].as_str().unwrap_or("") {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
-            if obj["payment_status"] != "paid" || obj["metadata"]["kind"] != "topup" {
+            if obj["payment_status"] != "paid" {
                 return Ok(());
             }
             let Some(account_id) = obj["metadata"]["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
-            let cents = obj["amount_total"].as_i64().unwrap_or(0);
-            let session = obj["id"].as_str().unwrap_or_default();
-            post_entry(&state.db, account_id, "topup", cents * 10_000, &format!("Added credit (${:.2})", cents as f64 / 100.0), session).await?;
-            if let Some(pi) = obj["payment_intent"].as_str() {
-                let intent = stripe_get(state, &format!("payment_intents/{pi}")).await?;
-                if let Some(pm) = intent["payment_method"].as_str() {
-                    sqlx::query("UPDATE accounts SET stripe_payment_method_id = $2, stripe_customer_id = COALESCE(stripe_customer_id, $3), auto_recharge_failed_at = NULL WHERE id = $1")
-                        .bind(account_id)
-                        .bind(pm)
-                        .bind(obj["customer"].as_str())
-                        .execute(&state.db)
-                        .await?;
+            match obj["metadata"]["kind"].as_str() {
+                Some("topup") => {
+                    let cents = obj["amount_total"].as_i64().unwrap_or(0);
+                    let session = obj["id"].as_str().unwrap_or_default();
+                    post_entry(&state.db, account_id, "topup", cents * 10_000, &format!("Added credit (${:.2})", cents as f64 / 100.0), session).await?;
                 }
+                Some("plan") => crate::subscription::apply_checkout(&state.db, account_id, obj).await?,
+                _ => return Ok(()),
             }
+            save_payment_method(state, account_id, obj).await?;
         }
         "payment_intent.succeeded" if obj["metadata"]["kind"] == "auto_recharge" => {
             if let Some(account_id) = obj["metadata"]["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
@@ -402,9 +440,34 @@ pub async fn handle_stripe_event(state: &AppState, ev: &Value) -> AppResult<()> 
     Ok(())
 }
 
+/// Keep the card from a paid Checkout session for auto-recharge and plan renewals.
+async fn save_payment_method(state: &AppState, account_id: Uuid, session: &Value) -> AppResult<()> {
+    let Some(pi) = session["payment_intent"].as_str() else { return Ok(()) };
+    let intent = stripe_get(state, &format!("payment_intents/{pi}?expand[]=payment_method")).await?;
+    let method = &intent["payment_method"];
+    let kind = method["type"].as_str().unwrap_or_default();
+    if !matches!(kind, "card" | "link") {
+        tracing::info!(account = %account_id, kind, "not saving a payment method that can't be charged automatically");
+        return Ok(());
+    }
+    if let Some(pm) = method["id"].as_str() {
+        sqlx::query(
+            "UPDATE accounts SET stripe_payment_method_id = $2, stripe_customer_id = COALESCE(stripe_customer_id, $3), auto_recharge_failed_at = NULL,
+                    email_plan_renewal_failed_at = NULL
+             WHERE id = $1",
+        )
+        .bind(account_id)
+        .bind(pm)
+        .bind(session["customer"].as_str())
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn set_auto_recharge(state: &AppState, account_id: Uuid, enabled: bool, threshold: f64, amount: f64) -> AppResult<()> {
-    if !(0.0..=1000.0).contains(&threshold) || !(10.0..=1000.0).contains(&amount) {
-        return Err(AppError::bad("threshold must be $0–1,000 and recharge amount $10–1,000"));
+    if !(0.0..=1000.0).contains(&threshold) || !(MIN_TOPUP_USD..=1000.0).contains(&amount) {
+        return Err(AppError::bad("threshold must be $0–1,000 and recharge amount $25–1,000"));
     }
     if enabled {
         let pm: Option<String> = sqlx::query_scalar("SELECT stripe_payment_method_id FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;

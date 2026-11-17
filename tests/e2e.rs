@@ -21,6 +21,11 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Option<Self> {
+        Self::with(|_| {}).await
+    }
+
+    /// A harness whose config `tweak` adjusts first (e.g. pointing Stripe at a stand-in).
+    async fn with(tweak: impl FnOnce(&mut Config)) -> Option<Self> {
         let admin_url = std::env::var("TEST_DATABASE_URL").ok()?;
         let admin = PgPoolOptions::new().max_connections(2).connect(&admin_url).await.expect("admin connect");
         let dbname = format!("dumbmail_test_{}", uuid::Uuid::new_v4().simple());
@@ -31,7 +36,7 @@ impl Harness {
         };
         let db = PgPoolOptions::new().max_connections(5).connect(&url).await.unwrap();
         MIGRATOR.run(&db).await.unwrap();
-        let cfg = Config {
+        let mut cfg = Config {
             database_url: url,
             bind: "127.0.0.1:0".into(),
             public_url: "https://pl.test".into(),
@@ -51,6 +56,7 @@ impl Harness {
             secure_cookies: false,
             stripe_secret_key: None,
             stripe_webhook_secret: Some("whsec_test".into()),
+            stripe_api_base: "https://api.stripe.com/v1".into(),
             price_email_per_1000: 0.20,
             price_sms_segment: 0.0099,
             price_mms: 0.025,
@@ -69,6 +75,7 @@ impl Harness {
             operator_alert_email: Some("ops@pl.test".into()),
             redirect_hosts: vec!["old.pl.test".into()],
         };
+        tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();
         let router = app(state.clone());
         Some(Self { state, router, cookie: None, admin, dbname })
@@ -1615,4 +1622,254 @@ async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
     assert!(out.contains(r#""was_paused":true"#), "{out}");
     assert_eq!(paused(&mut h).await, None);
     h.cleanup().await;
+}
+
+/// A stand-in for the few Stripe endpoints billing uses. Records what was asked of it.
+#[derive(Default)]
+struct MockStripe {
+    sessions: Vec<std::collections::HashMap<String, String>>,
+    intents: Vec<(Option<String>, std::collections::HashMap<String, String>)>,
+    /// "ok" (default), "decline" (402 card_declined) or "error" (500).
+    mode: String,
+}
+
+type Mock = std::sync::Arc<std::sync::Mutex<MockStripe>>;
+
+async fn mock_stripe() -> (Mock, String) {
+    use axum::extract::{Form, Path, State};
+    use axum::routing::{get, post};
+    use std::collections::HashMap;
+    let mock: Mock = Default::default();
+    let app = axum::Router::new()
+        .route("/customers", post(|| async { axum::Json(json!({"id": "cus_mock", "object": "customer"})) }))
+        .route("/customers/{id}", get(|Path(id): Path<String>| async move { axum::Json(json!({"id": id, "object": "customer"})) }))
+        .route(
+            "/checkout/sessions",
+            post(|State(m): State<Mock>, Form(f): Form<HashMap<String, String>>| async move {
+                let mut m = m.lock().unwrap();
+                m.sessions.push(f);
+                let id = format!("cs_mock_{}", m.sessions.len());
+                axum::Json(json!({"id": id, "url": format!("https://checkout.stripe.test/{id}")}))
+            }),
+        )
+        .route(
+            "/payment_intents/{id}",
+            // pi_..._bank was paid by bank debit, which can't be charged automatically later.
+            get(|Path(id): Path<String>| async move {
+                let kind = if id.ends_with("_bank") { "us_bank_account" } else { "card" };
+                axum::Json(json!({"id": id, "payment_method": {"id": format!("pm_{kind}"), "type": kind}}))
+            }),
+        )
+        .route("/payment_intents/{id}/cancel", post(|Path(id): Path<String>| async move { axum::Json(json!({"id": id, "status": "canceled"})) }))
+        .route(
+            "/payment_intents",
+            post(|State(m): State<Mock>, headers: axum::http::HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
+                let mut m = m.lock().unwrap();
+                let key = headers.get("idempotency-key").and_then(|v| v.to_str().ok()).map(String::from);
+                m.intents.push((key, f));
+                let n = m.intents.len();
+                match m.mode.as_str() {
+                    "decline" => (StatusCode::PAYMENT_REQUIRED, axum::Json(json!({"error": {"code": "card_declined", "message": "Your card was declined."}}))),
+                    "error" => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": {"message": "Stripe is having a bad day"}}))),
+                    _ => (StatusCode::OK, axum::Json(json!({"id": format!("pi_mock_{n}"), "status": "succeeded"}))),
+                }
+            }),
+        )
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (mock, base)
+}
+
+fn stripe_sig(body: &str) -> String {
+    use hmac::Mac;
+    let t = chrono::Utc::now().timestamp();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"whsec_test").unwrap();
+    mac.update(format!("{t}.{body}").as_bytes());
+    format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Deliver a paid plan Checkout session the way Stripe's webhook would.
+async fn plan_paid(h: &Harness, account: &Value, session: &str, from_tier: i16, tier: i16, cents: i64) {
+    let ev = json!({"type": "checkout.session.completed", "data": {"object": {"id": session, "payment_status": "paid", "amount_total": cents,
+        "payment_intent": format!("pi_{session}"), "customer": "cus_mock",
+        "metadata": {"kind": "plan", "account_id": account, "tier": tier.to_string(), "from_tier": from_tier.to_string()}}}}).to_string();
+    let (s, _, body) = h.raw("POST", "/webhooks/stripe", &[("stripe-signature", &stripe_sig(&ev)), ("content-type", "application/json")], &ev).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn monthly_email_plans() {
+    let (mock, base) = mock_stripe().await;
+    let Some(mut h) = Harness::with(|c| {
+        c.stripe_secret_key = Some("sk_test_mock".into());
+        c.stripe_api_base = base;
+    })
+    .await
+    else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    let me = h.signup().await;
+    let acct = me["account"]["id"].clone();
+    let acct_id: uuid::Uuid = acct.as_str().unwrap().parse().unwrap();
+    let renew = |h: &Harness| {
+        let state = h.state.clone();
+        async move { dumbmail::subscription::run_renewals(&state).await.unwrap() }
+    };
+    let past_due = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move {
+            sqlx::query("UPDATE accounts SET email_plan_period_end = now() - interval '1 minute'").execute(&db).await.unwrap();
+        }
+    };
+
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "none");
+    assert_eq!(b["plan_options"].as_array().unwrap().len(), 6);
+    assert_eq!(b["plan_options"][5]["price"], 320.0);
+    assert_eq!(b["plan_options"][5]["emails"], 960_000);
+    assert_eq!(b["min_topup"], 25.0);
+    let (s, _) = h.req("POST", "/api/billing/checkout", Some(json!({"amount": 10}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "top-ups start at $25");
+    let (s, _) = h.req("POST", "/api/billing/plan", Some(json!({"tier": 7}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Start: Checkout for the full $10, which renews and saves the card.
+    let r = h.ok("POST", "/api/billing/plan", Some(json!({"tier": 1}))).await;
+    assert!(r["url"].as_str().unwrap().starts_with("https://checkout.stripe.test/"));
+    {
+        let m = mock.lock().unwrap();
+        let sess = &m.sessions[0];
+        assert_eq!(sess["line_items[0][price_data][unit_amount]"], "1000");
+        assert_eq!((sess["metadata[tier]"].as_str(), sess["metadata[from_tier]"].as_str()), ("1", "0"));
+        assert_eq!(sess["payment_intent_data[setup_future_usage]"], "off_session");
+        assert!(sess.iter().any(|(k, v)| k.starts_with("excluded_payment_method_types") && v == "us_bank_account"), "renewals need a card that can be charged on the spot");
+        assert!(sess["custom_text[submit][message]"].contains("Renews every month at $10"));
+    }
+    for _ in 0..2 {
+        plan_paid(&h, &acct, "cs_start", 0, 1, 1000).await;
+    }
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "active", "{}", b["plan"]);
+    assert_eq!(b["plan"]["emails_included"], 30_000);
+    assert_eq!(b["plan_payments"].as_array().unwrap().len(), 1, "a repeated webhook applies once");
+    assert_eq!(b["has_payment_method"], true);
+    assert_eq!(b["balance"], 0.0);
+
+    // 30 emails with 25 free: the other 5 come from the plan, so no credit is needed.
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "All"}))).await;
+    let mut csv = String::from("email\n");
+    for i in 0..30 {
+        csv.push_str(&format!("p{i}@x.test\n"));
+    }
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["emails_used"], 5);
+    assert_eq!(b["balance"], 0.0);
+    let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE status = 'sent'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(sent, 30);
+
+    // Upgrade 1 → 3 mid-month: pay the $30 difference, get the 90,000 extra emails now.
+    let r = h.ok("POST", "/api/billing/plan", Some(json!({"tier": 3}))).await;
+    assert!(r["url"].is_string());
+    assert_eq!(mock.lock().unwrap().sessions[1]["line_items[0][price_data][unit_amount]"], "3000");
+    plan_paid(&h, &acct, "cs_up", 1, 3, 3000).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!((b["plan"]["tier"].as_i64(), b["plan"]["emails_included"].as_i64()), (Some(3), Some(120_000)));
+    assert_eq!(b["plan"]["emails_used"], 5);
+
+    // Downgrade waits for the renewal; nothing to pay now.
+    let r = h.ok("POST", "/api/billing/plan", Some(json!({"tier": 2}))).await;
+    assert!(r["url"].is_null());
+    assert_eq!(r["billing"]["plan"]["next_tier"], 2);
+
+    // Renewal charges the saved card for the new tier and starts a fresh month.
+    past_due(&h).await;
+    renew(&h).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "active", "{}", b["plan"]);
+    assert_eq!((b["plan"]["tier"].as_i64(), b["plan"]["emails_included"].as_i64(), b["plan"]["emails_used"].as_i64()), (Some(2), Some(60_000), Some(0)));
+    assert!(b["plan"]["next_tier"].is_null());
+    {
+        let m = mock.lock().unwrap();
+        assert_eq!(m.intents.len(), 1, "renewed exactly once");
+        assert_eq!(m.intents[0].1["amount"], "2000");
+        assert_eq!(m.intents[0].1["off_session"], "true");
+        assert!(m.intents[0].0.as_deref().unwrap().starts_with("plan-renewal-"));
+    }
+    assert_eq!(b["plan_payments"].as_array().unwrap().len(), 3);
+
+    // Stripe unreachable: no attempt is counted, and the retry reuses the idempotency key.
+    mock.lock().unwrap().mode = "error".into();
+    past_due(&h).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["renewal_attempts"], 0);
+    mock.lock().unwrap().mode = "ok".into();
+    renew(&h).await;
+    {
+        let m = mock.lock().unwrap();
+        assert_eq!(m.intents.len(), 3);
+        assert_eq!(m.intents[1].0, m.intents[2].0, "same key, so an unknown outcome can't charge twice");
+    }
+    assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "active");
+
+    // Declined three times (a day apart): plan emails stop at once, the plan ends after the third.
+    mock.lock().unwrap().mode = "decline".into();
+    past_due(&h).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "renewal_failed");
+    assert_eq!(b["plan"]["renewal_attempts"], 1);
+    assert_eq!(b["plan"]["emails_remaining"], 0);
+    assert_eq!(dumbmail::billing::quote(&h.state, acct_id, "email", 1, false, false).await.unwrap(), 200, "while renewal fails, emails cost credit");
+    renew(&h).await;
+    assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["renewal_attempts"], 1, "waits a day before retrying");
+    for attempt in 2..=3 {
+        sqlx::query("UPDATE accounts SET email_plan_renewal_failed_at = now() - interval '25 hours'").execute(&h.state.db).await.unwrap();
+        renew(&h).await;
+        let b = h.ok("GET", "/api/billing", None).await;
+        if attempt < 3 {
+            assert_eq!(b["plan"]["renewal_attempts"], attempt);
+        } else {
+            assert_eq!(b["plan"]["status"], "none");
+            assert_eq!(b["plan"]["ended_reason"], "renewal_failed");
+        }
+    }
+    let keys: std::collections::HashSet<_> = mock.lock().unwrap().intents[3..].iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(keys.len(), 3, "each declined attempt is a new charge attempt");
+
+    // A late upgrade payment for a plan that has ended becomes credit instead of vanishing.
+    plan_paid(&h, &acct, "cs_late", 1, 2, 1000).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["balance"], 10.0);
+    assert_eq!(b["plan"]["status"], "none");
+    assert!(b["plan_payments"][0]["description"].as_str().unwrap().contains("added as credit"));
+
+    // Cancel at the end of the month: no charge, the plan just ends. Keeping it undoes that.
+    mock.lock().unwrap().mode = "ok".into();
+    plan_paid(&h, &acct, "cs_again", 0, 1, 1000).await;
+    assert_eq!(h.ok("POST", "/api/billing/plan/cancel", None).await["plan"]["status"], "cancelling");
+    assert_eq!(h.ok("POST", "/api/billing/plan/resume", None).await["plan"]["status"], "active");
+    h.ok("POST", "/api/billing/plan/cancel", None).await;
+    let charges_before = mock.lock().unwrap().intents.len();
+    past_due(&h).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "none");
+    assert_eq!(b["plan"]["ended_reason"], "cancelled");
+    assert_eq!(mock.lock().unwrap().intents.len(), charges_before);
+
+    // Paid by bank debit: the plan starts, but that account isn't kept for automatic charges.
+    plan_paid(&h, &acct, "cs_bank", 0, 1, 1000).await;
+    let pm: Option<String> = sqlx::query_scalar("SELECT stripe_payment_method_id FROM accounts WHERE id = $1").bind(acct_id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pm.as_deref(), Some("pm_card"));
+    assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "active");
 }

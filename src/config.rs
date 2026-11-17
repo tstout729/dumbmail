@@ -66,6 +66,9 @@ pub struct Config {
     /// Signing secret of the Stripe webhook pointed at {PUBLIC_URL}/webhooks/stripe.
     #[arg(long, env = "STRIPE_WEBHOOK_SECRET", hide_env_values = true)]
     pub stripe_webhook_secret: Option<String>,
+    /// Stripe API base URL (tests point it at a local stand-in).
+    #[arg(long, env = "STRIPE_API_BASE", default_value = "https://api.stripe.com/v1")]
+    pub stripe_api_base: String,
 
     /// Customer prices in USD. Each covers the worst-case provider cost plus Stripe's fee on the
     /// smallest ($10) top-up (5.9%) and still leaves a margin.

@@ -1,13 +1,14 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { redirect, type LoaderFunctionArgs } from "react-router";
 import { AlertTriangle, CreditCard, Server } from "lucide-react";
-import type { AutoRecharge, Billing } from "../../api";
-import { keys, queryClient, useAutoRecharge, useBilling, useCheckout, useSession } from "../../api";
+import type { AutoRecharge, Billing, EmailPlan, PlanOption } from "../../api";
+import { keys, queryClient, useAutoRecharge, useBilling, useCancelPlan, useCheckout, useChoosePlan, useResumePlan, useSession } from "../../api";
 import { TimeSeriesChart } from "../../components/charts/TimeSeriesChart";
 import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
   EmptyRow,
   Field,
   Input,
@@ -20,26 +21,28 @@ import {
   Toggle,
   cx,
 } from "../../components/ui";
-import { formatCurrency, formatDateTime, formatNumber, formatPrice } from "../../lib/format";
+import { formatCurrency, formatDate, formatDateTime, formatNumber, formatPrice } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { utcToZoned } from "../../lib/tz";
 
 /**
- * Stripe Checkout returns to `?topup=success|cancelled`. Handle it before the page renders: toast, refresh the
- * balance (again a few seconds later, since Stripe's webhook can land after the redirect), and drop the param.
+ * Stripe Checkout returns to `?topup=` or `?plan=` `success|cancelled`. Handle it before the page renders: toast,
+ * refresh billing (again a few seconds later, since Stripe's webhook can land after the redirect), and drop the param.
  */
 export function billingLoader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
   const topup = url.searchParams.get("topup");
-  if (!topup) return null;
-  if (topup === "success") {
-    toast.success("Payment received. Your credit is being added.");
+  const plan = url.searchParams.get("plan");
+  if (!topup && !plan) return null;
+  if (topup === "success" || plan === "success") {
+    toast.success(topup ? "Payment received. Your credit is being added." : "Payment received. Your plan is being set up.");
     void queryClient.invalidateQueries({ queryKey: keys.billing });
     setTimeout(() => void queryClient.invalidateQueries({ queryKey: keys.billing }), 4000);
-  } else if (topup === "cancelled") {
-    toast.info("Top-up cancelled. You weren't charged.");
+  } else if (topup === "cancelled" || plan === "cancelled") {
+    toast.info(`${topup ? "Top-up" : "Plan change"} cancelled. You weren't charged.`);
   }
   url.searchParams.delete("topup");
+  url.searchParams.delete("plan");
   return redirect(url.pathname + url.search);
 }
 
@@ -62,6 +65,7 @@ export function BillingPage() {
   if (b.mode === "self_hosted") return <SelfHostedCard b={b} />;
   return (
     <div className="space-y-4">
+      <PlanCard b={b} />
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <BalanceCard b={b} />
         <AutoRechargeCard b={b} />
@@ -71,6 +75,217 @@ export function BillingPage() {
       <PricesCard b={b} />
       <LedgerCard b={b} />
     </div>
+  );
+}
+
+type ActivePlan = Exclude<EmailPlan, { status: "none" }>;
+
+/** Monthly email plan: pick one, or see the current one and upgrade, downgrade or cancel it. */
+function PlanCard({ b }: { b: Billing }) {
+  if (!b.stripe_enabled || b.plan_options.length === 0) return null;
+  return b.plan.status === "none" ? <ChoosePlan b={b} ended={b.plan} /> : <CurrentPlan b={b} plan={b.plan} />;
+}
+
+/** Sends the browser to Stripe Checkout when a plan change needs a payment now; otherwise confirms the saved change. */
+function usePlanChange() {
+  const choose = useChoosePlan();
+  const [redirecting, setRedirecting] = useState(false);
+  const change = (tier: number, saved: string) =>
+    choose.mutate(tier, {
+      onSuccess: ({ url }) => {
+        if (url) {
+          setRedirecting(true);
+          window.location.assign(url);
+        } else {
+          toast.success(saved);
+        }
+      },
+    });
+  return { change, busy: choose.isPending || redirecting, variables: choose.variables };
+}
+
+function ChoosePlan({ b, ended }: { b: Billing; ended: Extract<EmailPlan, { status: "none" }> }) {
+  const { account } = useSession();
+  const { change, busy } = usePlanChange();
+  const [tier, setTier] = useState(1);
+  const pick = b.plan_options.find((o) => o.tier === tier) ?? b.plan_options[0];
+  return (
+    <Card title="Monthly email plan">
+      {ended.ended_at ? (
+        <div className="mb-4">
+          <Notice tone="amber" icon={<AlertTriangle />} title={`Your plan ended on ${formatDate(ended.ended_at, account.timezone)}`}>
+            {ended.ended_reason === "renewal_failed"
+              ? "We couldn't charge your card for the renewal. Emails past your free allowance now use prepaid credit."
+              : "You cancelled it. Emails past your free allowance now use prepaid credit."}
+          </Notice>
+        </div>
+      ) : null}
+      <p className="text-sm text-zinc-600">
+        Pay monthly for a set number of emails at about {Math.round((1 - pick.price_per_1000 / b.prices.email_per_1000) * 100)}% less than pay-as-you-go. Each
+        plan is double the one before it, so upgrading mid-month costs just the difference.
+      </p>
+      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6" role="radiogroup" aria-label="Plan">
+        {b.plan_options.map((o) => (
+          <PlanChip key={o.tier} option={o} selected={o.tier === tier} onClick={() => setTier(o.tier)} />
+        ))}
+      </div>
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <Button variant="primary" loading={busy} icon={<CreditCard className="size-3.5" />} onClick={() => change(tier, "Plan saved")}>
+          Subscribe for {formatCurrency(pick.price)}/month
+        </Button>
+        <p className="text-xs text-zinc-500">
+          Renews monthly until you cancel. Unused emails don't carry over; anything past your plan uses prepaid credit.
+        </p>
+      </div>
+    </Card>
+  );
+}
+
+function PlanChip({ option, selected, onClick }: { option: PlanOption; selected: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      onClick={onClick}
+      className={cx(
+        "rounded-md border px-3 py-2.5 text-left transition-colors",
+        selected ? "border-accent-600 bg-accent-50 ring-1 ring-accent-600" : "border-zinc-300 bg-white hover:border-zinc-400",
+      )}
+    >
+      <div className="text-sm font-semibold tabular-nums text-zinc-950">{formatCurrency(option.price)}/mo</div>
+      <div className="text-xs tabular-nums text-zinc-700">{formatNumber(option.emails)} emails</div>
+      <div className="mt-0.5 text-[11px] tabular-nums text-zinc-500">{formatCurrency(option.price_per_1000, true)} per 1,000</div>
+    </button>
+  );
+}
+
+function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
+  const { account } = useSession();
+  const { change, busy, variables } = usePlanChange();
+  const cancel = useCancelPlan();
+  const resume = useResumePlan();
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [changing, setChanging] = useState(false);
+  const end = formatDate(plan.period_end, account.timezone);
+  const next = b.plan_options.find((o) => o.tier === plan.tier + 1);
+  const pct = plan.emails_included ? Math.min(100, (plan.emails_used / plan.emails_included) * 100) : 100;
+  const badge =
+    plan.status === "renewal_failed" ? (
+      <Badge tone="amber">Payment failed</Badge>
+    ) : plan.status === "cancelling" ? (
+      <Badge tone="gray">Ends {end}</Badge>
+    ) : (
+      <Badge tone="green">Active</Badge>
+    );
+  return (
+    <Card title="Monthly email plan" actions={badge}>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <div className="text-lg font-semibold tabular-nums text-zinc-950">
+          {formatNumber(plan.emails_included)} emails <span className="text-sm font-normal text-zinc-500">this month</span>
+        </div>
+        <div className="text-sm tabular-nums text-zinc-700">{formatCurrency(plan.price)}/month</div>
+      </div>
+      {plan.status === "renewal_failed" ? (
+        <div className="mt-3">
+          <Notice tone="amber" icon={<AlertTriangle />} title="We couldn't charge your card for this month">
+            We'll try again tomorrow (try {plan.renewal_attempts} of {plan.max_renewal_attempts}). Until then, emails past your free allowance use prepaid
+            credit. Paying with another card starts a new month right away.
+            <div className="mt-2">
+              <Button size="sm" variant="primary" loading={busy} onClick={() => change(plan.tier, "Plan saved")}>
+                Pay {formatCurrency(plan.price)} with another card
+              </Button>
+            </div>
+          </Notice>
+        </div>
+      ) : (
+        <>
+          <div
+            className="mt-3 h-2 overflow-hidden rounded-full bg-zinc-100"
+            role="meter"
+            aria-valuenow={plan.emails_used}
+            aria-valuemin={0}
+            aria-valuemax={plan.emails_included}
+            aria-label="Plan emails used"
+          >
+            <div className={cx("h-full rounded-full", pct >= 90 ? "bg-amber-500" : "bg-accent-600")} style={{ width: `${pct}%` }} />
+          </div>
+          <p className="mt-1.5 text-xs tabular-nums text-zinc-500">
+            {formatNumber(plan.emails_used)} used · {formatNumber(plan.emails_remaining)} left until {end}
+          </p>
+          <p className="mt-3 text-sm text-zinc-700">
+            {plan.status === "cancelling"
+              ? `Your plan ends on ${end} and won't renew. After that, emails past your free allowance use prepaid credit.`
+              : plan.next_tier && plan.next_emails && plan.next_price
+                ? `On ${end} it changes to ${formatNumber(plan.next_emails)} emails for ${formatCurrency(plan.next_price)}/month.`
+                : `Renews on ${end} for ${formatCurrency(plan.price)}.`}
+          </p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {plan.status === "cancelling" ? (
+              <Button variant="primary" loading={resume.isPending} onClick={() => resume.mutate(undefined, { onSuccess: () => toast.success("Your plan will renew") })}>
+                Keep my plan
+              </Button>
+            ) : (
+              <>
+                {next ? (
+                  <Button variant="primary" loading={busy && variables === next.tier} onClick={() => change(next.tier, "Plan saved")}>
+                    Double to {formatNumber(next.emails)} emails for {formatCurrency(next.price - plan.price)} more
+                  </Button>
+                ) : null}
+                {plan.next_tier ? (
+                  <Button loading={busy && variables === plan.tier} onClick={() => change(plan.tier, "You'll stay on your current plan")}>
+                    Keep {formatNumber(plan.emails_included)} emails
+                  </Button>
+                ) : null}
+                <Button onClick={() => setChanging((v) => !v)} aria-expanded={changing}>
+                  Change plan
+                </Button>
+                <Button variant="ghost" onClick={() => setConfirmCancel(true)}>
+                  Cancel plan
+                </Button>
+              </>
+            )}
+          </div>
+          {changing && plan.status !== "cancelling" ? (
+            <div className="mt-4 border-t border-zinc-100 pt-4">
+              <p className="mb-2 text-xs text-zinc-500">
+                A bigger plan starts now: you pay the difference today. A smaller one starts at your next renewal on {end}.
+              </p>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6" role="radiogroup" aria-label="Change plan to">
+                {b.plan_options.map((o) => (
+                  <PlanChip
+                    key={o.tier}
+                    option={o}
+                    selected={o.tier === (plan.next_tier ?? plan.tier)}
+                    onClick={() =>
+                      change(o.tier, o.tier < plan.tier ? `Your plan changes on ${end}` : "You'll stay on your current plan")
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </>
+      )}
+      {confirmCancel ? (
+        <ConfirmDialog
+          title="Cancel your email plan?"
+          body={`It stays active until ${end} and won't renew. After that, emails past your free allowance use prepaid credit.`}
+          confirmLabel="Cancel plan"
+          danger
+          loading={cancel.isPending}
+          onConfirm={() =>
+            cancel.mutate(undefined, {
+              onSuccess: () => {
+                setConfirmCancel(false);
+                toast.success(`Plan cancelled. It stays active until ${end}.`);
+              },
+            })
+          }
+          onClose={() => setConfirmCancel(false)}
+        />
+      ) : null}
+    </Card>
   );
 }
 
@@ -95,15 +310,16 @@ function SelfHostedCard({ b }: { b: Billing }) {
   );
 }
 
-const presets = [10, 25, 50, 100] as const;
-const MIN_TOPUP = 10;
+// Stripe's fixed 30¢ per payment makes small top-ups costly, so the smallest is $25 and $50 is suggested.
+const presets = [25, 50, 100, 250] as const;
 const MAX_TOPUP = 5000;
 
 function BalanceCard({ b }: { b: Billing }) {
   const checkout = useCheckout();
-  const [preset, setPreset] = useState<number | "custom">(25);
+  const [preset, setPreset] = useState<number | "custom">(50);
   const [custom, setCustom] = useState("");
   const [redirecting, setRedirecting] = useState(false);
+  const MIN_TOPUP = b.min_topup;
   const amount = preset === "custom" ? Number(custom) : preset;
   const valid = Number.isFinite(amount) && amount >= MIN_TOPUP && amount <= MAX_TOPUP;
 
@@ -123,12 +339,20 @@ function BalanceCard({ b }: { b: Billing }) {
       <div className={cx("text-4xl font-semibold tracking-tight tabular-nums", b.balance <= 0 ? "text-red-700" : "text-zinc-950")}>
         {formatCurrency(b.balance, true)}
       </div>
-      <p className="mt-1 text-xs text-zinc-500">Prepaid credit. Each email past your free allowance, and every text, is charged from it.</p>
+      <p className="mt-1 text-xs text-zinc-500">
+        Prepaid credit. Every text, and each email past your free allowance{b.plan.status !== "none" ? " and your plan" : ""}, is charged from it.
+      </p>
       {b.balance <= 0 ? (
         <div className="mt-3">
-          <Notice tone="amber" icon={<AlertTriangle />} title="Paid sending is paused">
-            Add credit to send texts and emails beyond your free {formatNumber(b.free_emails_per_month)}.
-          </Notice>
+          {b.plan.status === "active" || b.plan.status === "cancelling" ? (
+            <Notice tone="gray" icon={<AlertTriangle />} title="No credit for texts">
+              Emails come from your free allowance and your plan. Add credit to send texts, or emails once your plan runs out.
+            </Notice>
+          ) : (
+            <Notice tone="amber" icon={<AlertTriangle />} title="Paid sending is paused">
+              Add credit to send texts and emails beyond your free {formatNumber(b.free_emails_per_month)}.
+            </Notice>
+          )}
         </div>
       ) : null}
       <div className="mt-4 border-t border-zinc-100 pt-4">
@@ -198,6 +422,7 @@ function AutoRechargeCard({ b }: { b: Billing }) {
   const current = draft ?? b.auto_recharge;
   const disabled = !b.has_payment_method;
   const edit = (patch: Partial<AutoRecharge>) => setDraft({ ...current, ...patch });
+  const MIN_TOPUP = b.min_topup;
   const amountValid = current.amount >= MIN_TOPUP && current.amount <= MAX_TOPUP;
   const thresholdValid = current.threshold >= 0;
 
@@ -282,7 +507,11 @@ function ThisMonthCard({ b }: { b: Billing }) {
           </div>
           <p className="mt-1.5 text-xs text-zinc-500">
             {formatNumber(b.free_emails_remaining)} free left, reset on the 1st.
-            {paidEmails > 0 ? ` ${formatNumber(paidEmails)} paid emails so far.` : ` After that, ${formatPrice(b.prices.email_per_1000)} per 1,000.`}
+            {b.plan.status === "active" || b.plan.status === "cancelling"
+              ? " After that, emails come from your plan."
+              : paidEmails > 0
+                ? ` ${formatNumber(paidEmails)} paid emails so far.`
+                : ` After that, ${formatPrice(b.prices.email_per_1000)} per 1,000.`}
           </p>
         </div>
         <div>
@@ -368,8 +597,18 @@ function PricesCard({ b }: { b: Billing }) {
   // A worked example from our own prices: 10,000 contacts, 4 emails each this month.
   const exampleEmails = 40_000;
   const exampleCost = (Math.max(0, exampleEmails - b.free_emails_per_month) / 1000) * p.email_per_1000;
+  const smallest = b.plan_options[0];
   const rows = [
     { item: "Email", price: `${formatPrice(p.email_per_1000)} per 1,000`, note: `First ${formatNumber(b.free_emails_per_month)} each month are free` },
+    ...(smallest
+      ? [
+          {
+            item: "Email plan",
+            price: `From ${formatCurrency(smallest.price)} a month`,
+            note: `${formatNumber(smallest.emails)} emails (${formatCurrency(smallest.price_per_1000, true)} per 1,000); each larger plan doubles`,
+          },
+        ]
+      : []),
     { item: "SMS", price: `${formatPrice(p.sms_per_segment)} per segment`, note: "A segment is up to 160 characters, or 70 with emoji" },
     { item: "MMS", price: `${formatPrice(p.mms_per_message)} per message`, note: "Texts with an image" },
     { item: "Phone number", price: `${formatPrice(p.phone_number_monthly)} per month`, note: "Only for numbers you get from DumbMail" },
@@ -391,7 +630,7 @@ function PricesCard({ b }: { b: Billing }) {
         </tbody>
       </Table>
       <div className="border-t border-zinc-100 px-4 py-3 text-xs text-zinc-600">
-        <p>No plans or contact tiers. Other providers charge about $150/mo just to keep 10,000 contacts; here you only pay for the messages you send.</p>
+        <p>No contact tiers. Other providers charge about $150/mo just to keep 10,000 contacts; here you pay only for the messages you send, as you go or with a monthly plan.</p>
         <p className="mt-1 text-zinc-500">
           For example, 4 emails this month to each of 10,000 contacts ({formatNumber(exampleEmails)} emails) costs {formatCurrency(exampleCost, true)} here.
         </p>
@@ -400,8 +639,15 @@ function PricesCard({ b }: { b: Billing }) {
   );
 }
 
+type LedgerRow = { id: string; kind: string; description: string; amount: number; created_at: string; card: boolean };
+
 function LedgerCard({ b }: { b: Billing }) {
   const { account } = useSession();
+  // Credit moves and plan card payments in one list, newest first. Plan payments go on the card, not the balance.
+  const rows: LedgerRow[] = [
+    ...b.ledger.map((e) => ({ ...e, card: false })),
+    ...b.plan_payments.map((p) => ({ id: p.id, kind: "plan", description: p.description, amount: p.amount, created_at: p.created_at, card: true })),
+  ].sort((x, y) => y.created_at.localeCompare(x.created_at));
   return (
     <Card title="Transactions" padded={false}>
       <Table className="rounded-none border-0 shadow-none">
@@ -414,22 +660,28 @@ function LedgerCard({ b }: { b: Billing }) {
           </tr>
         </thead>
         <tbody>
-          {b.ledger.length === 0 ? (
+          {rows.length === 0 ? (
             <EmptyRow cols={4}>
-              <p className="px-4 py-8 text-center text-sm text-zinc-500">No transactions yet. Top-ups and charges show up here.</p>
+              <p className="px-4 py-8 text-center text-sm text-zinc-500">No transactions yet. Top-ups, plan payments and charges show up here.</p>
             </EmptyRow>
           ) : (
-            b.ledger.map((e) => (
+            rows.map((e) => (
               <tr key={e.id} className="[&:last-child>td]:border-b-0">
                 <Td className="whitespace-nowrap text-zinc-600">{formatDateTime(e.created_at, account.timezone)}</Td>
                 <Td className="text-zinc-900">{e.description}</Td>
                 <Td>
-                  <Badge tone={e.amount > 0 ? "green" : "gray"}>{e.kind.replace(/_/g, " ")}</Badge>
+                  <Badge tone={e.card ? "blue" : e.amount > 0 ? "green" : "gray"}>{e.kind.replace(/_/g, " ")}</Badge>
                 </Td>
-                <Td className={cx("whitespace-nowrap text-right font-medium tabular-nums", e.amount > 0 ? "text-accent-700" : "text-zinc-900")}>
-                  {e.amount > 0 ? "+" : e.amount < 0 ? "−" : ""}
-                  {formatPrice(Math.abs(e.amount))}
-                </Td>
+                {e.card ? (
+                  <Td className="whitespace-nowrap text-right font-medium tabular-nums text-zinc-900">
+                    {formatCurrency(e.amount, true)} <span className="text-xs font-normal text-zinc-500">card</span>
+                  </Td>
+                ) : (
+                  <Td className={cx("whitespace-nowrap text-right font-medium tabular-nums", e.amount > 0 ? "text-accent-700" : "text-zinc-900")}>
+                    {e.amount > 0 ? "+" : e.amount < 0 ? "−" : ""}
+                    {formatPrice(Math.abs(e.amount))}
+                  </Td>
+                )}
               </tr>
             ))
           )}

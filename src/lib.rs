@@ -25,6 +25,7 @@ pub mod segments;
 pub mod sending;
 pub mod site;
 pub mod state;
+pub mod subscription;
 pub mod web;
 
 use axum::Router;

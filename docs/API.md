@@ -274,8 +274,21 @@ time (7 days out) and is released then unless the balance is topped up first.
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/billing` | – | `Billing` (replaces the v0.1 shape) |
-| POST | `/api/billing/checkout` | `{amount: number}` (USD, 10–5000) | `{url}`: redirect the browser to Stripe Checkout; it returns to `/settings/billing?topup=success` or `?topup=cancelled` |
-| PATCH | `/api/billing/auto-recharge` | `{enabled: boolean, threshold: number, amount: number}` | `Billing` |
+| POST | `/api/billing/checkout` | `{amount: number}` (USD, 25–5000) | `{url}`: redirect the browser to Stripe Checkout; it returns to `/settings/billing?topup=success` or `?topup=cancelled` |
+| PATCH | `/api/billing/auto-recharge` | `{enabled: boolean, threshold: number, amount: number}` (amount 25–1000) | `Billing` |
+| POST | `/api/billing/plan` | `{tier: 1-6}` | `{url: string \| null, billing: Billing}`: `url` is a Stripe Checkout page when something is due now (a new plan, or an upgrade's price difference); a downgrade or re-choosing the current tier is saved and `url` is null. Returns to `/settings/billing?plan=success` or `?plan=cancelled` |
+| POST | `/api/billing/plan/cancel` | – | `Billing` (stops renewal; the plan lasts to `period_end`) |
+| POST | `/api/billing/plan/resume` | – | `Billing` (undoes a cancellation before `period_end`) |
+
+#### Monthly email plans
+
+Optional, hosted only, dashboard only (API keys get 403). Tier N costs $10 × 2^(N-1) a month for
+30,000 × 2^(N-1) emails, about 17% below pay-as-you-go. Emails use the free allowance first, then the
+plan, then prepaid credit. An upgrade mid-month charges the price difference and adds the extra emails
+at once; a downgrade starts at the next renewal. Renewals charge the saved card (no Stripe Billing).
+A declined renewal is retried a day later, up to 3 tries, then the plan ends; while it's failing, plan
+emails aren't available. Unused plan emails don't carry over. A plan payment that no longer fits by
+the time it lands (e.g. an upgrade paid after the plan ended) is added to prepaid credit.
 
 ```ts
 type Billing = {
@@ -290,6 +303,13 @@ type Billing = {
   usage: { date: string; kind: "email" | "sms" | "mms" | "number"; quantity: number; amount: number }[]; // last 30 days, daily
   ledger: { id: string; kind: string; description: string; amount: number; created_at: string }[];      // newest 50; credits positive
   limits: { profiles: number | null };
+  plan: { status: "none"; ended_at: string | null; ended_reason: "cancelled" | "renewal_failed" | null }
+      | { status: "active" | "cancelling" | "renewal_failed"; tier: number; price: number; emails_included: number; emails_used: number;
+          emails_remaining: number; period_start: string; period_end: string; next_tier: number | null; next_price: number | null;
+          next_emails: number | null; renewal_attempts: number; renewal_failed_at: string | null; max_renewal_attempts: number };
+  plan_options: { tier: number; price: number; emails: number; price_per_1000: number; pay_as_you_go_price: number }[];
+  plan_payments: { id: string; kind: "start" | "upgrade" | "renewal"; tier: number; amount: number; description: string; created_at: string }[]; // card payments, newest 24
+  min_topup: number;                      // USD
 };
 ```
 

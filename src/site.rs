@@ -9,7 +9,7 @@ use axum::Router;
 
 use crate::state::AppState;
 
-const UPDATED: &str = "November 15, 2026";
+const UPDATED: &str = "November 16, 2026";
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/about", get(about)).route("/privacy", get(privacy)).route("/terms", get(terms))
@@ -87,7 +87,7 @@ footer a {{ color:var(--muted); margin-right:16px; }}
     ))
 }
 
-fn thousands(n: i64) -> String {
+pub(crate) fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
@@ -108,12 +108,13 @@ fn money(v: f64) -> String {
 
 async fn about(State(state): State<AppState>) -> Html<String> {
     let c = &state.cfg;
+    let plan_price = format!("${}", crate::subscription::price_cents(1) / 100);
     let free = if c.free_emails_per_month > 0 { format!("<p>The first {} emails each month are free.</p>", thousands(c.free_emails_per_month)) } else { String::new() };
     page(
-        "DumbMail: email and text marketing you pay for as you go",
+        "DumbMail: email and text marketing priced by what you send",
         &format!(
-            r#"<h1>Email and text marketing, without the monthly plan.</h1>
-<p>DumbMail sends your store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow your list; flows follow up on browsing, carts and orders. You pay only for what you send.</p>
+            r#"<h1>Email and text marketing, priced by what you send.</h1>
+<p>DumbMail sends your store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow your list; flows follow up on browsing, carts and orders. You pay only for what you send, never for how many contacts you keep.</p>
 <p><a class="cta" href="/signup">Create an account</a><a class="cta secondary" href="/login">Log in</a></p>
 <h2>What it does</h2>
 <ul>
@@ -130,9 +131,10 @@ async fn about(State(state): State<AppState>) -> Html<String> {
 <tr><td>Text message (SMS)</td><td>{sms} per segment</td></tr>
 <tr><td>Picture message (MMS)</td><td>{mms} each</td></tr>
 <tr><td>Phone number</td><td>{num} per month</td></tr>
+<tr><td>Monthly email plan</td><td>From {plan_price} a month for {plan_emails} emails; each bigger plan doubles both</td></tr>
 </table>
 {free}
-<p class="muted">Add credit with a card and it's used as you send. No subscription.</p>
+<p class="muted">Add credit with a card and it's used as you send, or choose a monthly email plan for about 17% less per email. No contact tiers.</p>
 <h2>Open source</h2>
 <p>DumbMail is open source under the AGPL-3.0 license, so you can also run it yourself.</p>
 <h2>Contact</h2>
@@ -141,6 +143,8 @@ async fn about(State(state): State<AppState>) -> Html<String> {
             sms = money(c.price_sms_segment),
             mms = money(c.price_mms),
             num = money(c.price_number_monthly),
+            plan_price = plan_price,
+            plan_emails = thousands(crate::subscription::emails(1)),
             contact = contact(&state),
         ),
     )
@@ -236,7 +240,9 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 <p>We may pause sending, hold messages or suspend an account to protect deliverability, recipients or the service, for example after high bounce or complaint rates. We'll tell you why when we can.</p>
 
 <h2>Prices and payment</h2>
-<p>The hosted service is pay as you go. You add credit and it's used as you send, at the prices on our <a href="/about">About page</a>. We may change prices with at least 30 days' notice by email; changes don't apply to messages already sent. Phone numbers are billed monthly from your credit and may be released if their rent goes unpaid. Taxes may apply. For billing questions or refund requests, contact us.</p>
+<p>The hosted service is pay as you go. You add credit and it's used as you send, at the prices on our <a href="/about">About page</a>. We may change prices with at least 30 days' notice by email; changes don't apply to messages already sent.</p>
+<p>You can also choose a monthly email plan: a set number of emails each month for a fixed price. It's charged to your card when you start it and again at the start of each month until you cancel. Cancel any time in Settings → Billing; the plan stays active until the end of the month you've paid for and then stops renewing. Plan emails left at the end of a month don't carry over. Moving to a bigger plan is charged right away for the difference in price; moving to a smaller one starts at your next renewal. If a renewal can't be charged, we try three times, a day apart, and then end the plan.</p>
+<p>Phone numbers are billed monthly from your credit and may be released if their rent goes unpaid. Taxes may apply. For billing questions or refund requests, contact us.</p>
 
 <h2>Your content</h2>
 <p>You own your content and subscriber data. You give us permission to store and process it only to provide the service. You're responsible for having the rights and consents needed to upload and message it.</p>

@@ -176,6 +176,7 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     }
     if tick.is_multiple_of(3) {
         crate::billing::run_auto_recharge(state).await?;
+        crate::subscription::run_renewals(state).await?;
         crate::billing::charge_numbers(state).await?;
     }
     if tick.is_multiple_of(45) {

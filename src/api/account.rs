@@ -34,6 +34,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/billing", get(billing))
         .route("/api/billing/checkout", post(checkout))
         .route("/api/billing/auto-recharge", axum::routing::patch(auto_recharge))
+        .route("/api/billing/plan", post(choose_plan))
+        .route("/api/billing/plan/cancel", post(cancel_plan))
+        .route("/api/billing/plan/resume", post(resume_plan))
         .route("/api/phone-numbers", get(numbers).post(claim_number))
         .route("/api/phone-numbers/available", get(available_numbers))
         .route("/api/phone-numbers/{id}", delete(release_number))
@@ -508,6 +511,37 @@ async fn auto_recharge(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
         return Err(AppError::Forbidden("change auto-recharge from the dashboard".into()));
     }
     crate::billing::set_auto_recharge(&state, ctx.account_id, b.enabled, b.threshold, b.amount).await?;
+    Ok(Json(billing_json(&state, ctx.account_id).await?))
+}
+
+#[derive(Deserialize)]
+struct PlanBody {
+    tier: i16,
+}
+
+/// Start, upgrade or downgrade the monthly email plan. `url` is a Stripe Checkout page when
+/// something is due now (a new plan or an upgrade); otherwise the change is saved and `url` is null.
+async fn choose_plan(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<PlanBody>) -> AppResult<Json<Value>> {
+    if ctx.via_api_key {
+        return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
+    }
+    let url = crate::subscription::choose(&state, ctx.account_id, b.tier).await?;
+    Ok(Json(json!({"url": url, "billing": billing_json(&state, ctx.account_id).await?})))
+}
+
+async fn cancel_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    if ctx.via_api_key {
+        return Err(AppError::Forbidden("cancel the email plan from the dashboard".into()));
+    }
+    crate::subscription::cancel(&state.db, ctx.account_id).await?;
+    Ok(Json(billing_json(&state, ctx.account_id).await?))
+}
+
+async fn resume_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    if ctx.via_api_key {
+        return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
+    }
+    crate::subscription::resume(&state.db, ctx.account_id).await?;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 

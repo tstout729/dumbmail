@@ -615,6 +615,33 @@ export type AutoRecharge = { enabled: boolean; threshold: number; amount: number
 
 export type LedgerEntry = { id: string; kind: string; description: string; amount: number; created_at: string };
 
+export type PlanStatus = "none" | "active" | "cancelling" | "renewal_failed";
+
+/** The monthly email plan. Fields past `status` are present whenever there is a plan (status ≠ "none"). */
+export type EmailPlan =
+  | { status: "none"; ended_at: string | null; ended_reason: "cancelled" | "renewal_failed" | null }
+  | {
+      status: Exclude<PlanStatus, "none">;
+      tier: number;
+      price: number;
+      emails_included: number;
+      emails_used: number;
+      emails_remaining: number;
+      period_start: string;
+      period_end: string;
+      /** A downgrade waiting for the next renewal. */
+      next_tier: number | null;
+      next_price: number | null;
+      next_emails: number | null;
+      renewal_attempts: number;
+      renewal_failed_at: string | null;
+      max_renewal_attempts: number;
+    };
+
+export type PlanOption = { tier: number; price: number; emails: number; price_per_1000: number; pay_as_you_go_price: number };
+
+export type PlanPayment = { id: string; kind: "start" | "upgrade" | "renewal"; tier: number; amount: number; description: string; created_at: string };
+
 export type Billing = {
   mode: "hosted" | "self_hosted";
   balance: number;
@@ -629,6 +656,11 @@ export type Billing = {
   usage: { date: string; kind: UsageKind; quantity: number; amount: number }[];
   ledger: LedgerEntry[];
   limits: { profiles: number | null };
+  plan: EmailPlan;
+  plan_options: PlanOption[];
+  plan_payments: PlanPayment[];
+  /** Smallest card top-up in USD. */
+  min_topup: number;
 };
 
 // ---- Phone numbers and SMS ----
