@@ -5,6 +5,10 @@
 //! (event ids are time-ordered), records who did what with which product in
 //! `catalog_interactions`, and, for stores without a feed, adds the products it sees so the
 //! catalog fills itself. Products from a feed, the API or a CSV are never changed by events.
+//!
+//! Anyone can send events from a browser, so a learned product starts unverified: it shows only to
+//! the person whose own event carried it, until `verify` reads its page on the store's site. Orders
+//! from the browser are recorded but don't count as sales (only trusted ones do).
 
 use std::collections::HashMap;
 
@@ -126,20 +130,26 @@ async fn learn_product(db: &PgPool, account_id: Uuid, item: &Value, existing: Op
     let categories: Option<Vec<String>> = item.get("categories").map(super::store::parse_list).map(|v| v.into_iter().take(20).map(|c| c.chars().take(200).collect()).collect());
     let image = http_url(item, "image_url");
     let brand = text(item, "brand").map(|b| b.chars().take(200).collect::<String>());
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO catalog_products (id, account_id, external_id, title, url, image_url, price, currency, categories, brand, source)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, '{}'), $10, 'events')
+    // Until it's verified, the newest event's details stand in. Once the store's page has confirmed
+    // it, the page wins: events only ask for a fresh look now and then.
+    let fresh = "catalog_products.source = 'events' AND NOT catalog_products.verified";
+    let q = format!(
+        "INSERT INTO catalog_products (id, account_id, external_id, title, url, image_url, price, currency, categories, brand, source, verified, verify_after)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, '{{}}'), $10, 'events', false, now())
          ON CONFLICT (account_id, external_id) DO UPDATE SET
-            title = CASE WHEN catalog_products.source = 'events' THEN EXCLUDED.title ELSE catalog_products.title END,
-            url = CASE WHEN catalog_products.source = 'events' THEN COALESCE(EXCLUDED.url, catalog_products.url) ELSE catalog_products.url END,
-            image_url = CASE WHEN catalog_products.source = 'events' THEN COALESCE(EXCLUDED.image_url, catalog_products.image_url) ELSE catalog_products.image_url END,
-            price = CASE WHEN catalog_products.source = 'events' THEN COALESCE(EXCLUDED.price, catalog_products.price) ELSE catalog_products.price END,
-            currency = CASE WHEN catalog_products.source = 'events' THEN COALESCE(EXCLUDED.currency, catalog_products.currency) ELSE catalog_products.currency END,
-            categories = CASE WHEN catalog_products.source = 'events' AND $9::text[] IS NOT NULL THEN EXCLUDED.categories ELSE catalog_products.categories END,
-            brand = CASE WHEN catalog_products.source = 'events' THEN COALESCE(EXCLUDED.brand, catalog_products.brand) ELSE catalog_products.brand END,
-            updated_at = CASE WHEN catalog_products.source = 'events' THEN now() ELSE catalog_products.updated_at END
-         RETURNING id",
-    )
+            title = CASE WHEN {fresh} THEN EXCLUDED.title ELSE catalog_products.title END,
+            url = CASE WHEN {fresh} THEN COALESCE(EXCLUDED.url, catalog_products.url) ELSE catalog_products.url END,
+            image_url = CASE WHEN {fresh} THEN COALESCE(EXCLUDED.image_url, catalog_products.image_url) ELSE catalog_products.image_url END,
+            price = CASE WHEN {fresh} THEN COALESCE(EXCLUDED.price, catalog_products.price) ELSE catalog_products.price END,
+            currency = CASE WHEN {fresh} THEN COALESCE(EXCLUDED.currency, catalog_products.currency) ELSE catalog_products.currency END,
+            categories = CASE WHEN {fresh} AND $9::text[] IS NOT NULL THEN EXCLUDED.categories ELSE catalog_products.categories END,
+            brand = CASE WHEN {fresh} THEN COALESCE(EXCLUDED.brand, catalog_products.brand) ELSE catalog_products.brand END,
+            verify_after = CASE WHEN catalog_products.source = 'events' AND catalog_products.verified AND catalog_products.verify_after IS NULL
+                                 AND catalog_products.verified_at < now() - interval '1 day' THEN now() ELSE catalog_products.verify_after END,
+            updated_at = CASE WHEN {fresh} THEN now() ELSE catalog_products.updated_at END
+         RETURNING id"
+    );
+    let id: Uuid = sqlx::query_scalar(&q)
     .bind(existing.unwrap_or_else(Uuid::now_v7))
     .bind(account_id)
     .bind(&external_id)
@@ -219,9 +229,15 @@ async fn rules_for(db: &PgPool, account_id: Uuid) -> sqlx::Result<Rules> {
     Ok(Rules { learn, hosts: site_hosts(db, account_id).await? })
 }
 
+/// One event to read: id, account, profile, metric, properties, when, and whether a browser sent it
+/// (`None`: recorded before that was tracked).
+pub type EventRow<'a> = (Uuid, Uuid, Uuid, &'a str, &'a Value, DateTime<Utc>, Option<bool>);
+
 /// Record one event's products. Returns how many items it recorded.
-pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, Rules>, ev: (Uuid, Uuid, Uuid, &str, &Value, DateTime<Utc>)) -> sqlx::Result<usize> {
-    let (event_id, account_id, profile_id, metric, props, at) = ev;
+pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, Rules>, ev: EventRow<'_>) -> sqlx::Result<usize> {
+    let (event_id, account_id, profile_id, metric, props, at, from_browser) = ev;
+    // Only what the server, the API or an integration recorded counts as a sale.
+    let trusted = from_browser == Some(false);
     let Some(kind) = kind_for(metric) else { return Ok(0) };
     let mut n = 0;
     for item in event_items(metric, props) {
@@ -244,8 +260,8 @@ pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, Rules>, ev: (Uu
         let Some((product_id, variant_id)) = ids else { continue };
         let qty = item.get("quantity").and_then(parse_price).map(|q| q.round().clamp(1.0, 10_000.0) as i32).unwrap_or(1);
         sqlx::query(
-            "INSERT INTO catalog_interactions (account_id, profile_id, product_id, variant_id, kind, quantity, price, event_id, occurred_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (event_id, product_id, kind) DO NOTHING",
+            "INSERT INTO catalog_interactions (account_id, profile_id, product_id, variant_id, kind, quantity, price, event_id, occurred_at, trusted)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (event_id, product_id, kind) DO NOTHING",
         )
         .bind(account_id)
         .bind(profile_id)
@@ -256,6 +272,7 @@ pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, Rules>, ev: (Uu
         .bind(item.get("price").and_then(parse_price))
         .bind(event_id)
         .bind(at)
+        .bind(trusted)
         .execute(db)
         .await?;
         n += 1;
@@ -280,8 +297,8 @@ pub async fn run(state: &AppState, lag_secs: i64) -> anyhow::Result<bool> {
     .fetch_all(&mut *tx)
     .await?;
     let Some(last) = window.last().copied() else { return Ok(false) };
-    let rows: Vec<(Uuid, Uuid, Uuid, String, Value, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT e.id, e.account_id, e.profile_id, m.name, e.properties, e.occurred_at FROM events e JOIN metrics m ON m.id = e.metric_id
+    let rows: Vec<(Uuid, Uuid, Uuid, String, Value, DateTime<Utc>, Option<bool>)> = sqlx::query_as(
+        "SELECT e.id, e.account_id, e.profile_id, m.name, e.properties, e.occurred_at, e.from_browser FROM events e JOIN metrics m ON m.id = e.metric_id
          WHERE e.id > $1 AND e.id <= $2 AND m.name IN ('Viewed Product', 'Added to Cart', 'Started Checkout', 'Placed Order')
          ORDER BY e.id",
     )
@@ -290,8 +307,8 @@ pub async fn run(state: &AppState, lag_secs: i64) -> anyhow::Result<bool> {
     .fetch_all(&mut *tx)
     .await?;
     let mut cache = HashMap::new();
-    for (id, account, profile, metric, props, at) in &rows {
-        if let Err(e) = record(&state.db, &mut cache, (*id, *account, *profile, metric, props, *at)).await {
+    for (id, account, profile, metric, props, at, from_browser) in &rows {
+        if let Err(e) = record(&state.db, &mut cache, (*id, *account, *profile, metric, props, *at, *from_browser)).await {
             // One bad event must not stall the reader for everyone.
             tracing::warn!(event = %id, error = %e, "couldn't read products from event");
         }
@@ -311,32 +328,104 @@ pub async fn catch_up(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Items a flow's triggering event carries, as product cards: matched to the catalog where
-/// possible (for current prices and images), otherwise from what the event itself says.
-/// An unmatched item's link is kept only when it goes to the store's own site (`hosts`).
-pub async fn event_cards(db: &PgPool, account_id: Uuid, hosts: &[String], event: &Value) -> sqlx::Result<Vec<(Option<Uuid>, Value)>> {
+/// A catalog match for an event item: the product and, when the item names one, the variant.
+pub type Match = Option<(Uuid, Option<Uuid>)>;
+
+/// [`resolve`] for many items at once, in three queries whatever their number.
+pub async fn resolve_many(db: &PgPool, account_id: Uuid, items: &[Value]) -> sqlx::Result<Vec<Match>> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut vids: Vec<String> = Vec::new();
+    let mut skus: Vec<String> = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+    for it in items {
+        keys.extend(text(it, "product_id"));
+        keys.extend(text(it, "sku"));
+        vids.extend(text(it, "variant_id"));
+        skus.extend(text(it, "sku"));
+        if let Some(u) = http_url(it, "url") {
+            urls.extend(url_keys(&u));
+        }
+    }
+    if keys.is_empty() && vids.is_empty() && urls.is_empty() {
+        return Ok(vec![None; items.len()]);
+    }
+    let by_ext: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, external_id FROM catalog_products WHERE account_id = $1 AND external_id = ANY($2)")
+        .bind(account_id)
+        .bind(&keys)
+        .fetch_all(db)
+        .await?;
+    let vars: Vec<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, product_id, external_id, sku FROM catalog_variants WHERE account_id = $1 AND (external_id = ANY($2) OR sku = ANY($3)) ORDER BY id",
+    )
+    .bind(account_id)
+    .bind(&vids)
+    .bind(&skus)
+    .fetch_all(db)
+    .await?;
+    let by_url: Vec<(Uuid, String)> = if urls.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, url FROM catalog_products WHERE account_id = $1 AND url = ANY($2) ORDER BY updated_at DESC").bind(account_id).bind(&urls).fetch_all(db).await?
+    };
+    Ok(items
+        .iter()
+        .map(|it| {
+            let (pid, vid, sku) = (text(it, "product_id"), text(it, "variant_id"), text(it, "sku"));
+            let ext = |k: &Option<String>| k.as_ref().and_then(|k| by_ext.iter().find(|p| &p.1 == k)).map(|p| p.0);
+            let mut product = ext(&pid).or_else(|| ext(&sku));
+            let mut variant = None;
+            if let Some(v) = &vid {
+                let hit = vars.iter().find(|x| &x.2 == v && product.is_none_or(|p| x.1 == p));
+                if let Some(h) = hit {
+                    variant = Some(h.0);
+                    product = product.or(Some(h.1));
+                }
+            }
+            if product.is_none() {
+                if let Some(h) = sku.as_ref().and_then(|s| vars.iter().find(|x| x.3.as_deref() == Some(s.as_str()))) {
+                    variant = variant.or(Some(h.0));
+                    product = Some(h.1);
+                }
+            }
+            if product.is_none() {
+                if let Some(u) = http_url(it, "url") {
+                    let ks = url_keys(&u);
+                    product = by_url.iter().find(|p| ks.contains(&p.1)).map(|p| p.0);
+                }
+            }
+            product.map(|p| (p, variant))
+        })
+        .collect())
+}
+
+/// A product card made only from what one event item says. Its link is kept only when it goes to
+/// the store's own site (`hosts`).
+pub fn raw_card(item: &Value, props: &Value, hosts: &[String]) -> Value {
+    let price = item.get("price").and_then(parse_price);
+    let currency = text(item, "currency").or_else(|| text(props, "currency"));
+    json!({
+        "id": text(item, "product_id"),
+        "variant_id": text(item, "variant_id"),
+        "title": text(item, "name").or_else(|| text(item, "title")),
+        "name": text(item, "name").or_else(|| text(item, "title")),
+        "url": http_url(item, "url").filter(|u| on_site(hosts, u)),
+        "image_url": http_url(item, "image_url"),
+        "price": price,
+        "currency": currency,
+        "price_text": price.map(|p| super::store::money(p, currency.as_deref())),
+        "quantity": item.get("quantity").and_then(parse_price),
+        "in_stock": true,
+    })
+}
+
+/// Items a flow's triggering event carries: each one's catalog match (product and variant) and a
+/// card made from what the event itself says.
+pub async fn event_cards(db: &PgPool, account_id: Uuid, hosts: &[String], event: &Value) -> sqlx::Result<Vec<(Match, Value)>> {
     let metric = event.get("metric").and_then(|m| m.as_str()).unwrap_or("");
     let props = event.get("properties").cloned().unwrap_or(json!({}));
-    let mut out = Vec::new();
-    for item in event_items(metric, &props).into_iter().take(MAX_ITEMS) {
-        let found = resolve(db, account_id, &item).await?;
-        let price = item.get("price").and_then(parse_price);
-        let currency = text(&item, "currency").or_else(|| text(&props, "currency"));
-        let card = json!({
-            "id": text(&item, "product_id"),
-            "title": text(&item, "name").or_else(|| text(&item, "title")),
-            "name": text(&item, "name").or_else(|| text(&item, "title")),
-            "url": http_url(&item, "url").filter(|u| on_site(hosts, u)),
-            "image_url": http_url(&item, "image_url"),
-            "price": price,
-            "currency": currency,
-            "price_text": price.map(|p| super::store::money(p, currency.as_deref())),
-            "quantity": item.get("quantity").and_then(parse_price),
-            "in_stock": true,
-        });
-        out.push((found.map(|f| f.0), card));
-    }
-    Ok(out)
+    let items: Vec<Value> = event_items(metric, &props).into_iter().take(MAX_ITEMS).collect();
+    let found = resolve_many(db, account_id, &items).await?;
+    Ok(items.iter().zip(found).map(|(it, m)| (m, raw_card(it, &props, hosts))).collect())
 }
 
 #[cfg(test)]

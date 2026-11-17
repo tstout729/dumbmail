@@ -3,7 +3,7 @@
 //! [`upsert_products`] is the one way authoritative product data gets in (REST, MCP, CSV, feeds,
 //! and later the Shopify app). It is safe to call in bulk: each product is its own short
 //! transaction, unchanged products are skipped by content hash, and restocks and price drops are
-//! handed to background jobs rather than handled inline.
+//! handed to background jobs queued in the same transaction as the change, so none is lost.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -412,13 +412,12 @@ enum Saved {
 }
 
 /// Save products from an authoritative source (not events). Problems with one product are
-/// reported in the summary and don't stop the rest.
+/// reported in the summary and don't stop the rest. Products saved here count as verified.
 pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInput], origin: Origin) -> AppResult<UpsertSummary> {
     if inputs.len() > MAX_BATCH && !matches!(origin, Origin::Feed(_) | Origin::Csv) {
         return Err(AppError::bad(format!("send at most {MAX_BATCH} products per call")));
     }
     let mut out = UpsertSummary::default();
-    let mut changes = Vec::new();
     for p in inputs {
         let c = match clean(p) {
             Ok(c) => c,
@@ -427,7 +426,7 @@ pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInp
                 continue;
             }
         };
-        match upsert_one(db, account_id, &c, origin, &mut changes).await {
+        match upsert_one(db, account_id, &c, origin).await {
             Ok(Saved::Created(id)) => {
                 out.created += 1;
                 out.ids.push(id);
@@ -444,9 +443,6 @@ pub async fn upsert_products(db: &PgPool, account_id: Uuid, inputs: &[ProductInp
             Err(e) => out.error(e.public_message()),
         }
     }
-    for ch in changes {
-        super::alerts::enqueue_change(db, account_id, &ch).await?;
-    }
     Ok(out)
 }
 
@@ -458,13 +454,14 @@ struct Existing {
     feed_id: Option<Uuid>,
     price: Option<f64>,
     in_stock: bool,
+    missing_since: Option<DateTime<Utc>>,
 }
 
-async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, changes: &mut Vec<Change>) -> AppResult<Saved> {
+async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin) -> AppResult<Saved> {
     let hash = crate::auth::sha256_hex(&serde_json::to_string(c).map_err(|e| AppError::Internal(e.into()))?);
     let mut tx = db.begin().await?;
     let existing: Option<Existing> = sqlx::query_as(
-        "SELECT id, content_hash, source, feed_id, price, in_stock FROM catalog_products WHERE account_id = $1 AND external_id = $2 FOR UPDATE",
+        "SELECT id, content_hash, source, feed_id, price, in_stock, missing_since FROM catalog_products WHERE account_id = $1 AND external_id = $2 FOR UPDATE",
     )
     .bind(account_id)
     .bind(&c.external_id)
@@ -473,7 +470,18 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, ch
     if let Some(e) = &existing {
         if e.content_hash.as_deref() == Some(hash.as_str()) && e.source == origin.name() && e.feed_id == origin.feed_id() {
             if origin.feed_id().is_some() {
-                sqlx::query("UPDATE catalog_products SET feed_seen_at = now() WHERE id = $1").bind(e.id).execute(&mut *tx).await?;
+                // Back in the feed after leaving it: it shows again if the store publishes it.
+                sqlx::query(
+                    "UPDATE catalog_products SET feed_seen_at = now(), missing_since = NULL, published = source_published,
+                        updated_at = CASE WHEN missing_since IS NULL THEN updated_at ELSE now() END WHERE id = $1",
+                )
+                .bind(e.id)
+                .execute(&mut *tx)
+                .await?;
+                if e.missing_since.is_some() {
+                    tx.commit().await?;
+                    return Ok(Saved::Updated(e.id));
+                }
             }
             tx.commit().await?;
             return Ok(Saved::Unchanged(e.id));
@@ -495,9 +503,9 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, ch
             let id = Uuid::now_v7();
             sqlx::query(
                 "INSERT INTO catalog_products (id, account_id, external_id, title, description, url, image_url, images, price, compare_at_price,
-                    currency, available, inventory, categories, tags, brand, vendor, custom, published, published_at, source, feed_id, feed_seen_at, content_hash)
+                    currency, available, inventory, categories, tags, brand, vendor, custom, published, source_published, published_at, source, feed_id, feed_seen_at, content_hash, verified)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, '[]'::jsonb), $9, NULLIF($10, 0), $11, COALESCE($12, true), $13, COALESCE($14, '{}'), COALESCE($15, '{}'),
-                    $16, $17, COALESCE($18, '{}'::jsonb), COALESCE($19, true), COALESCE($20, now()), $21, $22, CASE WHEN $22::uuid IS NULL THEN NULL ELSE now() END, $23)",
+                    $16, $17, COALESCE($18, '{}'::jsonb), COALESCE($19, true), COALESCE($19, true), COALESCE($20, now()), $21, $22, CASE WHEN $22::uuid IS NULL THEN NULL ELSE now() END, $23, true)",
             )
             .bind(id)
             .bind(account_id)
@@ -534,9 +542,11 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, ch
                     currency = COALESCE($9, currency), available = COALESCE($10, available),
                     inventory = COALESCE($11, inventory),
                     categories = COALESCE($12, categories), tags = COALESCE($13, tags), brand = COALESCE($14, brand), vendor = COALESCE($15, vendor),
-                    custom = COALESCE($16, custom), published = COALESCE($17, published), published_at = COALESCE($18, published_at),
+                    custom = COALESCE($16, custom), source_published = COALESCE($17, source_published),
+                    published = COALESCE($17, source_published) AND ($20::uuid IS NOT NULL OR missing_since IS NULL),
+                    missing_since = CASE WHEN $20::uuid IS NULL THEN missing_since ELSE NULL END, published_at = COALESCE($18, published_at),
                     source = $19, feed_id = COALESCE($20, feed_id), feed_seen_at = CASE WHEN $20::uuid IS NULL THEN feed_seen_at ELSE now() END,
-                    content_hash = $21, updated_at = now()
+                    content_hash = $21, verified = true, verified_at = COALESCE(verified_at, now()), verify_after = NULL, verify_error = NULL, updated_at = now()
                  WHERE id = $1",
             )
             .bind(e.id)
@@ -640,9 +650,9 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, ch
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
-
+    // Restocks and price drops are queued in this transaction: they're saved exactly when the change is.
     if let Some(e) = &existing {
+        let mut changes = Vec::new();
         for (vid, was, now) in &variant_ids {
             if !*was && *now {
                 changes.push(Change::Restock { product_id: id, variant_id: Some(*vid) });
@@ -656,9 +666,12 @@ async fn upsert_one(db: &PgPool, account_id: Uuid, c: &Clean, origin: Origin, ch
                 changes.push(Change::PriceDrop { product_id: id, old, new });
             }
         }
-        return Ok(Saved::Updated(id));
+        for ch in &changes {
+            super::alerts::enqueue_change(&mut tx, account_id, ch).await?;
+        }
     }
-    Ok(Saved::Created(id))
+    tx.commit().await?;
+    Ok(if existing.is_some() { Saved::Updated(id) } else { Saved::Created(id) })
 }
 
 /// A product row as the API returns it.
@@ -686,13 +699,20 @@ pub struct Product {
     pub published_at: DateTime<Utc>,
     pub source: String,
     pub feed_id: Option<Uuid>,
+    /// False for a product learned from browser events that the server hasn't confirmed yet: it
+    /// shows only to the person whose own event carried it.
+    pub verified: bool,
+    /// Why verifying it from its page hasn't worked (yet).
+    pub verify_error: Option<String>,
+    /// When it left its feed (it's unpublished until it comes back).
+    pub missing_since: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 pub const PRODUCT_COLS: &str = "cp.id, cp.external_id, cp.title, cp.description, cp.url, cp.image_url, cp.images, cp.price, cp.compare_at_price, cp.currency,
     cp.available, cp.inventory, cp.in_stock, cp.categories, cp.tags, cp.brand, cp.vendor, cp.custom, cp.published, cp.published_at, cp.source, cp.feed_id,
-    cp.created_at, cp.updated_at";
+    cp.verified, cp.verify_error, cp.missing_since, cp.created_at, cp.updated_at";
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Variant {
@@ -726,6 +746,8 @@ pub struct ListQuery {
     #[serde(default)]
     pub on_sale: Option<bool>,
     #[serde(default)]
+    pub verified: Option<bool>,
+    #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
@@ -757,6 +779,9 @@ fn push_filters(qb: &mut QueryBuilder<'_, Postgres>, account_id: Uuid, q: &ListQ
     }
     if q.on_sale == Some(true) {
         qb.push(" AND cp.compare_at_price > cp.price");
+    }
+    if let Some(v) = q.verified {
+        qb.push(" AND cp.verified = ").push_bind(v);
     }
 }
 
@@ -796,14 +821,20 @@ pub async fn detail(db: &PgPool, account_id: Uuid, key: &str) -> AppResult<Value
     .bind(p.id)
     .fetch_all(db)
     .await?;
-    let waiting: Vec<(Uuid, Option<String>, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT s.profile_id, pr.email, s.variant_id, s.created_at FROM catalog_stock_subscriptions s JOIN profiles pr ON pr.id = s.profile_id
+    let waiting: Vec<(Uuid, Option<String>, Option<Uuid>, DateTime<Utc>, bool)> = sqlx::query_as(
+        "SELECT s.profile_id, pr.email, s.variant_id, s.created_at, s.confirmed_at IS NOT NULL FROM catalog_stock_subscriptions s JOIN profiles pr ON pr.id = s.profile_id
          WHERE s.product_id = $1 AND s.notified_at IS NULL ORDER BY s.created_at LIMIT 100",
     )
     .bind(p.id)
     .fetch_all(db)
     .await?;
-    let waiting_total: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE product_id = $1 AND notified_at IS NULL").bind(p.id).fetch_one(db).await?;
+    let (waiting_total, unconfirmed_total): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE confirmed_at IS NOT NULL), count(*) FILTER (WHERE confirmed_at IS NULL)
+         FROM catalog_stock_subscriptions WHERE product_id = $1 AND notified_at IS NULL",
+    )
+    .bind(p.id)
+    .fetch_one(db)
+    .await?;
     let counts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT kind, count(DISTINCT event_id) FROM catalog_interactions WHERE product_id = $1 AND occurred_at > now() - interval '30 days' GROUP BY kind",
     )
@@ -813,8 +844,9 @@ pub async fn detail(db: &PgPool, account_id: Uuid, key: &str) -> AppResult<Value
     let mut v = serde_json::to_value(&p).map_err(|e| AppError::Internal(e.into()))?;
     v["variants"] = json!(vs);
     v["history"] = json!(history.iter().map(|h| json!({"variant_id": h.0, "price": h.1, "compare_at_price": h.2, "in_stock": h.3, "inventory": h.4, "recorded_at": h.5})).collect::<Vec<_>>());
-    v["waiting"] = json!(waiting.iter().map(|w| json!({"profile_id": w.0, "email": w.1, "variant_id": w.2, "since": w.3})).collect::<Vec<_>>());
+    v["waiting"] = json!(waiting.iter().map(|w| json!({"profile_id": w.0, "email": w.1, "variant_id": w.2, "since": w.3, "confirmed": w.4})).collect::<Vec<_>>());
     v["waiting_total"] = json!(waiting_total);
+    v["unconfirmed_total"] = json!(unconfirmed_total);
     v["activity_30d"] = Value::Object(counts.into_iter().map(|(k, n)| (k, json!(n))).collect());
     Ok(v)
 }
@@ -827,18 +859,18 @@ pub async fn delete(db: &PgPool, account_id: Uuid, key: &str) -> AppResult<Produ
 
 /// Counts for the Products page header.
 pub async fn summary(db: &PgPool, account_id: Uuid) -> AppResult<Value> {
-    let (total, in_stock, published, from_events): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT count(*), count(*) FILTER (WHERE in_stock), count(*) FILTER (WHERE published), count(*) FILTER (WHERE source = 'events')
+    let (total, in_stock, published, from_events, unverified): (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE in_stock), count(*) FILTER (WHERE published), count(*) FILTER (WHERE source = 'events'), count(*) FILTER (WHERE NOT verified)
          FROM catalog_products WHERE account_id = $1",
     )
     .bind(account_id)
     .fetch_one(db)
     .await?;
-    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND notified_at IS NULL")
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND notified_at IS NULL AND confirmed_at IS NOT NULL")
         .bind(account_id)
         .fetch_one(db)
         .await?;
-    Ok(json!({"products": total, "in_stock": in_stock, "published": published, "learned_from_events": from_events, "waiting_for_restock": waiting}))
+    Ok(json!({"products": total, "in_stock": in_stock, "published": published, "learned_from_events": from_events, "unverified": unverified, "waiting_for_restock": waiting}))
 }
 
 /// Distinct categories, tags and brands (most used first), for pickers.
@@ -916,6 +948,46 @@ pub fn card(p: &Product) -> Value {
         "brand": p.brand,
         "description": short,
     })
+}
+
+/// A product card for one variant: the variant's price, stock and image where it has them.
+pub fn variant_card(p: &Product, v: &Variant) -> Value {
+    let mut c = card(p);
+    let price = v.price.or(p.price);
+    let compare = if v.price.is_some() { v.compare_at_price } else { p.compare_at_price };
+    let on_sale = matches!((price, compare), (Some(a), Some(b)) if b > a);
+    c["variant_id"] = json!(v.external_id);
+    c["variant"] = json!(v.title);
+    c["price"] = json!(price);
+    c["compare_at_price"] = json!(compare);
+    c["price_text"] = json!(price.map(|x| money(x, p.currency.as_deref())));
+    c["compare_at_text"] = json!(compare.filter(|_| on_sale).map(|x| money(x, p.currency.as_deref())));
+    c["on_sale"] = json!(on_sale);
+    c["in_stock"] = json!(v.in_stock);
+    if let Some(img) = &v.image_url {
+        c["image_url"] = json!(img);
+    }
+    c
+}
+
+pub async fn variants_by_ids(db: &PgPool, ids: &[Uuid]) -> AppResult<Vec<(Uuid, Variant)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<VariantRow> = sqlx::query_as(
+        "SELECT product_id, id, external_id, title, options, sku, price, compare_at_price, available, inventory, in_stock, image_url FROM catalog_variants WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.product_id, r.variant)).collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct VariantRow {
+    product_id: Uuid,
+    #[sqlx(flatten)]
+    variant: Variant,
 }
 
 #[cfg(test)]

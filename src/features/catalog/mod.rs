@@ -7,6 +7,7 @@
 //! - `recs`: best sellers, bought/viewed together, picks per person.
 //! - `blocks`: fills `products` email blocks and the `catalog` / `recommendations` template variables.
 //! - `alerts`: back-in-stock and price-drop events, and the on-site "Notify me" widget.
+//! - `verify`: confirms products learned from browser events by reading their page on the store's site.
 
 pub mod alerts;
 pub mod api;
@@ -15,6 +16,7 @@ pub mod feeds;
 pub mod learn;
 pub mod recs;
 pub mod store;
+pub mod verify;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -82,7 +84,8 @@ fn tools() -> Vec<Value> {
     vec![
         tool("list_products", "List products", "Search the product catalog by title, id, SKU or brand, with filters. Returns price, stock and where each product came from.",
             obj(json!({"q": {"type": "string"}, "category": {"type": "string"}, "tag": {"type": "string"}, "brand": {"type": "string"}, "in_stock": {"type": "boolean"},
-                       "on_sale": {"type": "boolean"}, "published": {"type": "boolean"}, "limit": {"type": "integer", "maximum": 200}, "offset": {"type": "integer"}}), &[]), true, false),
+                       "on_sale": {"type": "boolean"}, "published": {"type": "boolean"},
+                       "verified": {"type": "boolean", "description": "false: products learned from site events that DumbMail hasn't confirmed from their page yet."}, "limit": {"type": "integer", "maximum": 200}, "offset": {"type": "integer"}}), &[]), true, false),
         tool("get_product", "Get a product", "One product by DumbMail id or the store's id: variants, price and stock history, recent activity and who's waiting for a restock.",
             obj(json!({"product_id": {"type": "string"}}), &["product_id"]), true, false),
         tool("upsert_products", "Add or update products", "Save up to 1000 products by the store's id. Fields left out keep their saved value. Price drops and restocks found here trigger the Price Dropped and Back in Stock events (see dumbmail://docs/catalog).",
@@ -214,6 +217,7 @@ impl Feature for Module {
             "catalog_feed_sync" => feeds::run_sync(state, payload).await,
             "catalog_back_in_stock" => alerts::run_back_in_stock(state, payload).await,
             "catalog_price_drop" => alerts::run_price_drop(state, payload).await,
+            "catalog_verify" => verify::run(state, payload).await,
             "catalog_learn" => match learn::run(state, payload["lag_secs"].as_i64().unwrap_or(5)).await {
                 Ok(true) => crate::jobs::enqueue(&state.db, "catalog_learn", payload.clone(), None).await.map(|_| ()).map_err(Into::into),
                 Ok(false) => Ok(()),
@@ -232,9 +236,15 @@ impl Feature for Module {
         .await?;
         if tick.is_multiple_of(3) {
             feeds::queue_due(&state.db).await?;
+            verify::queue_due(&state.db).await?;
         }
         if tick.is_multiple_of(180) {
             sqlx::query("DELETE FROM catalog_price_drop_notices WHERE notified_at < now() - interval '400 days'").execute(&state.db).await?;
+            // Back-in-stock requests nobody confirmed.
+            sqlx::query("DELETE FROM catalog_stock_subscriptions WHERE confirmed_at IS NULL AND created_at < now() - make_interval(days => $1)")
+                .bind(alerts::CONFIRM_DAYS)
+                .execute(&state.db)
+                .await?;
         }
         Ok(())
     }

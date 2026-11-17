@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/client/back-in-stock.js", get(alerts::widget_js))
         .route("/client/products/stock", get(alerts::stock_status).options(alerts::preflight))
         .route("/client/back-in-stock", post(alerts::subscribe_public).options(alerts::preflight).layer(DefaultBodyLimit::max(4 * 1024)))
+        .route("/client/back-in-stock/confirm/{token}", get(alerts::confirm_page).post(alerts::confirm_post))
 }
 
 async fn summary_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -127,7 +128,7 @@ pub async fn recommendations(state: &AppState, account_id: Uuid, q: &RecsQuery) 
         (Some(pid), None) => {
             crate::api::audience::load_profile(state, account_id, pid).await?;
             let picks = recs::for_person(&state.db, account_id, pid, limit).await?;
-            let viewed = recs::recently_viewed(&state.db, account_id, pid, limit, false).await?;
+            let viewed: Vec<store::Product> = recs::recently_viewed(&state.db, account_id, pid, limit, false).await?.into_iter().map(|r| r.0).collect();
             Ok(json!({"for_person": blocks::cards(&picks), "recently_viewed": blocks::cards(&viewed),
                       "how": "Products bought or viewed together with this person's, then popular products in the categories they browse, leaving out what they bought, then best sellers."}))
         }

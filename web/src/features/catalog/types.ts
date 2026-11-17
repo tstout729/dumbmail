@@ -39,6 +39,11 @@ export type Product = {
   published_at: string;
   source: ProductSource;
   feed_id: string | null;
+  /** False for a product learned from site events that DumbMail hasn't confirmed from its page yet. */
+  verified: boolean;
+  verify_error: string | null;
+  /** When it left its feed (it's unpublished until it comes back). */
+  missing_since: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -55,8 +60,10 @@ export type PriceHistoryEntry = {
 export type ProductDetail = Product & {
   variants: Variant[];
   history: PriceHistoryEntry[];
-  waiting: { profile_id: string; email: string | null; variant_id: string | null; since: string }[];
+  waiting: { profile_id: string; email: string | null; variant_id: string | null; since: string; confirmed: boolean }[];
   waiting_total: number;
+  /** Requests still waiting for the person to confirm by email. */
+  unconfirmed_total: number;
   activity_30d: Partial<Record<"viewed" | "carted" | "checkout" | "ordered", number>>;
 };
 
@@ -67,6 +74,7 @@ export type ProductQuery = {
   brand?: string;
   in_stock?: boolean;
   on_sale?: boolean;
+  verified?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -76,6 +84,7 @@ export type CatalogSummary = {
   in_stock: number;
   published: number;
   learned_from_events: number;
+  unverified: number;
   waiting_for_restock: number;
 };
 

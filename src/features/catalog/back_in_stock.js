@@ -14,6 +14,13 @@
   }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function placeholder() { return document.querySelector("[data-dumbmail-back-in-stock]"); }
+  // The option the shopper picked in the store's own add-to-cart form (Shopify and most themes keep it in name="id").
+  function selectedVariant() {
+    var el = document.querySelector('form[action*="/cart/add"] [name="id"]');
+    if (!el) return null;
+    if (el.type === "radio") { var on = document.querySelector('form[action*="/cart/add"] [name="id"]:checked'); return on ? on.value : null; }
+    return el.value || null;
+  }
 
   // Which product is this page? Settings first, then the placeholder's attributes, the store, the page's structured data, the URL.
   function detect(cb) {
@@ -21,13 +28,13 @@
     var pid = CFG.productId || (el && el.getAttribute("data-product-id"));
     var vid = CFG.variantId || (el && el.getAttribute("data-variant-id"));
     var url = location.href.split("#")[0];
-    if (pid || vid) return cb({ product_id: pid, variant_id: vid, url: url });
+    if (pid || vid) return cb({ product_id: pid, variant_id: vid || selectedVariant(), url: url });
     var m = /\/products\/([^\/?#]+)/.exec(location.pathname);
     if (window.Shopify && m) {
       var r = (window.Shopify.routes && window.Shopify.routes.root) || "/";
       fetch(r + "products/" + m[1] + ".js", { credentials: "same-origin" }).then(function (x) { return x.ok ? x.json() : null; }).then(function (p) {
         if (!p) return cb({ url: url });
-        var sel = new URLSearchParams(location.search).get("variant");
+        var sel = new URLSearchParams(location.search).get("variant") || selectedVariant();
         cb({ product_id: String(p.id), variant_id: sel || null, url: url });
       }).catch(function () { cb({ url: url }); });
       return;
@@ -94,9 +101,11 @@
         var email = root.querySelector("input").value.trim(), sel = root.querySelector("select"), btn = root.querySelector("button"), msg = root.querySelector(".dm-bis-msg");
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { msg.className = "dm-bis-msg dm-bis-err"; msg.textContent = "Enter a valid email."; return; }
         btn.disabled = true;
+        // A visitor who came from one of the store's emails carries its link token: they're armed without a confirmation email.
+        var token = (window.dumbmail && window.dumbmail.profile && window.dumbmail.profile().$token) || null;
         fetch(q("/client/back-in-stock", {}), {
           method: "POST", headers: { "content-type": "application/json" }, credentials: "omit",
-          body: JSON.stringify({ email: email, product_id: info.product_id, variant_id: sel ? sel.value : chosen ? chosen.id : null })
+          body: JSON.stringify({ email: email, token: token, product_id: info.product_id, variant_id: sel ? sel.value : chosen ? chosen.id : null })
         }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); }).then(function (r) {
           btn.disabled = false;
           if (!r.ok) { msg.className = "dm-bis-msg dm-bis-err"; msg.textContent = (r.j && r.j.error && r.j.error.message) || "Something went wrong. Try again."; return; }
@@ -118,9 +127,13 @@
 
   function start() {
     check();
-    // Stores switch variants by changing the URL (?variant=…) without reloading.
+    // Stores switch variants by changing the URL (?variant=…) without reloading, or only in their add-to-cart form.
     var href = location.href;
     setInterval(function () { if (location.href !== href) { href = location.href; check(); } }, 1500);
+    document.addEventListener("change", function (e) {
+      var t = e.target;
+      if (t && t.closest && t.closest('form[action*="/cart/add"]')) setTimeout(check, 0);
+    });
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();

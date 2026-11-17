@@ -2,8 +2,13 @@
 //! or a Google Shopping / Merchant Center XML feed (RSS 2.0 or Atom with the `g:` namespace).
 //!
 //! Fetching uses the same protections as webhooks and brand import: public addresses only, DNS
-//! pinned per hop, at most 5 redirects re-checked hop by hop, time limits and a size cap. Fetches
-//! are conditional (ETag / Last-Modified), so an unchanged feed costs one small request.
+//! pinned per hop (and no proxy from the environment), at most 5 redirects re-checked hop by hop,
+//! time limits and a size cap. Fetches are conditional (ETag / Last-Modified, sent only to the
+//! address they came from), so an unchanged feed costs one small request.
+//!
+//! A feed has one sync at a time: a sync holds a lease on the feed row, and checks before saving
+//! each batch that the feed's setup (address, format, field map, on/off) hasn't changed since it
+//! started. A sync that finds it has changed stops without saving anything more.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -21,6 +26,12 @@ use crate::state::AppState;
 
 pub const MAX_FEED_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_FEED_PRODUCTS: usize = 50_000;
+/// Most XML nodes (elements, text, attributes) one feed may have.
+const MAX_XML_NODES: u32 = 3_000_000;
+/// Products saved per batch; the sync re-checks its lease and the feed's setup between batches.
+const SYNC_CHUNK: usize = 200;
+/// How long a sync's lease lasts without being renewed.
+const LEASE_MINUTES: i32 = 15;
 const MAX_FEEDS: i64 = 20;
 const GOOGLE_NS: &str = "http://base.google.com/ns/1.0";
 
@@ -93,6 +104,9 @@ fn check_format(f: &str) -> AppResult<()> {
 fn check_url(u: &str) -> AppResult<String> {
     let u = u.trim();
     match url::Url::parse(u) {
+        Ok(p) if !p.username().is_empty() || p.password().is_some() => {
+            Err(AppError::bad("the feed address can't hold a username or password; use a feed link that works without signing in"))
+        }
         Ok(p) if matches!(p.scheme(), "http" | "https") && p.host_str().is_some() && u.len() <= 2000 => Ok(p.to_string()),
         _ => Err(AppError::bad("the feed address must be an http(s) URL")),
     }
@@ -104,10 +118,12 @@ pub async fn list(db: &PgPool, account_id: Uuid) -> AppResult<Vec<Value>> {
     let mut out = Vec::new();
     for f in rows {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_products WHERE feed_id = $1").bind(f.id).fetch_one(db).await?;
-        let queued: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = 'catalog_feed_sync' AND payload->>'feed_id' = $1 AND run_at <> 'infinity')")
-            .bind(f.id.to_string())
-            .fetch_one(db)
-            .await?;
+        let queued: bool = sqlx::query_scalar(
+            "SELECT (sync_queued_at > now() - interval '1 hour') IS TRUE OR (sync_lease_until > now()) IS TRUE FROM catalog_feeds WHERE id = $1",
+        )
+        .bind(f.id)
+        .fetch_one(db)
+        .await?;
         let mut v = serde_json::to_value(&f).map_err(|e| AppError::Internal(e.into()))?;
         v["products"] = json!(n);
         v["syncing"] = json!(queued);
@@ -174,11 +190,16 @@ pub async fn update(db: &PgPool, account_id: Uuid, id: Uuid, b: FeedInput) -> Ap
         return Err(AppError::bad("sync every 1 to 168 hours"));
     }
     let name = b.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(120).collect()).unwrap_or(cur.name.clone());
-    // A new address or mapping needs a full fetch: forget what the old one said.
+    // A new address or mapping needs a full fetch: forget what the old one said. Any change to what
+    // a sync reads (or turning the feed off) makes a sync already running stop without saving more.
     let reset = url != cur.url || format != cur.format || map != cur.field_map;
+    let enabled = b.enabled.unwrap_or(cur.enabled);
+    let bump = reset || enabled != cur.enabled;
     sqlx::query(
         "UPDATE catalog_feeds SET name = $3, url = $4, format = $5, field_map = $6, interval_hours = $7, enabled = $8, unpublish_missing = $9,
-            etag = CASE WHEN $10 THEN NULL ELSE etag END, last_modified = CASE WHEN $10 THEN NULL ELSE last_modified END, updated_at = now()
+            etag = CASE WHEN $10 THEN NULL ELSE etag END, last_modified = CASE WHEN $10 THEN NULL ELSE last_modified END,
+            validator_url = CASE WHEN $10 THEN NULL ELSE validator_url END,
+            config_version = config_version + CASE WHEN $11 THEN 1 ELSE 0 END, updated_at = now()
          WHERE id = $1 AND account_id = $2",
     )
     .bind(id)
@@ -188,12 +209,13 @@ pub async fn update(db: &PgPool, account_id: Uuid, id: Uuid, b: FeedInput) -> Ap
     .bind(&format)
     .bind(&map)
     .bind(interval)
-    .bind(b.enabled.unwrap_or(cur.enabled))
+    .bind(enabled)
     .bind(b.unpublish_missing.unwrap_or(cur.unpublish_missing))
     .bind(reset)
+    .bind(bump)
     .execute(db)
     .await?;
-    if reset && b.enabled.unwrap_or(cur.enabled) {
+    if reset && enabled {
         queue_sync(db, id, true).await?;
     }
     get(db, account_id, id).await
@@ -206,17 +228,23 @@ pub async fn delete(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Feed> 
     Ok(f)
 }
 
-/// Queue a sync unless one is already waiting. `full` ignores the saved ETag.
+/// Queue a sync unless one is already waiting (then a `full` request makes that one full). `full`
+/// ignores the saved ETag. Marking the feed and queuing the job is one statement, so two requests
+/// can't both queue one. A sync that's running doesn't count: the queued one runs after it.
 pub async fn queue_sync(db: &PgPool, feed_id: Uuid, full: bool) -> AppResult<bool> {
-    let queued: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = 'catalog_feed_sync' AND payload->>'feed_id' = $1 AND run_at <> 'infinity' AND locked_at IS NULL)")
-        .bind(feed_id.to_string())
-        .fetch_one(db)
-        .await?;
-    if queued {
-        return Ok(false);
+    let queued: Option<i64> = sqlx::query_scalar(
+        "WITH f AS (UPDATE catalog_feeds SET sync_queued_at = now(), sync_full = $2
+                    WHERE id = $1 AND enabled AND (sync_queued_at IS NULL OR sync_queued_at < now() - interval '1 hour') RETURNING id)
+         INSERT INTO jobs (kind, payload) SELECT 'catalog_feed_sync', jsonb_build_object('feed_id', id) FROM f RETURNING id",
+    )
+    .bind(feed_id)
+    .bind(full)
+    .fetch_optional(db)
+    .await?;
+    if queued.is_none() && full {
+        sqlx::query("UPDATE catalog_feeds SET sync_full = true WHERE id = $1 AND sync_queued_at IS NOT NULL").bind(feed_id).execute(db).await?;
     }
-    crate::jobs::enqueue(db, "catalog_feed_sync", json!({"feed_id": feed_id, "full": full}), None).await?;
-    Ok(true)
+    Ok(queued.is_some())
 }
 
 /// Scheduler: queue the feeds that are due.
@@ -240,7 +268,12 @@ pub async fn queue_due(db: &PgPool) -> anyhow::Result<()> {
 #[doc(hidden)]
 pub static TEST_LOOPBACK_PORTS: Lazy<Mutex<Vec<u16>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-async fn vet(u: &str) -> AppResult<(String, std::net::SocketAddr)> {
+async fn vet(u: &str, hosts: Option<&[String]>) -> AppResult<(String, std::net::SocketAddr)> {
+    if let Some(h) = hosts {
+        if !super::learn::on_site(h, u) {
+            return Err(AppError::bad("the page redirected away from the store's own site"));
+        }
+    }
     if let Ok(p) = url::Url::parse(u) {
         let port = p.port_or_known_default().unwrap_or(0);
         if p.host_str() == Some("127.0.0.1") && TEST_LOOPBACK_PORTS.lock().map(|l| l.contains(&port)).unwrap_or(false) {
@@ -252,27 +285,41 @@ async fn vet(u: &str) -> AppResult<(String, std::net::SocketAddr)> {
 
 pub enum Fetched {
     NotModified,
+    /// `url` is where the body came from after redirects; `etag` and `last_modified` belong to it.
     Body { bytes: Vec<u8>, url: String, etag: Option<String>, last_modified: Option<String> },
 }
 
-pub async fn fetch(raw: &str, etag: Option<&str>, last_modified: Option<&str>) -> AppResult<Fetched> {
+/// Saved ETag / Last-Modified and the address they came from.
+#[derive(Default, Clone, Copy)]
+pub struct Validators<'a> {
+    pub url: Option<&'a str>,
+    pub etag: Option<&'a str>,
+    pub last_modified: Option<&'a str>,
+}
+
+/// Fetch `raw` (at most `max` bytes). Validators are sent only to the address they came from.
+/// With `hosts`, every hop must stay on those hosts (a store's own site).
+pub async fn fetch(raw: &str, v: Option<Validators<'_>>, max: usize, hosts: Option<&[String]>) -> AppResult<Fetched> {
     let mut url = raw.to_string();
     for _ in 0..6 {
-        let (host, addr) = vet(&url).await?;
+        let (host, addr) = vet(&url, hosts).await?;
         let client = reqwest::Client::builder()
             .resolve(&host, addr)
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(90))
             .user_agent("DumbMail-Feed/1.0 (+https://dumbmail.ai)")
             .build()
             .map_err(|e| AppError::Internal(e.into()))?;
-        let mut req = client.get(&url).header("accept", "application/json, application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5");
-        if let Some(e) = etag {
-            req = req.header("if-none-match", e);
-        }
-        if let Some(m) = last_modified {
-            req = req.header("if-modified-since", m);
+        let mut req = client.get(&url).header("accept", "application/json, application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, text/html;q=0.8, */*;q=0.5");
+        if let Some(v) = v.filter(|v| v.url == Some(url.as_str())) {
+            if let Some(e) = v.etag {
+                req = req.header("if-none-match", e);
+            }
+            if let Some(m) = v.last_modified {
+                req = req.header("if-modified-since", m);
+            }
         }
         let res = req.send().await.map_err(|e| AppError::bad(format!("couldn't reach the feed: {}", e.without_url())))?;
         let status = res.status();
@@ -287,8 +334,9 @@ pub async fn fetch(raw: &str, etag: Option<&str>, last_modified: Option<&str>) -
         if !status.is_success() {
             return Err(AppError::bad(format!("the feed returned HTTP {}", status.as_u16())));
         }
-        if res.content_length().is_some_and(|n| n as usize > MAX_FEED_BYTES) {
-            return Err(AppError::bad("the feed is larger than 25 MB; split it into smaller feeds"));
+        let too_big = || AppError::bad(if max == MAX_FEED_BYTES { "the feed is larger than 25 MB; split it into smaller feeds".to_string() } else { format!("the page is larger than {} MB", max / (1024 * 1024)) });
+        if res.content_length().is_some_and(|n| n as usize > max) {
+            return Err(too_big());
         }
         let header = |k: &str| res.headers().get(k).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(300).collect::<String>());
         let (etag, last_modified) = (header("etag"), header("last-modified"));
@@ -296,8 +344,8 @@ pub async fn fetch(raw: &str, etag: Option<&str>, last_modified: Option<&str>) -
         let mut stream = res;
         while let Some(chunk) = stream.chunk().await.map_err(|e| AppError::bad(format!("couldn't read the feed: {}", e.without_url())))? {
             bytes.extend_from_slice(&chunk);
-            if bytes.len() > MAX_FEED_BYTES {
-                return Err(AppError::bad("the feed is larger than 25 MB; split it into smaller feeds"));
+            if bytes.len() > max {
+                return Err(too_big());
             }
         }
         return Ok(Fetched::Body { bytes, url, etag, last_modified });
@@ -482,9 +530,16 @@ fn currency_of(price: &str) -> Option<String> {
 }
 
 pub fn parse_google_xml(body: &[u8], map: &Value) -> Result<(Vec<ProductInput>, Vec<String>), String> {
+    parse_xml(body, map, MAX_XML_NODES)
+}
+
+fn parse_xml(body: &[u8], map: &Value, nodes_limit: u32) -> Result<(Vec<ProductInput>, Vec<String>), String> {
     let text = String::from_utf8_lossy(body);
-    let opts = roxmltree::ParsingOptions { allow_dtd: false, ..Default::default() };
-    let doc = roxmltree::Document::parse_with_options(&text, opts).map_err(|e| format!("the feed isn't valid XML ({e})"))?;
+    let opts = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit, ..Default::default() };
+    let doc = roxmltree::Document::parse_with_options(&text, opts).map_err(|e| match e {
+        roxmltree::Error::NodesLimitReached => format!("the feed has more than {nodes_limit} XML nodes; split it into smaller feeds"),
+        e => format!("the feed isn't valid XML ({e})"),
+    })?;
     let root = doc.root_element();
     let items: Vec<roxmltree::Node<'_, '_>> = match root.tag_name().name() {
         "rss" => root.children().filter(|c| c.has_tag_name("channel")).flat_map(|ch| ch.children().filter(|c| c.has_tag_name("item"))).collect(),
@@ -494,6 +549,7 @@ pub fn parse_google_xml(body: &[u8], map: &Value) -> Result<(Vec<ProductInput>, 
     let mut errors = Vec::new();
     // Items sharing g:item_group_id are variants of one product.
     let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut group_at: HashMap<String, usize> = HashMap::new();
     let mut products: Vec<Value> = Vec::new();
     for (i, node) in items.iter().take(MAX_FEED_PRODUCTS).enumerate() {
         let f = xml_fields(*node);
@@ -550,9 +606,12 @@ pub fn parse_google_xml(body: &[u8], map: &Value) -> Result<(Vec<ProductInput>, 
             "custom": if custom.is_empty() { Value::Null } else { Value::Object(custom) },
         });
         match first(&f, map, "group_id", &["g:item_group_id"]) {
-            Some(g) => match groups.iter_mut().find(|(k, _)| *k == g) {
-                Some((_, list)) => list.push(rec),
-                None => groups.push((g, vec![rec])),
+            Some(g) => match group_at.get(&g) {
+                Some(&i) => groups[i].1.push(rec),
+                None => {
+                    group_at.insert(g.clone(), groups.len());
+                    groups.push((g, vec![rec]));
+                }
             },
             None => products.push(rec),
         }
@@ -735,80 +794,164 @@ pub fn parse_csv(text: &str) -> Result<(Vec<ProductInput>, Vec<String>), String>
 #[derive(Deserialize)]
 struct SyncJob {
     feed_id: Uuid,
-    #[serde(default)]
-    full: bool,
 }
 
-async fn finish(db: &PgPool, id: Uuid, status: &str, error: Option<&str>, counts: Option<Value>, etag: Option<&str>, last_modified: Option<&str>) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE catalog_feeds SET last_status = $2, last_error = $3, last_counts = COALESCE($4, last_counts), etag = COALESCE($5, etag),
-            last_modified = COALESCE($6, last_modified), last_synced_at = now(), next_sync_at = now() + make_interval(hours => interval_hours), updated_at = now()
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(status)
-    .bind(error.map(|e| e.chars().take(1000).collect::<String>()))
-    .bind(counts)
-    .bind(etag)
-    .bind(last_modified)
-    .execute(db)
-    .await?;
-    Ok(())
+/// What a sync read when it took the feed's lease.
+#[derive(sqlx::FromRow)]
+struct Claimed {
+    account_id: Uuid,
+    url: String,
+    format: String,
+    field_map: Value,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    validator_url: Option<String>,
+    unpublish_missing: bool,
+    config_version: i32,
+    sync_full: bool,
+}
+
+/// The sync's lease and the feed setup it started with: every write it makes checks both.
+struct Lease {
+    feed_id: Uuid,
+    token: Uuid,
+    version: i32,
+}
+
+impl Lease {
+    /// Still ours, and the feed's setup unchanged (renews the lease).
+    async fn current(&self, db: &PgPool) -> sqlx::Result<bool> {
+        Ok(sqlx::query(
+            "UPDATE catalog_feeds SET sync_lease_until = now() + make_interval(mins => $4)
+             WHERE id = $1 AND sync_lease = $2 AND config_version = $3 AND enabled",
+        )
+        .bind(self.feed_id)
+        .bind(self.token)
+        .bind(self.version)
+        .bind(LEASE_MINUTES)
+        .execute(db)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
+    async fn release(&self, db: &PgPool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE catalog_feeds SET sync_lease = NULL, sync_lease_until = NULL WHERE id = $1 AND sync_lease = $2").bind(self.feed_id).bind(self.token).execute(db).await?;
+        Ok(())
+    }
+
+    /// Record the outcome and let go of the feed, unless the setup changed meanwhile (then the result
+    /// is stale and only the lease is let go). After a full body, `validators` replace the saved
+    /// ones exactly (a response without them clears them); `None` keeps the saved ones.
+    async fn finish(&self, db: &PgPool, status: &str, error: Option<&str>, counts: Option<Value>, validators: Option<(&str, Option<&str>, Option<&str>)>) -> sqlx::Result<()> {
+        let done = sqlx::query(
+            "UPDATE catalog_feeds SET last_status = $4, last_error = $5, last_counts = COALESCE($6, last_counts),
+                etag = CASE WHEN $7 THEN $8 ELSE etag END, last_modified = CASE WHEN $7 THEN $9 ELSE last_modified END,
+                validator_url = CASE WHEN $7 THEN $10 ELSE validator_url END,
+                last_synced_at = now(), next_sync_at = now() + make_interval(hours => interval_hours), updated_at = now(),
+                sync_lease = NULL, sync_lease_until = NULL
+             WHERE id = $1 AND sync_lease = $2 AND config_version = $3",
+        )
+        .bind(self.feed_id)
+        .bind(self.token)
+        .bind(self.version)
+        .bind(status)
+        .bind(error.map(|e| e.chars().take(1000).collect::<String>()))
+        .bind(counts)
+        .bind(validators.is_some())
+        .bind(validators.and_then(|v| v.1))
+        .bind(validators.and_then(|v| v.2))
+        .bind(validators.map(|v| v.0))
+        .execute(db)
+        .await?
+        .rows_affected();
+        if done == 0 {
+            self.release(db).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Parsing a big feed is CPU work: it runs off the async workers.
+async fn parse(format: String, bytes: Vec<u8>, map: Value, url: String) -> Result<(Vec<ProductInput>, Vec<String>), String> {
+    tokio::task::spawn_blocking(move || if format == "google_xml" { parse_google_xml(&bytes, &map) } else { parse_json(&bytes, &map, &url) })
+        .await
+        .unwrap_or_else(|e| Err(format!("couldn't read the feed ({e})")))
 }
 
 /// Job: fetch a feed and save its products. Problems are recorded on the feed (shown in the
-/// dashboard), not retried, so a broken feed isn't fetched over and over.
+/// dashboard), not retried, so a broken feed isn't fetched over and over. While another sync of the
+/// same feed runs, this one waits its turn.
 pub async fn run_sync(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let j: SyncJob = serde_json::from_value(payload.clone())?;
-    let row: Option<(Uuid, String, String, Value, Option<String>, Option<String>, bool, bool)> =
-        sqlx::query_as("SELECT account_id, url, format, field_map, etag, last_modified, enabled, unpublish_missing FROM catalog_feeds WHERE id = $1")
-            .bind(j.feed_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let Some((account_id, url, format, map, etag, last_modified, _enabled, unpublish)) = row else { return Ok(()) };
-    let started = Utc::now();
-    let fetched = if j.full { fetch(&url, None, None).await } else { fetch(&url, etag.as_deref(), last_modified.as_deref()).await };
-    let (bytes, final_url, new_etag, new_lm) = match fetched {
-        Ok(Fetched::NotModified) => {
-            finish(&state.db, j.feed_id, "not_modified", None, None, None, None).await?;
-            return Ok(());
+    let db = &state.db;
+    let token = Uuid::now_v7();
+    let claimed: Option<Claimed> = sqlx::query_as(
+        "UPDATE catalog_feeds SET sync_lease = $2, sync_lease_until = now() + make_interval(mins => $3), sync_queued_at = NULL
+         WHERE id = $1 AND enabled AND (sync_lease IS NULL OR sync_lease_until < now())
+         RETURNING account_id, url, format, field_map, etag, last_modified, validator_url, unpublish_missing, config_version, sync_full",
+    )
+    .bind(j.feed_id)
+    .bind(token)
+    .bind(LEASE_MINUTES)
+    .fetch_optional(db)
+    .await?;
+    let Some(f) = claimed else {
+        let busy: Option<bool> = sqlx::query_scalar("SELECT enabled AND sync_lease_until > now() FROM catalog_feeds WHERE id = $1").bind(j.feed_id).fetch_optional(db).await?.flatten();
+        if busy == Some(true) {
+            // Another sync of this feed is running: run after it.
+            crate::jobs::enqueue(db, "catalog_feed_sync", payload.clone(), Some(Utc::now() + chrono::Duration::seconds(30))).await?;
+        } else {
+            sqlx::query("UPDATE catalog_feeds SET sync_queued_at = NULL WHERE id = $1").bind(j.feed_id).execute(db).await?;
         }
-        Ok(Fetched::Body { bytes, url, etag, last_modified }) => (bytes, url, etag, last_modified),
-        Err(e) => {
-            finish(&state.db, j.feed_id, "error", Some(&e.public_message()), None, None, None).await?;
-            return Ok(());
-        }
+        return Ok(());
     };
-    let parsed = if format == "google_xml" { parse_google_xml(&bytes, &map) } else { parse_json(&bytes, &map, &final_url) };
-    let (inputs, mut errors) = match parsed {
+    let lease = Lease { feed_id: j.feed_id, token, version: f.config_version };
+    let started = Utc::now();
+    let saved = Validators { url: f.validator_url.as_deref(), etag: f.etag.as_deref(), last_modified: f.last_modified.as_deref() };
+    let fetched = fetch(&f.url, (!f.sync_full).then_some(saved), MAX_FEED_BYTES, None).await;
+    let (bytes, final_url, new_etag, new_lm) = match fetched {
+        Ok(Fetched::NotModified) => return Ok(lease.finish(db, "not_modified", None, None, None).await?),
+        Ok(Fetched::Body { bytes, url, etag, last_modified }) => (bytes, url, etag, last_modified),
+        Err(e) => return Ok(lease.finish(db, "error", Some(&e.public_message()), None, None).await?),
+    };
+    let (inputs, mut errors) = match parse(f.format.clone(), bytes, f.field_map.clone(), final_url.clone()).await {
         Ok(p) => p,
-        Err(e) => {
-            finish(&state.db, j.feed_id, "error", Some(&e), None, None, None).await?;
-            return Ok(());
-        }
+        Err(e) => return Ok(lease.finish(db, "error", Some(&e), None, None).await?),
     };
     if inputs.is_empty() {
         let msg = errors.first().cloned().unwrap_or_else(|| "the feed has no products".into());
-        finish(&state.db, j.feed_id, "error", Some(&msg), Some(json!({"fetched": 0, "errors": errors.len()})), None, None).await?;
-        return Ok(());
+        return Ok(lease.finish(db, "error", Some(&msg), Some(json!({"fetched": 0, "errors": errors.len()})), None).await?);
     }
     let parse_errors = errors.len() as u64;
     let mut total = store::UpsertSummary::default();
-    for chunk in inputs.chunks(500) {
-        let s = store::upsert_products(&state.db, account_id, chunk, Origin::Feed(j.feed_id)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    for chunk in inputs.chunks(SYNC_CHUNK) {
+        // The feed's address, format or mapping changed (or it was turned off) since this sync
+        // started: what it read is out of date. Stop; the sync queued by that change does the rest.
+        if !lease.current(db).await? {
+            lease.release(db).await?;
+            return Ok(());
+        }
+        let s = store::upsert_products(db, f.account_id, chunk, Origin::Feed(j.feed_id)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
         total.created += s.created;
         total.updated += s.updated;
         total.unchanged += s.unchanged;
         total.failed += s.failed;
         errors.extend(s.errors);
     }
-    let removed = if unpublish {
-        sqlx::query("UPDATE catalog_products SET published = false, updated_at = now() WHERE feed_id = $1 AND published AND (feed_seen_at IS NULL OR feed_seen_at < $2)")
-            .bind(j.feed_id)
-            .bind(started)
-            .execute(&state.db)
-            .await?
-            .rows_affected()
+    // Only a complete, clean read says what left the feed: with items skipped (unreadable, invalid
+    // or past the limit), a missing product may just be one of them.
+    let complete = errors.is_empty();
+    let removed = if f.unpublish_missing && complete && lease.current(db).await? {
+        sqlx::query(
+            "UPDATE catalog_products SET published = false, missing_since = now(), updated_at = now()
+             WHERE feed_id = $1 AND missing_since IS NULL AND (feed_seen_at IS NULL OR feed_seen_at < $2)",
+        )
+        .bind(j.feed_id)
+        .bind(started)
+        .execute(db)
+        .await?
+        .rows_affected()
     } else {
         0
     };
@@ -816,9 +959,10 @@ pub async fn run_sync(state: &AppState, payload: &Value) -> anyhow::Result<()> {
                         "failed": total.failed + parse_errors, "unpublished": removed});
     let note = (!errors.is_empty()).then(|| {
         let shown: Vec<&str> = errors.iter().take(5).map(String::as_str).collect();
-        format!("{} item(s) skipped: {}", errors.len(), shown.join("; "))
+        let kept = if f.unpublish_missing { " Products missing from this read were left as they were." } else { "" };
+        format!("{} item(s) skipped: {}.{kept}", errors.len(), shown.join("; "))
     });
-    finish(&state.db, j.feed_id, "ok", note.as_deref(), Some(counts), new_etag.as_deref(), new_lm.as_deref()).await?;
+    lease.finish(db, "ok", note.as_deref(), Some(counts), Some((&final_url, new_etag.as_deref(), new_lm.as_deref()))).await?;
     Ok(())
 }
 
@@ -859,6 +1003,29 @@ mod tests {
         assert_eq!(items[0].url.as_deref(), Some("https://shop.test/cap"));
         assert_eq!(items[0].categories.as_deref(), Some(&["Hats".to_string()][..]));
         assert_eq!(items[0].custom.as_ref().unwrap()["colour"], "Red");
+    }
+
+    #[test]
+    fn xml_size_is_bounded_and_groups_keep_their_items() {
+        let item = |id: &str, g: &str| format!("<item><g:id>{id}</g:id><g:title>T</g:title><g:price>1 USD</g:price><g:item_group_id>{g}</g:item_group_id></item>");
+        // Groups interleaved: each one still gets exactly its own items, in feed order.
+        let items: String = (0..3000).map(|i| item(&format!("v{i}"), &format!("g{}", i % 1000))).collect();
+        let xml = format!(r#"<rss xmlns:g="http://base.google.com/ns/1.0"><channel>{items}</channel></rss>"#);
+        let (out, errors) = parse_google_xml(xml.as_bytes(), &json!({})).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(out.len(), 1000);
+        let g7 = out.iter().find(|p| p.external_id == "g7").unwrap();
+        let ids: Vec<&str> = g7.variants.as_ref().unwrap().iter().map(|v| v.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["v7", "v1007", "v2007"]);
+        let err = parse_xml(xml.as_bytes(), &json!({}), 500).unwrap_err();
+        assert!(err.contains("more than 500 XML nodes"), "{err}");
+    }
+
+    #[test]
+    fn feed_addresses_with_credentials_are_refused() {
+        assert!(check_url("https://user:secret@shop.test/feed.xml").is_err());
+        assert!(check_url("https://token@shop.test/feed.xml").is_err());
+        assert!(check_url("https://shop.test/feed.xml?key=abc").is_ok());
     }
 
     #[test]

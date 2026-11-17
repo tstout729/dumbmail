@@ -8,6 +8,7 @@ import {
   Card,
   ConfirmDialog,
   EmptyState,
+  Notice,
   Page,
   PageHeader,
   Skeleton,
@@ -77,7 +78,8 @@ function ProductView({ p }: { p: ProductDetail }) {
           <span className="flex flex-wrap items-center gap-2">
             <span>{p.external_id}</span>
             <SourceBadge source={p.source} />
-            {!p.published ? <Badge tone="amber">Unpublished</Badge> : null}
+            {!p.verified ? <Badge tone="amber">Unverified</Badge> : null}
+            {p.missing_since ? <Badge tone="amber">Not in the feed</Badge> : !p.published ? <Badge tone="amber">Unpublished</Badge> : null}
           </span>
         }
         actions={
@@ -102,6 +104,21 @@ function ProductView({ p }: { p: ProductDetail }) {
           </>
         }
       />
+      {!p.verified ? (
+        <div className="mb-4">
+          <Notice tone="amber" title="Not verified yet">
+            This product came from your site's events, which anyone can send. Until DumbMail reads its page on your site, it only shows to the person who viewed or bought it, as their own visit described it.
+            {p.verify_error ? ` Last try: ${p.verify_error}.` : ""}
+          </Notice>
+        </div>
+      ) : null}
+      {p.missing_since ? (
+        <div className="mb-4">
+          <Notice tone="amber" title={`Not in its feed since ${formatDateTime(p.missing_since, account.timezone)}`}>
+            It's hidden from emails until the feed lists it again.
+          </Notice>
+        </div>
+      ) : null}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <div className="flex flex-col gap-4 sm:flex-row">
@@ -251,7 +268,7 @@ function ProductView({ p }: { p: ProductDetail }) {
           )}
         </Card>
         <Card
-          title={`Waiting for a restock (${formatNumber(p.waiting_total)})`}
+          title={`Waiting for a restock (${formatNumber(p.waiting_total)})${p.unconfirmed_total ? ` · ${formatNumber(p.unconfirmed_total)} not confirmed` : ""}`}
           padded={false}
         >
           {p.waiting.length ? (
@@ -268,6 +285,7 @@ function ProductView({ p }: { p: ProductDetail }) {
                     {w.email ?? "Profile"}
                   </Link>
                   <span className="shrink-0 text-xs text-zinc-500">
+                    {w.confirmed ? null : <Badge tone="amber">Not confirmed</Badge>}{" "}
                     {w.variant_id ? variantName(w.variant_id) : "Any option"} ·{" "}
                     {formatDateTime(w.since, account.timezone)}
                   </span>

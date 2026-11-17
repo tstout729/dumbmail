@@ -356,13 +356,17 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
 
 /// Job: an event happened; start matching metric-triggered flows.
 pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
-    let row: Option<(Uuid, Uuid, String, Value, Option<f64>, chrono::DateTime<Utc>)> = sqlx::query_as(
-        "SELECT e.account_id, e.profile_id, m.name, e.properties, e.value, e.occurred_at FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1",
+    let row: Option<(Uuid, Uuid, String, Value, Option<f64>, chrono::DateTime<Utc>, Option<bool>)> = sqlx::query_as(
+        "SELECT e.account_id, e.profile_id, m.name, e.properties, e.value, e.occurred_at, e.from_browser FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1",
     )
     .bind(event_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((account_id, profile_id, metric, props, value, at)) = row else { return Ok(()) };
+    let Some((account_id, profile_id, metric, props, value, at, from_browser)) = row else { return Ok(()) };
+    // Message, consent and alert metrics start flows only when DumbMail recorded them itself.
+    if from_browser == Some(true) && crate::audience::is_reserved_metric(&metric) {
+        return Ok(());
+    }
     let flows: Vec<FlowRow> = sqlx::query_as(
         "SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2",
     )

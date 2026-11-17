@@ -19,7 +19,8 @@ export function ProductsPage() {
   const q = useDebouncedValue(search.trim(), 250);
   const category = params.get("category") ?? "";
   const stock = params.get("stock") ?? "";
-  const filters: ProductQuery = { q: q || undefined, category: category || undefined, in_stock: stock === "" ? undefined : stock === "in" };
+  const unverified = params.get("verified") === "no";
+  const filters: ProductQuery = { q: q || undefined, category: category || undefined, in_stock: stock === "" ? undefined : stock === "in", verified: unverified ? false : undefined };
   const filterKey = JSON.stringify(filters);
   // Paging belongs to one set of filters; changing them starts at the first page.
   const [paging, setPaging] = useState({ key: "", offset: 0 });
@@ -28,7 +29,7 @@ export function ProductsPage() {
   const summary = useCatalogSummary();
   const facets = useCatalogFacets();
   const importing = params.get("import") === "1";
-  const filtered = Boolean(q || category || stock);
+  const filtered = Boolean(q || category || stock || unverified);
 
   const setParam = (k: string, v: string) => {
     const next = new URLSearchParams(params);
@@ -43,7 +44,11 @@ export function ProductsPage() {
     <Page>
       <PageHeader
         title="Products"
-        description={s ? `${formatNumber(s.products)} products · ${formatNumber(s.in_stock)} in stock` : "Your catalog, for product blocks, recommendations and alerts."}
+        description={
+          s
+            ? `${formatNumber(s.products)} products · ${formatNumber(s.in_stock)} in stock${s.unverified ? ` · ${formatNumber(s.unverified)} unverified` : ""}`
+            : "Your catalog, for product blocks, recommendations and alerts."
+        }
         actions={
           <>
             <Button icon={<Upload className="size-3.5" />} onClick={() => setParam("import", "1")}>
@@ -60,6 +65,16 @@ export function ProductsPage() {
         <div className="mb-4">
           <Notice tone="blue" title="These products came from your website">
             DumbMail adds the products people view and buy on your site. Add a feed or upload a CSV for full details like stock, sale prices and variants.
+          </Notice>
+        </div>
+      ) : null}
+      {s && s.unverified > 0 && !unverified ? (
+        <div className="mb-4">
+          <Notice tone="amber" title={`${formatNumber(s.unverified)} unverified ${s.unverified === 1 ? "product" : "products"}`}>
+            These came from your site's events, which anyone can send, so they only show to the person who viewed or bought them until DumbMail reads their page on your site.{" "}
+            <button type="button" className="font-medium underline" onClick={() => setParam("verified", "no")}>
+              Show them
+            </button>
           </Notice>
         </div>
       ) : null}
@@ -80,6 +95,10 @@ export function ProductsPage() {
           <option value="">Any stock</option>
           <option value="in">In stock</option>
           <option value="out">Sold out</option>
+        </Select>
+        <Select value={unverified ? "no" : ""} onChange={(e) => setParam("verified", e.target.value)} className="w-auto" aria-label="Verified">
+          <option value="">Verified or not</option>
+          <option value="no">Unverified only</option>
         </Select>
       </div>
       <Table>
@@ -127,7 +146,8 @@ export function ProductsPage() {
                       <div className="truncate font-medium text-zinc-900">{p.title}</div>
                       <div className="truncate text-xs text-zinc-500">
                         {p.external_id}
-                        {!p.published ? " · Unpublished" : ""}
+                        {!p.verified ? " · Unverified" : ""}
+                        {p.missing_since ? " · Not in the feed" : !p.published ? " · Unpublished" : ""}
                       </div>
                     </div>
                   </div>

@@ -5,7 +5,7 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use dumbmail::features::catalog::{feeds, learn};
+use dumbmail::features::catalog::{alerts, feeds, learn};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,45 @@ async fn event(h: &Harness, pk: &str, email: &str, metric: &str, props: Value) {
     let body = json!({"metric": metric, "profile": {"email": email}, "properties": props}).to_string();
     let (s, _, b) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &body).await;
     assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+/// An order recorded with an API key-backed session (trusted), not from a browser.
+async fn api_event(h: &mut Harness, email: &str, metric: &str, props: Value) {
+    h.ok("POST", "/api/events", Some(json!({"metric": metric, "profile": {"email": email}, "properties": props}))).await;
+}
+
+/// Ask to be told when a product is back, as the widget does.
+async fn ask(h: &Harness, pk: &str, body: Value, ip: Option<&str>) -> (StatusCode, Value) {
+    let mut headers = vec![("content-type", "application/json")];
+    if let Some(ip) = ip {
+        headers.push(("x-real-ip", ip));
+    }
+    let (st, _, b) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &headers, &body.to_string()).await;
+    (st, serde_json::from_str(&b).unwrap_or(json!({"_raw": b})))
+}
+
+/// Tap every back-in-stock confirmation link emailed to `email` (opening the page, then the button).
+async fn confirm(h: &Harness, email: &str) -> usize {
+    let links: Vec<String> = h
+        .state
+        .email
+        .sent()
+        .into_iter()
+        .filter(|m| m.to == email && m.html.contains("/client/back-in-stock/confirm/"))
+        .map(|m| find_link(&m.html, "/client/back-in-stock/confirm/"))
+        .collect();
+    for l in &links {
+        let (st, _, page) = h.raw("GET", l, &[], "").await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(page.contains("<form method=\"post\">") || page.contains("all set") || page.contains("back in stock"), "{page}");
+        let (st, _, _) = h.raw("POST", l, &[], "").await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    links.len()
+}
+
+async fn subscribe_to_email(h: &Harness, email: &str) {
+    sqlx::query("UPDATE profiles SET email_consent = 'subscribed' WHERE email = $1").bind(email).execute(&h.state.db).await.unwrap();
 }
 
 async fn metric_count(h: &Harness, metric: &str) -> i64 {
@@ -79,17 +118,23 @@ async fn products_alerts_and_account_isolation() {
     assert_eq!((stock["found"].as_bool(), stock["in_stock"].as_bool(), stock["variant"]["in_stock"].as_bool()), (Some(true), Some(false), Some(false)));
     let (_, _, js) = h.raw("GET", &format!("/client/back-in-stock.js?k={pk}"), &[], "").await;
     assert!(js.contains("/client/back-in-stock") && js.contains(&pk) && !js.contains("__KEY__"));
-    let sub = |email: &str, variant: Option<&str>| json!({"email": email, "product_id": "TEE", "variant_id": variant}).to_string();
+    let sub = |email: &str, variant: Option<&str>| json!({"email": email, "product_id": "TEE", "variant_id": variant});
     for (email, variant) in [("first@x.test", Some("TEE-S")), ("second@x.test", None), ("third@x.test", Some("TEE-M"))] {
-        let (st, _, b) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json")], &sub(email, variant)).await;
-        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, b) = ask(&h, &pk, sub(email, variant), None).await;
+        assert_eq!((st, b["confirm"].as_bool()), (StatusCode::OK, Some(true)), "{b}");
     }
-    let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json")], &sub("first@x.test", Some("TEE-S"))).await;
+    let (st, _) = ask(&h, &pk, sub("first@x.test", Some("TEE-S")), None).await;
     assert_eq!(st, StatusCode::OK, "asking twice is fine");
-    let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json")], &json!({"email": "x@x.test", "product_id": "MUG"}).to_string()).await;
+    let (st, _) = ask(&h, &pk, json!({"email": "x@x.test", "product_id": "MUG"}), None).await;
     assert_eq!(st, StatusCode::CONFLICT, "in stock: nothing to wait for");
-    let (st, _, _) = h.raw("POST", "/client/back-in-stock?k=pk_wrong", &[("content-type", "application/json")], &sub("y@x.test", None)).await;
+    let (st, _, _) = h.raw("POST", "/client/back-in-stock?k=pk_wrong", &[("content-type", "application/json")], &sub("y@x.test", None).to_string()).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // Nothing counts until each person confirms by email.
+    assert_eq!(metric_count(&h, "Subscribed to Back in Stock").await, 0);
+    assert_eq!(h.ok("GET", "/api/catalog/products/TEE", None).await["unconfirmed_total"], 3);
+    for email in ["first@x.test", "second@x.test", "third@x.test"] {
+        assert!(confirm(&h, email).await >= 1, "{email} got a confirmation email");
+    }
     assert_eq!(metric_count(&h, "Subscribed to Back in Stock").await, 3);
     let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'first@x.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(consent, "never_subscribed", "asking for an alert isn't consent to marketing");
@@ -113,8 +158,9 @@ async fn products_alerts_and_account_isolation() {
     // A restock limit tells only the oldest requests.
     h.ok("PATCH", "/api/catalog/settings", Some(json!({"back_in_stock_limit": 1}))).await;
     for email in ["m1@x.test", "m2@x.test"] {
-        let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json")], &sub(email, Some("TEE-M"))).await;
+        let (st, _) = ask(&h, &pk, sub(email, Some("TEE-M")), None).await;
         assert_eq!(st, StatusCode::OK);
+        confirm(&h, email).await;
     }
     let mut medium_back = tee(2);
     medium_back["variants"][1]["inventory"] = json!(4);
@@ -124,12 +170,15 @@ async fn products_alerts_and_account_isolation() {
     assert_eq!(told.len(), 3);
     assert_eq!(told[2], "third@x.test", "oldest first, capped at 1");
 
-    // Price drops go to recent viewers who didn't buy, once per cooldown.
-    for email in ["viewer@x.test", "buyer@x.test"] {
+    // Price drops go to recent viewers who didn't buy and are subscribed to email, once per cooldown.
+    for email in ["viewer@x.test", "buyer@x.test", "browser@x.test"] {
         event(&h, &pk, email, "Viewed Product", json!({"name": "Mug", "product_id": "MUG", "price": 12})).await;
     }
     event(&h, &pk, "buyer@x.test", "Placed Order", json!({"items": [{"name": "Mug", "product_id": "MUG", "price": 12, "quantity": 1}]})).await;
     learn::catch_up(&h.state).await.unwrap();
+    // browser@x.test never opted in to marketing: a price drop is marketing, so they aren't told.
+    subscribe_to_email(&h, "viewer@x.test").await;
+    subscribe_to_email(&h, "buyer@x.test").await;
     let (st, v) = h.req("PATCH", "/api/catalog/settings", Some(json!({"price_drop_percent": null, "price_drop_amount": null}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "price drops need a threshold: {v}");
     h.ok("PATCH", "/api/catalog/settings", Some(json!({"price_drop_percent": 10}))).await;
@@ -161,16 +210,17 @@ async fn products_alerts_and_account_isolation() {
     other.ok("POST", "/api/catalog/products", Some(json!({"external_id": "MUG", "title": "Their mug", "price": 1}))).await;
     assert_eq!(h.ok("GET", "/api/catalog/products/MUG", None).await["title"], "Mug", "same id in another account is a different product");
 
-    // One visitor can only ask so many times an hour.
+    // One visitor can only ask so many times an hour, counted in the database.
     h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "GONE", "title": "Gone", "inventory": 0}))).await;
     let mut codes = Vec::new();
     for i in 0..31 {
-        let body = json!({"email": format!("flood{i}@x.test"), "product_id": "GONE"}).to_string();
-        let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json"), ("x-real-ip", "203.0.113.9")], &body).await;
+        let (st, _) = ask(&h, &pk, json!({"email": format!("flood{i}@x.test"), "product_id": "GONE"}), Some("203.0.113.9")).await;
         codes.push(st);
     }
     assert!(codes[..30].iter().all(|c| *c == StatusCode::OK), "{codes:?}");
     assert_eq!(codes[30], StatusCode::CONFLICT, "the 31st request from one address is refused");
+    let from_ip: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE ip_hash IS NOT NULL").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(from_ip, 30);
 
     // CSV import.
     let csv = "id,title,price,variant_id,variant title,inventory,material\nHAT,Wool hat,25,HAT-1,One size,3,wool\nSCARF,Scarf,40,,,,cotton\n";
@@ -184,20 +234,61 @@ async fn products_alerts_and_account_isolation() {
     h.cleanup().await;
 }
 
+/// A stand-in store website: `/products/<handle>` serves the page set for it (404 otherwise).
+async fn site_server(pages: Arc<Mutex<std::collections::HashMap<String, String>>>) -> String {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    let app = axum::Router::new()
+        .route(
+            "/products/{handle}",
+            axum::routing::get(|State(p): State<Arc<Mutex<std::collections::HashMap<String, String>>>>, Path(handle): Path<String>| async move {
+                match p.lock().unwrap().get(&handle).cloned() {
+                    Some(html) => ([("content-type", "text/html")], html).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
+        .with_state(pages);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    feeds::TEST_LOOPBACK_PORTS.lock().unwrap().push(port);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn product_page(name: &str, price: &str, image: &str) -> String {
+    format!(
+        r#"<html><head><script type="application/ld+json">{{"@context":"https://schema.org","@type":"Product","name":"{name}","image":"{image}",
+        "offers":{{"@type":"Offer","price":"{price}","priceCurrency":"USD","availability":"https://schema.org/InStock"}}}}</script></head><body>{name}</body></html>"#
+    )
+}
+
+/// Run the verification the scheduler hands out, until nothing is due.
+async fn verify_all(h: &Harness) {
+    for _ in 0..5 {
+        dumbmail::features::catalog::verify::queue_due(&h.state.db).await.unwrap();
+        h.drain().await;
+    }
+}
+
 #[tokio::test]
 async fn events_build_the_catalog_and_fill_emails() {
     let mut h = harness!();
     let me = h.signup().await;
     let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let pages = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let site = site_server(pages.clone()).await;
+    sqlx::query("UPDATE accounts SET website = $1").bind(&site).execute(&h.state.db).await.unwrap();
 
     // An official product, then events that call it something else: events never overwrite it.
-    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "TEE", "title": "Organic tee", "price": 30, "url": "https://acme.test/products/tee",
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "TEE", "title": "Organic tee", "price": 30, "url": format!("{site}/products/tee"),
         "image_url": "https://cdn.acme.test/tee.jpg", "categories": ["Shirts"]}))).await;
-    let socks = json!({"name": "Wool socks", "product_id": "SOCKS", "price": 12, "url": "https://acme.test/products/socks", "image_url": "https://cdn.acme.test/socks.jpg", "categories": ["Socks"]});
-    let cap = json!({"name": "Cap", "product_id": "CAP", "price": 20, "url": "https://acme.test/products/cap", "categories": ["Shirts"]});
+    let socks = json!({"name": "Socks (from the browser)", "product_id": "SOCKS", "price": 1, "url": format!("{site}/products/socks"), "image_url": "https://evil.example/x.jpg", "categories": ["Socks"]});
+    let cap = json!({"name": "Cap", "product_id": "CAP", "price": 20, "url": format!("{site}/products/cap"), "categories": ["Shirts"]});
     for who in ["ann@x.test", "bob@x.test", "cy@x.test"] {
         event(&h, &pk, who, "Viewed Product", json!({"name": "Renamed tee", "product_id": "TEE", "price": 1})).await;
-        event(&h, &pk, who, "Placed Order", json!({"order_id": who, "items": [
+        // Orders the store records (the API, an integration) count as sales.
+        api_event(&mut h, who, "Placed Order", json!({"order_id": who, "items": [
             {"name": "Renamed tee", "product_id": "TEE", "price": 30, "quantity": 1}, socks.clone()]})).await;
     }
     event(&h, &pk, "dee@x.test", "Viewed Product", cap.clone()).await;
@@ -208,12 +299,19 @@ async fn events_build_the_catalog_and_fill_emails() {
     let tee = h.ok("GET", "/api/catalog/products/TEE", None).await;
     assert_eq!((tee["title"].as_str(), tee["price"].as_f64()), (Some("Organic tee"), Some(30.0)), "events don't change API products");
     let s = h.ok("GET", "/api/catalog/products/SOCKS", None).await;
-    assert_eq!((s["source"].as_str(), s["image_url"].as_str()), (Some("events"), Some("https://cdn.acme.test/socks.jpg")));
+    assert_eq!((s["source"].as_str(), s["verified"].as_bool()), (Some("events"), Some(false)));
     let summary = h.ok("GET", "/api/catalog/summary", None).await;
-    assert_eq!((summary["products"].as_i64(), summary["learned_from_events"].as_i64()), (Some(3), Some(2)), "{summary}");
+    assert_eq!((summary["products"].as_i64(), summary["learned_from_events"].as_i64(), summary["unverified"].as_i64()), (Some(3), Some(2), Some(2)), "{summary}");
     learn::catch_up(&h.state).await.unwrap();
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_interactions").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(n, 3 + 6 + 2, "views, order items and the cart add, each read once");
+
+    // The store's pages confirm the learned products; what the page says replaces what the browser said.
+    pages.lock().unwrap().insert("socks".into(), product_page("Wool socks", "12.00", "https://cdn.acme.test/socks.jpg"));
+    pages.lock().unwrap().insert("cap".into(), product_page("Cap", "20.00", "https://cdn.acme.test/cap.jpg"));
+    verify_all(&h).await;
+    let s = h.ok("GET", "/api/catalog/products/SOCKS", None).await;
+    assert_eq!((s["verified"].as_bool(), s["title"].as_str(), s["price"].as_f64(), s["image_url"].as_str()), (Some(true), Some("Wool socks"), Some(12.0), Some("https://cdn.acme.test/socks.jpg")), "{s}");
 
     // Recommendations: bought together, and picks for a person that leave out what they bought.
     let r = h.ok("GET", "/api/catalog/recommendations?product_id=TEE", None).await;
@@ -229,21 +327,21 @@ async fn events_build_the_catalog_and_fill_emails() {
     assert!(!picks.contains(&"TEE") && !picks.contains(&"SOCKS"), "never what they bought: {picks:?}");
 
     // A preview as Dee: event items fall back to her latest cart; recommended, best sellers and Jinja lookups fill in.
-    let content = json!({"subject": "Hi {{ catalog.products[\"TEE\"].title }}", "blocks": [
+    let content = json!({"subject": "Hi {{ catalog.products[\"TEE\"].title }} / {{ organization.catalog.products[\"TEE\"].title }}", "blocks": [
         {"type": "products", "source": "event_items", "count": 4, "columns": 2},
         {"type": "products", "source": "best_sellers", "count": 1, "columns": 1},
         {"type": "products", "source": "recently_viewed", "count": 1, "columns": 1, "button_text": "Back to it"},
         {"type": "products", "source": "handpicked", "product_ids": ["NOPE"], "fallback": "newest", "count": 1},
-        {"type": "text", "html": "{% for p in recommendations[:1] %}<p>Pick: {{ p.title }}</p>{% endfor %}"}
+        {"type": "text", "html": "{% for p in recommendations[:1] %}<p>Pick: {{ p.title }}</p>{% endfor %}{% for p in person.recommendations[:1] %}<p>Again: {{ p.title }}</p>{% endfor %}"}
     ]});
     let out = h.ok("POST", "/api/render", Some(json!({"channel": "email", "content": content, "profile_id": dee}))).await;
     let html = out["html"].as_str().unwrap();
-    assert_eq!(out["subject"], "Hi Organic tee");
+    assert_eq!(out["subject"], "Hi Organic tee / Organic tee");
     assert!(html.contains("https://cdn.acme.test/tee.jpg"), "the cart's tee, with the catalog's image");
-    assert!(html.contains(">Back to it</a>") && html.contains("https://acme.test/products/cap"));
-    assert!(html.contains("Pick: Wool socks"), "{html}");
+    assert!(html.contains(">Back to it</a>") && html.contains(&format!("{site}/products/cap")));
+    assert!(html.contains("Pick: Wool socks") && html.contains("Again: Wool socks"), "{html}");
     let sms = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": "Back in stock: {{ catalog.products['SOCKS'].title }} {{ catalog.best_sellers[0].url }}"}}))).await;
-    assert!(sms["body"].as_str().unwrap().contains("Wool socks https://acme.test/products/"), "{sms}");
+    assert!(sms["body"].as_str().unwrap().contains(&format!("Wool socks {site}/products/")), "{sms}");
 
     // Abandoned checkout from the blueprint shows the cart's products in the email.
     let flow = h.ok("POST", "/api/flows/from-blueprint", Some(json!({"key": "abandoned_checkout"}))).await;
@@ -256,7 +354,7 @@ async fn events_build_the_catalog_and_fill_emails() {
     h.ok("PATCH", &format!("/api/flows/{fid}"), Some(json!({"definition": def}))).await;
     h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
     event(&h, &pk, "eve@x.test", "Started Checkout", json!({"checkout_url": "https://acme.test/cart/1", "items": [
-        {"name": "Organic tee", "product_id": "TEE", "price": 30, "quantity": 1}, {"name": "Mystery item", "price": 5, "url": "https://acme.test/m"}]})).await;
+        {"name": "Organic tee", "product_id": "TEE", "price": 30, "quantity": 1}, {"name": "Mystery item", "price": 5, "url": format!("{site}/m")}]})).await;
     h.drain().await;
     h.fast_forward().await;
     let mail = h.state.email.sent().into_iter().find(|m| m.to == "eve@x.test").expect("reminder sent");
@@ -285,8 +383,12 @@ async fn events_build_the_catalog_and_fill_emails() {
 struct FeedState {
     body: String,
     etag: String,
+    content_type: String,
     hits: u32,
     conditional_hits: u32,
+    /// Requests to /moved that carried a validator (they belong to /feed, not /moved).
+    moved_conditional: u32,
+    delay_ms: u64,
 }
 
 async fn feed_server(state: Arc<Mutex<FeedState>>) -> String {
@@ -296,17 +398,37 @@ async fn feed_server(state: Arc<Mutex<FeedState>>) -> String {
     let app = axum::Router::new()
         .route(
             "/feed",
-            axum::routing::get(|State(s): State<Arc<Mutex<FeedState>>>, headers: HeaderMap| async move {
-                let mut s = s.lock().unwrap();
-                s.hits += 1;
-                if headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(s.etag.as_str()) {
+            axum::routing::get(|State(st): State<Arc<Mutex<FeedState>>>, headers: HeaderMap| async move {
+                let delay = {
+                    let mut s = st.lock().unwrap();
+                    s.hits += 1;
+                    s.delay_ms
+                };
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                let mut s = st.lock().unwrap();
+                if !s.etag.is_empty() && headers.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(s.etag.as_str()) {
                     s.conditional_hits += 1;
                     return StatusCode::NOT_MODIFIED.into_response();
                 }
-                ([("etag", s.etag.clone()), ("content-type", "application/rss+xml".to_string())], s.body.clone()).into_response()
+                let ct = if s.content_type.is_empty() { "application/rss+xml".to_string() } else { s.content_type.clone() };
+                let mut res = ([("content-type", ct)], s.body.clone()).into_response();
+                if !s.etag.is_empty() {
+                    res.headers_mut().insert("etag", s.etag.parse().unwrap());
+                }
+                res
             }),
         )
-        .route("/moved", axum::routing::get(|| async { axum::response::Redirect::temporary("/feed") }))
+        .route(
+            "/moved",
+            axum::routing::get(|State(s): State<Arc<Mutex<FeedState>>>, headers: HeaderMap| async move {
+                if headers.contains_key("if-none-match") || headers.contains_key("if-modified-since") {
+                    s.lock().unwrap().moved_conditional += 1;
+                }
+                axum::response::Redirect::temporary("/feed")
+            }),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -359,11 +481,13 @@ async fn feeds_sync_safely_and_mcp_tools() {
     feeds::queue_due(&h.state.db).await.unwrap();
     h.drain().await;
     assert_eq!(fs.lock().unwrap().conditional_hits, 1);
+    assert_eq!(fs.lock().unwrap().moved_conditional, 0, "the ETag goes only to the address it came from");
     assert_eq!(h.ok("GET", &format!("/api/catalog/feeds/{fid}"), None).await["last_status"], "not_modified");
 
     // Someone waits for the rug; the feed brings it back, drops the lamp's price and stops listing nothing else.
-    let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json")], &json!({"email": "w@x.test", "product_id": "B2"}).to_string()).await;
+    let (st, _) = ask(&h, &pk, json!({"email": "w@x.test", "product_id": "B2"}), None).await;
     assert_eq!(st, StatusCode::OK);
+    confirm(&h, "w@x.test").await;
     {
         let mut s = fs.lock().unwrap();
         s.body = rss(&[("B2", "Rug", "100.00", "in stock")]);
@@ -418,5 +542,469 @@ async fn feeds_sync_safely_and_mcp_tools() {
     assert_eq!(bad["isError"], true);
     let recs = call("get_recommendations", json!({"product_id": "B2"})).await;
     assert_eq!(recs["structuredContent"]["product"]["id"], "B2");
+    h.cleanup().await;
+}
+
+async fn feed_row(h: &Harness, fid: &str) -> (Option<String>, i32, Option<String>) {
+    sqlx::query_as("SELECT etag, config_version, last_status FROM catalog_feeds WHERE id = $1::uuid").bind(fid).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn jobs_of(h: &Harness, kind: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = $1 AND run_at <> 'infinity'").bind(kind).fetch_one(&h.state.db).await.unwrap()
+}
+
+fn json_feed(items: &[(&str, &str, f64)]) -> String {
+    json!({"products": items.iter().map(|(id, title, price)| json!({"id": id, "title": title, "price": price, "url": format!("https://acme.test/{id}")})).collect::<Vec<_>>()}).to_string()
+}
+
+/// Finding 4: one sync per feed at a time, and a sync whose feed changed meanwhile saves nothing.
+#[tokio::test]
+async fn feed_syncs_run_one_at_a_time_and_drop_stale_results() {
+    let mut h = harness!();
+    h.signup().await;
+    let old = Arc::new(Mutex::new(FeedState { body: json_feed(&[("P", "Lamp", 50.0)]), etag: "\"v1\"".into(), content_type: "application/json".into(), ..Default::default() }));
+    let old_base = feed_server(old.clone()).await;
+    let feed = h.ok("POST", "/api/catalog/feeds", Some(json!({"url": format!("{old_base}/feed"), "format": "json"}))).await;
+    let fid = feed["id"].as_str().unwrap().to_string();
+    h.drain().await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/P", None).await["price"], 50.0);
+    sqlx::query("DELETE FROM jobs").execute(&h.state.db).await.unwrap();
+
+    // Two syncs of the same feed at once: one fetches, the other waits its turn.
+    old.lock().unwrap().delay_ms = 300;
+    let hits = old.lock().unwrap().hits;
+    let job = json!({"feed_id": fid});
+    let (a, b) = tokio::join!(feeds::run_sync(&h.state, &job), feeds::run_sync(&h.state, &job));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(old.lock().unwrap().hits, hits + 1, "only one of them fetched");
+    let later: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'catalog_feed_sync' AND run_at > now()").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(later, 1, "the other is queued to run after it");
+    sqlx::query("DELETE FROM jobs").execute(&h.state.db).await.unwrap();
+
+    // A slow sync of the old address finishes after the feed moved to a new one: its (cheaper,
+    // stale) prices and ETag are not saved, and no price drop comes of them.
+    {
+        let mut s = old.lock().unwrap();
+        s.body = json_feed(&[("P", "Lamp", 10.0)]);
+        s.etag = "\"stale\"".into();
+        s.delay_ms = 400;
+    }
+    let new = Arc::new(Mutex::new(FeedState { body: json_feed(&[("P", "Lamp", 45.0)]), etag: "\"n1\"".into(), content_type: "application/json".into(), ..Default::default() }));
+    let new_base = feed_server(new.clone()).await;
+    let st = h.state.clone();
+    let slow = tokio::spawn(async move { feeds::run_sync(&st, &json!({"feed_id": fid.clone()})).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let fid = feed["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/catalog/feeds/{fid}"), Some(json!({"url": format!("{new_base}/feed")}))).await;
+    slow.await.unwrap().unwrap();
+    assert_eq!(h.ok("GET", "/api/catalog/products/P", None).await["price"], 50.0, "the stale read wasn't applied");
+    assert_ne!(feed_row(&h, &fid).await.0.as_deref(), Some("\"stale\""));
+    assert_eq!(jobs_of(&h, "catalog_price_drop").await, 0, "no price drop from stale data");
+    h.drain().await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/P", None).await["price"], 45.0, "the new address's sync ran");
+    assert_eq!(feed_row(&h, &fid).await.0.as_deref(), Some("\"n1\""));
+
+    // A turned-off feed isn't fetched, even by a job already queued.
+    h.ok("PATCH", &format!("/api/catalog/feeds/{fid}"), Some(json!({"enabled": false}))).await;
+    let hits = new.lock().unwrap().hits;
+    feeds::run_sync(&h.state, &json!({"feed_id": fid})).await.unwrap();
+    assert_eq!(new.lock().unwrap().hits, hits);
+    h.cleanup().await;
+}
+
+/// Findings 8 and 11: products leave a feed only after a complete read and come back when it lists
+/// them again; a 200 without validators clears the saved ones.
+#[tokio::test]
+async fn feeds_unpublish_only_after_a_clean_read() {
+    let mut h = harness!();
+    h.signup().await;
+    let (st, _) = h.req("POST", "/api/catalog/feeds", Some(json!({"url": "https://user:pw@shop.test/feed.json"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "no credentials in feed addresses");
+    let fs = Arc::new(Mutex::new(FeedState { body: json_feed(&[("A", "Lamp", 10.0), ("B", "Rug", 20.0)]), etag: "\"v1\"".into(), content_type: "application/json".into(), ..Default::default() }));
+    let base = feed_server(fs.clone()).await;
+    let feed = h.ok("POST", "/api/catalog/feeds", Some(json!({"url": format!("{base}/feed"), "format": "json"}))).await;
+    let fid = feed["id"].as_str().unwrap().to_string();
+    h.drain().await;
+    let sync = |h: &Harness| {
+        let db = h.state.db.clone();
+        let fid = fid.clone();
+        async move {
+            sqlx::query("UPDATE catalog_feeds SET sync_full = false").execute(&db).await.unwrap();
+            feeds::queue_sync(&db, fid.parse().unwrap(), true).await.unwrap();
+        }
+    };
+
+    // B is missing, but one item couldn't be read: nothing is unpublished.
+    fs.lock().unwrap().body = json!({"products": [{"id": "A", "title": "Lamp", "price": 10}, {"title": "no id"}]}).to_string();
+    fs.lock().unwrap().etag = "\"v2\"".into();
+    sync(&h).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/B", None).await["published"], true, "a partial read hides nothing");
+    let f = h.ok("GET", &format!("/api/catalog/feeds/{fid}"), None).await;
+    assert!(f["last_error"].as_str().unwrap().contains("left as they were"), "{f}");
+
+    // A clean read without B unpublishes it; when B comes back unchanged, it's published again.
+    fs.lock().unwrap().body = json_feed(&[("A", "Lamp", 10.0)]);
+    sync(&h).await;
+    h.drain().await;
+    let b = h.ok("GET", "/api/catalog/products/B", None).await;
+    assert_eq!((b["published"].as_bool(), b["missing_since"].is_string()), (Some(false), true));
+    fs.lock().unwrap().body = json_feed(&[("A", "Lamp", 10.0), ("B", "Rug", 20.0)]);
+    sync(&h).await;
+    h.drain().await;
+    let b = h.ok("GET", "/api/catalog/products/B", None).await;
+    assert_eq!((b["published"].as_bool(), b["missing_since"].is_null()), (Some(true), true), "{b}");
+    // The store's own "unpublished" stays, whatever the feed's presence.
+    fs.lock().unwrap().body = json!({"products": [{"id": "A", "title": "Lamp", "price": 10}, {"id": "B", "title": "Rug", "price": 20, "published": false}]}).to_string();
+    sync(&h).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/B", None).await["published"], false);
+
+    // A full response without an ETag clears the saved one.
+    assert!(feed_row(&h, &fid).await.0.is_some());
+    fs.lock().unwrap().etag = String::new();
+    fs.lock().unwrap().body = json_feed(&[("A", "Lamp", 11.0)]);
+    sqlx::query("UPDATE catalog_feeds SET next_sync_at = now() - interval '1 minute'").execute(&h.state.db).await.unwrap();
+    feeds::queue_due(&h.state.db).await.unwrap();
+    h.drain().await;
+    assert_eq!(feed_row(&h, &fid).await.0, None);
+    h.cleanup().await;
+}
+
+/// Finding 1: alert, message and consent events can't be sent from a browser; alert events can't be
+/// sent through the API either; and a browser-marked one never starts a flow.
+#[tokio::test]
+async fn forged_alert_events_are_refused() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    for key in ["back_in_stock", "price_drop"] {
+        let f = h.ok("POST", "/api/flows/from-blueprint", Some(json!({"key": key}))).await;
+        h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    }
+    h.ok("POST", "/api/profiles", Some(json!({"email": "victim@x.test", "email_consent": "subscribed"}))).await;
+    let forged = json!({"name": "FREE phone", "product_id": "X", "url": "https://evil.example/", "items": [{"name": "FREE phone", "url": "https://evil.example/"}]});
+    for metric in ["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", " back in stock ", "Subscribed to List", "Opened Email", "Unsubscribed"] {
+        let body = json!({"metric": metric, "profile": {"email": "victim@x.test"}, "properties": forged, "unique_id": "bis:0190"}).to_string();
+        let (st, _, b) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{metric:?} from a browser: {b}");
+    }
+    let (st, v) = h.req("POST", "/api/events", Some(json!({"metric": "Price Dropped", "profile": {"email": "victim@x.test"}, "properties": forged}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "only a real price change makes a Price Dropped event: {v}");
+    h.ok("POST", "/api/events", Some(json!({"metric": "Opened Email", "profile": {"email": "victim@x.test"}}))).await;
+    event(&h, &pk, "victim@x.test", "Viewed Product", json!({"name": "Mug", "product_id": "MUG"})).await;
+    h.drain().await;
+    h.fast_forward().await;
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(runs, 0);
+    assert!(h.state.email.sent().iter().all(|m| m.to != "victim@x.test"));
+    let from_browser: Vec<Option<bool>> = sqlx::query_scalar("SELECT e.from_browser FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name IN ('Viewed Product', 'Opened Email') ORDER BY m.name").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(from_browser, vec![Some(false), Some(true)], "API events are trusted, browser ones marked");
+
+    // Even if one got in, an alert event marked as from a browser starts no flow.
+    let (account, profile): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT account_id, id FROM profiles WHERE email = 'victim@x.test'").fetch_one(&h.state.db).await.unwrap();
+    let metric = dumbmail::audience::metric_id(&h.state.db, account, "Back in Stock").await.unwrap();
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO events (id, account_id, profile_id, metric_id, properties, occurred_at, from_browser) VALUES ($1, $2, $3, $4, $5, now(), true)")
+        .bind(id).bind(account).bind(profile).bind(metric).bind(&forged).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::on_event(&h.state, id).await.unwrap();
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(runs, 0);
+    h.cleanup().await;
+}
+
+/// Finding 3: what a browser says about a product never reaches anyone else's email, and browser
+/// orders don't make best sellers.
+#[tokio::test]
+async fn unverified_products_only_reach_their_own_viewer() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let pages = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let site = site_server(pages.clone()).await;
+    sqlx::query("UPDATE accounts SET website = $1").bind(&site).execute(&h.state.db).await.unwrap();
+    // Two real products: browsers "buy" B a lot, the store's own records show one sale of C.
+    h.ok("POST", "/api/catalog/products", Some(json!({"products": [
+        {"external_id": "B", "title": "Bowl", "price": 20, "categories": ["Kitchen"], "url": format!("{site}/products/b")},
+        {"external_id": "C", "title": "Cup", "price": 8, "categories": ["Kitchen"], "url": format!("{site}/products/c"), "published_at": "2020-01-01T00:00:00Z"}]}))).await;
+    for who in ["x1@evil.test", "x2@evil.test", "x3@evil.test"] {
+        event(&h, &pk, who, "Placed Order", json!({"items": [{"name": "Bowl", "product_id": "B", "price": 20}]})).await;
+    }
+    api_event(&mut h, "real@x.test", "Placed Order", json!({"items": [{"name": "Cup", "product_id": "C", "price": 8}]})).await;
+    // The victim views a product the catalog doesn't have yet; an attacker then describes the same
+    // product (and a made-up one) with their own words and pictures.
+    event(&h, &pk, "victim@x.test", "Viewed Product", json!({"name": "Linen apron", "product_id": "APRON", "price": 30, "url": format!("{site}/products/apron"), "categories": ["Kitchen"]})).await;
+    let evil = |id: &str, name: &str| json!({"name": name, "product_id": id, "price": 0.01, "url": format!("{site}/products/{}", id.to_lowercase()), "image_url": "https://evil.example/x.jpg", "categories": ["Kitchen"]});
+    for who in ["x1@evil.test", "x2@evil.test", "x3@evil.test"] {
+        event(&h, &pk, who, "Viewed Product", evil("APRON", "Scam apron")).await;
+        event(&h, &pk, who, "Viewed Product", evil("FREEBIE", "FREE phone")).await;
+        event(&h, &pk, who, "Placed Order", json!({"items": [evil("FREEBIE", "FREE phone")]})).await;
+    }
+    learn::catch_up(&h.state).await.unwrap();
+    verify_all(&h).await; // the pages don't exist: nothing gets verified
+    let summary = h.ok("GET", "/api/catalog/summary", None).await;
+    assert_eq!(summary["unverified"], 2, "{summary}");
+    let apron = h.ok("GET", "/api/catalog/products/APRON", None).await;
+    assert!(apron["verify_error"].is_string(), "{apron}");
+
+    let content = json!({"subject": "{% for p in catalog.best_sellers %}{{ p.title }},{% endfor %}", "blocks": [
+        {"type": "products", "source": "best_sellers", "count": 6},
+        {"type": "products", "source": "newest", "count": 6},
+        {"type": "products", "source": "on_sale", "count": 6, "fallback": "newest"},
+        {"type": "products", "source": "collection", "category": "Kitchen", "count": 6},
+        {"type": "products", "source": "handpicked", "product_ids": ["FREEBIE", "APRON"], "count": 6},
+        {"type": "products", "source": "recommended", "count": 6},
+        {"type": "products", "source": "recently_viewed", "count": 6},
+        {"type": "text", "html": "{% for p in recommendations %}{{ p.title }};{% endfor %} {{ catalog.newest[0].title }}"}
+    ]});
+    let victim = profile_id(&mut h, "victim@x.test").await;
+    let out = h.ok("POST", "/api/render", Some(json!({"channel": "email", "content": content, "profile_id": victim}))).await;
+    let html = out["html"].as_str().unwrap();
+    for bad in ["FREE phone", "Scam apron", "evil.example", "0.01"] {
+        assert!(!html.contains(bad) && !out["subject"].as_str().unwrap().contains(bad), "{bad} reached someone else: {html}");
+    }
+    assert!(html.contains("Linen apron"), "the victim's own view, as they saw it");
+    assert!(out["subject"].as_str().unwrap().starts_with("Cup,Bowl"), "only the store's own orders make best sellers: {}", out["subject"]);
+    // The attacker sees their own made-up product in their own cart-style block (their own data).
+    let x1 = profile_id(&mut h, "x1@evil.test").await;
+    let own = h.ok("POST", "/api/render", Some(json!({"channel": "email", "content": {"subject": "s", "blocks": [{"type": "products", "source": "event_items"}]}, "profile_id": x1}))).await;
+    assert!(own["html"].as_str().unwrap().contains("FREE phone"));
+
+    // Once the store's page confirms APRON, the page's details are what everyone sees.
+    pages.lock().unwrap().insert("apron".into(), product_page("Linen apron", "30.00", "https://cdn.acme.test/apron.jpg"));
+    sqlx::query("UPDATE catalog_products SET verify_after = now(), verify_attempts = 0 WHERE external_id = 'APRON'").execute(&h.state.db).await.unwrap();
+    verify_all(&h).await;
+    let apron = h.ok("GET", "/api/catalog/products/APRON", None).await;
+    assert_eq!((apron["verified"].as_bool(), apron["title"].as_str(), apron["image_url"].as_str()), (Some(true), Some("Linen apron"), Some("https://cdn.acme.test/apron.jpg")));
+    event(&h, &pk, "x1@evil.test", "Viewed Product", evil("APRON", "Scam apron")).await;
+    learn::catch_up(&h.state).await.unwrap();
+    assert_eq!(h.ok("GET", "/api/catalog/products/APRON", None).await["title"], "Linen apron", "a verified product isn't rewritten by events");
+    h.cleanup().await;
+}
+
+/// Finding 5: price drops and restocks claim each person atomically, and a restock's limit holds
+/// across jobs running at once and retries.
+#[tokio::test]
+async fn alert_jobs_tell_each_person_once() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let account: uuid::Uuid = me["account"]["id"].as_str().unwrap().parse().unwrap();
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "P", "title": "Pan", "price": 100}))).await;
+    for i in 0..5 {
+        let email = format!("v{i}@x.test");
+        event(&h, &pk, &email, "Viewed Product", json!({"name": "Pan", "product_id": "P"})).await;
+    }
+    learn::catch_up(&h.state).await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = 'subscribed'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE catalog_products SET price = 70 WHERE external_id = 'P'").execute(&h.state.db).await.unwrap();
+    let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM catalog_products WHERE external_id = 'P'").fetch_one(&h.state.db).await.unwrap();
+    // Two price drops handled at the same moment.
+    let drop = |old: f64, new: f64| json!({"account_id": account, "product_id": pid, "old": old, "new": new, "drop_id": uuid::Uuid::now_v7(), "after": null});
+    let (d1, d2) = (drop(100.0, 80.0), drop(80.0, 70.0));
+    let (a, b) = tokio::join!(alerts::run_price_drop(&h.state, &d1), alerts::run_price_drop(&h.state, &d2));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(metric_count(&h, "Price Dropped").await, 5, "each person told once");
+    alerts::run_price_drop(&h.state, &d1).await.unwrap();
+    assert_eq!(metric_count(&h, "Price Dropped").await, 5, "a retry tells nobody again");
+
+    // A restock with six people waiting and a limit of three.
+    h.ok("PATCH", "/api/catalog/settings", Some(json!({"back_in_stock_limit": 3}))).await;
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "R", "title": "Rack", "inventory": 0}))).await;
+    let rid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM catalog_products WHERE external_id = 'R'").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO catalog_stock_subscriptions (id, account_id, profile_id, product_id, confirmed_at, created_at)
+         SELECT gen_random_uuid(), account_id, id, $1, now(), now() - make_interval(mins => row_number() OVER (ORDER BY email)::int) FROM profiles",
+    )
+    .bind(rid)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO profiles (id, account_id, email) VALUES (gen_random_uuid(), $1, 'w6@x.test')").bind(account).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO catalog_stock_subscriptions (id, account_id, profile_id, product_id, confirmed_at) SELECT gen_random_uuid(), account_id, id, $1, now() FROM profiles WHERE email = 'w6@x.test'")
+        .bind(rid)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM jobs").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "R", "inventory": 4}))).await;
+    // The restock and its job were saved with the stock change.
+    let job: Value = sqlx::query_scalar("SELECT payload FROM jobs WHERE kind = 'catalog_back_in_stock'").fetch_one(&h.state.db).await.unwrap();
+    let (a, b) = tokio::join!(alerts::run_back_in_stock(&h.state, &job), alerts::run_back_in_stock(&h.state, &job));
+    a.unwrap();
+    b.unwrap();
+    alerts::run_back_in_stock(&h.state, &job).await.unwrap();
+    assert_eq!(metric_count(&h, "Back in Stock").await, 3, "the limit holds");
+    let told: Vec<String> = events_for(&h, "Back in Stock").await.into_iter().map(|e| e.0).collect();
+    assert_eq!(told, vec!["v4@x.test", "v3@x.test", "v2@x.test"], "oldest requests first");
+    h.cleanup().await;
+}
+
+/// Finding 6: a back-in-stock request with an address the site doesn't know waits for an emailed
+/// confirmation; a visitor the store's emails identified is armed at once; limits hold under load.
+#[tokio::test]
+async fn back_in_stock_requests_are_confirmed_and_bounded() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let account: uuid::Uuid = me["account"]["id"].as_str().unwrap().parse().unwrap();
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "G", "title": "Gloves", "inventory": 0}))).await;
+
+    // Someone types a stranger's address: only a confirmation email goes out.
+    let (st, v) = ask(&h, &pk, json!({"email": "stranger@x.test", "product_id": "G"}), Some("198.51.100.1")).await;
+    assert_eq!((st, v["confirm"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "stranger@x.test").expect("confirmation sent");
+    assert!(mail.subject.contains("Confirm your back-in-stock alert") && mail.html.contains("Gloves"));
+    assert_eq!(metric_count(&h, "Subscribed to Back in Stock").await, 0);
+    // Not confirmed: a restock tells them nothing.
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "G", "inventory": 2}))).await;
+    h.drain().await;
+    assert_eq!(metric_count(&h, "Back in Stock").await, 0);
+    // Confirming while it's in stock just says so.
+    let link = find_link(&mail.html, "/client/back-in-stock/confirm/");
+    let (_, _, page) = h.raw("POST", &link, &[], "").await;
+    assert!(page.contains("back in stock"), "{page}");
+    assert_eq!(h.ok("GET", "/api/catalog/products/G", None).await["unconfirmed_total"], 0);
+
+    // A visitor who came from one of the store's emails is armed at once, for their own address only.
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "G", "inventory": 0}))).await;
+    let known: uuid::Uuid = h.ok("POST", "/api/profiles", Some(json!({"email": "known@x.test"}))).await["id"].as_str().unwrap().parse().unwrap();
+    let token = dumbmail::public::profile_token(&h.state, account, known);
+    let (st, v) = ask(&h, &pk, json!({"email": "known@x.test", "token": token, "product_id": "G"}), None).await;
+    assert_eq!((st, v["confirm"].as_bool()), (StatusCode::OK, None), "{v}");
+    assert_eq!(metric_count(&h, "Subscribed to Back in Stock").await, 1);
+    let (_, v) = ask(&h, &pk, json!({"email": "someone-else@x.test", "token": token, "product_id": "G"}), None).await;
+    assert_eq!(v["confirm"], true, "a token doesn't vouch for another address");
+    assert!(h.state.email.sent().iter().all(|m| m.to != "known@x.test"));
+
+    // Thirty requests at once from one person for thirty sold-out products: 25 are taken.
+    let many: Vec<Value> = (0..30).map(|i| json!({"external_id": format!("S{i}"), "title": format!("Sock {i}"), "inventory": 0})).collect();
+    h.ok("POST", "/api/catalog/products", Some(json!({"products": many}))).await;
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..30 {
+        let router = h.router.clone();
+        let uri = format!("/client/back-in-stock?k={pk}");
+        let body = json!({"email": "greedy@x.test", "product_id": format!("S{i}")}).to_string();
+        set.spawn(async move {
+            let req = Request::builder().method("POST").uri(uri).header("content-type", "application/json").header("x-real-ip", format!("192.0.2.{i}")).body(Body::from(body)).unwrap();
+            router.oneshot(req).await.unwrap().status()
+        });
+    }
+    let codes: Vec<StatusCode> = set.join_all().await;
+    assert_eq!(codes.iter().filter(|c| **c == StatusCode::OK).count(), 25, "{codes:?}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions s JOIN profiles p ON p.id = s.profile_id WHERE p.email = 'greedy@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(rows, 25);
+    let sent = h.state.email.sent().iter().filter(|m| m.to == "greedy@x.test").count();
+    assert_eq!(sent, 3, "one inbox gets at most three confirmations a day");
+
+    // An account at its hourly limit takes no more.
+    sqlx::query(
+        "INSERT INTO catalog_stock_subscriptions (id, account_id, profile_id, product_id, created_at, notified_at)
+         SELECT gen_random_uuid(), $1, (SELECT id FROM profiles WHERE email = 'greedy@x.test'), (SELECT id FROM catalog_products WHERE external_id = 'G'), now(), now() FROM generate_series(1, 5000)",
+    )
+    .bind(account)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let (st, _) = ask(&h, &pk, json!({"email": "late@x.test", "product_id": "G"}), None).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    h.cleanup().await;
+}
+
+/// Finding 12: a variant's restock shows the variant, and a product the store unpublished doesn't
+/// show from an event's own data.
+#[tokio::test]
+async fn event_items_show_variants_and_hide_unpublished_products() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/catalog/products", Some(json!({"products": [
+        {"external_id": "TEE", "title": "Tee", "url": "https://acme.test/tee", "image_url": "https://cdn.acme.test/tee.jpg",
+         "variants": [{"external_id": "TEE-S", "title": "Small", "price": 25, "image_url": "https://cdn.acme.test/tee-s.jpg"},
+                      {"external_id": "TEE-M", "title": "Medium", "price": 30, "inventory": 0}]},
+        {"external_id": "OLD", "title": "Old thing", "published": false}]}))).await;
+    let event = json!({"metric": "Back in Stock", "properties": {"name": "Tee", "product_id": "TEE", "variant_id": "TEE-S",
+        "items": [{"name": "Tee", "product_id": "TEE", "variant_id": "TEE-S"}, {"name": "Old thing", "product_id": "OLD", "price": 1}]}});
+    let content = json!({"subject": "s", "blocks": [{"type": "products", "source": "event_items", "count": 4, "hide_out_of_stock": false}]});
+    let out = h.ok("POST", "/api/render", Some(json!({"channel": "email", "content": content, "event": event}))).await;
+    let html = out["html"].as_str().unwrap();
+    assert!(html.contains("$25.00") && html.contains("tee-s.jpg"), "the variant's price and picture: {html}");
+    assert!(!html.contains("Old thing"), "unpublished products don't show");
+    h.cleanup().await;
+}
+
+/// Finding 10: a profile property called `catalog` keeps its name in templates.
+#[tokio::test]
+async fn profile_properties_keep_their_template_names() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "MUG", "title": "Mug", "price": 9}))).await;
+    let gold = h.ok("POST", "/api/profiles", Some(json!({"email": "gold@x.test", "properties": {"catalog": "Gold club"}}))).await["id"].as_str().unwrap().to_string();
+    let plain = h.ok("POST", "/api/profiles", Some(json!({"email": "plain@x.test"}))).await["id"].as_str().unwrap().to_string();
+    let body = json!({"body": "[{{ catalog }}] {{ organization.catalog.products['MUG'].title }} {{ person.recommendations[0].title }}"});
+    let out = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": body, "profile_id": gold}))).await;
+    assert!(out["body"].as_str().unwrap().contains("[Gold club] Mug Mug"), "{out}");
+    let out = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": body, "profile_id": plain}))).await;
+    assert!(out["body"].as_str().unwrap().contains("[] Mug Mug"), "the short name stays the property's on this account: {out}");
+    h.cleanup().await;
+}
+
+/// Finding 9: lists that are the same for everyone are read once per send, and an event block's
+/// queries don't grow with the number of items.
+#[tokio::test]
+async fn catalog_lookups_dont_repeat_per_recipient() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+    struct Count(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+        fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if e.metadata().target().starts_with("sqlx::query") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let mut h = harness!();
+    let me = h.signup().await;
+    let account_id: uuid::Uuid = me["account"]["id"].as_str().unwrap().parse().unwrap();
+    let many: Vec<Value> = (0..12).map(|i| json!({"external_id": format!("P{i}"), "title": format!("Thing {i}"), "price": 10 + i})).collect();
+    h.ok("POST", "/api/catalog/products", Some(json!({"products": many}))).await;
+    for i in 0..3 {
+        h.ok("POST", "/api/profiles", Some(json!({"email": format!("r{i}@x.test")}))).await;
+    }
+    let account = dumbmail::campaigns::load_account(&h.state.db, account_id).await.unwrap();
+    let q = format!("SELECT {} FROM profiles p ORDER BY email", dumbmail::models::PROFILE_COLS);
+    let people: Vec<dumbmail::models::Profile> = sqlx::query_as(&q).fetch_all(&h.state.db).await.unwrap();
+    let n = Arc::new(AtomicUsize::new(0));
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Count(n.clone())));
+    let run = |content: Value, event: Option<Value>, p: usize| {
+        let (db, account, person, n) = (h.state.db.clone(), account.clone(), people[p].clone(), n.clone());
+        async move {
+            let before = n.load(Ordering::SeqCst);
+            let mut ctx = json!({"person": {}, "organization": {}});
+            dumbmail::features::catalog::personalize(&db, &account, Some(&person), event.as_ref(), &content, &mut ctx, false).await.unwrap();
+            n.load(Ordering::SeqCst) - before
+        }
+    };
+    let shared = json!({"subject": "{{ catalog.products['P1'].title }} {{ catalog.best_sellers[0].title }}", "blocks": [
+        {"type": "products", "source": "handpicked", "product_ids": ["P2", "P3"]}, {"type": "products", "source": "newest"}, {"type": "products", "source": "on_sale", "fallback": "best_sellers"}]});
+    let first = run(shared.clone(), None, 0).await;
+    assert!(first > 0, "queries are counted");
+    assert_eq!(run(shared.clone(), None, 1).await, 0, "the next recipient reads nothing again");
+    assert_eq!(run(shared, None, 2).await, 0);
+    let items = |k: usize| json!({"metric": "Started Checkout", "properties": {"items": (0..k).map(|i| json!({"name": format!("Thing {i}"), "product_id": format!("P{i}"), "sku": format!("S{i}")})).collect::<Vec<_>>()}});
+    let block = json!({"subject": "s", "blocks": [{"type": "products", "source": "event_items", "count": 1}]});
+    let one = run(block.clone(), Some(items(1)), 0).await;
+    let twelve = run(block, Some(items(12)), 0).await;
+    assert!(one <= 5 && twelve == one, "one item: {one} queries, twelve items: {twelve}");
+    let recs = run(json!({"subject": "s", "blocks": [{"type": "products", "source": "recommended"}]}), None, 0).await;
+    assert!(recs <= 12, "picks for a person: {recs} queries");
+    drop(_guard);
     h.cleanup().await;
 }
