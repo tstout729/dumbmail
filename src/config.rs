@@ -138,10 +138,27 @@ pub struct Config {
     /// redirect. Webhooks, the API, MCP, tracking links and the website snippet keep working there.
     #[arg(long, env = "REDIRECT_HOSTS", value_delimiter = ',')]
     pub redirect_hosts: Vec<String>,
+    /// Base URL (no trailing slash) for tracking, unsubscribe and confirmation links in email from
+    /// accounts without their own branded link domain, e.g. https://dumbmaillinks.com. Keeps
+    /// PUBLIC_URL's domain out of customers' email, so one sender's spam can't get it blocklisted.
+    /// Point the domain at this service before setting it. Unset uses PUBLIC_URL.
+    #[arg(long, env = "LINK_URL")]
+    pub link_url: Option<String>,
 }
 
 impl Config {
     pub fn public_url(&self) -> &str {
         self.public_url.trim_end_matches('/')
+    }
+
+    /// Base URL for links in email when the account has no branded link domain.
+    pub fn link_url(&self) -> &str {
+        self.link_url.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).unwrap_or(self.public_url())
+    }
+
+    /// LINK_URL's hostname when it differs from PUBLIC_URL's.
+    pub fn shared_link_host(&self) -> Option<String> {
+        let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_lowercase));
+        host(self.link_url()).filter(|h| Some(h) != host(self.public_url()).as_ref())
     }
 }

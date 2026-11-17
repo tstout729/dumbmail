@@ -63,6 +63,8 @@ Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stri
 
 ### Branded link domains
 
+Hosted installs should set `LINK_URL` to a separate domain used only for tracking, unsubscribe and confirmation links (e.g. `https://dumbmaillinks.com`), so a customer's spam can't get `PUBLIC_URL`'s domain blocklisted. Point that domain at the service and check `https://LINK_HOST/healthz` before setting it; links already sent keep working on `PUBLIC_URL`. A customer's own branded link domain takes priority over it.
+
 On Railway, set `RAILWAY_API_TOKEN` to a project token (Railway provides the project, environment and service ids itself), and customer domains plus their certificates are created through Railway's API. Self-hosters point each customer's CNAME at `PUBLIC_URL`'s host and terminate TLS in their proxy (Caddy's on-demand TLS works well).
 
 ### SMS (Telnyx or Twilio)

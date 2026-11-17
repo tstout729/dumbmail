@@ -76,6 +76,7 @@ impl Harness {
             support_email: Some("help@pl.test".into()),
             operator_alert_email: Some("ops@pl.test".into()),
             redirect_hosts: vec!["old.pl.test".into()],
+            link_url: None,
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();
@@ -2323,4 +2324,40 @@ async fn double_opt_in_never_lets_anyone_in_unconfirmed() {
     let to_bots = h.state.email.sent().into_iter().filter(|m| m.to.starts_with("bot")).count();
     assert_eq!(to_bots, 5);
     h.cleanup().await;
+}
+
+#[tokio::test]
+async fn email_links_use_the_shared_link_domain() {
+    let Some(mut h) = Harness::with(|c| c.link_url = Some("https://links.pl.test/".into())).await else {
+        eprintln!("TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    h.signup().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": "Email\nbob@x.test\n", "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Fall", "channel": "email",
+        "audience": {"include": [{"type": "list", "id": list["id"]}], "exclude": []},
+        "content": {"subject": "Hi", "blocks": [{"type": "button", "text": "Shop", "href": "https://acme.test/fall"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "bob@x.test").expect("bob got the campaign");
+
+    // Tracking, the open pixel and unsubscribe all point at the link domain, never at PUBLIC_URL.
+    assert!(mail.unsubscribe_url.as_deref().unwrap().starts_with("https://links.pl.test/u/"));
+    let click = find_link(&mail.html, "https://links.pl.test/t/c/");
+    find_link(&mail.html, "https://links.pl.test/t/o/");
+    assert!(!mail.html.contains("https://pl.test/t/") && !mail.html.contains("https://pl.test/u/"));
+    let (s, hd, _) = h.raw("GET", &click.replace("https://links.pl.test", ""), &[("host", "links.pl.test")], "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert!(hd.get("location").unwrap().to_str().unwrap().starts_with("https://acme.test/fall"));
+
+    // The link domain serves only public pages; the app itself stays on PUBLIC_URL.
+    let (s, hd, _) = h.raw("GET", "/campaigns", &[("host", "links.pl.test")], "").await;
+    assert_eq!(s, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(hd.get("location").unwrap(), "https://pl.test/campaigns");
+    let (s, _, _) = h.raw("GET", "/healthz", &[("host", "links.pl.test")], "").await;
+    assert_eq!(s, StatusCode::OK);
+    // No customer can claim it as their branded domain.
+    let (s, _) = h.req("POST", "/api/account/link-domain", Some(json!({"domain": "links.pl.test"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
 }
