@@ -12,7 +12,9 @@ import {
   useMetrics,
   useSegments,
 } from "../../api";
+import { parseRange } from "../../components/charts/RangePicker";
 import { ChannelIcons, blueprintChannels } from "../../components/flows/channels";
+import { FlowsSummary } from "../../components/flows/FlowsSummary";
 import { triggerKind, triggerSummary } from "../../components/flows/graph";
 import {
   Button,
@@ -42,6 +44,7 @@ export function FlowsPage() {
   const segments = useSegments();
   const [params, setParams] = useSearchParams();
   const creating = params.get("create") === "1";
+  const days = parseRange(params.get("days"));
   const [q, setQ] = useState("");
   const [deleting, setDeleting] = useState<Flow | null>(null);
   const remove = useDeleteFlow();
@@ -56,6 +59,13 @@ export function FlowsPage() {
     setParams(next, { replace: true });
   };
 
+  const setDays = (d: number) => {
+    const next = new URLSearchParams(params);
+    if (d === 30) next.delete("days");
+    else next.set("days", String(d));
+    setParams(next, { replace: true });
+  };
+
   return (
     <Page>
       <PageHeader
@@ -67,6 +77,7 @@ export function FlowsPage() {
           </Button>
         }
       />
+      {(flows.data ?? []).length > 0 ? <FlowsSummary days={days} onDaysChange={setDays} /> : null}
       <div className="mb-4 flex justify-end">
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-2.5 size-3.5 text-zinc-400" />

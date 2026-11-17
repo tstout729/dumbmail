@@ -238,6 +238,7 @@ Form `config` (content, fields, phone step, style, teaser, targeting and schedul
 | Method | Path | Query | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/analytics/overview` | `?days=30` | `{days, totals: {revenue, attributed_revenue, campaign_revenue, flow_revenue, orders, attributed_orders, emails_sent, sms_sent, emails_delivered, opens, clicks, email_clicks, open_rate, click_rate, unsubscribe_rate, bounce_rate, complaint_rate, profiles, new_profiles}, previous: (the same totals for the `days` before, without `profiles`), series: {date, revenue, attributed_revenue, campaign_revenue, flow_revenue, emails_sent, sms_sent, opens, clicks, new_profiles}[], top_campaigns: {id, name, sent_at, recipients, open_rate, click_rate, orders, revenue}[], top_flows: {id, name, status, recipients, open_rate, click_rate, orders, revenue}[]}`. Flow numbers cover the range only. |
+| GET | `/api/analytics/flows` | `?days=30` | `{days, totals: {revenue, orders, store_revenue, messages_sent, recipients, delivered, opens, clicks, open_rate, click_rate, revenue_per_recipient}, previous: (the same totals for the `days` before), series: {date, revenue, messages_sent}[]}`. Flow messages and flow-attributed orders only. |
 
 Attribution: a conversion event (`Placed Order` by default) is credited to the newest email the person opened or clicked in the previous 5 days, or the newest SMS they clicked in the previous 24 hours.
 

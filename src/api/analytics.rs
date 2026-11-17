@@ -11,7 +11,9 @@ use crate::error::AppResult;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/analytics/overview", get(overview_h))
+    Router::new()
+        .route("/api/analytics/overview", get(overview_h))
+        .route("/api/analytics/flows", get(flows_h))
 }
 
 #[derive(Deserialize)]
@@ -168,4 +170,67 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
 
 async fn overview_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Days>) -> AppResult<Json<Value>> {
     Ok(Json(overview(&state, ctx.account_id, q.days.unwrap_or(30)).await?))
+}
+
+/// Flow-only totals for `[now - from_days, now - to_days)`: what flows sent and what they earned.
+async fn flow_window(state: &AppState, account_id: Uuid, from_days: i64, to_days: i64) -> AppResult<Value> {
+    let lo = format!("now() - interval '{from_days} days'");
+    let hi = format!("now() - interval '{to_days} days'");
+    let (sent, recipients, delivered, email_delivered, opens, clicks): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*) FILTER (WHERE status NOT IN ('queued','sending','failed','skipped')),
+                count(DISTINCT profile_id) FILTER (WHERE status NOT IN ('queued','sending','failed','skipped')),
+                count(*) FILTER (WHERE status IN ('sent','delivered') OR opened_at IS NOT NULL),
+                count(*) FILTER (WHERE channel = 'email' AND (status IN ('sent','delivered') OR opened_at IS NOT NULL)),
+                count(opened_at) FILTER (WHERE channel = 'email'),
+                count(clicked_at)
+         FROM messages WHERE account_id = $1 AND flow_id IS NOT NULL AND NOT is_test AND created_at >= {lo} AND created_at < {hi}"
+    ))
+    .bind(account_id)
+    .fetch_one(&state.db)
+    .await?;
+    let (store_revenue, revenue, orders): (f64, f64, i64) = sqlx::query_as(&format!(
+        "SELECT COALESCE(sum(value), 0)::float8, COALESCE(sum(value) FILTER (WHERE flow_id IS NOT NULL), 0)::float8,
+                count(*) FILTER (WHERE flow_id IS NOT NULL)
+         FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {lo} AND e.occurred_at < {hi}) x"
+    ))
+    .bind(account_id)
+    .fetch_one(&state.db)
+    .await?;
+    let rate = |n: f64, d: f64| if d > 0.0 { n / d } else { 0.0 };
+    Ok(json!({
+        "revenue": revenue, "orders": orders, "store_revenue": store_revenue,
+        "messages_sent": sent, "recipients": recipients, "delivered": delivered, "opens": opens, "clicks": clicks,
+        "open_rate": rate(opens as f64, email_delivered as f64), "click_rate": rate(clicks as f64, delivered as f64),
+        "revenue_per_recipient": rate(revenue, recipients as f64),
+    }))
+}
+
+/// Flow performance for the last `days` days, the `days` before that, and flow revenue and sends by day.
+pub async fn flows(state: &AppState, account_id: Uuid, days: i64) -> AppResult<Value> {
+    let days = days.clamp(1, 365);
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    let since = format!("now() - interval '{days} days'");
+    let totals = flow_window(state, account_id, days, 0).await?;
+    let previous = flow_window(state, account_id, days * 2, days).await?;
+    let rows: Vec<(String, f64, i64)> = sqlx::query_as(&format!(
+        "WITH d AS (
+            SELECT to_char(g, 'YYYY-MM-DD') AS day FROM generate_series(
+              date_trunc('day', ({since}) AT TIME ZONE $2), date_trunc('day', now() AT TIME ZONE $2), interval '1 day') g),
+         m AS (SELECT to_char(created_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n
+               FROM messages WHERE account_id = $1 AND flow_id IS NOT NULL AND NOT is_test AND created_at >= {since}
+                 AND status NOT IN ('queued','sending','failed','skipped') GROUP BY 1),
+         r AS (SELECT to_char(occurred_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, sum(value) AS rev
+               FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {since}) x WHERE flow_id IS NOT NULL GROUP BY 1)
+         SELECT d.day, COALESCE(r.rev, 0)::float8, COALESCE(m.n, 0) FROM d LEFT JOIN m USING (day) LEFT JOIN r USING (day) ORDER BY d.day"
+    ))
+    .bind(account_id)
+    .bind(&tz)
+    .fetch_all(&state.db)
+    .await?;
+    let series: Vec<Value> = rows.into_iter().map(|(date, rev, n)| json!({"date": date, "revenue": rev, "messages_sent": n})).collect();
+    Ok(json!({"days": days, "totals": totals, "previous": previous, "series": series}))
+}
+
+async fn flows_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Days>) -> AppResult<Json<Value>> {
+    Ok(Json(flows(&state, ctx.account_id, q.days.unwrap_or(30)).await?))
 }

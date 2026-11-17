@@ -273,6 +273,11 @@ async fn signup_import_segment_campaign_tracking_unsubscribe() {
     assert_eq!(ov["previous"]["emails_sent"], 0);
     assert_eq!(ov["previous"]["attributed_revenue"], 0.0);
     assert_eq!(ov["series"].as_array().unwrap().last().unwrap()["campaign_revenue"], 120.5);
+    // The flows summary counts flow revenue only; this order belongs to the campaign.
+    let fa = h.ok("GET", "/api/analytics/flows?days=30", None).await;
+    assert_eq!(fa["totals"]["revenue"], 0.0);
+    assert_eq!(fa["totals"]["store_revenue"], 120.5);
+    assert_eq!(fa["totals"]["messages_sent"], 0);
     let metrics = h.ok("GET", "/api/metrics", None).await;
     let order = metrics["data"].as_array().unwrap().iter().find(|m| m["name"] == "Placed Order").unwrap().clone();
     assert_eq!(order["has_value"], true);
@@ -329,6 +334,11 @@ async fn welcome_and_abandoned_checkout_flows() {
     h.ok("POST", &format!("/api/lists/{list_id}/members"), Some(json!({"emails": ["new@x.test"]}))).await;
     h.drain().await;
     assert_eq!(h.ok("GET", &format!("/api/flows/{fid}/report"), None).await["total_runs"], 1);
+    let fa = h.ok("GET", "/api/analytics/flows?days=30", None).await;
+    assert_eq!(fa["totals"]["messages_sent"], 3);
+    assert_eq!(fa["totals"]["recipients"], 1);
+    assert_eq!(fa["previous"]["messages_sent"], 0);
+    assert_eq!(fa["series"].as_array().unwrap().iter().map(|d| d["messages_sent"].as_i64().unwrap()).sum::<i64>(), 3);
 
     // Abandoned checkout: exits when the person buys.
     let ac = h.ok("POST", "/api/flows/from-blueprint", Some(json!({"key": "abandoned_checkout"}))).await;

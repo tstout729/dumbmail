@@ -781,6 +781,29 @@ export type AnalyticsOverview = {
   }[];
 };
 
+export type FlowTotals = {
+  revenue: number;
+  orders: number;
+  /** All tracked store revenue in the range, so flow revenue can be shown as a share. */
+  store_revenue: number;
+  messages_sent: number;
+  recipients: number;
+  delivered: number;
+  opens: number;
+  clicks: number;
+  open_rate: number;
+  click_rate: number;
+  revenue_per_recipient: number;
+};
+
+export type FlowAnalytics = {
+  days: number;
+  totals: FlowTotals;
+  /** The same totals for the `days` before this range. */
+  previous: FlowTotals;
+  series: { date: string; revenue: number; messages_sent: number }[];
+};
+
 // ---- Sending and domains ----
 
 export type DnsStatus = "not_started" | "pending" | "verified" | "failed";

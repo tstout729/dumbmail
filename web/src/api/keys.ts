@@ -35,4 +35,5 @@ export const keys = {
   form: (id: string) => ["form", id] as const,
   images: ["images"] as const,
   overview: (days: number) => ["analytics-overview", days] as const,
+  flowAnalytics: (days: number) => ["analytics-flows", days] as const,
 };
