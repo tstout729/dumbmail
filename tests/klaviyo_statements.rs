@@ -1,7 +1,7 @@
 //! An account that never imported from Klaviyo pays nothing for the importer: the send, schedule,
 //! test-send, go-live, live-edit, flow-send and segment-refresh paths run exactly as many SQL statements
 //! as on `main` before the importer. The counts below were measured by running this same file against
-//! `origin/main` (28ef812); a change here means one of those paths picked up a query.
+//! `origin/main` (35d7abc); a change here means one of those paths picked up a query.
 //!
 //! Statements are counted from sqlx's own query log (`sqlx::query` tracing events), one per statement
 //! executed, on this test's thread only.
@@ -140,7 +140,7 @@ async fn an_account_that_never_imported_runs_the_same_sql_as_before() {
     let got: Vec<(&str, usize)> = report.iter().map(|(l, n, _)| (*l, *n)).collect();
     let detail: Vec<String> = report.iter().map(|(l, n, s)| show(l, *n, s)).collect();
     println!("{}", detail.join("\n"));
-    // Measured on origin/main (28ef812) with this same test.
+    // Measured on origin/main (35d7abc) with this same test.
     let expected: Vec<(&str, usize)> = EXPECTED.to_vec();
     assert_eq!(got, expected, "{}", detail.join("\n"));
     h.cleanup().await;
@@ -148,8 +148,8 @@ async fn an_account_that_never_imported_runs_the_same_sql_as_before() {
 
 const EXPECTED: &[(&str, usize)] = &[
     ("campaign start", 13),
-    ("schedule", 11),
-    ("send now", 12),
+    ("schedule", 14),
+    ("send now", 15),
     ("test send", 12),
     ("flow go-live", 5),
     ("live flow edit", 2),
