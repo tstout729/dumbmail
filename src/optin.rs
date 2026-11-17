@@ -77,9 +77,9 @@ pub async fn start(
     if account.sending_paused_at.is_some() {
         return Ok(Started::Unavailable("email sending is paused".into()));
     }
-    let Some(from_email) = account.from_email.clone() else { return Ok(Started::Unavailable("no sender email".into())) };
+    let Some(from_email) = account.from_email.as_deref() else { return Ok(Started::Unavailable("no sender email".into())) };
     if state.email.name() == "ses" {
-        if let Err(e) = crate::sending::check_sender_domain_name(account, &from_email) {
+        if let Err(e) = crate::sending::check_sender_domain_name(account, from_email) {
             return Ok(Started::Unavailable(e));
         }
     }
@@ -155,11 +155,34 @@ pub async fn start(
     tx.commit().await?;
 
     let url = format!("{}/c/{}", crate::domains::link_base(state, account), token(state, id));
+    match deliver(state, account, profile_id, email, confirmation_email(account, &url)).await? {
+        Ok(()) => Ok(Started::Pending),
+        Err(why) => {
+            sqlx::query("DELETE FROM optin_confirmations WHERE id = $1").bind(id).execute(&state.db).await?;
+            Ok(Started::Unavailable(why))
+        }
+    }
+}
+
+/// Send a confirmation email (this module's, or another feature's such as a back-in-stock request)
+/// to `to`. Like double opt-in confirmations it isn't billed, but it's kept like any sent email so a
+/// bounce or complaint suppresses the address and counts. The caller applies its own rate limits.
+/// `Err` says why it couldn't be sent (sending paused, no verified sender, the provider refused).
+pub async fn deliver(state: &AppState, account: &Account, profile_id: Uuid, to: &str, email: (String, String, String)) -> AppResult<Result<(), String>> {
+    if account.sending_paused_at.is_some() {
+        return Ok(Err("email sending is paused".into()));
+    }
+    let Some(from_email) = account.from_email.clone() else { return Ok(Err("no sender email".into())) };
+    if state.email.name() == "ses" {
+        if let Err(e) = crate::sending::check_sender_domain_name(account, &from_email) {
+            return Ok(Err(e));
+        }
+    }
+    let (subject, html, text) = email;
     let message_id = Uuid::now_v7();
-    let (subject, html, text) = confirmation_email(account, &url);
     let outgoing = OutgoingEmail {
         message_id,
-        to: email.to_string(),
+        to: to.to_string(),
         from_name: account.from_name.clone().unwrap_or_else(|| account.name.clone()),
         from_email,
         reply_to: account.reply_to.clone(),
@@ -171,7 +194,6 @@ pub async fn start(
     crate::sending::throttle_email(state).await;
     match state.email.send(&outgoing).await {
         Ok(provider_id) => {
-            // Kept like any sent email, so a bounce or complaint suppresses the address and counts.
             sqlx::query(
                 "INSERT INTO messages (id, account_id, profile_id, channel, to_address, subject, status, provider_message_id, sent_at)
                  VALUES ($1, $2, $3, 'email', $4, $5, 'sent', $6, now())",
@@ -179,23 +201,49 @@ pub async fn start(
             .bind(message_id)
             .bind(account.id)
             .bind(profile_id)
-            .bind(email)
+            .bind(to)
             .bind(&subject)
             .bind(&provider_id)
             .execute(&state.db)
             .await?;
             crate::deliverability::record_confirmation_send(&state.db, message_id, &provider_id, account.id).await?;
-            Ok(Started::Pending)
+            Ok(Ok(()))
         }
-        Err(e) => {
-            sqlx::query("DELETE FROM optin_confirmations WHERE id = $1").bind(id).execute(&state.db).await?;
-            Ok(Started::Unavailable(format!("couldn't send the confirmation email: {e:#}")))
-        }
+        Err(e) => Ok(Err(format!("couldn't send the confirmation email: {e:#}"))),
     }
 }
 
 /// Subject, HTML and text of a confirmation email.
 pub fn confirmation_email(account: &Account, url: &str) -> (String, String, String) {
+    confirm_email(
+        account,
+        url,
+        &ConfirmCopy {
+            subject: &format!("Confirm your subscription to {}", account.name),
+            heading: "Confirm your subscription",
+            line: &format!("Tap the button to start getting emails from {}.", account.name),
+            text_line: &format!("Open this link to start getting emails from {}", account.name),
+            button: "Yes, subscribe me",
+            didnt: "sign up",
+        },
+    )
+}
+
+/// The words of a confirmation email (plain text; escaped where needed).
+pub struct ConfirmCopy<'a> {
+    pub subject: &'a str,
+    pub heading: &'a str,
+    /// The line above the button.
+    pub line: &'a str,
+    /// The plain-text part's line before the link.
+    pub text_line: &'a str,
+    pub button: &'a str,
+    /// "If you didn't {didnt}, ignore this email".
+    pub didnt: &'a str,
+}
+
+/// A confirmation email in the account's style: a heading, one line and one button.
+pub fn confirm_email(account: &Account, url: &str, copy: &ConfirmCopy<'_>) -> (String, String, String) {
     let name = esc(&account.name);
     let color = crate::render::safe_color(&account.brand_color, "#1f6f5c");
     let address = account.address.as_deref().map(esc).map(|a| format!(" · {a}")).unwrap_or_default();
@@ -205,24 +253,30 @@ pub fn confirmation_email(account: &Account, url: &str) -> (String, String, Stri
         .filter(|u| u.starts_with("https://"))
         .map(|u| format!(r#"<img src="{}" alt="{name}" style="max-height:48px;max-width:200px;margin:0 0 20px;display:block">"#, esc(u)))
         .unwrap_or_default();
-    let subject = format!("Confirm your subscription to {}", account.name);
+    let subject = copy.subject.to_string();
     let html = format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;background:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:12px"><tr><td style="padding:32px">
-{logo}<h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;color:#111827">Confirm your subscription</h1>
-<p style="font-size:16px;line-height:1.5;color:#4b5563;margin:0 0 24px">Tap the button to start getting emails from {name}.</p>
-<a href="{url}" style="display:inline-block;background:{color};color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:12px 24px;border-radius:8px">Yes, subscribe me</a>
-<p style="font-size:13px;line-height:1.5;color:#6b7280;margin:24px 0 0">If you didn't sign up, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.</p>
+{logo}<h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;color:#111827">{heading}</h1>
+<p style="font-size:16px;line-height:1.5;color:#4b5563;margin:0 0 24px">{line}</p>
+<a href="{url}" style="display:inline-block;background:{color};color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:12px 24px;border-radius:8px">{button}</a>
+<p style="font-size:13px;line-height:1.5;color:#6b7280;margin:24px 0 0">If you didn't {didnt}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.</p>
 </td></tr></table>
 <p style="font-size:12px;color:#9ca3af;margin:16px 0 0">{name}{address}</p>
 </td></tr></table></body></html>"#,
         url = esc(url),
+        heading = esc(copy.heading),
+        line = esc(copy.line),
+        button = esc(copy.button),
+        didnt = esc(copy.didnt),
     );
     let text = format!(
-        "Confirm your subscription\n\nOpen this link to start getting emails from {}:\n{url}\n\nIf you didn't sign up, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.\n\n--\n{}{}\n",
-        account.name,
+        "{}\n\n{}:\n{url}\n\nIf you didn't {}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.\n\n--\n{}{}\n",
+        copy.heading,
+        copy.text_line,
+        copy.didnt,
         account.name,
         account.address.as_deref().map(|a| format!(", {a}")).unwrap_or_default(),
     );

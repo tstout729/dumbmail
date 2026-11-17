@@ -192,7 +192,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
 
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
-    let ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    // Product blocks and catalog variables are filled per recipient (see features::catalog).
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,
@@ -208,7 +210,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool),
     }
     let (subject, rendered) = if spec.channel == "email" {
-        let content: EmailContent = serde_json::from_value(spec.content.clone())?;
+        let content: EmailContent = serde_json::from_value(content.into_owned())?;
         let from_email = content
             .from_email
             .clone()
@@ -231,7 +233,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         };
         (Some(subject), Rendered::Email(email))
     } else {
-        let content: SmsContent = serde_json::from_value(spec.content.clone())?;
+        let content: SmsContent = serde_json::from_value(content.into_owned())?;
         let (provider, mut from, own_provider) = crate::phone::sender(state, spec.account.id).await?;
         if let Some(c) = conversational {
             from = c.from.clone();
@@ -319,11 +321,16 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     match result {
         Ok(provider_id) => {
             let cost = crate::billing::charge_message(state, spec.account.id, spec.channel, segments, is_mms, own_provider).await?;
-            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4 WHERE id = $1")
+            let from_domain = match &rendered {
+                Rendered::Email(e) => crate::features::reports::delivery::sender_domain(&e.from_email),
+                Rendered::Sms(..) => None,
+            };
+            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4, from_domain = $5 WHERE id = $1")
                 .bind(message_id)
                 .bind(&provider_id)
                 .bind(segments as i32)
                 .bind(cost)
+                .bind(from_domain)
                 .execute(&state.db)
                 .await?;
             if limited {

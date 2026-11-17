@@ -1,0 +1,46 @@
+{
+  "engagement": {
+    "source": "MailerLite, Email Marketing Benchmarks (2026 edition)",
+    "url": "https://www.mailerlite.com/blog/compare-your-email-performance-metrics-industry-benchmarks",
+    "published": "2025-12-03",
+    "period": "Campaigns sent December 2024 to November 2025: 3.6 million campaigns from 181,000 accounts in 46 industries. Figures are medians.",
+    "note": "Open rates include emails Apple Mail opens automatically, so they run high. Compare clicks first.",
+    "industries": [
+      {"key": "all", "label": "All industries", "open_rate": 0.4346, "click_rate": 0.0209, "unsubscribe_rate": 0.0022},
+      {"key": "ecommerce", "label": "E-commerce", "open_rate": 0.3267, "click_rate": 0.0107, "unsubscribe_rate": 0.0018},
+      {"key": "retail", "label": "Retail", "open_rate": 0.3747, "click_rate": 0.0127, "unsubscribe_rate": 0.0022},
+      {"key": "beauty", "label": "Beauty and personal care", "open_rate": 0.384, "click_rate": 0.0095, "unsubscribe_rate": 0.0023},
+      {"key": "health_fitness", "label": "Health and fitness", "open_rate": 0.4781, "click_rate": 0.0145, "unsubscribe_rate": 0.003},
+      {"key": "restaurants", "label": "Restaurants and cafes", "open_rate": 0.4432, "click_rate": 0.0106, "unsubscribe_rate": 0.0039},
+      {"key": "food", "label": "Agriculture and food services", "open_rate": 0.4551, "click_rate": 0.0183, "unsubscribe_rate": 0.0023},
+      {"key": "software", "label": "Software and web apps", "open_rate": 0.3931, "click_rate": 0.0115, "unsubscribe_rate": 0.002},
+      {"key": "nonprofit", "label": "Nonprofit", "open_rate": 0.5238, "click_rate": 0.029, "unsubscribe_rate": 0.0019},
+      {"key": "media", "label": "Media", "open_rate": 0.4297, "click_rate": 0.041, "unsubscribe_rate": 0.001},
+      {"key": "publishing", "label": "Publishing", "open_rate": 0.3424, "click_rate": 0.0282, "unsubscribe_rate": 0.002},
+      {"key": "travel", "label": "Travel and transportation", "open_rate": 0.301, "click_rate": 0.0168, "unsubscribe_rate": 0.0013}
+    ],
+    "range": {
+      "open_rate": [0.301, 0.5571],
+      "click_rate": [0.0083, 0.049],
+      "unsubscribe_rate": [0.0009, 0.004]
+    }
+  },
+  "limits": {
+    "bounce_rate": {
+      "good_below": 0.02,
+      "review_at": 0.05,
+      "source": "Amazon SES sending review FAQ",
+      "url": "https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html",
+      "checked": "2026-11-17",
+      "text": "Amazon SES recommends staying under 2% (hard bounces) and reviews accounts at 5%."
+    },
+    "complaint_rate": {
+      "good_below": 0.001,
+      "review_at": 0.003,
+      "source": "Google email sender guidelines (in force since February 1, 2024)",
+      "url": "https://support.google.com/a/answer/81126",
+      "checked": "2026-11-17",
+      "text": "Gmail asks senders to keep spam complaints under 0.1% and never reach 0.3%."
+    }
+  }
+}
