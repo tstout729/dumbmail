@@ -19,7 +19,7 @@ pub async fn hit(state: &AppState, bucket: &str, limit: i32, window_secs: i64) -
     .fetch_one(&state.db)
     .await?;
     if hits > limit {
-        return Err(AppError::RateLimited("Too many attempts. Wait a few minutes and try again.".into()));
+        return Err(AppError::Busy("Too many attempts. Wait a few minutes and try again.".into()));
     }
     Ok(())
 }

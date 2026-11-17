@@ -519,6 +519,9 @@ pub struct TrackBody {
 }
 
 pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResult<Value> {
+    if core::is_server_only_metric(&b.metric) {
+        return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself, from a real stock or price change or a confirmed request", b.metric.trim())));
+    }
     let input: ProfileInput = serde_json::from_value(b.profile)?;
     let profile = match input.id {
         Some(id) if input.email.is_none() && input.phone_number.is_none() && input.external_id.is_none() => {

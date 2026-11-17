@@ -84,6 +84,8 @@ impl Role {
                         | FlowEdit
                         | FlowLive
                         | TransactionalSend
+                        | ReportsManage
+                        | CatalogWrite
                         | ContentRead
                         | ContentWrite
                         | FormsWrite
@@ -170,6 +172,12 @@ pub enum Perm {
     ContentWrite,
     FormsWrite,
     AnalyticsRead,
+    /// Save, schedule and delete reports, and change attribution settings.
+    ReportsManage,
+    /// Add and change products, product feeds and back-in-stock and price-drop settings.
+    CatalogWrite,
+    /// Delete products and product feeds.
+    CatalogDelete,
     AccountRead,
     SettingsWrite,
     /// Sending domains, link domain, phone numbers and SMS providers.
@@ -188,7 +196,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    pub const ALL: [Perm; 34] = [
+    pub const ALL: [Perm; 37] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -212,6 +220,9 @@ impl Perm {
         Perm::ContentWrite,
         Perm::FormsWrite,
         Perm::AnalyticsRead,
+        Perm::ReportsManage,
+        Perm::CatalogWrite,
+        Perm::CatalogDelete,
         Perm::AccountRead,
         Perm::SettingsWrite,
         Perm::Domains,
@@ -252,6 +263,9 @@ impl Perm {
             ContentWrite => "content.write",
             FormsWrite => "forms.write",
             AnalyticsRead => "analytics.read",
+            ReportsManage => "reports.manage",
+            CatalogWrite => "catalog.write",
+            CatalogDelete => "catalog.delete",
             AccountRead => "account.read",
             SettingsWrite => "settings.write",
             Domains => "domains.manage",
@@ -276,8 +290,9 @@ impl Perm {
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),
-            ContentWrite | FormsWrite => (Area::Content, true),
+            ContentWrite | FormsWrite | CatalogWrite | CatalogDelete => (Area::Content, true),
             AnalyticsRead => (Area::Analytics, false),
+            ReportsManage => (Area::Analytics, true),
             AccountRead | BillingRead | TeamRead | AuditRead => (Area::Account, false),
             SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys => (Area::Account, true),
         })
@@ -489,6 +504,18 @@ pub static PUBLIC_ROUTES: &[RouteRule] = &[
     public("GET", "/robots.txt"),
     public("GET", "/sitemap.xml"),
     public("GET", "/site/{file}"),
+    // Feature modules' public pages and widget endpoints
+    // Reports (src/features/reports/recipients.rs): confirming an address for report emails
+    public("GET", "/report-emails/{token}"),
+    public("POST", "/report-emails/{token}"),
+    // Catalog (src/features/catalog/api.rs): the back-in-stock widget, stock lookup and confirmation
+    public("GET", "/client/back-in-stock.js"),
+    public("GET", "/client/products/stock"),
+    public("OPTIONS", "/client/products/stock"),
+    public("POST", "/client/back-in-stock"),
+    public("OPTIONS", "/client/back-in-stock"),
+    public("GET", "/client/back-in-stock/confirm/{token}"),
+    public("POST", "/client/back-in-stock/confirm/{token}"),
 ];
 
 /// Every signed-in route outside the feature modules.
@@ -766,6 +793,8 @@ mod tests {
         assert!(Role::Analyst.has(Export) && !Role::Analyst.has(AudienceWrite) && !Role::Analyst.has(CampaignDraft) && !Role::Analyst.has(TestSend));
         assert!(Role::Content.has(CampaignDraft) && Role::Content.has(ContentWrite) && Role::Content.has(TestSend));
         assert!(!Role::Content.has(CampaignSend) && !Role::Content.has(Export) && !Role::Content.has(ProfilesRead) && !Role::Content.has(TransactionalSend));
+        assert!(Role::Manager.has(ReportsManage) && Role::Manager.has(CatalogWrite) && !Role::Manager.has(CatalogDelete) && Role::Admin.has(CatalogDelete));
+        assert!(!Role::Analyst.has(ReportsManage) && !Role::Content.has(CatalogWrite) && Role::Content.has(ContentRead));
     }
 
     #[test]

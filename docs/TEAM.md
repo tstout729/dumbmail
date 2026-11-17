@@ -21,6 +21,12 @@ API and, for members, invites, API keys and the audit log, over MCP.
 The server checks every request, whatever the dashboard shows. A request a role can't make gets
 `403 forbidden` with a message naming the role.
 
+Reports and the product catalog: everyone who sees analytics reads reports; exports (people's data)
+need the export permission (analysts and up); saving, scheduling and deleting reports and changing
+attribution are for managers and up. Everyone who sees content reads the catalog (who's waiting for
+a restock, and picks for a person, also need permission to read profiles); managers and up change
+products, feeds and alert settings; admins and up delete products and feeds.
+
 Test sends: owners, admins and managers send tests to any address or number. Content members send
 test **emails** only, and only to the email addresses of the account's members that already have
 a profile (a manager's first test to an address makes one). API keys need the `messaging` scope.
@@ -118,7 +124,7 @@ sessions that never entered one).
   `POST /api/auth/password/reset` `{token, password}` sets the new password and signs out every
   session. The forgot answer is the same whether or not the email has a login.
 
-Sign-in, reset, invite and code attempts are rate limited and answer `429 rate_limited` when
+Sign-in, reset, invite and code attempts are rate limited and answer `429 busy` when
 exceeded. For password sign-in only failures count: 30 per address and 10 per email from one
 address in 15 minutes. Failures for one email from everywhere only make the next check wait a
 little (up to 3 seconds), so strangers guessing can't lock the real person out. A password change

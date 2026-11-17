@@ -89,6 +89,12 @@ pub trait Feature: Send + Sync {
     async fn on_event(&self, _state: &AppState, _event_id: Uuid) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Called once when the server starts, on a background task that startup never waits for. For
+    /// slow upkeep that's safe to retry on the next start, like building an index concurrently.
+    async fn after_start(&self, _state: &AppState) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub static ALL: &[&dyn Feature] = &[
@@ -151,6 +157,17 @@ pub async fn tick(state: &AppState, tick: u64) {
             tracing::error!(feature = f.name(), error = %format!("{e:#}"), "feature scheduler work failed");
         }
     }
+}
+
+/// Run every feature's [`Feature::after_start`] on its own task and return at once. Errors are logged.
+pub fn spawn_after_start(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for f in ALL {
+            if let Err(e) = f.after_start(&state).await {
+                tracing::error!(feature = f.name(), error = %format!("{e:#}"), "feature startup work failed");
+            }
+        }
+    })
 }
 
 /// Errors are logged, not returned: the event's flows already ran and must not run again on a retry.

@@ -1424,3 +1424,50 @@ async fn sso_counts_as_two_factor_only_with_proof_of_a_second_factor() {
     assert_eq!(log["data"][0]["details"]["idp_enforces_mfa"], true);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn catalog_and_reports_keep_people_data_behind_profile_and_export_permissions() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.95");
+    let me = signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let acct = me["account"]["id"].as_str().unwrap().to_string();
+    ok(&h, &mut owner, "POST", "/api/catalog/products", Some(json!({"products": [{"id": "TEE", "title": "Tee", "price": 20, "url": "https://shop.test/tee", "inventory": 0}]}))).await;
+    let p = ok(&h, &mut owner, "POST", "/api/profiles", Some(json!({"email": "waiting@customer.test"}))).await;
+    sqlx::query("INSERT INTO catalog_stock_subscriptions (id, account_id, profile_id, product_id) SELECT $1, $2::uuid, $3::uuid, id FROM catalog_products WHERE account_id = $2::uuid")
+        .bind(Uuid::now_v7())
+        .bind(&acct)
+        .bind(p["id"].as_str().unwrap())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let (mut content, _) = join(&h, &mut owner, "writer@acme.test", "content").await;
+    let (mut analyst, _) = join(&h, &mut owner, "numbers@acme.test", "analyst").await;
+    let (mut manager, _) = join(&h, &mut owner, "boss@acme.test", "manager").await;
+
+    // Who's waiting for a restock is people's data: owners see it, content members see counts.
+    assert!(ok(&h, &mut owner, "GET", "/api/catalog/products/TEE", None).await.to_string().contains("waiting@customer.test"));
+    let seen = ok(&h, &mut content, "GET", "/api/catalog/products/TEE", None).await;
+    assert!(!seen.to_string().contains("waiting@customer.test") && seen.get("waiting_total").is_some(), "{seen}");
+    // Picks for a person show what they viewed and bought.
+    let recs = format!("/api/catalog/recommendations?profile_id={}", p["id"].as_str().unwrap());
+    assert_eq!(status(&h, &mut content, "GET", &recs, None).await, StatusCode::FORBIDDEN);
+    ok(&h, &mut analyst, "GET", &recs, None).await;
+    ok(&h, &mut content, "GET", "/api/catalog/recommendations?product_id=TEE", None).await;
+    // Content reads the catalog but doesn't change it; managers change it; only admins and up delete.
+    assert_eq!(status(&h, &mut content, "POST", "/api/catalog/products", Some(json!({"products": [{"id": "X", "title": "X"}]}))).await, StatusCode::FORBIDDEN);
+    assert_eq!(status(&h, &mut manager, "DELETE", "/api/catalog/products/TEE", None).await, StatusCode::FORBIDDEN);
+    ok(&h, &mut owner, "DELETE", "/api/catalog/products/TEE", None).await;
+    assert_eq!(ok(&h, &mut owner, "GET", "/api/audit?action=product.delete", None).await["total"], 1);
+
+    // Reports: analysts read and export, but don't save reports or change attribution.
+    ok(&h, &mut analyst, "GET", "/api/reports", None).await;
+    assert_eq!(status(&h, &mut analyst, "PATCH", "/api/reports/attribution", Some(json!({"count_opens": false}))).await, StatusCode::FORBIDDEN);
+    assert_eq!(status(&h, &mut content, "POST", "/api/reports/exports", Some(json!({"kind": "profiles"}))).await, StatusCode::FORBIDDEN);
+    let (st, v) = call(&h, &mut analyst, "POST", "/api/reports/exports", Some(json!({"kind": "profiles"}))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    ok(&h, &mut manager, "PATCH", "/api/reports/attribution", Some(json!({"count_opens": false}))).await;
+    for action in ["export.start", "reports.attribution_change"] {
+        assert_eq!(ok(&h, &mut owner, "GET", &format!("/api/audit?action={action}"), None).await["total"], 1, "{action}");
+    }
+    h.cleanup().await;
+}

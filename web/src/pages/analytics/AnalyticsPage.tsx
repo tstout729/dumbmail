@@ -7,6 +7,7 @@ import { BarSeriesChart } from "../../components/charts/BarSeriesChart";
 import { RangePicker, parseRange } from "../../components/charts/RangePicker";
 import { TimeSeriesChart } from "../../components/charts/TimeSeriesChart";
 import { Card, EmptyRow, Page, PageHeader, Segmented, Skeleton, SkeletonRows, StatusBadge, Table, Td, Th, cx } from "../../components/ui";
+import { useAttribution } from "../../features/reports/api";
 import { formatCompact, formatCurrency, formatDate, formatNumber, formatPercent, pluralize } from "../../lib/format";
 
 const color = { flows: "#219464", campaigns: "#6d5bd0", other: "#d4d4d8", email: "#219464", sms: "#6d5bd0" };
@@ -71,6 +72,7 @@ export function AnalyticsPage() {
 }
 
 function RevenueHero({ data, loading, vs }: { data: AnalyticsOverview | undefined; loading: boolean; vs: string }) {
+  const attribution = useAttribution();
   const t = data?.totals;
   const p = data?.previous;
   const share = t && t.revenue > 0 ? t.attributed_revenue / t.revenue : 0;
@@ -92,7 +94,7 @@ function RevenueHero({ data, loading, vs }: { data: AnalyticsOverview | undefine
           <div>
             <div className="flex items-center gap-1 text-sm font-medium text-zinc-600">
               Revenue from DumbMail
-              <Hint text="An order counts when the buyer opened or clicked one of your emails in the 5 days before, or clicked a text in the 24 hours before. The newest message gets the credit." />
+              <Hint text={`${attribution.data?.description ?? "An order counts when the buyer opened or clicked one of your emails in the 5 days before, or clicked a text in the 24 hours before. The newest message gets the credit."} Change this in Settings → Attribution.`} />
             </div>
             {loading ? (
               <Skeleton className="mt-2 h-12 w-40" />

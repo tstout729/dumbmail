@@ -145,12 +145,13 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
+    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
     if b.channel == "email" {
-        let content: render::EmailContent = serde_json::from_value(b.content)?;
+        let content: render::EmailContent = serde_json::from_value(content)?;
         let r = render::render_email(&account, &content, &ctx, None)?;
         Ok(json!({"subject": r.subject, "preheader": r.preheader, "html": r.html, "text": r.text}))
     } else {
-        let content: render::SmsContent = serde_json::from_value(b.content)?;
+        let content: render::SmsContent = serde_json::from_value(content)?;
         let body = render::render_sms(&account, &content, &ctx, None, false)?;
         let (chars, segs) = crate::providers::sms::segment_count(&body);
         Ok(json!({"body": body, "characters": chars, "segments": segs}))
