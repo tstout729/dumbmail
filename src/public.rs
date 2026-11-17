@@ -7,7 +7,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::audience::{self, NewEvent, ProfileInput};
@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/client/dumbmail.js", get(onsite_js))
         .route("/client/postlark.js", get(onsite_js))
         .route("/client/forms", get(client_forms))
+        .route("/client/form-render.js", get(form_render_js))
         .route("/client/ping", post(client_ping).options(cors_preflight))
         .route("/client/events", post(client_event).options(cors_preflight))
         .route("/client/test", get(client_test_status).post(client_test).options(cors_preflight).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
@@ -33,6 +34,7 @@ pub fn routes() -> Router<AppState> {
         .route("/client/forms/{id}/view", post(form_view).options(cors_preflight))
         .route("/f/{id}", get(form_page))
         .route("/f/{id}/embed.js", get(form_embed))
+        .route("/i/{id}", get(image))
         .route("/webhooks/ses/{secret}", post(ses_webhook))
         .route("/webhooks/telnyx/{secret}", post(telnyx_webhook))
         .route("/webhooks/twilio/{secret}", post(twilio_webhook))
@@ -473,6 +475,8 @@ async fn client_test(State(state): State<AppState>, Query(q): Query<KeyQuery>, b
 }
 
 const ONSITE_JS: &str = include_str!("onsite.js");
+/// The shared form renderer used by the website script, the hosted page and the dashboard preview.
+const FORM_RENDER_JS: &str = include_str!("form_render.js");
 const SHOPIFY_PIXEL_JS: &str = include_str!("shopify_pixel.js");
 
 /// The Shopify custom pixel code for an account, ready to paste.
@@ -482,11 +486,37 @@ pub fn shopify_pixel(state: &AppState, key: &str) -> String {
         .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
 }
 
+/// The renderer file as one JavaScript expression: trimmed, without its trailing semicolon.
+fn renderer_expr() -> &'static str {
+    let s = FORM_RENDER_JS.trim();
+    s.strip_suffix(';').unwrap_or(s).trim_end()
+}
+
+/// `window.DumbMailFormRenderer` for the hosted page (and anything else that wants it on its own).
+async fn form_render_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        format!("window.DumbMailFormRenderer = {};\n", renderer_expr()),
+    )
+        .into_response()
+}
+
 fn onsite_script(state: &AppState, key: &str, only_form: Option<Uuid>) -> Response {
-    let js = ONSITE_JS
-        .replacen("__BASE__", &serde_json::to_string(state.cfg.public_url()).unwrap_or_default(), 1)
-        .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
-        .replacen("__FORM__", &only_form.map(|f| serde_json::to_string(&f.to_string()).unwrap_or_default()).unwrap_or_else(|| "null".into()), 1);
+    let fill = |s: &str| {
+        s.replacen("__BASE__", &serde_json::to_string(state.cfg.public_url()).unwrap_or_default(), 1)
+            .replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
+            .replacen("__FORM__", &only_form.map(|f| serde_json::to_string(&f.to_string()).unwrap_or_default()).unwrap_or_else(|| "null".into()), 1)
+    };
+    // The renderer goes in last, through a NUL marker that no JSON-encoded value can contain, so
+    // neither the renderer's code nor the visitor-supplied key is ever read as a placeholder.
+    let js = match ONSITE_JS.split_once("__RENDERER__") {
+        Some((head, tail)) => fill(&format!("{head}\u{0}{tail}")).replacen('\u{0}', renderer_expr(), 1),
+        None => fill(ONSITE_JS),
+    };
     ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=300")], js).into_response()
 }
 
@@ -494,16 +524,18 @@ async fn onsite_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> 
     onsite_script(&state, &q.k, None)
 }
 
-/// Live forms for the onsite script.
+/// Live forms for the onsite script (forms scheduled outside now are left out).
 async fn client_forms(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
     let res: AppResult<Value> = async {
         let a = account_by_public_key(&state, &q.k).await?;
         let forms: Vec<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 AND status = 'live' ORDER BY created_at").bind(a.id).fetch_all(&state.db).await?;
+        let now = chrono::Utc::now();
         let data: Vec<Value> = forms
             .iter()
+            .filter(|f| crate::forms::is_open(&f.config, now))
             .map(|f| {
-                let mut c = f.config.clone();
-                if c.get("brand_color").and_then(|v| v.as_str()).is_none() {
+                let mut c = crate::forms::public_config(&f.config);
+                if c.get("brand_color").and_then(|v| v.as_str()).is_none_or(|v| v.is_empty()) {
                     c["brand_color"] = json!(a.brand_color);
                 }
                 json!({"id": f.id, "kind": f.kind, "config": c})
@@ -578,6 +610,7 @@ pub struct SubscribeBody {
     email: Option<String>,
     phone_number: Option<String>,
     first_name: Option<String>,
+    last_name: Option<String>,
     #[serde(default)]
     sms_consent: bool,
     /// The A/B test version the visitor saw.
@@ -586,6 +619,28 @@ pub struct SubscribeBody {
     /// The browser's IANA time zone; fills the profile's `timezone` and `country` when they're missing.
     #[serde(default)]
     timezone: Option<String>,
+    /// Answers to birthday and custom fields by field key (the standard keys may be sent here too).
+    #[serde(default)]
+    fields: Option<Map<String, Value>>,
+    /// "phone" for the form's optional second screen that adds a phone number.
+    #[serde(default)]
+    step: Option<String>,
+    /// From the first screen's response: lets the phone step add the number to that same person.
+    #[serde(default)]
+    phone_token: Option<String>,
+}
+
+impl SubscribeBody {
+    /// Every submitted answer by field key.
+    fn given(&self) -> Map<String, Value> {
+        let mut m = self.fields.clone().unwrap_or_default();
+        for (k, v) in [("email", &self.email), ("phone_number", &self.phone_number), ("first_name", &self.first_name), ("last_name", &self.last_name)] {
+            if let Some(v) = v.as_ref().filter(|v| !v.trim().is_empty()) {
+                m.insert(k.into(), json!(v));
+            }
+        }
+        m
+    }
 }
 
 /// Count a view or sign-up for a form's A/B test version. Returns the version when the form is testing it.
@@ -610,13 +665,23 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if form.account_id != account.id || form.status != "live" {
         return Err(AppError::not_found("form"));
     }
-    let email = b.email.clone().filter(|e| !e.trim().is_empty());
-    let phone = b.phone_number.clone().filter(|p| !p.trim().is_empty());
-    if email.is_none() && phone.is_none() {
-        return Err(AppError::bad("enter your email"));
+    // Outside the form's start/end window sign-ups are refused, with two hours' grace after the end
+    // for someone who opened the form just before it closed.
+    let now = chrono::Utc::now();
+    if !crate::forms::is_open(&form.config, now) && !crate::forms::is_open(&form.config, now - chrono::Duration::hours(2)) {
+        return Err(AppError::Conflict("This form isn't open right now.".into()));
     }
-    if let Some(p) = &phone {
-        normalize_phone(p).ok_or_else(|| AppError::bad("enter a valid mobile number"))?;
+    match b.step.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => {}
+        Some("phone") => return phone_step(state, account, &form, b).await,
+        Some(other) => return Err(AppError::bad(format!("step must be \"phone\" or left out (got {other:?})"))),
+    }
+    let defs = crate::forms::field_defs(&form.config);
+    let answers = crate::forms::answers(&defs, &b.given())?;
+    let email = answers.email.clone();
+    let phone = answers.phone_number.clone();
+    if email.is_none() && phone.is_none() {
+        return Err(AppError::bad(if defs.iter().any(|d| d.key == "email") { "enter your email" } else { "enter your mobile number" }));
     }
     // A double opt-in list: the email address joins only after confirming by email.
     let double_opt_in = match (form.list_id, &email) {
@@ -626,7 +691,9 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     let input = ProfileInput {
         email: email.clone(),
         phone_number: phone.clone(),
-        first_name: b.first_name.clone().filter(|n| !n.trim().is_empty()),
+        first_name: answers.first_name,
+        last_name: answers.last_name,
+        properties: (!answers.properties.is_empty()).then_some(answers.properties),
         email_consent: email.as_ref().filter(|_| !double_opt_in).map(|_| "subscribed".to_string()),
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
@@ -667,6 +734,61 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(l) = form.list_id {
         audience::add_to_list(&state.db, account.id, l, &[p.id]).await?;
     }
+    let mut out = json!({"ok": true, "message": form.config["success_message"].as_str().unwrap_or("Thanks for subscribing!")});
+    // Only a profile this sign-up created gets a token: anyone can type an existing person's email,
+    // and the token must not let them add a number to that person. Others' numbers stand alone.
+    if form.config["phone_step"]["enabled"].as_bool() == Some(true) && upserted.created {
+        out["phone_token"] = json!(phone_step_token(state, form.id, p.id));
+    }
+    // The code is only handed over here, after a real sign-up (public configs leave it out).
+    let version = b.variant.as_deref().filter(|v| crate::api::messaging::form_versions(&form.config).contains(v));
+    if let Some(code) = crate::forms::discount_code(&form.config, version) {
+        out["discount_code"] = json!(code);
+    }
+    Ok(out)
+}
+
+/// A token, good for an hour, that lets this form's phone step add a number to `profile`.
+fn phone_step_token(state: &AppState, form: Uuid, profile: Uuid) -> String {
+    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
+    crate::auth::sign(&state.cfg.secret_key, &format!("pstep:{}:{}:{exp:x}", form.simple(), profile.simple()))
+}
+
+/// The profile a phone-step token names, if it's genuine, for this form and not expired.
+fn phone_step_profile(state: &AppState, form: Uuid, token: &str) -> Option<Uuid> {
+    let payload = crate::auth::verify(&state.cfg.secret_key, token)?;
+    let mut parts = payload.strip_prefix("pstep:")?.split(':');
+    let (f, p, exp) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || f != form.simple().to_string() || i64::from_str_radix(exp, 16).ok()? < chrono::Utc::now().timestamp() {
+        return None;
+    }
+    p.parse().ok()
+}
+
+/// The second screen after an email sign-up: adds a phone number and SMS consent to the same person.
+/// It isn't a second sign-up: no submit count, list join, confirmation email or "Subscribed to List".
+async fn phone_step(state: &AppState, account: &Account, form: &FormRow, b: &SubscribeBody) -> AppResult<Value> {
+    if form.config["phone_step"]["enabled"].as_bool() != Some(true) {
+        return Err(AppError::bad("this form doesn't have a phone step"));
+    }
+    let given = b.given();
+    let text = |k: &str| given.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(String::from);
+    let raw = text("phone_number").ok_or_else(|| AppError::bad("enter your mobile number"))?;
+    let phone = normalize_phone(&raw).ok_or_else(|| AppError::bad("enter a valid mobile number"))?;
+    if !b.sms_consent {
+        return Err(AppError::bad("tick the box to agree to texts"));
+    }
+    // The number joins the person who just signed up only with the token from that sign-up (an email
+    // alone proves nothing), only when they have no number yet, and only when nobody else has this one.
+    // Otherwise the number and its consent stand alone, so they can't land on someone else's profile.
+    let owner = b.phone_token.as_deref().and_then(|t| phone_step_profile(state, form.id, t));
+    let by_phone = audience::find_profile(&state.db, account.id, &ProfileInput { phone_number: Some(phone.clone()), ..Default::default() }).await?;
+    let target = match owner {
+        Some(id) if by_phone.is_none() => audience::find_profile(&state.db, account.id, &ProfileInput { id: Some(id), ..Default::default() }).await?.filter(|p| p.id == id && p.phone_number.is_none()),
+        _ => None,
+    };
+    let input = ProfileInput { id: target.map(|p| p.id), phone_number: Some(phone), sms_consent: Some("subscribed".into()), ..Default::default() };
+    audience::upsert_profile_public(&state.db, account.id, &input).await?;
     Ok(json!({"ok": true, "message": form.config["success_message"].as_str().unwrap_or("Thanks for subscribing!")}))
 }
 
@@ -675,15 +797,34 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
     let res: AppResult<Value> = async {
         let a = account_by_public_key(&state, &q.k).await?;
         let b: SubscribeBody = if is_form {
-            let pairs: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let pairs: Vec<(String, String)> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let one = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            // Everything else is a field answer; a key sent more than once (ticked checkboxes) becomes a list.
+            let mut fields = Map::new();
+            for (k, v) in &pairs {
+                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone") {
+                    continue;
+                }
+                match fields.get_mut(k) {
+                    Some(Value::Array(a)) => a.push(json!(v)),
+                    Some(prev) => *prev = json!([prev.take(), v]),
+                    None => {
+                        fields.insert(k.clone(), json!(v));
+                    }
+                }
+            }
             SubscribeBody {
-                form_id: pairs.get("form_id").and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("missing form"))?,
-                email: pairs.get("email").cloned(),
-                phone_number: pairs.get("phone_number").cloned(),
-                first_name: pairs.get("first_name").cloned(),
-                sms_consent: pairs.contains_key("sms_consent"),
-                variant: pairs.get("variant").cloned(),
-                timezone: None,
+                form_id: one("form_id").and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("missing form"))?,
+                email: one("email"),
+                phone_number: one("phone_number"),
+                first_name: one("first_name"),
+                last_name: one("last_name"),
+                sms_consent: one("sms_consent").is_some(),
+                variant: one("variant"),
+                fields: Some(fields),
+                step: one("step"),
+                phone_token: one("phone_token"),
+                timezone: one("timezone"),
             }
         } else {
             serde_json::from_slice(&body)?
@@ -694,7 +835,10 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
     if is_form {
         // Hosted page fallback without JavaScript.
         return match res {
-            Ok(v) => page("Thanks", &format!("<h1>{}</h1>", esc(v["message"].as_str().unwrap_or("Thanks!"))), "#1f6f5c").into_response(),
+            Ok(v) => {
+                let code = v["discount_code"].as_str().map(|c| format!("<p>Your code: <strong>{}</strong></p>", esc(c))).unwrap_or_default();
+                page("Thanks", &format!("<h1>{}</h1>{code}", esc(v["message"].as_str().unwrap_or("Thanks!"))), "#1f6f5c").into_response()
+            }
             Err(e) => page("Oops", &format!("<h1>Something's off</h1><p>{}</p>", esc(&e.public_message())), "#1f6f5c").into_response(),
         };
     }
@@ -720,47 +864,162 @@ async fn form_view(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q)
     cors(StatusCode::NO_CONTENT.into_response())
 }
 
-fn form_fields_html(f: &FormRow) -> String {
-    let collect: Vec<String> = f.config["collect"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_else(|| vec!["email".into()]);
+const SMS_CONSENT: &str = "By checking this box you agree to receive recurring automated marketing texts at this number. Consent is not a condition of purchase. Msg & data rates may apply. Reply STOP to opt out.";
+
+/// The plain HTML fields for the hosted page without JavaScript.
+fn form_fields_html(config: &Value) -> String {
     let mut h = String::new();
-    if collect.iter().any(|c| c == "first_name") {
-        h.push_str(r#"<input type="text" name="first_name" placeholder="First name" autocomplete="given-name">"#);
-    }
-    if collect.iter().any(|c| c == "email") {
-        h.push_str(r#"<input type="email" name="email" placeholder="Email address" autocomplete="email" required>"#);
-    }
-    if collect.iter().any(|c| c == "phone_number") {
-        let consent = f.config["sms_consent_text"].as_str().unwrap_or("By checking this box you agree to receive recurring automated marketing texts at this number. Consent is not a condition of purchase. Msg & data rates may apply. Reply STOP to opt out.");
-        h.push_str(&format!(r#"<input type="tel" name="phone_number" placeholder="Mobile number" autocomplete="tel"><label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 12px"><input type="checkbox" name="sms_consent" value="1" style="margin-top:3px"><span>{}</span></label>"#, esc(consent)));
+    for d in crate::forms::field_defs(config) {
+        let key = esc(&d.key);
+        let req = if d.required { " required" } else { "" };
+        let label = d.label.as_deref().filter(|l| !l.trim().is_empty());
+        if let Some(l) = label {
+            h.push_str(&format!(r#"<label class="l">{}</label>"#, esc(l)));
+        }
+        let ph = |default: &str| esc(d.placeholder.as_deref().or(if label.is_some() { None } else { Some(default) }).unwrap_or(""));
+        let name = label.map(String::from).unwrap_or_else(|| d.key.replace('_', " "));
+        match (d.key.as_str(), d.kind.as_str()) {
+            ("email", _) => h.push_str(&format!(r#"<input type="email" name="email" placeholder="{}" autocomplete="email"{req}>"#, ph("Email address"))),
+            ("phone_number", _) => {
+                let consent = config["sms_consent_text"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or(SMS_CONSENT);
+                h.push_str(&format!(
+                    r#"<input type="tel" name="phone_number" placeholder="{}" autocomplete="tel"{req}><label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 12px"><input type="checkbox" name="sms_consent" value="1" style="margin-top:3px"><span>{}</span></label>"#,
+                    ph("Mobile number"),
+                    esc(consent)
+                ))
+            }
+            ("first_name", _) => h.push_str(&format!(r#"<input type="text" name="first_name" placeholder="{}" autocomplete="given-name"{req}>"#, ph("First name"))),
+            ("last_name", _) => h.push_str(&format!(r#"<input type="text" name="last_name" placeholder="{}" autocomplete="family-name"{req}>"#, ph("Last name"))),
+            (_, "date") => h.push_str(&format!(r#"<input type="date" name="{key}" aria-label="{}"{req}>"#, esc(&name))),
+            (_, "number") => h.push_str(&format!(r#"<input type="number" step="any" name="{key}" placeholder="{}"{req}>"#, ph(&name))),
+            (_, "select") => {
+                h.push_str(&format!(r#"<select name="{key}"{req}><option value="">{}</option>"#, ph("Choose one")));
+                for o in &d.options {
+                    h.push_str(&format!(r#"<option>{}</option>"#, esc(o)));
+                }
+                h.push_str("</select>");
+            }
+            (_, "radio" | "checkboxes") => {
+                if label.is_none() {
+                    h.push_str(&format!(r#"<label class="l">{}</label>"#, esc(&name)));
+                }
+                let t = if d.kind == "radio" { "radio" } else { "checkbox" };
+                for o in &d.options {
+                    h.push_str(&format!(r#"<label class="o"><input type="{t}" name="{key}" value="{v}"> {v}</label>"#, v = esc(o)));
+                }
+            }
+            (_, "checkbox") => {
+                h.push_str(&format!(r#"<label class="o"><input type="checkbox" name="{key}" value="1"{req}> {}</label>"#, esc(&name)));
+            }
+            _ => h.push_str(&format!(r#"<input type="text" name="{key}" maxlength="{}" placeholder="{}"{req}>"#, crate::forms::MAX_ANSWER, ph(&name))),
+        }
     }
     h
 }
 
-async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+#[derive(Deserialize)]
+struct FormPageQuery {
+    /// The token from the form's `preview_url`.
+    preview: Option<String>,
+    /// In a preview, the A/B test version to show (default a).
+    v: Option<String>,
+}
+
+/// The hosted sign-up page. The shared renderer draws it; the noscript copy keeps sign-ups working
+/// without JavaScript. With a valid preview token it also shows drafts and counts and saves nothing.
+async fn form_page(State(state): State<AppState>, Path(id): Path<Uuid>, Query(q): Query<FormPageQuery>) -> Response {
     let Ok((f, a)) = load_form(&state, id).await else { return (StatusCode::NOT_FOUND, "form not found").into_response() };
-    if f.status != "live" {
-        return (StatusCode::NOT_FOUND, "this form isn't published yet").into_response();
+    let preview = q.preview.as_deref().is_some_and(|t| crate::forms::preview_ok(&state.cfg.secret_key, f.id, t));
+    let color = f.config["brand_color"].as_str().filter(|c| !c.is_empty()).unwrap_or(&a.brand_color).to_string();
+    if !preview {
+        if f.status != "live" {
+            return (StatusCode::NOT_FOUND, "this form isn't published yet").into_response();
+        }
+        if !crate::forms::is_open(&f.config, chrono::Utc::now()) {
+            return page(&a.name, "<h1>This form isn't open right now</h1><p>Please check back later.</p>", &color).into_response();
+        }
     }
-    let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
-    // A/B test: each page load shows a random version.
     let versions = crate::api::messaging::form_versions(&f.config);
-    let version = (!versions.is_empty()).then(|| versions[rand::Rng::gen_range(&mut rand::thread_rng(), 0..versions.len())].to_string());
-    let _ = count_variant(&state, &f, version.as_deref(), false).await;
-    let config = version.as_deref().map(|v| crate::api::messaging::form_version_config(&f.config, v)).unwrap_or_else(|| f.config.clone());
-    let variant_input = version.map(|v| format!(r#"<input type="hidden" name="variant" value="{}">"#, esc(&v))).unwrap_or_default();
-    let color = f.config["brand_color"].as_str().unwrap_or(&a.brand_color).to_string();
-    let img = config["image_url"].as_str().filter(|s| !s.is_empty()).map(|u| format!(r#"<img src="{}" alt="" style="width:100%;border-radius:8px;margin-bottom:16px">"#, esc(u))).unwrap_or_default();
-    let body = format!(
-        r#"{img}<h1>{h}</h1><p>{b}</p><form method="post" action="{base}/client/subscribe?k={k}"><input type="hidden" name="form_id" value="{id}">{variant_input}{fields}<input type="submit" value="{btn}"></form>"#,
+    let version = if versions.is_empty() {
+        None
+    } else if preview {
+        Some(q.v.filter(|v| versions.contains(&v.as_str())).unwrap_or_else(|| "a".into()))
+    } else {
+        // A/B test: each page load shows a random version.
+        Some(versions[rand::Rng::gen_range(&mut rand::thread_rng(), 0..versions.len())].to_string())
+    };
+    if !preview {
+        let _ = sqlx::query("UPDATE forms SET views = views + 1 WHERE id = $1").bind(id).execute(&state.db).await;
+        let _ = count_variant(&state, &f, version.as_deref(), false).await;
+    }
+    let mut config = version.as_deref().map(|v| crate::api::messaging::form_version_config(&f.config, v)).unwrap_or_else(|| f.config.clone());
+    // A preview shows the discount code so it can be checked; visitors only get it by signing up.
+    if !preview {
+        config = crate::forms::public_config(&config);
+    }
+    if config["brand_color"].as_str().is_none_or(|c| c.is_empty()) {
+        config["brand_color"] = json!(a.brand_color);
+    }
+    let base = state.cfg.public_url();
+    let submit_url = format!("{base}/client/subscribe?k={}", a.public_key);
+    let variant_input = version.as_deref().map(|v| format!(r#"<input type="hidden" name="variant" value="{}">"#, esc(v))).unwrap_or_default();
+    let img = config["image_url"].as_str().filter(|s| !s.is_empty()).map(|u| format!(r#"<img src="{}" alt="{}">"#, esc(u), esc(config["image_alt"].as_str().unwrap_or("")))).unwrap_or_default();
+    let (action, note, disabled) = if preview {
+        (String::new(), r#"<p class="n">Preview: sign-ups here aren't saved.</p>"#, " disabled")
+    } else {
+        (format!(r#" method="post" action="{}""#, esc(&submit_url)), "", "")
+    };
+    let static_form = format!(
+        r#"{img}<h1>{h}</h1><p>{b}</p>{note}<form{action}><input type="hidden" name="form_id" value="{id}">{variant_input}{fields}<input type="submit" value="{btn}"{disabled}></form>"#,
         h = esc(config["headline"].as_str().unwrap_or("")),
         b = esc(config["body"].as_str().unwrap_or("")),
-        base = state.cfg.public_url(),
-        k = esc(&a.public_key),
-        fields = form_fields_html(&f),
+        fields = form_fields_html(&config),
         btn = esc(config["button_text"].as_str().unwrap_or("Sign up")),
     );
-    page(&a.name, &body, &color).into_response()
+    let c = crate::render::safe_color(&color, "#1f6f5c");
+    let noscript_css = format!(
+        ".dm-ns{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f4f5;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center}}\
+.dm-ns .c{{background:#fff;border-radius:12px;padding:32px;max-width:420px;width:calc(100% - 32px);box-shadow:0 1px 3px rgba(0,0,0,.08);box-sizing:border-box}}.dm-ns img{{width:100%;border-radius:8px;margin-bottom:16px}}\
+.dm-ns h1{{font-size:22px;margin:0 0 12px}}.dm-ns p{{color:#4b5563;line-height:1.5;white-space:pre-line}}.dm-ns .n{{font-size:13px;font-style:italic}}\
+.dm-ns input[type=submit]{{background:{c};color:#fff;border:0;border-radius:8px;padding:12px 20px;font-size:16px;font-weight:600;cursor:pointer;width:100%}}\
+.dm-ns input[type=email],.dm-ns input[type=tel],.dm-ns input[type=text],.dm-ns input[type=number],.dm-ns input[type=date],.dm-ns select{{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:8px;font-size:16px;margin:0 0 10px;background:#fff}}\
+.dm-ns label{{font-size:13px;color:#4b5563}}.dm-ns .l{{display:block;margin:0 0 4px}}.dm-ns .o{{display:block;margin:0 0 8px}}"
+    );
+    let data = json!({
+        "form": {"id": f.id, "kind": "page", "config": config, "version": version},
+        "submit": if preview { Value::Null } else { json!(submit_url) },
+    });
+    // JSON inside a script element: escaping "<" means nothing in it can close the element.
+    let data = data.to_string().replace('<', "\\u003c");
+    let robots = if preview { r#"<meta name="robots" content="noindex">"# } else { "" };
+    Html(format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{robots}<style>body{{margin:0}}</style></head><body>
+<div id="dm-form"></div>
+<noscript><style>{noscript_css}</style><div class="dm-ns"><div class="c">{static_form}</div></div></noscript>
+<script type="application/json" id="dm-form-data">{data}</script>
+<script src="{base}/client/form-render.js"></script>
+<script>{MOUNT_JS}</script>
+</body></html>"#,
+        title = esc(&a.name),
+    ))
+    .into_response()
 }
+
+/// Mounts the renderer on the hosted page and posts sign-ups as JSON. Without the renderer (blocked
+/// or failed to load) it shows the plain form from the noscript copy instead.
+const MOUNT_JS: &str = r#"(function () {
+  var d = JSON.parse(document.getElementById("dm-form-data").textContent);
+  var el = document.getElementById("dm-form"), R = window.DumbMailFormRenderer;
+  if (!R || typeof R.mount !== "function") { var ns = document.querySelector("noscript"); if (ns) el.innerHTML = ns.textContent; return; }
+  var opts = { container: el };
+  if (d.submit) opts.submit = function (data) {
+    var body = {}; for (var k in data) if (Object.prototype.hasOwnProperty.call(data, k)) body[k] = data[k];
+    body.form_id = d.form.id; if (d.form.version && !body.variant) body.variant = d.form.version;
+    return fetch(d.submit, { method: "POST", credentials: "omit", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().catch(function () { return { error: { message: "Something went wrong. Please try again." } }; }); });
+  };
+  R.mount(d.form, opts);
+})();"#;
 
 async fn form_embed(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
     let Ok((f, a)) = load_form(&state, id).await else { return (StatusCode::NOT_FOUND, "// form not found").into_response() };
@@ -768,6 +1027,24 @@ async fn form_embed(State(state): State<AppState>, Path(id): Path<Uuid>) -> Resp
         return ([(header::CONTENT_TYPE, "application/javascript")], "/* form not published */").into_response();
     }
     onsite_script(&state, &a.public_key, Some(f.id))
+}
+
+/// A public uploaded image. Served with the type it was sniffed as and locked down so it can only ever be an image.
+async fn image(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "image not found").into_response();
+    let Ok(id) = Uuid::parse_str(&id) else { return not_found() };
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as("SELECT content_type, bytes FROM images WHERE id = $1").bind(id).fetch_optional(&state.db).await.unwrap_or_default();
+    let Some((content_type, bytes)) = row else { return not_found() };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 // ---------- Provider webhooks ----------

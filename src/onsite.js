@@ -1,7 +1,7 @@
 /* DumbMail onsite script: visitor recognition, shopping events, sign-up forms and a setup test mode. Paste once in <head> or the footer. */
 (function () {
   "use strict";
-  var BASE = __BASE__, KEY = __KEY__, ONLY_FORM = __FORM__, VERSION = 3;
+  var BASE = __BASE__, KEY = __KEY__, ONLY_FORM = __FORM__, VERSION = 4;
   var ME = document.currentScript;
   if ((window.__dumbmailLoaded || window.__postlarkLoaded) && !ONLY_FORM) {
     // A second copy of the snippet: tell the first one (test mode shows it) and stop.
@@ -820,6 +820,7 @@
     if (pv.path !== location.pathname) pv = { path: location.pathname, cands: [], timer: 0, sent: false };
     setTimeout(function () { scanProduct(); scanCheckout(); }, 700);
     setTimeout(function () { if (!pv.cands.length) scanProduct(); }, 2500);
+    countPageView();
     if (formsCache) runForms(formsCache);
   }
   function hookRoutes() {
@@ -844,7 +845,9 @@
   }
 
   // ---------- Forms ----------
-  var formsCache = null, showing = false, scheduled = {};
+  // The shared form renderer (src/form_render.js); the hosted page and the dashboard preview draw forms with it too.
+  var FORMS_UI = __RENDERER__;
+  var formsCache = null, showing = null, open = {}, scheduled = {}, teasers = {};
   function loadForms(cb) {
     if (formsCache) return cb(formsCache);
     fetch(BASE + "/client/forms?k=" + encodeURIComponent(KEY), { credentials: "omit" })
@@ -856,101 +859,69 @@
       .catch(function () { if (TEST) test.warn("network", "This page couldn't reach " + BASE + ". A Content-Security-Policy, firewall or ad blocker may be blocking it."); });
   }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
-  function el(tag, attrs, html) { var x = document.createElement(tag); for (var k in attrs) x.setAttribute(k, attrs[k]); if (html != null) x.innerHTML = html; return x; }
   function days(n) { return n * 86400000; }
   function closedKey(f) { return "pl_form_closed_" + f.id; }
   function doneKey(f) { return "pl_form_done_" + f.id; }
+  // The teaser after the visitor closed the form, and when they hid it with its own ×.
+  function teaserKey(f) { return "pl_form_teaser_" + f.id; }
+  function teaserHiddenKey(f) { return "pl_form_teaser_hidden_" + f.id; }
+  function targeting(f) { return (f.config && f.config.targeting) || {}; }
+  function freqDays(f) { var t = targeting(f); return t.frequency_days == null ? 7 : Number(t.frequency_days) || 0; }
+  function floating(f) { return f.kind === "popup" || f.kind === "flyout"; }
 
-  // A/B test: each visitor keeps one version (a = the form itself) and sees its text and image.
+  // Pages seen in this visit (single-page app route changes count too), and when this browser first ran the script.
+  var PAGE_VIEWS = "pl_page_views", FIRST_SEEN = "pl_first_seen";
+  function countPageView() { store.set(PAGE_VIEWS, (Number(store.get(PAGE_VIEWS, true)) || 0) + 1, true); }
+  function pageViews() { return Number(store.get(PAGE_VIEWS, true)) || 1; }
+  function firstSeen() { var t = Number(store.get(FIRST_SEEN)); if (!t) { t = now(); store.set(FIRST_SEEN, t); } return t; }
+
+  // A/B test: each visitor keeps one version (a = the form itself) and sees its content.
+  var VERSION_KEYS = ["headline", "body", "button_text", "image_url", "image_alt", "no_thanks_text", "success_message", "success_body", "discount_code"];
   function withVersion(f) {
     var base = f.config || {}, vs = base.variants || [];
-    if (!vs.length) return f;
+    if (!vs.length) return { id: f.id, kind: f.kind, config: base, version: null };
     var ids = ["a"].concat(vs.map(function (x) { return x.id; })), key = "pl_form_var_" + f.id, v = store.get(key);
     if (ids.indexOf(v) < 0) { v = ids[Math.floor(Math.random() * ids.length)]; store.set(key, v); }
     var c = {};
     for (var k in base) c[k] = base[k];
     vs.forEach(function (x) {
-      if (x.id === v) ["headline", "body", "button_text", "image_url"].forEach(function (k) { if (x[k] && String(x[k]).trim()) c[k] = x[k]; });
+      if (x.id === v) VERSION_KEYS.forEach(function (k) { if (x[k] != null && String(x[k]).trim()) c[k] = x[k]; });
     });
     return { id: f.id, kind: f.kind, config: c, version: v };
   }
 
-  function fieldsHtml(f) {
-    var c = f.config || {}, collect = c.collect || ["email"], h = "";
-    var input = "width:100%;box-sizing:border-box;padding:12px 14px;border:1px solid #d1d5db;border-radius:8px;font:inherit;font-size:16px;margin:0 0 10px;color:#111827;background:#fff";
-    if (collect.indexOf("first_name") >= 0) h += '<input type="text" name="first_name" placeholder="First name" autocomplete="given-name" style="' + input + '">';
-    if (collect.indexOf("email") >= 0) h += '<input type="email" name="email" placeholder="Email address" autocomplete="email" required style="' + input + '">';
-    if (collect.indexOf("phone_number") >= 0) {
-      var consent = c.sms_consent_text || "By checking this box, you agree to receive recurring automated marketing text messages at this number. Consent is not a condition of purchase. Msg & data rates may apply. Reply STOP to opt out, HELP for help.";
-      h += '<input type="tel" name="phone_number" placeholder="Mobile number" autocomplete="tel" style="' + input + '">' +
-        '<label style="display:flex;gap:8px;align-items:flex-start;margin:0 0 12px;font-size:12px;line-height:1.4;color:#6b7280;text-align:left"><input type="checkbox" name="sms_consent" value="1" style="margin-top:2px;flex:none"><span>' + esc(consent) + "</span></label>";
-    }
-    return h;
-  }
-
-  function render(f) {
-    var c = f.config || {}, color = /^#[0-9a-fA-F]{3,8}$/.test(c.brand_color || "") ? c.brand_color : "#1f6f5c";
-    var embed = f.kind === "embed";
-    var box = el("div", {
-      role: embed ? "region" : "dialog", "aria-modal": embed ? "false" : "true", "aria-label": c.headline || "Sign up", "data-pl-own": "1",
-      style: "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#fff;color:#111827;border-radius:14px;padding:28px;box-sizing:border-box;text-align:center;line-height:1.5;" +
-        (embed ? "max-width:480px;margin:0 auto;border:1px solid #e5e7eb;" : "position:relative;width:min(420px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.28);")
-    },
-      (c.image_url ? '<img src="' + esc(c.image_url) + '" alt="" style="width:100%;border-radius:10px;margin:0 0 16px;display:block">' : "") +
-      '<h2 style="margin:0 0 8px;font-size:24px;line-height:1.2;font-weight:700;color:#111827">' + esc(c.headline) + "</h2>" +
-      '<p style="margin:0 0 18px;color:#4b5563;font-size:15px">' + esc(c.body) + "</p>" +
-      '<form novalidate>' + fieldsHtml(f) +
-      '<button type="submit" style="width:100%;padding:13px;border:0;border-radius:8px;background:' + color + ';color:#fff;font:inherit;font-size:16px;font-weight:600;cursor:pointer">' + esc(c.button_text || "Sign up") + "</button>" +
-      '<p data-pl-err style="color:#b91c1c;font-size:13px;margin:8px 0 0;min-height:1em"></p></form>');
-    var wrap = box, onKey;
-    function close(remember) {
-      if (remember) store.set(closedKey(f), Date.now());
-      if (onKey) document.removeEventListener("keydown", onKey);
-      if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
-      showing = false;
-    }
-    if (!embed) {
-      var x = el("button", { type: "button", "aria-label": "Close", style: "position:absolute;top:8px;right:10px;border:0;background:none;font-size:26px;line-height:1;cursor:pointer;color:#9ca3af;padding:6px" }, "&times;");
-      x.onclick = function () { close(true); };
-      box.appendChild(x);
-      wrap = el("div", {
-        "data-pl-own": "1",
-        style: f.kind === "flyout"
-          ? "position:fixed;right:16px;bottom:16px;z-index:2147483000;max-width:calc(100vw - 32px)"
-          : "position:fixed;inset:0;background:rgba(17,24,39,.55);display:flex;align-items:center;justify-content:center;z-index:2147483000;padding:16px;box-sizing:border-box"
-      });
-      wrap.appendChild(box);
-      if (f.kind === "popup") wrap.addEventListener("click", function (e) { if (e.target === wrap) close(true); });
-      onKey = function (e) { if (e.key === "Escape") close(true); };
-      document.addEventListener("keydown", onKey);
-    }
-    box.querySelector("form").addEventListener("submit", function (e) {
-      e.preventDefault();
-      var form = e.target, d = { form_id: f.id, variant: f.version || null }, err = form.querySelector("[data-pl-err]"), btn = form.querySelector("button[type=submit]");
-      ["email", "phone_number", "first_name"].forEach(function (n) { var i = form.querySelector("[name=" + n + "]"); if (i && i.value) d[n] = i.value.trim(); });
-      var cb = form.querySelector("[name=sms_consent]"); d.sms_consent = !!(cb && cb.checked);
-      try { d.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { /* old browsers */ }
-      if (form.querySelector("[name=email]") && !d.email) { err.textContent = "Enter your email address."; return; }
-      if (d.phone_number && !d.sms_consent) { err.textContent = "Check the box to agree to texts, or leave the number blank."; return; }
-      btn.disabled = true; btn.style.opacity = ".7"; err.textContent = "";
-      if (TEST) {
-        // Test mode: show the thank-you without subscribing anyone or changing who this browser is.
-        test.check("identify", { email: d.email || null, how: "signup_form", summary: "Sign-up form works (" + (d.email || d.phone_number) + " was not subscribed in test mode)" });
-        form.outerHTML = '<p style="font-size:18px;font-weight:600;margin:8px 0 0;color:#111827">' + esc(c.success_message || "Thanks for signing up!") + " (test)</p>";
-        if (!embed) setTimeout(function () { close(false); }, 3000);
-        return;
-      }
-      post("/client/subscribe", d).then(function (r) { return r.json(); }).then(function (j) {
-        btn.disabled = false; btn.style.opacity = "";
-        if (j.error) { err.textContent = j.error.message; return; }
-        store.set(doneKey(f), Date.now());
-        var who = {}; if (d.email) who.email = d.email; if (d.phone_number) who.phone_number = d.phone_number; if (d.first_name) who.first_name = d.first_name;
+  function mountForm(f, container) {
+    var opts = {
+      test: !!TEST,
+      submit: function (d) {
+        if (TEST) {
+          // Test mode: show the thank-you without subscribing anyone or changing who this browser is.
+          if (d.step !== "phone") test.check("identify", { email: d.email || null, how: "signup_form", summary: "Sign-up form works (" + (d.email || d.phone_number) + " was not subscribed in test mode)" });
+          return Promise.resolve({ ok: true });
+        }
+        return post("/client/subscribe", d).then(function (r) { return r.json(); });
+      },
+      onSuccess: function (d) {
+        if (TEST) return;
+        store.set(doneKey(f), now());
+        store.del(teaserKey(f));
+        hideTeaser(f);
+        var who = {};
+        each(["email", "phone_number", "first_name", "last_name"], function (k) { if (d[k]) who[k] = d[k]; });
         api.identify(who, "signup_form");
-        form.outerHTML = '<p style="font-size:18px;font-weight:600;margin:8px 0 0;color:#111827">' + esc(j.message || c.success_message || "Thanks for signing up!") + "</p>";
-        if (!embed) setTimeout(function () { close(false); }, 3000);
-      }).catch(function () { btn.disabled = false; btn.style.opacity = ""; err.textContent = "Something went wrong. Please try again."; });
-    });
-    return { wrap: wrap, close: close };
+      },
+      onClose: function (reason) {
+        delete open[f.id];
+        if (showing === f.id) showing = null;
+        if (reason === "dismiss") {
+          store.set(closedKey(f), now());
+          if (teaserOf(f) && !store.get(doneKey(f))) store.set(teaserKey(f), now());
+        }
+        syncTeaser(f);
+      }
+    };
+    if (container) opts.container = container;
+    return FORMS_UI.mount(f, opts);
   }
 
   // Test-mode views aren't counted, so testing doesn't skew A/B results.
@@ -958,22 +929,24 @@
 
   function renderEmbeds(f) {
     var slots = document.querySelectorAll('[data-dumbmail-form="' + f.id + '"], [data-postlark-form="' + f.id + '"]');
-    if (!slots.length && ONLY_FORM && ME) slots = [ME.parentNode];
-    for (var i = 0; i < slots.length; i++) { if (slots[i].getAttribute("data-pl-rendered")) continue; slots[i].setAttribute("data-pl-rendered", "1"); slots[i].appendChild(render(f).wrap); view(f); }
+    if (!slots.length && ONLY_FORM && ME && ME.parentNode) slots = [ME.parentNode];
+    for (var i = 0; i < slots.length; i++) { if (slots[i].getAttribute("data-pl-rendered")) continue; slots[i].setAttribute("data-pl-rendered", "1"); mountForm(f, slots[i]); view(f); }
   }
+  // force: open now whatever the targeting says (teaser, data-dumbmail-open, showForm, test panel), unless it's already open.
   function show(f, force) {
     if (f.kind === "embed") return renderEmbeds(f);
+    if (!floating(f) || open[f.id] || !document.body) return;
     if (showing && !force) return;
-    showing = true;
-    document.body.appendChild(render(f).wrap);
+    hideTeaser(f);
+    showing = f.id;
+    open[f.id] = mountForm(f);
     view(f);
   }
 
-  function eligible(f) {
-    var t = (f.config && f.config.targeting) || {};
+  // Targeting that depends on the page and the visitor, not on whether they've seen the form.
+  function pageOk(f) {
+    var t = targeting(f);
     if (store.get(doneKey(f))) return false;
-    var closed = store.get(closedKey(f)), freq = t.frequency_days == null ? 7 : Number(t.frequency_days);
-    if (closed && Date.now() - closed < days(freq)) return false;
     if (t.hide_for_subscribers !== false && identified()) return false;
     var mobile = window.matchMedia && window.matchMedia("(max-width: 768px)").matches;
     if (t.devices === "mobile" && !mobile) return false;
@@ -982,14 +955,30 @@
     var inc = (t.url_contains || []).filter(Boolean), exc = (t.url_excludes || []).filter(Boolean);
     if (inc.length && !inc.some(function (s) { return href.indexOf(String(s).toLowerCase()) >= 0; })) return false;
     if (exc.some(function (s) { return href.indexOf(String(s).toLowerCase()) >= 0; })) return false;
+    var start = t.start_at && Date.parse(t.start_at), end = t.end_at && Date.parse(t.end_at);
+    if ((start && now() < start) || (end && now() > end)) return false;
+    return true;
+  }
+  function eligible(f) {
+    var t = targeting(f);
+    if (!pageOk(f)) return false;
+    var closed = store.get(closedKey(f));
+    if (closed && now() - closed < days(freqDays(f))) return false;
+    if (pageViews() < (Number(t.page_views) || 1)) return false;
+    if (t.visitors === "new" || t.visitors === "returning") {
+      var returning = now() - firstSeen() > 30 * 60000;
+      if (returning !== (t.visitors === "returning")) return false;
+    }
     return true;
   }
 
   function schedule(f) {
-    if (scheduled[f.id] || !eligible(f)) return;
+    var t = targeting(f);
+    if (t.trigger === "manual" || scheduled[f.id] || !eligible(f)) return;
     scheduled[f.id] = true;
-    var t = (f.config && f.config.targeting) || {}, fired = false;
-    function fire() { if (!fired) { fired = true; show(f); } }
+    var fired = false;
+    // Single-page apps may have moved to a page the form doesn't target by the time it fires; try again on a later page.
+    function fire() { if (fired) return; fired = true; if (eligible(f)) show(f); else scheduled[f.id] = false; }
     if (t.trigger === "scroll") {
       var pct = Number(t.scroll_percent || 40);
       var onScroll = function () {
@@ -1002,17 +991,50 @@
       if (mobile) { setTimeout(fire, 15000); return; } // no mouse on phones: fall back to a delay
       document.addEventListener("mouseout", function onOut(e) { if (!e.relatedTarget && e.clientY <= 0) { document.removeEventListener("mouseout", onOut); fire(); } });
     } else {
-      setTimeout(fire, Math.max(0, Number((f.config && f.config.delay_seconds) || 5)) * 1000);
+      var c = f.config || {}, delay = c.delay_seconds == null || c.delay_seconds === "" ? 5 : Number(c.delay_seconds);
+      setTimeout(fire, (isFinite(delay) && delay >= 0 ? delay : 5) * 1000);
     }
+  }
+
+  // Teaser tab: "always" shows it on eligible pages until the form opens; after the visitor closes the form
+  // without signing up it stays on every page until they sign up or hide it with its ×.
+  function teaserOf(f) { var t = f.config && f.config.teaser; return floating(f) && t && typeof t === "object" && t.enabled === true ? t : null; }
+  function teaserWanted(f) {
+    var t = teaserOf(f);
+    if (!t || ONLY_FORM || open[f.id] || store.get(doneKey(f))) return false;
+    var hidden = store.get(teaserHiddenKey(f));
+    if (hidden && now() - hidden < days(freqDays(f))) return false;
+    if (store.get(teaserKey(f))) return pageOk(f);
+    return t.show === "always" && eligible(f);
+  }
+  function hideTeaser(f) { if (teasers[f.id]) { teasers[f.id].destroy(); delete teasers[f.id]; } }
+  function syncTeaser(f) {
+    var want = teaserWanted(f);
+    if (want && !teasers[f.id] && document.body) {
+      teasers[f.id] = FORMS_UI.teaser(f, {
+        onOpen: function () { show(f, true); },
+        onDismiss: function () { store.set(teaserHiddenKey(f), now()); store.del(teaserKey(f)); hideTeaser(f); }
+      });
+    } else if (!want) hideTeaser(f);
   }
 
   function runForms(forms) {
     forms.forEach(function (f) {
       if (ONLY_FORM && f.id !== ONLY_FORM) return;
       if (f.kind === "embed") show(f);
-      else if (ONLY_FORM && f.kind === "page") return;
-      else if (f.kind !== "page") schedule(f);
+      else if (floating(f)) { schedule(f); syncTeaser(f); }
     });
+  }
+  // Any element with data-dumbmail-open="FORM_ID" opens that popup or flyout, including ones added later.
+  function hookOpeners() {
+    document.addEventListener("click", function (e) {
+      var t = e.target, el = t && t.closest ? t.closest("[data-dumbmail-open]") : null;
+      if (!el || inOwnUi(el)) return;
+      var id = el.getAttribute("data-dumbmail-open");
+      if (!id) return;
+      e.preventDefault();
+      loadForms(function (forms) { forms.forEach(function (f) { if (f.id === id && floating(f)) show(f, true); }); });
+    }, true);
   }
   // Embed slots that appear later (single-page apps, lazy sections) get their form too.
   function watchEmbeds() {
@@ -1030,8 +1052,11 @@
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();
       hookRoutes();
+      hookOpeners();
+      countPageView();
       if (AUTO) { hookLayer(); scanProduct(); scanCheckout(); }
     }
+    firstSeen();
     loadForms(function (forms) {
       if (TEST) {
         var live = forms.filter(function (f) { return f.kind !== "page"; });

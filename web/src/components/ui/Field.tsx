@@ -129,17 +129,85 @@ export function Segmented<T extends string>({ value, onChange, options, size = "
   );
 }
 
-export function ColorInput({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+type ColorInputProps = {
+  value: string;
+  onChange: (value: string) => void;
+  /** The color used while `value` is empty, shown in the swatch and as the text placeholder. */
+  placeholder?: string;
+  "aria-label"?: string;
+};
+
+const hex6 = /^#[0-9a-f]{6}$/i;
+
+export function ColorInput({ value, onChange, placeholder, "aria-label": ariaLabel }: ColorInputProps) {
+  const swatch = hex6.test(value) ? value : placeholder && hex6.test(placeholder) ? placeholder : "#115f42";
   return (
     <div className="flex items-center gap-2">
       <input
         type="color"
-        value={/^#[0-9a-f]{6}$/i.test(value) ? value : "#115f42"}
+        value={swatch}
         onChange={(e) => onChange(e.target.value)}
-        className="h-8.5 w-10 cursor-pointer rounded-md border border-zinc-300 bg-white p-1"
-        aria-label="Pick color"
+        className="h-8.5 w-10 shrink-0 cursor-pointer rounded-md border border-zinc-300 bg-white p-1"
+        aria-label={ariaLabel ? `${ariaLabel}: pick color` : "Pick color"}
       />
-      <Input value={value} onChange={(e) => onChange(e.target.value)} className="font-mono w-28" />
+      <Input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} className="font-mono w-28" aria-label={ariaLabel} />
+    </div>
+  );
+}
+
+type RangeInputProps = {
+  value: number | undefined;
+  /** Shown (and used by the slider) while `value` is unset. */
+  placeholder: number;
+  min: number;
+  max: number;
+  step?: number;
+  unit?: string;
+  onChange: (value: number) => void;
+  "aria-label"?: string;
+};
+
+/** A slider with a number box beside it. The number box clamps on blur so typing "1" on the way to "16" isn't fought. */
+export function RangeInput({ value, placeholder, min, max, step = 1, unit, onChange, "aria-label": ariaLabel }: RangeInputProps) {
+  const fieldId = useContext(FieldIdContext);
+  const [text, setText] = useState<string | null>(null);
+  const shown = value ?? placeholder;
+  const clamp = (n: number) => Math.min(max, Math.max(min, Math.round(n / step) * step));
+  return (
+    <div className="flex items-center gap-3">
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={shown}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="h-1.5 min-w-0 flex-1 cursor-pointer accent-accent-700"
+        aria-label={ariaLabel}
+      />
+      <div className="flex shrink-0 items-center gap-1">
+        <input
+          id={fieldId}
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={text ?? (value === undefined ? "" : String(value))}
+          placeholder={String(placeholder)}
+          onChange={(e) => {
+            setText(e.target.value);
+            const n = Number(e.target.value);
+            if (e.target.value !== "" && Number.isFinite(n) && n >= min && n <= max) onChange(n);
+          }}
+          onBlur={() => {
+            if (text !== null && text !== "" && Number.isFinite(Number(text))) onChange(clamp(Number(text)));
+            setText(null);
+          }}
+          className={cx(control, "h-8 w-16 px-2 text-right tabular-nums")}
+          aria-label={ariaLabel}
+        />
+        {unit ? <span className="w-5 text-xs text-zinc-500">{unit}</span> : null}
+      </div>
     </div>
   );
 }

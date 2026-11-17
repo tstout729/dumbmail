@@ -13,6 +13,7 @@ pub mod deliverability;
 pub mod domains;
 pub mod error;
 pub mod flows;
+pub mod forms;
 pub mod jobs;
 pub mod mcp;
 pub mod models;
@@ -45,7 +46,7 @@ fn stays_on_old_host(path: &str) -> bool {
     if path.starts_with("/api/auth/google") {
         return false;
     }
-    ["/api/", "/webhooks/", "/mcp", "/healthz", "/t/", "/o/", "/u/", "/c/", "/f/", "/client/", "/onsite.js", "/google"].iter().any(|p| path.starts_with(p))
+    ["/api/", "/webhooks/", "/mcp", "/healthz", "/t/", "/o/", "/u/", "/c/", "/f/", "/i/", "/client/", "/onsite.js", "/google"].iter().any(|p| path.starts_with(p))
 }
 
 /// Visits to a retired hostname (REDIRECT_HOSTS) move permanently to PUBLIC_URL.
@@ -75,7 +76,7 @@ async fn link_domain_guard(
     use axum::response::IntoResponse;
     let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
     let path = req.uri().path().to_string();
-    let public_ok = ["/t/", "/u/", "/c/", "/f/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
+    let public_ok = ["/t/", "/u/", "/c/", "/f/", "/i/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
     if public_ok || host.is_empty() {
         return next.run(req).await;
     }

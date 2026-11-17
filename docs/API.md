@@ -140,11 +140,12 @@ type Template = { id: string; name: string; channel: "email" | "sms"; content: E
 type Form = {
   id: string; name: string; status: "draft" | "live"; kind: "popup" | "embed" | "flyout" | "page";
   list_id: string | null;
-  config: { headline: string; body: string; button_text: string; success_message: string;
-            collect: ("email" | "phone_number" | "first_name")[]; sms_consent_text?: string;
-            delay_seconds?: number; brand_color?: string; image_url?: string };
+  config: FormConfig;  // every key is documented in docs/FORMS.md
   created_at: string; updated_at: string; stats: { views: number; submits: number };
+  variant_stats: { id: "a" | "b" | "c" | "d"; views: number; submits: number; submit_rate: number }[];  // [] unless A/B testing
+  preview_url: string;  // hosted page that shows drafts too and counts and saves nothing
 };
+type Image = { id: string; url: string; content_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp"; size: number; created_at: string };
 type MetricSummary = { id: string; name: string; count_30d: number; last_seen: string | null };
 type EventRow = { id: string; metric: string; profile_id: string; properties: Record<string, unknown>; value: number | null; occurred_at: string };
 ```
@@ -224,8 +225,13 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | GET | `/api/flows/blueprints` | – | `{data: {key, name, description, channel_mix, trigger, definition}[]}` |
 | POST | `/api/flows/from-blueprint` | `{key, name?}` | `Flow` |
 | GET | `/api/forms` | – | `{data: Form[], total}` |
-| POST | `/api/forms` | `{name, kind, list_id, config}` | `Form` |
-| GET/PATCH/DELETE | `/api/forms/:id` | partial | `Form` |
+| POST | `/api/forms` | `{name, kind, list_id, config, status?}` | `Form` (draft unless `status: "live"`) |
+| GET/PATCH/DELETE | `/api/forms/:id` | partial | `Form`. PATCH merges `config` one level deep: sent keys replace, others are kept, `null` resets a key |
+| POST | `/api/images` | the raw file with its image `Content-Type`, or JSON `{url}` or `{data_base64}` | `Image`. PNG, JPEG, GIF or WebP (checked from the bytes, not the claimed type; no SVG), up to 5 MB, 500 per account (409 past that). The same file again returns the existing image |
+| GET | `/api/images` | – | `{data: Image[], total}` (newest 200) |
+| DELETE | `/api/images/:id` | – | `{ok}` |
+
+Form `config` (content, fields, phone step, style, teaser, targeting and schedule, A/B versions) is documented key by key in [FORMS.md](FORMS.md). Unknown keys and out-of-range values are rejected with a 400 that names the key and what it accepts.
 
 ## Analytics
 
@@ -238,9 +244,11 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 ## Public endpoints (no auth)
 
 - `POST /client/events?k=<public_key>` – browser tracking (`{metric, profile, properties}`), CORS open.
-- `POST /client/subscribe?k=<public_key>` – form submit (`{form_id, email?, phone_number?, first_name?, sms_consent?, timezone?}`; `timezone` is the browser's IANA zone and fills the profile's `timezone` and `country` properties when they're missing). Returns `{ok, message}`, plus `confirm: true` when the form's list is double opt-in and a confirmation email went out (the message then asks them to check their inbox; set `config.confirm_message` on the form to change it).
+- `POST /client/subscribe?k=<public_key>` – form submit, JSON or form-encoded: `{form_id, variant?, email?, phone_number?, first_name?, last_name?, sms_consent?, timezone?, fields?: {birthday?, <custom key>…}, step?: "phone", phone_token?}`. `timezone` is the browser's IANA zone and fills the profile's `timezone` and `country` properties when they're missing (the form renderer sends it). Answers are checked against the form's `fields` (see [FORMS.md](FORMS.md)): required fields, choices and types are enforced with a 400 naming the field, and answers the form doesn't ask for are ignored. Birthday and custom answers become profile properties; like names, they only fill blanks. Returns `{ok, message}`, plus `discount_code` when the form (or the visitor's A/B version) has one (public form configs leave the code out, so it's only handed over after a sign-up), `phone_token` when the form has a phone step and this sign-up created the profile, and `confirm: true` when the form's list is double opt-in and a confirmation email went out (the message then asks them to check their inbox; set `config.confirm_message` on the form to change it). `step: "phone"` (only when `config.phone_step.enabled`) needs `phone_number` and `sms_consent: true`, adds them to the person who signed up on the first screen when `phone_token` from that response is sent (good for an hour, and only if they have no number yet and nobody else has this one; otherwise the number is saved on its own profile, since an email address alone proves nothing), and doesn't count as a sign-up (no submit count, list join or event).
 - `GET|POST /c/:token` – double opt-in confirmation. GET shows a "Yes, subscribe me" button; only the POST confirms, so link scanners can't. Links work for 7 days.
-- `GET /f/:form_id` hosted sign-up page, `GET /f/:form_id/embed.js` embed script.
+- `GET /f/:form_id` hosted sign-up page (drawn by the shared form renderer, with a plain HTML copy for browsers without JavaScript). Outside the form's `targeting.start_at`/`end_at` it says the form isn't open. `?preview=<token>` (from the form's `preview_url`) also shows drafts and ignores the schedule, counts no views and saves nothing; add `&v=b` to preview an A/B version. `GET /f/:form_id/embed.js` embed script.
+- `GET /client/form-render.js` – the shared form renderer as `window.DumbMailFormRenderer` (CORS open, cached 5 minutes).
+- `GET /i/:image_id` – an uploaded image, cached for a year (`immutable`), with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'`.
 - `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click). For email, when the account has lists with `show_on_preferences`, GET shows a preference page instead: a checkbox per list, "Save preferences" (`action=save` with a `list` field per checked list; leaving a list records "Unsubscribed from List") and "Unsubscribe from all emails". Any POST without `action=save`, including one-click, unsubscribes from all email.
 - `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
@@ -498,16 +506,4 @@ Shopping event properties: `Viewed Product` has the item fields; `Added to Cart`
 | POST | `/api/website/tests` | `{url?}` (defaults to the account website) | `SiteTest` |
 | GET | `/api/website/tests/{code}` | – | `SiteTest`: `{code, url, open_url, checks, created_at, expires_at, active, last_seen_at, last_url}` |
 
-Forms gain `config.targeting`; every field is optional:
-
-```ts
-type Targeting = {
-  trigger: "delay" | "scroll" | "exit_intent";   // default "delay" (uses config.delay_seconds)
-  scroll_percent?: number;                       // for "scroll", default 40
-  devices?: "all" | "desktop" | "mobile";         // default "all"
-  url_contains?: string[];                       // show only on pages whose URL contains one of these
-  url_excludes?: string[];                       // never show on these
-  frequency_days?: number;                       // after someone closes it, wait this long (default 7)
-  hide_for_subscribers?: boolean;                // default true: skip people already identified on this browser
-};
-```
+Forms have `config.targeting` (trigger, scroll depth, devices, page URLs, page views, new or returning visitors, frequency, hiding for known subscribers, and a `start_at`/`end_at` schedule); see the Targeting section of [FORMS.md](FORMS.md). `GET /client/forms` leaves out forms outside their schedule.

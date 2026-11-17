@@ -1,13 +1,12 @@
 import { Plus, Trophy } from "lucide-react";
 import type { ReactNode } from "react";
-import type { Form, FormConfig, FormVariant, FormVariantField, VersionId } from "../../api";
+import type { Form, FormConfig, FormVariant, VersionId } from "../../api";
 import { Badge, Button, Card, Segmented, Table, Td, Th, cx } from "../../components/ui";
 import { formatNumber, formatPercent } from "../../lib/format";
+import { variantFields } from "./formConfig";
 
 export type VariantId = FormVariant["id"];
 
-/** Fields a version can change. Everything else in the config is shared by all versions. */
-export const variantFields: FormVariantField[] = ["headline", "body", "button_text", "image_url"];
 const variantIds: VariantId[] = ["b", "c", "d"];
 
 export const versionLabel = (id: VersionId) => `Version ${id.toUpperCase()}`;
@@ -32,8 +31,28 @@ export function versionConfig(config: FormConfig, version: VersionId): FormConfi
 
 /** A new version starts as a copy of A's content. */
 export function newVariant(config: FormConfig, id: VariantId): FormVariant {
-  return { id, headline: config.headline, body: config.body, button_text: config.button_text, image_url: config.image_url };
+  const out: FormVariant = { id };
+  for (const k of variantFields) {
+    const val = config[k];
+    if (val && val.trim()) out[k] = val;
+  }
+  return out;
 }
+
+/** The base config with `version`'s content copied in and the test ended: "use this version". */
+export function adoptVersion(config: FormConfig, version: VersionId): FormConfig {
+  const v = versionConfig(config, version);
+  const out: FormConfig = { ...config, variants: [] };
+  for (const k of variantFields) out[k] = v[k];
+  return out;
+}
+
+/** True when `version` shows the same content in both configs. */
+export const sameVersionContent = (a: FormConfig, b: FormConfig, version: VersionId) => {
+  const x = versionConfig(a, version);
+  const y = versionConfig(b, version);
+  return variantFields.every((k) => (x[k] ?? "") === (y[k] ?? ""));
+};
 
 /** The variant id the next added version gets, or null at the limit (D). */
 export function nextVariantId(config: FormConfig): VariantId | null {
@@ -70,7 +89,7 @@ export function AbTestCard({ config, savedConfig, onStart, onAdd, onEnd }: AbTes
   if (!versions.length) {
     return (
       <Card title="A/B test">
-        <p className="text-sm text-zinc-600">Try different headlines, text, button labels or images and see which gets more sign-ups.</p>
+        <p className="text-sm text-zinc-600">Try different headlines, text, images, offers or thank-you messages and see which gets more sign-ups.</p>
         {savedTesting ? (
           // Starting again before the end is saved would carry the old test's counts into the new one.
           <p className="mt-2 text-xs text-amber-700">The test ends when you save. Then you can start a new one.</p>
@@ -98,8 +117,8 @@ export function AbTestCard({ config, savedConfig, onStart, onAdd, onEnd }: AbTes
     >
       <div className="space-y-3 text-sm text-zinc-600">
         <p>
-          Each visitor gets one version at random and keeps seeing it. Versions differ only in headline, body, button text and image. Fields, colors, targeting
-          and the success message are shared.
+          Each visitor gets one version at random and keeps seeing it. Versions can change the headline, body, button, image, &ldquo;No thanks&rdquo; link,
+          thank-you message and discount code. Fields, style, targeting and everything else are shared.
         </p>
         {!savedTesting ? <p className="text-xs text-amber-700">Save to start the test.</p> : null}
         {next ? (

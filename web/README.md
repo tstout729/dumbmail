@@ -10,7 +10,7 @@ pnpm install
 pnpm dev          # http://<host>:7312, listens on all interfaces
 ```
 
-Run the backend on `127.0.0.1:7311`. The dev server forwards `/api`, `/client`, `/t`, `/u`, `/f`, `/mcp`, `/webhooks`, `/onsite.js` and `/healthz` to it. The proxy rules match whole path segments, so `/f/...` is forwarded but client routes like `/flows` and `/forms` are not.
+Run the backend on `127.0.0.1:7311`. The dev server forwards `/api`, `/client`, `/t`, `/u`, `/f`, `/i`, `/mcp`, `/webhooks`, `/onsite.js` and `/healthz` to it. The proxy rules match whole path segments, so `/f/...` is forwarded but client routes like `/flows` and `/forms` are not.
 
 ## Check and build
 

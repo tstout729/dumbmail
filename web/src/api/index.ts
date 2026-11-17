@@ -14,3 +14,4 @@ export * from "./templates";
 export * from "./campaigns";
 export * from "./flows";
 export * from "./forms";
+export * from "./images";

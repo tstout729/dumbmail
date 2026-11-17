@@ -2,6 +2,7 @@ pub mod account;
 pub mod analytics;
 pub mod audience;
 pub mod google;
+pub mod images;
 pub mod messaging;
 
 use axum::extract::{FromRequest, Request};
@@ -52,4 +53,5 @@ pub fn router() -> Router<AppState> {
         .merge(audience::routes())
         .merge(messaging::routes())
         .merge(analytics::routes())
+        .merge(images::routes())
 }

@@ -122,6 +122,18 @@ impl Harness {
         (status, h, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// A request with a binary body, sent with this harness's session cookie.
+    async fn bytes(&self, method: &str, path: &str, content_type: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut b = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, content_type);
+        if let Some(c) = &self.cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        let res = self.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+        let status = res.status();
+        let h = res.headers().clone();
+        (status, h, res.into_body().collect().await.unwrap().to_bytes().to_vec())
+    }
+
     async fn drain(&self) {
         jobs::drain(&self.state).await.unwrap();
     }
@@ -1324,7 +1336,7 @@ async fn form_ab_test() {
     assert_eq!(listed["data"][0]["variant_stats"], f["variant_stats"]);
 
     // Edits that leave a version's content alone keep its counts; changing what it shows starts it over.
-    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"success_message": "Welcome!"}}))).await;
+    let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"legal_text": "No spam."}}))).await;
     assert_eq!(f["variant_stats"][1]["submits"], if shown == "b" { 2 } else { 1 });
     assert_eq!(f["variant_stats"][0]["views"], if shown == "a" { 2 } else { 1 });
     let f = h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"headline": "New A"}}))).await;
@@ -2568,5 +2580,514 @@ async fn nested_segments_cannot_blow_up() {
     let (s, v) = h.req("POST", "/api/segments", Some(json!({"name": "Top", "definition": many(&mid["id"])}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(v.to_string().contains("too many times"), "{v}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn form_config_validation_and_merge() {
+    let mut h = harness!();
+    h.signup().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Signups"}))).await;
+    let create = |config: Value| json!({"name": "Form", "kind": "popup", "list_id": list["id"], "config": config});
+
+    // Every key in docs/FORMS.md, plus the keys forms already stored before.
+    let style = json!({"layout": "image_left", "width": 640, "align": "left", "font": "DM Sans", "headline_size": 30, "headline_weight": 800, "body_size": 16,
+            "background_color": "#fff", "headline_color": "#111827", "text_color": "#4b5563", "button_color": "#000000", "button_text_color": "#ffffff",
+            "button_full_width": false, "input_background": "#ffffff", "input_border_color": "#d1d5db", "input_text_color": "#111827", "corner_radius": 20,
+            "button_radius": 40, "input_radius": 4, "padding": 32, "border_width": 1, "border_color": "#e5e7eb", "shadow": "soft", "overlay_color": "#000000",
+            "overlay_opacity": 60, "close_on_overlay": false, "close_color": "#9ca3af", "position": "top", "animation": "zoom", "page_background": "#f0fdf4",
+            "custom_css": ".dm-headline { letter-spacing: -0.02em; }"});
+    let full = json!({
+        "headline": "Hi", "body": "Line one\nLine two", "button_text": "Join", "image_url": "https://cdn.test/a.png", "image_alt": "A scarf",
+        "no_thanks_text": "No thanks", "success_message": "Done", "success_body": "Welcome aboard", "discount_code": "WELCOME10",
+        "legal_text": "See our [privacy policy](https://acme.test/privacy).", "success_button_text": "Shop", "success_button_url": "https://acme.test/shop",
+        "redirect_url": "https://acme.test/thanks", "auto_close_seconds": 0, "confirm_message": "Check your inbox", "sms_consent_text": "Texts ok",
+        "brand_color": "#1f6f5c", "delay_seconds": 12, "collect": ["email"],
+        "fields": [
+            {"key": "first_name", "label": "First name"},
+            {"key": "email", "required": true},
+            {"key": "skin_type", "type": "select", "label": "Skin type", "options": ["Dry", "Oily"]},
+            {"key": "interests", "type": "checkboxes", "options": ["Skincare", "Makeup"]}
+        ],
+        "phone_step": {"enabled": true, "headline": "Texts too?", "body": "Early access", "button_text": "Text me", "skip_text": "No thanks"},
+        "style": style,
+        "teaser": {"enabled": true, "text": "10% off", "position": "left", "show": "always"},
+        "targeting": {"trigger": "scroll", "scroll_percent": 50, "devices": "desktop", "url_contains": ["/shop"], "url_excludes": ["/checkout"], "page_views": 2,
+            "visitors": "new", "frequency_days": 14, "hide_for_subscribers": false, "start_at": "2026-01-01T00:00:00-08:00", "end_at": "2099-01-01T00:00:00Z"},
+        "variants": [{"id": "b", "headline": "Hey", "image_alt": "Alt B", "no_thanks_text": "Later", "success_body": "B body", "discount_code": "B10"}]
+    });
+    let form = h.ok("POST", "/api/forms", Some(create(full.clone()))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    assert_eq!(form["config"]["collect"], json!(["first_name", "email"]), "collect follows fields");
+    assert_eq!(form["config"]["style"], full["style"]);
+    assert!(form["preview_url"].as_str().unwrap().starts_with(&format!("https://pl.test/f/{fid}?preview=")), "{form}");
+    // A form saved the old way still validates.
+    h.ok("POST", "/api/forms", Some(create(json!({"collect": ["email", "phone_number", "first_name"], "delay_seconds": 5, "sms_consent_text": "x", "confirm_message": "y",
+        "targeting": {"trigger": "exit_intent", "devices": "all", "url_contains": [""], "frequency_days": 7, "hide_for_subscribers": true}, "variants": null})))).await;
+
+    for (bad, says) in [
+        (json!({"headlin": "x"}), "did you mean \"headline\""),
+        (json!({"colour": "x"}), "Allowed keys"),
+        (json!({"style": {"button_color": "red"}}), "config.style.button_color must be a hex color"),
+        (json!({"style": {"width": 2000}}), "280 to 900"),
+        (json!({"style": {"font": "Comic Sans"}}), "config.style.font must be one of"),
+        (json!({"style": {"shade": "x"}}), "config.style has no key \"shade\""),
+        (json!({"style": {"custom_css": "a".repeat(10_001)}}), "at most 10000"),
+        (json!({"brand_color": "#12"}), "hex color"),
+        (json!({"image_url": "javascript:alert(1)"}), "http(s) URL"),
+        (json!({"headline": "x".repeat(201)}), "at most 200"),
+        (json!({"auto_close_seconds": 61}), "0 to 60"),
+        (json!({"targeting": {"start_at": "next tuesday"}}), "ISO 8601"),
+        (json!({"targeting": {"delay_seconds": 3}}), "top-level"),
+        (json!({"teaser": {"position": "middle"}}), "config.teaser.position"),
+        (json!({"phone_step": {"enabled": "yes"}}), "true or false"),
+        (json!({"fields": [{"key": "email"}, {"key": "skin", "type": "dropdown"}]}), "config.fields[1].type must be one of"),
+        (json!({"fields": [{"key": "email"}, {"key": "skin", "type": "select"}]}), "options is required"),
+        (json!({"fields": [{"key": "email"}, {"key": "skin", "options": ["a"]}]}), "only applies to select"),
+        (json!({"fields": [{"key": "first_name"}]}), "email or phone_number"),
+        (json!({"fields": [{"key": "email"}, {"key": "email"}]}), "twice"),
+        (json!({"fields": [{"key": "email"}, {"key": "email_consent"}]}), "reserved"),
+        (json!({"fields": [{"key": "email", "type": "text"}]}), "custom fields"),
+        (json!({"fields": (0..13).map(|i| json!({"key": if i == 0 { "email".to_string() } else { format!("q{i}") }})).collect::<Vec<_>>()}), "at most 12"),
+        (json!({"variants": [{"id": "b", "legal_text": "x"}]}), "form variants can change only"),
+        (json!({"variants": [{"id": "b", "discount_code": "x".repeat(61)}]}), "config.variants[0].discount_code"),
+        (json!({"collect": ["email", "birthday"]}), "config.collect"),
+        (json!("headline"), "config must be an object"),
+    ] {
+        let (s, v) = h.req("POST", "/api/forms", Some(create(bad.clone()))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains(says), "{bad}: {msg}");
+    }
+
+    // Updates merge one level deep: sent keys replace, others stay, null resets to the default.
+    let path = format!("/api/forms/{fid}");
+    let f = h.ok("PATCH", &path, Some(json!({"config": {"style": {"width": 500}, "headline": null, "discount_code": null}}))).await;
+    assert_eq!(f["config"]["style"], json!({"width": 500}), "objects are replaced whole");
+    assert!(f["config"].get("headline").is_none() && f["config"].get("discount_code").is_none());
+    assert_eq!(f["config"]["teaser"], full["teaser"], "keys not sent are kept");
+    let f = h.ok("PATCH", &path, Some(json!({"config": {"fields": [{"key": "phone_number", "required": true}, {"key": "last_name"}]}}))).await;
+    assert_eq!(f["config"]["collect"], json!(["phone_number"]));
+    let f = h.ok("PATCH", &path, Some(json!({"config": {"fields": null, "style": {"align": null, "width": 300}}}))).await;
+    assert!(f["config"].get("fields").is_none());
+    assert_eq!(f["config"]["collect"], json!(["phone_number"]), "collect keeps the last synced fields");
+    assert_eq!(f["config"]["style"], json!({"width": 300}), "nulls inside an object are dropped");
+    let (s, v) = h.req("PATCH", &path, Some(json!({"config": {"style": {"width": 100}}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(h.ok("GET", &path, None).await["config"]["style"], json!({"width": 300}), "a rejected update changes nothing");
+    h.cleanup().await;
+}
+
+async fn live_form(h: &mut Harness, config: Value) -> (String, String, String) {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Signups"}))).await;
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let f = h.ok("POST", "/api/forms", Some(json!({"name": "Form", "kind": "embed", "list_id": list_id, "config": config, "status": "live"}))).await;
+    assert_eq!(f["status"], "live");
+    let pk: String = sqlx::query_scalar("SELECT public_key FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    (f["id"].as_str().unwrap().to_string(), list_id, pk)
+}
+
+#[tokio::test]
+async fn discount_code_only_after_sign_up() {
+    let mut h = harness!();
+    h.signup().await;
+    let (fid, _, pk) = live_form(&mut h, json!({"discount_code": "SECRET10", "variants": [{"id": "b", "discount_code": "BSECRET"}]})).await;
+    let (_, _, feed) = h.raw("GET", &format!("/client/forms?k={pk}"), &[], "").await;
+    assert!(!feed.contains("SECRET"), "the live feed leaks the code: {feed}");
+    let (_, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert!(!html.contains("SECRET"), "the hosted page leaks the code");
+    let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
+    let preview = f["preview_url"].as_str().unwrap().trim_start_matches("https://pl.test").to_string();
+    let (_, _, html) = h.raw("GET", &preview, &[], "").await;
+    assert!(html.contains("SECRET10"), "a preview shows the code for checking");
+    let sub = |email: &str, variant: &str| json!({"form_id": fid, "email": email, "variant": variant}).to_string();
+    for (email, variant, code) in [("da@x.test", "a", "SECRET10"), ("db@x.test", "b", "BSECRET"), ("dz@x.test", "z", "SECRET10")] {
+        let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &sub(email, variant)).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["discount_code"], code, "version {variant}");
+    }
+    let (_, _, page) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/x-www-form-urlencoded")], &format!("form_id={fid}&email=dn%40x.test")).await;
+    assert!(page.contains("SECRET10"), "the no-JavaScript thank-you page shows the code");
+}
+
+#[tokio::test]
+async fn form_custom_fields_and_phone_step() {
+    let mut h = harness!();
+    h.signup().await;
+    let (fid, list_id, pk) = live_form(&mut h, json!({"fields": [
+        {"key": "email"},
+        {"key": "first_name"},
+        {"key": "last_name"},
+        {"key": "birthday"},
+        {"key": "skin_type", "type": "select", "label": "Skin type", "required": true, "options": ["Dry ", "Oily"]},
+        {"key": "interests", "type": "checkboxes", "options": ["Skincare", "Makeup", "Hair"]},
+        {"key": "age", "type": "number"},
+        {"key": "agree", "type": "checkbox", "label": "I agree", "required": true},
+        {"key": "note", "type": "text"}
+    ]})).await;
+    let url = format!("/client/subscribe?k={pk}");
+    let post = |h: &Harness, body: Value| {
+        let url = url.clone();
+        let router = h.router.clone();
+        async move {
+            let req = Request::builder().method("POST").uri(&url).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+            let res = router.oneshot(req).await.unwrap();
+            let s = res.status();
+            let v: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap_or(Value::Null);
+            (s, v)
+        }
+    };
+    let base = |extra: Value| {
+        let mut b = json!({"form_id": fid, "email": "skin@x.test", "fields": {"skin_type": "Dry", "agree": true}});
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "fields" {
+                for (fk, fv) in v.as_object().unwrap() {
+                    b["fields"][fk] = fv.clone();
+                }
+            } else {
+                b[k] = v.clone();
+            }
+        }
+        b
+    };
+    for (body, says) in [
+        (json!({"form_id": fid, "fields": {"skin_type": "Dry", "agree": true}}), "enter your email"),
+        (base(json!({"fields": {"skin_type": null}})), "choose an answer for \"Skin type\""),
+        (base(json!({"fields": {"skin_type": "Normal"}})), "Skin type must be one of: Dry, Oily"),
+        (base(json!({"fields": {"agree": false}})), "tick \"I agree\""),
+        (base(json!({"fields": {"interests": ["Skincare", "Nails"]}})), "\"Nails\" isn't a choice"),
+        (base(json!({"fields": {"birthday": "21/04/1990"}})), "Birthday must be a date"),
+        (base(json!({"fields": {"age": "old"}})), "Age must be a number"),
+        (base(json!({"fields": {"note": "x".repeat(501)}})), "too long"),
+        (base(json!({"email": "not-an-email"})), "valid email"),
+    ] {
+        let (s, v) = post(&h, body.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains(says), "{body}: {v}");
+    }
+    let (s, v) = post(&h, base(json!({"first_name": "Sky", "last_name": "Lee", "fields": {"birthday": "1990-04-21", "interests": ["Makeup", "Skincare", "Makeup"], "age": "31", "note": " hi ", "hacker": "ignored", "email_consent": "x"}}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let p = h.ok("GET", "/api/profiles?q=skin", None).await["data"][0].clone();
+    assert_eq!((p["first_name"].as_str(), p["last_name"].as_str()), (Some("Sky"), Some("Lee")));
+    let props = &p["properties"];
+    assert_eq!(props["birthday"], "1990-04-21");
+    assert_eq!(props["skin_type"], "Dry");
+    assert_eq!(props["interests"], json!(["Skincare", "Makeup"]), "saved once each, in the form's order");
+    assert_eq!(props["age"], 31);
+    assert_eq!(props["agree"], true);
+    assert_eq!(props["note"], "hi");
+    assert!(props.get("hacker").is_none() && props.get("email_consent").is_none(), "{props}");
+    // Sign-ups only fill blanks.
+    let (s, _) = post(&h, base(json!({"first_name": "Mallory", "fields": {"skin_type": "Oily", "note": "changed"}}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let p = h.ok("GET", "/api/profiles?q=skin", None).await["data"][0].clone();
+    assert_eq!(p["first_name"], "Sky");
+    assert_eq!(p["properties"]["skin_type"], "Dry");
+    assert_eq!(p["properties"]["note"], "hi");
+    // The no-JavaScript form posts the same answers; repeated checkboxes become a list.
+    let (s, _, body) = h.raw("POST", &url, &[("content-type", "application/x-www-form-urlencoded")],
+        &format!("form_id={fid}&email=plain%40x.test&skin_type=Oily&agree=1&interests=Hair&interests=Skincare&birthday=2001-02-03")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!body.contains("Something's off"), "{body}");
+    let p = h.ok("GET", "/api/profiles?q=plain", None).await["data"][0].clone();
+    assert_eq!(p["properties"]["interests"], json!(["Skincare", "Hair"]));
+    assert_eq!(p["properties"]["agree"], true);
+    assert_eq!(p["properties"]["birthday"], "2001-02-03");
+
+    // Phone step: only when the form turns it on.
+    let phone = |email: &str, consent: bool| json!({"form_id": fid, "step": "phone", "email": email, "phone_number": "(503) 555-0142", "sms_consent": consent});
+    let (s, v) = post(&h, phone("skin@x.test", true)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("phone step"));
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"phone_step": {"enabled": true}}}))).await;
+    let events = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Subscribed to List'").fetch_one(&db).await.unwrap() }
+    };
+    let (s, v) = post(&h, phone("skin@x.test", false)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("agree to texts"));
+    let (s, v) = post(&h, json!({"form_id": fid, "step": "phone", "phone_number": "12", "sms_consent": true})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = post(&h, json!({"form_id": fid, "step": "other"})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    // An email alone can't attach a number: someone could type a stranger's address. It stands alone.
+    let (s, v) = post(&h, phone("skin@x.test", true)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let p = h.ok("GET", "/api/profiles?q=skin", None).await["data"][0].clone();
+    assert!(p["phone_number"].is_null(), "no token: the email's profile is untouched");
+    let alone: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE phone_number = '+15035550142' AND email IS NULL AND sms_consent = 'subscribed'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(alone, 1);
+    // The first screen's token ties the number to the person who just signed up.
+    let (s, first) = post(&h, json!({"form_id": fid, "email": "tok@x.test", "fields": {"skin_type": "Dry", "agree": true}})).await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    let token = first["phone_token"].as_str().expect("phone_token when the phone step is on").to_string();
+    // Someone typing an existing person's email gets no token for that person's profile.
+    let (s, again) = post(&h, json!({"form_id": fid, "email": "skin@x.test", "fields": {"skin_type": "Dry", "agree": true}})).await;
+    assert_eq!(s, StatusCode::OK, "{again}");
+    assert!(again.get("phone_token").is_none(), "no token for a profile this sign-up didn't create: {again}");
+    let before = h.ok("GET", &format!("/api/forms/{fid}"), None).await["stats"].clone();
+    let events_before = events(&h).await;
+    let members = h.ok("GET", &format!("/api/lists/{list_id}"), None).await["member_count"].clone();
+    for bad in ["nope".to_string(), format!("{token}x"), token.replace("pstep:", "pstap:")] {
+        let (s, _) = post(&h, json!({"form_id": fid, "step": "phone", "phone_token": bad, "phone_number": "+15035550150", "sms_consent": true})).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let p = h.ok("GET", "/api/profiles?q=tok", None).await["data"][0].clone();
+    assert!(p["phone_number"].is_null(), "bad tokens attach nothing");
+    let (s, v) = post(&h, json!({"form_id": fid, "step": "phone", "phone_token": token, "phone_number": "(503) 555-0144", "sms_consent": true})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let p = h.ok("GET", "/api/profiles?q=tok", None).await["data"][0].clone();
+    assert_eq!(p["phone_number"], "+15035550144", "linked to the person who signed up");
+    assert_eq!(p["sms_consent"], "subscribed");
+    assert_eq!(h.ok("GET", &format!("/api/forms/{fid}"), None).await["stats"], before, "the phone step isn't a second sign-up");
+    assert_eq!(events(&h).await, events_before);
+    assert_eq!(h.ok("GET", &format!("/api/lists/{list_id}"), None).await["member_count"], members);
+    // The same token with a different number for someone who now has one stands alone instead.
+    let (s, _) = post(&h, json!({"form_id": fid, "step": "phone", "phone_token": token, "phone_number": "+15035550143", "sms_consent": true})).await;
+    assert_eq!(s, StatusCode::OK);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE phone_number = '+15035550143' AND email IS NULL AND sms_consent = 'subscribed'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn form_schedule_preview_and_hosted_page() {
+    let mut h = harness!();
+    h.signup().await;
+    let soon = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let (fid, _, pk) = live_form(&mut h, json!({"headline": "Big </script><script>alert(1)</script> sale", "targeting": {"start_at": soon}})).await;
+    let in_feed = |h: &Harness| {
+        let (router, pk, fid) = (h.router.clone(), pk.clone(), fid.clone());
+        async move {
+            let res = router.oneshot(Request::builder().uri(format!("/client/forms?k={pk}")).body(Body::empty()).unwrap()).await.unwrap();
+            let v: Value = serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+            v["data"].as_array().unwrap().iter().any(|f| f["id"] == fid.as_str())
+        }
+    };
+    assert!(!in_feed(&h).await, "not open yet");
+    let (s, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(html.contains("isn't open right now"), "{html}");
+    // Sign-ups follow the schedule too: refused before the start, and after the end once two hours' grace pass.
+    let sign = |h: &Harness, email: &'static str| {
+        let (router, pk, fid) = (h.router.clone(), pk.clone(), fid.clone());
+        async move {
+            let req = Request::builder().method("POST").uri(format!("/client/subscribe?k={pk}")).header("content-type", "application/json")
+                .body(Body::from(json!({"form_id": fid, "email": email}).to_string())).unwrap();
+            router.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(sign(&h, "early@x.test").await, StatusCode::CONFLICT);
+    let ended = |hours: i64| json!({"config": {"targeting": {"end_at": (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()}}});
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(ended(1))).await;
+    assert_eq!(sign(&h, "grace@x.test").await, StatusCode::OK, "within the grace after the end");
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(ended(3))).await;
+    assert_eq!(sign(&h, "late@x.test").await, StatusCode::CONFLICT);
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"targeting": {"start_at": soon}}}))).await;
+    let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
+    let preview = f["preview_url"].as_str().unwrap().trim_start_matches("https://pl.test").to_string();
+    let (s, _, html) = h.raw("GET", &preview, &[], "").await;
+    assert_eq!(s, StatusCode::OK, "a preview ignores the schedule");
+    assert!(html.contains(r#"<div id="dm-form"></div>"#) && html.contains("\"submit\":null"), "{html}");
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"targeting": {"start_at": past}}}))).await;
+    assert!(in_feed(&h).await);
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"targeting": {"end_at": past}}}))).await;
+    assert!(!in_feed(&h).await, "closed");
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"targeting": null}}))).await;
+
+    // The hosted page mounts the shared renderer, keeps a no-JavaScript copy and counts the view.
+    let (s, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    for needle in [
+        r#"<div id="dm-form"></div>"#,
+        "<noscript>",
+        r#"<script src="https://pl.test/client/form-render.js"></script>"#,
+        "DumbMailFormRenderer",
+        "R.mount(d.form, opts)",
+        &format!("\"submit\":\"https://pl.test/client/subscribe?k={pk}\""),
+        &format!(r#"action="https://pl.test/client/subscribe?k={pk}""#),
+        r#"<input type="email" name="email""#,
+        "<title>Acme Goods</title>",
+        "\"kind\":\"page\"",
+    ] {
+        assert!(html.contains(needle), "{needle} missing: {html}");
+    }
+    assert!(!html.contains("</script><script>alert(1)"), "form text can't break out of the data script");
+    assert!(html.contains(r"</script>"));
+    assert_eq!(h.ok("GET", &format!("/api/forms/{fid}"), None).await["stats"]["views"], 1);
+
+    // Drafts: only the preview link shows them, and it counts nothing.
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "draft"}))).await;
+    let (s, _, _) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = h.raw("GET", &format!("/f/{fid}?preview=fpreview:{}.AAAAAAAAAAAAAAAA", fid.replace('-', "")), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a made-up token is no token");
+    let other = h.ok("POST", "/api/forms", Some(json!({"name": "Other"}))).await;
+    let other_preview = other["preview_url"].as_str().unwrap();
+    let token = other_preview.split("preview=").nth(1).unwrap();
+    let (s, _, _) = h.raw("GET", &format!("/f/{fid}?preview={token}"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "another form's token doesn't work");
+    let (s, _, html) = h.raw("GET", &preview, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(html.contains("\"submit\":null") && html.contains("aren't saved") && html.contains("noindex"), "{html}");
+    assert!(!html.contains("action="), "the preview's plain form doesn't post anywhere");
+    assert_eq!(h.ok("GET", &format!("/api/forms/{fid}"), None).await["stats"]["views"], 1, "previews aren't views");
+
+    // The renderer, on its own and inside the website script.
+    let renderer = include_str!("../src/form_render.js").trim();
+    let renderer = renderer.strip_suffix(';').unwrap_or(renderer).trim_end();
+    let (s, hd, js) = h.raw("GET", "/client/form-render.js", &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(hd["content-type"].to_str().unwrap().starts_with("application/javascript"));
+    assert_eq!(hd["access-control-allow-origin"], "*");
+    assert_eq!(hd["cache-control"], "public, max-age=300");
+    assert_eq!(js, format!("window.DumbMailFormRenderer = {renderer};\n"));
+    for k in [pk.as_str(), "__RENDERER__"] {
+        let (_, _, js) = h.raw("GET", &format!("/onsite.js?k={k}"), &[], "").await;
+        assert!(js.contains(&format!("KEY = \"{k}\"")), "{k}");
+        if include_str!("../src/onsite.js").contains("__RENDERER__") {
+            assert!(js.contains(&format!("var FORMS_UI = {renderer};")), "renderer inlined");
+            assert_eq!(js.matches("__RENDERER__").count(), usize::from(k == "__RENDERER__"), "only the JSON-quoted key can say __RENDERER__");
+        }
+    }
+    h.cleanup().await;
+}
+
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+    0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[tokio::test]
+async fn images_upload_serve_and_limits() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let owner = h.cookie.clone();
+    let (s, _, body) = h.bytes("POST", "/api/images", "image/jpeg", PNG.to_vec()).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let img: Value = serde_json::from_slice(&body).unwrap();
+    let id = img["id"].as_str().unwrap().to_string();
+    assert_eq!(img["content_type"], "image/png", "the claimed type is ignored");
+    assert_eq!(img["size"], PNG.len());
+    assert_eq!(img["url"], format!("https://pl.test/i/{id}"));
+    let (_, _, again) = h.bytes("POST", "/api/images", "image/png", PNG.to_vec()).await;
+    assert_eq!(serde_json::from_slice::<Value>(&again).unwrap()["id"], id.as_str(), "the same file is stored once");
+
+    let (s, _, body) = h.bytes("POST", "/api/images", "image/png", b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>".to_vec()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("isn't a PNG, JPEG, GIF or WebP"));
+    let (s, _, _) = h.bytes("POST", "/api/images", "text/plain", PNG.to_vec()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _, body) = h.bytes("POST", "/api/images", "image/png", [PNG, &vec![0u8; 5 * 1024 * 1024]].concat()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("at most 5 MB"));
+    let (s, v) = h.req("POST", "/api/images", Some(json!({"url": "ftp://x.test/a.png"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let (s, v) = h.req("POST", "/api/images", Some(json!({"data_base64": "!!!"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let gif = h.ok("POST", "/api/images", Some(json!({"data_base64": "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="}))).await;
+    assert_eq!(gif["content_type"], "image/gif");
+    let listed = h.ok("GET", "/api/images", None).await;
+    assert_eq!(listed["total"], 2);
+    assert_eq!(listed["data"][0]["id"], gif["id"], "newest first");
+
+    // Served publicly, as an image only.
+    let (s, hd, bytes) = h.bytes("GET", &format!("/i/{id}"), "text/plain", vec![]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(bytes, PNG);
+    assert_eq!(hd["content-type"], "image/png");
+    assert_eq!(hd["cache-control"], "public, max-age=31536000, immutable");
+    assert_eq!(hd["x-content-type-options"], "nosniff");
+    assert_eq!(hd["content-security-policy"], "default-src 'none'");
+    let (s, _, _) = h.raw("GET", "/i/nope", &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = h.raw("GET", &format!("/i/{}", uuid::Uuid::new_v4()), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // 500 per account; an image it already has still comes back.
+    let account: uuid::Uuid = me["account"]["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("INSERT INTO images (id, account_id, content_type, size, sha256, bytes) SELECT gen_random_uuid(), $1, 'image/png', 1, md5(i::text), '\\x00'::bytea FROM generate_series(1, 498) i")
+        .bind(account)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let (s, _, body) = h.bytes("POST", "/api/images", "image/png", [PNG, b"x"].concat()).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("500 images"), "{}", String::from_utf8_lossy(&body));
+    let (s, _, _) = h.bytes("POST", "/api/images", "image/png", PNG.to_vec()).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Another account can't see or delete them, and keeps its own copy of the same file.
+    h.cookie = None;
+    h.ok("POST", "/api/auth/signup", Some(json!({"email": "other@b.test", "password": "correct horse", "company": "Other Co"}))).await;
+    assert_eq!(h.ok("GET", "/api/images", None).await["total"], 0);
+    let (s, _) = h.req("DELETE", &format!("/api/images/{id}"), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (_, _, mine) = h.bytes("POST", "/api/images", "image/png", PNG.to_vec()).await;
+    assert_ne!(serde_json::from_slice::<Value>(&mine).unwrap()["id"], id.as_str());
+    h.cookie = owner;
+    h.ok("DELETE", &format!("/api/images/{id}"), None).await;
+    let (s, _, _) = h.raw("GET", &format!("/i/{id}"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn forms_and_images_over_mcp() {
+    let mut h = harness!();
+    h.signup().await;
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "Claude"}))).await["key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "VIP"}))).await;
+    let router = h.router.clone();
+    let mut n = 0;
+    let mut rpc = move |method: &str, params: Value| {
+        n += 1;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"jsonrpc": "2.0", "id": n, "method": method, "params": params}).to_string()))
+            .unwrap();
+        let router = router.clone();
+        async move { serde_json::from_slice::<Value>(&router.oneshot(req).await.unwrap().into_body().collect().await.unwrap().to_bytes()).unwrap() }
+    };
+    let tools = rpc("tools/list", json!({})).await;
+    let tools = tools["result"]["tools"].as_array().unwrap().clone();
+    for name in ["get_form", "upload_image", "list_images", "create_form", "update_form"] {
+        assert!(tools.iter().any(|t| t["name"] == name), "{name}");
+    }
+    let create = tools.iter().find(|t| t["name"] == "create_form").unwrap();
+    assert_eq!(create["inputSchema"]["properties"]["config"]["properties"]["style"]["properties"]["shadow"]["enum"][0], "none");
+    let res = rpc("resources/read", json!({"uri": "dumbmail://docs/forms"})).await;
+    assert!(res["result"]["contents"][0]["text"].as_str().unwrap().contains("## Phone step"));
+
+    let up = rpc("tools/call", json!({"name": "upload_image", "arguments": {"data_base64": "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="}})).await;
+    let img = up["result"]["structuredContent"].clone();
+    assert_eq!(img["content_type"], "image/gif", "{up}");
+    let made = rpc("tools/call", json!({"name": "create_form", "arguments": {"list_id": list["id"], "kind": "page", "config": {"image_url": img["url"], "style": {"layout": "background"}}}})).await;
+    let made = &made["result"]["structuredContent"];
+    assert_eq!(made["status"], "draft", "{made}");
+    let fid = made["form"]["id"].as_str().unwrap().to_string();
+    let bad = rpc("tools/call", json!({"name": "update_form", "arguments": {"id": fid, "config": {"style": {"layout": "sideways"}}}})).await;
+    assert_eq!(bad["result"]["isError"], true);
+    assert!(bad["result"]["content"][0]["text"].as_str().unwrap().contains("config.style.layout must be one of"), "{bad}");
+    let up = rpc("tools/call", json!({"name": "update_form", "arguments": {"id": fid, "status": "live", "config": {"variants": [{"id": "b", "headline": "B"}]}}})).await;
+    assert_eq!(up["result"]["structuredContent"]["form"]["status"], "live", "{up}");
+    let got = rpc("tools/call", json!({"name": "get_form", "arguments": {"id": fid}})).await;
+    let got = &got["result"]["structuredContent"];
+    assert_eq!(got["form"]["config"]["image_url"], img["url"]);
+    assert_eq!(got["form"]["variant_stats"].as_array().unwrap().len(), 2);
+    assert!(got["preview_url"].as_str().unwrap().contains("?preview="), "{got}");
+    assert_eq!(got["hosted_url"], format!("https://pl.test/f/{fid}"));
+    let listed = rpc("tools/call", json!({"name": "list_images", "arguments": {}})).await;
+    assert_eq!(listed["result"]["structuredContent"]["total"], 1);
+    let del = rpc("tools/call", json!({"name": "delete", "arguments": {"type": "image", "id": img["id"]}})).await;
+    assert_eq!(del["result"]["structuredContent"]["deleted"], true, "{del}");
+    let listed = rpc("tools/call", json!({"name": "list_images", "arguments": {}})).await;
+    assert_eq!(listed["result"]["structuredContent"]["total"], 0);
     h.cleanup().await;
 }
