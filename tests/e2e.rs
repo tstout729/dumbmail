@@ -1947,11 +1947,11 @@ async fn monthly_email_plans() {
     assert!(b["plan_payments"][0]["description"].as_str().unwrap().contains("added as credit"));
 
     // An old attempt that settles after the customer bought a new plan can't touch the new one:
-    // a decline is ignored, and a payment becomes credit.
+    // one that never charged is closed without charging, and one that did becomes credit.
     mock.lock().unwrap().mode = "ok".into();
     plan_paid(&h, &acct, "cs_new1", 0, 1, 1000).await;
-    for (mode, outcome) in [("decline", 0.0), ("ok", 20.0)] {
-        mock.lock().unwrap().mode = "error".into();
+    for (in_flight, mode, outcome) in [("error", "decline", 0.0), ("lost", "ok", 20.0)] {
+        mock.lock().unwrap().mode = in_flight.into();
         past_due(&h).await;
         renew(&h).await; // in flight, outcome unknown
         let session = format!("cs_after_{mode}");
@@ -1970,6 +1970,21 @@ async fn monthly_email_plans() {
     }
     let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM plan_renewals WHERE status = 'pending'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(pending, 0);
+
+    // A pending attempt that never reached Stripe isn't sent after the customer cancels.
+    mock.lock().unwrap().mode = "error".into();
+    past_due(&h).await;
+    renew(&h).await;
+    h.ok("POST", "/api/billing/plan/cancel", None).await;
+    mock.lock().unwrap().mode = "ok".into();
+    let before = charges(&mock);
+    age(&h).await;
+    renew(&h).await;
+    renew(&h).await;
+    assert_eq!(charges(&mock), before, "cancelled before anything was charged");
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!((b["plan"]["status"].as_str(), b["plan"]["ended_reason"].as_str()), (Some("none"), Some("cancelled")));
+    plan_paid(&h, &acct, "cs_after_cancel", 0, 2, 2000).await;
 
     // Cancel at the end of the month: no charge, the plan just ends. Keeping it undoes that.
     mock.lock().unwrap().mode = "ok".into();

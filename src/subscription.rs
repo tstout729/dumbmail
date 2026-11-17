@@ -492,6 +492,23 @@ async fn resolve(state: &AppState, id: Uuid) -> anyhow::Result<()> {
         Ok(Some(pi)) => return settle(state, &r, &pi).await,
         Ok(None) => {}
     }
+    // Nothing has been charged for this attempt. If the plan was cancelled or changed since it was
+    // recorded, close it without charging (a payment that turns up later still becomes credit).
+    let still_due: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1 AND email_plan_tier IS NOT NULL AND email_plan_period_end = $2
+                        AND NOT email_plan_cancel_at_period_end)",
+    )
+    .bind(r.account_id)
+    .bind(r.period_end)
+    .fetch_one(&state.db)
+    .await?;
+    if !still_due {
+        sqlx::query("UPDATE plan_renewals SET status = 'declined', failure = 'not sent: plan cancelled or changed', resolved_at = now() WHERE id = $1 AND status = 'pending'")
+            .bind(r.id)
+            .execute(&state.db)
+            .await?;
+        return Ok(());
+    }
     // Stripe keeps a key's first answer, including a 500, for about a day. If an earlier send left
     // nothing behind (no payment exists for this attempt), a fresh key lets the retry go through.
     let key = if Utc::now() - r.created_at > chrono::Duration::minutes(10) {
@@ -527,15 +544,31 @@ async fn resolve(state: &AppState, id: Uuid) -> anyhow::Result<()> {
     }
 }
 
-/// The PaymentIntent Stripe has for this attempt, if any (matched by its renewal id).
+/// The PaymentIntent Stripe has for this attempt, if any (matched by its renewal id). Reads every
+/// page of the customer's PaymentIntents since the attempt began; "none" is only returned once the
+/// whole list has been read, since it allows a fresh idempotency key.
 async fn find_intent(state: &AppState, r: &Renewal, customer: &str) -> Result<Option<Value>, String> {
     let since = (r.created_at - chrono::Duration::minutes(5)).timestamp();
-    let v = billing::stripe_get(state, &format!("payment_intents?customer={customer}&created[gte]={since}&limit=100"))
-        .await
-        .map_err(|e| e.public_message())?;
-    let Some(list) = v["data"].as_array() else { return Err(format!("unexpected answer: {}", v["error"]["message"].as_str().unwrap_or("no data"))) };
     let id = r.id.to_string();
-    Ok(list.iter().find(|pi| pi["metadata"]["renewal_id"].as_str() == Some(id.as_str())).cloned())
+    let mut after: Option<String> = None;
+    for _ in 0..50 {
+        let page = after.as_deref().map(|a| format!("&starting_after={a}")).unwrap_or_default();
+        let v = billing::stripe_get(state, &format!("payment_intents?customer={customer}&created[gte]={since}&limit=100{page}"))
+            .await
+            .map_err(|e| e.public_message())?;
+        let Some(list) = v["data"].as_array() else { return Err(format!("unexpected answer: {}", v["error"]["message"].as_str().unwrap_or("no data"))) };
+        if let Some(pi) = list.iter().find(|pi| pi["metadata"]["renewal_id"].as_str() == Some(id.as_str())) {
+            return Ok(Some(pi.clone()));
+        }
+        if v["has_more"] != true {
+            return Ok(None);
+        }
+        after = list.last().and_then(|pi| pi["id"].as_str()).map(String::from);
+        if after.is_none() {
+            return Err("Stripe said there were more payments but sent none".into());
+        }
+    }
+    Err("too many payments to check".into())
 }
 
 async fn settle(state: &AppState, r: &Renewal, pi: &Value) -> anyhow::Result<()> {
