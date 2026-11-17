@@ -123,7 +123,7 @@ export function ProductsPage() {
                 <Td>
                   <div className="flex min-w-0 items-center gap-3">
                     <ProductThumb src={p.image_url} alt="" />
-                    <div className="min-w-0">
+                    <div className="min-w-0 max-w-[9rem] sm:max-w-xs lg:max-w-md">
                       <div className="truncate font-medium text-zinc-900">{p.title}</div>
                       <div className="truncate text-xs text-zinc-500">
                         {p.external_id}

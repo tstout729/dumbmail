@@ -29,6 +29,9 @@ const BATCH: i64 = 200;
 const MAX_WAITING_PER_PERSON: i64 = 25;
 /// Back-in-stock requests one visitor (IP address) can make per hour.
 const MAX_PER_VISITOR_HOUR: u32 = 30;
+/// New back-in-stock requests an account takes per hour, whatever addresses they come from. High
+/// enough that a real store never meets it; it only stops a flood.
+const MAX_NEW_PER_ACCOUNT_HOUR: i64 = 5000;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Settings {
@@ -456,6 +459,13 @@ pub async fn subscribe(db: &PgPool, account_id: Uuid, email: &str, product_id: O
     if in_stock {
         return Err(AppError::Conflict("Good news: it's in stock now.".into()));
     }
+    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND created_at > now() - interval '1 hour'")
+        .bind(account_id)
+        .fetch_one(db)
+        .await?;
+    if recent >= MAX_NEW_PER_ACCOUNT_HOUR {
+        return Err(AppError::Conflict("We're getting a lot of requests right now. Please try again later.".into()));
+    }
     let input = ProfileInput { email: Some(email), ..Default::default() };
     let profile = audience::upsert_profile_public(db, account_id, &input).await?.profile;
     let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE profile_id = $1 AND notified_at IS NULL").bind(profile.id).fetch_one(db).await?;
@@ -501,8 +511,9 @@ fn visitor_allowed(ip: Option<&str>) -> bool {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static SEEN: once_cell::sync::Lazy<Mutex<HashMap<String, (Instant, u32)>>> = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
-    let Some(ip) = ip else { return true };
-    let Ok(mut m) = SEEN.lock() else { return true };
+    // Requests without a usable address share one bucket.
+    let ip = ip.unwrap_or("unknown");
+    let Ok(mut m) = SEEN.lock() else { return false };
     let hour = Duration::from_secs(3600);
     if m.len() > 50_000 {
         m.retain(|_, (at, _)| at.elapsed() < hour);

@@ -161,6 +161,17 @@ async fn products_alerts_and_account_isolation() {
     other.ok("POST", "/api/catalog/products", Some(json!({"external_id": "MUG", "title": "Their mug", "price": 1}))).await;
     assert_eq!(h.ok("GET", "/api/catalog/products/MUG", None).await["title"], "Mug", "same id in another account is a different product");
 
+    // One visitor can only ask so many times an hour.
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "GONE", "title": "Gone", "inventory": 0}))).await;
+    let mut codes = Vec::new();
+    for i in 0..31 {
+        let body = json!({"email": format!("flood{i}@x.test"), "product_id": "GONE"}).to_string();
+        let (st, _, _) = h.raw("POST", &format!("/client/back-in-stock?k={pk}"), &[("content-type", "application/json"), ("x-real-ip", "203.0.113.9")], &body).await;
+        codes.push(st);
+    }
+    assert!(codes[..30].iter().all(|c| *c == StatusCode::OK), "{codes:?}");
+    assert_eq!(codes[30], StatusCode::CONFLICT, "the 31st request from one address is refused");
+
     // CSV import.
     let csv = "id,title,price,variant_id,variant title,inventory,material\nHAT,Wool hat,25,HAT-1,One size,3,wool\nSCARF,Scarf,40,,,,cotton\n";
     let r = h.ok("POST", "/api/catalog/products/import", Some(json!({"csv": csv}))).await;

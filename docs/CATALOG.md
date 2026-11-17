@@ -98,7 +98,7 @@ Bought-together and viewed-together counts are cached per product for six hours.
 4. When a feed, CSV or API update takes the product or variant from out of stock to in stock, DumbMail records a **Back in Stock** event for each person waiting, oldest request first, in batches of 200, up to `back_in_stock_limit` people per restock (empty = everyone). A request for the whole product is answered by any variant coming back. Each request is answered once; people ask again to be told again.
 5. The **Back in stock** starter flow emails them. Normal consent rules apply.
 
-The public endpoints, for custom widgets: `GET /client/products/stock?k=KEY&product_id=...&variant_id=...` and `POST /client/back-in-stock?k=KEY` with `{"email", "product_id", "variant_id"}`. A person can wait on at most 25 products at once.
+The public endpoints, for custom widgets: `GET /client/products/stock?k=KEY&product_id=...&variant_id=...` and `POST /client/back-in-stock?k=KEY` with `{"email", "product_id", "variant_id"}`. A person can wait on at most 25 products at once. Each visitor (IP address) can make 30 requests an hour, and an account takes at most 5,000 new requests an hour.
 
 ## Price drops
 

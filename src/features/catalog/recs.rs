@@ -86,6 +86,10 @@ pub async fn related(db: &PgPool, product_id: Uuid, kind: Related) -> AppResult<
             .await?
         }
     };
+    // Nothing yet isn't worth remembering: the first orders or views should show up right away.
+    if rows.is_empty() {
+        return Ok(rows);
+    }
     sqlx::query(
         "INSERT INTO catalog_rec_cache (product_id, kind, items, computed_at) VALUES ($1, $2, $3, now())
          ON CONFLICT (product_id, kind) DO UPDATE SET items = EXCLUDED.items, computed_at = now()",
