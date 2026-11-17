@@ -156,6 +156,30 @@ pub enum Condition {
         #[serde(default)]
         metric: Option<String>,
     },
+    /// Viewed, carted, checked out or ordered a product: one product (the store's id), or any
+    /// product in a category, with a tag or of a brand (all optional). Counts events, read from the
+    /// product catalog's activity (see `features::catalog`).
+    Product {
+        action: ProductAction,
+        #[serde(default)]
+        product_id: Option<String>,
+        #[serde(default)]
+        category: Option<String>,
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        brand: Option<String>,
+        #[serde(default = "at_least")]
+        op: EventOp,
+        #[serde(default)]
+        count: Option<i64>,
+        #[serde(default)]
+        within_days: Option<i64>,
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default)]
+        until: Option<String>,
+    },
     /// A stable random share of profiles, e.g. a 10% holdout. The same seed always picks the same people.
     Random {
         percent: f64,
@@ -171,6 +195,19 @@ pub enum Condition {
 
 fn yes() -> bool {
     true
+}
+
+fn at_least() -> EventOp {
+    EventOp::AtLeast
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductAction {
+    Viewed,
+    Carted,
+    Checkout,
+    Ordered,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +507,17 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                     return Err(AppError::bad("prediction metric can't be empty (leave it out for Placed Order)"));
                 }
                 check_cmp(*op, value, *measure == Prediction::ChurnRisk)?;
+            }
+            Condition::Product { product_id, category, tag, brand, count, within_days, since, until, .. } => {
+                for v in [product_id, category, tag, brand].into_iter().flatten() {
+                    if v.trim().is_empty() || v.chars().count() > 255 {
+                        return Err(AppError::bad("product, category, tag and brand must be 1 to 255 characters (or left out)"));
+                    }
+                }
+                if count.is_some_and(|c| c < 0) {
+                    return Err(AppError::bad("count must be 0 or more"));
+                }
+                check_window(*within_days, since, until)?;
             }
             Condition::Random { percent, .. } => {
                 if !(percent.is_finite() && *percent > 0.0 && *percent <= 100.0) {
@@ -1095,6 +1143,37 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             };
             push_cmp(qb, expr, *op, value);
         }
+        Condition::Product { action, product_id, category, tag, brand, op, count, within_days, since, until } => {
+            let kind = match action {
+                ProductAction::Viewed => "viewed",
+                ProductAction::Carted => "carted",
+                ProductAction::Checkout => "checkout",
+                ProductAction::Ordered => "ordered",
+            };
+            qb.push("((SELECT count(DISTINCT e.event_id) FROM catalog_interactions e JOIN catalog_products cp ON cp.id = e.product_id WHERE e.profile_id = p.id AND e.kind = ");
+            qb.push_bind(kind);
+            if let Some(id) = product_id {
+                qb.push(" AND cp.external_id = ").push_bind(id.trim().to_string());
+            }
+            if let Some(c) = category {
+                qb.push(" AND cp.categories @> ARRAY[").push_bind(c.trim().to_string()).push("]::text[]");
+            }
+            if let Some(t) = tag {
+                qb.push(" AND cp.tags @> ARRAY[").push_bind(t.trim().to_string()).push("]::text[]");
+            }
+            if let Some(b) = brand {
+                qb.push(" AND lower(cp.brand) = lower(").push_bind(b.trim().to_string()).push(")");
+            }
+            push_window(qb, *within_days, since, until);
+            let n = count.unwrap_or(1);
+            match op {
+                EventOp::AtLeast => qb.push(") >= ").push_bind(n),
+                EventOp::AtMost => qb.push(") <= ").push_bind(n),
+                EventOp::Exactly => qb.push(") = ").push_bind(n),
+                EventOp::Zero => qb.push(") = 0"),
+            };
+            qb.push(")");
+        }
         Condition::Random { percent, seed } => {
             // Stable per profile and seed: hash into 0..9999 and keep the lowest `percent` share.
             qb.push("(((hashtextextended(p.id::text || ").push_bind(seed.clone().unwrap_or_default()).push(", 0) % 10000) + 10000) % 10000 < ");
@@ -1273,6 +1352,27 @@ mod tests {
         }
         assert!(sql.contains("hashtextextended"));
         assert!(sql.contains("segment_members"), "an unresolved segment falls back to its last membership");
+    }
+
+    #[test]
+    fn product_rules_compile_with_bound_values() {
+        let def = parse(&json!({"match": "all", "conditions": [
+            {"type": "product", "action": "ordered", "product_id": "TEE-1", "count": 2, "within_days": 90},
+            {"type": "product", "action": "viewed", "category": "Shirts", "tag": "organic", "brand": "Acme", "since": "2026-10-01"},
+            {"type": "product", "action": "carted", "op": "zero"}
+        ]}))
+        .unwrap();
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT 1 FROM profiles p WHERE ");
+        push_definition(&mut qb, &def);
+        let sql = qb.sql();
+        assert!(sql.contains("FROM catalog_interactions e JOIN catalog_products cp"));
+        assert!(sql.contains("cp.categories @> ARRAY["));
+        for leaked in ["TEE-1", "Shirts", "organic", "Acme", "ordered", "2026-10-01"] {
+            assert!(!sql.contains(leaked), "{leaked} must be bound, not inlined");
+        }
+        assert!(parse(&json!({"conditions": [{"type": "product", "action": "bought"}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "category": " "}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "within_days": 0}]})).is_err());
     }
 
     #[test]
