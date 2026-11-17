@@ -591,10 +591,11 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
                 .bind(cost)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), cost_micros = $3 WHERE id = $1")
+            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), cost_micros = $3, from_domain = $4 WHERE id = $1")
                 .bind(message_id)
                 .bind(&provider_id)
                 .bind(cost)
+                .bind(crate::features::reports::delivery::sender_domain(&email.from_email))
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;

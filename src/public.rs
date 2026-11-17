@@ -155,7 +155,7 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
     Redirect::to(&q.u).into_response()
 }
 
-fn page(title: &str, body: &str, color: &str) -> Html<String> {
+pub(crate) fn page(title: &str, body: &str, color: &str) -> Html<String> {
     let color = crate::render::safe_color(color, "#1f6f5c");
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t}</title>

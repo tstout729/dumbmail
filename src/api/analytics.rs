@@ -30,7 +30,7 @@ async fn window_totals(state: &AppState, account_id: Uuid, from_days: i64, to_da
     let (sent_email, sent_sms, delivered, opens, clicks, email_clicks, unsubs, bounces, complaints): (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','sending','failed','skipped')),
                 count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','sending','failed','skipped')),
-                count(*) FILTER (WHERE channel = 'email' AND status IN ('sent','delivered')),
+                count(*) FILTER (WHERE channel = 'email' AND (status IN ('sent','delivered') OR opened_at IS NOT NULL)),
                 count(opened_at) FILTER (WHERE channel = 'email'),
                 count(clicked_at),
                 count(clicked_at) FILTER (WHERE channel = 'email'),
