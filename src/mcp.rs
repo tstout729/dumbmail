@@ -356,13 +356,13 @@ Read dumbmail://docs/segments for the details and examples.",
         tool("list_campaigns", "List campaigns", "Campaigns with status and performance stats (recipients, open/click rates, revenue).", obj(json!({"status": {"enum": ["draft", "scheduled", "sending", "testing", "sent", "cancelled", "failed"]}, "channel": {"enum": ["email", "sms"]}}), &[]), true, false),
         tool("get_campaign", "Get a campaign", "One campaign with content, audience, stats and readiness problems.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
         tool("create_campaign", "Create a campaign draft", "Create a draft email or SMS campaign. Returns the draft plus estimated recipients and anything still missing before it can send. Nothing is sent.",
-            obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "audience": audience_schema, "content": email_content, "ab_test": ab_test}), &["channel"]), false, false),
-        tool("update_campaign", "Update a campaign draft", "Change a draft or scheduled campaign's name, audience, content or A/B test (content and ab_test replace the whole object; ab_test null removes the test).",
-            obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "audience": audience_schema, "content": email_content, "ab_test": ab_test}), &["id"]), false, false),
+            obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "audience": audience_schema, "content": email_content, "ab_test": ab_test, "send_options": crate::features::sendtime::send_options_schema()}), &["channel"]), false, false),
+        tool("update_campaign", "Update a campaign draft", "Change a draft or scheduled campaign's name, audience, content, A/B test or send options (content, ab_test and send_options replace the whole object; ab_test null removes the test; send_options null sends to everyone at once).",
+            obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "audience": audience_schema, "content": email_content, "ab_test": ab_test, "send_options": crate::features::sendtime::send_options_schema()}), &["id"]), false, false),
         tool("send_test", "Send a test", "Send a test of a campaign to up to 10 email addresses or phone numbers. Tests are marked [Test] and don't count in reports. For an A/B test, version picks which version (a-d, default a).",
             obj(json!({"campaign_id": {"type": "string"}, "to": {"type": "array", "items": {"type": "string"}, "maxItems": 10}, "version": {"enum": ["a", "b", "c", "d"]}}), &["campaign_id", "to"]), false, false),
-        tool("send_campaign", "Send or schedule a campaign", "Send a campaign now or schedule it (send_at in the future). This messages real people and can't be undone once sent. Without confirm=true it returns a dry run with the recipient count and readiness problems. Get the user's explicit approval before confirming.",
-            obj(json!({"campaign_id": {"type": "string"}, "send_at": {"type": "string", "format": "date-time", "description": "Omit to send now"}, "confirm": {"type": "boolean"}}), &["campaign_id"]), false, true),
+        tool("send_campaign", "Send or schedule a campaign", "Send a campaign now or schedule it (send_at in the future). With send_options timing local_time, the day of send_at (in the account's time zone, or today when omitted) is the day it goes out at local_time in each person's zone, starting when the first zone reaches it. send_options given here are saved on the campaign first. This messages real people and can't be undone once sent. Without confirm=true it returns a dry run with the recipient count, readiness problems and when it would go out (send_plan). Get the user's explicit approval before confirming.",
+            obj(json!({"campaign_id": {"type": "string"}, "send_at": {"type": "string", "format": "date-time", "description": "Omit to send now"}, "send_options": crate::features::sendtime::send_options_schema(), "confirm": {"type": "boolean"}}), &["campaign_id"]), false, true),
         tool("cancel_campaign", "Cancel a campaign", "Unschedule a scheduled campaign (back to draft) or stop a campaign that is mid-send or waiting on its A/B test.", obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), false, true),
         tool("pick_campaign_winner", "Pick an A/B test winner", "For a campaign in status testing: send the chosen version (or, if version is omitted, the current leader) to the rest of the audience now. This messages real people; requires confirm=true and the user's approval. Check get_campaign_report's ab_test first.",
             obj(json!({"campaign_id": {"type": "string"}, "version": {"enum": ["a", "b", "c", "d"]}, "confirm": {"type": "boolean"}}), &["campaign_id"]), false, true),
@@ -576,7 +576,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         }
         "update_campaign" => {
             let id = uuid_arg(&a, "id")?;
-            msg::update_campaign(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None, ab_test: a.get("ab_test").cloned() }).await?;
+            msg::update_campaign(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None, ab_test: a.get("ab_test").cloned(), send_options: a.get("send_options").cloned() }).await?;
             campaign_with_readiness(state, acct, id).await
         }
         "send_test" => {
@@ -588,14 +588,29 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "send_campaign" => {
             let id = uuid_arg(&a, "campaign_id")?;
             let send_at: Option<DateTime<Utc>> = a["send_at"].as_str().map(|s| s.parse().map_err(|_| AppError::bad("send_at must be an ISO 8601 date-time"))).transpose()?;
+            if let Some(opts) = a.get("send_options") {
+                crate::features::sendtime::checked(Some(opts))?;
+            }
             if a["confirm"].as_bool() != Some(true) {
                 let mut dry = campaign_with_readiness(state, acct, id).await?;
+                let c = campaigns::load(&state.db, acct, id).await?;
+                let mut opts = match a.get("send_options") {
+                    Some(v) => crate::features::sendtime::options::parse(v)?,
+                    None => crate::features::sendtime::options::of(c.send_options.as_ref()),
+                };
+                if let Some(o) = opts.as_mut() {
+                    o.local_date = None;
+                }
+                let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
+                if !audience.include.is_empty() {
+                    dry["send_plan"] = crate::features::sendtime::plan::preview(state, acct, &c.channel, &audience, opts, send_at).await?;
+                }
                 dry["dry_run"] = json!(true);
                 dry["note"] = json!(format!("Nothing sent. This would {} to {} recipients. Call again with confirm=true once the user approves.",
                     if send_at.is_some() { "schedule the campaign" } else { "send now" }, dry["estimated_recipients"]));
                 return Ok(dry);
             }
-            let c = msg::launch(state, acct, id, send_at).await?;
+            let c = msg::launch(state, acct, id, send_at, a.get("send_options")).await?;
             msg::campaign_json(state, &c).await
         }
         "cancel_campaign" => {

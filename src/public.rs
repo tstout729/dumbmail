@@ -65,10 +65,11 @@ struct Msg {
     campaign_id: Option<Uuid>,
     flow_id: Option<Uuid>,
     is_test: bool,
+    transactional: bool,
 }
 
 async fn load_msg(state: &AppState, id: Uuid) -> AppResult<Option<Msg>> {
-    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test FROM messages WHERE id = $1")
+    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test, transactional FROM messages WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?)
@@ -129,7 +130,10 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
         return (StatusCode::BAD_REQUEST, "invalid link").into_response();
     }
     if let Ok(Some(m)) = load_msg(&state, id).await {
-        let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&q.u).execute(&state.db).await;
+        // A transactional link can carry a secret (a password-reset token): keep only that a click
+        // happened, when, and the site it went to.
+        let recorded = if m.transactional { url::Url::parse(&q.u).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { q.u.clone() };
+        let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&recorded).execute(&state.db).await;
         let first: Result<Option<Uuid>, _> = sqlx::query_scalar(
             "UPDATE messages SET clicked_at = COALESCE(clicked_at, now()), opened_at = CASE WHEN channel = 'email' THEN COALESCE(opened_at, now()) ELSE opened_at END
              WHERE id = $1 AND clicked_at IS NULL RETURNING id",
@@ -138,7 +142,7 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
         .fetch_optional(&state.db)
         .await;
         let metric = if m.channel == "sms" { "Clicked SMS" } else { "Clicked Email" };
-        let _ = msg_event(&state, &m, metric, json!({"url": q.u}), None).await;
+        let _ = msg_event(&state, &m, metric, json!({"url": recorded}), None).await;
         if matches!(first, Ok(Some(_))) && m.channel == "email" {
             let _ = msg_event(&state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
         }
@@ -1102,7 +1106,7 @@ async fn webhook_scope(state: &AppState, s: &str) -> AppResult<Option<Uuid>> {
 }
 
 async fn msg_by_provider_id(state: &AppState, pid: &str) -> AppResult<Option<Msg>> {
-    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test FROM messages WHERE provider_message_id = $1")
+    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test, transactional FROM messages WHERE provider_message_id = $1")
         .bind(pid)
         .fetch_optional(&state.db)
         .await?)
@@ -1257,7 +1261,7 @@ async fn stripe_webhook(State(state): State<AppState>, headers: HeaderMap, body:
 }
 
 /// Operator endpoints need `Authorization: Bearer ADMIN_TOKEN`; they don't exist when it's unset or short.
-fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+pub fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     let want = state.cfg.admin_token.as_deref().filter(|t| t.len() >= 32).ok_or_else(|| AppError::NotFound("not found".into()))?;
     let got = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     if got.len() != want.len() || got.bytes().zip(want.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {

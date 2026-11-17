@@ -44,7 +44,7 @@ pub fn prices(state: &AppState) -> Prices {
 }
 
 /// Calendar month key ("2026-11") in the account's time zone.
-async fn month_key(db: &PgPool, account_id: Uuid) -> AppResult<String> {
+async fn month_key<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid) -> AppResult<String> {
     let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
     let now = Utc::now().with_timezone(&tz);
@@ -158,15 +158,43 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
     Ok(amount)
 }
 
+/// [`charge_message`] for one email, inside the caller's transaction, so the caller can record the
+/// charge with its own row and charge it once (transactional email does).
+pub async fn charge_email_tx(state: &AppState, tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<i64> {
+    if !state.cfg.hosted {
+        return Ok(0);
+    }
+    let month = month_key(&mut *tx, account_id).await?;
+    let used: i32 = sqlx::query_scalar(
+        "UPDATE accounts SET free_emails_used = CASE WHEN free_month = $2 THEN free_emails_used + 1 ELSE 1 END, free_month = $2
+         WHERE id = $1 RETURNING free_emails_used",
+    )
+    .bind(account_id)
+    .bind(&month)
+    .fetch_one(&mut *tx)
+    .await?;
+    let covered = used as i64 <= state.cfg.free_emails_per_month || crate::subscription::use_email(&mut *tx, account_id).await?;
+    let amount = if covered { 0 } else { prices(state).email };
+    debit_usage_tx(tx, account_id, "email", 1, amount).await?;
+    Ok(amount)
+}
+
 /// Debit the balance and roll the charge into today's usage row for this kind.
 pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, amount: i64) -> AppResult<()> {
+    let mut tx = db.begin().await?;
+    debit_usage_tx(&mut tx, account_id, kind, qty, amount).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`debit_usage`] inside the caller's transaction.
+pub async fn debit_usage_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind: &str, qty: i64, amount: i64) -> AppResult<()> {
     let label = match kind {
         "email" => "Emails sent",
         "sms" => "SMS segments sent",
         "mms" => "MMS sent",
         _ => "Usage",
     };
-    let mut tx = db.begin().await?;
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO ledger (id, account_id, kind, day, quantity, amount_micros, description)
@@ -182,7 +210,6 @@ pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, am
     .bind(label)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 

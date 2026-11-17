@@ -11,6 +11,7 @@ import { formatCurrency, formatDateTime, formatNumber, formatPercent, pluralize 
 import { toast } from "../../lib/toast";
 import { contentSnippet, metricLabels, versionContent, versionIds, versionLabel, versionName } from "./abTest";
 import { ChannelIcon } from "./CampaignsPage";
+import { SendProgressCard } from "../../features/sendtime/SendProgressCard";
 
 export function CampaignReportView({ campaign }: { campaign: Campaign }) {
   const { account } = useSession();
@@ -53,9 +54,9 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
             <Button variant="ghost" icon={<Eye className="size-3.5" />} onClick={() => setViewing("a")}>
               {viewVersions.length > 1 ? "View versions" : "View message"}
             </Button>
-            {campaign.status === "testing" ? (
+            {campaign.status === "testing" || campaign.status === "sending" ? (
               <Button variant="secondary" onClick={() => setConfirmCancel(true)}>
-                Cancel the rest
+                {campaign.status === "testing" ? "Cancel the rest" : "Stop sending"}
               </Button>
             ) : null}
             <Button icon={<Copy className="size-3.5" />} loading={duplicate.isPending} onClick={() => duplicate.mutate(campaign.id, { onSuccess: (d) => navigate(`/campaigns/${d.id}`) })}>
@@ -72,6 +73,7 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
         </div>
       ) : null}
       {ab ? <AbTestResults campaign={campaign} ab={ab} totalRecipients={stats.recipients} timezone={tz} /> : null}
+      <SendProgressCard campaignId={campaign.id} live={campaign.status === "sending"} timezone={tz} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Stat label="Recipients" value={formatNumber(stats.recipients)} sub={`${formatNumber(stats.delivered)} delivered`} />
         {campaign.channel === "email" ? (
@@ -150,8 +152,12 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
       ) : null}
       {confirmCancel ? (
         <ConfirmDialog
-          title="Cancel the rest of this campaign?"
-          body="Nobody else gets it. The people in the test already got their version."
+          title={campaign.status === "testing" ? "Cancel the rest of this campaign?" : "Stop sending this campaign?"}
+          body={
+            campaign.status === "testing"
+              ? "Nobody else gets it. The people in the test already got their version."
+              : "Nobody who hasn't got it yet will get it, including time zones still waiting. People who already got it keep it."
+          }
           confirmLabel="Cancel campaign"
           danger
           loading={cancel.isPending}
