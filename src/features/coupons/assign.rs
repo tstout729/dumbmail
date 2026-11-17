@@ -340,14 +340,15 @@ pub async fn form_sign_up(state: &AppState, account: &Account, form: &FormRow, p
     if !created {
         return;
     }
-    match form_code(state, account.id, form.id, name, profile_id, ip, true).await {
+    match form_code(state, account.id, form.id, name, profile_id, ip).await {
         Ok(Some(code)) => out["discount_code"] = json!(code),
         Ok(None) => {}
         Err(e) => tracing::warn!(account = %account.id, form = %form.id, error = %e.public_message(), "couldn't give a sign-up form coupon code"),
     }
 }
 
-async fn form_code(state: &AppState, account_id: Uuid, form_id: Uuid, name: &str, profile_id: Uuid, ip: Option<&str>, limited: bool) -> AppResult<Option<String>> {
+/// The coupon's hourly form limit always applies; the per-visitor limit applies when the visitor's address is known.
+async fn form_code(state: &AppState, account_id: Uuid, form_id: Uuid, name: &str, profile_id: Uuid, ip: Option<&str>) -> AppResult<Option<String>> {
     let Some(c) = store::by_name(&state.db, account_id, name).await? else {
         tracing::warn!(account = %account_id, form = %form_id, "the form's coupon doesn't exist; no code given");
         return Ok(None);
@@ -355,7 +356,7 @@ async fn form_code(state: &AppState, account_id: Uuid, form_id: Uuid, name: &str
     expired(&c)?;
     let ip_hash = ip.filter(|s| !s.is_empty()).map(|s| crate::auth::sha256_hex(&format!("coupon-ip:{s}")));
     let mut tx = state.db.begin().await?;
-    if limited {
+    {
         // Checked and recorded under locks on the coupon and the visitor, always in that order, so
         // simultaneous sign-ups can't get past a limit together.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("coupon-form:{}", c.id)).execute(&mut *tx).await?;
@@ -397,7 +398,8 @@ async fn form_code(state: &AppState, account_id: Uuid, form_id: Uuid, name: &str
 }
 
 /// A double opt-in sign-up was confirmed (from the link in its email): the code the form hands out,
-/// shown on the confirmation page. The link reached the address, so no per-visitor limit applies.
+/// shown on the confirmation page. The link reached the address, so no per-visitor limit applies;
+/// the coupon's hourly form limit does (past it, a later visit to the link shows the code).
 pub async fn confirmation_code(state: &AppState, confirmation_id: Uuid) -> Option<String> {
     let row: Option<(Uuid, Uuid, Uuid, Option<String>)> = sqlx::query_as(
         "SELECT f.account_id, f.id, o.profile_id, f.config->>'coupon' FROM optin_confirmations o JOIN forms f ON f.id = o.form_id
@@ -410,7 +412,7 @@ pub async fn confirmation_code(state: &AppState, confirmation_id: Uuid) -> Optio
     .flatten();
     let (account_id, form_id, profile_id, name) = row?;
     let name = name.filter(|n| !n.trim().is_empty())?;
-    match form_code(state, account_id, form_id, name.trim(), profile_id, None, false).await {
+    match form_code(state, account_id, form_id, name.trim(), profile_id, None).await {
         Ok(code) => code,
         Err(e) => {
             tracing::warn!(account = %account_id, form = %form_id, error = %e.public_message(), "couldn't give a confirmed sign-up its coupon code");
