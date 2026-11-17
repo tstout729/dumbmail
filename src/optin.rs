@@ -4,8 +4,8 @@
 //!
 //! Confirmation emails aren't billed and don't count toward the warm-up limit (or raise it). They do count
 //! toward the bounce and complaint rates. One address gets at most one every 24 hours and an account at most
-//! `MAX_PER_HOUR` (one visitor `MAX_PER_IP_HOUR`), so a bot filling in a form can't use DumbMail to flood
-//! someone's inbox; `+tags` and Gmail dots don't make an address new. Addresses that
+//! `MAX_PER_HOUR` (one visitor `MAX_PER_IP_HOUR`, one inbox `MAX_PER_INBOX_DAY` a day however the address is
+//! spelled), so a bot filling in a form can't use DumbMail to flood someone's inbox. Addresses that
 //! bounced or complained before get none. When no confirmation can be sent, the sign-up is refused rather
 //! than let through unconfirmed.
 
@@ -22,6 +22,8 @@ use crate::state::AppState;
 pub const LINK_DAYS: i32 = 7;
 /// An address waiting to confirm isn't sent another email for this long.
 const RESEND_AFTER_HOURS: i32 = 24;
+/// Most confirmations one inbox (`email_key`) gets from an account in a day, however the address is spelled.
+const MAX_PER_INBOX_DAY: i64 = 3;
 /// Most confirmation emails one account sends in an hour.
 const MAX_PER_HOUR: i64 = 200;
 /// Most confirmation emails one visitor (IP address) can trigger in an hour, across all accounts.
@@ -46,22 +48,14 @@ pub fn id_from_token(state: &AppState, token: &str) -> Option<Uuid> {
     crate::auth::verify(&state.cfg.secret_key, token)?.strip_prefix('c')?.parse().ok()
 }
 
-/// Mailbox providers that deliver `name+anything@` to `name@`. Elsewhere a `+` may be part of a different
-/// address, so stripping it could let a made-up variant hold back the real person's confirmation.
-const PLUS_TAG_DOMAINS: &[&str] = &[
-    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com",
-    "protonmail.com", "proton.me", "pm.me", "fastmail.com", "fastmail.fm",
-];
-
-/// The inbox an address reaches: lowercased; at providers that ignore them, `+tag` removed (and for Gmail
-/// the dots too), so `v.ictim+1@gmail.com` and `victim@googlemail.com` count as the same person.
+/// The inbox an address most likely reaches: lowercased, `+tag` removed and, for Gmail, dots removed too,
+/// so `v.ictim+1@gmail.com`, `victim+2@shop.test` and `victim@googlemail.com` count as their inbox. Used
+/// only to cap how many confirmations one inbox gets (`MAX_PER_INBOX_DAY`); whether a confirmation is
+/// already waiting is judged on the exact address, so a made-up variant can't hold back the real one.
 pub fn email_key(email: &str) -> String {
     let e = email.trim().to_lowercase();
     let Some((local, domain)) = e.rsplit_once('@') else { return e };
     let domain = if domain == "googlemail.com" { "gmail.com" } else { domain };
-    if !PLUS_TAG_DOMAINS.contains(&domain) {
-        return format!("{local}@{domain}");
-    }
     let local = local.split('+').next().unwrap_or(local);
     let local = if domain == "gmail.com" { local.replace('.', "") } else { local.to_string() };
     format!("{local}@{domain}")
@@ -105,14 +99,23 @@ pub async fn start(
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("optin-ip:{h}")).execute(&mut *tx).await?;
     }
     let waiting: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email_key = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
+        "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
     )
     .bind(account.id)
-    .bind(&key)
+    .bind(email)
     .bind(RESEND_AFTER_HOURS)
     .fetch_one(&mut *tx)
     .await?;
     if waiting {
+        return Ok(Started::Pending);
+    }
+    let to_inbox: i64 = sqlx::query_scalar("SELECT count(*) FROM optin_confirmations WHERE account_id = $1 AND email_key = $2 AND created_at > now() - interval '24 hours'")
+        .bind(account.id)
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await?;
+    if to_inbox >= MAX_PER_INBOX_DAY {
+        tracing::warn!(account = %account.id, "double opt-in: per-inbox daily limit reached; not sending another");
         return Ok(Started::Pending);
     }
     if let Some(h) = &ip_hash {
@@ -294,7 +297,7 @@ mod tests {
         assert_eq!(email_key("V.ictim+1@Gmail.com"), "victim@gmail.com");
         assert_eq!(email_key("victim@googlemail.com"), "victim@gmail.com");
         assert_eq!(email_key("jane+news@outlook.com"), "jane@outlook.com");
-        assert_eq!(email_key("jane.doe+news@shop.test"), "jane.doe+news@shop.test", "other providers may treat + as part of the address");
+        assert_eq!(email_key("jane.doe+news@shop.test"), "jane.doe@shop.test");
         assert_ne!(email_key("jane.doe@shop.test"), email_key("janedoe@shop.test"), "dots only matter outside Gmail");
     }
 
