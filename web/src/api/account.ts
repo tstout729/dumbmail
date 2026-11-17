@@ -51,10 +51,17 @@ export function useSending() {
   return useQuery({ queryKey: keys.sending, queryFn: accountApi.sending });
 }
 
-/** Every domain endpoint returns the full `Sending` shape, so each mutation just replaces the cache. */
+/**
+ * Every domain endpoint returns the full `Sending` shape, so each mutation shows its result straight away,
+ * then refetches: with several domains, an older response can land after a newer one.
+ */
 function useSendingMutation<V>(mutationFn: (vars: V) => Promise<Sending>) {
   const qc = useQueryClient();
-  return useMutation({ mutationFn, onSuccess: (data) => qc.setQueryData(keys.sending, data) });
+  return useMutation({
+    mutationFn,
+    onSuccess: (data) => qc.setQueryData(keys.sending, data),
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.sending }),
+  });
 }
 
 export const useAddDomain = () => useSendingMutation<string>(accountApi.addDomain);

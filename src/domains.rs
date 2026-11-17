@@ -137,14 +137,19 @@ async fn used_by_other_account(state: &AppState, account_id: Uuid, domain: &str)
 /// Add a sending domain (or refresh its records if the account already has it). Returns the cleaned name.
 pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<String> {
     let domain = clean_domain(raw)?;
+    let mf = mail_from_for(&domain);
+    // Claim the row under a per-account lock, so simultaneous adds can't get past the cap.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('sending_domains:' || $1::text, 0))").bind(account_id).execute(&mut *tx).await?;
     let (exists, count): (bool, i64) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM sending_domains WHERE account_id = $1 AND domain = $2), (SELECT count(*) FROM sending_domains WHERE account_id = $1)",
     )
     .bind(account_id)
     .bind(&domain)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
     if exists {
+        tx.commit().await?;
         verify_sending_domain(state, account_id, &domain).await?;
         return Ok(domain);
     }
@@ -154,30 +159,26 @@ pub async fn add_sending_domain(state: &AppState, account_id: Uuid, raw: &str) -
     if verified_elsewhere(state, account_id, &domain).await? {
         return Err(AppError::Conflict("that domain is already verified by another account".into()));
     }
-    let st = state.email.add_domain(&domain).await.map_err(|e| AppError::bad(format!("could not start domain setup: {e:#}")))?;
-    let mf = mail_from_for(&domain);
+    sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status, mail_from_domain) VALUES ($1, $2, $3, 'pending', $4)")
+        .bind(Uuid::now_v7())
+        .bind(account_id)
+        .bind(&domain)
+        .bind(&mf)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if let Err(e) = state.email.add_domain(&domain).await {
+        sqlx::query("DELETE FROM sending_domains WHERE account_id = $1 AND domain = $2").bind(account_id).bind(&domain).execute(&state.db).await?;
+        return Err(AppError::bad(format!("could not start domain setup: {e:#}")));
+    }
     // Configure the shared provider identity only when no other account is using this domain.
     if !used_by_other_account(state, account_id, &domain).await? {
         if let Err(e) = state.email.set_mail_from(&domain, &mf).await {
             tracing::warn!(domain = %domain, error = %e, "could not set custom MAIL FROM");
         }
     }
-    let mut records = sending_records(state, account_id, &domain, &st.records);
-    annotate(state, &mut records).await;
-    sqlx::query(
-        "INSERT INTO sending_domains (id, account_id, domain, status, records, mail_from_domain) VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (account_id, domain) DO NOTHING",
-    )
-    .bind(Uuid::now_v7())
-    .bind(account_id)
-    .bind(&domain)
-    // A provider "verified" only means some account proved it; this account still has to.
-    .bind(if st.status == "failed" { "failed" } else { "pending" })
-    .bind(Value::Array(records))
-    .bind(&mf)
-    .execute(&state.db)
-    .await?;
-    // The records may already be in place (e.g. the domain was removed and added back).
+    // Checks DNS and fills in the records; they may already be in place (e.g. the domain was removed and added back).
     verify_sending_domain(state, account_id, &domain).await?;
     Ok(domain)
 }

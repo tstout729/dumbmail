@@ -684,7 +684,24 @@ async fn billing_numbers_onsite_and_domains() {
         .bind(acct_id).execute(&h.state.db).await.unwrap();
     let (s, _) = h.req("POST", "/api/account/domains", Some(json!({"domain": "one-too-many.example"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Simultaneous adds can't get past the cap either.
+    sqlx::query("DELETE FROM sending_domains WHERE domain = 'filler1.example'").execute(&h.state.db).await.unwrap();
+    let (a, b) = tokio::join!(
+        dumbmail::domains::add_sending_domain(&h.state, acct_id, "race-a.example"),
+        dumbmail::domains::add_sending_domain(&h.state, acct_id, "race-b.example"),
+    );
+    assert!(a.is_ok() != b.is_ok(), "exactly one of two simultaneous adds fits under the cap");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sending_domains WHERE account_id = $1").bind(acct_id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, dumbmail::domains::MAX_SENDING_DOMAINS);
+    sqlx::query("DELETE FROM sending_domains WHERE domain LIKE 'race-%'").execute(&h.state.db).await.unwrap();
     sqlx::query("DELETE FROM sending_domains WHERE domain LIKE 'filler%'").execute(&h.state.db).await.unwrap();
+    // While a deploy rolls out, the previous version's writes to the old columns are mirrored.
+    sqlx::query("UPDATE accounts SET sending_domain = 'old-version.example', sending_domain_status = 'verified' WHERE id = $1").bind(acct_id).execute(&h.state.db).await.unwrap();
+    let st: String = sqlx::query_scalar("SELECT status FROM sending_domains WHERE account_id = $1 AND domain = 'old-version.example'").bind(acct_id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(st, "verified");
+    sqlx::query("UPDATE accounts SET sending_domain = NULL WHERE id = $1").bind(acct_id).execute(&h.state.db).await.unwrap();
+    let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM sending_domains WHERE domain = 'old-version.example')").fetch_one(&h.state.db).await.unwrap();
+    assert!(gone);
     let rm = h.ok("DELETE", "/api/account/domains/second-brand.example", None).await;
     assert_eq!(rm["email"]["domains"].as_array().unwrap().len(), 1);
     let (s, _) = h.req("DELETE", "/api/account/domains/not-mine.example", None).await;
