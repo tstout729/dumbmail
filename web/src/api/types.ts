@@ -371,6 +371,15 @@ export type RandomSplitNode = {
   yes: string | null;
   no: string | null;
 };
+/** Waits up to `amount` `unit` for the person to text back: `yes` if they did, `no` if not. */
+export type WaitForReplyNode = {
+  id: string;
+  type: "wait_for_reply";
+  amount: number;
+  unit: DelayUnit;
+  yes: string | null;
+  no: string | null;
+};
 export type UpdateProfileNode = {
   id: string;
   type: "update_profile";
@@ -398,6 +407,7 @@ export type FlowNode =
   | SmsNode
   | ConditionNode
   | RandomSplitNode
+  | WaitForReplyNode
   | UpdateProfileNode
   | ListActionNode
   | WebhookNode;

@@ -109,7 +109,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     }
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
-            "condition" | "random_split" => vec!["yes", "no"],
+            "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
             "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
@@ -148,6 +148,18 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                 }
             }
             "update_profile" => need("properties")?,
+            "wait_for_reply" => {
+                let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+                let unit = match n.str("unit") {
+                    Some("minutes") => 60.0,
+                    Some("hours") => 3600.0,
+                    Some("days") => 86400.0,
+                    _ => 0.0,
+                };
+                if amount <= 0.0 || unit == 0.0 || amount * unit > 30.0 * 86400.0 {
+                    return Err(AppError::bad(format!("wait for reply {} needs a positive amount and a unit (minutes, hours or days), up to 30 days", n.id)));
+                }
+            }
             "add_to_list" | "remove_from_list" => need("list_id")?,
             "webhook" => {
                 let u = n.str("url").unwrap_or("");
@@ -574,7 +586,8 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "email" | "sms" => {
-                // Smart sending: skip if this person got any message in the last N hours (0 = off).
+                // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
+                // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 let recent: bool = hours > 0 && crate::features::sendtime::recently_messaged(&state.db, run.profile_id, &node.kind, hours).await?;
                 if !recent {
@@ -619,6 +632,48 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
+            }
+            // Wait until they text back (yes) or the time runs out (no); see `features::inbox`. The
+            // start and deadline are saved with the job in one transaction, and the branch is decided
+            // only by replies between them, however late the job runs.
+            "wait_for_reply" if !waited => {
+                let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let secs = (amount
+                    * match node.str("unit") {
+                        Some("minutes") => 60.0,
+                        Some("hours") => 3600.0,
+                        _ => 86400.0,
+                    })
+                .clamp(1.0, 30.0 * 86400.0);
+                let since = Utc::now();
+                let until = since + Duration::milliseconds((secs * 1000.0) as i64);
+                context["_waited"] = json!(node_id);
+                context["_reply_since"] = json!(since);
+                context["_reply_until"] = json!(until);
+                let mut tx = state.db.begin().await?;
+                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&mut *tx).await?;
+                crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+            "wait_for_reply" => {
+                let at = |k: &str| context.get(k).and_then(|v| serde_json::from_value::<chrono::DateTime<Utc>>(v.clone()).ok());
+                let since = at("_reply_since").unwrap_or_else(Utc::now);
+                // A deadline that can't be read counts nothing after the wait began.
+                let deadline = at("_reply_until").unwrap_or(since);
+                let now = Utc::now();
+                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                if !replied && now < deadline {
+                    // Woken before the deadline without a reply inside the wait: keep waiting.
+                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(deadline)).await?;
+                    return Ok(());
+                }
+                if let Some(o) = context.as_object_mut() {
+                    o.remove("_waited");
+                    o.remove("_reply_since");
+                    o.remove("_reply_until");
+                }
+                next = node.str(if replied { "yes" } else { "no" }).map(str::to_string);
             }
             "random_split" => {
                 let percent = split_percent(&node).unwrap_or(50);

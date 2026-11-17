@@ -771,7 +771,13 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
     }
     let mut sent = 0;
-    for addr in to {
+    for raw in to {
+        // A number is put in one form first, so the profile lookup, the opt-out check and the send agree.
+        let addr = if c.channel == "sms" {
+            &crate::models::normalize_phone(raw).ok_or_else(|| AppError::bad(format!("{raw:?} isn't a phone number (use +15035550100)")))?
+        } else {
+            raw
+        };
         let input = if c.channel == "email" {
             crate::audience::ProfileInput { email: Some(addr.clone()), ..Default::default() }
         } else {
