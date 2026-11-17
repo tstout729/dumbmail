@@ -375,11 +375,46 @@ pub fn context(account: &Account, profile: Option<&Profile>, event: Option<&Valu
     Value::Object(root)
 }
 
+/// What an email's footer carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Footer {
+    /// Brand, postal address and the unsubscribe link (every marketing email).
+    Marketing,
+    /// Brand and postal address only (transactional mail that wants it).
+    Address,
+    /// Nothing (transactional mail by default).
+    None,
+}
+
+/// How an email is rendered. Marketing email always uses the defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct EmailOptions {
+    pub footer: Footer,
+    pub track_clicks: bool,
+    pub track_opens: bool,
+}
+
+impl Default for EmailOptions {
+    fn default() -> Self {
+        Self { footer: Footer::Marketing, track_clicks: true, track_opens: true }
+    }
+}
+
 pub fn render_email(
     account: &Account,
     content: &EmailContent,
     ctx: &Value,
     tracking: Option<&Tracking<'_>>,
+) -> AppResult<RenderedEmail> {
+    render_email_with(account, content, ctx, tracking, EmailOptions::default())
+}
+
+pub fn render_email_with(
+    account: &Account,
+    content: &EmailContent,
+    ctx: &Value,
+    tracking: Option<&Tracking<'_>>,
+    opts: EmailOptions,
 ) -> AppResult<RenderedEmail> {
     let theme = content.theme.clone().unwrap_or_default();
     let brand = safe_color(theme.brand_color.as_deref().unwrap_or(&account.brand_color), "#1f6f5c");
@@ -396,15 +431,23 @@ pub fn render_email(
             .collect();
         format!("{}<br>", links.join(" · "))
     };
-    let footer = format!(
-        r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
-        // The footer goes through the template engine with the body, so brand text (often read
-        // from a website) must not be able to open a template tag.
-        social_html = no_tpl(&social_html),
-        name = no_tpl(&esc(&account.name)),
-        addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
-        unsub = esc(&unsub),
-    );
+    let footer = match opts.footer {
+        Footer::Marketing => format!(
+            r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
+            // The footer goes through the template engine with the body, so brand text (often read
+            // from a website) must not be able to open a template tag.
+            social_html = no_tpl(&social_html),
+            name = no_tpl(&esc(&account.name)),
+            addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
+            unsub = esc(&unsub),
+        ),
+        Footer::Address => format!(
+            "{}{}",
+            no_tpl(&esc(&account.name)),
+            if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) }
+        ),
+        Footer::None => String::new(),
+    };
 
     let (html_source, text_source) = match (&content.blocks, &content.html) {
         (Some(blocks), _) if !blocks.is_empty() => {
@@ -417,8 +460,8 @@ pub fn render_email(
             let mut text = String::new();
             block_text(&json!({"type": "html", "html": html}), &mut text);
             let doc = if html.to_lowercase().contains("<body") {
-                // Custom full HTML: make sure an unsubscribe link exists.
-                if html.contains("unsubscribe_url") {
+                // Custom full HTML: make sure an unsubscribe link exists (and any footer is added).
+                if html.contains("unsubscribe_url") || footer.is_empty() {
                     html.clone()
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
@@ -435,13 +478,22 @@ pub fn render_email(
     let preheader = render_str(content.preheader.as_deref().unwrap_or(""), ctx, false)?;
     let mut html = render_str(&html_source, ctx, true)?;
     let mut text = render_str(&text_source, ctx, false)?;
-    for (label, url) in &socials {
-        text.push_str(&format!("\n{label}: {url}"));
+    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {address}") });
+    match opts.footer {
+        Footer::Marketing => {
+            for (label, url) in &socials {
+                text.push_str(&format!("\n{label}: {url}"));
+            }
+            text.push_str(&format!("\n--\n{signature}\nUnsubscribe: {unsub}\n"));
+        }
+        Footer::Address => text.push_str(&format!("\n--\n{signature}\n")),
+        Footer::None => {}
     }
-    text.push_str(&format!("\n--\n{}{}\nUnsubscribe: {unsub}\n", account.name, if address.is_empty() { String::new() } else { format!(", {address}") }));
 
-    if let Some(t) = tracking {
+    if let Some(t) = tracking.filter(|_| opts.track_clicks) {
         html = rewrite_links(&html, t);
+    }
+    if let Some(t) = tracking.filter(|_| opts.track_opens) {
         let pixel = format!(
             r#"<img src="{}/t/o/{}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;">"#,
             t.public_url,

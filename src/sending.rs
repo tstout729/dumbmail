@@ -99,6 +99,8 @@ pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) ->
 
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let p = spec.profile;
+    // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
+    let mut send_note: Option<String> = None;
     let to = match spec.channel {
         "email" => {
             // `pending`: a double opt-in sign-up that hasn't confirmed gets nothing until it does.
@@ -120,10 +122,39 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
+            // Quiet hours in the recipient's own time zone: their phone number's (the account's when we can't tell).
             if !spec.is_test {
-                if let Some(until) = sms_quiet_until(spec.account, Utc::now()) {
+                let hours = crate::features::sendtime::sms_hours(&state.db, spec.account, p, Utc::now()).await?;
+                if hours.skip {
+                    let why = "time zones disagree";
+                    match spec.message_id {
+                        Some(mid) => {
+                            sqlx::query("UPDATE messages SET send_note = $2 WHERE id = $1").bind(mid).bind(&hours.note).execute(&state.db).await?;
+                        }
+                        None => {
+                            sqlx::query(
+                                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error, send_note)
+                                 VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, 'skipped', $8, $9)",
+                            )
+                            .bind(Uuid::now_v7())
+                            .bind(spec.account.id)
+                            .bind(p.id)
+                            .bind(spec.campaign_id)
+                            .bind(spec.flow_id)
+                            .bind(spec.flow_node_id)
+                            .bind(p.phone_number.as_deref().unwrap_or_default())
+                            .bind(why)
+                            .bind(&hours.note)
+                            .execute(&state.db)
+                            .await?;
+                        }
+                    }
+                    return Ok(Outcome::Skipped(why));
+                }
+                if let Some(until) = hours.wait {
                     return Ok(Outcome::Deferred(until));
                 }
+                send_note = hours.note;
             }
             spec.to_override.clone().or_else(|| p.phone_number.clone())
         }
@@ -241,8 +272,8 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
 
     if spec.message_id.is_none() {
         sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -254,26 +285,53 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         .bind(&to)
         .bind(&subject)
         .bind(spec.is_test)
+        .bind(&send_note)
         .execute(&state.db)
         .await?;
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3 WHERE id = $1")
+        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note) WHERE id = $1")
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
+            .bind(&send_note)
             .execute(&state.db)
             .await?;
     }
 
+    match &rendered {
+        Rendered::Email(_) => throttle_email(state).await,
+        Rendered::Sms(..) => throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await,
+    }
+    // An opt-out, a cancel, a pause or (texts) the closing of the window can land while waiting for a
+    // slot: check again right before the hand-off.
+    if !spec.is_test {
+        if let Some(stop) = last_check(state, spec.account, p.id, spec.channel, spec.campaign_id).await? {
+            if limited {
+                crate::deliverability::return_daily_slot(state, spec.account.id);
+            }
+            return match stop {
+                Stop::Defer(until) => {
+                    if spec.message_id.is_none() {
+                        // A flow re-runs this step then and creates a new message.
+                        sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id).execute(&state.db).await?;
+                    }
+                    Ok(Outcome::Deferred(until))
+                }
+                Stop::Skip(why, note) => {
+                    sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1")
+                        .bind(message_id)
+                        .bind(why)
+                        .bind(note)
+                        .execute(&state.db)
+                        .await?;
+                    Ok(Outcome::Skipped(why))
+                }
+            };
+        }
+    }
     let result = match &rendered {
-        Rendered::Email(e) => {
-            throttle_email(state).await;
-            state.email.send(e).await
-        }
-        Rendered::Sms(s, provider, _) => {
-            throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
-            provider.send(s).await
-        }
+        Rendered::Email(e) => state.email.send(e).await,
+        Rendered::Sms(s, provider, _) => provider.send(s).await,
     };
     match result {
         Ok(provider_id) => {
@@ -302,7 +360,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                         account_id: spec.account.id,
                         profile_id: p.id,
                         metric,
-                        properties: json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        properties: match &send_note {
+                            Some(note) => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id, "time_zone_note": note}),
+                            None => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        },
                         value: None,
                         occurred_at: None,
                         unique_id: Some(message_id.to_string()),
@@ -341,6 +402,63 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             Ok(Outcome::Failed(msg))
         }
     }
+}
+
+/// Why a message stops at the last check: skipped (with a note for the message), or deferred.
+enum Stop {
+    Skip(&'static str, Option<String>),
+    Defer(DateTime<Utc>),
+}
+
+/// The last check before the provider call, in one query against the current state: the person's
+/// consent and suppression for the channel, the account's email pause, the campaign's status, and for
+/// texts the whole quiet-hours decision. None: send it.
+async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
+                CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
+                (SELECT c.status FROM campaigns c WHERE c.id = $2),
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict
+         FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
+         WHERE p.id = $1",
+    )
+    .bind(profile_id)
+    .bind(campaign_id)
+    .bind(channel)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict)) = row else {
+        return Ok(Some(Stop::Skip("profile deleted", None)));
+    };
+    match campaign.as_deref() {
+        _ if campaign_id.is_none() => {}
+        Some("sending") => {}
+        Some("cancelled") | None => return Ok(Some(Stop::Skip("campaign cancelled", None))),
+        Some(_) => return Ok(Some(Stop::Skip("campaign stopped", None))),
+    }
+    if channel == "email" {
+        if email.is_none() || email_consent == "unsubscribed" || email_consent == "pending" {
+            return Ok(Some(Stop::Skip("not emailable", None)));
+        }
+        if suppressed {
+            return Ok(Some(Stop::Skip("suppressed", None)));
+        }
+        if paused {
+            return Ok(Some(Stop::Skip("sending paused", None)));
+        }
+        return Ok(None);
+    }
+    if sms_consent != "subscribed" || phone.is_none() {
+        return Ok(Some(Stop::Skip("no sms consent", None)));
+    }
+    let ((s, e), skip_conflicts) = crate::features::sendtime::settings::window_from(start.zip(end), conflict.as_deref());
+    let zones = crate::features::sendtime::settings::sms_zones(props.as_ref().unwrap_or(&Value::Null), phone.as_deref(), account_tz(account));
+    let hours = crate::features::sendtime::settings::decide(&zones, Utc::now(), s, e, skip_conflicts);
+    if hours.skip {
+        return Ok(Some(Stop::Skip("time zones disagree", hours.note)));
+    }
+    Ok(hours.wait.map(Stop::Defer))
 }
 
 #[cfg(test)]
