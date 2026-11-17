@@ -114,15 +114,19 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-async fn callback(State(state): State<AppState>, jar: CookieJar, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
+async fn callback(State(state): State<AppState>, headers: axum::http::HeaderMap, jar: CookieJar, Query(q): Query<CallbackQuery>) -> (CookieJar, Redirect) {
+    let meta = crate::features::team::login::ReqMeta::from_headers(&headers);
     let cookie = jar.get(OAUTH_COOKIE).map(|c| c.value().to_string());
     let jar = jar.remove(with_cookie_domain(&state, Cookie::build(OAUTH_COOKIE).path(OAUTH_COOKIE_PATH).build()));
     // Errors go back to the login page as a short code it explains, never as free text, so a
     // crafted link can't put arbitrary words on our login page.
     let fail = |jar: CookieJar, code: &str| (jar, Redirect::to(&app_location(&state, &format!("/login?error={code}"))));
     match finish(&state, cookie, q).await {
-        Ok((user_id, account_id, dest)) => match new_session(&state, user_id, account_id).await {
-            Ok(token) => (jar.add(session_cookie(&state, token)), Redirect::to(&app_location(&state, &dest))),
+        Ok((user_id, account_id, dest)) => match new_session(&state, user_id, account_id, "google", &meta).await {
+            Ok(token) => {
+                crate::features::team::audit::record(&state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "google"})).await;
+                (jar.add(session_cookie(&state, token)), Redirect::to(&app_location(&state, &dest)))
+            }
             Err(_) => fail(jar, "failed"),
         },
         Err(code) => fail(jar, code),
@@ -165,6 +169,13 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> R
     let body: Value = res.json().await.map_err(|_| "google")?;
     let id_token = body["id_token"].as_str().ok_or("google")?;
     let claims = parse_id_token(id_token, client_id, chrono::Utc::now().timestamp()).map_err(|e| if e.contains("verified") { "unverified" } else { "google" })?;
+    // Coming back from an invite link with no login yet: join that account instead of starting one.
+    let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE google_sub = $1 OR email = $2)").bind(&claims.sub).bind(&claims.email).fetch_one(&state.db).await.map_err(|_| "failed")?;
+    if !known {
+        if let Some((uid, account)) = crate::features::team::members::google_invite_signup(state, &next, &claims.email, &claims.sub, claims.name.clone()).await.map_err(|_| "failed")? {
+            return Ok((uid, account, "/".into()));
+        }
+    }
     let (user_id, account_id, created) = google_user(state, &claims).await.map_err(|e| match e {
         AppError::Conflict(_) => "conflict",
         AppError::Forbidden(_) => "closed",
@@ -215,7 +226,7 @@ const FREE_MAIL: [&str; 16] = [
 /// Find or create the DumbMail user for a Google sign-in. Returns (user, account, created).
 pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid, Uuid, bool)> {
     let first_account = |uid: Uuid| async move {
-        sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM memberships WHERE user_id = $1 ORDER BY created_at LIMIT 1").bind(uid).fetch_one(&state.db).await
+        crate::features::team::login::pick_account(state, uid).await?.ok_or_else(|| AppError::Forbidden("this login isn't part of any account anymore".into()))
     };
     if let Some(uid) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE google_sub = $1").bind(&c.sub).fetch_optional(&state.db).await? {
         return Ok((uid, first_account(uid).await?, false));
@@ -227,15 +238,25 @@ pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid,
         }
         // Sign-up doesn't confirm email addresses, so whoever set this password may not own the
         // address. Linking cuts off every way they could still get in: the password, every older
-        // session and every API key on the user's accounts (the owner makes new keys if needed).
-        // Accounts have no team invites, so the user's memberships are only accounts they created.
+        // session, pending password resets, a two-factor app they may have set up, and the API
+        // keys they could have made (keys this login made, and keys from before teams on accounts
+        // it owns; teammates' keys on shared accounts stay). The owner makes new keys if needed.
         let mut tx = state.db.begin().await?;
-        sqlx::query("UPDATE users SET google_sub = $2, password_hash = NULL WHERE id = $1").bind(uid).bind(&c.sub).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
-        sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE revoked_at IS NULL AND account_id IN (SELECT account_id FROM memberships WHERE user_id = $1)")
+        sqlx::query("UPDATE users SET google_sub = $2, password_hash = NULL, totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1")
             .bind(uid)
+            .bind(&c.sub)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM password_resets WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE api_keys SET revoked_at = now() WHERE revoked_at IS NULL AND (created_by = $1
+                OR (created_by IS NULL AND account_id IN (SELECT account_id FROM memberships WHERE user_id = $1 AND role = 'owner')))",
+        )
+        .bind(uid)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok((uid, first_account(uid).await?, false));
     }

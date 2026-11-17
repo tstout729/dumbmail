@@ -102,6 +102,8 @@ pub fn app(state: AppState) -> Router {
         .merge(mcp::routes())
         .merge(features::routes())
         .merge(site::routes())
+        // Records successful changes in the audit log (rules in features::team::access).
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), features::team::audit::layer))
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), site::host_split))
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))

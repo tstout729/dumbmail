@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use super::ApiJson;
 use crate::auth::{self, Ctx, API_KEY_PREFIX, SESSION_COOKIE};
+use crate::features::team::{self, login::ReqMeta};
+use axum::http::HeaderMap;
 use crate::campaigns::load_account;
 use crate::error::{AppError, AppResult};
 use crate::models::{normalize_email, normalize_phone, Account, User};
@@ -29,8 +31,6 @@ pub fn routes() -> Router<AppState> {
         .route("/api/account/domains/{domain}/verify", post(verify_one_domain))
         .route("/api/account/link-domain", post(add_link_domain).delete(remove_link_domain))
         .route("/api/account/link-domain/verify", post(verify_link_domain))
-        .route("/api/api-keys", get(list_keys).post(create_key))
-        .route("/api/api-keys/{id}", delete(revoke_key))
         .route("/api/billing", get(billing))
         .route("/api/billing/checkout", post(checkout))
         .route("/api/billing/auto-recharge", axum::routing::patch(auto_recharge))
@@ -76,22 +76,16 @@ fn time_days(d: i64) -> time::Duration {
     time::Duration::days(d)
 }
 
-pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid) -> AppResult<String> {
-    let token = auth::random_token(32);
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, account_id, expires_at) VALUES ($1, $2, $3, now() + interval '30 days')")
-        .bind(auth::sha256_hex(&token))
-        .bind(user_id)
-        .bind(account_id)
-        .execute(&state.db)
-        .await?;
-    Ok(token)
+/// Start a browser session (`method`: password or google). See `features::team::login`.
+pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid, method: &str, meta: &ReqMeta) -> AppResult<String> {
+    team::login::start_session(state, user_id, account_id, method, None, meta).await
 }
 
 /// Create an account and its owner. Shared by the signup route and the `create-account` command.
 pub async fn create_account(state: &AppState, email: &str, password: &str, name: Option<String>, company: &str) -> AppResult<(User, Account)> {
     let email = normalize_email(email).ok_or_else(|| AppError::bad("enter a valid email"))?;
-    if password.len() < 8 {
-        return Err(AppError::bad("use a password of at least 8 characters"));
+    if password.chars().count() < 8 || password.len() > 200 {
+        return Err(AppError::bad("use a password of 8 to 200 characters"));
     }
     let hash = auth::hash_password(password)?;
     insert_owner(state, &email, Some(hash), None, name, company, None).await
@@ -136,13 +130,17 @@ pub(crate) async fn insert_owner(
     Ok((user, account))
 }
 
-async fn signup(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJson<SignupBody>) -> AppResult<(CookieJar, Json<Value>)> {
+async fn signup(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar, ApiJson(b): ApiJson<SignupBody>) -> AppResult<(CookieJar, Json<Value>)> {
     if !state.cfg.allow_signup {
         return Err(AppError::Forbidden("sign-ups are turned off on this server".into()));
     }
+    let meta = ReqMeta::from_headers(&headers);
+    team::login::signup_guard(&state, &meta).await?;
     let (user, account) = create_account(&state, &b.email, &b.password, b.name, &b.company).await?;
-    let token = new_session(&state, user.id, account.id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email}))))
+    let token = new_session(&state, user.id, account.id, "password", &meta).await?;
+    team::audit::record(&state, account.id, &meta.actor(Some(user.id)), "account.signup", None, json!({})).await;
+    let me = team::login::me_for_token(&state, &token, &meta).await?;
+    Ok((jar.add(session_cookie(&state, token)), Json(me)))
 }
 
 #[derive(Deserialize)]
@@ -151,27 +149,13 @@ struct LoginBody {
     password: String,
 }
 
-async fn login(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJson<LoginBody>) -> AppResult<(CookieJar, Json<Value>)> {
-    let email = b.email.trim().to_lowercase();
-    let row: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as("SELECT id, email, name, password_hash FROM users WHERE email = $1")
-        .bind(&email)
-        .fetch_optional(&state.db)
-        .await?;
-    let bad = || AppError::BadRequest("that email and password don't match".into());
-    let (id, email, name, hash) = row.ok_or_else(bad)?;
-    let Some(hash) = hash else {
-        return Err(AppError::BadRequest("this account signs in with Google; use Continue with Google".into()));
-    };
-    if !auth::verify_password(&b.password, &hash) {
-        return Err(bad());
-    }
-    let account_id: Uuid = sqlx::query_scalar("SELECT account_id FROM memberships WHERE user_id = $1 ORDER BY created_at LIMIT 1")
-        .bind(id)
-        .fetch_one(&state.db)
-        .await?;
-    let account = load_account(&state.db, account_id).await?;
-    let token = new_session(&state, id, account_id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": User { id, email, name }, "account": account, "support_email": state.cfg.support_email}))))
+/// Password sign-in. When the person has two-factor login on (or the account requires it), the
+/// session starts restricted and `restriction` says what's left (see `features::team::login`).
+async fn login(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar, ApiJson(b): ApiJson<LoginBody>) -> AppResult<(CookieJar, Json<Value>)> {
+    let meta = ReqMeta::from_headers(&headers);
+    let token = team::login::password_login(&state, &b.email, &b.password, &meta).await?;
+    let me = team::login::me_for_token(&state, &token, &meta).await?;
+    Ok((jar.add(session_cookie(&state, token)), Json(me)))
 }
 
 async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(CookieJar, Json<Value>)> {
@@ -182,12 +166,7 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(Coo
 }
 
 async fn me(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let account = load_account(&state.db, ctx.account_id).await?;
-    let user: Option<User> = match ctx.user_id {
-        Some(uid) => sqlx::query_as("SELECT id, email, name FROM users WHERE id = $1").bind(uid).fetch_optional(&state.db).await?,
-        None => None,
-    };
-    Ok(Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email})))
+    Ok(Json(team::login::me_json(&state, &ctx).await?))
 }
 
 #[derive(Deserialize)]
@@ -454,25 +433,8 @@ async fn remove_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
     sending_now(&state, ctx.account_id).await
 }
 
-async fn list_keys(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let rows: Vec<(Uuid, String, String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT id, name, prefix, created_at, last_used_at FROM api_keys WHERE account_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC",
-    )
-    .bind(ctx.account_id)
-    .fetch_all(&state.db)
-    .await?;
-    let data: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, name, prefix, created_at, last_used_at)| json!({"id": id, "name": name, "prefix": prefix, "created_at": created_at, "last_used_at": last_used_at}))
-        .collect();
-    Ok(Json(json!({"data": data})))
-}
-
-#[derive(Deserialize)]
-struct KeyBody {
-    name: Option<String>,
-}
-
+/// A full-access API key with no member behind it (acts as an owner). The dashboard and API make
+/// keys through `features::team::keys`, with scopes and the member who made them.
 pub async fn new_api_key(state: &AppState, account_id: Uuid, name: &str) -> AppResult<Value> {
     let key = format!("{API_KEY_PREFIX}{}", auth::random_token(24));
     let prefix: String = key.chars().take(12).collect();
@@ -486,27 +448,6 @@ pub async fn new_api_key(state: &AppState, account_id: Uuid, name: &str) -> AppR
         .execute(&state.db)
         .await?;
     Ok(json!({"id": id, "name": name, "prefix": prefix, "key": key}))
-}
-
-async fn create_key(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<KeyBody>) -> AppResult<Json<Value>> {
-    if ctx.via_api_key {
-        return Err(AppError::Forbidden("create API keys from the dashboard".into()));
-    }
-    let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "API key".into());
-    Ok(Json(new_api_key(&state, ctx.account_id, &name).await?))
-}
-
-async fn revoke_key(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let n = sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL")
-        .bind(id)
-        .bind(ctx.account_id)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-    if n == 0 {
-        return Err(AppError::not_found("API key"));
-    }
-    Ok(Json(json!({"ok": true})))
 }
 
 pub async fn billing_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {

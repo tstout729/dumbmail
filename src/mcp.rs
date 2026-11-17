@@ -85,9 +85,19 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let res = match crate::features::mcp_call(state, ctx, &name, &args).await {
-                Some(r) => r,
-                None => call(state, ctx, &name, args).await,
+            // Every tool needs its permission (features::team::access); successful changes are audited.
+            let res = match crate::features::team::access::authorize_tool(state, ctx, &name, &args).await {
+                Err(e) => Err(e),
+                Ok(_) => {
+                    let res = match crate::features::mcp_call(state, ctx, &name, &args).await {
+                        Some(r) => r,
+                        None => call(state, ctx, &name, args.clone()).await,
+                    };
+                    if res.is_ok() {
+                        crate::features::team::audit::after_tool(state, ctx, &name, &args).await;
+                    }
+                    res
+                }
             };
             Ok(match res {
                 Ok(v) => {

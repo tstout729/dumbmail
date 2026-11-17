@@ -391,8 +391,8 @@ async fn security_guards() {
     let (s, _) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["nope@x.test"]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // API keys can't mint more keys; revoked keys stop working.
-    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await;
+    // Only keys with the account scope can mint more keys (tests/team.rs covers scopes); revoked keys stop working.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k", "scopes": ["audience", "messaging"]}))).await;
     let k = key["key"].as_str().unwrap();
     let (s, _, _) = h.raw("POST", "/api/api-keys", &[("authorization", &format!("Bearer {k}")), ("content-type", "application/json")], "{}").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
