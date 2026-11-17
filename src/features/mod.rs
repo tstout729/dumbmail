@@ -79,6 +79,12 @@ pub trait Feature: Send + Sync {
         Ok(())
     }
 
+    /// The permission each of this feature's routes and MCP tools needs (see `team::access`).
+    /// Routes and tools left out are refused, and a test fails for any route without a rule.
+    fn access(&self) -> team::access::Access {
+        team::access::Access::default()
+    }
+
     /// Called once for each recorded event, after flows have seen it.
     async fn on_event(&self, _state: &AppState, _event_id: Uuid) -> anyhow::Result<()> {
         Ok(())

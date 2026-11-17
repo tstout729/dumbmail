@@ -249,7 +249,7 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
 /// The visitor's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For entry (the
 /// one the proxy added; earlier entries come from the visitor and can be made up). Only a valid IP counts.
 /// The per-visitor limit is a second line of defense; the per-inbox and per-account limits don't use it.
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+pub fn client_ip(headers: &HeaderMap) -> Option<String> {
     let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
     let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
     get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))

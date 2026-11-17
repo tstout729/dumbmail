@@ -17,6 +17,16 @@ The code lives at https://github.com/tstout729/dumbmail. Work in `~/projects/dum
 - Build new features as feature modules (see Layout). Change the shared files only for what a module can't do from its own.
 - Values in SQL are always bound (`push_bind`), never formatted into the query.
 - Dates people see, and day boundaries, use the account's time zone.
+- Every route and MCP tool needs a permission rule, or it's refused (403 naming the route or tool and where to add it). One guard checks them for every request, keyed on the matched route and method (`src/features/team/guard.rs`), so a handler never checks roles itself. A feature declares its rules in `access()`, with paths exactly as registered:
+
+  ```rust
+  use crate::features::team::access::{public, rule, Access, Perm, RouteRule, ToolRule};
+  static ROUTES: &[RouteRule] = &[rule("GET", "/api/things", Perm::ContentRead), rule("POST", "/api/things/{id}/send", Perm::CampaignSend), public("POST", "/webhooks/things")];
+  static TOOLS: &[ToolRule] = &[ToolRule { name: "list_things", perm: Perm::ContentRead }];
+  fn access(&self) -> Access { Access { routes: ROUTES, tools: TOOLS } }
+  ```
+
+  Pick the narrowest `Perm` in `src/features/team/access.rs` (roles and API key scopes follow from it; `Perm::TransactionalSend` is reserved for transactional sending). `public` is only for routes with no sign-in (webhooks, public pages); their handlers get no permission check. Checks that depend on data (only drafts, only teammates) go in the write itself. Record changes with `features::team::audit(state, ctx, action, target, details)` right after they commit, with fixed fields, never request bodies. `tests/team.rs` checks every rule against the real router.
 
 ## Checks
 
