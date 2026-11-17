@@ -360,7 +360,7 @@ pub async fn test(state: &AppState, integ: &Integration, script: Option<&str>, s
     let started = Instant::now();
     let slot = Slots::take_within(integ.account_id, Duration::from_secs(5))
         .await
-        .ok_or_else(|| AppError::Conflict("too many scripts are running for this account right now; try again in a few seconds".into()))?;
+        .ok_or_else(|| AppError::Busy("too many scripts are running for this account right now; try again in a few seconds".into()))?;
     let (input, pull_meta) = match sample {
         TestSample::Payload { payload, headers, query, source } => {
             let body = match &payload {

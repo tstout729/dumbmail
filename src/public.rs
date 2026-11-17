@@ -155,7 +155,8 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
     Redirect::to(&q.u).into_response()
 }
 
-fn page(title: &str, body: &str, color: &str) -> Html<String> {
+/// A small branded page (confirmations, unsubscribes) around `body`, which must already be escaped HTML.
+pub(crate) fn page(title: &str, body: &str, color: &str) -> Html<String> {
     let color = crate::render::safe_color(color, "#1f6f5c");
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{t}</title>
@@ -340,8 +341,10 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
-        if audience::is_server_only_metric(&state.db, a.id, metric).await? {
-            return Err(AppError::bad(format!("{metric:?} can only be recorded by a server (an integration or the private API)")));
+        // Message, consent and alert events come only from DumbMail itself, and an account's
+        // integration events (bookings, orders) only from a server: flows trust them.
+        if audience::is_reserved_metric(metric) || audience::is_account_server_only_metric(&state.db, a.id, metric).await? {
+            return Err(AppError::bad(format!("{:?} is recorded by DumbMail or a server and can't be sent from a browser", metric.trim())));
         }
         let input = public_profile(&state, a.id, &b["profile"])?;
         let p = match input.id {
@@ -357,7 +360,7 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         };
         let props = if b["properties"].is_object() { b["properties"].clone() } else { json!({}) };
         let value = b["value"].as_f64();
-        audience::record_event(
+        audience::record_browser_event(
             &state.db,
             NewEvent {
                 account_id: a.id,
@@ -583,7 +586,8 @@ pub fn profile_token(state: &AppState, account_id: Uuid, profile_id: Uuid) -> St
     auth::sign(&state.cfg.secret_key, &format!("p{}{}{exp:x}", profile_id.simple(), &account_id.simple().to_string()[..8]))
 }
 
-fn profile_from_token(state: &AppState, account_id: Uuid, token: &str) -> Option<Uuid> {
+/// The profile a link token (see [`profile_token`]) names, if it's genuine, for this account and not expired.
+pub fn profile_from_token(state: &AppState, account_id: Uuid, token: &str) -> Option<Uuid> {
     let payload = auth::verify(&state.cfg.secret_key, token)?;
     let rest = payload.strip_prefix('p')?;
     if rest.len() < 41 {

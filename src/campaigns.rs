@@ -443,21 +443,11 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
     finish_if_done(&state.db, c.id).await
 }
 
-/// Attribution: each conversion credited to the newest email opened/clicked in the prior 5 days,
-/// or SMS clicked in the prior 24 hours. Yields (event id, value, occurred_at, campaign_id, flow_id, flow_node_id, variant).
-pub const ATTRIBUTION_SQL: &str = "
-    SELECT e.id AS event_id, COALESCE(e.value, 0) AS value, e.occurred_at, att.campaign_id, att.flow_id, att.flow_node_id, att.variant
-    FROM events e
-    JOIN metrics mt ON mt.id = e.metric_id
-    JOIN accounts a ON a.id = e.account_id AND mt.name = a.conversion_metric
-    LEFT JOIN LATERAL (
-        SELECT m.campaign_id, m.flow_id, m.flow_node_id, m.variant FROM messages m
-        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND (
-            (m.channel = 'email' AND GREATEST(m.opened_at, m.clicked_at) BETWEEN e.occurred_at - interval '5 days' AND e.occurred_at)
-            OR (m.channel = 'sms' AND m.clicked_at BETWEEN e.occurred_at - interval '1 day' AND e.occurred_at))
-        ORDER BY GREATEST(m.opened_at, m.clicked_at) DESC LIMIT 1
-    ) att ON true
-    WHERE e.account_id = $1";
+/// Attribution: each conversion credited to a message by the account's attribution settings (by
+/// default the newest email opened or clicked in the prior 5 days, or SMS clicked in the prior 24
+/// hours). Defined with the other reporting code in `features::reports::attribution`. Yields (event
+/// id, value, occurred_at, profile_id, message_id, channel, campaign_id, flow_id, flow_node_id, variant).
+pub const ATTRIBUTION_SQL: &str = crate::features::reports::attribution::ATTRIBUTION_SQL;
 
 pub async fn stats(db: &PgPool, account_id: Uuid, campaign_id: Uuid) -> AppResult<MessageStats> {
     let q = format!("SELECT {STATS_SELECT} FROM messages m WHERE m.campaign_id = $1 AND NOT m.is_test AND m.status <> 'skipped'");

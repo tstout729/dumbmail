@@ -1,5 +1,7 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
+import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
 
@@ -204,6 +206,7 @@ export type RandomCondition = { type: "random"; percent: number; seed?: string }
 export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: Condition[] };
 
 export type Condition =
+  | ProductCondition
   | PropertyCondition
   | EventCondition
   | EventValueCondition
@@ -238,7 +241,8 @@ export type EmailBlock =
   | { type: "spacer"; height?: number }
   | { type: "columns"; columns: EmailBlock[][] }
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
-  | { type: "html"; html: string };
+  | { type: "html"; html: string }
+  | ProductsBlock;
 
 export type EmailBlockType = EmailBlock["type"];
 
