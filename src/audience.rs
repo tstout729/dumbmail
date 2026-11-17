@@ -163,7 +163,8 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         };
         match res {
             Ok(u) => {
-                crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), &u.profile).await;
+                let source = if fill_only { EventSource::Browser } else { EventSource::Api };
+                crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), &u.profile, source).await;
                 return Ok(u);
             }
             // Lost a race with another insert, or the update collided with another profile's identity.
@@ -247,10 +248,48 @@ pub fn is_reserved_metric(name: &str) -> bool {
     is_server_only_metric(name) || named(BROWSER_RESERVED_METRICS, name)
 }
 
+/// Who recorded an event. Webhook payloads carry it, so a receiver can tell browser input from
+/// data DumbMail or the business's own systems confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventSource {
+    /// DumbMail itself (sends, opens, clicks, unsubscribes, forms, alerts).
+    System,
+    /// The REST API or MCP, with an API key or a dashboard session.
+    Api,
+    /// A connected integration syncing from another system.
+    Integration,
+    /// The public browser endpoint (`/client/events`): anyone with the site key can send these.
+    Browser,
+}
+
+impl EventSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventSource::System => "system",
+            EventSource::Api => "api",
+            EventSource::Integration => "integration",
+            EventSource::Browser => "browser",
+        }
+    }
+}
+
 /// Record an event and wake any live flows triggered by that metric (and features that asked to
 /// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
-    insert_event(db, ev, false).await
+    insert_event(db, ev, EventSource::System).await
+}
+
+/// Record an event sent through the REST API or MCP.
+pub async fn record_api_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
+    insert_event(db, ev, EventSource::Api).await
+}
+
+/// Record an event with an explicit source (e.g. an integration's sync).
+pub async fn record_event_from(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
+    if source == EventSource::Browser {
+        return record_browser_event(db, ev).await;
+    }
+    insert_event(db, ev, source).await
 }
 
 /// Record an event a browser sent through the public endpoint. It's marked as such, so features
@@ -259,11 +298,12 @@ pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Op
     if is_reserved_metric(ev.metric) {
         return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", ev.metric.trim())));
     }
-    insert_event(db, ev, true).await
+    insert_event(db, ev, EventSource::Browser).await
 }
 
-async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppResult<Option<Uuid>> {
+async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
+    let metric = ev.metric.trim();
     let id = Uuid::now_v7();
     let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
     let inserted: Option<Uuid> = sqlx::query_scalar(
@@ -281,7 +321,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppR
     .bind(ev.occurred_at)
     .bind(&ev.unique_id)
     .bind(ev.message_id)
-    .bind(from_browser)
+    .bind(source == EventSource::Browser)
     .fetch_optional(db)
     .await?;
     let Some(event_id) = inserted else { return Ok(None) };
@@ -290,15 +330,26 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppR
         .bind(ev.occurred_at)
         .execute(db)
         .await?;
-    let has_flow: bool = sqlx::query_scalar(
+    // The event is recorded. Nothing below may fail the caller: a send that went out, an
+    // unsubscribe or a provider callback must not be reported as failed (or retried) because
+    // follow-up work couldn't be queued. Failures are logged.
+    crate::features::warehouse::event_recorded(db, ev.account_id, ev.profile_id, ev.message_id).await;
+    crate::features::webhooks::event_recorded(db, ev.account_id, event_id, metric, source, ev.message_id, &ev.properties).await;
+    let has_flow = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2)",
     )
     .bind(ev.account_id)
-    .bind(ev.metric)
+    .bind(metric)
     .fetch_one(db)
-    .await?;
-    if has_flow || crate::features::wants_event(db, ev.account_id, ev.metric).await {
-        crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await?;
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(event = %event_id, error = %e, "couldn't check for flows; queuing the event for them anyway");
+        true
+    });
+    if has_flow || crate::features::wants_event(db, ev.account_id, metric).await {
+        if let Err(e) = crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await {
+            tracing::error!(event = %event_id, metric, error = %e, "couldn't queue the event for flows");
+        }
     }
     Ok(Some(event_id))
 }

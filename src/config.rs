@@ -65,6 +65,11 @@ pub struct Config {
     #[arg(long, env = "WORKERS", default_value_t = 4)]
     pub workers: usize,
 
+    /// Worker tasks for background-lane jobs (webhooks, exports): these never take sending work,
+    /// and the main workers never take theirs.
+    #[arg(long, env = "BACKGROUND_WORKERS", default_value_t = 2)]
+    pub background_workers: usize,
+
     /// Stripe secret key for credit top-ups (hosted billing).
     #[arg(long, env = "STRIPE_SECRET_KEY", hide_env_values = true)]
     pub stripe_secret_key: Option<String>,

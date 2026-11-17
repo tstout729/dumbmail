@@ -24,6 +24,8 @@ struct S3State {
     fail_keys: Option<String>,
     deny: bool,
     bad_auth: usize,
+    /// Answer CompleteMultipartUpload with 200 and then an error document, as S3 can.
+    complete_error: bool,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +84,9 @@ async fn s3_handler(State(s): State<S3>, method: Method, Path((bucket, key)): Pa
             st.uploads.get_mut(id).unwrap().1.insert(n, body.to_vec());
             ([("etag", format!("\"etag-{n}\""))], "").into_response()
         }
+        ("POST", Some(_), None, _) if st.complete_error => {
+            (StatusCode::OK, "  \n  \n<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>").into_response()
+        }
         ("POST", Some(id), None, _) => {
             let (k, parts) = st.uploads.remove(id).unwrap();
             let xml = String::from_utf8_lossy(&body).to_string();
@@ -127,12 +132,13 @@ fn destination(endpoint: &str, extra: Value) -> Value {
 
 async fn run_export(h: &mut Harness, dest: &str, kind: &str) -> Value {
     let run = h.ok("POST", &format!("/api/warehouse/destinations/{dest}/runs"), Some(json!({"kind": kind}))).await;
-    h.drain().await;
+    // A new destination's first run waits a minute (see run.rs); fast-forward past it.
+    h.fast_forward().await;
     h.ok("GET", &format!("/api/warehouse/runs/{}", run["id"].as_str().unwrap()), None).await
 }
 
 #[tokio::test]
-async fn exports_each_row_once_per_window_with_a_manifest() {
+async fn exports_rows_with_their_keys_and_a_manifest() {
     let mut h = harness!();
     let (s3, endpoint) = mock_s3().await;
     h.signup().await;
@@ -162,7 +168,7 @@ async fn exports_each_row_once_per_window_with_a_manifest() {
     let profiles = s3.json_rows("profiles");
     assert_eq!(profiles.len(), 3);
     assert_eq!(profiles[0]["properties"]["plan"], "gold");
-    assert!(profiles.iter().all(|p| p["email_consent"].is_string()));
+    assert!(profiles.iter().all(|p| p["email_consent"].is_string() && p["_updated_at"].is_string()));
     let events = s3.json_rows("events");
     assert_eq!((events.len(), events[0]["metric"].as_str(), events[0]["value"].as_f64()), (1, Some("Placed Order"), Some(12.5)));
     assert_eq!(s3.json_rows("list_members").len(), 3);
@@ -177,11 +183,13 @@ async fn exports_each_row_once_per_window_with_a_manifest() {
     let ds = |name: &str| manifest["datasets"].as_array().unwrap().iter().find(|d| d["name"] == name).unwrap().clone();
     assert_eq!(ds("profiles")["rows"], 3);
     assert_eq!(ds("profiles")["mode"], "incremental");
+    assert_eq!(ds("profiles")["key"], json!(["id"]));
+    assert_eq!(ds("list_members")["key"], json!(["list_id", "profile_id"]));
     assert_eq!(ds("lists")["mode"], "snapshot");
     assert_eq!(ds("profiles")["files"][0]["rows"], 3);
     assert_eq!(run["rows"].as_i64().unwrap(), manifest["datasets"].as_array().unwrap().iter().map(|d| d["rows"].as_i64().unwrap()).sum::<i64>());
 
-    // The next run takes only what changed since: one profile, no events.
+    // The next run takes what changed since (and re-reads a 15-minute overlap): one profile, no events.
     let mark: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT exported_until FROM warehouse_watermarks WHERE dataset = 'profiles'").fetch_one(&h.state.db).await.unwrap();
     sqlx::query("UPDATE profiles SET first_name = 'Pat', updated_at = $1 + interval '1 millisecond' WHERE email = 'p2@x.test'").bind(mark).execute(&h.state.db).await.unwrap();
     let before = s3.keys("/events/").len();
@@ -200,7 +208,7 @@ async fn exports_each_row_once_per_window_with_a_manifest() {
     let key = s3.keys(&format!("run={}", full["id"].as_str().unwrap())).into_iter().find(|k| k.contains("/events/")).unwrap();
     assert!(key.ends_with(".csv.gz"));
     let lines = s3.lines(&key);
-    assert_eq!(lines[0], "id,profile_id,metric,properties,value,occurred_at,created_at,unique_id,message_id");
+    assert_eq!(lines[0], "id,profile_id,metric,properties,value,occurred_at,created_at,unique_id,message_id,from_browser,_updated_at");
     assert!(lines[1].contains("\"{\"\"sku\"\": \"\"A, B\"\"}\"") || lines[1].contains("\"{\"\"sku\"\":\"\"A, B\"\"}\""), "{}", lines[1]);
     assert_eq!(s3.bad_auth_count(), 0);
     h.cleanup().await;
@@ -240,10 +248,10 @@ async fn big_files_go_up_in_parts_and_a_failed_run_resumes() {
     s3.0.lock().unwrap().fail_keys = Some("/events/".into());
     let run = h.ok("POST", &format!("/api/warehouse/destinations/{dest}/runs"), Some(json!({"kind": "full"}))).await;
     let run_id = run["id"].as_str().unwrap().to_string();
-    h.drain().await;
+    h.fast_forward().await;
     let r = h.ok("GET", &format!("/api/warehouse/runs/{run_id}"), None).await;
     assert_eq!((r["status"].as_str(), r["attempts"].as_i64()), (Some("running"), Some(1)), "{r}");
-    assert!(r["error"].as_str().unwrap().contains("HTTP 500"), "{r}");
+    assert_eq!(r["error"], "upload failed: HTTP 500 InternalError", "{r}");
     assert!(s3.count("POST", "/profiles/", "uploads=") >= 1, "a multipart upload was used");
     assert_eq!(s3.json_rows("profiles").len(), 12_000);
     // Another run can't start while this one is going.
@@ -323,9 +331,10 @@ async fn scheduled_runs_and_mcp_tools() {
     h.signup().await;
     let d = h.ok("POST", "/api/warehouse/destinations", Some(destination(&endpoint, json!({"schedule": "hourly", "datasets": ["lists"]})))).await;
     assert!(d["next_run_at"].is_string(), "{d}");
-    // The scheduler starts the first run right away, then at the top of each hour.
+    // The scheduler starts the first run right away (it waits a minute for the baseline), then at
+    // the top of each hour.
     dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
-    h.drain().await;
+    h.fast_forward().await;
     let runs = h.ok("GET", &format!("/api/warehouse/destinations/{}/runs", d["id"].as_str().unwrap()), None).await;
     assert_eq!(runs["total"], 1, "{runs}");
     assert_eq!(runs["data"][0]["status"], "succeeded");
@@ -339,12 +348,12 @@ async fn scheduled_runs_and_mcp_tools() {
     let hdrs = [("authorization", auth.as_str()), ("content-type", "application/json")];
     let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
     let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()).await;
-    for t in ["create_export_destination", "start_export", "list_export_runs", "list_export_datasets"] {
+    for t in ["create_export_destination", "start_warehouse_export", "list_export_runs", "list_export_datasets"] {
         assert!(body.contains(t), "{t}");
     }
-    let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("start_export", json!({"id": d["id"], "kind": "full"}))).await;
+    let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("start_warehouse_export", json!({"id": d["id"], "kind": "full"}))).await;
     assert!(body.contains("dry_run"), "{body}");
-    let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("start_export", json!({"id": d["id"], "kind": "full", "confirm": true}))).await;
+    let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("start_warehouse_export", json!({"id": d["id"], "kind": "full", "confirm": true}))).await;
     let res: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(res["result"]["structuredContent"]["kind"], "full", "{res}");
     let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("delete_export_destination", json!({"id": d["id"]}))).await;
@@ -389,5 +398,137 @@ async fn real_s3_compatible_storage() {
     assert_eq!(run["status"], "succeeded", "{run}");
     assert!(run["bytes"].as_i64().unwrap() > 8 * 1024 * 1024, "big enough for a multipart upload: {run}");
     eprintln!("wrote {} rows under {prefix}; manifest {}", run["rows"], run["manifest_key"]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_message_exported_before_its_delivery_comes_back_with_its_final_status() {
+    let mut h = harness!();
+    let (s3, endpoint) = mock_s3().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "late@x.test", "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let d = h.ok("POST", "/api/warehouse/destinations", Some(destination(&endpoint, json!({"datasets": ["messages", "profiles"]})))).await;
+    let dest = d["id"].as_str().unwrap().to_string();
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Launch", "channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+
+    // The first export has the message as sent.
+    let run = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    let first = s3.json_rows("messages");
+    assert_eq!((first.len(), first[0]["status"].as_str()), (1, Some("sent")));
+    // Hours later, after the export, the provider confirms delivery. Nothing about the row's own
+    // time columns moved past the watermark except delivered_at.
+    let pid: String = sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE NOT is_test").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE messages SET created_at = now() - interval '3 hours', sent_at = now() - interval '3 hours'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE warehouse_watermarks SET exported_until = now() - interval '1 minute'").execute(&h.state.db).await.unwrap();
+    let sns = json!({"Type": "Notification", "Message": json!({"eventType": "Delivery", "mail": {"messageId": pid}}).to_string()});
+    let (s, _, _) = h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &sns.to_string()).await;
+    assert_eq!(s, 200);
+
+    // The next export has it again, with its final status, newer than the first copy.
+    let run2 = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(run2["status"], "succeeded", "{run2}");
+    let run2_id = run2["id"].as_str().unwrap();
+    let again: Vec<Value> = s3.keys(&format!("run={run2_id}")).iter().filter(|k| k.contains("/messages/")).flat_map(|k| s3.lines(k)).map(|l| serde_json::from_str(&l).unwrap()).collect();
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0]["id"], first[0]["id"]);
+    assert_eq!(again[0]["status"], "delivered");
+    assert!(again[0]["delivered_at"].is_string());
+    let (a, b): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) = (first[0]["_updated_at"].as_str().unwrap().parse().unwrap(), again[0]["_updated_at"].as_str().unwrap().parse().unwrap());
+    assert!(b > a, "keep the copy with the latest _updated_at");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_upload_is_done_only_when_the_storage_service_says_so() {
+    let mut h = harness!();
+    let (s3, endpoint) = mock_s3().await;
+    h.signup().await;
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    // Big enough for a multipart upload.
+    sqlx::query(
+        "INSERT INTO profiles (id, account_id, email, properties, created_at, updated_at)
+         SELECT gen_random_uuid(), $1, 'mp' || i || '@x.test', jsonb_build_object('blob', (SELECT string_agg(md5(random()::text || i || j), '') FROM generate_series(1, 64) j)),
+                now() - interval '1 hour', now() - interval '1 hour'
+         FROM generate_series(1, 12000) i",
+    )
+    .bind(account)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let d = h.ok("POST", "/api/warehouse/destinations", Some(destination(&endpoint, json!({"datasets": ["profiles"]})))).await;
+    let dest = d["id"].as_str().unwrap().to_string();
+
+    // CompleteMultipartUpload answers 200, then an error document: that's a failure.
+    s3.0.lock().unwrap().complete_error = true;
+    let run = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(run["status"], "running", "{run}");
+    assert_eq!(run["error"], "finishing a multipart upload failed: HTTP 200 InternalError", "{run}");
+    assert_eq!(run["files"], 0);
+    assert!(run["manifest_key"].is_null());
+    assert!(s3.keys("_manifests/").is_empty(), "no manifest for a file that never completed");
+    assert_eq!(s3.count("DELETE", "/profiles/", "uploadId="), 1, "the upload was aborted");
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM warehouse_watermarks").fetch_one(&h.state.db).await.unwrap(), 0);
+    // Nothing the storage service said is kept beyond its code.
+    let err = sqlx::query_scalar::<_, Option<String>>("SELECT error FROM warehouse_runs").fetch_one(&h.state.db).await.unwrap().unwrap();
+    assert!(!err.contains("encountered"), "{err}");
+
+    // When it works again the run finishes, and only then do the manifest and watermark appear.
+    s3.0.lock().unwrap().complete_error = false;
+    h.fast_forward().await;
+    let r = h.ok("GET", &format!("/api/warehouse/runs/{}", run["id"].as_str().unwrap()), None).await;
+    assert_eq!(r["status"], "succeeded", "{r}");
+    assert_eq!(s3.json_rows("profiles").len(), 12_000);
+    assert_eq!(s3.keys("_manifests/").len(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM warehouse_watermarks").fetch_one(&h.state.db).await.unwrap(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn moving_a_destination_cancels_its_run_and_needs_its_keys_again() {
+    let mut h = harness!();
+    let (s3, endpoint) = mock_s3().await;
+    let (s3b, endpoint_b) = mock_s3().await;
+    h.signup().await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "m1@x.test"}))).await;
+    let d = h.ok("POST", "/api/warehouse/destinations", Some(destination(&endpoint, json!({"datasets": ["profiles", "lists"]})))).await;
+    let dest = d["id"].as_str().unwrap().to_string();
+    let run = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM warehouse_watermarks").fetch_one(&h.state.db).await.unwrap(), 1);
+
+    // A run is waiting when the destination moves to another host.
+    let waiting = h.ok("POST", &format!("/api/warehouse/destinations/{dest}/runs"), Some(json!({"kind": "incremental"}))).await;
+    // The saved keys are never sent to a new host: they must be given again.
+    let (s, v) = h.req("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"endpoint": endpoint_b}))).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("access_key_id"), "{v}");
+    assert_eq!(s3b.0.lock().unwrap().log.len(), 0, "nothing was signed for the new host with the old keys");
+    let moved = h.ok("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"endpoint": endpoint_b, "access_key_id": "AKTEST123456", "secret_access_key": "another-secret"}))).await;
+    assert!(moved["id"].is_string());
+    let w = h.ok("GET", &format!("/api/warehouse/runs/{}", waiting["id"].as_str().unwrap()), None).await;
+    assert_eq!((w["status"].as_str(), w["error"].as_str()), (Some("cancelled"), Some("destination_changed")), "{w}");
+    // The next run starts a fresh baseline at the new place: every row, not just changes.
+    h.fast_forward().await;
+    let before = s3.objects().len();
+    let run2 = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(run2["status"], "succeeded", "{run2}");
+    assert!(run2["datasets"][0]["after"].is_null(), "{run2}");
+    assert_eq!(s3b.json_rows("profiles").len(), 1);
+    assert_eq!(s3.objects().len(), before, "nothing more went to the old bucket");
+
+    // A prefix change is a move too; a run reads its settings once, when it starts.
+    let r3 = h.ok("POST", &format!("/api/warehouse/destinations/{dest}/runs"), Some(json!({"kind": "full"}))).await;
+    h.ok("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"name": "Renamed"}))).await;
+    h.fast_forward().await;
+    let r3 = h.ok("GET", &format!("/api/warehouse/runs/{}", r3["id"].as_str().unwrap()), None).await;
+    assert_eq!(r3["status"], "succeeded", "a rename doesn't stop a run: {r3}");
+    let (s, _) = h.req("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"prefix": "dm/./x"}))).await;
+    assert_eq!(s, 400, "dot segments would change the signed path");
     h.cleanup().await;
 }

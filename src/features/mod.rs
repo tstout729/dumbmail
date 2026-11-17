@@ -12,6 +12,7 @@ pub mod content;
 pub mod coupons;
 pub mod hub;
 pub mod inbox;
+pub mod indexes;
 pub mod integrations;
 pub mod klaviyo_import;
 pub mod objects;

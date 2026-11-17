@@ -30,9 +30,20 @@ Self-hosted servers set "DumbMail address" (an advanced field).
 
 Attaching calls `POST /api/hooks {url, topic, metric, source: "make"}`, which subscribes the
 Make webhook URL to one DumbMail topic and returns its id; detaching calls
-`DELETE /api/hooks/{id}`. DumbMail sends each event as one signed JSON envelope
-(`{id, topic, created_at, account_id, api_version, data}`); if Make ever answers 410 Gone, DumbMail
-removes the hook.
+`DELETE /api/hooks/{id}`. A hook belongs to the API key that made it: that key can list and delete
+only its own hooks, and revoking the key removes them. DumbMail sends each event as one signed JSON
+envelope (`{id, topic, created_at, account_id, api_version, source, data}`); if Make ever answers
+410 Gone, DumbMail removes the hook.
+
+**The webhook URL is the credential.** Make's custom-app webhooks accept whatever is posted to
+their URL; the app can't check DumbMail's `DumbMail-Webhook-Signature` there (it would need the
+endpoint's signing secret, which the attach step receives but Make's webhook communication can't
+use to verify a request). So anyone who learns a scenario's webhook URL can feed it fake events.
+Tell users, in the app's description and help: treat the webhook URL like a password, don't share
+it, and if it leaks, delete the webhook in Make and create a new one (DumbMail drops the old hook
+when Make answers 410). Check `source` in the envelope: only `system`, `api` and `integration`
+events should drive anything that moves money or ships goods; `browser` events can be sent by
+anyone with the site's public key.
 
 **RPC** `listLists`: `rpcs/listLists/communication.imljson` fills the List dropdowns.
 
@@ -47,7 +58,8 @@ removes the hook.
 | `removeFromList` | Action | Remove a profile from a list | Removes a profile from a list (find its ID with Search profiles). | same |
 | `unsubscribeEmail` | Action | Unsubscribe from email | Unsubscribes an email address from marketing email. | same |
 | `unsubscribeSms` | Action | Unsubscribe from texts | Unsubscribes a phone number from marketing texts. | same |
-| `searchProfiles` | Search | Search profiles | Finds profiles by email, phone number, name or external ID. | same |
+| `searchProfiles` | Search | Search profiles | Finds profiles by email, phone number, name or external ID. Pages through results 100 at a time up to the limit. | same |
+| `makeApiCall` | Universal (REST) | Make an API call | Calls any DumbMail API route with the connection's key. The path is always under `/api/` on the connection's DumbMail address, so the key is never sent anywhere else. | `communication`, `mappable-parameters`, `interface` |
 
 Every module uses the `dumbmail` connection. Files map to tabs by name: `communication.imljson` →
 Communication, `mappable-parameters.imljson` → Mappable parameters, `interface.imljson` →
@@ -56,6 +68,13 @@ choices live on the webhook).
 
 The actions call the regular DumbMail API: `POST /api/profiles`, `POST /api/events`,
 `POST|DELETE /api/lists/{id}/members`, `GET /api/profiles?q=`, `GET /api/lists`.
+
+## Make's review requirements
+
+- A universal module (`makeApiCall`), using a relative path only.
+- Searches paginate (`searchProfiles`, with `pagination` and a stop condition).
+- The key is hidden in logs (`base.imljson` sanitizes the Authorization header).
+- Every module has a label, a description and an interface.
 
 ## Publish
 

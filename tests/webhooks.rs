@@ -108,11 +108,14 @@ async fn events_reach_a_subscribed_endpoint_signed_without_any_flow() {
     let listed = h.ok("GET", "/api/webhooks", None).await;
     assert!(!listed.to_string().contains(&secret));
 
-    // A metric it doesn't want: still no job. The one it wants: one job, one signed request.
+    // A metric it doesn't want: nothing queued at all. The one it wants: one outbox row and one
+    // background fan-out job, never a flow job, and one signed request.
     h.ok("POST", "/api/events", Some(json!({"metric": "Viewed Product", "profile": {"email": "a@x.test"}}))).await;
-    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'flow_event'").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 0);
     h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "a@x.test", "first_name": "Ann"}, "properties": {"total": 42}, "value": 42, "unique_id": "o-1"}))).await;
-    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'flow_event'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'flow_event'").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'webhooks_fanout' AND lane = 'background'").await, 1);
     h.drain().await;
     let hits = rx.hits();
     assert_eq!(hits.len(), 1, "{hits:?}");
@@ -123,6 +126,7 @@ async fn events_reach_a_subscribed_endpoint_signed_without_any_flow() {
     assert_eq!(env["data"]["event"]["metric"], "Placed Order");
     assert_eq!(env["data"]["event"]["value"], 42.0);
     assert_eq!(env["data"]["profile"]["email"], "a@x.test");
+    assert_eq!(env["source"], "api", "recorded through the API");
     assert!(env["id"].as_str().is_some());
     assert!(verify(&secret, &hits[0]), "signature doesn't verify");
     assert!(!verify("whsec_wrong", &hits[0]));
@@ -134,6 +138,7 @@ async fn events_reach_a_subscribed_endpoint_signed_without_any_flow() {
     assert_eq!(log["data"][0]["response_code"], 200);
     let d = h.ok("GET", &format!("/api/webhooks/{id}/deliveries/{}", log["data"][0]["id"].as_str().unwrap()), None).await;
     assert_eq!(d["payload"]["id"], env["id"]);
+    assert!(d.get("response_body").is_none(), "response bodies are never kept: {d}");
     h.cleanup().await;
 }
 
@@ -171,6 +176,7 @@ async fn profile_list_and_flow_topics() {
     let unsub = envs.iter().find(|e| e["topic"] == "profile.unsubscribed").unwrap();
     assert_eq!(unsub["data"]["channel"], "email");
     assert_eq!(unsub["data"]["reason"], "profile_update");
+    assert_eq!((unsub["data"]["before"].as_str(), unsub["data"]["after"].as_str()), (Some("subscribed"), Some("unsubscribed")));
     let added = envs.iter().find(|e| e["topic"] == "list.member_added" && e["data"]["list"]["name"] == "VIP").unwrap();
     assert_eq!(added["data"]["profile"]["email"], "b@x.test");
     let flow_ev = envs.iter().find(|e| e["topic"] == "flow.status_changed").unwrap();
@@ -226,7 +232,7 @@ async fn failures_back_off_retry_and_turn_the_endpoint_off_after_three_days() {
     assert!(e["next_retry_at"].is_string());
     let log = h.ok("GET", &format!("/api/webhooks/{id}/deliveries"), None).await;
     assert_eq!((log["data"][0]["status"].as_str(), log["data"][0]["attempts"].as_i64(), log["data"][0]["response_code"].as_i64()), (Some("pending"), Some(1), Some(500)));
-    assert_eq!(log["data"][0]["error"], "HTTP 500");
+    assert_eq!(log["data"][0]["error"], "http_error");
     // While it backs off, new events wait instead of hitting it again.
     h.ok("POST", "/api/profiles", Some(json!({"email": "c2@x.test"}))).await;
     h.fast_forward().await;
@@ -247,7 +253,10 @@ async fn failures_back_off_retry_and_turn_the_endpoint_off_after_three_days() {
     h.drain().await;
     sqlx::query("UPDATE webhook_deliveries SET expires_at = now() - interval '1 minute' WHERE status = 'pending'").execute(&h.state.db).await.unwrap();
     retry_now(&h).await;
+    // The every-minute sweep fails it, whether or not anything else is sent.
+    dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
     assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'failed'").await, 1);
+    assert_eq!(count(&h, "SELECT pending::bigint FROM webhook_endpoints").await, 0);
 
     // Failing for three days turns it off and emails the account.
     rx.answer(&[500, 500]);
@@ -266,10 +275,14 @@ async fn failures_back_off_retry_and_turn_the_endpoint_off_after_three_days() {
     h.fast_forward().await;
     assert_eq!(rx.hits().len(), before);
 
-    // Turned back on and resent: the failed ones go out again.
+    // Turned back on: what was still waiting (c4, inside its 24 hours) goes out, and a resend
+    // sends the one that had failed (c3).
     h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"enabled": true}))).await;
     let r = h.ok("POST", &format!("/api/webhooks/{id}/resend"), Some(json!({"since": "2020-01-01T00:00:00Z"}))).await;
-    assert_eq!(r["resent"], 2, "{r}");
+    assert_eq!(r["resent"], 1, "{r}");
+    // One resend a minute: it's the claim, so a second one now is refused.
+    let (s, _) = h.req("POST", &format!("/api/webhooks/{id}/resend"), Some(json!({"since": "2020-01-01T00:00:00Z"}))).await;
+    assert_eq!(s, 429);
     h.drain().await;
     let emails: Vec<String> = rx.hits()[before..].iter().map(|x| x.body["data"]["profile"]["email"].as_str().unwrap().to_string()).collect();
     assert_eq!(emails, vec!["c3@x.test", "c4@x.test"]);
@@ -308,6 +321,11 @@ async fn batches_tests_rotation_filters_and_limits() {
     let rot = h.ok("POST", &format!("/api/webhooks/{id}/rotate-secret"), None).await;
     let new = rot["secret"].as_str().unwrap().to_string();
     assert_ne!(old, new);
+    // A test goes out on the endpoint's one-at-a-time lease: while a delivery holds it, it waits.
+    sqlx::query("UPDATE webhook_endpoints SET lease_until = now() + interval '1 minute'").execute(&h.state.db).await.unwrap();
+    let (s, _) = h.req("POST", &format!("/api/webhooks/{id}/test"), Some(json!({"topic": "message.opened"}))).await;
+    assert_eq!(s, 429);
+    sqlx::query("UPDATE webhook_endpoints SET lease_until = NULL").execute(&h.state.db).await.unwrap();
     let t = h.ok("POST", &format!("/api/webhooks/{id}/test"), Some(json!({"topic": "message.opened"}))).await;
     assert_eq!(t["ok"], true, "{t}");
     assert_eq!(t["delivery"]["test"], true);
@@ -413,6 +431,13 @@ async fn mcp_tools_for_webhooks() {
     for t in ["create_webhook", "list_webhook_deliveries", "resend_webhook_deliveries", "rotate_flow_webhook_secret"] {
         assert!(body.contains(t), "{t} missing");
     }
+    // Every tool name is used once (two features defining one name would hide one of them).
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let mut names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let n = names.len();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), n, "duplicate MCP tool names");
     let (_, _, body) = h.raw("POST", "/mcp", &hdrs, &call("create_webhook", json!({"url": format!("{base}/m"), "topics": ["profile.created"]}))).await;
     let res: Value = serde_json::from_str(&body).unwrap();
     let created = &res["result"]["structuredContent"];
@@ -487,5 +512,289 @@ async fn message_segment_and_form_topics() {
     assert_eq!(by("segment.left")["data"]["segment"]["name"], "VIPs");
     let f = by("form.submitted");
     assert_eq!((f["data"]["form"]["name"].as_str(), f["data"]["profile"]["email"].as_str()), (Some("Popup"), Some("fan@x.test")));
+    h.cleanup().await;
+}
+
+/// A list of `n` subscribed profiles, imported. Returns its id.
+async fn email_list(h: &mut Harness, prefix: &str, n: usize) -> String {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": prefix}))).await;
+    let mut csv = String::from("email\n");
+    for i in 0..n {
+        csv.push_str(&format!("{prefix}{i}@x.test\n"));
+    }
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    list["id"].as_str().unwrap().to_string()
+}
+
+async fn send_campaign(h: &mut Harness, list_id: &str) -> String {
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Launch", "channel": "email", "audience": {"include": [{"type": "list", "id": list_id}]},
+        "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{id}/send"), None).await;
+    id
+}
+
+async fn ses(h: &Harness, msg: Value) -> axum::http::StatusCode {
+    let sns = json!({"Type": "Notification", "Message": msg.to_string()});
+    h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &sns.to_string()).await.0
+}
+
+#[tokio::test]
+async fn a_broken_outbox_never_breaks_sending_unsubscribes_or_provider_callbacks() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["event.tracked", "message.sent", "message.delivered", "message.bounced",
+        "profile.unsubscribed", "profile.suppressed", "campaign.sent", "campaign.finished", "segment.entered", "segment.left", "list.member_added"]}))).await;
+    let seg = h.ok("POST", "/api/segments", Some(json!({"name": "Everyone", "definition": {"match": "all", "conditions": [{"type": "property", "field": "x", "op": "eq", "value": 1}]}}))).await;
+    let seg_id: uuid::Uuid = seg["id"].as_str().unwrap().parse().unwrap();
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    let list = email_list(&mut h, "obs", 3).await;
+    h.drain().await;
+    let before = rx.hits().len();
+
+    // From here on every write to the outbox fails.
+    sqlx::query("ALTER TABLE webhook_outbox ADD CONSTRAINT outbox_down CHECK (false) NOT VALID").execute(&h.state.db).await.unwrap();
+
+    // A campaign still sends in full and finishes; nothing is marked failed.
+    let cid = send_campaign(&mut h, &list).await;
+    h.drain().await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sent", "{c}");
+    assert_eq!(count(&h, "SELECT count(*) FROM messages WHERE status = 'sent' AND NOT is_test").await, 3);
+    assert_eq!(count(&h, "SELECT count(*) FROM messages WHERE status = 'failed'").await, 0);
+
+    // An unsubscribe link still unsubscribes.
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "obs0@x.test").unwrap();
+    let unsub = mail.unsubscribe_url.clone().unwrap();
+    let (s, _, body) = h.raw("POST", unsub.trim_start_matches("https://pl.test"), &[("content-type", "application/x-www-form-urlencoded")], "").await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'obs0@x.test' AND email_consent = 'unsubscribed'").await, 1);
+
+    // Provider callbacks still land: a delivery and a hard bounce.
+    let ids: Vec<String> = sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE NOT is_test ORDER BY to_address").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(ses(&h, json!({"eventType": "Delivery", "mail": {"messageId": ids[1]}})).await, 200);
+    assert_eq!(ses(&h, json!({"notificationType": "Bounce", "mail": {"messageId": ids[2]}, "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}})).await, 200);
+    assert_eq!(count(&h, "SELECT count(*) FROM messages WHERE status = 'delivered'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM messages WHERE status = 'bounced'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email_suppressed_reason = 'hard_bounce'").await, 1);
+
+    // A segment refresh (its webhook rows go in its own transaction) still commits.
+    sqlx::query("UPDATE profiles SET properties = '{\"x\": 1}'").execute(&h.state.db).await.unwrap();
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    assert_eq!(count(&h, "SELECT member_count::bigint FROM segments").await, 3);
+    // So does adding people to a list, and tracking an event.
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "late@x.test", "list_ids": [list]}))).await;
+    assert!(p["id"].is_string());
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "late@x.test"}}))).await;
+    h.drain().await;
+    assert_eq!(rx.hits().len(), before, "nothing could be queued, and nothing else broke");
+
+    // Once the outbox works again, so do webhooks.
+    sqlx::query("ALTER TABLE webhook_outbox DROP CONSTRAINT outbox_down").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "late@x.test"}}))).await;
+    h.drain().await;
+    assert!(rx.topics().iter().any(|t| t == "event.tracked"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_big_send_with_a_subscriber_makes_no_job_per_message_and_stays_off_the_main_workers() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    let list = email_list(&mut h, "big", 250).await;
+    h.drain().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["message.sent"], "batch_size": 100}))).await;
+    let cid = send_campaign(&mut h, &list).await;
+
+    // The main workers send the whole campaign without touching webhook work.
+    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::MAIN).await.unwrap();
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    assert_eq!(count(&h, "SELECT count(*) FROM messages WHERE status = 'sent' AND NOT is_test").await, 250);
+    assert!(rx.hits().is_empty(), "the main workers sent no webhooks");
+    // No job per message: no flow job (no flow wants these events), one fan-out job in the background lane.
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'flow_event'").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind LIKE 'webhooks_%' AND lane = 'main'").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind LIKE 'webhooks_%'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox WHERE topic = 'message.sent'").await, 250);
+
+    // The background workers deliver them, 100 to a request.
+    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::BACKGROUND).await.unwrap();
+    assert_eq!(rx.envelopes().len(), 250);
+    assert_eq!(rx.hits().len(), 3);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 0);
+    assert_eq!(count(&h, "SELECT pending::bigint FROM webhook_endpoints").await, 0);
+    let ids: std::collections::HashSet<String> = rx.envelopes().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids.len(), 250, "every event has its own id");
+    assert!(rx.envelopes().iter().all(|e| e["source"] == "system" && e["data"]["message"]["campaign_id"] == cid.as_str()));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn changing_the_url_cancels_what_was_waiting_for_the_old_one() {
+    let mut h = harness!();
+    let (old_rx, old_base) = receiver().await;
+    let (new_rx, new_base) = receiver().await;
+    h.signup().await;
+    let ep = h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{old_base}/hook"), "topics": ["profile.created"], "batch_size": 1}))).await;
+    let id = ep["id"].as_str().unwrap().to_string();
+    old_rx.answer(&[500]);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "q1@x.test"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "q2@x.test"}))).await;
+    h.drain().await;
+    assert_eq!(old_rx.hits().len(), 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'pending'").await, 2);
+
+    // A new receiver: what was queued for the old URL is cancelled, never sent to the new one.
+    let e = h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"url": format!("{new_base}/hook")}))).await;
+    assert_eq!(e["revision"], 2);
+    assert_eq!(e["stats"]["pending"], 0);
+    let log = h.ok("GET", &format!("/api/webhooks/{id}/deliveries?status=cancelled"), None).await;
+    assert_eq!(log["total"], 2, "{log}");
+    assert_eq!(log["data"][0]["error"], "url_changed");
+    retry_now(&h).await;
+    assert!(new_rx.hits().is_empty(), "old deliveries went to the new URL: {:?}", new_rx.hits());
+    // Nor can a resend send them there.
+    let r = h.ok("POST", &format!("/api/webhooks/{id}/resend"), Some(json!({"since": "2020-01-01T00:00:00Z", "status": "all"}))).await;
+    assert_eq!(r["resent"], 0, "{r}");
+
+    // New events go to the new URL.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "q3@x.test"}))).await;
+    h.drain().await;
+    let got: Vec<String> = new_rx.envelopes().iter().map(|e| e["data"]["profile"]["email"].as_str().unwrap().to_string()).collect();
+    assert_eq!(got, vec!["q3@x.test"]);
+    assert_eq!(old_rx.hits().len(), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn every_event_says_who_sent_it_and_browser_ones_can_be_left_out() {
+    let mut h = harness!();
+    let (all_rx, all_base) = receiver().await;
+    let (trusted_rx, trusted_base) = receiver().await;
+    h.signup().await;
+    let pk = h.ok("GET", "/api/me", None).await["account"]["public_key"].as_str().unwrap().to_string();
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{all_base}/all"), "topics": ["event.tracked", "message.sent"]}))).await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{trusted_base}/t"), "topics": ["event.tracked"], "trusted_only": true}))).await;
+
+    // A browser with the public key can send any non-reserved metric, including "Placed Order".
+    let (s, _, b) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
+        &json!({"metric": "Placed Order", "value": 999, "profile": {"email": "forger@x.test"}}).to_string()).await;
+    assert_eq!(s, 200, "{b}");
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "value": 20, "profile": {"email": "real@x.test"}}))).await;
+    // An API client may record a message metric (imports do), but that's not a message DumbMail sent.
+    h.ok("POST", "/api/events", Some(json!({"metric": "Received Email", "profile": {"email": "real@x.test"}}))).await;
+    h.drain().await;
+
+    let all = all_rx.envelopes();
+    let src = |rx: &[Value], email: &str| rx.iter().find(|e| e["data"]["profile"]["email"] == email && e["data"]["event"]["metric"] == "Placed Order").map(|e| e["source"].clone());
+    assert_eq!(src(&all, "forger@x.test"), Some(json!("browser")));
+    assert_eq!(src(&all, "real@x.test"), Some(json!("api")));
+    assert!(!all.iter().any(|e| e["topic"] == "message.sent"), "a recorded metric doesn't make a message topic");
+    let trusted = trusted_rx.envelopes();
+    assert_eq!(src(&trusted, "forger@x.test"), None, "trusted_only leaves browser events out");
+    assert_eq!(src(&trusted, "real@x.test"), Some(json!("api")));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn consent_changes_carry_before_and_after_and_repeat_callbacks_are_told_once() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    let list = email_list(&mut h, "rep", 1).await;
+    h.drain().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "batch_size": 1, "topics": ["message.delivered", "profile.unsubscribed", "profile.suppressed"]}))).await;
+    send_campaign(&mut h, &list).await;
+    h.drain().await;
+    let pid: String = sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE NOT is_test").fetch_one(&h.state.db).await.unwrap();
+    // SNS repeats notifications; a repeat isn't a new delivery.
+    for _ in 0..3 {
+        assert_eq!(ses(&h, json!({"eventType": "Delivery", "mail": {"messageId": pid}})).await, 200);
+    }
+    let mail = h.state.email.sent().into_iter().find(|m| m.to == "rep0@x.test").unwrap();
+    let unsub = mail.unsubscribe_url.clone().unwrap();
+    for _ in 0..2 {
+        h.raw("POST", unsub.trim_start_matches("https://pl.test"), &[("content-type", "application/x-www-form-urlencoded")], "").await;
+    }
+    h.drain().await;
+    let topics = rx.topics();
+    assert_eq!(topics.iter().filter(|t| *t == "message.delivered").count(), 1, "{topics:?}");
+    assert_eq!(topics.iter().filter(|t| *t == "profile.unsubscribed").count(), 1, "{topics:?}");
+    let u = rx.envelopes().into_iter().find(|e| e["topic"] == "profile.unsubscribed").unwrap();
+    assert_eq!((u["data"]["before"].as_str(), u["data"]["after"].as_str(), u["data"]["reason"].as_str()), (Some("subscribed"), Some("unsubscribed"), Some("unsubscribe_link")));
+    assert_eq!(u["data"]["profile"]["email"], "rep0@x.test");
+    // A bounce on an address already unsubscribed isn't reported as an unsubscribe; it is a suppression.
+    assert_eq!(ses(&h, json!({"notificationType": "Bounce", "mail": {"messageId": pid}, "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}})).await, 200);
+    assert_eq!(ses(&h, json!({"notificationType": "Bounce", "mail": {"messageId": pid}, "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}})).await, 200);
+    h.drain().await;
+    let topics = rx.topics();
+    assert_eq!(topics.iter().filter(|t| *t == "profile.suppressed").count(), 1, "{topics:?}");
+    assert_eq!(topics.iter().filter(|t| *t == "profile.unsubscribed").count(), 1, "{topics:?}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn rest_hooks_belong_to_the_key_that_made_them() {
+    let mut h = harness!();
+    let (_rx, base) = receiver().await;
+    h.signup().await;
+    let key_a = h.ok("POST", "/api/api-keys", Some(json!({"name": "Zapier"}))).await["key"].as_str().unwrap().to_string();
+    let key_b = h.ok("POST", "/api/api-keys", Some(json!({"name": "Make"}))).await["key"].as_str().unwrap().to_string();
+    let (auth_a, auth_b) = (format!("Bearer {key_a}"), format!("Bearer {key_b}"));
+    let a = [("authorization", auth_a.as_str()), ("content-type", "application/json")];
+    let b = [("authorization", auth_b.as_str()), ("content-type", "application/json")];
+    let dash = h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/dash"), "topics": ["profile.created"]}))).await;
+    let (s, _, body) = h.raw("POST", "/api/hooks", &a, &json!({"hookUrl": format!("{base}/zap"), "topic": "profile.created", "source": "zapier"}).to_string()).await;
+    assert_eq!(s, 201, "{body}");
+    let hook: Value = serde_json::from_str(&body).unwrap();
+
+    // Each key sees and deletes only its own hooks; never a dashboard endpoint.
+    let (_, _, body) = h.raw("GET", "/api/hooks", &a, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["total"], 1);
+    let (_, _, body) = h.raw("GET", "/api/hooks", &b, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["total"], 0);
+    let (s, _, _) = h.raw("DELETE", &format!("/api/hooks/{}", hook["id"].as_str().unwrap()), &b, "").await;
+    assert_eq!(s, 404);
+    let (s, _, _) = h.raw("DELETE", &format!("/api/hooks/{}", dash["id"].as_str().unwrap()), &a, "").await;
+    assert_eq!(s, 404);
+    assert_eq!(h.ok("GET", "/api/webhooks", None).await["total"], 2);
+    // REST hooks are for API keys, not dashboard sessions.
+    let (s, _) = h.req("POST", "/api/hooks", Some(json!({"hookUrl": format!("{base}/x"), "topic": "profile.created"}))).await;
+    assert_eq!(s, 403);
+    // Revoking the key removes its hooks.
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE name = 'Zapier'").fetch_one(&h.state.db).await.unwrap();
+    h.ok("DELETE", &format!("/api/api-keys/{key_id}"), None).await;
+    dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    assert_eq!(h.ok("GET", "/api/webhooks", None).await["total"], 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failing_endpoint_is_turned_off_after_three_days_even_with_no_more_traffic() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    let ep = h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["profile.created"], "batch_size": 1}))).await;
+    let id = ep["id"].as_str().unwrap().to_string();
+    rx.answer(&[500]);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "once@x.test"}))).await;
+    h.drain().await;
+    // Its last delivery expired long ago and nothing else is sent; the sweep still turns it off.
+    sqlx::query("UPDATE webhook_deliveries SET expires_at = now() - interval '1 day'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE webhook_endpoints SET failing_since = now() - interval '4 days', retry_at = NULL").execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    let e = h.ok("GET", &format!("/api/webhooks/{id}"), None).await;
+    assert_eq!(e["status"], "disabled", "{e}");
+    let alert = h.state.email.sent().into_iter().find(|m| m.subject == "A webhook endpoint was turned off").unwrap();
+    // The alert names the endpoint by host, never by its full URL (which can be a credential).
+    assert!(!alert.text.contains("/hook") && alert.text.contains("127.0.0.1"), "{}", alert.text);
+    assert_eq!(alert.from_email, "help@pl.test");
+    assert_eq!(alert.to, "owner@acme.test");
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'failed' AND error = 'expired'").await, 1);
     h.cleanup().await;
 }

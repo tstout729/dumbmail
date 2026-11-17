@@ -56,6 +56,29 @@ describe('REST hook trigger', () => {
     const samples = await appTester(trigger.performList, { authData, inputData: { metric: 'Placed Order' } });
     expect(samples[0].id).toBe('e1');
   });
+
+  it('drops deliveries DumbMail did not sign', async () => {
+    const crypto = require('crypto');
+    const secret = 'whsec_test';
+    const env = { id: 'e2', topic: 'event.tracked', source: 'api', data: {} };
+    const content = JSON.stringify(env);
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.createHmac('sha256', secret).update(`${ts}.${content}`).digest('hex');
+    const raw = (signature, timestamp = ts) => ({
+      method: 'POST',
+      content,
+      headers: { 'Http-Dumbmail-Webhook-Timestamp': timestamp, 'Http-Dumbmail-Webhook-Signature': signature },
+    });
+    const subscribeData = { id: 'h1', secret };
+    const ok = await appTester(trigger.perform, { authData, subscribeData, cleanedRequest: env, rawRequest: raw(`v1=${sig}`) });
+    expect(ok).toEqual([env]);
+    const forged = await appTester(trigger.perform, { authData, subscribeData, cleanedRequest: env, rawRequest: raw(`v1=${'0'.repeat(64)}`) });
+    expect(forged).toEqual([]);
+    const unsigned = await appTester(trigger.perform, { authData, subscribeData, cleanedRequest: env, rawRequest: { method: 'POST', content, headers: {} } });
+    expect(unsigned).toEqual([]);
+    const old = await appTester(trigger.perform, { authData, subscribeData, cleanedRequest: env, rawRequest: raw(`v1=${sig}`, String(Number(ts) - 3600)) });
+    expect(old).toEqual([]);
+  });
 });
 
 describe('actions', () => {

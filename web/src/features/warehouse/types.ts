@@ -1,6 +1,6 @@
-export type DatasetInfo = { name: string; mode: "incremental" | "snapshot"; description: string; columns: string[] };
+export type DatasetInfo = { name: string; mode: "incremental" | "snapshot"; description: string; key: string[]; columns: string[] };
 
-export type RunStatus = "queued" | "running" | "succeeded" | "failed";
+export type RunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 export type RunDataset = { name: string; mode: "incremental" | "snapshot"; rows: number; files: number; done: boolean; after: string | null; through: string };
 

@@ -11,6 +11,7 @@ export type Endpoint = {
   topics: string[];
   metrics: string[];
   filter: FilterCondition[] | null;
+  trusted_only: boolean;
   enabled: boolean;
   status: EndpointStatus;
   source: "dashboard" | "api" | "zapier" | "make";
@@ -26,7 +27,8 @@ export type Endpoint = {
   last_failure_at: string | null;
   created_at: string;
   updated_at: string;
-  stats: { pending: number; delivered_24h: number; failed_24h: number };
+  revision: number;
+  stats: { pending: number; delivered_24h: number; failed_24h: number; dropped_total: number; last_dropped_at: string | null };
 };
 
 export type CreatedEndpoint = Endpoint & { secret: string };
@@ -36,12 +38,13 @@ export type EndpointInput = {
   description?: string;
   topics?: string[];
   metrics?: string[];
+  trusted_only?: boolean;
   enabled?: boolean;
   batch_size?: number;
   rate_per_second?: number;
 };
 
-export type DeliveryStatus = "pending" | "delivered" | "failed";
+export type DeliveryStatus = "pending" | "sending" | "delivered" | "failed" | "dropped" | "cancelled";
 
 export type Delivery = {
   id: string;
@@ -59,9 +62,9 @@ export type Delivery = {
   created_at: string;
 };
 
-export type DeliveryDetail = Delivery & { payload: unknown; response_body: string | null };
+export type DeliveryDetail = Delivery & { payload: unknown };
 
-export type TestResult = { ok: boolean; delivery: Delivery; response_body: string | null };
+export type TestResult = { ok: boolean; delivery: Delivery };
 
 export type RotatedSecret = { secret: string; secret_hint: string; previous_secret_valid_until?: string };
 

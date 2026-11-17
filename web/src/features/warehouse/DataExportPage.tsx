@@ -44,8 +44,18 @@ function providerOf(d: Destination): Provider {
   return "other";
 }
 
-const runTone: Record<RunStatus, Tone> = { queued: "gray", running: "amber", succeeded: "green", failed: "red" };
-const runLabel: Record<RunStatus, string> = { queued: "Queued", running: "Running", succeeded: "Done", failed: "Failed" };
+const runTone: Record<RunStatus, Tone> = { queued: "gray", running: "amber", succeeded: "green", failed: "red", cancelled: "gray" };
+const runLabel: Record<RunStatus, string> = { queued: "Queued", running: "Running", succeeded: "Done", failed: "Failed", cancelled: "Stopped" };
+
+/** Why a run stopped, in plain words. */
+function runNote(r: Run): string | null {
+  if (r.status === "cancelled") {
+    return r.error === "destination_reenabled" ? "Stopped: the destination was turned back on, so the next export starts fresh" : "Stopped: the destination changed, so the next export starts fresh there";
+  }
+  if (r.status === "failed") return r.error;
+  if (r.status === "running" && r.error) return `Retrying: ${r.error}`;
+  return null;
+}
 const scheduleLabel: Record<Schedule, string> = { hourly: "Every hour", daily: "Daily at 1am", manual: "Only when started" };
 
 function formatBytes(n: number): string {
@@ -227,7 +237,7 @@ function RunsTable({ id }: { id: string }) {
                 {r.kind === "full" ? "Full export" : "Changes"} <span className="text-zinc-500">· {formatDateTime(r.created_at, account.timezone)}</span>
               </div>
               <div className="truncate text-xs text-zinc-500">
-                {r.status === "failed" ? r.error : r.status === "running" && r.error ? `Retrying: ${r.error}` : `${formatNumber(r.files)} files · ${formatBytes(r.bytes)}${duration(r) ? ` · ${duration(r)}` : ""}`}
+                {runNote(r) ?? `${formatNumber(r.files)} files · ${formatBytes(r.bytes)}${duration(r) ? ` · ${duration(r)}` : ""}`}
               </div>
             </div>
             <div className="flex shrink-0 flex-col items-end gap-0.5">
@@ -333,7 +343,7 @@ function DestinationForm({ destination, onClose }: { destination?: Destination; 
           <Field label="Bucket">
             <Input value={bucket} onChange={(e) => setBucket(e.target.value)} required placeholder="acme-data" />
           </Field>
-          <Field label="Folder" hint="Optional prefix.">
+          <Field label="Folder" hint={destination ? "Optional. Changing where files go, or their format, starts a fresh full export there." : "Optional prefix."}>
             <Input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="dumbmail/" />
           </Field>
           <Field label="Region" hint={p.regionHint}>
@@ -341,7 +351,10 @@ function DestinationForm({ destination, onClose }: { destination?: Destination; 
           </Field>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Access key ID" hint={destination ? `Now ${destination.access_key_hint}. Leave blank to keep it.` : p.keyHint}>
+          <Field
+            label="Access key ID"
+            hint={destination ? `Now ${destination.access_key_hint}. Leave blank to keep it, unless you change the endpoint, region or bucket: keys are only sent where they were saved for.` : p.keyHint}
+          >
             <Input value={accessKey} onChange={(e) => setAccessKey(e.target.value)} required={!destination} autoComplete="off" />
           </Field>
           <Field label="Secret access key" hint={destination ? "Leave blank to keep it." : "Stored encrypted and never shown again."}>

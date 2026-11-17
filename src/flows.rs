@@ -259,8 +259,12 @@ pub struct Fetched {
 pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     let mut url = raw.to_string();
     for _ in 0..5 {
-        let (host, addr) = check_webhook_url(&url).await.map_err(|_| AppError::bad("enter a public website address"))?;
+        let (host, addr) = tokio::time::timeout(std::time::Duration::from_secs(5), check_webhook_url(&url))
+            .await
+            .map_err(|_| AppError::bad("that address didn't resolve in time"))?
+            .map_err(|_| AppError::bad("enter a public website address"))?;
         let client = reqwest::Client::builder()
+            .no_proxy()
             .resolve(&host, addr)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
@@ -297,21 +301,28 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
 }
 
 /// Signed with the account's flow webhook secret (see docs/WEBHOOKS.md); a GET signs an empty body.
+/// One 10-second deadline covers resolving and checking the address and the request; no proxy is
+/// used, so the connection goes to the address that was checked.
 async fn call_webhook(state: &AppState, account_id: Uuid, url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
-    let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let client = reqwest::Client::builder()
-        .resolve(&host, addr)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("dumbmail-webhook/0.1")
-        .build()?;
     let body = if get { Vec::new() } else { serde_json::to_vec(payload)? };
-    let mut req = if get { client.get(url) } else { client.post(url).header("content-type", "application/json").body(body.clone()) };
-    for (k, v) in crate::features::webhooks::flow_signature_headers(state, account_id, &body).await {
-        req = req.header(k, v);
-    }
-    req.send().await?.error_for_status()?;
-    Ok(())
+    let headers = crate::features::webhooks::flow_signature_headers(state, account_id, &body).await;
+    let send = async {
+        let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(&host, addr)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("dumbmail-webhook/0.1")
+            .build()?;
+        let mut req = if get { client.get(url) } else { client.post(url).header("content-type", "application/json").body(body.clone()) };
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req.send().await?.error_for_status()?;
+        anyhow::Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), send).await.map_err(|_| anyhow::anyhow!("no response within 10 seconds"))?
 }
 
 async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {

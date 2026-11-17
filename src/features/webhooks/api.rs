@@ -2,7 +2,7 @@
 //! REST hooks (subscribe / unsubscribe / sample) for Zapier and Make.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -31,7 +31,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/webhooks/{id}/deliveries", get(deliveries_h))
         .route("/api/webhooks/{id}/deliveries/{delivery_id}", get(delivery_h))
         .route("/api/webhooks/{id}/resend", post(resend_h))
-        .route("/api/hooks", post(subscribe_h))
+        .route("/api/hooks", get(hooks_h).post(subscribe_h))
         .route("/api/hooks/me", get(me_h))
         .route("/api/hooks/samples", get(samples_h))
         .route("/api/hooks/{id}", axum::routing::delete(unsubscribe_h))
@@ -39,9 +39,9 @@ pub fn routes() -> Router<AppState> {
 
 // ---------- Endpoint rows ----------
 
-const LIST_COLS: &str = "e.id, e.url, e.description, e.topics, e.metrics, e.filter, e.enabled, e.source, e.batch_size, e.rate_per_second, e.secret_hint,
+const LIST_COLS: &str = "e.id, e.url, e.description, e.topics, e.metrics, e.filter, e.trusted_only, e.enabled, e.source, e.batch_size, e.rate_per_second, e.secret_hint,
     e.previous_secret_until, e.consecutive_failures, e.failing_since, e.retry_at, e.disabled_reason, e.last_success_at, e.last_failure_at, e.created_at, e.updated_at,
-    (SELECT count(*) FROM webhook_deliveries d WHERE d.endpoint_id = e.id AND d.status = 'pending') AS pending,
+    e.revision, e.dropped_total, e.last_dropped_at, e.pending::bigint AS pending,
     (SELECT count(*) FROM webhook_deliveries d WHERE d.endpoint_id = e.id AND d.status = 'delivered' AND d.created_at > now() - interval '24 hours') AS delivered_24h,
     (SELECT count(*) FROM webhook_deliveries d WHERE d.endpoint_id = e.id AND d.status = 'failed' AND d.created_at > now() - interval '24 hours') AS failed_24h";
 
@@ -53,6 +53,7 @@ struct Row {
     topics: Vec<String>,
     metrics: Vec<String>,
     filter: Option<Value>,
+    trusted_only: bool,
     enabled: bool,
     source: String,
     batch_size: i32,
@@ -67,6 +68,9 @@ struct Row {
     last_failure_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    revision: i32,
+    dropped_total: i64,
+    last_dropped_at: Option<DateTime<Utc>>,
     pending: i64,
     delivered_24h: i64,
     failed_24h: i64,
@@ -81,13 +85,13 @@ fn row_json(r: &Row) -> Value {
         "active"
     };
     json!({
-        "id": r.id, "url": r.url, "description": r.description, "topics": r.topics, "metrics": r.metrics, "filter": r.filter,
+        "id": r.id, "url": r.url, "description": r.description, "topics": r.topics, "metrics": r.metrics, "filter": r.filter, "trusted_only": r.trusted_only,
         "enabled": r.enabled, "status": status, "source": r.source, "batch_size": r.batch_size, "rate_per_second": r.rate_per_second,
         "secret_hint": r.secret_hint, "previous_secret_valid_until": r.previous_secret_until.filter(|t| *t > Utc::now()),
         "consecutive_failures": r.consecutive_failures, "failing_since": r.failing_since, "next_retry_at": r.retry_at.filter(|t| *t > Utc::now()),
         "disabled_reason": r.disabled_reason, "last_success_at": r.last_success_at, "last_failure_at": r.last_failure_at,
-        "created_at": r.created_at, "updated_at": r.updated_at,
-        "stats": {"pending": r.pending, "delivered_24h": r.delivered_24h, "failed_24h": r.failed_24h},
+        "created_at": r.created_at, "updated_at": r.updated_at, "revision": r.revision,
+        "stats": {"pending": r.pending, "delivered_24h": r.delivered_24h, "failed_24h": r.failed_24h, "dropped_total": r.dropped_total, "last_dropped_at": r.last_dropped_at},
     })
 }
 
@@ -127,6 +131,7 @@ struct Fields {
     topics: Option<Vec<String>>,
     metrics: Option<Vec<String>>,
     filter: Option<Option<Value>>,
+    trusted_only: Option<bool>,
     enabled: Option<bool>,
     batch_size: Option<i32>,
     rate_per_second: Option<i32>,
@@ -134,7 +139,7 @@ struct Fields {
 
 async fn parse_fields(b: &Value) -> AppResult<Fields> {
     let obj = b.as_object().ok_or_else(|| AppError::bad("send a JSON object"))?;
-    let allowed = ["url", "description", "topics", "metrics", "filter", "enabled", "batch_size", "rate_per_second"];
+    let allowed = ["url", "description", "topics", "metrics", "filter", "trusted_only", "enabled", "batch_size", "rate_per_second"];
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(AppError::bad(format!("unknown field {k:?}; allowed: {}", allowed.join(", "))));
     }
@@ -189,6 +194,9 @@ async fn parse_fields(b: &Value) -> AppResult<Fields> {
     if let Some(v) = obj.get("enabled") {
         f.enabled = Some(v.as_bool().ok_or_else(|| AppError::bad("enabled must be true or false"))?);
     }
+    if let Some(v) = obj.get("trusted_only") {
+        f.trusted_only = Some(v.as_bool().ok_or_else(|| AppError::bad("trusted_only must be true or false"))?);
+    }
     let int = |k: &str, lo: i64, hi: i64| -> AppResult<Option<i32>> {
         match obj.get(k) {
             None => Ok(None),
@@ -205,7 +213,7 @@ async fn parse_fields(b: &Value) -> AppResult<Fields> {
 
 // ---------- Actions (shared by the REST API and MCP) ----------
 
-pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, source: &str, default_batch: i32) -> AppResult<Value> {
+pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, source: &str, default_batch: i32, api_key_id: Option<Uuid>) -> AppResult<Value> {
     let f = parse_fields(body).await?;
     let url = f.url.ok_or_else(|| AppError::bad("url is required"))?;
     let topics = f.topics.ok_or_else(|| AppError::bad("topics is required"))?;
@@ -216,8 +224,9 @@ pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, sou
     let secret = super::new_secret();
     let id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO webhook_endpoints (id, account_id, url, description, topics, metrics, filter, enabled, source, batch_size, rate_per_second, secret_enc, secret_hint)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        "INSERT INTO webhook_endpoints (id, account_id, url, description, topics, metrics, filter, enabled, source, batch_size, rate_per_second, secret_enc, secret_hint,
+            trusted_only, api_key_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(id)
     .bind(account_id)
@@ -232,6 +241,8 @@ pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, sou
     .bind(f.rate_per_second.unwrap_or(10))
     .bind(crate::crypto::encrypt(&state.cfg.secret_key, &secret)?)
     .bind(super::secret_hint(&secret))
+    .bind(f.trusted_only.unwrap_or(false))
+    .bind(api_key_id)
     .execute(&state.db)
     .await?;
     super::forget(account_id);
@@ -240,18 +251,24 @@ pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, sou
     Ok(out)
 }
 
+/// Changing the URL starts a new revision: deliveries queued for the old URL are cancelled, never
+/// sent to the new one.
 pub(super) async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &Value) -> AppResult<Value> {
-    endpoint(state, account_id, id).await?;
+    let ep = endpoint(state, account_id, id).await?;
     let f = parse_fields(body).await?;
     let turning_on = f.enabled == Some(true);
+    let new_url = f.url.as_deref().is_some_and(|u| u != ep.url);
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE webhook_endpoints SET url = COALESCE($3, url), description = COALESCE($4, description), topics = COALESCE($5, topics),
            metrics = COALESCE($6, metrics), filter = CASE WHEN $7 THEN $8 ELSE filter END, batch_size = COALESCE($9, batch_size),
-           rate_per_second = COALESCE($10, rate_per_second), enabled = COALESCE($11, enabled),
+           rate_per_second = COALESCE($10, rate_per_second), enabled = COALESCE($11, enabled), trusted_only = COALESCE($14, trusted_only),
+           revision = revision + CASE WHEN $13 THEN 1 ELSE 0 END,
            disabled_reason = CASE WHEN $12 THEN NULL ELSE disabled_reason END,
-           failing_since = CASE WHEN $12 AND NOT enabled THEN NULL ELSE failing_since END,
-           consecutive_failures = CASE WHEN $12 AND NOT enabled THEN 0 ELSE consecutive_failures END,
-           retry_at = CASE WHEN $12 THEN NULL ELSE retry_at END,
+           failing_since = CASE WHEN ($12 AND NOT enabled) OR $13 THEN NULL ELSE failing_since END,
+           consecutive_failures = CASE WHEN ($12 AND NOT enabled) OR $13 THEN 0 ELSE consecutive_failures END,
+           retry_at = CASE WHEN $12 OR $13 THEN NULL ELSE retry_at END,
+           drop_alerted = CASE WHEN $13 THEN false ELSE drop_alerted END,
            updated_at = now()
          WHERE id = $1 AND account_id = $2",
     )
@@ -267,12 +284,30 @@ pub(super) async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &
     .bind(f.rate_per_second)
     .bind(f.enabled)
     .bind(turning_on)
-    .execute(&state.db)
+    .bind(new_url)
+    .bind(f.trusted_only)
+    .execute(&mut *tx)
     .await?;
-    super::forget(account_id);
-    if turning_on {
-        deliver::wake(&state.db, &[id]).await?;
+    if new_url {
+        sqlx::query(
+            "WITH c AS (UPDATE webhook_deliveries SET status = 'cancelled', error = 'url_changed'
+                        WHERE endpoint_id = $1 AND status = 'pending' AND revision < (SELECT revision FROM webhook_endpoints WHERE id = $1) RETURNING 1)
+             UPDATE webhook_endpoints SET pending = GREATEST(0, pending - (SELECT count(*) FROM c)::int) WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
+    if turning_on {
+        // What was still waiting (inside its 24 hours) is tried again now.
+        sqlx::query("UPDATE webhook_deliveries SET next_attempt_at = now() WHERE endpoint_id = $1 AND status = 'pending' AND next_attempt_at > now()")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        deliver::wake(&mut tx, &[id]).await?;
+    }
+    tx.commit().await?;
+    super::forget(account_id);
     get_one(state, account_id, id).await
 }
 
@@ -328,36 +363,64 @@ fn delivery_json(d: &DeliveryRow) -> Value {
         "delivered_at": d.delivered_at, "created_at": d.created_at})
 }
 
-/// Send one sample event now and record it in the log.
+/// Send one sample event now and record it in the log. It goes out on the same one-at-a-time
+/// lease as real deliveries, and its row is never one the delivery job would pick up.
 pub(super) async fn send_test(state: &AppState, account_id: Uuid, id: Uuid, topic: Option<&str>) -> AppResult<Value> {
-    let ep = endpoint(state, account_id, id).await?;
-    let topics: Vec<String> = sqlx::query_scalar("SELECT topics FROM webhook_endpoints WHERE id = $1").bind(id).fetch_one(&state.db).await?;
+    endpoint(state, account_id, id).await?;
+    let ep: Option<Endpoint> = sqlx::query_as(&format!(
+        "UPDATE webhook_endpoints SET lease_until = now() + interval '30 seconds'
+         WHERE id = $1 AND account_id = $2 AND (lease_until IS NULL OR lease_until < now()) RETURNING {ENDPOINT_COLS}"
+    ))
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(ep) = ep else { return Err(AppError::Busy("DumbMail is sending to this endpoint right now; try the test again in a few seconds".into())) };
+    let res = test_on_lease(state, account_id, &ep, topic).await;
+    sqlx::query("UPDATE webhook_endpoints SET lease_until = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+    res
+}
+
+async fn test_on_lease(state: &AppState, account_id: Uuid, ep: &Endpoint, topic: Option<&str>) -> AppResult<Value> {
+    let topics: Vec<String> = sqlx::query_scalar("SELECT topics FROM webhook_endpoints WHERE id = $1").bind(ep.id).fetch_one(&state.db).await?;
     let topic = match topic {
         Some(t) if topics::is_topic(t) => t.to_string(),
         Some(t) => return Err(AppError::bad(format!("unknown topic {t:?}"))),
         None => topics.first().cloned().unwrap_or_else(|| "event.tracked".into()),
     };
     let event_id = Uuid::now_v7();
-    let mut env = super::envelope(event_id, account_id, &topic, topics::sample_data(&topic, None));
-    env["test"] = json!(true);
+    let env = json!({"id": event_id, "topic": topic, "created_at": Utc::now(), "account_id": account_id, "api_version": super::API_VERSION,
+        "source": "system", "test": true, "data": topics::sample_data(&topic, None)});
     let delivery_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO webhook_deliveries (id, account_id, endpoint_id, event_id, topic, payload, is_test) VALUES ($1, $2, $3, $4, $5, $6, true)")
-        .bind(delivery_id)
-        .bind(account_id)
-        .bind(id)
-        .bind(event_id)
-        .bind(&topic)
-        .bind(&env)
-        .execute(&state.db)
-        .await?;
-    let secrets = deliver::secrets(state, &ep)?;
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (id, account_id, endpoint_id, revision, event_id, topic, payload, is_test, status) VALUES ($1, $2, $3, $4, $5, $6, $7, true, 'sending')",
+    )
+    .bind(delivery_id)
+    .bind(account_id)
+    .bind(ep.id)
+    .bind(ep.revision)
+    .bind(event_id)
+    .bind(&topic)
+    .bind(&env)
+    .execute(&state.db)
+    .await?;
+    let secrets = deliver::secrets(state, ep)?;
     let body = if ep.batch_size <= 1 { serde_json::to_vec(&env) } else { serde_json::to_vec(&json!([env])) }.map_err(|e| AppError::Internal(e.into()))?;
     let outcome = deliver::send(&ep.url, &secrets, (ep.batch_size <= 1).then_some(topic.as_str()), &body).await;
-    deliver::record(&state.db, &[delivery_id], &outcome).await?;
     // A test is tried once.
-    sqlx::query("UPDATE webhook_deliveries SET status = 'failed' WHERE id = $1 AND status = 'pending'").bind(delivery_id).execute(&state.db).await?;
+    sqlx::query(
+        "UPDATE webhook_deliveries SET status = CASE WHEN $2 THEN 'delivered' ELSE 'failed' END, attempts = 1, last_attempt_at = now(),
+           delivered_at = CASE WHEN $2 THEN now() END, response_code = $3, error = $4, duration_ms = $5 WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .bind(outcome.ok)
+    .bind(outcome.code)
+    .bind(outcome.error)
+    .bind(outcome.ms)
+    .execute(&state.db)
+    .await?;
     let d: DeliveryRow = sqlx::query_as(&format!("SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = $1")).bind(delivery_id).fetch_one(&state.db).await?;
-    Ok(json!({"ok": outcome.ok, "delivery": delivery_json(&d), "response_body": outcome.body}))
+    Ok(json!({"ok": outcome.ok, "delivery": delivery_json(&d)}))
 }
 
 #[derive(Deserialize)]
@@ -371,8 +434,8 @@ pub(super) struct DeliveryQuery {
 pub(super) async fn deliveries(state: &AppState, account_id: Uuid, id: Uuid, q: &DeliveryQuery) -> AppResult<(Vec<Value>, i64)> {
     endpoint(state, account_id, id).await?;
     let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
-    if status.is_some_and(|s| !matches!(s, "pending" | "delivered" | "failed")) {
-        return Err(AppError::bad("status must be pending, delivered, failed or all"));
+    if status.is_some_and(|s| !matches!(s, "pending" | "sending" | "delivered" | "failed" | "dropped" | "cancelled")) {
+        return Err(AppError::bad("status must be pending, sending, delivered, failed, dropped, cancelled or all"));
     }
     let topic = q.topic.as_deref().filter(|s| !s.is_empty());
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
@@ -399,19 +462,18 @@ pub(super) async fn deliveries(state: &AppState, account_id: Uuid, id: Uuid, q: 
     Ok((rows.iter().map(delivery_json).collect(), total))
 }
 
+/// One delivery with its payload (personal data: for people allowed to read payloads).
 pub(super) async fn delivery(state: &AppState, account_id: Uuid, id: Uuid, delivery_id: Uuid) -> AppResult<Value> {
-    let row: Option<(Value, Option<String>)> =
-        sqlx::query_as("SELECT payload, response_body FROM webhook_deliveries WHERE id = $1 AND endpoint_id = $2 AND account_id = $3")
-            .bind(delivery_id)
-            .bind(id)
-            .bind(account_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let (payload, response_body) = row.ok_or_else(|| AppError::not_found("delivery"))?;
+    let payload: Option<Value> = sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = $1 AND endpoint_id = $2 AND account_id = $3")
+        .bind(delivery_id)
+        .bind(id)
+        .bind(account_id)
+        .fetch_optional(&state.db)
+        .await?;
+    let payload = payload.ok_or_else(|| AppError::not_found("delivery"))?;
     let d: DeliveryRow = sqlx::query_as(&format!("SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = $1")).bind(delivery_id).fetch_one(&state.db).await?;
     let mut out = delivery_json(&d);
     out["payload"] = payload;
-    out["response_body"] = json!(response_body);
     Ok(out)
 }
 
@@ -431,13 +493,10 @@ pub(super) struct ResendBody {
 
 const MAX_RESEND: i64 = 10_000;
 
-/// Queue earlier deliveries again (same event ids, so receivers can drop duplicates).
+/// Queue earlier deliveries again (same event ids, so receivers can drop duplicates). Only
+/// deliveries made for the endpoint's current URL; at most one resend a minute per endpoint.
 pub(super) async fn resend(state: &AppState, account_id: Uuid, id: Uuid, b: ResendBody) -> AppResult<Value> {
     endpoint(state, account_id, id).await?;
-    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM webhook_endpoints WHERE id = $1").bind(id).fetch_one(&state.db).await?;
-    if !enabled {
-        return Err(AppError::bad("turn the endpoint on before resending"));
-    }
     if b.delivery_ids.as_ref().is_none_or(|v| v.is_empty()) && b.since.is_none() {
         return Err(AppError::bad("give delivery_ids, or a since time (and optionally until) to resend a range"));
     }
@@ -445,12 +504,29 @@ pub(super) async fn resend(state: &AppState, account_id: Uuid, id: Uuid, b: Rese
         return Err(AppError::bad("at most 1,000 delivery_ids at a time; use since/until for more"));
     }
     let status = b.status.as_deref().unwrap_or("failed");
-    if !matches!(status, "failed" | "delivered" | "all") {
-        return Err(AppError::bad("status must be failed, delivered or all"));
+    if !matches!(status, "failed" | "delivered" | "dropped" | "all") {
+        return Err(AppError::bad("status must be failed, delivered, dropped or all"));
     }
+    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM webhook_endpoints WHERE id = $1").bind(id).fetch_one(&state.db).await?;
+    if !enabled {
+        return Err(AppError::bad("turn the endpoint on before resending"));
+    }
+    // The limit is the claim: two resends at once can't both get past it. A resend also lets an
+    // endpoint that's backing off be tried right away, so this caps that at once a minute.
+    let mut tx = state.db.begin().await?;
+    let claimed: Option<i32> = sqlx::query_scalar(
+        "UPDATE webhook_endpoints SET last_resend_at = now(), retry_at = NULL
+         WHERE id = $1 AND account_id = $2 AND enabled AND (last_resend_at IS NULL OR last_resend_at < now() - interval '1 minute') RETURNING revision",
+    )
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(revision) = claimed else { return Err(AppError::Busy("one resend a minute per endpoint; try again shortly".into())) };
     let n = sqlx::query(
-        "UPDATE webhook_deliveries SET status = 'pending', next_attempt_at = now(), expires_at = now() + interval '24 hours'
-         WHERE id IN (SELECT id FROM webhook_deliveries WHERE endpoint_id = $1 AND account_id = $2 AND status <> 'pending' AND NOT is_test
+        "UPDATE webhook_deliveries SET status = 'pending', next_attempt_at = now(), expires_at = now() + interval '24 hours', error = NULL
+         WHERE id IN (SELECT id FROM webhook_deliveries WHERE endpoint_id = $1 AND account_id = $2 AND revision = $8
+                        AND status IN ('failed', 'delivered', 'dropped') AND NOT is_test
                         AND ($3::uuid[] IS NULL OR id = ANY($3)) AND ($4::timestamptz IS NULL OR created_at >= $4) AND ($5::timestamptz IS NULL OR created_at <= $5)
                         AND ($6 = 'all' OR status = $6)
                       ORDER BY created_at LIMIT $7)",
@@ -462,12 +538,13 @@ pub(super) async fn resend(state: &AppState, account_id: Uuid, id: Uuid, b: Rese
     .bind(b.until)
     .bind(status)
     .bind(MAX_RESEND)
-    .execute(&state.db)
+    .bind(revision)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
-    // A manual resend tries again right away, even if the endpoint was backing off.
-    sqlx::query("UPDATE webhook_endpoints SET retry_at = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
-    deliver::wake(&state.db, &[id]).await?;
+    sqlx::query("UPDATE webhook_endpoints SET pending = pending + $2 WHERE id = $1").bind(id).bind(n as i32).execute(&mut *tx).await?;
+    deliver::wake(&mut tx, &[id]).await?;
+    tx.commit().await?;
     Ok(json!({"resent": n, "limit": MAX_RESEND}))
 }
 
@@ -496,8 +573,22 @@ pub(super) async fn rotate_flow_secret(state: &AppState, account_id: Uuid) -> Ap
     Ok(json!({"secret": secret, "secret_hint": super::secret_hint(&secret)}))
 }
 
-/// REST hook subscribe: one topic, one URL, one event per request.
-pub(super) async fn subscribe(state: &AppState, account_id: Uuid, b: &Value) -> AppResult<Value> {
+/// The API key a request was made with (REST hooks belong to the key that made them).
+pub(super) async fn key_of(state: &AppState, ctx: &Ctx, headers: &HeaderMap) -> AppResult<Uuid> {
+    let key = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
+    let (true, Some(key)) = (ctx.via_api_key, key) else {
+        return Err(AppError::Forbidden("REST hooks are made with an API key (Zapier, Make or your own code); in the dashboard, use Settings → Webhooks".into()));
+    };
+    let id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM api_keys WHERE key_hash = $1 AND account_id = $2 AND revoked_at IS NULL")
+        .bind(crate::auth::sha256_hex(key))
+        .bind(ctx.account_id)
+        .fetch_optional(&state.db)
+        .await?;
+    id.ok_or(AppError::Unauthorized)
+}
+
+/// REST hook subscribe: one topic, one URL, one event per request. The hook belongs to `key_id`.
+pub(super) async fn subscribe(state: &AppState, account_id: Uuid, key_id: Uuid, b: &Value) -> AppResult<Value> {
     let obj = b.as_object().ok_or_else(|| AppError::bad("send a JSON object"))?;
     let url = ["url", "target_url", "hookUrl"].iter().find_map(|k| obj.get(*k).and_then(|v| v.as_str())).ok_or_else(|| AppError::bad("url is required"))?;
     let topic = obj.get("topic").and_then(|v| v.as_str()).ok_or_else(|| AppError::bad("topic is required"))?;
@@ -512,11 +603,44 @@ pub(super) async fn subscribe(state: &AppState, account_id: Uuid, b: &Value) -> 
     if let Some(m) = obj.get("metric").and_then(|v| v.as_str()).filter(|m| !m.trim().is_empty()) {
         body.insert("metrics".into(), json!([m]));
     }
-    if let Some(f) = obj.get("filter") {
-        body.insert("filter".into(), f.clone());
+    for k in ["filter", "trusted_only"] {
+        if let Some(v) = obj.get(k) {
+            body.insert(k.into(), v.clone());
+        }
     }
-    let ep = create(state, account_id, &Value::Object(body), source, 1).await?;
+    let ep = create(state, account_id, &Value::Object(body), source, 1, Some(key_id)).await?;
     Ok(json!({"id": ep["id"], "url": ep["url"], "topic": topic, "metric": ep["metrics"].get(0), "secret": ep["secret"]}))
+}
+
+/// The key's own REST hooks.
+pub(super) async fn hooks(state: &AppState, account_id: Uuid, key_id: Uuid) -> AppResult<Vec<Value>> {
+    let rows: Vec<(Uuid, String, Vec<String>, Vec<String>, String, bool, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, url, topics, metrics, source, enabled, created_at FROM webhook_endpoints WHERE account_id = $1 AND api_key_id = $2 ORDER BY created_at",
+    )
+    .bind(account_id)
+    .bind(key_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, url, topics, metrics, source, enabled, created_at)| {
+            json!({"id": id, "url": url, "topic": topics.first(), "metric": metrics.first(), "source": source, "enabled": enabled, "created_at": created_at})
+        })
+        .collect())
+}
+
+/// Delete one of the key's own REST hooks. Other endpoints, including dashboard ones, aren't its to delete.
+pub(super) async fn unsubscribe(state: &AppState, account_id: Uuid, key_id: Uuid, id: Uuid) -> AppResult<()> {
+    let n = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1 AND account_id = $2 AND api_key_id = $3").bind(id).bind(account_id).bind(key_id).execute(&state.db).await?.rows_affected();
+    if n == 0 {
+        return Err(AppError::not_found("hook"));
+    }
+    super::forget(account_id);
+    Ok(())
+}
+
+fn envelope(id: Value, account_id: Uuid, topic: &str, source: &str, created_at: DateTime<Utc>, data: Value) -> Value {
+    json!({"id": id, "topic": topic, "created_at": created_at, "account_id": account_id, "api_version": super::API_VERSION, "source": source, "data": data})
 }
 
 /// Sample events for a topic, newest first, shaped like real deliveries. For `event.tracked` with
@@ -526,32 +650,35 @@ pub(super) async fn samples(state: &AppState, account_id: Uuid, topic: &str, met
         return Err(AppError::bad(format!("unknown topic {topic:?} (see GET /api/webhooks/topics)")));
     }
     if let (Some(metric), "event.tracked") = (metric, topic) {
-        let rows: Vec<(Uuid, Value, Option<f64>, DateTime<Utc>, Option<String>, Option<Uuid>, Uuid, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(Uuid, Value, Option<f64>, DateTime<Utc>, Option<String>, Option<Uuid>, bool, Uuid, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(
-                "SELECT e.id, e.properties, e.value, e.occurred_at, e.unique_id, e.message_id, p.id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name
+                "SELECT e.id, e.properties, e.value, e.occurred_at, e.unique_id, e.message_id, e.from_browser, p.id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name
                  FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id
                  WHERE e.account_id = $1 AND m.account_id = $1 AND m.name = $2 ORDER BY e.occurred_at DESC LIMIT 3",
             )
             .bind(account_id)
-            .bind(metric)
+            .bind(metric.trim())
             .fetch_all(&state.db)
             .await?;
         if !rows.is_empty() {
+            // Events don't record whether the API or DumbMail sent them; DumbMail's own metric
+            // names are taken as its own.
+            let not_browser = if crate::audience::is_reserved_metric(metric) { "system" } else { "api" };
             let out: Vec<Value> = rows
                 .into_iter()
                 .map(|r| {
-                    super::envelope(r.0, account_id, topic, json!({
-                        "event": {"id": r.0, "metric": metric, "properties": r.1, "value": r.2, "occurred_at": r.3, "unique_id": r.4, "message_id": r.5},
-                        "profile": {"id": r.6, "email": r.7, "phone_number": r.8, "external_id": r.9, "first_name": r.10, "last_name": r.11},
+                    envelope(json!(r.0), account_id, topic, if r.6 { "browser" } else { not_browser }, r.3, json!({
+                        "event": {"id": r.0, "metric": metric.trim(), "properties": r.1, "value": r.2, "occurred_at": r.3, "unique_id": r.4, "message_id": r.5},
+                        "profile": {"id": r.7, "email": r.8, "phone_number": r.9, "external_id": r.10, "first_name": r.11, "last_name": r.12},
                     }))
                 })
                 .collect();
             return Ok(Value::Array(out));
         }
     }
-    let mut env = super::envelope(Uuid::nil(), account_id, topic, topics::sample_data(topic, metric));
-    env["id"] = json!("00000000-0000-7000-8000-000000000000");
-    Ok(json!([env]))
+    let source = if topic == "form.submitted" { "browser" } else { "system" };
+    Ok(json!([envelope(json!("00000000-0000-7000-8000-000000000000"), account_id, topic, source, Utc::now(), topics::sample_data(topic, metric))]))
 }
 
 // ---------- Handlers ----------
@@ -567,7 +694,7 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value
 }
 
 async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
-    Ok((StatusCode::CREATED, Json(create(&state, ctx.account_id, &b, if ctx.via_api_key { "api" } else { "dashboard" }, 50).await?)))
+    Ok((StatusCode::CREATED, Json(create(&state, ctx.account_id, &b, if ctx.via_api_key { "api" } else { "dashboard" }, 50, None).await?)))
 }
 
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -618,12 +745,21 @@ async fn rotate_flow_secret_h(State(state): State<AppState>, ctx: Ctx) -> AppRes
     Ok(Json(rotate_flow_secret(&state, ctx.account_id).await?))
 }
 
-async fn subscribe_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
-    Ok((StatusCode::CREATED, Json(subscribe(&state, ctx.account_id, &b).await?)))
+async fn subscribe_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
+    let key = key_of(&state, &ctx, &headers).await?;
+    Ok((StatusCode::CREATED, Json(subscribe(&state, ctx.account_id, key, &b).await?)))
 }
 
-async fn unsubscribe_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    delete(&state, ctx.account_id, id).await?;
+async fn hooks_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap) -> AppResult<Json<Value>> {
+    let key = key_of(&state, &ctx, &headers).await?;
+    let rows = hooks(&state, ctx.account_id, key).await?;
+    let n = rows.len();
+    Ok(Json(json!({"data": rows, "total": n})))
+}
+
+async fn unsubscribe_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    let key = key_of(&state, &ctx, &headers).await?;
+    unsubscribe(&state, ctx.account_id, key, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 

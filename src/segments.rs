@@ -1252,11 +1252,12 @@ pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def:
         .bind(segment_id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
-    // The first refresh only records who is already in the segment.
+    // The first refresh only records who is already in the segment. Webhook events are written in
+    // this transaction, so they go out exactly when the change does (a failure can't spoil it).
     if !first_refresh {
-        crate::features::webhooks::segment_changed(db, account_id, segment_id, &entered, &left).await;
+        crate::features::webhooks::segment_changed_in(&mut tx, account_id, segment_id, &entered, &left).await;
     }
+    tx.commit().await?;
     Ok(entered)
 }
 

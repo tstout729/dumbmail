@@ -49,7 +49,35 @@ const DOCS = "https://github.com/tstout729/dumbmail/blob/main/docs/WEBHOOKS.md";
 const statusTone: Record<EndpointStatus, Tone> = { active: "green", failing: "amber", disabled: "gray" };
 const statusLabel: Record<EndpointStatus, string> = { active: "Active", failing: "Failing", disabled: "Off" };
 const sourceLabel: Record<Endpoint["source"], string | null> = { dashboard: null, api: "API", zapier: "Zapier", make: "Make" };
-const deliveryTone: Record<DeliveryStatus, Tone> = { delivered: "green", pending: "amber", failed: "red" };
+const deliveryTone: Record<DeliveryStatus, Tone> = { delivered: "green", pending: "amber", sending: "amber", failed: "red", dropped: "red", cancelled: "gray" };
+const deliveryLabel: Record<DeliveryStatus, string> = {
+  delivered: "Delivered",
+  pending: "Waiting",
+  sending: "Sending",
+  failed: "Failed",
+  dropped: "Dropped",
+  cancelled: "Cancelled",
+};
+
+/** What an error class in the delivery log means, in plain words. */
+const errorText: Record<string, string> = {
+  address_rejected: "Not a public https:// address",
+  timeout: "No answer within 10 seconds",
+  connect_failed: "Couldn't connect",
+  request_failed: "The request failed",
+  redirect: "Redirected (use the final URL)",
+  http_error: "Error response",
+  expired: "Not delivered within 24 hours",
+  backlog_full: "Dropped: too many waiting",
+  url_changed: "Cancelled: the URL changed",
+  internal: "DumbMail couldn't send it",
+};
+
+function deliveryError(d: { error: string | null; response_code: number | null }): string {
+  const text = d.error ? (errorText[d.error] ?? d.error) : "";
+  if (d.response_code) return text ? `HTTP ${d.response_code} · ${text}` : `HTTP ${d.response_code}`;
+  return text;
+}
 
 export function WebhooksPage() {
   return (
@@ -204,6 +232,7 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
   const [metrics, setMetrics] = useState<string[]>(endpoint?.metrics ?? []);
   const [batch, setBatch] = useState(String(endpoint?.batch_size ?? 50));
   const [rate, setRate] = useState(String(endpoint?.rate_per_second ?? 10));
+  const [trustedOnly, setTrustedOnly] = useState(endpoint?.trusted_only ?? false);
   const [error, setError] = useState<string | null>(null);
   const pending = create.isPending || update.isPending;
   const all = topics.data ?? [];
@@ -222,6 +251,7 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
       description: description.trim(),
       topics: selected,
       metrics: selected.includes("event.tracked") ? metrics : [],
+      trusted_only: trustedOnly,
       batch_size: Number(batch),
       rate_per_second: Number(rate),
     };
@@ -245,7 +275,14 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
   return (
     <Modal title={endpoint ? "Edit endpoint" : "Add endpoint"} onClose={onClose} size="lg">
       <form onSubmit={onSubmit} className="space-y-4">
-        <Field label="URL" hint="An https:// address on the public internet that accepts POST requests.">
+        <Field
+          label="URL"
+          hint={
+            endpoint
+              ? "Changing it cancels anything still waiting to go to the old URL, so nothing meant for one receiver goes to another."
+              : "An https:// address on the public internet that accepts POST requests."
+          }
+        >
           <Input value={url} onChange={(e) => setUrl(e.target.value)} required autoFocus type="url" placeholder="https://example.com/dumbmail-webhook" />
         </Field>
         <Field label="Description" hint="Optional. So you know what this is for.">
@@ -284,6 +321,12 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
             <TagInput value={metrics} onChange={setMetrics} placeholder="Placed Order" aria-label="Metrics" />
           </Field>
         ) : null}
+        <Checkbox
+          checked={trustedOnly}
+          onChange={(e) => setTrustedOnly(e.target.checked)}
+          label="Leave out events sent from a browser"
+          description="Anyone with your site's public key can send events from a browser, with any values. Every event says who sent it (its source); turn this on if this endpoint acts on orders or money."
+        />
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Events per request" hint="1 sends one JSON object per request; more sends a JSON array.">
             <Input type="number" min={1} max={100} value={batch} onChange={(e) => setBatch(e.target.value)} required />
@@ -322,7 +365,7 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
       {
         onSuccess: (r) => {
           if (r.ok) toast.success(`Test event delivered (HTTP ${r.delivery.response_code ?? ""})`);
-          else toast.error(`Test event failed: ${r.delivery.error ?? "no response"}`);
+          else toast.error(`Test event failed: ${deliveryError(r.delivery) || "no response"}`);
         },
       },
     );
@@ -342,6 +385,12 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
           <Notice tone="amber" title="Deliveries are failing">
             Failing since {formatDateTime(endpoint.failing_since, account.timezone)}.{" "}
             {endpoint.next_retry_at ? `Next try at ${formatDateTime(endpoint.next_retry_at, account.timezone)}. ` : ""}Deliveries are retried for 24 hours; an endpoint that fails for 3 days is turned off.
+          </Notice>
+        ) : null}
+        {endpoint.stats.dropped_total > 0 ? (
+          <Notice tone="amber" title="Some events were dropped">
+            {formatNumber(endpoint.stats.dropped_total)} {endpoint.stats.dropped_total === 1 ? "event was" : "events were"} dropped because more than 100,000 were waiting
+            {endpoint.stats.last_dropped_at ? ` (last ${formatRelative(endpoint.stats.last_dropped_at)})` : ""}. You can resend dropped events from the log for 14 days.
           </Notice>
         ) : null}
         <div className="flex flex-wrap items-center gap-2">
@@ -371,6 +420,8 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
             {endpoint.secret_hint}
             {endpoint.previous_secret_valid_until ? <span className="font-sans text-zinc-500"> (old one works until {formatDateTime(endpoint.previous_secret_valid_until, account.timezone)})</span> : null}
           </dd>
+          <dt className="text-zinc-500">Sources</dt>
+          <dd className="text-zinc-800">{endpoint.trusted_only ? "Not events sent from a browser" : "All, each marked with its source"}</dd>
           <dt className="text-zinc-500">Per request</dt>
           <dd className="text-zinc-800">
             {endpoint.batch_size === 1 ? "1 event" : `up to ${endpoint.batch_size} events`}, at most {endpoint.rate_per_second} per second
@@ -454,6 +505,8 @@ function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
               { value: "failed", label: "Failed" },
               { value: "pending", label: "Waiting" },
               { value: "delivered", label: "Delivered" },
+              { value: "dropped", label: "Dropped" },
+              { value: "cancelled", label: "Cancelled" },
             ]}
           />
           <Button size="sm" onClick={resendFailed} loading={resend.isPending} disabled={!endpoint.enabled}>
@@ -478,8 +531,8 @@ function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
                 </span>
               </span>
               <span className="flex min-w-0 shrink-0 flex-col items-end gap-0.5">
-                <Badge tone={deliveryTone[d.status]}>{d.status === "pending" ? "Waiting" : d.status === "delivered" ? "Delivered" : "Failed"}</Badge>
-                <span className="max-w-48 truncate text-xs text-zinc-500">{d.error ?? (d.response_code ? `HTTP ${d.response_code}` : "")}</span>
+                <Badge tone={deliveryTone[d.status]}>{deliveryLabel[d.status]}</Badge>
+                <span className="max-w-48 truncate text-xs text-zinc-500">{deliveryError(d)}</span>
               </span>
             </button>
           ))
@@ -502,7 +555,7 @@ function DeliveryModal({ endpointId, deliveryId, canResend, onClose }: { endpoin
       onClose={onClose}
       size="lg"
       footer={
-        data && data.status !== "pending" && !data.test ? (
+        data && ["failed", "delivered", "dropped"].includes(data.status) && !data.test ? (
           <Button
             variant="primary"
             disabled={!canResend}
@@ -523,7 +576,7 @@ function DeliveryModal({ endpointId, deliveryId, canResend, onClose }: { endpoin
           <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
             <dt className="text-zinc-500">Status</dt>
             <dd>
-              <Badge tone={deliveryTone[data.status]}>{data.status === "pending" ? "Waiting" : data.status === "delivered" ? "Delivered" : "Failed"}</Badge>
+              <Badge tone={deliveryTone[data.status]}>{deliveryLabel[data.status]}</Badge>
             </dd>
             <dt className="text-zinc-500">Created</dt>
             <dd className="text-zinc-800">{formatDateTime(data.created_at, account.timezone)}</dd>
@@ -534,14 +587,13 @@ function DeliveryModal({ endpointId, deliveryId, canResend, onClose }: { endpoin
             </dd>
             <dt className="text-zinc-500">Response</dt>
             <dd className="text-zinc-800">
-              {data.error ?? (data.response_code ? `HTTP ${data.response_code}` : "None yet")}
+              {deliveryError(data) || "None yet"}
               {data.duration_ms !== null ? ` in ${formatNumber(data.duration_ms)} ms` : ""}
             </dd>
             <dt className="text-zinc-500">Event id</dt>
             <dd className="break-all font-mono text-xs text-zinc-700">{data.event_id}</dd>
           </dl>
           <CodeBlock code={JSON.stringify(data.payload, null, 2)} label="Payload" />
-          {data.response_body ? <CodeBlock code={data.response_body} label="Response body (first 1 KB)" /> : null}
         </div>
       )}
     </Modal>

@@ -9,7 +9,7 @@ pub struct Topic {
 }
 
 pub const TOPICS: &[Topic] = &[
-    Topic { name: "event.tracked", group: "Events", description: "Any event is recorded (API, website, forms, messages). Pick metrics to get only those." },
+    Topic { name: "event.tracked", group: "Events", description: "Any event is recorded (API, website, forms, messages). Pick metrics to get only those. The envelope's source says who recorded it." },
     Topic { name: "profile.created", group: "Profiles", description: "A new profile is added." },
     Topic { name: "profile.updated", group: "Profiles", description: "A profile's details, properties or consent change." },
     Topic { name: "profile.deleted", group: "Profiles", description: "A profile is deleted." },
@@ -41,18 +41,16 @@ pub fn list_json() -> Value {
     Value::Array(TOPICS.iter().map(|t| json!({"topic": t.name, "group": t.group, "description": t.description})).collect())
 }
 
-/// The topics an event of this metric also produces (besides `event.tracked`).
-pub fn derived(metric: &str) -> &'static [&'static str] {
-    match metric {
-        "Received Email" | "Received SMS" => &["message.sent"],
-        "Opened Email" => &["message.opened"],
-        "Clicked Email" | "Clicked SMS" => &["message.clicked"],
-        "Bounced Email" => &["message.bounced", "profile.suppressed"],
-        "Marked Email as Spam" => &["message.complained", "profile.suppressed", "profile.unsubscribed"],
-        "Unsubscribed" | "Unsubscribed from SMS" => &["profile.unsubscribed"],
-        "Subscribed to SMS" => &["profile.subscribed"],
-        _ => &[],
-    }
+/// The message topic one of DumbMail's own message events stands for (besides `event.tracked`).
+pub fn message_topic(metric: &str) -> Option<&'static str> {
+    Some(match metric {
+        "Received Email" | "Received SMS" => "message.sent",
+        "Opened Email" => "message.opened",
+        "Clicked Email" | "Clicked SMS" => "message.clicked",
+        "Bounced Email" => "message.bounced",
+        "Marked Email as Spam" => "message.complained",
+        _ => return None,
+    })
 }
 
 fn sample_profile() -> Value {
@@ -84,8 +82,8 @@ pub fn sample_data(topic: &str, metric: Option<&str>) -> Value {
             d
         }
         "profile.deleted" => json!({"profile": profile}),
-        "profile.subscribed" => json!({"channel": "email", "reason": "form", "profile": profile}),
-        "profile.unsubscribed" => json!({"channel": "email", "reason": "unsubscribe_link", "message_id": sample_message()["id"], "profile": profile}),
+        "profile.subscribed" => json!({"channel": "email", "reason": "double_opt_in", "before": "pending", "after": "subscribed", "profile": profile}),
+        "profile.unsubscribed" => json!({"channel": "email", "reason": "unsubscribe_link", "before": "subscribed", "after": "unsubscribed", "message_id": sample_message()["id"], "profile": profile}),
         "profile.suppressed" => json!({"channel": "email", "reason": "hard_bounce", "message_id": sample_message()["id"], "profile": profile}),
         "list.member_added" | "list.member_removed" => json!({"list": {"id": "0193a5b4-9d40-7b88-9f44-5c6d7e8f9a01", "name": "Newsletter"}, "profile": profile}),
         "segment.entered" | "segment.left" => json!({"segment": {"id": "0193a5b4-ae50-7c99-8a55-6d7e8f9a0b12", "name": "VIP customers"}, "profile": profile}),

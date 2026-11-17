@@ -84,11 +84,39 @@ pub struct Response {
     pub status: u16,
     pub etag: Option<String>,
     pub body: String,
+    /// The whole answer arrived (not cut off by the size limit or an error).
+    pub complete: bool,
 }
+
+/// S3 error codes worth showing as they are. Anything else is reported as `other`, so nothing a
+/// storage service puts in its answer (which can echo request details) is ever stored or emailed.
+const KNOWN_CODES: &[&str] = &[
+    "AccessDenied", "AccountProblem", "AuthorizationHeaderMalformed", "BadDigest", "EntityTooLarge", "EntityTooSmall", "ExpiredToken", "InternalError",
+    "InvalidAccessKeyId", "InvalidArgument", "InvalidBucketName", "InvalidPart", "InvalidPartOrder", "InvalidRequest", "InvalidToken", "KeyTooLongError",
+    "MalformedXML", "MethodNotAllowed", "NoSuchBucket", "NoSuchKey", "NoSuchUpload", "NotImplemented", "PermanentRedirect", "PreconditionFailed",
+    "QuotaExceeded", "RequestTimeTooSkewed", "RequestTimeout", "ServiceUnavailable", "SignatureDoesNotMatch", "SlowDown", "TemporaryRedirect",
+    "TokenRefreshRequired", "XAmzContentSHA256Mismatch",
+];
+
+/// "<what> failed: HTTP 403 AccessDenied". `what` is one of this module's fixed phrases.
+fn failure(what: &str, r: &Response) -> anyhow::Error {
+    let code = xml_tag(&r.body, "Code").filter(|c| KNOWN_CODES.contains(&c.as_str())).unwrap_or_else(|| "other".into());
+    let detail = if !r.complete { "incomplete_response".to_string() } else { code };
+    anyhow::anyhow!("{what} failed: HTTP {} {detail}", r.status)
+}
+
+/// Keys DumbMail writes never have `.` or `..` segments (a URL parser would rewrite them, and the
+/// request would no longer match its signature).
+pub fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// How long one request may take, from checking the address to reading the answer.
+const DEADLINE: Duration = Duration::from_secs(150);
 
 impl Bucket {
     /// Scheme+host(+port) and the path for an object key.
-    fn locate(&self, key: &str) -> anyhow::Result<(String, String)> {
+    pub(super) fn locate(&self, key: &str) -> anyhow::Result<(String, String)> {
         let key = key.trim_start_matches('/');
         let (scheme, host, base_path) = match &self.endpoint {
             None => ("https".to_string(), format!("s3.{}.amazonaws.com", self.region), String::new()),
@@ -109,70 +137,101 @@ impl Bucket {
         }
     }
 
+    /// Where requests go (scheme, host and port): the keys are only ever sent there.
+    pub fn origin(&self) -> String {
+        self.locate("").map(|(o, _)| o).unwrap_or_default()
+    }
+
     pub async fn send(&self, method: &str, key: &str, query: &[(&str, &str)], body: Vec<u8>, content_type: Option<&str>) -> anyhow::Result<Response> {
         let (origin, path) = self.locate(key)?;
+        if has_dot_segment(&path) {
+            anyhow::bail!("object paths can't have . or .. segments");
+        }
         let query: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         let qs = query.iter().map(|(k, v)| if v.is_empty() { uri_encode(k, false) } else { format!("{}={}", uri_encode(k, false), uri_encode(v, false)) }).collect::<Vec<_>>().join("&");
-        let url = if qs.is_empty() { format!("{origin}{}", uri_encode(&path, true)) } else { format!("{origin}{}?{qs}", uri_encode(&path, true)) };
-        let target = net::check(&url, "storage endpoint").await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-        let host = match target.url.port() {
-            Some(p) => format!("{}:{p}", target.host),
-            None => target.host.clone(),
+        let encoded = uri_encode(&path, true);
+        let url = if qs.is_empty() { format!("{origin}{encoded}") } else { format!("{origin}{encoded}?{qs}") };
+        let work = async {
+            let target = net::check(&url, "storage endpoint").await.map_err(|_| anyhow::anyhow!("storage request failed: address_rejected"))?;
+            // Sign exactly what goes out: if parsing changed the path, the signature wouldn't match it.
+            if target.url.path() != encoded {
+                anyhow::bail!("storage request failed: path_changed");
+            }
+            let host = match target.url.port() {
+                Some(p) => format!("{}:{p}", target.host),
+                None => target.host.clone(),
+            };
+            let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let payload_hash = sha256_hex(&body);
+            let mut headers = vec![("host".to_string(), host), ("x-amz-content-sha256".to_string(), payload_hash.clone()), ("x-amz-date".to_string(), amz_date.clone())];
+            if let Some(ct) = content_type {
+                headers.push(("content-type".to_string(), ct.to_string()));
+            }
+            let auth = authorization(method, &path, &query, &headers, &payload_hash, &self.access_key, &self.secret_key, &self.region, "s3", &amz_date);
+            let client = net::client(&target, TIMEOUT)?;
+            let m = reqwest::Method::from_bytes(method.as_bytes())?;
+            let mut req = client.request(m, target.url.clone()).header("authorization", auth).body(body);
+            for (k, v) in headers.iter().filter(|(k, _)| k != "host") {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let res = req.send().await.map_err(|e| {
+                let class = if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connect_failed"
+                } else {
+                    "request_failed"
+                };
+                anyhow::anyhow!("storage request failed: {class}")
+            })?;
+            let status = res.status().as_u16();
+            let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).map(String::from);
+            let b = net::read_capped(res, 64 * 1024).await;
+            let complete = b.complete();
+            Ok(Response { status, etag, body: String::from_utf8_lossy(&b.bytes).into_owned(), complete })
         };
-        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let payload_hash = sha256_hex(&body);
-        let mut headers = vec![("host".to_string(), host), ("x-amz-content-sha256".to_string(), payload_hash.clone()), ("x-amz-date".to_string(), amz_date.clone())];
-        if let Some(ct) = content_type {
-            headers.push(("content-type".to_string(), ct.to_string()));
-        }
-        let auth = authorization(method, &path, &query, &headers, &payload_hash, &self.access_key, &self.secret_key, &self.region, "s3", &amz_date);
-        let client = net::client(&target, TIMEOUT)?;
-        let m = reqwest::Method::from_bytes(method.as_bytes())?;
-        let mut req = client.request(m, target.url.clone()).header("authorization", auth).body(body);
-        for (k, v) in headers.iter().filter(|(k, _)| k != "host") {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        let res = req.send().await.map_err(|e| anyhow::anyhow!("couldn't reach the storage endpoint: {}", e.without_url()))?;
-        let status = res.status().as_u16();
-        let etag = res.headers().get("etag").and_then(|v| v.to_str().ok()).map(String::from);
-        let body = String::from_utf8_lossy(&net::read_capped(res, 64 * 1024).await).into_owned();
-        Ok(Response { status, etag, body })
+        net::within(DEADLINE, work).await.unwrap_or_else(|| Err(anyhow::anyhow!("storage request failed: timeout")))
     }
 
-    fn check(r: &Response, what: &str) -> anyhow::Result<()> {
-        // S3 can answer 200 with an <Error> body (CompleteMultipartUpload).
-        if (200..300).contains(&r.status) && !r.body.contains("<Error>") {
+    fn ok(r: &Response, what: &str) -> anyhow::Result<()> {
+        // S3 can answer 200 and then an <Error> document (CompleteMultipartUpload, CopyObject).
+        if (200..300).contains(&r.status) && r.complete && !r.body.contains("<Error>") {
             return Ok(());
         }
-        let code = xml_tag(&r.body, "Code").unwrap_or_default();
-        let msg = xml_tag(&r.body, "Message").unwrap_or_default();
-        let detail = [code, msg].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(": ");
-        anyhow::bail!("{what} failed (HTTP {}){}", r.status, if detail.is_empty() { String::new() } else { format!(": {detail}") })
+        Err(failure(what, r))
     }
 
+    /// A single upload. It counts only with a 2xx, the whole answer and an ETag.
     pub async fn put(&self, key: &str, body: Vec<u8>, content_type: &str) -> anyhow::Result<()> {
         let r = self.send("PUT", key, &[], body, Some(content_type)).await?;
-        Self::check(&r, "upload")
+        Self::ok(&r, "upload")?;
+        if r.etag.is_none() {
+            anyhow::bail!("upload failed: HTTP {} no_etag", r.status);
+        }
+        Ok(())
     }
 
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let r = self.send("DELETE", key, &[], Vec::new(), None).await?;
-        Self::check(&r, "delete")
+        Self::ok(&r, "delete")
     }
 
     pub async fn create_multipart(&self, key: &str, content_type: &str) -> anyhow::Result<String> {
         let r = self.send("POST", key, &[("uploads", "")], Vec::new(), Some(content_type)).await?;
-        Self::check(&r, "starting a multipart upload")?;
-        xml_tag(&r.body, "UploadId").ok_or_else(|| anyhow::anyhow!("the storage service didn't return an upload id"))
+        Self::ok(&r, "starting a multipart upload")?;
+        xml_tag(&r.body, "UploadId").filter(|u| !u.is_empty()).ok_or_else(|| anyhow::anyhow!("starting a multipart upload failed: HTTP {} no_upload_id", r.status))
     }
 
     pub async fn upload_part(&self, key: &str, upload_id: &str, n: usize, body: Vec<u8>) -> anyhow::Result<String> {
         let n = n.to_string();
         let r = self.send("PUT", key, &[("partNumber", &n), ("uploadId", upload_id)], body, None).await?;
-        Self::check(&r, "uploading a part")?;
-        r.etag.ok_or_else(|| anyhow::anyhow!("the storage service didn't return an ETag for a part"))
+        Self::ok(&r, "uploading a part")?;
+        r.etag.ok_or_else(|| anyhow::anyhow!("uploading a part failed: HTTP {} no_etag", r.status))
     }
 
+    /// Finish a multipart upload. It counts only when the whole answer arrived and is a
+    /// CompleteMultipartUploadResult with an ETag: S3 answers 200 at once and can still fail
+    /// (an <Error> document after whitespace), and a cut-off answer proves nothing.
     pub async fn complete_multipart(&self, key: &str, upload_id: &str, parts: &[String]) -> anyhow::Result<()> {
         let mut xml = String::from("<CompleteMultipartUpload>");
         for (i, etag) in parts.iter().enumerate() {
@@ -181,7 +240,11 @@ impl Bucket {
         }
         xml.push_str("</CompleteMultipartUpload>");
         let r = self.send("POST", key, &[("uploadId", upload_id)], xml.into_bytes(), Some("application/xml")).await?;
-        Self::check(&r, "finishing a multipart upload")
+        Self::ok(&r, "finishing a multipart upload")?;
+        if !completed(&r.body) {
+            anyhow::bail!("finishing a multipart upload failed: HTTP {} bad_response", r.status);
+        }
+        Ok(())
     }
 
     pub async fn abort_multipart(&self, key: &str, upload_id: &str) {
@@ -189,6 +252,11 @@ impl Bucket {
             tracing::warn!(error = %format!("{e:#}"), "couldn't abort multipart upload");
         }
     }
+}
+
+/// A CompleteMultipartUpload answer that says it worked.
+fn completed(body: &str) -> bool {
+    body.contains("<CompleteMultipartUploadResult") && !body.contains("<Error>") && xml_tag(body, "ETag").is_some_and(|e| !e.is_empty())
 }
 
 fn xml_tag(body: &str, tag: &str) -> Option<String> {
@@ -251,5 +319,18 @@ mod tests {
         b.path_style = true;
         assert_eq!(b.locate("x/y.gz").unwrap(), ("https://abc.r2.cloudflarestorage.com".into(), "/acme/x/y.gz".into()));
         assert_eq!(xml_tag("<a><UploadId> u1 </UploadId></a>", "UploadId").as_deref(), Some("u1"));
+        assert!(has_dot_segment("/acme/./x") && has_dot_segment("/a/../b") && !has_dot_segment("/a/.hidden/b.gz"));
+    }
+
+    #[test]
+    fn completion_must_say_it_worked() {
+        assert!(completed("<?xml version=\"1.0\"?>\n<CompleteMultipartUploadResult><Bucket>b</Bucket><ETag>\"abc-2\"</ETag></CompleteMultipartUploadResult>"));
+        assert!(!completed("  \n  \n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>"));
+        assert!(!completed(""));
+        assert!(!completed("<CompleteMultipartUploadResult><Bucket>b</Bucket>"));
+        let r = Response { status: 403, etag: None, body: "<Error><Code>AccessDenied</Code><Message>signature abc123 for AKIA...</Message></Error>".into(), complete: true };
+        assert_eq!(failure("upload", &r).to_string(), "upload failed: HTTP 403 AccessDenied");
+        let r = Response { status: 400, etag: None, body: "<Error><Code>Reflected AKIA123</Code></Error>".into(), complete: true };
+        assert_eq!(failure("upload", &r).to_string(), "upload failed: HTTP 400 other");
     }
 }

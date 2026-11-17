@@ -318,10 +318,10 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         _ => insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?,
     }
     sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
-    tx.commit().await?;
     if c.sent_at.is_none() {
-        crate::features::webhooks::campaign_event(&state.db, c.id, "campaign.sent").await;
+        crate::features::webhooks::campaign_sent_in(&mut tx, c.account_id, c.id).await;
     }
+    tx.commit().await?;
 
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY id")
         .bind(c.id)
@@ -349,7 +349,7 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState,
 }
 
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
-    let done: Option<String> = sqlx::query_scalar(
+    let done: Option<(String, Uuid)> = sqlx::query_as(
         // A test slice that has gone out waits for its results ('testing') before the winner send;
         // the wait starts when the last test message is handled (sends can be deferred, e.g. SMS quiet hours).
         "UPDATE campaigns SET
@@ -359,13 +359,13 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'
          AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)
-         RETURNING status",
+         RETURNING status, account_id",
     )
     .bind(campaign_id)
     .fetch_optional(db)
     .await?;
-    if done.as_deref() == Some("sent") {
-        crate::features::webhooks::campaign_event(db, campaign_id, "campaign.finished").await;
+    if let Some(("sent", account_id)) = done.as_ref().map(|(s, a)| (s.as_str(), *a)) {
+        crate::features::webhooks::campaign_finished(db, account_id, campaign_id).await;
     }
     Ok(())
 }

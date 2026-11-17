@@ -192,7 +192,7 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                 AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
                 other => other,
             })?;
-        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), &saved).await;
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), &saved, core::EventSource::Api).await;
         return Ok(saved);
     }
     Ok(p)
@@ -530,7 +530,7 @@ pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResul
     if !props.is_object() {
         return Err(AppError::bad("properties must be an object"));
     }
-    let id = core::record_event(
+    let id = core::record_api_event(
         &state.db,
         NewEvent {
             account_id,

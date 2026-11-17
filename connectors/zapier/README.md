@@ -17,8 +17,17 @@ own address; it must be `https://`.
 
 When a Zap turns on, Zapier calls `POST /api/hooks` with its hook URL and the trigger's topic;
 DumbMail then sends each event to that URL as one signed JSON envelope
-(`{id, topic, created_at, account_id, api_version, data}`). Turning the Zap off calls
+(`{id, topic, created_at, account_id, api_version, source, data}`). Turning the Zap off calls
 `DELETE /api/hooks/:id`. If Zapier answers a delivery with 410 Gone, DumbMail removes the hook.
+A hook belongs to the API key the Zap connected with; revoking the key removes its hooks.
+
+Every delivery is checked before it reaches the Zap: DumbMail signs each request with the hook's
+secret (returned when the hook is made and kept in `subscribeData`), and the trigger drops any
+request whose signature doesn't verify or is more than 5 minutes old (`verified` in
+`triggers/hooks.js`). Still, **treat the Zap's hook URL as a credential**: don't share it, and if it
+leaks, turn the Zap off and on to get a new one. Each event also carries `source`; only `system`,
+`api` and `integration` events should drive anything that moves money or ships goods, since
+`browser` events can be sent by anyone with the site's public key.
 Sample data for the Zap editor comes from `GET /api/hooks/samples` (the account's latest real
 events when there are any). See `docs/WEBHOOKS.md` in the DumbMail repository.
 

@@ -16,10 +16,12 @@ CREATE TABLE warehouse_destinations (
     datasets        text[] NOT NULL,
     schedule        text NOT NULL DEFAULT 'daily',      -- hourly | daily | manual
     enabled         boolean NOT NULL DEFAULT true,
+    revision        integer NOT NULL DEFAULT 1,         -- bumped when where or how files are written changes
+    baseline_after  timestamptz NOT NULL DEFAULT now(), -- the next run starts no earlier (see run.rs)
     next_run_at     timestamptz,
     last_run_at     timestamptz,
     last_test_at    timestamptz,
-    last_test_error text,
+    last_test_error text,                               -- a status and a short class, never a response body
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -30,16 +32,19 @@ CREATE TABLE warehouse_runs (
     id             uuid PRIMARY KEY,
     account_id     uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     destination_id uuid NOT NULL REFERENCES warehouse_destinations(id) ON DELETE CASCADE,
+    revision       integer NOT NULL,                 -- the destination revision it was started under
+    settings       jsonb NOT NULL,                   -- the destination as it was when the run started (keys encrypted)
     kind           text NOT NULL,                    -- incremental | full
-    status         text NOT NULL DEFAULT 'queued',   -- queued | running | succeeded | failed
+    status         text NOT NULL DEFAULT 'queued',   -- queued | running | succeeded | failed | cancelled
     progress       jsonb NOT NULL DEFAULT '{}',      -- per dataset: window, cursor, files, rows
     window_end     timestamptz NOT NULL,
     rows           bigint NOT NULL DEFAULT 0,
     files          integer NOT NULL DEFAULT 0,
     bytes          bigint NOT NULL DEFAULT 0,
     attempts       integer NOT NULL DEFAULT 0,
-    error          text,
+    error          text,                             -- a status and a short class, never a response body
     manifest_key   text,
+    lease_until    timestamptz,                      -- one worker per run at a time
     created_at     timestamptz NOT NULL DEFAULT now(),
     started_at     timestamptz,
     finished_at    timestamptz
@@ -54,3 +59,16 @@ CREATE TABLE warehouse_watermarks (
     exported_until timestamptz NOT NULL,
     PRIMARY KEY (destination_id, dataset)
 );
+
+-- Rows of mutable datasets that changed without a change column to find them by (a message's
+-- delivery, open or bounce; a profile's last activity). Written only for accounts with an export
+-- set up, one row per changed row (repeat changes move changed_at). Kept 7 days.
+CREATE TABLE warehouse_changes (
+    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    dataset    text NOT NULL,
+    row_id     uuid NOT NULL,
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, dataset, row_id)
+);
+CREATE INDEX warehouse_changes_time_idx ON warehouse_changes (account_id, dataset, changed_at, row_id);
+CREATE INDEX warehouse_changes_prune_idx ON warehouse_changes (changed_at);

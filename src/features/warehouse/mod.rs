@@ -2,13 +2,22 @@
 //! (Snowflake, BigQuery, Redshift and friends read the files straight from the bucket).
 //!
 //! A destination is a bucket with credentials (stored encrypted), a format (gzip'd JSON lines or
-//! CSV), the datasets to export and a schedule. Runs are jobs that write bounded files in keyset
-//! order (see `run`), with a manifest per run. docs/DATA_EXPORT.md has the file layout, the schemas
-//! and ready-to-paste warehouse SQL.
+//! CSV), the datasets to export and a schedule. Runs are background jobs that write bounded files
+//! in keyset order (see `run`), with a manifest per run. docs/DATA_EXPORT.md has the file layout,
+//! the schemas and ready-to-paste warehouse SQL.
+//!
+//! Changing where or how files are written (endpoint, region, bucket, prefix, path style, format)
+//! starts a new revision: runs in progress are cancelled, the watermarks are cleared so the next
+//! run is a full baseline, and if requests would go to a different host the keys must be given
+//! again (DumbMail never signs a request to a new host with keys saved for another).
 
 mod datasets;
 mod run;
 mod s3;
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -83,6 +92,97 @@ impl Feature for Module {
         }
         Ok(())
     }
+
+    /// Incremental exports read profiles by `updated_at` and events by `created_at`. On big
+    /// accounts that wants these indexes; exports work without them, slower.
+    async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
+        crate::features::indexes::ensure(state, INDEX_LOCK_KEY, "data export indexes", INDEXES).await
+    }
+}
+
+const INDEX_LOCK_KEY: i64 = 0x0d4d_7761_7265_686f;
+const INDEXES: &[(&str, &str)] = &[
+    ("profiles_account_updated_idx", "CREATE INDEX CONCURRENTLY profiles_account_updated_idx ON profiles (account_id, updated_at, id)"),
+    ("events_account_created_idx", "CREATE INDEX CONCURRENTLY events_account_created_idx ON events (account_id, created_at, id)"),
+];
+
+// ---------- The change log ----------
+
+/// The datasets the account's enabled destinations export, cached briefly per server. A new
+/// destination's first run waits [`run::BASELINE_DELAY_SECS`] (longer than this), so by the time
+/// it reads its baseline every server is logging changes for it.
+type DatasetCache = Mutex<HashMap<Uuid, (Instant, Arc<Vec<String>>)>>;
+static EXPORTED: LazyLock<DatasetCache> = LazyLock::new(Default::default);
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+async fn exported(db: &sqlx::PgPool, account_id: Uuid) -> Option<Arc<Vec<String>>> {
+    if let Some((at, v)) = EXPORTED.lock().ok().and_then(|m| m.get(&account_id).map(|(a, v)| (*a, v.clone()))) {
+        if at.elapsed() < CACHE_TTL {
+            return Some(v);
+        }
+    }
+    let lists: Vec<Vec<String>> = sqlx::query_scalar("SELECT datasets FROM warehouse_destinations WHERE account_id = $1 AND enabled").bind(account_id).fetch_all(db).await.ok()?;
+    let mut all: Vec<String> = lists.into_iter().flatten().collect();
+    all.sort();
+    all.dedup();
+    let v = Arc::new(all);
+    if let Ok(mut m) = EXPORTED.lock() {
+        if m.len() > 20_000 {
+            m.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+        }
+        m.insert(account_id, (Instant::now(), v.clone()));
+    }
+    Some(v)
+}
+
+fn forget(account_id: Uuid) {
+    if let Ok(mut m) = EXPORTED.lock() {
+        m.remove(&account_id);
+    }
+}
+
+/// Note that rows of a mutable dataset changed where they have no change column of their own (a
+/// message's delivery, open, click or bounce; a profile's last activity), so incremental exports
+/// pick them up again. Only for accounts exporting that dataset. Never fails the caller.
+pub async fn changed_many(db: &sqlx::PgPool, account_id: Uuid, rows: &[(&str, Uuid)]) {
+    let rows: Vec<(&str, Uuid)> = match exported(db, account_id).await {
+        Some(sets) => rows.iter().copied().filter(|(d, _)| sets.iter().any(|s| s == d)).collect(),
+        // Unsure (the database didn't answer): let the insert check.
+        None => rows.to_vec(),
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let (sets, ids): (Vec<&str>, Vec<Uuid>) = rows.into_iter().unzip();
+    let res = sqlx::query(
+        "INSERT INTO warehouse_changes (account_id, dataset, row_id)
+         SELECT $1, x.dataset, x.row_id FROM UNNEST($2::text[], $3::uuid[]) AS x(dataset, row_id)
+         WHERE EXISTS (SELECT 1 FROM warehouse_destinations d WHERE d.account_id = $1 AND d.enabled AND x.dataset = ANY(d.datasets))
+         ON CONFLICT (account_id, dataset, row_id) DO UPDATE SET changed_at = now()",
+    )
+    .bind(account_id)
+    .bind(&sets)
+    .bind(&ids)
+    .execute(db)
+    .await;
+    if let Err(e) = res {
+        tracing::error!(account = %account_id, error = %e, "couldn't note changed rows for data exports");
+    }
+}
+
+/// [`changed_many`] for one row.
+pub async fn changed(db: &sqlx::PgPool, account_id: Uuid, dataset: &str, row_id: Uuid) {
+    changed_many(db, account_id, &[(dataset, row_id)]).await
+}
+
+/// An event was recorded: its profile's last activity moved, and a message event (an open, a
+/// click, a bounce ...) changed its message. Called by `audience::record_event`.
+pub async fn event_recorded(db: &sqlx::PgPool, account_id: Uuid, profile_id: Uuid, message_id: Option<Uuid>) {
+    let mut rows = vec![("profiles", profile_id)];
+    if let Some(m) = message_id {
+        rows.push(("messages", m));
+    }
+    changed_many(db, account_id, &rows).await
 }
 
 #[derive(sqlx::FromRow)]
@@ -102,6 +202,8 @@ pub(crate) struct Dest {
     datasets: Vec<String>,
     schedule: String,
     enabled: bool,
+    revision: i32,
+    baseline_after: DateTime<Utc>,
     next_run_at: Option<DateTime<Utc>>,
     last_run_at: Option<DateTime<Utc>>,
     last_test_at: Option<DateTime<Utc>>,
@@ -111,7 +213,7 @@ pub(crate) struct Dest {
 }
 
 const DEST_COLS: &str = "id, account_id, name, endpoint, region, bucket, prefix, path_style, access_key_enc, secret_key_enc, access_key_hint, format, datasets, schedule,
-    enabled, next_run_at, last_run_at, last_test_at, last_test_error, created_at, updated_at";
+    enabled, revision, baseline_after, next_run_at, last_run_at, last_test_at, last_test_error, created_at, updated_at";
 
 async fn load(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Dest> {
     sqlx::query_as::<_, Dest>(&format!("SELECT {DEST_COLS} FROM warehouse_destinations WHERE id = $1 AND account_id = $2"))
@@ -222,8 +324,8 @@ fn parse_fields(b: &Value) -> AppResult<Fields> {
         }
     }
     if let Some(p) = &f.prefix {
-        if !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '=')) || p.contains("..") {
-            return Err(AppError::bad("prefix may use letters, digits and / - _ . ="));
+        if !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '=')) || p.contains("..") || s3::has_dot_segment(p) {
+            return Err(AppError::bad("prefix may use letters, digits and / - _ . = (and no folder named . or ..)"));
         }
     }
     if let Some(v) = obj.get("endpoint") {
@@ -290,7 +392,8 @@ fn key_hint(key: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// Write and delete a small file. The delete may be refused (write-only keys); that's fine.
+/// Write and delete a small file. The delete may be refused (write-only keys); that's fine. The
+/// error is a fixed phrase with a status and an allowlisted code (see s3.rs), safe to show and keep.
 async fn test_write(b: &s3::Bucket, prefix: &str) -> Result<(), String> {
     let key = format!("{}_dumbmail_test/{}.txt", run::key_prefix(prefix), Uuid::now_v7());
     b.put(&key, b"DumbMail checked that it can write here. You can delete this file.".to_vec(), "text/plain").await.map_err(|e| format!("{e:#}"))?;
@@ -330,8 +433,10 @@ async fn create(state: &AppState, account_id: Uuid, body: &Value) -> AppResult<V
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO warehouse_destinations (id, account_id, name, endpoint, region, bucket, prefix, path_style, access_key_enc, secret_key_enc, access_key_hint,
-            format, datasets, schedule, enabled, next_run_at, last_test_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CASE WHEN $14 = 'manual' THEN NULL ELSE now() END, now())",
+            format, datasets, schedule, enabled, next_run_at, last_test_at
+            , baseline_after)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CASE WHEN $14 = 'manual' THEN NULL ELSE now() END, now(),
+            now() + make_interval(secs => $16))",
     )
     .bind(id)
     .bind(account_id)
@@ -348,32 +453,49 @@ async fn create(state: &AppState, account_id: Uuid, body: &Value) -> AppResult<V
     .bind(f.datasets.clone().unwrap_or_else(datasets::all_names))
     .bind(&schedule)
     .bind(enabled)
+    .bind(run::BASELINE_DELAY_SECS as f64)
     .execute(&state.db)
     .await?;
+    forget(account_id);
     dest_json(state, &load(state, account_id, id).await?).await
 }
 
 async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &Value) -> AppResult<Value> {
     let d = load(state, account_id, id).await?;
     let f = parse_fields(body)?;
+    // Where requests would go, and where files would land, after this change.
+    let mut b = run::bucket(state, &d).map_err(AppError::Internal)?;
+    let old_origin = b.origin();
+    b.endpoint = f.endpoint.clone().unwrap_or(d.endpoint.clone());
+    b.region = f.region.clone().unwrap_or(d.region.clone());
+    b.bucket = f.bucket.clone().unwrap_or(d.bucket.clone());
+    b.path_style = f.path_style.unwrap_or(d.path_style);
+    let prefix = f.prefix.clone().unwrap_or(d.prefix.clone());
+    let format = f.format.clone().unwrap_or(d.format.clone());
+    let new_origin = b.origin();
+    if new_origin != old_origin && (f.access_key_id.is_none() || f.secret_access_key.is_none()) {
+        return Err(AppError::bad(format!(
+            "this change sends requests to {} instead of {}; give access_key_id and secret_access_key for it (saved keys are only ever sent to the host they were saved for)",
+            host_of(&new_origin),
+            host_of(&old_origin)
+        )));
+    }
+    if let Some(a) = &f.access_key_id {
+        b.access_key = a.clone();
+    }
+    if let Some(s) = &f.secret_access_key {
+        b.secret_key = s.clone();
+    }
+    // A new revision: files would go somewhere else, or in another format.
+    let moved = b.endpoint != d.endpoint || b.region != d.region || b.bucket != d.bucket || b.path_style != d.path_style || !key_prefix_eq(&prefix, &d.prefix) || format != d.format;
+    // Turned back on: changes weren't logged while it was off, so it starts over too.
+    let reenabled = f.enabled == Some(true) && !d.enabled;
     if f.touches_storage() {
-        let endpoint = f.endpoint.clone().unwrap_or(d.endpoint.clone());
-        let bucket_name = f.bucket.clone().unwrap_or(d.bucket.clone());
-        let mut b = run::bucket(state, &d).map_err(AppError::Internal)?;
-        b.endpoint = endpoint;
-        b.region = f.region.clone().unwrap_or(d.region.clone());
-        b.bucket = bucket_name;
-        b.path_style = f.path_style.unwrap_or(d.path_style);
-        if let Some(a) = &f.access_key_id {
-            b.access_key = a.clone();
-        }
-        if let Some(s) = &f.secret_access_key {
-            b.secret_key = s.clone();
-        }
-        test_write(&b, f.prefix.as_deref().unwrap_or(&d.prefix)).await.map_err(|e| AppError::bad(format!("DumbMail couldn't write to that bucket: {e}")))?;
+        test_write(&b, &prefix).await.map_err(|e| AppError::bad(format!("DumbMail couldn't write to that bucket: {e}")))?;
     }
     let enc = |v: &Option<String>| -> AppResult<Option<String>> { v.as_ref().map(|s| crate::crypto::encrypt(&state.cfg.secret_key, s)).transpose().map_err(AppError::Internal) };
-    let schedule_changed = f.schedule.as_ref().is_some_and(|s| *s != d.schedule) || f.enabled == Some(true) && !d.enabled;
+    let schedule_changed = f.schedule.as_ref().is_some_and(|s| *s != d.schedule) || reenabled;
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE warehouse_destinations SET name = COALESCE($3, name), endpoint = CASE WHEN $4 THEN $5 ELSE endpoint END, region = COALESCE($6, region),
            bucket = COALESCE($7, bucket), prefix = COALESCE($8, prefix), path_style = COALESCE($9, path_style),
@@ -381,6 +503,8 @@ async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &Value) -> A
            format = COALESCE($13, format), datasets = COALESCE($14, datasets), schedule = COALESCE($15, schedule), enabled = COALESCE($16, enabled),
            next_run_at = CASE WHEN $17 THEN (CASE WHEN COALESCE($15, schedule) = 'manual' THEN NULL ELSE now() END) ELSE next_run_at END,
            last_test_at = CASE WHEN $18 THEN now() ELSE last_test_at END, last_test_error = CASE WHEN $18 THEN NULL ELSE last_test_error END,
+           revision = revision + CASE WHEN $19 THEN 1 ELSE 0 END,
+           baseline_after = CASE WHEN $19 OR $20 THEN now() + make_interval(secs => $21) ELSE baseline_after END,
            updated_at = now()
          WHERE id = $1 AND account_id = $2",
     )
@@ -402,9 +526,31 @@ async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &Value) -> A
     .bind(f.enabled)
     .bind(schedule_changed)
     .bind(f.touches_storage())
-    .execute(&state.db)
+    .bind(moved)
+    .bind(reenabled)
+    .bind(run::BASELINE_DELAY_SECS as f64)
+    .execute(&mut *tx)
     .await?;
+    if moved || reenabled {
+        // Nothing queued for the old place goes to the new one, and the next run is a fresh baseline.
+        let why = if moved { "destination_changed" } else { "destination_reenabled" };
+        let active: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM warehouse_runs WHERE destination_id = $1 AND status IN ('queued', 'running')").bind(id).fetch_all(&mut *tx).await?;
+        for r in active {
+            run::cancel(&mut *tx, r, why).await?;
+        }
+        sqlx::query("DELETE FROM warehouse_watermarks WHERE destination_id = $1").bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    forget(account_id);
     dest_json(state, &load(state, account_id, id).await?).await
+}
+
+fn key_prefix_eq(a: &str, b: &str) -> bool {
+    run::key_prefix(a) == run::key_prefix(b)
+}
+
+fn host_of(origin: &str) -> String {
+    url::Url::parse(origin).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_else(|| origin.to_string())
 }
 
 async fn delete(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
@@ -412,6 +558,7 @@ async fn delete(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
     if n == 0 {
         return Err(AppError::not_found("export destination"));
     }
+    forget(account_id);
     Ok(())
 }
 
@@ -452,7 +599,7 @@ async fn get_run(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Valu
 }
 
 fn datasets_json() -> Value {
-    json!(datasets::DATASETS.iter().map(|d| json!({"name": d.name, "mode": if d.incremental { "incremental" } else { "snapshot" }, "description": d.description, "columns": d.columns})).collect::<Vec<_>>())
+    json!(datasets::DATASETS.iter().map(|d| json!({"name": d.name, "mode": if d.incremental { "incremental" } else { "snapshot" }, "description": d.description, "key": d.key, "columns": d.columns})).collect::<Vec<_>>())
 }
 
 // ---------- Handlers ----------
@@ -543,7 +690,7 @@ fn tool_defs() -> Vec<Value> {
         tool("delete_export_destination", "Delete an export destination", "Stop exporting to a destination and forget its keys and run history (files already in the bucket stay). Without confirm=true it only describes what would happen.",
             obj(json!({"id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
         tool("test_export_destination", "Test an export destination", "Write and delete a small test file in the destination's bucket and report the result.", obj(json!({"id": {"type": "string"}}), &["id"]), false, false),
-        tool("start_export", "Start an export now", "Start an export run now. incremental exports what changed since the last run; full exports every row of every dataset (can be large). A full export requires confirm=true.",
+        tool("start_warehouse_export", "Start a data export now", "Start an export run now. incremental exports what changed since the last run; full exports every row of every dataset (can be large). A full export requires confirm=true.",
             obj(json!({"id": {"type": "string"}, "kind": {"enum": ["incremental", "full"]}, "confirm": {"type": "boolean"}}), &["id", "kind"]), false, false),
         tool("list_export_runs", "List export runs", "A destination's recent runs: status, rows and files per dataset, errors and the manifest's key. Pass run_id for one run.",
             obj(json!({"id": {"type": "string"}, "run_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}), &[]), true, false),
@@ -581,7 +728,7 @@ async fn call_tool(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option
             Ok(id) => test(state, acct, id).await,
             Err(e) => Err(e),
         },
-        "start_export" => async {
+        "start_warehouse_export" => async {
             let id = id_arg(a, "id")?;
             let kind = a["kind"].as_str().unwrap_or("");
             if kind == "full" && a["confirm"].as_bool() != Some(true) {
