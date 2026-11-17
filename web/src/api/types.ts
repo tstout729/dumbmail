@@ -12,6 +12,7 @@ export type ApiErrorCode =
   | "forbidden"
   | "conflict"
   | "limit_reached"
+  | "rate_limited"
   | "internal";
 
 export type Profile = {
