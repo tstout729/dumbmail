@@ -71,9 +71,15 @@ struct PreviewBody {
     campaign_id: Option<Uuid>,
     channel: Option<String>,
     audience: Option<Value>,
-    #[serde(default)]
+    /// Missing: the campaign's. `null`: everyone at once.
+    #[serde(default, deserialize_with = "present")]
     send_options: Option<Value>,
     send_at: Option<DateTime<Utc>>,
+}
+
+/// Deserializes a present field (even `null`) as Some, so a missing field stays None.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 /// Estimate when a send goes out. Missing fields come from the campaign when `campaign_id` is given.

@@ -11,6 +11,7 @@ import { formatCurrency, formatDateTime, formatNumber, formatPercent, pluralize 
 import { toast } from "../../lib/toast";
 import { contentSnippet, metricLabels, versionContent, versionIds, versionLabel, versionName } from "./abTest";
 import { ChannelIcon } from "./CampaignsPage";
+import { SendProgressCard } from "../../features/sendtime/SendProgressCard";
 
 export function CampaignReportView({ campaign }: { campaign: Campaign }) {
   const { account } = useSession();
@@ -65,6 +66,7 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
         }
       />
       {ab ? <AbTestResults campaign={campaign} ab={ab} totalRecipients={stats.recipients} timezone={tz} /> : null}
+      <SendProgressCard campaignId={campaign.id} live={campaign.status === "sending"} timezone={tz} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Stat label="Recipients" value={formatNumber(stats.recipients)} sub={`${formatNumber(stats.delivered)} delivered`} />
         {campaign.channel === "email" ? (

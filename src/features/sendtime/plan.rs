@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sqlx::{PgPool, QueryBuilder};
 use uuid::Uuid;
 
-use super::clock::{local_instant, next_local, window_wait};
+use super::clock::{local_instant, next_local};
 use super::options::{self, Late, SendOptions, Timing};
 use super::zone;
 use crate::campaigns::Audience;
@@ -105,8 +105,13 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// When this recipient's message is released. `index`/`total` place them in a gradual send.
+    /// When this recipient's message is released. `index`/`total` place them in a gradual send;
+    /// `sms_zones` are the zones a text must respect (see `settings::sms_zones`).
     pub fn release(&self, tz: Tz, index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
+        self.release_with(tz, &[tz], index, total, personal)
+    }
+
+    pub fn release_with(&self, tz: Tz, sms_zones: &[Tz], index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
         let at = match self.opts.timing {
             Timing::AllAtOnce => self.start,
             Timing::LocalTime => {
@@ -124,7 +129,7 @@ impl Plan {
         };
         // Texts never go out during the recipient's quiet hours.
         match self.sms_window {
-            Some((s, e)) => window_wait(tz, at, s, e).unwrap_or(at),
+            Some((s, e)) => super::settings::sms_wait(sms_zones, at, s, e).unwrap_or(at),
             None => at,
         }
     }
@@ -260,9 +265,10 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
         let zones: Vec<(Uuid, Tz)> = rows.iter().map(|(_, pid, props, phone)| (*pid, zone::resolve_parts(props, phone.as_deref(), plan.account_tz).0)).collect();
         let hists = if plan.opts.timing == Timing::BestTime { personal_histograms(&state.db, &zones, plan.start).await? } else { HashMap::new() };
         let (mut ids, mut ats, mut tzs) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()));
-        for ((mid, _, _, _), (pid, tz)) in rows.iter().zip(&zones) {
+        for ((mid, _, props, phone), (pid, tz)) in rows.iter().zip(&zones) {
             ids.push(*mid);
-            ats.push(plan.release(*tz, index, total, hists.get(pid)));
+            let sms_zones = super::settings::sms_zones(props, phone.as_deref(), plan.account_tz);
+            ats.push(plan.release_with(*tz, &sms_zones, index, total, hists.get(pid)));
             tzs.push(tz.name().to_string());
             index += 1;
         }

@@ -22,7 +22,6 @@ static PROMO: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
         ("ends soon", r"\b(offer|sale|deal)s?\s+ends?\s+(soon|tonight|today|tomorrow)\b"),
         ("free shipping offer", r"\bfree\s+shipping\s+on\s+(all\s+)?orders\s+over\b"),
         ("new arrivals", r"\b(new\s+arrivals|just\s+dropped|new\s+collection)\b"),
-        ("unsubscribe link", r"\{\{\s*unsubscribe_url\s*\}\}"),
     ]
     .into_iter()
     .map(|(label, re)| (label, Regex::new(&format!("(?i){re}")).expect("promo regex")))
@@ -58,9 +57,15 @@ fn text_of(content: &Value) -> String {
 
 pub fn review(content: &Value) -> Review {
     static TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
-    let text = TAGS.replace_all(&text_of(content), " ").replace("&nbsp;", " ");
-    let flags: Vec<String> = PROMO.iter().filter(|(_, re)| re.is_match(&text)).map(|(l, _)| l.to_string()).collect();
-    let blocked = flags.len() >= 2 || flags.iter().any(|f| f == "unsubscribe link");
+    // A marketing unsubscribe link anywhere (attributes and block links included) means marketing.
+    static UNSUB: Lazy<Regex> = Lazy::new(|| Regex::new(r"\{\{\s*unsubscribe_url\s*\}\}").unwrap());
+    let text = TAGS.replace_all(&text_of(content), " ").replace("&nbsp;", " ").replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", "\"");
+    let mut flags: Vec<String> = PROMO.iter().filter(|(_, re)| re.is_match(&text)).map(|(l, _)| l.to_string()).collect();
+    let unsubscribe = UNSUB.is_match(&content.to_string());
+    if unsubscribe {
+        flags.push("unsubscribe link".into());
+    }
+    let blocked = flags.len() >= 2 || unsubscribe;
     Review { flags, blocked }
 }
 
@@ -93,5 +98,10 @@ mod tests {
         assert_eq!(r.flags, vec!["percent off", "shop now"]);
         let unsub = json!({"html": "<a href=\"{{ unsubscribe_url }}\">Unsubscribe</a>"});
         assert!(review(&unsub).blocked, "a marketing unsubscribe link means it's marketing");
+        let unsub = json!({"blocks": [{"type": "button", "text": "Opt out", "href": "{{unsubscribe_url}}"}]});
+        assert!(review(&unsub).blocked);
+        // Rendered HTML escapes apostrophes; the rules still see them.
+        let rendered = json!({"html": "<p>Don&#39;t miss out on our exclusive offer</p>"});
+        assert!(review(&rendered).blocked);
     }
 }

@@ -3,6 +3,7 @@
 //! telemarketing rules allow).
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -33,8 +34,34 @@ fn clamp_window(s: i32, e: i32) -> (u32, u32) {
 /// (falling back to the account's) and the account's SMS window.
 pub async fn sms_quiet_until(db: &PgPool, account: &Account, profile: &Profile, now: DateTime<Utc>) -> sqlx::Result<Option<DateTime<Utc>>> {
     let (s, e) = sms_window(db, account.id).await?;
-    let (tz, _) = zone::resolve(profile, crate::sending::account_tz(account));
-    Ok(window_wait(tz, now, s, e))
+    let zones = sms_zones(&profile.properties, profile.phone_number.as_deref(), crate::sending::account_tz(account));
+    Ok(sms_wait(&zones, now, s, e))
+}
+
+/// The zones a text must respect. A `timezone` property can come from a browser, so it never makes
+/// quiet hours looser than the phone number's own zone: when both are known and differ, both count.
+pub fn sms_zones(props: &Value, phone: Option<&str>, account_tz: Tz) -> Vec<Tz> {
+    let (tz, _) = zone::resolve_parts(props, phone, account_tz);
+    match phone.and_then(zone::phone_zone) {
+        Some(p) if p != tz => vec![p, tz],
+        _ => vec![tz],
+    }
+}
+
+/// When a text may go so that it's inside the window in every one of `zones` (the first is the
+/// phone's). If their windows never overlap, the phone's zone alone decides.
+pub fn sms_wait(zones: &[Tz], now: DateTime<Utc>, start: u32, end: u32) -> Option<DateTime<Utc>> {
+    let mut at = now;
+    for _ in 0..8 {
+        match zones.iter().filter_map(|z| window_wait(*z, at, start, end)).max() {
+            None => return (at > now).then_some(at),
+            Some(next) => at = next,
+        }
+        if at > now + chrono::Duration::days(2) {
+            break;
+        }
+    }
+    zones.first().and_then(|z| window_wait(*z, now, start, end))
 }
 
 pub async fn settings_json(db: &PgPool, account_id: Uuid) -> sqlx::Result<Value> {
@@ -85,6 +112,25 @@ pub async fn update(db: &PgPool, account_id: Uuid, b: SettingsBody) -> AppResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_browser_time_zone_never_loosens_quiet_hours() {
+        use chrono::TimeZone;
+        let la: Tz = chrono_tz::America::Los_Angeles;
+        let utc = |h: u32| Utc.with_ymd_and_hms(2026, 11, 20, h, 0, 0).unwrap();
+        // New York number claiming Los Angeles: both count. 17:00 UTC = 12:00 NY, 09:00 LA: open in both.
+        let z = sms_zones(&serde_json::json!({"timezone": "America/Los_Angeles"}), Some("+12125550100"), la);
+        assert_eq!(z.len(), 2);
+        assert_eq!(sms_wait(&z, utc(17), 540, 1200), None);
+        // 02:00 UTC = 21:00 NY, 18:00 LA: closed in New York, so it waits for 09:00 LA (= 12:00 NY) tomorrow.
+        assert_eq!(sms_wait(&z, utc(2), 540, 1200), Some(utc(17)));
+        // A New York number claiming Manila (13 hours ahead): the windows never overlap, so New York decides.
+        let z = sms_zones(&serde_json::json!({"timezone": "Asia/Manila"}), Some("+12125550100"), la);
+        assert_eq!(sms_wait(&z, utc(16), 540, 1200), None, "11:00 in New York");
+        assert_eq!(sms_wait(&z, utc(3), 540, 1200), Some(utc(14)), "22:00 in New York waits for 09:00");
+        // No phone zone: just the one.
+        assert_eq!(sms_zones(&serde_json::json!({"timezone": "Asia/Kolkata"}), Some("+18505550100"), la).len(), 1);
+    }
 
     #[test]
     fn stored_windows_stay_legal() {

@@ -181,10 +181,7 @@ async fn resolve_content(db: &PgPool, account_id: Uuid, b: &SendBody) -> AppResu
     if let (Some(s), Some(o)) = (&b.subject, content.as_object_mut()) {
         o.insert("subject".into(), json!(s));
     }
-    let r = review::review(&content);
-    if r.blocked {
-        return Err(AppError::bad(review::blocked_message(&r)));
-    }
+    check_review(&content)?;
     let o = content.as_object().ok_or_else(|| AppError::bad("content must be an object"))?;
     if o.get("subject").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
         return Err(AppError::bad("give the email a subject"));
@@ -194,6 +191,16 @@ async fn resolve_content(db: &PgPool, account_id: Uuid, b: &SendBody) -> AppResu
         return Err(AppError::bad("give the email blocks, html or text"));
     }
     Ok((content, b.template_id))
+}
+
+fn check_review(content: &Value) -> AppResult<()> {
+    let r = review::review(content);
+    if r.blocked { Err(AppError::bad(review::blocked_message(&r))) } else { Ok(()) }
+}
+
+/// The review again on what would actually go out, so variables can't carry a promotion past it.
+fn check_rendered(email: &OutgoingEmail) -> AppResult<()> {
+    check_review(&json!({"subject": email.subject, "from_name": email.from_name, "html": email.html, "text": email.text}))
 }
 
 fn escape(s: &str) -> String {
@@ -363,6 +370,7 @@ async fn deliver(state: &AppState, account: &Account, id: Uuid, b: &SendBody, to
     }
     let message_id = Uuid::now_v7();
     let email = render_for(state, account, &profile, b, content, message_id)?;
+    check_rendered(&email)?;
     let price = crate::billing::quote(state, account.id, "email", 1, false, false).await?;
     if price > 0 && crate::billing::balance(&state.db, account.id).await? < price {
         return Err(AppError::LimitReached("your balance is empty; add credit in Settings → Billing".into()));
@@ -450,7 +458,7 @@ pub async fn retry(state: &AppState, id: Uuid) -> anyhow::Result<()> {
     if let Some(reason) = suppressed(&state.db, profile.id).await? {
         return fail(suppressed_message(&reason)).await;
     }
-    let email = match resolve_content(&state.db, account_id, &b).await.and_then(|(c, _)| render_for(state, &account, &profile, &b, &c, message_id)) {
+    let email = match resolve_content(&state.db, account_id, &b).await.and_then(|(c, _)| render_for(state, &account, &profile, &b, &c, message_id)).and_then(|e| check_rendered(&e).map(|_| e)) {
         Ok(e) => e,
         Err(e) => return fail(e.public_message()).await,
     };
@@ -471,6 +479,7 @@ pub async fn dry_run(state: &AppState, account_id: Uuid, b: SendBody, include_ht
     };
     let profile = existing.unwrap_or_else(|| unsaved_profile(account_id, &to));
     let email = render_for(state, &account, &profile, &b, &content, Uuid::nil())?;
+    check_rendered(&email)?;
     let r = review::review(&content);
     let mut out = json!({
         "dry_run": true,
