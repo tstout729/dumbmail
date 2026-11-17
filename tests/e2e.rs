@@ -2869,6 +2869,22 @@ async fn form_schedule_preview_and_hosted_page() {
     let (s, _, html) = h.raw("GET", &format!("/f/{fid}"), &[], "").await;
     assert_eq!(s, StatusCode::OK);
     assert!(html.contains("isn't open right now"), "{html}");
+    // Sign-ups follow the schedule too: refused before the start, and after the end once two hours' grace pass.
+    let sign = |h: &Harness, email: &'static str| {
+        let (router, pk, fid) = (h.router.clone(), pk.clone(), fid.clone());
+        async move {
+            let req = Request::builder().method("POST").uri(format!("/client/subscribe?k={pk}")).header("content-type", "application/json")
+                .body(Body::from(json!({"form_id": fid, "email": email}).to_string())).unwrap();
+            router.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(sign(&h, "early@x.test").await, StatusCode::CONFLICT);
+    let ended = |hours: i64| json!({"config": {"targeting": {"end_at": (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()}}});
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(ended(1))).await;
+    assert_eq!(sign(&h, "grace@x.test").await, StatusCode::OK, "within the grace after the end");
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(ended(3))).await;
+    assert_eq!(sign(&h, "late@x.test").await, StatusCode::CONFLICT);
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"config": {"targeting": {"start_at": soon}}}))).await;
     let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
     let preview = f["preview_url"].as_str().unwrap().trim_start_matches("https://pl.test").to_string();
     let (s, _, html) = h.raw("GET", &preview, &[], "").await;

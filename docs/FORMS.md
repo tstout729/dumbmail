@@ -149,7 +149,7 @@ A small tab in a corner of the page that opens the popup or flyout. Popup and fl
 | `visitors` | `all`, `new`, `returning` | `all` | `returning` means this browser visited before today's visit (more than 30 minutes ago). |
 | `frequency_days` | integer 0–365 | 7 | After someone closes it, wait this long before showing it again. |
 | `hide_for_subscribers` | boolean | true | Skip visitors the site already knows. |
-| `start_at`, `end_at` | ISO 8601 date-time with a time zone, like `2026-12-01T09:00:00-08:00` | none | Only show between these times. Outside them the form doesn't load on the site and the hosted page says it's closed. |
+| `start_at`, `end_at` | ISO 8601 date-time with a time zone, like `2026-12-01T09:00:00-08:00` | none | Only show between these times. Outside them the form doesn't load on the site, the hosted page says it's closed, and sign-ups are refused (with two hours' grace after the end for someone who opened the form just before). |
 
 Any element on the site with `data-dumbmail-open="FORM_ID"` opens that form when clicked, whatever its trigger.
 

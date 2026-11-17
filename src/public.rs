@@ -665,6 +665,12 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if form.account_id != account.id || form.status != "live" {
         return Err(AppError::not_found("form"));
     }
+    // Outside the form's start/end window sign-ups are refused, with two hours' grace after the end
+    // for someone who opened the form just before it closed.
+    let now = chrono::Utc::now();
+    if !crate::forms::is_open(&form.config, now) && !crate::forms::is_open(&form.config, now - chrono::Duration::hours(2)) {
+        return Err(AppError::Conflict("This form isn't open right now.".into()));
+    }
     match b.step.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => {}
         Some("phone") => return phone_step(state, account, &form, b).await,
