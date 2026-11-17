@@ -5,7 +5,8 @@ import type { Session } from "./types";
 
 export type SignupInput = { email: string; password: string; name?: string; company: string };
 export type LoginInput = { email: string; password: string };
-export type AuthOptions = { google: boolean; signup: boolean };
+/** `site_url` is the marketing site (About, Pricing, Privacy, Terms) when it's on its own host. */
+export type AuthOptions = { google: boolean; signup: boolean; site_url: string | null };
 
 export const authApi = {
   me: () => api<Session>("GET", "/api/me"),
@@ -18,6 +19,12 @@ export const authApi = {
 /** Which sign-in methods this server offers (Google appears once its client is configured). */
 export function useAuthOptions() {
   return useQuery({ queryKey: ["auth-options"], queryFn: authApi.options, staleTime: Infinity, retry: false });
+}
+
+/** A marketing-site page (e.g. "/privacy"): absolute on the site host when it has one, else relative. */
+export function useSiteHref(path: string): string {
+  const { data } = useAuthOptions();
+  return `${data?.site_url ?? ""}${path}`;
 }
 
 export function useMe() {

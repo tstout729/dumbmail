@@ -119,7 +119,7 @@ pub struct Config {
     pub secure_cookies: bool,
 
     /// Google OAuth web client for "Continue with Google". Both unset hides the button. The client's
-    /// authorized redirect URI must be PUBLIC_URL + /api/auth/google/callback.
+    /// authorized redirect URI must be GOOGLE_REDIRECT_BASE (default PUBLIC_URL) + /api/auth/google/callback.
     #[arg(long, env = "GOOGLE_CLIENT_ID")]
     pub google_client_id: Option<String>,
     #[arg(long, env = "GOOGLE_CLIENT_SECRET", hide_env_values = true)]
@@ -145,6 +145,24 @@ pub struct Config {
     /// Point the domain at this service before setting it. Unset uses PUBLIC_URL.
     #[arg(long, env = "LINK_URL")]
     pub link_url: Option<String>,
+    /// Marketing site base URL (no trailing slash), e.g. https://dumbmail.ai while PUBLIC_URL is
+    /// https://app.dumbmail.ai. On this host `/` is the landing page and `/about`, `/pricing`,
+    /// `/privacy` and `/terms` are served; the API, MCP, webhooks, tracking links, hosted forms, the
+    /// website snippet and Google sign-in keep working there; any other page visit is sent to
+    /// PUBLIC_URL. On PUBLIC_URL's host those pages redirect here. Unset (or the same host as
+    /// PUBLIC_URL) keeps one host for everything, with the landing page at `/home`. Its host must not
+    /// be in REDIRECT_HOSTS.
+    #[arg(long, env = "SITE_URL")]
+    pub site_url: Option<String>,
+    /// Domain for the session and Google sign-in cookies (e.g. dumbmail.ai), so they reach both the
+    /// site host and the app host. Unset makes them host-only.
+    #[arg(long, env = "COOKIE_DOMAIN")]
+    pub cookie_domain: Option<String>,
+    /// Base URL Google returns people to after "Continue with Google": the redirect URI is this +
+    /// /api/auth/google/callback, and it must be registered on the Google client. Defaults to
+    /// PUBLIC_URL. On a different host than PUBLIC_URL, set COOKIE_DOMAIN to a domain covering both.
+    #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
+    pub google_redirect_base: Option<String>,
 }
 
 impl Config {
@@ -157,9 +175,40 @@ impl Config {
         self.link_url.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).unwrap_or(self.public_url())
     }
 
+    /// SITE_URL without a trailing slash, when it's set and on a different host from PUBLIC_URL.
+    pub fn site_url(&self) -> Option<&str> {
+        let site = self.site_url.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty())?;
+        let host = host_of(site)?;
+        (Some(host) != self.public_host()).then_some(site)
+    }
+
+    /// SITE_URL's hostname (lowercase) when the marketing site is on its own host.
+    pub fn site_host(&self) -> Option<String> {
+        self.site_url().and_then(host_of)
+    }
+
+    /// PUBLIC_URL's hostname (lowercase).
+    pub fn public_host(&self) -> Option<String> {
+        host_of(self.public_url())
+    }
+
+    /// COOKIE_DOMAIN without a leading dot, when set.
+    pub fn cookie_domain(&self) -> Option<&str> {
+        self.cookie_domain.as_deref().map(|d| d.trim().trim_start_matches('.')).filter(|d| !d.is_empty())
+    }
+
+    /// Base URL for Google's redirect URI: GOOGLE_REDIRECT_BASE, else PUBLIC_URL.
+    pub fn google_redirect_base(&self) -> &str {
+        self.google_redirect_base.as_deref().map(|u| u.trim().trim_end_matches('/')).filter(|u| !u.is_empty()).unwrap_or(self.public_url())
+    }
+
     /// LINK_URL's hostname when it differs from PUBLIC_URL's.
     pub fn shared_link_host(&self) -> Option<String> {
         let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_lowercase));
         host(self.link_url()).filter(|h| Some(h) != host(self.public_url()).as_ref())
     }
+}
+
+fn host_of(u: &str) -> Option<String> {
+    url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_lowercase))
 }
