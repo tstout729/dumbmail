@@ -8,6 +8,8 @@ import type {
   AuditFilters,
   AuditPage,
   CreatedScopedKey,
+  GoogleLinkInfo,
+  GoogleLinkSession,
   InviteResult,
   NewKeyInput,
   PublicInvite,
@@ -58,6 +60,11 @@ export const teamApi = {
   changePassword: (input: { current_password: string; new_password: string }) => api<{ ok: true; other_sessions_revoked: number }>("POST", "/api/me/password", input),
   forgot: (email: string) => api<{ ok: true; message: string }>("POST", "/api/auth/password/forgot", { email }),
   reset: (input: { token: string; password: string }) => api<{ ok: true }>("POST", "/api/auth/password/reset", input),
+  requestEmailConfirmation: () => api<{ ok: true; already_confirmed: boolean; message: string }>("POST", "/api/me/email-confirmation"),
+  confirmEmail: (token: string) => api<{ ok: true; message: string }>("POST", "/api/auth/confirm-email", { token }),
+  googleLink: () => api<GoogleLinkInfo>("GET", "/api/auth/google/link"),
+  linkWithPassword: (password: string) => api<GoogleLinkSession>("POST", "/api/auth/google/link/password", { password }),
+  startFresh: () => api<GoogleLinkSession>("POST", "/api/auth/google/link/fresh"),
   security: () => api<AccountSecurity>("GET", "/api/team/security"),
   updateSecurity: (requireTwoFactor: boolean) => api<AccountSecurity>("PATCH", "/api/team/security", { require_two_factor: requireTwoFactor }),
   sso: () => api<{ sso: SsoSettings | null; redirect_uri: string }>("GET", "/api/team/sso"),
@@ -83,6 +90,7 @@ export function useTeamSession(): TeamSessionInfo {
     sign_in_method: s.sign_in_method ?? null,
     two_factor_enabled: s.two_factor_enabled ?? false,
     login_methods: s.login_methods ?? { password: true, google: false },
+    email_confirmed: s.email_confirmed ?? true,
     accounts: s.accounts ?? [],
   };
 }
@@ -202,6 +210,34 @@ export function useForgotPassword() {
 
 export function useResetPassword() {
   return useMutation({ mutationFn: teamApi.reset, meta: { silentError: true } });
+}
+
+export function useRequestEmailConfirmation() {
+  return useMutation({ mutationFn: teamApi.requestEmailConfirmation, meta: { silentError: true } });
+}
+
+export function useConfirmEmail() {
+  return useMutation({ mutationFn: teamApi.confirmEmail, meta: { silentError: true } });
+}
+
+export function useGoogleLink() {
+  return useQuery({ queryKey: ["google-link"], queryFn: teamApi.googleLink, retry: false, staleTime: Infinity });
+}
+
+/**
+ * A full page load into the new session, so nothing cached from before it stays. Other tabs find
+ * out on their next write (the server answers `account_changed` and they reload).
+ */
+function openSession(s: GoogleLinkSession) {
+  window.location.assign(s.next.startsWith("/") && !s.next.startsWith("//") ? s.next : "/");
+}
+
+export function useLinkWithPassword() {
+  return useMutation({ mutationFn: teamApi.linkWithPassword, meta: { silentError: true }, onSuccess: openSession });
+}
+
+export function useStartFresh() {
+  return useMutation({ mutationFn: teamApi.startFresh, meta: { silentError: true }, onSuccess: openSession });
 }
 
 export function useAccountSecurity(enabled = true) {

@@ -155,7 +155,8 @@ pub fn spawn_workers(state: AppState) {
 pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     let due: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE campaigns SET status = 'sending', updated_at = now()
-         WHERE status = 'scheduled' AND send_at <= now() RETURNING id",
+         WHERE status = 'scheduled' AND send_at <= now()
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = campaigns.account_id AND a.closed_at IS NOT NULL) RETURNING id",
     )
     .fetch_all(&state.db)
     .await?;

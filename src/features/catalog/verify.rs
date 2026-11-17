@@ -164,7 +164,8 @@ pub async fn queue_due(db: &PgPool) -> anyhow::Result<()> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE catalog_products SET verify_after = now() + interval '1 hour' WHERE id IN (
             SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY account_id ORDER BY verify_after, id) AS rn
-                            FROM catalog_products WHERE verify_after <= now() AND source = 'events') x
+                            FROM catalog_products p WHERE verify_after <= now() AND source = 'events'
+                              AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = p.account_id AND a.closed_at IS NOT NULL)) x
             WHERE rn = 1 LIMIT 50)
          RETURNING id",
     )

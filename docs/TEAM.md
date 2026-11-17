@@ -173,6 +173,53 @@ running at once. So a shared address (an office) is slowed down, never locked ou
 password gets in once its wait is over. A password change
 or reset also stops any sign-in that checked the old password from getting a session.
 
+## Confirmed email addresses and Continue with Google
+
+Signing up with a password doesn't prove the email address belongs to the person who typed it. So
+a login's email starts unconfirmed, and becomes confirmed when its owner shows they get mail there:
+
+- they open the confirmation link (sent at sign-up; it works once, for 24 hours);
+- they finish a password reset (the link went to that address);
+- they accept a team invite sent to that address;
+- they sign in with Google for that address.
+
+Single sign-on doesn't confirm an address: an account's owner sets up the identity provider, and
+that owner may not be the address's owner. `GET /api/me` says `email_confirmed`. While it's false,
+the Security settings page offers to send the link again.
+
+- `POST /api/me/email-confirmation`: email a new link (older ones stop working). Signed-in
+  dashboard sessions only; 3 an hour per login.
+- `POST /api/auth/confirm-email` `{token}`: open a link. It confirms the address and signs nobody
+  in. 20 tries an hour per network address.
+
+**Continue with Google for an address that already has a password login.** If that login's email is
+confirmed, Google is linked to it and you're signed in; nothing else changes. If it isn't, nothing
+is linked and nobody is signed in: whoever made it may be a stranger who signed up with your
+address first and is waiting for you to move in. You go to a page that says when the login was
+made, with two choices. The choice stays open for 10 minutes, works once, and only in the browser
+that signed in with Google.
+
+- **That was me**: type that login's password. It's checked exactly like the sign-in page (same
+  limits, same answer for a wrong password). If it's right, Google is linked, the email is marked
+  confirmed, nothing is removed, and you're signed in as with a password, so two-factor login
+  still applies.
+- **That wasn't me, start fresh**: in one step, the old login is emptied and can never sign in
+  again (its password, sessions, two-factor, single sign-on links and API keys go, and it leaves
+  every account). Each account it alone owned is closed: everyone in it loses access (their own
+  logins are untouched), its API keys and pending invites stop working, single sign-on turns off,
+  its website snippet and forms stop, scheduled and sending campaigns stop, flows go back to draft,
+  email sending is paused, and auto-recharge and plan renewal stop. The closed account's audit log
+  records `account.closed` with reason `email_owner_started_fresh`. Then you get a new, empty
+  account as its owner, as a first-time Google sign-up does.
+
+The page's routes: `GET /api/auth/google/link` (what to show), `POST /api/auth/google/link/password`
+`{password}` and `POST /api/auth/google/link/fresh`. They work only with the cookie the Google
+sign-in left in that browser, and only from the app's own pages.
+
+On a server with sign-ups off, nobody can make a login by signing up, so Continue with Google links
+to an unconfirmed login directly, as before (cutting off its password, sessions, two-factor and the
+keys it made).
+
 ## API keys
 
 Keys (`/api/api-keys`, Settings → Developers) have scopes and an optional expiry:

@@ -1003,6 +1003,9 @@ async fn single_sign_on_with_openid_connect() {
 
     // Someone new signs in through the provider and joins with the default role.
     let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.expect("sso sign-in");
+    // The provider is set up by the account's owner, so it doesn't prove the address is jo's.
+    let confirmed: bool = sqlx::query_scalar("SELECT email_confirmed_at IS NOT NULL FROM users WHERE email = 'jo@acme.test'").fetch_one(&h.state.db).await.unwrap();
+    assert!(!confirmed, "single sign-on doesn't confirm an email");
     let me = ok(&h, &mut jo, "GET", "/api/me", None).await;
     assert_eq!((me["user"]["email"].as_str(), me["role"].as_str(), me["sign_in_method"].as_str(), me["account"]["id"].as_str()), (Some("jo@acme.test"), Some("content"), Some("sso"), Some(account_id.as_str())));
     ok(&h, &mut jo, "GET", "/api/campaigns", None).await;

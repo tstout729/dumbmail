@@ -99,11 +99,27 @@ pub(crate) async fn insert_owner(
     company: &str,
     website: Option<String>,
 ) -> AppResult<(User, Account)> {
+    let mut tx = state.db.begin().await?;
+    let made = insert_owner_tx(&mut tx, email, password_hash, google_sub, name, company, website).await?;
+    tx.commit().await?;
+    Ok(made)
+}
+
+/// [`insert_owner`] inside a transaction the caller commits. A Google subject id means Google
+/// proved the address, so the login starts with its email confirmed.
+pub(crate) async fn insert_owner_tx(
+    tx: &mut sqlx::PgConnection,
+    email: &str,
+    password_hash: Option<String>,
+    google_sub: Option<&str>,
+    name: Option<String>,
+    company: &str,
+    website: Option<String>,
+) -> AppResult<(User, Account)> {
     let company = company.trim();
     if company.is_empty() {
         return Err(AppError::bad("enter your company or brand name"));
     }
-    let mut tx = state.db.begin().await?;
     let account: Account = sqlx::query_as("INSERT INTO accounts (id, public_key, name, from_name, website) VALUES ($1, $2, $3, $3, $4) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(format!("pk_{}", auth::random_token(12)))
@@ -111,7 +127,10 @@ pub(crate) async fn insert_owner(
         .bind(website)
         .fetch_one(&mut *tx)
         .await?;
-    let user: User = sqlx::query_as("INSERT INTO users (id, email, name, password_hash, google_sub) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name")
+    let user: User = sqlx::query_as(
+        "INSERT INTO users (id, email, name, password_hash, google_sub, email_confirmed_at) VALUES ($1, $2, $3, $4, $5, CASE WHEN $5::text IS NOT NULL THEN now() END)
+         RETURNING id, email, name",
+    )
         .bind(Uuid::now_v7())
         .bind(email)
         .bind(name.filter(|n| !n.trim().is_empty()))
@@ -124,7 +143,6 @@ pub(crate) async fn insert_owner(
             other => other,
         })?;
     sqlx::query("INSERT INTO memberships (user_id, account_id) VALUES ($1, $2)").bind(user.id).bind(account.id).execute(&mut *tx).await?;
-    tx.commit().await?;
     Ok((user, account))
 }
 
@@ -139,6 +157,8 @@ async fn signup(State(state): State<AppState>, headers: HeaderMap, jar: CookieJa
     let how = team::login::SessionStart { entered_password: true, ..Default::default() };
     let token = team::login::start_session_with(&state, user.id, account.id, "password", None, &meta, how).await?;
     team::audit::record(&state, account.id, &meta.actor(Some(user.id)), "account.signup", None, json!({})).await;
+    // Signing up doesn't prove the address is theirs; the link does (see `team::confirm`).
+    team::confirm::send_link_later(&state, user.id);
     let me = team::login::me_for_token(&state, &token, &meta).await?;
     Ok((jar.add(session_cookie(&state, token)), Json(me)))
 }

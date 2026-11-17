@@ -634,7 +634,7 @@ async fn billing_numbers_onsite_and_domains() {
 
 #[tokio::test]
 async fn brand_import_and_google_sign_in() {
-    use dumbmail::api::google::{google_user, GoogleClaims};
+    use dumbmail::api::google::{google_user, GoogleClaims, GoogleUser};
     let mut h = harness!();
     h.signup().await;
     let old_cookie = h.cookie.clone();
@@ -672,30 +672,32 @@ async fn brand_import_and_google_sign_in() {
     let (_, hdrs, _) = h.raw("GET", "/api/auth/google/callback?error=access_denied&state=x", &[], "").await;
     assert_eq!(hdrs.get(header::LOCATION).unwrap().to_str().unwrap(), "/login?error=cancelled");
 
-    // Google with the same email joins the existing account, turns its password off and ends old sessions.
+    // Google with the same email doesn't link to a password login whose email was never confirmed
+    // (see tests/login_link.rs); once it's confirmed it's the same person, and everything stays.
     let claims = |sub: &str, email: &str, given: Option<&str>| GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from) };
     let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
     let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "planted"}))).await;
     let key = key["key"].as_str().unwrap().to_string();
-    let (uid, acct, created) = google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap();
-    assert_eq!((acct, created), (account_id, false));
-    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), (uid, account_id, false));
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = 'owner@acme.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap(), GoogleUser::Unconfirmed(uid));
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE id = $1").bind(uid).execute(&h.state.db).await.unwrap();
+    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap(), GoogleUser::SignedIn(uid, account_id, false));
+    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), GoogleUser::SignedIn(uid, account_id, false));
     h.cookie = old_cookie;
     let (s, _) = h.req("GET", "/api/me", None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "old sessions end when Google is linked");
-    let (s, v) = h.req("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v.to_string().contains("Google"), "{v}");
+    assert_eq!(s, StatusCode::OK, "sessions stay when a confirmed login links Google");
+    let (s, _) = h.req("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
+    assert_eq!(s, StatusCode::OK, "the password still works");
     assert!(google_user(&h.state, &claims("g-intruder", "owner@acme.test", None)).await.is_err(), "a second Google account can't take over the email");
     let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {key}"))], "").await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "API keys made before Google proved the email are revoked");
+    assert_eq!(s, StatusCode::OK, "API keys stay");
 
     // New people get a new account: named after them on free mail, after their domain on a work address.
-    let (_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap();
+    let GoogleUser::SignedIn(_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap() else { panic!("new Google user") };
     assert!(created);
     let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(ann_acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((name.as_str(), website), ("Ann's brand", None));
-    let (_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap();
+    let GoogleUser::SignedIn(_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap() else { panic!("new Google user") };
     let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(bob_acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((name.as_str(), website.as_deref()), ("stayportland.com", Some("https://stayportland.com")));
     h.cleanup().await;

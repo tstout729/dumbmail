@@ -5,6 +5,8 @@
 
 pub mod access;
 pub mod audit;
+pub mod confirm;
+pub mod google_link;
 pub mod guard;
 pub mod keys;
 pub mod login;
@@ -67,6 +69,11 @@ static ROUTE_RULES: &[RouteRule] = &[
     rule("POST", "/api/me/reauth", ConfirmIdentity),
     public("POST", "/api/auth/password/forgot"),
     public("POST", "/api/auth/password/reset"),
+    rule("POST", "/api/me/email-confirmation", OwnLogin),
+    public("POST", "/api/auth/confirm-email"),
+    public("GET", "/api/auth/google/link"),
+    public("POST", "/api/auth/google/link/password"),
+    public("POST", "/api/auth/google/link/fresh"),
     public("GET", "/api/auth/sso"),
     public("GET", "/api/auth/sso/callback"),
     rule("GET", "/api/api-keys", ApiKeys),
@@ -132,6 +139,11 @@ impl Feature for Module {
             .route("/api/me/reauth", post(login::reauth_h))
             .route("/api/auth/password/forgot", post(login::forgot_h))
             .route("/api/auth/password/reset", post(login::reset_h))
+            .route("/api/me/email-confirmation", post(confirm::request_h))
+            .route("/api/auth/confirm-email", post(confirm::confirm_h))
+            .route("/api/auth/google/link", get(google_link::show_h))
+            .route("/api/auth/google/link/password", post(google_link::password_h))
+            .route("/api/auth/google/link/fresh", post(google_link::fresh_h))
             .route("/api/auth/sso", get(sso::start_h))
             .route("/api/auth/sso/callback", get(sso::callback_h))
             .route("/api/api-keys", get(keys::list_h).post(keys::create_h))
@@ -228,6 +240,8 @@ impl Feature for Module {
             ratelimit::prune(state).await?;
             sqlx::query("DELETE FROM sessions WHERE expires_at < now() - interval '1 day'").execute(&state.db).await?;
             sqlx::query("DELETE FROM password_resets WHERE expires_at < now() - interval '1 day'").execute(&state.db).await?;
+            sqlx::query("DELETE FROM email_confirmations WHERE expires_at < now() - interval '1 day'").execute(&state.db).await?;
+            sqlx::query("DELETE FROM google_link_pending WHERE expires_at < now() - interval '1 day'").execute(&state.db).await?;
         }
         Ok(())
     }
