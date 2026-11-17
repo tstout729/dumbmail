@@ -257,6 +257,73 @@ pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uui
     Ok(Some(event_id))
 }
 
+/// One past event brought in from another platform (see [`record_history`]).
+pub struct HistoryEvent {
+    pub profile_id: Uuid,
+    pub metric_id: Uuid,
+    pub properties: Value,
+    pub value: Option<f64>,
+    pub occurred_at: DateTime<Utc>,
+    /// Required: history is deduplicated on it, so importing twice adds nothing.
+    pub unique_id: String,
+}
+
+/// Record past events quietly: no flows start and nothing is sent or billed. Profiles' `last_event_at`
+/// moves only as far as the events' own times. Returns how many were new.
+pub async fn record_history(db: &PgPool, account_id: Uuid, events: &[HistoryEvent]) -> AppResult<u64> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut ids = Vec::with_capacity(events.len());
+    let (mut profiles, mut metrics, mut props, mut values, mut times, mut uniques) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for e in events {
+        ids.push(Uuid::now_v7());
+        profiles.push(e.profile_id);
+        metrics.push(e.metric_id);
+        props.push(e.properties.clone());
+        values.push(e.value.or_else(|| e.properties.get("$value").and_then(|v| v.as_f64())));
+        times.push(e.occurred_at);
+        uniques.push(e.unique_id.clone());
+    }
+    let inserted: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id)
+         SELECT x.id, $1, x.profile_id, x.metric_id, x.properties, x.value, x.occurred_at, x.unique_id
+         FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::jsonb[], $6::float8[], $7::timestamptz[], $8::text[])
+              AS x(id, profile_id, metric_id, properties, value, occurred_at, unique_id)
+         JOIN profiles p ON p.id = x.profile_id AND p.account_id = $1
+         JOIN metrics m ON m.id = x.metric_id AND m.account_id = $1
+         ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+         RETURNING profile_id, occurred_at",
+    )
+    .bind(account_id)
+    .bind(&ids)
+    .bind(&profiles)
+    .bind(&metrics)
+    .bind(&props)
+    .bind(&values)
+    .bind(&times)
+    .bind(&uniques)
+    .fetch_all(db)
+    .await?;
+    let mut latest: std::collections::HashMap<Uuid, DateTime<Utc>> = std::collections::HashMap::new();
+    for (p, t) in &inserted {
+        let e = latest.entry(*p).or_insert(*t);
+        if t > e {
+            *e = *t;
+        }
+    }
+    let (lp, lt): (Vec<Uuid>, Vec<DateTime<Utc>>) = latest.into_iter().unzip();
+    sqlx::query(
+        "UPDATE profiles p SET last_event_at = GREATEST(COALESCE(p.last_event_at, 'epoch'), x.t)
+         FROM unnest($1::uuid[], $2::timestamptz[]) AS x(id, t) WHERE p.id = x.id",
+    )
+    .bind(&lp)
+    .bind(&lt)
+    .execute(db)
+    .await?;
+    Ok(inserted.len() as u64)
+}
+
 /// Add profiles to a list and wake list-triggered flows for newly added members.
 pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
     let added: Vec<Uuid> = sqlx::query_scalar(
