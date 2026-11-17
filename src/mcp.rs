@@ -77,11 +77,19 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/list" => {
+            let mut all = tools();
+            all.extend(crate::features::mcp_tools());
+            Ok(json!({"tools": all}))
+        }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            Ok(match call(state, ctx, &name, args).await {
+            let res = match crate::features::mcp_call(state, ctx, &name, &args).await {
+                Some(r) => r,
+                None => call(state, ctx, &name, args).await,
+            };
+            Ok(match res {
                 Ok(v) => {
                     let text = serde_json::to_string_pretty(&v).unwrap_or_default();
                     let structured = if v.is_object() { v } else { json!({"result": v}) };
@@ -92,21 +100,28 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         }
         "prompts/list" => Ok(json!({"prompts": prompts()})),
         "prompts/get" => prompt(params["name"].as_str().unwrap_or(""), &params["arguments"]).ok_or((-32602, "unknown prompt".into())),
-        "resources/list" => Ok(json!({"resources": [
-            {"uri": "dumbmail://docs/segments", "name": "Segment rules", "description": "How to write segment definitions, flow splits and filters", "mimeType": "text/markdown"},
-            {"uri": "dumbmail://docs/email", "name": "Email content blocks", "description": "Email block types and personalization variables", "mimeType": "text/markdown"},
-            {"uri": "dumbmail://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"},
-            {"uri": "dumbmail://docs/forms", "name": "Sign-up form reference", "description": "Every form config key: content, fields, phone step, style, teaser, targeting, A/B versions, images and previews", "mimeType": "text/markdown"}
-        ]})),
+        "resources/list" => {
+            let mut resources = vec![
+            json!({"uri": "dumbmail://docs/segments", "name": "Segment rules", "description": "How to write segment definitions, flow splits and filters", "mimeType": "text/markdown"}),
+            json!({"uri": "dumbmail://docs/email", "name": "Email content blocks", "description": "Email block types and personalization variables", "mimeType": "text/markdown"}),
+            json!({"uri": "dumbmail://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"}),
+            json!({"uri": "dumbmail://docs/forms", "name": "Sign-up form reference", "description": "Every form config key: content, fields, phone step, style, teaser, targeting, A/B versions, images and previews", "mimeType": "text/markdown"})
+            ];
+            for d in crate::features::mcp_docs() {
+                resources.push(json!({"uri": format!("dumbmail://docs/{}", d.slug), "name": d.name, "description": d.description, "mimeType": "text/markdown"}));
+            }
+            Ok(json!({"resources": resources}))
+        }
         "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
         "resources/read" => {
             let uri = params["uri"].as_str().unwrap_or("");
+            let feature_docs = crate::features::mcp_docs();
             let text = match uri {
                 "dumbmail://docs/segments" | "postlark://docs/segments" => Some(SEGMENT_DOC),
                 "dumbmail://docs/email" | "postlark://docs/email" => Some(EMAIL_DOC),
                 "dumbmail://docs/flows" | "postlark://docs/flows" => Some(FLOW_DOC),
                 "dumbmail://docs/forms" => Some(FORMS_DOC),
-                _ => None,
+                other => other.strip_prefix("dumbmail://docs/").and_then(|slug| feature_docs.iter().find(|d| d.slug == slug)).map(|d| d.text),
             };
             text.map(|t| json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": t}]})).ok_or((-32002, format!("resource not found: {uri}")))
         }
@@ -129,14 +144,14 @@ the tools require confirm=true and you should get the user's explicit go-ahead f
 Sign-up forms: create_form / update_form take a config described in the dumbmail://docs/forms resource; check one with get_form's preview_url before publishing, and upload images with upload_image. \
 Times are ISO 8601; the account has a time zone (default America/Los_Angeles) used for reporting buckets.";
 
-fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool, destructive: bool) -> Value {
+pub fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool, destructive: bool) -> Value {
     json!({
         "name": name, "title": title, "description": description, "inputSchema": schema,
         "annotations": {"title": title, "readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": read_only, "openWorldHint": destructive}
     })
 }
 
-fn obj(props: Value, required: &[&str]) -> Value {
+pub fn obj(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
@@ -386,7 +401,7 @@ fn opt_uuid(a: &Value, k: &str) -> AppResult<Option<Uuid>> {
     }
 }
 
-fn from<T: serde::de::DeserializeOwned>(v: Value) -> AppResult<T> {
+pub fn from<T: serde::de::DeserializeOwned>(v: Value) -> AppResult<T> {
     serde_json::from_value(v).map_err(|e| AppError::bad(format!("invalid arguments: {e}")))
 }
 

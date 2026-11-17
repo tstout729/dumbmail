@@ -13,6 +13,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { featureNav, featureSettingsTabs } from "../../features/registry";
+
 export type NavItem = {
   label: string;
   to: string;
@@ -23,7 +25,7 @@ export type NavItem = {
 };
 export type NavGroup = { label?: string; items: NavItem[] };
 
-export const mainNav: NavGroup[] = [
+const coreNav: NavGroup[] = [
   {
     items: [
       { label: "Home", to: "/", icon: Home, end: true },
@@ -52,6 +54,16 @@ export const mainNav: NavGroup[] = [
   },
 ];
 
+/** The core menu plus each feature's entries, added to the group they name (or a new group). */
+export const mainNav: NavGroup[] = featureNav.reduce<NavGroup[]>(
+  (groups, { group, ...item }) => {
+    const at = groups.findIndex((g) => g.label === group);
+    if (at === -1) return [...groups, { label: group, items: [item] }];
+    return groups.map((g, i) => (i === at ? { ...g, items: [...g.items, item] } : g));
+  },
+  coreNav,
+);
+
 export const bottomNav: NavItem[] = [
   { label: "Developers", to: "/settings/developers", icon: Code2 },
   {
@@ -71,4 +83,5 @@ export const settingsNav: { label: string; title: string; to: string; end?: bool
   { label: "Website", title: "Website snippet", to: "/settings/website" },
   { label: "Billing", title: "Billing and credit", to: "/settings/billing" },
   { label: "Developers", title: "Developers and API keys", to: "/settings/developers" },
+  ...featureSettingsTabs,
 ];

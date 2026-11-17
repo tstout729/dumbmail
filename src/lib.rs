@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod deliverability;
 pub mod domains;
 pub mod error;
+pub mod features;
 pub mod flows;
 pub mod forms;
 pub mod jobs;
@@ -99,6 +100,7 @@ pub fn app(state: AppState) -> Router {
         .merge(api::router())
         .merge(public::routes())
         .merge(mcp::routes())
+        .merge(features::routes())
         .merge(site::routes())
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), site::host_split))
