@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod integrations;
 pub mod klaviyo_import;
 pub mod objects;
+pub mod people;
 pub mod push;
 pub mod reports;
 pub mod reviews;
@@ -96,6 +97,7 @@ pub static ALL: &[&dyn Feature] = &[
     &integrations::Module,
     &klaviyo_import::Module,
     &objects::Module,
+    &people::Module,
     &push::Module,
     &reports::Module,
     &reviews::Module,

@@ -159,7 +159,7 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
 
 pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
     if channel == "sms" {
-        qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
+        qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL");
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }

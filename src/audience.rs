@@ -162,10 +162,12 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
         };
         match res {
-            Ok(u) => return Ok(u),
+            // Consent history, a deleted person's suppression record, linked-identifier conflicts.
+            Ok(u) => return crate::features::people::consent::after_upsert(db, account_id, input, existing.as_ref(), u).await,
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                crate::features::people::consent::note_identity_conflict(db, account_id, input).await;
                 return Err(AppError::Conflict("another profile already uses that email, phone number or external id".into()))
             }
             Err(e) => return Err(e.into()),

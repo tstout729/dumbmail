@@ -26,6 +26,8 @@
   function profile() { return store.get(PROFILE) || {}; }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
   function post(path, body) {
+    // Global Privacy Control: the visitor asked not to have their data sold or shared.
+    if (navigator.globalPrivacyControl === true && body && typeof body === "object") body.gpc = true;
     try {
       return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), keepalive: true, credentials: "omit"

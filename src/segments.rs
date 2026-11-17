@@ -1008,7 +1008,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             }
             qb.push(match channel {
                 Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL)",
-                Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed')",
+                Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL)",
             });
         }
         Condition::Suppressed { value } => {

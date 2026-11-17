@@ -120,6 +120,13 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
+            // A number on the suppression list (see features::people) gets no texts.
+            if !spec.is_test {
+                let suppressed: Option<String> = sqlx::query_scalar("SELECT sms_suppressed_reason FROM profiles WHERE id = $1").bind(p.id).fetch_one(&state.db).await?;
+                if suppressed.is_some() {
+                    return Ok(Outcome::Skipped("suppressed"));
+                }
+            }
             if !spec.is_test {
                 if let Some(until) = sms_quiet_until(spec.account, Utc::now()) {
                     return Ok(Outcome::Deferred(until));

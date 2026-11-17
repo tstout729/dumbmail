@@ -11,6 +11,7 @@ use super::{page, ApiJson, Page};
 use crate::audience::{self as core, NewEvent, ProfileInput};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::people::{with_source, ConsentSource};
 use crate::models::{EventRow, List, Profile, Segment, PROFILE_COLS};
 use crate::segments;
 use crate::state::AppState;
@@ -101,7 +102,7 @@ pub async fn create_profile(state: &AppState, account_id: Uuid, body: Value) -> 
 }
 
 async fn create_profile_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {
-    Ok(Json(create_profile(&state, ctx.account_id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), create_profile(&state, ctx.account_id, b)).await?))
 }
 
 pub async fn load_profile(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Profile> {
@@ -197,12 +198,12 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
 }
 
 async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {
-    Ok(Json(patch_profile(&state, ctx.account_id, id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), patch_profile(&state, ctx.account_id, id, b)).await?))
 }
 
 async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let n = sqlx::query("DELETE FROM profiles WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&state.db).await?.rows_affected();
-    if n == 0 {
+    // Every profile-keyed row goes; someone who had unsubscribed stays suppressed if re-imported.
+    if crate::features::people::privacy::delete_profile_fully(&state.db, ctx.account_id, id).await?.is_none() {
         return Err(AppError::not_found("profile"));
     }
     Ok(Json(json!({"ok": true})))
@@ -247,7 +248,7 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
         return Err(AppError::bad("CSV is larger than 50 MB; split it into smaller files"));
     }
     // Role and throwaway addresses are left out of marketing imports; an unsubscribe file keeps them.
-    let r = core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent, !as_unsubscribed).await?;
+    let r = crate::features::people::consent::with_method("import", core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent, !as_unsubscribed)).await?;
     if r.created + r.updated > 0 {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"contacts\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
@@ -255,7 +256,7 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
 }
 
 async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(import(&state, ctx.account_id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), import(&state, ctx.account_id, b)).await?))
 }
 
 // ---------- Lists ----------
@@ -364,7 +365,7 @@ pub async fn add_members(state: &AppState, account_id: Uuid, list_id: Uuid, b: M
 }
 
 async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
-    Ok(Json(json!({"added": add_members(&state, ctx.account_id, id, b).await?})))
+    Ok(Json(json!({"added": with_source(ConsentSource::from_ctx(&ctx), add_members(&state, ctx.account_id, id, b)).await?})))
 }
 
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
@@ -542,7 +543,7 @@ pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResul
 }
 
 async fn track_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<TrackBody>) -> AppResult<Json<Value>> {
-    Ok(Json(track(&state, ctx.account_id, b).await?))
+    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), track(&state, ctx.account_id, b)).await?))
 }
 
 #[derive(Deserialize)]

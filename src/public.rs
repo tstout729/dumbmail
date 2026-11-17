@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::audience::{self, NewEvent, ProfileInput};
 use crate::auth;
 use crate::error::{AppError, AppResult};
+use crate::features::people::{consent as people_consent, Channel, ConsentSource};
 use crate::models::{normalize_phone, Account, FormRow};
 use crate::state::AppState;
 
@@ -207,7 +208,7 @@ async fn preference_lists(state: &AppState, m: &Msg) -> Option<Vec<crate::prefer
     (!lists.is_empty()).then_some(lists)
 }
 
-async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>, body: Bytes) -> Response {
+async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     if let (crate::preferences::Choice::Save(keep), "email") = (crate::preferences::parse_choice(&body), m.channel.as_str()) {
@@ -223,13 +224,15 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
         let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.unwrap_or_default();
         return page("Email preferences", &crate::preferences::form_html(&name, &lists, Some(notice)), &color).into_response();
     }
-    let col = if m.channel == "sms" { "sms_consent" } else { "email_consent" };
-    let changed: Result<Option<Uuid>, _> = sqlx::query_scalar(&format!(
-        "UPDATE profiles SET {col} = 'unsubscribed', updated_at = now() WHERE id = $1 AND {col} <> 'unsubscribed' RETURNING id"
-    ))
-    .bind(m.profile_id)
-    .fetch_optional(&state.db)
-    .await;
+    // Mail apps' one-click unsubscribe (RFC 8058), "Unsubscribe from all" on the preference page, or the plain page.
+    let method = match (String::from_utf8_lossy(&body).contains("List-Unsubscribe=One-Click"), crate::preferences::parse_choice(&body), body.is_empty()) {
+        (true, _, _) => "one_click",
+        (false, crate::preferences::Choice::All, false) => "preference_page",
+        _ => "unsubscribe_link",
+    };
+    let src = ConsentSource::new(method, "public").with_message(m.id).with_ip(client_ip(&headers).as_deref()).with_user_agent(user_agent(&headers));
+    let channel = if m.channel == "sms" { Channel::Sms } else { Channel::Email };
+    let changed = people_consent::set_consent(&state.db, m.account_id, m.profile_id, channel, "unsubscribed", None, &src).await;
     let _ = sqlx::query("UPDATE messages SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1").bind(id).execute(&state.db).await;
     if matches!(changed, Ok(Some(_))) {
         let metric = if m.channel == "sms" { "Unsubscribed from SMS" } else { "Unsubscribed" };
@@ -247,6 +250,10 @@ fn client_ip(headers: &HeaderMap) -> Option<String> {
     let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
     let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
     get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))
+}
+
+fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok())
 }
 
 /// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
@@ -352,6 +359,10 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
             }
             None => audience::upsert_profile_public(&state.db, a.id, &input).await?.profile,
         };
+        // Global Privacy Control from the visitor's browser: "do not sell or share" (only ever turned on here).
+        if b["gpc"] == json!(true) {
+            people_consent::set_ads_opt_out(&state.db, a.id, p.id, true, &ConsentSource::new("gpc", "public")).await?;
+        }
         let props = if b["properties"].is_object() { b["properties"].clone() } else { json!({}) };
         let value = b["value"].as_f64();
         audience::record_event(
@@ -727,7 +738,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     }
     // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
     if double_opt_in && upserted.created {
-        sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;
+        people_consent::set_consent(&state.db, account.id, p.id, Channel::Email, "pending", Some(&["never_subscribed"]), &people_consent::current_source()).await?;
     }
     count_form(state, form.id, true).await?;
     let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
@@ -851,7 +862,9 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
         } else {
             serde_json::from_slice(&body)?
         };
-        subscribe(&state, &a, &b, client_ip(&headers).as_deref()).await
+        let ip = client_ip(&headers);
+        let src = ConsentSource::form(b.form_id, ip.as_deref(), user_agent(&headers));
+        people_consent::with_source(src, subscribe(&state, &a, &b, ip.as_deref())).await
     }
     .await;
     if is_form {
@@ -1144,13 +1157,15 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
                 .execute(&state.db)
                 .await?;
             if permanent {
-                sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
+                let src = ConsentSource::new("hard_bounce", "public").with_message(m.id).with_detail("bounce_sub_type", msg["bounce"]["bounceSubType"].clone());
+                people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "hard_bounce", true, false, &src).await?;
             }
             msg_event(&state, &m, "Bounced Email", json!({"bounce_type": msg["bounce"]["bounceType"]}), Some(format!("bounce:{}", m.id))).await?;
         }
         "Complaint" => {
             sqlx::query("UPDATE messages SET status = 'complained' WHERE id = $1").bind(m.id).execute(&state.db).await?;
-            sqlx::query("UPDATE profiles SET email_suppressed_reason = 'complaint', email_consent = 'unsubscribed', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
+            let src = ConsentSource::new("spam_complaint", "public").with_message(m.id);
+            people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "complaint", true, true, &src).await?;
             msg_event(&state, &m, "Marked Email as Spam", json!({}), Some(format!("complaint:{}", m.id))).await?;
         }
         _ => {}
@@ -1184,7 +1199,8 @@ async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str
             audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric: "Received SMS Reply", properties: json!({"text": text}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
             continue;
         };
-        sqlx::query("UPDATE profiles SET sms_consent = $2, updated_at = now() WHERE id = $1").bind(pid).bind(consent).execute(&state.db).await?;
+        let src = ConsentSource::new("sms_keyword", "public").with_detail("keyword", json!(word)).with_detail("to", json!(to));
+        people_consent::set_consent(&state.db, account_id, pid, Channel::Sms, consent, None, &src).await?;
         audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric, properties: json!({"keyword": word}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
     }
     Ok(())

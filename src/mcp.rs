@@ -85,10 +85,13 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let res = match crate::features::mcp_call(state, ctx, &name, &args).await {
-                Some(r) => r,
-                None => call(state, ctx, &name, args).await,
-            };
+            let res = crate::features::people::with_source(crate::features::people::ConsentSource::mcp(ctx), async {
+                match crate::features::mcp_call(state, ctx, &name, &args).await {
+                    Some(r) => r,
+                    None => call(state, ctx, &name, args).await,
+                }
+            })
+            .await;
             Ok(match res {
                 Ok(v) => {
                     let text = serde_json::to_string_pretty(&v).unwrap_or_default();
