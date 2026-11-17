@@ -736,8 +736,11 @@ async fn nothing_was_lost_only_when_every_line_matches() {
     assert_eq!(item["done"], false);
     assert!(item["detail"].as_str().unwrap().contains("finished 3 days ago"), "{item}");
     // A Klaviyo send found after the run began: not current either.
-    sqlx::query("UPDATE klaviyo_imports SET finished_at = now(), source_counts = source_counts || jsonb_build_object('last_klaviyo_send', to_char(started_at + interval '1 minute', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) WHERE id = $1")
+    let started: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT started_at FROM klaviyo_imports WHERE id = $1").bind(id).fetch_one(&h.state.db).await.unwrap();
+    let sent_during = (started + Duration::minutes(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    sqlx::query("UPDATE klaviyo_imports SET finished_at = now(), source_counts = source_counts || jsonb_build_object('last_klaviyo_send', $2::text) WHERE id = $1")
         .bind(id)
+        .bind(&sent_during)
         .execute(&h.state.db)
         .await
         .unwrap();
@@ -917,6 +920,10 @@ async fn dm_profile(h: &Harness, ext: &str, email: Option<&str>, phone: Option<&
         .unwrap();
 }
 
+/// (name, Klaviyo email on the second run, expected (consent, suppression, held))
+type RerunEmail = (&'static str, Option<Value>, (&'static str, Option<&'static str>, bool));
+/// (name, DumbMail SMS consent before or new, Klaviyo SMS (consent, reachable), expected (consent, held))
+type SmsCase = (&'static str, Option<&'static str>, (&'static str, bool), (&'static str, bool));
 type EmailCase = (&'static str, Option<(&'static str, Option<&'static str>)>, (&'static str, Option<bool>, &'static str), bool, (&'static str, Option<&'static str>, bool));
 
 #[tokio::test]
@@ -983,7 +990,7 @@ async fn a_subscription_the_import_set_follows_klaviyo_on_the_next_run() {
     let mut h = harness!();
     h.signup().await;
     // (name, Klaviyo email on the second run, expected (consent, suppression, held))
-    let email_cases: &[(&str, Option<Value>, (&str, Option<&str>, bool))] = &[
+    let email_cases: &[RerunEmail] = &[
         ("now unsubscribed", em("UNSUBSCRIBED", Some(false), ""), ("unsubscribed", None, false)),
         ("now unrecognised", em("SOMETHING_NEW", Some(true), ""), ("never_subscribed", None, true)),
         ("now no record", None, ("never_subscribed", None, true)),
@@ -1053,7 +1060,7 @@ async fn sms_consent_case_by_case() {
     let mut h = harness!();
     h.signup().await;
     // (name, DumbMail SMS consent before or new, Klaviyo SMS (consent, reachable; "-" = no record), expected (consent, held))
-    let cases: &[(&str, Option<&str>, (&str, bool), (&str, bool))] = &[
+    let cases: &[SmsCase] = &[
         ("new: subscribed and reachable", None, ("SUBSCRIBED", true), ("subscribed", false)),
         ("new: subscribed but unreachable", None, ("SUBSCRIBED", false), ("never_subscribed", false)),
         ("new: unsubscribed", None, ("UNSUBSCRIBED", false), ("unsubscribed", false)),
@@ -1462,12 +1469,10 @@ async fn a_crash_between_writing_a_page_and_saving_it_is_replayed_cleanly() {
     let mut run = Run::new(&h.state, imp, &key);
     assert!(run.claim().await.unwrap());
     assert!(run.step_once().await.unwrap(), "metrics in one page");
-    let imp = store::load(&h.state.db, id).await.unwrap().unwrap();
     drop(run);
-    let mut run = Run::new(&h.state, imp, &key);
     sqlx::query("UPDATE klaviyo_imports SET phase = 'profiles', lease_owner = NULL, lease_until = NULL WHERE id = $1").bind(id).execute(&h.state.db).await.unwrap();
     let imp = store::load(&h.state.db, id).await.unwrap().unwrap();
-    run = Run::new(&h.state, imp, &key);
+    let mut run = Run::new(&h.state, imp, &key);
     assert!(run.claim().await.unwrap());
     assert!(!run.step_once().await.unwrap(), "first page of profiles written");
     assert_eq!(count(&h, "SELECT count(*) FROM profiles").await, 3, "the page's three profiles are in");
