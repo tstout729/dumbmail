@@ -1158,12 +1158,14 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     Ok(StatusCode::OK)
 }
 
-const STOP_WORDS: &[&str] = &["stop", "stopall", "unsubscribe", "cancel", "end", "quit", "optout", "revoke"];
-const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
+pub(crate) const STOP_WORDS: &[&str] = &["stop", "stopall", "unsubscribe", "cancel", "end", "quit", "optout", "revoke"];
+pub(crate) const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
 
-/// Inbound text: STOP/START keywords update SMS consent for the matching profile.
-async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str, text: &str) -> AppResult<()> {
-    let (Some(from), Some(to)) = (normalize_phone(from), normalize_phone(to)) else { return Ok(()) };
+/// Inbound text: every message is kept in the SMS inbox (see `features::inbox`, which also creates a
+/// profile for a number it hasn't seen, with SMS consent untouched). STOP/START keywords update SMS
+/// consent for the matching profile; everything else goes on to the inbox's keywords and auto-replies.
+async fn inbound_sms(state: &AppState, scope: Option<Uuid>, msg: &crate::features::inbox::Inbound) -> AppResult<()> {
+    let (Some(from), Some(to)) = (normalize_phone(&msg.from), normalize_phone(&msg.to)) else { return Ok(()) };
     let accounts: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT a.id FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
          WHERE (a.sms_from = $1 OR n.phone_number = $1) AND ($2::uuid IS NULL OR a.id = $2)",
@@ -1172,20 +1174,22 @@ async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str
     .bind(scope)
     .fetch_all(&state.db)
     .await?;
-    let word: String = text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    let word: String = msg.text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
     for account_id in accounts {
-        let pid: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&from).fetch_optional(&state.db).await?;
-        let Some(pid) = pid else { continue };
+        // None: the provider already delivered this message once (a webhook retry).
+        let Some(rx) = crate::features::inbox::receive(state, account_id, &from, &to, msg, &word).await? else { continue };
+        let pid = rx.profile_id;
         let (consent, metric) = if STOP_WORDS.contains(&word.as_str()) {
             ("unsubscribed", "Unsubscribed from SMS")
-        } else if START_WORDS.contains(&word.as_str()) {
+        } else if START_WORDS.contains(&word.as_str()) && !rx.new_profile {
             ("subscribed", "Subscribed to SMS")
         } else {
-            audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric: "Received SMS Reply", properties: json!({"text": text}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
+            crate::features::inbox::received(state, &rx).await?;
             continue;
         };
         sqlx::query("UPDATE profiles SET sms_consent = $2, updated_at = now() WHERE id = $1").bind(pid).bind(consent).execute(&state.db).await?;
         audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric, properties: json!({"keyword": word}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
+        crate::features::inbox::received(state, &rx).await?;
     }
     Ok(())
 }
@@ -1205,10 +1209,7 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
     let scope = webhook_scope(&state, &secret).await?;
     let p = &v["data"]["payload"];
     match v["data"]["event_type"].as_str().unwrap_or("") {
-        "message.received" => {
-            let to = p["to"][0]["phone_number"].as_str().unwrap_or_default();
-            inbound_sms(&state, scope, p["from"]["phone_number"].as_str().unwrap_or_default(), to, p["text"].as_str().unwrap_or_default()).await?;
-        }
+        "message.received" => inbound_sms(&state, scope, &crate::features::inbox::Inbound::from_telnyx(p)).await?,
         "message.finalized" => {
             let st = p["to"][0]["status"].as_str().unwrap_or_default();
             if let Some(id) = p["id"].as_str() {
@@ -1223,8 +1224,8 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
 async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, body: Bytes) -> AppResult<Response> {
     let scope = webhook_scope(&state, &secret).await?;
     let f: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    if let (Some(from), Some(to), Some(text)) = (f.get("From"), f.get("To"), f.get("Body")) {
-        inbound_sms(&state, scope, from, to, text).await?;
+    if let Some(msg) = crate::features::inbox::Inbound::from_twilio(&f) {
+        inbound_sms(&state, scope, &msg).await?;
     } else if let (Some(sid), Some(st)) = (f.get("MessageSid"), f.get("MessageStatus")) {
         match st.as_str() {
             "delivered" => sms_status(&state, scope, sid, true).await?,

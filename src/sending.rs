@@ -97,7 +97,25 @@ pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) ->
     format!("{}/u/{}", crate::domains::link_base(state, account), crate::auth::sign(&state.cfg.secret_key, &format!("u{}", message_id.simple())))
 }
 
+/// A conversational text: an answer to someone who texted in (see `features::inbox`). It skips the
+/// marketing-consent check and quiet hours, because the inbox checks its own reply rules first; it
+/// never reaches anyone who texted STOP, and it is billed and recorded like any other text.
+pub struct Conversational {
+    /// `reply` (typed by a person) or `auto_reply` (keyword answers and automatic replies).
+    pub kind: &'static str,
+    pub sent_by: Option<Uuid>,
+}
+
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
+    send_with(state, spec, None).await
+}
+
+/// Send a conversational SMS through the normal path (billing, provider, bookkeeping, events).
+pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversational: &Conversational) -> AppResult<Outcome> {
+    send_with(state, spec, Some(conversational)).await
+}
+
+async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
     let p = spec.profile;
     let to = match spec.channel {
         "email" => {
@@ -115,6 +133,12 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                 }
             }
             spec.to_override.clone().or_else(|| p.email.clone())
+        }
+        "sms" if conversational.is_some() => {
+            if p.sms_consent == "unsubscribed" {
+                return Ok(Outcome::Skipped("texted STOP"));
+            }
+            spec.to_override.clone().or_else(|| p.phone_number.clone())
         }
         "sms" => {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
@@ -261,6 +285,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             .await?;
     }
 
+    // Keep the text as sent, so the SMS inbox can show campaign, flow and reply texts in each thread.
+    if let (Rendered::Sms(s, _, _), false) = (&rendered, spec.is_test) {
+        crate::features::inbox::record_sent(&state.db, spec.account.id, p.id, message_id, &s.body, s.media_url.as_deref(), conversational).await?;
+    }
     let result = match &rendered {
         Rendered::Email(e) => {
             throttle_email(state).await;

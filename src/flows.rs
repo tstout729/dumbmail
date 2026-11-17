@@ -109,7 +109,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     }
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
-            "condition" | "random_split" => vec!["yes", "no"],
+            "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
             "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
@@ -148,6 +148,12 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                 }
             }
             "update_profile" => need("properties")?,
+            "wait_for_reply" => {
+                let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+                if amount <= 0.0 || !matches!(n.str("unit"), Some("minutes" | "hours" | "days")) {
+                    return Err(AppError::bad(format!("wait for reply {} needs a positive amount and a unit (minutes, hours or days)", n.id)));
+                }
+            }
             "add_to_list" | "remove_from_list" => need("list_id")?,
             "webhook" => {
                 let u = n.str("url").unwrap_or("");
@@ -621,6 +627,30 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
+            }
+            // Wait until they text back (yes) or the time runs out (no); see `features::inbox`.
+            "wait_for_reply" if !waited => {
+                let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let secs = amount * match node.str("unit") {
+                    Some("minutes") => 60.0,
+                    Some("hours") => 3600.0,
+                    _ => 86400.0,
+                };
+                context["_waited"] = json!(node_id);
+                context["_reply_since"] = json!(Utc::now());
+                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&state.db).await?;
+                let at = Utc::now() + Duration::milliseconds((secs * 1000.0) as i64);
+                crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                return Ok(());
+            }
+            "wait_for_reply" => {
+                let since = context.get("_reply_since").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_else(Utc::now);
+                if let Some(o) = context.as_object_mut() {
+                    o.remove("_waited");
+                    o.remove("_reply_since");
+                }
+                let replied = crate::features::inbox::replied_since(&state.db, run.profile_id, since).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                next = node.str(if replied { "yes" } else { "no" }).map(str::to_string);
             }
             "random_split" => {
                 let percent = split_percent(&node).unwrap_or(50);
