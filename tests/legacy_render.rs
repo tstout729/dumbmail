@@ -4,7 +4,9 @@
 //! blocks, raw HTML, personalization, markers content can't place, ...). `expected.json` is what
 //! `origin/main` produced for them before the content module, made by running this same file there
 //! with `LEGACY_RENDER_WRITE=<path>`: the pure renderer (marketing and transactional options) and a
-//! real campaign send through `sending::send`. This test renders them again and compares.
+//! real campaign send through `sending::send`. This test renders them again and compares. The
+//! coupon cases (an email whose only extra is a coupon tag or coupon block) were made on `origin/main`
+//! with unique coupon codes (35d7abc); the others are unchanged by it.
 
 #[macro_use]
 mod common;
@@ -42,7 +44,12 @@ async fn render_all(h: &mut Harness) -> Value {
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "Legacy"}))).await;
     h.ok("POST", &format!("/api/lists/{}/members", list["id"].as_str().unwrap()), Some(json!({"profile_ids": [pid]}))).await;
 
-    let ctx = json!({"first_name": "Lee", "person": {"first_name": "Lee", "properties": {"city": "Bend"}}, "organization": {"name": "Acme Goods"}, "unsubscribe_url": "https://links.test/u/x"});
+    // Emails that use only a coupon (PR #20) take the legacy path too: one code, so every send gets it.
+    let coupon = h.ok("POST", "/api/coupons", Some(json!({"name": "LEGACY"}))).await;
+    h.ok("POST", &format!("/api/coupons/{}/codes", coupon["id"].as_str().unwrap()), Some(json!({"codes": ["LEGACY-0001"]}))).await;
+
+    let ctx = json!({"first_name": "Lee", "person": {"first_name": "Lee", "properties": {"city": "Bend"}}, "organization": {"name": "Acme Goods"}, "unsubscribe_url": "https://links.test/u/x",
+        "__dm_coupons": {"codes": {"legacy": {"code": "LEGACY-0001", "expires": ""}}}});
     let tracking = Tracking { public_url: "https://links.test", secret: "fixture-secret", message_id: Uuid::nil(), unsubscribe_url: "https://links.test/u/x".into() };
     let inputs: Vec<Value> = serde_json::from_str(INPUTS).unwrap();
     let mut out = serde_json::Map::new();
@@ -96,6 +103,8 @@ async fn legacy_email_renders_exactly_as_before_the_content_module() {
     // The cases that changed on the first version of this module are really in there.
     assert!(want["five_columns"]["sent"]["html"].as_str().unwrap().contains("Col 5"));
     assert!(want["over_300_blocks"]["sent"]["html"].as_str().unwrap().contains("B327"));
+    assert!(want["coupon_tag"]["sent"]["html"].as_str().unwrap().contains("use LEGACY-0001 at checkout"));
+    assert!(want["coupon_block"]["sent"]["text"].as_str().unwrap().contains("Your code: LEGACY-0001"));
     h.cleanup().await;
 }
 

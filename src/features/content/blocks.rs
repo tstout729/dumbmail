@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use super::prepare::clean_url;
+use super::prepare::clean_url_keeping_coupons as clean_url;
 use crate::render::safe_color;
 
 pub const NETWORKS: [&str; 10] = ["instagram", "facebook", "tiktok", "x", "youtube", "pinterest", "linkedin", "threads", "website", "email"];

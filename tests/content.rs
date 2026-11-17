@@ -767,9 +767,15 @@ async fn starters_take_the_website_as_data_and_pre_arrival_needs_a_paid_booking(
     let pre = h.ok("GET", "/api/content/starters/pre_arrival", None).await;
     let content = pre["content"].clone();
     let render = |event: Value| json!({"channel": "email", "content": content.clone(), "event": event});
-    let paid = h.ok("POST", "/api/render", Some(render(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}})))).await;
+    let paid = h.ok("POST", "/api/render", Some(render(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}, "from_browser": false})))).await;
     assert!(paid["html"].as_str().unwrap().contains("123 Ocean View Rd"));
-    for unpaid in [json!({"properties": {"address": "123 Ocean View Rd"}}), json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": false}})] {
+    for unpaid in [
+        json!({"properties": {"address": "123 Ocean View Rd"}, "from_browser": false}),
+        json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": false}, "from_browser": false}),
+        // Paid, but recorded by a browser (anyone can send those), or not known to come from the server.
+        json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}, "from_browser": true}),
+        json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}}),
+    ] {
         let v = h.ok("POST", "/api/render", Some(render(unpaid))).await;
         let html = v["html"].as_str().unwrap();
         assert!(!html.contains("123 Ocean View Rd") && html.contains("once your booking is paid in full"), "{html}");
@@ -855,5 +861,205 @@ async fn permissions_follow_the_table() {
     // Hosted images need no sign-in.
     let (s, _, _) = h.raw("GET", "/e/assets/placeholder-hero.png", &[], "").await;
     assert_eq!(s, StatusCode::OK);
+    h.cleanup().await;
+}
+
+// ---------- Working with unique coupon codes (PR #20) ----------
+
+async fn coupon(h: &mut Harness, name: &str, codes: &[&str]) -> String {
+    let c = h.ok("POST", "/api/coupons", Some(json!({"name": name}))).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    if !codes.is_empty() {
+        h.ok("POST", &format!("/api/coupons/{id}/codes"), Some(json!({"codes": codes}))).await;
+    }
+    id
+}
+
+/// Codes from coupon `name` given to `profile`.
+async fn codes_of(h: &Harness, name: &str, profile: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT cc.code FROM coupon_codes cc JOIN coupons c ON c.id = cc.coupon_id WHERE c.name = $1 AND cc.profile_id = $2 ORDER BY cc.code")
+        .bind(name)
+        .bind(profile)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn coupon_codes_go_only_to_what_each_person_sees() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_id(&h).await;
+    let gold = profile(&h, acct, "gold@x.test", "subscribed", Some("Goldie"), json!({"tier": "gold"})).await;
+    let silver = profile(&h, acct, "silver@x.test", "subscribed", Some("Sil"), json!({"tier": "silver"})).await;
+    let none = profile(&h, acct, "none@x.test", "subscribed", Some("Nan"), json!({})).await;
+    let list = list_of(&mut h, &[gold, silver, none]).await;
+    coupon(&mut h, "VIP", &["VIP-0001", "VIP-0002", "VIP-0003"]).await;
+    coupon(&mut h, "TEAM", &["TEAM-0001", "TEAM-0002", "TEAM-0003"]).await;
+
+    // The TEAM coupon is only in a saved block (its stored copy is stale and has no coupon), in its
+    // text and in a button link.
+    let (s, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Offer", "blocks": [
+        {"type": "text", "html": "<p>Team code {% coupon_code 'TEAM' %}</p>"},
+        {"type": "image_text", "src": "https://img.example/a.png", "alt": "Tote", "heading": "Tote", "html": "<p>Ours</p>", "button_text": "Use it", "button_href": "https://shop.example/discount/{% coupon_code 'TEAM' %}"},
+    ]}))).await;
+    assert_eq!(s, StatusCode::CREATED, "{sb}");
+    let (s, bad) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Bad", "blocks": [{"type": "text", "html": "{% coupon_code name %}"}]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "saved blocks follow the coupon tag rules: {bad}");
+    let member = json!({"field": "person.properties.tier", "op": "set"});
+    let content = json!({"subject": "Offers", "preheader": "p", "blocks": [
+        {"type": "heading", "text": "Hi {{ first_name }}", "show_if": member},
+        {"type": "coupon", "coupon": "VIP", "title": "Gold code", "show_if": {"field": "person.properties.tier", "op": "eq", "value": "gold"}},
+        {"type": "saved", "saved_block_id": sb["id"], "name": "Offer", "show_if": member, "blocks": [{"type": "text", "html": "<p>Stale copy</p>"}]},
+    ]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Offers", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": content}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+
+    // The check panel sees the coupon inside the saved block, through the coupons module's own check.
+    let r = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": cid, "skip_links": true}))).await;
+    assert!(!r["findings"].as_array().unwrap().iter().any(|f| f["id"].as_str().unwrap().starts_with("coupon_") || f["id"] == "render_error"), "{r}");
+    let missing = json!({"subject": "x", "blocks": [{"type": "saved", "saved_block_id": sb["id"], "blocks": []}, {"type": "coupon", "coupon": "NOPE"}]});
+    let r = h.ok("POST", "/api/content/check", Some(json!({"content": missing, "skip_links": true}))).await;
+    let f = r["findings"].as_array().unwrap().iter().find(|f| f["id"] == "coupon_problem").unwrap_or_else(|| panic!("{r}"));
+    assert!(f["title"].as_str().unwrap().contains("no coupon named \"nope\"") && f["blocks_sending"] == true, "{f}");
+    coupon(&mut h, "SHORT", &["SHORT-0001"]).await;
+    let short = json!({"subject": "x", "blocks": [{"type": "text", "html": "{% coupon_code 'SHORT' %}"}]});
+    let r = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": cid, "content": short, "skip_links": true}))).await;
+    assert!(r["findings"].as_array().unwrap().iter().any(|f| f["id"] == "coupon_short" && f["title"].as_str().unwrap().contains("has 1 codes left")), "{r}");
+
+    // Previews show a sample code and use none.
+    let v = preview(&mut h, content.clone(), Some(gold)).await;
+    assert!(v["html"].as_str().unwrap().contains("SAMPLE-CODE"), "{v}");
+    let used: i64 = sqlx::query_scalar("SELECT count(*) FROM coupon_codes WHERE profile_id IS NOT NULL").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(used, 0);
+
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    let sent = h.state.email.sent();
+
+    // Gold sees both coupons and gets a code from each.
+    let (g_vip, g_team) = (codes_of(&h, "VIP", gold).await, codes_of(&h, "TEAM", gold).await);
+    assert_eq!((g_vip.len(), g_team.len()), (1, 1));
+    let to_gold = sent.iter().find(|m| m.to == "gold@x.test").unwrap();
+    assert!(to_gold.html.contains(&g_vip[0]) && to_gold.html.contains(&format!("Team code {}", g_team[0])));
+    assert!(to_gold.text.contains(&format!("Use it: https://shop.example/discount/{}", g_team[0])), "the code is in the saved block's button link: {}", to_gold.text);
+    assert!(!to_gold.html.contains("Stale copy"));
+
+    // Silver's VIP block is hidden: no VIP code used for them, only TEAM.
+    assert!(codes_of(&h, "VIP", silver).await.is_empty(), "a hidden coupon block uses no code");
+    let s_team = codes_of(&h, "TEAM", silver).await;
+    assert_eq!(s_team.len(), 1);
+    let to_silver = sent.iter().find(|m| m.to == "silver@x.test").unwrap();
+    assert!(to_silver.html.contains(&format!("Team code {}", s_team[0])) && !to_silver.html.contains("Gold code"));
+
+    // Everything is hidden for the third person: skipped, and no code used at all.
+    assert!(!sent.iter().any(|m| m.to == "none@x.test"));
+    let why: (String, String) = sqlx::query_as("SELECT status, error FROM messages WHERE profile_id = $1").bind(none).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(why, ("skipped".into(), "nothing to show for this person".into()));
+    assert!(codes_of(&h, "VIP", none).await.is_empty() && codes_of(&h, "TEAM", none).await.is_empty(), "a skipped person claims nothing");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM coupon_codes WHERE status = 'available' AND code LIKE 'VIP-%'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 2);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_coupon_tag_in_a_persons_data_never_becomes_a_tag() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_id(&h).await;
+    let p = profile(&h, acct, "sly@x.test", "subscribed", Some("Sly"), json!({"site": "https://shop.example/{% coupon_code 'VIP' %}"})).await;
+    let list = list_of(&mut h, &[p]).await;
+    coupon(&mut h, "VIP", &["VIP-0001"]).await;
+    let content = json!({"subject": "Hi", "preheader": "p", "blocks": [
+        {"type": "image_text", "src": "https://img.example/a.png", "alt": "A", "heading": "Your site", "html": "<p>x</p>", "button_text": "Visit", "button_href": "{{ person.properties.site }}"},
+    ]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Sly", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": content}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let m = h.state.email.sent().into_iter().find(|m| m.to == "sly@x.test").expect("sent");
+    assert!(!m.html.contains("VIP-0001") && !m.text.contains("VIP-0001"));
+    assert!(codes_of(&h, "VIP", p).await.is_empty(), "no code is claimed from a person's own data");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_check_takes_its_account_slot_before_any_audience_work() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let p = profile(&h, acct, "a@x.test", "subscribed", Some("A"), json!({})).await;
+    let list = list_of(&mut h, &[p]).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "C", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hi {{ first_name }}</p>"}]}}))).await;
+    let body = json!({"campaign_id": c["id"], "skip_links": true}).to_string();
+    let mut reqs = Vec::new();
+    for _ in 0..2 {
+        let b = h.page_headers("POST", axum::http::Request::builder().method("POST").uri("/api/content/check").header("content-type", "application/json")).await;
+        reqs.push(b.body(axum::body::Body::from(body.clone())).unwrap());
+    }
+    let router = h.router.clone();
+    let request = move |req: axum::http::Request<axum::body::Body>| {
+        let router = router.clone();
+        async move { tower::ServiceExt::oneshot(router, req).await.unwrap().status() }
+    };
+    // Hold the people table so any audience count waits.
+    let mut tx = h.state.db.begin().await.unwrap();
+    sqlx::query("LOCK TABLE profiles IN ACCESS EXCLUSIVE MODE").execute(&mut *tx).await.unwrap();
+    let first = tokio::spawn(request(reqs.remove(0)));
+    // The first check is now waiting on the audience count, holding the account's slot.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!first.is_finished());
+    // A second check is refused at once: it never reached the audience count, or it would wait too.
+    let second = tokio::time::timeout(std::time::Duration::from_secs(3), request(reqs.remove(0))).await.expect("refused without waiting on the audience");
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+    tx.rollback().await.unwrap();
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_images_are_served_on_the_marketing_site_host() {
+    let Some(h) = Harness::with(|c| {
+        c.public_url = "https://app.pl.test".into();
+        c.site_url = Some("https://pl.test".into());
+    })
+    .await
+    else {
+        return;
+    };
+    for host in ["pl.test", "app.pl.test"] {
+        let (s, headers, _) = h.raw("GET", "/e/icons/color-instagram.png", &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK, "{host}: served directly, not redirected: {headers:?}");
+        assert_eq!(headers["content-type"], "image/png");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn flow_emails_know_whether_a_browser_recorded_the_event() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    h.credit(5.0).await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let acct = account_id(&h).await;
+    profile(&h, acct, "server@x.test", "subscribed", Some("Sam"), json!({})).await;
+    profile(&h, acct, "browser@x.test", "subscribed", Some("Bea"), json!({})).await;
+    let pre = h.ok("GET", "/api/content/starters/pre_arrival", None).await;
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "Arrival", "trigger": {"type": "metric", "metric": "Booking Paid"}, "definition": {"entry": "e1", "nodes": [{"id": "e1", "type": "email", "content": pre["content"], "next": null}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    let props = json!({"address": "123 Ocean View Rd", "paid_in_full": true});
+    h.ok("POST", "/api/events", Some(json!({"metric": "Booking Paid", "profile": {"email": "server@x.test"}, "properties": props}))).await;
+    let (s, _, b) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &json!({"metric": "Booking Paid", "profile": {"email": "browser@x.test"}, "properties": props}).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    h.drain().await;
+    h.fast_forward().await;
+    h.drain().await;
+    let sent = h.state.email.sent();
+    let server = sent.iter().find(|m| m.to == "server@x.test").expect("server event's email");
+    assert!(server.html.contains("123 Ocean View Rd"), "a paid booking from the server shows the address");
+    let browser = sent.iter().find(|m| m.to == "browser@x.test").expect("browser event's email");
+    assert!(!browser.html.contains("123 Ocean View Rd") && browser.html.contains("once your booking is paid in full"), "a browser can't unlock arrival details");
     h.cleanup().await;
 }

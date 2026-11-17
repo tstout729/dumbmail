@@ -251,6 +251,7 @@ fn form_config_schema() -> Value {
             "end_at": {"type": "string", "format": "date-time", "description": "Only show until this time."}
         }), "When a popup or flyout opens; start_at/end_at schedule every kind.");
     let more = json!({
+        "coupon": text(64, "A coupon's name (list_coupons): each person this sign-up creates gets their own unique code from it on the thank-you screen (after confirming, on double opt-in lists), instead of discount_code. See dumbmail://docs/coupons."),
         "legal_text": text(1000, "Small print under the button; [label](https://url) becomes a link."),
         "success_button_text": text(60, "A button on the thank-you screen."),
         "success_button_url": url("Where that button goes; without it the button closes the form."),
@@ -783,8 +784,13 @@ async fn campaign_with_readiness(state: &AppState, acct: Uuid, id: Uuid) -> AppR
     let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
     let est = if audience.include.is_empty() { 0 } else { campaigns::estimate(&state.db, acct, &c.channel, &audience).await? };
     v["estimated_recipients"] = json!(est);
-    v["ready_to_send"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses").is_empty() && est > 0);
-    v["problems"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses"));
+    let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    // Coupons: missing or expired ones stop the send; too few codes for the audience is a warning.
+    let coupons = crate::features::coupons::checks::campaign_check(state, acct, &c).await?;
+    problems.extend(coupons.problems);
+    v["ready_to_send"] = json!(problems.is_empty() && est > 0);
+    v["problems"] = json!(problems);
+    v["warnings"] = json!(coupons.warnings);
     Ok(v)
 }
 
@@ -881,6 +887,7 @@ A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up 
 - `{"type": "engagement", "channel": "email" | "sms" | "any", "engaged": true, "within_days": 90}`. Email counts opens and clicks (Apple Mail Privacy Protection can inflate opens). SMS counts clicks and replies. `any` adds site activity, product views, carts, checkouts, orders and sign-ups. `engaged: false` finds people with none of these.
 - `{"type": "message", "action": "received" | "opened" | "clicked", "campaign_id": "..." | "flow_id": "...", "op": "has" | "has_not", "within_days": 30}`.
 - `{"type": "form", "form_id": "...", "op": "has" | "has_not", "within_days": 30}`: signed up through a form (any form when `form_id` is left out). `since` and `until` work too.
+- `{"type": "coupon", "coupon_id": "...", "action": "given" | "redeemed", "op": "has" | "has_not", "within_days": 30}`: got a code from a coupon (it reached them in a message or on a form), or used it in an order. Only orders recorded by the API or a store integration count as redeemed; orders from the website script are unverified and don't.
 - `{"type": "can_receive", "channel": "email" | "sms", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, and no bounce or complaint suppression. SMS needs a phone and subscribed consent.
 - `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint.
 - `{"type": "consent", "channel": "email" | "sms", "status": "subscribed" | "unsubscribed" | "never_subscribed" | "pending"}`.
@@ -950,6 +957,8 @@ More blocks (full reference: dumbmail://docs/content):
 
 Leave social `links` out to use the account's social links. Countdown and menu bar colors (`background`, `color`, `label_color`) are hex colors. Make a video thumbnail with make_video_thumbnail. Image blocks take `radius` (0-40). Any block can take `"show_if": {"field": "person.properties.tier", "op": "eq", "value": "gold"}` (ops `set`, `not_set`, `eq`, `neq`, `contains`, `gt`, `lt`) or `"show_if": {"expr": "event.value > 100"}` (or a list of up to 5 rules, all must hold) to show it only to some people; someone every block is hidden for is skipped, never sent an empty email. Links and images in these blocks may be tags; they must come out as http(s), mailto: or tel: links (http(s) images) or the block shows without them. Transactional email takes only the core blocks and table. `saved` blocks reuse a saved block (list_saved_blocks); starter designs come from list_starter_templates; check an email with check_email before sending.
 
+Unique coupon codes: `{% coupon_code 'WELCOME' %}` in the body of an email (a text block, button, link) or an SMS gives each person their own code from the coupon named WELCOME (the same code in every message, unless the coupon is set to a new code each time); `{% coupon_expiry 'WELCOME' %}` is its expiry date. Write the name in quotes. Not allowed in the subject or preheader, or in transactional email. Or add a coupon block: `{"type": "coupon", "coupon": "WELCOME", "title": "Your code", "show_expiry": true, "button_text": "Shop now", "href": "https://..."}` (the code in a dashed box). Previews and test sends show SAMPLE-CODE and use no code. If the coupon runs out, the message waits until codes are added. See dumbmail://docs/coupons.
+
 Variables (Jinja): `first_name`, `last_name`, `email`, `phone_number`, any custom property by name, `person.properties.x`, `event.properties.x` and `event.value` (flows), `organization.name`, `organization.website`, `unsubscribe_url`. Filters: `default('x')`, `upper`, `title`, `round`. The footer with the mailing address and unsubscribe link is added automatically; links are click-tracked automatically.
 
 SMS: `{"body": "Hi {{ first_name|default('there') }}! 20% off today: https://..."}`. The brand name and "Reply STOP to opt out." are added when needed; 160 GSM characters per segment (70 with emoji).
@@ -1018,7 +1027,7 @@ mod tests {
     fn form_config_schema_matches_validation() {
         let schema = form_config_schema();
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 25);
+        assert_eq!(keys.len(), 26);
         for k in &keys {
             let probe = serde_json::json!({ k.as_str(): null });
             assert!(crate::forms::check_config(&probe).is_ok(), "{k} is in the schema but rejected");

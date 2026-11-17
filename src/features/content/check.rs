@@ -869,6 +869,65 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
         }
     }
 
+    // Coupons: the check a campaign's launch runs (features::coupons::checks), on the email as it will
+    // be sent (saved blocks as they are now). Whether there are enough codes needs the audience, so
+    // that part runs only with permission to read people, behind the same guard and time limit.
+    let now = chrono::Utc::now();
+    let mut row = match &campaign {
+        Some(c) => crate::models::CampaignRow { content: content.clone(), audience: audience.as_ref().map(serde_json::to_value).transpose()?.unwrap_or(Value::Null), ..c.clone() },
+        None => crate::models::CampaignRow {
+            id: Uuid::nil(),
+            account_id,
+            name: String::new(),
+            channel: "email".into(),
+            status: "draft".into(),
+            audience: Value::Null,
+            content: content.clone(),
+            send_at: None,
+            sent_at: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            ab_test: None,
+            ab_test_ends_at: None,
+            ab_winner: None,
+            send_options: None,
+        },
+    };
+    if !may_read_people {
+        row.audience = Value::Null;
+    }
+    let row = super::prepare::with_saved_filled(state, &row).await?;
+    let coupons = crate::features::coupons::template::may_use_coupons(&row.content) || row.ab_test.as_ref().is_some_and(crate::features::coupons::template::may_use_coupons);
+    if coupons {
+        let counts_people = !row.audience.is_null();
+        let work = async {
+            let _db = if counts_people {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(5), DB_CHECKS.clone().acquire_owned())
+                        .await
+                        .map_err(|_| AppError::Busy("the server is busy checking other emails; try again in a minute".into()))?
+                        .map_err(|e| AppError::Internal(e.into()))?,
+                )
+            } else {
+                None
+            };
+            crate::features::coupons::checks::campaign_check(state, account_id, &row).await
+        };
+        match tokio::time::timeout(AUDIENCE_DEADLINE + Duration::from_secs(5), work).await {
+            Ok(Ok(c)) => {
+                for p in c.problems {
+                    findings.push(blocking("coupon_problem", p, "Emails that use this coupon can't be sent until you fix it."));
+                }
+                for w in c.warnings {
+                    findings.push(finding("coupon_short", "warning", w, "When a coupon runs out, its emails wait and go out once you add codes."));
+                }
+            }
+            Ok(Err(e)) => findings.push(finding("coupon_unchecked", "info", "Couldn't check the coupons", e.public_message())),
+            Err(_) => findings.push(finding("coupon_unchecked", "info", "Couldn't check the coupons", "Checking took too long; try again later.")),
+        }
+    }
+
     // Sending domain (when the product doesn't already require it).
     if !ses {
         let from = content.get("from_email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string).or(account.from_email.clone());

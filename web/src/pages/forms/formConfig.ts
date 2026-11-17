@@ -230,6 +230,7 @@ export const variantFields: FormVariantField[] = [
 
 const topLevelKeys = [
   ...variantFields,
+  "coupon",
   "legal_text",
   "success_button_text",
   "success_button_url",

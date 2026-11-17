@@ -269,19 +269,34 @@ pub fn clean_url(raw: &str, image: bool) -> Option<String> {
     ok.then(|| u.replace('{', "%7B").replace('}', "%7D"))
 }
 
+/// [`clean_url`] for an address [`resolve_url`] already personalized, at render time: the email's own
+/// coupon tags it kept stay as they are, for the renderer to fill in. (Tags that came from a
+/// person's data were percent-encoded by `resolve_url`, so they can't reach here as tags.)
+pub fn clean_url_keeping_coupons(raw: &str, image: bool) -> Option<String> {
+    let (u, tags) = crate::features::coupons::template::hide_tags(raw.trim());
+    clean_url(&u, image).map(|c| if tags.is_empty() { c } else { crate::features::coupons::template::restore_tags(&c, &tags) })
+}
+
 /// Personalize a link or image address for this recipient, then keep it only if [`clean_url`]
 /// allows the result. Empty when it's not allowed (the block then shows without the link).
+/// A coupon tag the email puts in a link (`https://shop.example/discount/{% coupon_code 'WELCOME' %}`)
+/// is left for the renderer, which puts the person's code there once it's claimed (see
+/// features::coupons); one that comes from a person's data is percent-encoded like any other brace.
 pub fn resolve_url(raw: &str, ctx: &Value, image: bool) -> String {
-    let t = raw.trim();
+    let (t, tags) = crate::features::coupons::template::hide_tags(raw.trim());
     let personalized: Cow<'_, str> = if t.contains("{{") || t.contains("{%") {
-        match ENGINE.render_str(t, ctx) {
+        match ENGINE.render_str(&t, ctx) {
             Ok(v) => Cow::Owned(v),
             Err(_) => return String::new(),
         }
     } else {
-        Cow::Borrowed(t)
+        Cow::Borrowed(&t)
     };
-    clean_url(&personalized, image).unwrap_or_default()
+    match clean_url(&personalized, image) {
+        Some(u) if !tags.is_empty() => crate::features::coupons::template::restore_tags(&u, &tags),
+        Some(u) => u,
+        None => String::new(),
+    }
 }
 
 // ---------- Saved blocks ----------
@@ -627,6 +642,8 @@ pub fn sample_ctx(account: &Account, event: Option<&Value>) -> Value {
     ctx["last_name"] = json!("Rivera");
     ctx["email"] = json!("alex@example.com");
     ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
+    // Coupon tags show a sample code and use none.
+    crate::features::coupons::template::fill_sample(&mut ctx);
     ctx
 }
 
@@ -707,6 +724,34 @@ pub fn freeze_with(content: &Value, saved: &SavedMap) -> Option<Value> {
         walk(list, saved);
     }
     Some(out)
+}
+
+/// `c` with the saved blocks in its content and each A/B version's filled in as a send started now
+/// would freeze them, for checks that must see what will be sent (the coupons a campaign uses).
+pub async fn with_saved_filled(state: &AppState, c: &CampaignRow) -> AppResult<CampaignRow> {
+    let variants = c.ab_test.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array());
+    let mut ids = content_refs(&c.content);
+    for v in variants.into_iter().flatten() {
+        ids.extend(content_refs(&v["content"]));
+    }
+    let mut out = c.clone();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    ids.sort();
+    ids.dedup();
+    let saved = load_saved(&state.db, c.account_id, &ids).await?;
+    if let Some(next) = freeze_with(&c.content, &saved) {
+        out.content = next;
+    }
+    if let Some(variants) = out.ab_test.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
+        for v in variants {
+            if let Some(next) = freeze_with(&v["content"], &saved) {
+                v["content"] = next;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// When a campaign's send starts, copy the saved blocks it uses into its content and each A/B

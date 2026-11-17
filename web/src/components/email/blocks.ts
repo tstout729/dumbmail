@@ -9,11 +9,13 @@ import {
   LayoutGrid,
   MoveVertical,
   ShoppingBag,
+  TicketPercent,
   type LucideIcon,
 } from "lucide-react";
 import type { EmailBlock, EmailBlockType, EmailContent } from "../../api";
 import { newProductsBlock, sourceLabel } from "../../features/catalog/ProductsBlockFields";
 import { contentBlockMeta, contentBlockOrder, contentBlockSummary, isContentBlock, isContentType, newContentBlock } from "../../features/content/blockDefs";
+import { couponBlockSummary, newCouponBlock } from "../../features/coupons/CouponBlockFields";
 
 export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon }> = {
   heading: { label: "Heading", icon: Heading },
@@ -25,11 +27,12 @@ export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon
   columns: { label: "Columns", icon: Columns2 },
   product: { label: "Product", icon: ShoppingBag },
   products: { label: "Products from catalog", icon: LayoutGrid },
+  coupon: { label: "Coupon code", icon: TicketPercent },
   html: { label: "HTML", icon: Code },
   ...contentBlockMeta,
 };
 
-export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "columns", "divider", "spacer", "html", ...contentBlockOrder];
+export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "coupon", "columns", "divider", "spacer", "html", ...contentBlockOrder];
 
 export function newBlock(type: EmailBlockType): EmailBlock {
   if (isContentType(type)) return newContentBlock(type);
@@ -60,6 +63,8 @@ export function newBlock(type: EmailBlockType): EmailBlock {
       return { type, html: "<p>Custom HTML</p>" };
     case "products":
       return newProductsBlock();
+    case "coupon":
+      return newCouponBlock();
   }
 }
 
@@ -90,6 +95,8 @@ export function blockSummary(b: EmailBlock): string {
       return stripTags(b.html) || "Custom HTML";
     case "products":
       return `${b.count ?? 4} × ${sourceLabel(b.source)}`;
+    case "coupon":
+      return couponBlockSummary(b);
   }
 }
 
@@ -111,5 +118,6 @@ export const templateVariables: { label: string; value: string }[] = [
   { label: "Event item (flows)", value: "{{ event.properties.items[0].name }}" },
   { label: "A product by its ID", value: '{{ catalog.products["YOUR-ID"].title }}' },
   { label: "Top pick for this person", value: "{{ recommendations[0].title }} {{ recommendations[0].url }}" },
+  { label: "Unique coupon code", value: "{% coupon_code 'COUPON NAME' %}" },
   { label: "Unsubscribe link", value: "{{ unsubscribe_url }}" },
 ];

@@ -148,6 +148,8 @@ fn check_template_content(content: &Value) -> AppResult<()> {
     if let Some(p) = crate::features::content::prepare::transactional_problem(content) {
         return Err(AppError::bad(p));
     }
+    // Coupon codes are marketing: not supported in transactional email (see docs/COUPONS.md).
+    crate::features::coupons::template::forbid(content)?;
     let r = review::review(content);
     if r.blocked {
         return Err(AppError::bad(review::blocked_message(&r)));

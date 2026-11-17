@@ -2,7 +2,7 @@
 
 More email blocks, display rules, saved blocks, starter templates and checks before sending. The core blocks (heading, text, image, button, divider, spacer, columns, product, products, html) are in `dumbmail://docs/email`.
 
-Text in any block can use personalization tags like `{{ first_name|default('there') }}`. Links and image addresses in these blocks can be tags too, like `{{ event.properties.url }}`: they're filled in for each recipient and then checked. A link must come out as `https://`, `http://`, `mailto:` or `tel:`, and an image as `https://` or `http://`; anything else (javascript:, data:, an address that's empty for this person) shows the block without that link or image.
+Text in any block can use personalization tags like `{{ first_name|default('there') }}`. Links and image addresses in these blocks can be tags too, like `{{ event.properties.url }}`: they're filled in for each recipient and then checked. A link must come out as `https://`, `http://`, `mailto:` or `tel:`, and an image as `https://` or `http://`; anything else (javascript:, data:, an address that's empty for this person) shows the block without that link or image. A link can hold a coupon tag, like `https://shop.example/discount/{% coupon_code 'WELCOME' %}`: it becomes the person's own code (see `dumbmail://docs/coupons`).
 
 Email that uses none of this page's features (saved blocks, display rules, the blocks below) is rendered exactly as before they existed.
 
@@ -88,7 +88,7 @@ Any block can carry `show_if`, so one email varies by person:
 {"type": "text", "html": "<p>Your VIP code: VIP20</p>", "show_if": {"field": "person.properties.tier", "op": "eq", "value": "gold"}}
 ```
 
-- `field`: a dotted path in the personalization data: `first_name`, `email`, `person.properties.<key>`, `event.value`, `event.properties.<key>`.
+- `field`: a dotted path in the personalization data: `first_name`, `email`, `person.properties.<key>`, `event.value`, `event.properties.<key>`, `event.from_browser` (flows: `true` when the event that started the flow was recorded by a browser through the website script, which anyone can do, or it isn't known; `false` when it came from the API or an integration).
 - `op`: `set`, `not_set`, `eq`, `neq`, `contains` (text contains, or a list includes), `gt`, `lt` (numbers; text that isn't a number never matches). Text comparisons ignore case.
 - Several rules that must all be true: a list, up to 5: `"show_if": [{"field": ...}, {"expr": ...}]`.
 - Advanced: `{"expr": "event.value > 100 and person.properties.vip"}`, a template expression that compares and combines values: `and`, `or`, `not`, `==`, `<`, `in`, `is defined`, and the filters `int`, `float`, `lower`, `upper`, `length`, `count`, `default`, `trim`, `first`, `last`, `string`, `bool`, `abs`, `round`, `title`, `capitalize`. No `{`, `}`, `%`, `#`, `*`, `~` or function calls. Each rule runs with a fixed work budget and sees only that recipient's data.
@@ -100,6 +100,8 @@ A rule never fails a send:
 - A rule that can't be worked out for someone (an advanced rule comparing text with a number, say) hides its block for that person only.
 - When rules hide every block for someone, that person is skipped with the reason "nothing to show for this person" (shown in the campaign report's delivery card and in `get_send_progress`); nobody gets an empty email. A test send to such a person says so.
 - The check (below) says how many people in the audience every block would be hidden for, and how many a rule can't be worked out for.
+
+Coupon codes (`dumbmail://docs/coupons`) are given out after the rules are decided, from what the person will see: someone a coupon's block or text is hidden for, or who is skipped, uses no code. A coupon tag or coupon block inside a saved block counts like one in the email.
 
 ## Saved blocks
 
@@ -135,7 +137,7 @@ MCP: `list_saved_blocks`, `save_block`, `update_saved_block`, `delete_saved_bloc
 
 Links that fall back to your website read it when the email renders (`organization.website`), so the address isn't copied into the template.
 
-The pre-arrival starter is for stays. Start its flow from a booking event your booking system sends through the API or an integration, never from an event your website sends from the browser (anyone can send those). Have the event carry `paid_in_full`: the intro, the arrival table (check-in, check-out, address, parking) and the directions button show only when `event.properties.paid_in_full` is true; otherwise the email says the details come once the booking is paid in full. It has no door, lockbox or access codes.
+The pre-arrival starter is for stays. Start its flow from a booking event your booking system sends through the API or an integration, never from an event your website sends from the browser (anyone can send those). Have the event carry `paid_in_full`: the intro, the arrival table (check-in, check-out, address, parking) and the directions button show only when `event.properties.paid_in_full` is true and `event.from_browser` is false (the event came from the API or an integration); otherwise the email says the details come once the booking is paid in full. It has no door, lockbox or access codes.
 
 MCP: `list_starter_templates` (with `key` for one's content), `create_template_from_starter`.
 
@@ -147,7 +149,7 @@ MCP: `list_starter_templates` (with `key` for one's content), `create_template_f
 - `{"campaign_id": "..."}`: a campaign (optionally with an unsaved `content` or `audience`);
 - `{"flow_id": "...", "node_id": "..."}`: a flow's email step.
 
-It returns `findings`, each with a `severity` (`error`, `warning`, `info`), a `title`, a `detail` that says what to fix, and `blocks_sending` (true only for what the product already refuses to send: a missing subject, sender or mailing address, an unverified sending domain where one is required, an empty audience, content that doesn't render). It checks:
+It returns `findings`, each with a `severity` (`error`, `warning`, `info`), a `title`, a `detail` that says what to fix, and `blocks_sending` (true only for what the product already refuses to send: a missing subject, sender or mailing address, an unverified sending domain where one is required, an empty audience, content that doesn't render, a coupon that doesn't exist or has expired). It checks:
 
 - links and images: broken or unreachable (requested from DumbMail's servers: public addresses only, redirects not followed and so reported as not checked, up to 40 addresses, results kept for 10 minutes; `skip_links: true` skips this), image addresses that answer with a web page instead of an image, images over 1 MB, missing alt text, sample images left in. DumbMail's own addresses (tracking links and open pixels copied from a sent email, unsubscribe links, hosted images) on any DumbMail host or any account's branded link domain are never requested, since that would count as an open or click: they're listed as "DumbMail link, not checked", and a tracked link is checked as the address it leads to;
 - subject (missing, over 60 characters, all capitals, `!!`) and preview text (missing, too long, same as the subject);
@@ -156,6 +158,7 @@ It returns `findings`, each with a `severity` (`error`, `warning`, `info`), a `t
 - who it goes to: nobody reachable, and how many never subscribed;
 - display rules: how many people every block would be hidden for (they'd be skipped), and how many a rule can't be worked out for (tried on up to 5,000 people in the audience; for flows, only rules about the person);
 - spam signals: image-only emails, link shorteners, link text that shows a different address than the link opens;
+- coupons: the same check a campaign's launch runs (`dumbmail://docs/coupons`), on the email with its saved blocks as they are now: a coupon that doesn't exist or has expired, and fewer codes left than the audience may need (counted only with permission to read profiles);
 - whether the sending domain is authenticated.
 
 `recipients` is the reachable count, `size_bytes` the email's size, and `links` each address checked with its status.

@@ -75,6 +75,8 @@ pub fn check_blocks(v: &Value) -> AppResult<Value> {
         Ok(())
     }
     walk(list, false)?;
+    // Coupon tags follow the same rules as in an email (see features::coupons).
+    crate::features::coupons::template::check_content("email", &serde_json::json!({"subject": "", "blocks": v}))?;
     Ok(v.clone())
 }
 

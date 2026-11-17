@@ -68,7 +68,7 @@ pub const STARTERS: &[Starter] = &[
     Starter {
         key: "pre_arrival",
         name: "Pre-arrival info",
-        description: "Arrival details for a stay. Start the flow from a booking event your booking system sends through the API or an integration (never a website event), and have it set paid_in_full: the address and arrival details show only when paid_in_full is true.",
+        description: "Arrival details for a stay. Start the flow from a booking event your booking system sends through the API or an integration (never a website event), and have it set paid_in_full: the address and arrival details show only when paid_in_full is true and the event wasn't recorded by a browser.",
         kind: "flow",
         trigger: Some("Booking Paid in Full"),
     },
@@ -90,11 +90,15 @@ fn event_link(var: &str, path: &str) -> String {
     }
 }
 
-/// Shown only when the event that started the flow says the booking is paid in full.
+/// Shown only when the event that started the flow says the booking is paid in full, and the event
+/// came from the server (an integration or the API), not a browser, where anyone could make one up.
 fn when_paid(mut b: Value) -> Value {
-    b["show_if"] = json!({"field": "event.properties.paid_in_full", "op": "eq", "value": "true"});
+    b["show_if"] = json!([{"field": "event.properties.paid_in_full", "op": "eq", "value": "true"}, {"field": "event.from_browser", "op": "eq", "value": "false"}]);
     b
 }
+
+/// The opposite of [`when_paid`]: shown when either of its rules doesn't hold.
+const NOT_PAID: &str = "event.properties.paid_in_full|string|trim|lower != 'true' or event.from_browser|string|lower != 'false'";
 
 fn heading(text: &str, level: u8, align: &str) -> Value {
     json!({"type": "heading", "text": text, "level": level, "align": align})
@@ -316,7 +320,7 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                     "rows": [["Check-in", "{{ event.properties.check_in|default('From 4:00 PM') }}"], ["Check-out", "{{ event.properties.check_out|default('By 10:00 AM') }}"], ["Address", "{{ event.properties.address }}"], ["Parking", "{{ event.properties.parking|default('Ask us') }}"]]})),
                 when_paid(button("Get directions", "{{ event.properties.directions_url|default('https://maps.google.com') }}")),
                 json!({"type": "text", "align": "left", "html": "<p>Your stay starts soon. We'll send the address and arrival details once your booking is paid in full.</p>",
-                    "show_if": {"field": "event.properties.paid_in_full", "op": "neq", "value": "true"}}),
+                    "show_if": {"expr": NOT_PAID}}),
                 text("<p>Anything you need before you arrive? Just reply to this email.</p>", "left"),
                 footer(b),
             ],
@@ -339,7 +343,7 @@ pub fn sample_event(key: &str) -> Option<Value> {
         "shipping" => Some(json!({"properties": {"order_id": "1042", "carrier": "UPS", "tracking_number": "1Z999AA10123456784"}})),
         "back_in_stock" => Some(json!({"properties": {"product_name": "Everyday tote", "product_id": "TOTE-1"}})),
         "booking_confirmation" => Some(json!({"properties": {"name": "Sunset kayak tour", "start_date": "Sat, Jun 6 at 6:00 PM", "end_date": "Sat, Jun 6 at 8:00 PM", "confirmation_code": "K7Q2P"}})),
-        "pre_arrival" => Some(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}})),
+        "pre_arrival" => Some(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}, "from_browser": false})),
         _ => None,
     }
 }
@@ -373,9 +377,25 @@ mod tests {
         for blk in c["blocks"].as_array().unwrap() {
             let shown = blk.to_string();
             if shown.contains("event.properties.address") || shown.contains("directions_url") || shown.contains("check_in") || shown.contains("arrival day") {
-                assert_eq!(blk["show_if"]["field"], "event.properties.paid_in_full", "{blk}");
-                assert_eq!(blk["show_if"]["op"], "eq", "{blk}");
+                assert_eq!(blk["show_if"], json!([{"field": "event.properties.paid_in_full", "op": "eq", "value": "true"}, {"field": "event.from_browser", "op": "eq", "value": "false"}]), "{blk}");
             }
+        }
+        // Exactly one of "the details" and "we'll send them once paid" shows, and the details only for
+        // a paid booking the server recorded.
+        let paid = crate::features::content::prepare::parse_rules(&when_paid(json!({}))["show_if"]).unwrap();
+        let unpaid = crate::features::content::prepare::parse_rules(&json!({"expr": NOT_PAID})).unwrap();
+        let holds = |rules: &[crate::features::content::prepare::Rule], ctx: &Value| rules.iter().all(|r| crate::features::content::prepare::rule_holds(r, ctx).unwrap());
+        for (event, details) in [
+            (json!({"properties": {"paid_in_full": true}, "from_browser": false}), true),
+            (json!({"properties": {"paid_in_full": "true"}, "from_browser": false}), true),
+            (json!({"properties": {"paid_in_full": true}, "from_browser": true}), false),
+            (json!({"properties": {"paid_in_full": false}, "from_browser": false}), false),
+            (json!({"properties": {"paid_in_full": true}}), false),
+            (json!({"properties": {}, "from_browser": false}), false),
+        ] {
+            let ctx = json!({"event": event});
+            assert_eq!(holds(&paid, &ctx), details, "{ctx}");
+            assert_eq!(holds(&unpaid, &ctx), !details, "{ctx}");
         }
     }
 

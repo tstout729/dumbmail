@@ -1719,5 +1719,61 @@
     }
    ]
   }
+ },
+ {
+  "name": "coupon_tag",
+  "content": {
+   "subject": "Your code",
+   "preheader": "Inside",
+   "blocks": [
+    {
+     "type": "text",
+     "html": "<p>Hi {{ first_name }}, use {% coupon_code 'LEGACY' %} at checkout{% set e %}{% coupon_expiry 'LEGACY' %}{% endset %}{% if e|trim %} by {{ e }}{% endif %}.</p>"
+    },
+    {
+     "type": "button",
+     "text": "Shop",
+     "href": "https://shop.example/discount/{% coupon_code 'LEGACY' %}"
+    }
+   ]
+  }
+ },
+ {
+  "name": "coupon_block",
+  "content": {
+   "subject": "A gift",
+   "blocks": [
+    {
+     "type": "heading",
+     "text": "A gift for you"
+    },
+    {
+     "type": "coupon",
+     "coupon": "LEGACY",
+     "title": "Your code",
+     "show_expiry": true,
+     "button_text": "Shop now",
+     "href": "https://shop.example"
+    },
+    {
+     "type": "columns",
+     "columns": [
+      [
+       {
+        "type": "text",
+        "html": "<p>Left</p>"
+       }
+      ],
+      [
+       {
+        "type": "coupon",
+        "coupon": "LEGACY",
+        "show_expiry": false
+       }
+      ]
+     ]
+    }
+   ]
+  }
  }
 ]

@@ -21,6 +21,7 @@ These keys can also be set per A/B test version (see `variants`).
 | `success_message` | text, ≤ 200 | "Thanks! Check your inbox." | Headline of the thank-you screen. |
 | `success_body` | text, ≤ 1,000 | none | Text under it. |
 | `discount_code` | text, ≤ 60 | none | Shown on the thank-you screen in a box with a Copy button. It's never sent to the website or the hosted page before someone signs up; the sign-up response carries it. |
+| `coupon` | text, ≤ 64 | none | A coupon's name ([COUPONS.md](COUPONS.md)). Each person this sign-up creates gets their own unique code from it on the thank-you screen, in place of `discount_code` (on a double opt-in list, on the confirmation page after confirming). People already in your audience, repeat sign-ups and sign-ups past the coupon's hourly limit or 3 per visitor an hour see no code. |
 
 Not per version:
 
