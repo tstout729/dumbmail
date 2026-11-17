@@ -8,6 +8,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
   engagement: "Engaged recently",
   message: "Got, opened or clicked a message",
   form: "Signed up through a form",
+  product: "Viewed, carted or bought a product",
   list: "List membership",
   segment: "In another segment",
   consent: "Consent",
@@ -21,7 +22,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
 /** Condition types grouped for the pickers. */
 export const conditionGroups: { label: string; types: Condition["type"][] }[] = [
   { label: "Profile", types: ["property"] },
-  { label: "Activity", types: ["event", "event_value", "event_time", "engagement", "message", "form"] },
+  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form"] },
   { label: "Membership", types: ["list", "segment"] },
   { label: "Reachability", types: ["consent", "can_receive", "suppressed"] },
   { label: "Predictive", types: ["prediction", "random"] },
@@ -54,6 +55,13 @@ export const eventOps: { value: EventCountOp; label: string }[] = [
   { value: "at_most", label: "at most" },
   { value: "exactly", label: "exactly" },
   { value: "zero", label: "zero times" },
+];
+
+export const productActions: { value: "viewed" | "carted" | "checkout" | "ordered"; label: string }[] = [
+  { value: "ordered", label: "bought" },
+  { value: "viewed", label: "viewed" },
+  { value: "carted", label: "added to cart" },
+  { value: "checkout", label: "started checkout with" },
 ];
 
 export const cmpOps: { value: CmpOp; label: string }[] = [
@@ -107,6 +115,8 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return { type, action: "opened", op: "has" };
     case "form":
       return { type, op: "has" };
+    case "product":
+      return { type, action: "ordered", op: "at_least", count: 1, within_days: 90 };
     case "list":
       return { type, list_id: firstListId ?? "", op: "in" };
     case "segment":
@@ -164,6 +174,8 @@ export function isConditionComplete(c: Condition): boolean {
       return Boolean(c.campaign_id || c.flow_id);
     case "form":
       return windowComplete(c);
+    case "product":
+      return (c.op === "zero" || isNum(c.count)) && windowComplete(c) && [c.product_id, c.category, c.tag, c.brand].every((v) => v === undefined || v.trim() !== "");
     case "list":
       return c.list_id !== "";
     case "segment":
@@ -245,6 +257,11 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
       return `${c.op === "has" ? "" : "not "}${c.action} ${c.campaign_id ? "campaign" : "flow"} message${c.within_days ? ` in the last ${c.within_days}d` : ""}`;
     case "form":
       return `${c.op === "has" ? "signed up" : "didn't sign up"} through ${c.form_id ? "a chosen form" : "any form"}${windowSummary(c)}`;
+    case "product": {
+      const what = c.product_id ? `product ${c.product_id}` : [c.category && `category ${c.category}`, c.tag && `tag ${c.tag}`, c.brand && `brand ${c.brand}`].filter(Boolean).join(", ") || "any product";
+      const count = c.op === "zero" ? "zero times" : `${eventOps.find((o) => o.value === c.op)?.label} ${c.count ?? 1}×`;
+      return `${productActions.find((a) => a.value === c.action)?.label ?? c.action} ${what} ${count}${windowSummary(c)}`;
+    }
     case "list":
       return `${c.op === "in" ? "in" : "not in"} list ${list(c.list_id)}`;
     case "segment":

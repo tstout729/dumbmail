@@ -193,7 +193,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
 
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
-    let ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    // Product blocks and catalog variables are filled per recipient (see features::catalog).
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,
@@ -209,7 +211,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool),
     }
     let (subject, rendered) = if spec.channel == "email" {
-        let content: EmailContent = serde_json::from_value(spec.content.clone())?;
+        let content: EmailContent = serde_json::from_value(content.into_owned())?;
         let from_email = content
             .from_email
             .clone()
@@ -232,7 +234,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         };
         (Some(subject), Rendered::Email(email))
     } else {
-        let content: SmsContent = serde_json::from_value(spec.content.clone())?;
+        let content: SmsContent = serde_json::from_value(content.into_owned())?;
         let (provider, from, own_provider) = crate::phone::sender(state, spec.account.id).await?;
         let prior_sms: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = 'sms' AND status IN ('sent','delivered'))")
             .bind(p.id)
