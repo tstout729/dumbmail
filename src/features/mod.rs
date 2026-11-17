@@ -79,6 +79,12 @@ pub trait Feature: Send + Sync {
         Ok(())
     }
 
+    /// The permission each of this feature's routes and MCP tools needs (see `team::access`).
+    /// Routes and tools left out are refused, and a test fails for any route without a rule.
+    fn access(&self) -> team::access::Access {
+        team::access::Access::default()
+    }
+
     /// Whether this feature's `on_event` needs to see the account's events of `metric`. Events
     /// reach `on_event` only when a live flow or some feature wants them, so keep this cheap (an
     /// `EXISTS`, cached briefly).

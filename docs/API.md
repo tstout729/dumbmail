@@ -58,6 +58,7 @@ type Condition =
   | { type: "segment"; segment_id: string; op: "in" | "not_in" } // the other segment's rules, evaluated live
   | { type: "consent"; channel: "email" | "sms"; status: Consent }
   | { type: "can_receive"; channel: "email" | "sms"; value?: boolean } // a send would reach them now
+  | { type: "coupon"; coupon_id: string; action?: "given" | "redeemed"; op?: "has" | "has_not"; within_days?: number } // see COUPONS.md
   | { type: "suppressed"; value?: boolean } // email suppressed after a hard bounce or complaint
   | ({ type: "form"; form_id?: string; op?: "has" | "has_not" } & Window) // signed up through a form (any form without form_id)
   | { type: "engagement"; channel: "email" | "sms" | "any"; engaged?: boolean; within_days: number }
@@ -155,18 +156,18 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | POST | `/api/auth/signup` | `{email, password, name?, company}` | `{user, account}` + cookie |
-| POST | `/api/auth/login` | `{email, password}` | `{user, account}` + cookie |
+| POST | `/api/auth/login` | `{email, password}` | Same as `/api/me`, + cookie. When two-factor or single sign-on isn't finished, `restriction` says what's left (see docs/TEAM.md) |
 | POST | `/api/auth/logout` | – | `{ok: true}` |
 | GET | `/api/auth/options` | – | `{google, signup, site_url}`: which sign-in methods this server offers, and the marketing site's base URL when SITE_URL puts it on its own host (else `null`) |
 | GET | `/api/auth/google?next=/path` | – | Redirects to Google ("Continue with Google"). The callback (`/api/auth/google/callback`) signs in, joins an existing user with the same email (turning its password off and ending older sessions), or creates a new account and sends it to `/onboarding`. Failures redirect to `/login?error=<code>`. With GOOGLE_REDIRECT_BASE on another host, Google returns to that host and the callback sends people on to PUBLIC_URL |
-| GET | `/api/me` | – | `{user, account, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too |
+| GET | `/api/me` | – | `{user, account, role, permissions, restriction, accounts, two_factor_enabled, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too. Team fields: docs/TEAM.md |
 | PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial. `social_links` is `{instagram\|facebook\|tiktok\|x\|youtube\|pinterest\|linkedin\|threads: https URL}`; a blank value removes that network. Social links appear in email footers | `Account` |
 | POST | `/api/brand/import` | `{url, apply?}` | `{brand: {website, name, logo_url, brand_color, colors[], address, from_email, from_email_found, social_links}}`. Reads the public website (and its stylesheets and logo) for brand suggestions. With `apply: true`, also saves website, logo, brand color and social links, plus name and address when the account has none, and returns `account` |
 | GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}, email_limit?: {limit, sent_last_24h, remaining, fixed, start}, unengaged_skip: {enabled, days, min_emails}}`. `email_limit` is the hosted service's 24-hour warm-up limit (see "Sending guardrails") |
 | POST | `/api/account/domain` | `{domain}` | same as GET sending |
 | POST | `/api/account/domain/verify` | – | same as GET sending |
-| GET | `/api/api-keys` | – | `{data: {id, name, prefix, created_at, last_used_at}[]}` |
-| POST | `/api/api-keys` | `{name}` | `{id, name, prefix, key}` (key shown once) |
+| GET | `/api/api-keys` | – | `{data: {id, name, prefix, scopes, expires_at, expired, created_by, created_at, last_used_at}[], scopes}` (owners and admins) |
+| POST | `/api/api-keys` | `{name, scopes?, expires_in_days?}` | `{id, name, prefix, scopes, expires_at, key}` (key shown once; scopes default to `full`, see docs/TEAM.md) |
 | DELETE | `/api/api-keys/:id` | – | `{ok: true}` |
 | GET | `/api/billing` | – | `{plan, limits: {profiles, emails_per_month, sms_per_month}, usage: {profiles, emails_this_month, sms_this_month}}` |
 

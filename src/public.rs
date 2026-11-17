@@ -132,7 +132,8 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
     if let Ok(Some(m)) = load_msg(&state, id).await {
         // A transactional link can carry a secret (a password-reset token): keep only that a click
         // happened, when, and the site it went to.
-        let recorded = if m.transactional { url::Url::parse(&q.u).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { q.u.clone() };
+        // A marketing link keeps the URL, without the person's own coupon codes (the redirect keeps them).
+        let recorded = if m.transactional { url::Url::parse(&q.u).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { crate::features::coupons::assign::mask_link(&state.db, m.profile_id, &q.u).await };
         let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&recorded).execute(&state.db).await;
         let first: Result<Option<Uuid>, _> = sqlx::query_scalar(
             "UPDATE messages SET clicked_at = COALESCE(clicked_at, now()), opened_at = CASE WHEN channel = 'email' THEN COALESCE(opened_at, now()) ELSE opened_at END
@@ -251,7 +252,7 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
 /// The visitor's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For entry (the
 /// one the proxy added; earlier entries come from the visitor and can be made up). Only a valid IP counts.
 /// The per-visitor limit is a second line of defense; the per-inbox and per-account limits don't use it.
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+pub fn client_ip(headers: &HeaderMap) -> Option<String> {
     let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
     let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
     get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))
@@ -290,7 +291,9 @@ async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Respo
         Confirmed::Joined(a) | Confirmed::Already(a) => {
             let acct = account_of(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
-            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>", esc(&name)))
+            // A sign-up that earned a coupon code gets it once confirmed (shown for 24 hours, see features::coupons).
+            let code = crate::features::coupons::assign::confirmation_code(state, id).await.map(|c| format!("<p>Your code: <strong>{}</strong></p>", esc(&c))).unwrap_or_default();
+            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>{code}", esc(&name)))
         }
         Confirmed::Expired(a) => (account_of(a).await, "<h1>This link has expired</h1><p>Sign up again and we'll send you a new one.</p>".to_string()),
     };
@@ -752,6 +755,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let (true, Some(list_id), Some(addr)) = (double_opt_in && p.email_consent != "subscribed", form.list_id, p.email.as_deref()) {
         match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone(), ip).await? {
             crate::optin::Started::Pending => {
+                // A form with a coupon: its code is given once the address is confirmed (see features::coupons).
+                crate::features::coupons::assign::form_pending(state, account, &form, p.id, upserted.created).await;
                 let msg = form.config["confirm_message"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("Almost done! Check your inbox and tap the link to confirm.");
                 return Ok(json!({"ok": true, "confirm": true, "message": msg}));
             }
@@ -781,6 +786,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(code) = crate::forms::discount_code(&form.config, version) {
         out["discount_code"] = json!(code);
     }
+    // A form with a coupon gives each person it signed up their own code instead (see features::coupons).
+    crate::features::coupons::assign::form_sign_up(state, account, &form, p.id, upserted.created, ip, &mut out).await;
     Ok(out)
 }
 

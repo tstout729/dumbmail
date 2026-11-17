@@ -208,6 +208,7 @@ async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
         sqlx::query_as("DELETE FROM profiles WHERE id = $1 AND account_id = $2 RETURNING email, phone_number, external_id").bind(id).bind(ctx.account_id).fetch_optional(&state.db).await?;
     let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found("profile")) };
     crate::features::webhooks::profile_deleted(&state.db, ctx.account_id, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
+    crate::features::team::audit(&state, &ctx, "profile.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -259,7 +260,9 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
 }
 
 async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(import(&state, ctx.account_id, b).await?))
+    let v = import(&state, ctx.account_id, b).await?;
+    crate::features::team::audit(&state, &ctx, "profiles.import", None, json!({"created": v["created"], "updated": v["updated"], "skipped": v["skipped"]})).await;
+    Ok(Json(v))
 }
 
 // ---------- Lists ----------
@@ -346,6 +349,7 @@ async fn delete_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
     if n == 0 {
         return Err(AppError::not_found("list"));
     }
+    crate::features::team::audit(&state, &ctx, "list.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -374,6 +378,7 @@ async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
     core::list_belongs(&state.db, ctx.account_id, id).await?;
     let n = core::remove_from_list(&state.db, ctx.account_id, id, &b.profile_ids).await?;
+    crate::features::team::audit(&state, &ctx, "list.members_remove", Some(&id.to_string()), json!({"removed": n})).await;
     Ok(Json(json!({"removed": n})))
 }
 
@@ -482,6 +487,7 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
     if n == 0 {
         return Err(AppError::not_found("segment"));
     }
+    crate::features::team::audit(&state, &ctx, "segment.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -693,6 +699,18 @@ pub async fn query_metric(state: &AppState, account_id: Uuid, q: MetricQuery) ->
     Ok(json!({"metric": q.metric, "interval": interval, "start": start, "end": end, "series": series, "total": total}))
 }
 
+impl MetricQuery {
+    /// Grouping by an event property shows people's own values, so it needs permission to read
+    /// profiles; totals and the campaign and flow groupings don't.
+    pub fn check_access(&self, ctx: &Ctx) -> AppResult<()> {
+        match self.group_by.as_deref().filter(|g| !g.is_empty()) {
+            None | Some("campaign" | "flow") => Ok(()),
+            Some(_) => crate::features::team::access::require_people_values(ctx, "an event property"),
+        }
+    }
+}
+
 async fn query_metric_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<MetricQuery>) -> AppResult<Json<Value>> {
+    b.check_access(&ctx)?;
     Ok(Json(query_metric(&state, ctx.account_id, b).await?))
 }

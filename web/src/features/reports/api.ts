@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, withQuery } from "../../api/client";
+import { api, reloadIfAccountChanged, withQuery, writeHeaders } from "../../api/client";
 import type {
   AttributionPatch,
   AttributionPreview,
@@ -62,13 +62,14 @@ export async function downloadCsv(path: string, body?: unknown, fallbackName = "
   const res = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "include",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    headers: body === undefined ? undefined : { "Content-Type": "application/json", ...writeHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
     let message = `Download failed (${res.status})`;
     try {
-      const j = (await res.json()) as { error?: { message?: string } };
+      const j = (await res.json()) as { error?: { code?: string; message?: string } };
+      reloadIfAccountChanged(res.status, j.error?.code);
       message = j.error?.message ?? message;
     } catch {
       // Not JSON; keep the status message.

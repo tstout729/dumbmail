@@ -199,6 +199,14 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
+    // Unique coupon codes are claimed here, after the checks above and just before rendering; a code
+    // stays the person's if a later check skips or defers this attempt. An empty pool holds the
+    // message. Messages without coupons do no coupon work (see features::coupons).
+    let coupons = match crate::features::coupons::assign::prepare_send(state, &spec, message_id).await? {
+        crate::features::coupons::Prepared::Ready(c) => c,
+        crate::features::coupons::Prepared::Hold(until) => return Ok(Outcome::Deferred(until)),
+    };
+    coupons.fill(&mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
@@ -340,6 +348,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     };
     match result {
         Ok(provider_id) => {
+            coupons.delivered(&state.db).await;
             let cost = crate::billing::charge_message(state, spec.account.id, spec.channel, segments, is_mms, own_provider).await?;
             let from_domain = match &rendered {
                 Rendered::Email(e) => crate::features::reports::delivery::sender_domain(&e.from_email),

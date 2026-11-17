@@ -436,6 +436,24 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid, occurrence: DateT
         return Ok(());
     }
     let spec: Spec = serde_json::from_value(spec)?;
+    // A report grouped by people's own values goes only to members who may see profiles, as
+    // checked now (roles change after a report is scheduled).
+    let to = if spec.people_values().is_some() {
+        let ids: Vec<Uuid> = to.iter().map(|(id, _)| *id).collect();
+        let roles: Vec<(Uuid, String)> = sqlx::query_as("SELECT user_id, role FROM memberships WHERE account_id = $1 AND user_id = ANY($2)").bind(account_id).bind(&ids).fetch_all(&state.db).await?;
+        let may: Vec<Uuid> = roles
+            .into_iter()
+            .filter(|(_, r)| crate::features::team::Role::parse(r).is_some_and(|r| r.has(crate::features::team::Perm::ProfilesRead)))
+            .map(|(id, _)| id)
+            .collect();
+        to.into_iter().filter(|(id, _)| may.contains(id)).collect::<Vec<_>>()
+    } else {
+        to
+    };
+    if to.is_empty() {
+        fail("No one gets this report: it's grouped by people's own details, and none of its recipients may see profiles.".into()).await?;
+        return Ok(());
+    }
     let result = match custom::run(state, account_id, spec, Mode::Job).await {
         Ok(r) => r,
         // Another report is running for the account, or the server is busy: try again shortly.

@@ -85,9 +85,14 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            let res = match crate::features::mcp_call(state, ctx, &name, &args).await {
-                Some(r) => r,
-                None => call(state, ctx, &name, args).await,
+            // Every tool needs its permission (features::team::access); a tool without a rule is
+            // refused. Tools record their own changes in the audit log where they make them.
+            let res = match crate::features::team::access::authorize_tool(state, ctx, &name, &args).await {
+                Err(e) => Err(e),
+                Ok(_) => match crate::features::mcp_call(state, ctx, &name, &args).await {
+                    Some(r) => r,
+                    None => call(state, ctx, &name, args).await,
+                },
             };
             Ok(match res {
                 Ok(v) => {
@@ -246,6 +251,7 @@ fn form_config_schema() -> Value {
             "end_at": {"type": "string", "format": "date-time", "description": "Only show until this time."}
         }), "When a popup or flyout opens; start_at/end_at schedule every kind.");
     let more = json!({
+        "coupon": text(64, "A coupon's name (list_coupons): each person this sign-up creates gets their own unique code from it on the thank-you screen (after confirming, on double opt-in lists), instead of discount_code. See dumbmail://docs/coupons."),
         "legal_text": text(1000, "Small print under the button; [label](https://url) becomes a link."),
         "success_button_text": text(60, "A button on the thank-you screen."),
         "success_button_url": url("Where that button goes; without it the button closes the form."),
@@ -438,9 +444,25 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 "missing_setup": missing,
             }))
         }
-        "update_account" => Ok(serde_json::to_value(crate::api::account::patch_account(state, acct, from(a)?).await?)?),
-        "import_brand" => crate::api::account::import_brand(state, acct, a["url"].as_str().unwrap_or(""), a["apply"].as_bool().unwrap_or(false)).await,
-        "set_sending_domain" => crate::api::account::set_domain(state, acct, a["domain"].as_str().unwrap_or("")).await,
+        "update_account" => {
+            let v = serde_json::to_value(crate::api::account::patch_account(state, acct, from(a)?).await?)?;
+            crate::features::team::audit(state, ctx, "account.settings_change", None, json!({})).await;
+            Ok(v)
+        }
+        "import_brand" => {
+            let apply = a["apply"].as_bool().unwrap_or(false);
+            let v = crate::api::account::import_brand(state, acct, a["url"].as_str().unwrap_or(""), apply).await?;
+            if apply {
+                crate::features::team::audit(state, ctx, "account.brand_import", None, json!({})).await;
+            }
+            Ok(v)
+        }
+        "set_sending_domain" => {
+            let domain = a["domain"].as_str().unwrap_or("");
+            let v = crate::api::account::set_domain(state, acct, domain).await?;
+            crate::features::team::audit(state, ctx, "domain.add", Some(domain), json!({})).await;
+            Ok(v)
+        }
         "check_sending_domain" => {
             match a["domain"].as_str().filter(|d| !d.trim().is_empty()) {
                 Some(d) => crate::domains::verify_sending_domain(state, acct, d).await?,
@@ -453,10 +475,12 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 return Ok(json!({"dry_run": true, "note": "Nothing removed. Emails from addresses on this domain stop sending until it's added and verified again. Call again with confirm=true once the user approves."}));
             }
             crate::domains::remove_sending_domain(state, acct, a["domain"].as_str().unwrap_or("")).await?;
+            crate::features::team::audit(state, ctx, "domain.remove", a["domain"].as_str(), json!({})).await;
             crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
         }
         "set_link_domain" => {
             crate::domains::set_link_domain(state, acct, a["domain"].as_str().unwrap_or("")).await?;
+            crate::features::team::audit(state, ctx, "link_domain.set", a["domain"].as_str(), json!({})).await;
             crate::api::account::sending_json(state, &load_account(&state.db, acct).await?).await
         }
         "check_link_domain" => {
@@ -471,7 +495,9 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 let price = crate::billing::to_usd(crate::billing::prices(state).number_monthly);
                 return Ok(json!({"dry_run": true, "note": format!("Nothing claimed. This number costs ${price:.2}/month from the account balance. Call again with confirm=true once the user approves.")}));
             }
-            Ok(crate::phone::row_json(&crate::phone::claim(state, acct, a["phone_number"].as_str().unwrap_or("")).await?))
+            let row = crate::phone::claim(state, acct, a["phone_number"].as_str().unwrap_or("")).await?;
+            crate::features::team::audit(state, ctx, "phone_number.claim", a["phone_number"].as_str(), json!({})).await;
+            Ok(crate::phone::row_json(&row))
         }
         "get_website_snippet" => {
             let (pk, seen, url): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
@@ -505,10 +531,18 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             aud::profile_detail(state, acct, id).await
         }
         "upsert_profile" => Ok(serde_json::to_value(aud::create_profile(state, acct, a).await?)?),
-        "import_profiles" => aud::import(state, acct, from(a)?).await,
+        "import_profiles" => {
+            let v = aud::import(state, acct, from(a)?).await?;
+            crate::features::team::audit(state, ctx, "profiles.import", None, json!({"created": v["created"], "updated": v["updated"], "skipped": v["skipped"]})).await;
+            Ok(v)
+        }
         "track_event" => aud::track(state, acct, from(a)?).await,
         "list_metrics" => aud::metrics(state, acct).await,
-        "query_metric" => aud::query_metric(state, acct, from(a)?).await,
+        "query_metric" => {
+            let q: aud::MetricQuery = from(a)?;
+            q.check_access(ctx)?;
+            aud::query_metric(state, acct, q).await
+        }
         "get_events" => {
             let q = aud::EventsQuery { metric: a["metric"].as_str().map(String::from), profile_id: opt_uuid(&a, "profile_id")?, limit: Some(a["limit"].as_i64().unwrap_or(50)), offset: None };
             let (rows, total) = aud::events(state, acct, &q).await?;
@@ -554,7 +588,9 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "create_template" => Ok(serde_json::to_value(msg::create_template(state, acct, from(a)?).await?)?),
         "render_preview" => {
             let include_html = a["include_html"].as_bool().unwrap_or(false);
-            let mut r = msg::render_preview(state, acct, msg::RenderBody { channel: a["channel"].as_str().unwrap_or("email").into(), content: a["content"].clone(), profile_id: opt_uuid(&a, "profile_id")?, event: a.get("event").cloned() }).await?;
+            // A real person's data only for callers who may read profiles; others get the sample person.
+            let profile_id = if ctx.can(crate::features::team::Perm::ProfilesRead) { opt_uuid(&a, "profile_id")? } else { None };
+            let mut r = msg::render_preview(state, acct, msg::RenderBody { channel: a["channel"].as_str().unwrap_or("email").into(), content: a["content"].clone(), profile_id, event: a.get("event").cloned() }).await?;
             if !include_html {
                 if let Some(o) = r.as_object_mut() {
                     if let Some(h) = o.remove("html") {
@@ -575,14 +611,12 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         }
         "update_campaign" => {
             let id = uuid_arg(&a, "id")?;
-            msg::update_campaign(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None, ab_test: a.get("ab_test").cloned(), send_options: a.get("send_options").cloned() }).await?;
+            msg::update_campaign_in(state, acct, id, msg::CampaignBody { name: a["name"].as_str().map(String::from), channel: None, audience: a.get("audience").cloned(), content: a.get("content").cloned(), send_at: None, ab_test: a.get("ab_test").cloned(), send_options: a.get("send_options").cloned() }, msg::editable_for(ctx)).await?;
             campaign_with_readiness(state, acct, id).await
         }
         "send_test" => {
-            let c = campaigns::load(&state.db, acct, uuid_arg(&a, "campaign_id")?).await?;
-            let account = load_account(&state.db, acct).await?;
             let to: Vec<String> = from(a["to"].clone())?;
-            Ok(json!({"sent": campaigns::send_test(state, &account, &c, &to, a["version"].as_str()).await?}))
+            Ok(json!({"sent": crate::features::team::sends::test_send(state, ctx, uuid_arg(&a, "campaign_id")?, &to, a["version"].as_str()).await?}))
         }
         "send_campaign" => {
             let id = uuid_arg(&a, "campaign_id")?;
@@ -610,10 +644,12 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 return Ok(dry);
             }
             let c = msg::launch(state, acct, id, send_at, a.get("send_options")).await?;
+            crate::features::team::audit::campaign(state, ctx, if c.status == "scheduled" { "campaign.schedule" } else { "campaign.send" }, &c).await;
             msg::campaign_json(state, &c).await
         }
         "cancel_campaign" => {
             let c = msg::cancel(state, acct, uuid_arg(&a, "campaign_id")?).await?;
+            crate::features::team::audit::campaign(state, ctx, "campaign.cancel", &c).await;
             msg::campaign_json(state, &c).await
         }
         "pick_campaign_winner" => {
@@ -624,6 +660,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                     "note": "Nothing sent. Call again with confirm=true once the user approves sending this version to the rest of the audience."}));
             }
             let c = campaigns::pick_winner(state, &c, a["version"].as_str()).await?;
+            crate::features::team::audit::campaign(state, ctx, "campaign.pick_winner", &c).await;
             msg::campaign_json(state, &c).await
         }
         "get_campaign_report" => msg::report(state, acct, uuid_arg(&a, "campaign_id")?).await,
@@ -671,6 +708,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "update_flow" => {
             let id = uuid_arg(&a, "id")?;
             let f = msg::update_flow(state, acct, id, msg::FlowBody { name: a["name"].as_str().map(String::from), trigger: a.get("trigger").cloned(), definition: a.get("definition").cloned() }).await?;
+            crate::features::team::audit::flow(state, ctx, "flow.update", &f).await;
             msg::flow_json(state, &f).await
         }
         "set_flow_status" => {
@@ -682,6 +720,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                     "note": "Nothing changed. Turning this flow live sends real messages to everyone who triggers it from now on. Call again with confirm=true once the user approves."}));
             }
             let f = msg::set_flow_status(state, acct, id, status).await?;
+            crate::features::team::audit::flow(state, ctx, "flow.status_change", &f).await;
             msg::flow_json(state, &f).await
         }
         "get_flow_report" => msg::flow_report(state, acct, uuid_arg(&a, "id")?).await,
@@ -703,6 +742,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "update_form" => {
             let id = uuid_arg(&a, "id")?;
             let f = msg::update_form(state, acct, id, from(json!({"name": a["name"], "kind": a["kind"], "list_id": a["list_id"], "config": a["config"], "status": a["status"]}))?).await?;
+            crate::features::team::audit(state, ctx, "form.update", Some(&id.to_string()), json!({"name": f.name, "status": f.status})).await;
             let form = msg::form_one(state, &f).await?;
             Ok(form_detail(state, &f, form))
         }
@@ -716,7 +756,12 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             Some("forms") => analytics::forms(state, acct, a["days"].as_i64().unwrap_or(30)).await,
             _ => analytics::overview(state, acct, a["days"].as_i64().unwrap_or(30)).await,
         },
-        "delete" => delete(state, acct, a["type"].as_str().unwrap_or(""), uuid_arg(&a, "id")?).await,
+        "delete" => {
+            let (kind, id) = (a["type"].as_str().unwrap_or(""), uuid_arg(&a, "id")?);
+            let v = delete(state, acct, kind, id).await?;
+            crate::features::team::audit(state, ctx, &format!("{kind}.delete"), Some(&id.to_string()), json!({})).await;
+            Ok(v)
+        }
         other => Err(AppError::bad(format!("unknown tool {other:?}"))),
     }
 }
@@ -739,25 +784,26 @@ async fn campaign_with_readiness(state: &AppState, acct: Uuid, id: Uuid) -> AppR
     let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
     let est = if audience.include.is_empty() { 0 } else { campaigns::estimate(&state.db, acct, &c.channel, &audience).await? };
     v["estimated_recipients"] = json!(est);
-    v["ready_to_send"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses").is_empty() && est > 0);
-    v["problems"] = json!(campaigns::readiness(&account, &c, state.email.name() == "ses"));
+    let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    // Coupons: missing or expired ones stop the send; too few codes for the audience is a warning.
+    let coupons = crate::features::coupons::checks::campaign_check(state, acct, &c).await?;
+    problems.extend(coupons.problems);
+    v["ready_to_send"] = json!(problems.is_empty() && est > 0);
+    v["problems"] = json!(problems);
+    v["warnings"] = json!(coupons.warnings);
     Ok(v)
 }
 
 async fn delete(state: &AppState, acct: Uuid, kind: &str, id: Uuid) -> AppResult<Value> {
     let table = match kind {
+        // These two depend on status, checked in the DELETE itself.
         "campaign" => {
-            let c = campaigns::load(&state.db, acct, id).await?;
-            if matches!(c.status.as_str(), "sending" | "testing" | "sent") {
-                return Err(AppError::Conflict("sent campaigns are kept for reporting".into()));
-            }
-            "campaigns"
+            msg::delete_campaign(state, acct, id).await?;
+            return Ok(json!({"deleted": true, "type": kind, "id": id}));
         }
         "flow" => {
-            if msg::load_flow(state, acct, id).await?.status == "live" {
-                return Err(AppError::Conflict("turn the flow off first".into()));
-            }
-            "flows"
+            msg::delete_flow(state, acct, id).await?;
+            return Ok(json!({"deleted": true, "type": kind, "id": id}));
         }
         "segment" => "segments",
         "list" => "lists",
@@ -841,6 +887,7 @@ A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up 
 - `{"type": "engagement", "channel": "email" | "sms" | "any", "engaged": true, "within_days": 90}`. Email counts opens and clicks (Apple Mail Privacy Protection can inflate opens). SMS counts clicks and replies. `any` adds site activity, product views, carts, checkouts, orders and sign-ups. `engaged: false` finds people with none of these.
 - `{"type": "message", "action": "received" | "opened" | "clicked", "campaign_id": "..." | "flow_id": "...", "op": "has" | "has_not", "within_days": 30}`.
 - `{"type": "form", "form_id": "...", "op": "has" | "has_not", "within_days": 30}`: signed up through a form (any form when `form_id` is left out). `since` and `until` work too.
+- `{"type": "coupon", "coupon_id": "...", "action": "given" | "redeemed", "op": "has" | "has_not", "within_days": 30}`: got a code from a coupon (it reached them in a message or on a form), or used it in an order. Only orders recorded by the API or a store integration count as redeemed; orders from the website script are unverified and don't.
 - `{"type": "can_receive", "channel": "email" | "sms", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, and no bounce or complaint suppression. SMS needs a phone and subscribed consent.
 - `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint.
 - `{"type": "consent", "channel": "email" | "sms", "status": "subscribed" | "unsubscribed" | "never_subscribed" | "pending"}`.
@@ -891,6 +938,8 @@ const EMAIL_DOC: &str = r#"# Email content
 ```
 
 Products from the catalog (dumbmail://docs/catalog): `{"type": "products", "source": "handpicked" | "collection" | "best_sellers" | "newest" | "on_sale" | "event_items" | "recently_viewed" | "recommended", "count": 4, "columns": 2, "fallback": "best_sellers"}` is filled for each person when the email sends: `event_items` shows the triggering event's cart, viewed product or order; `recommended` picks for the person. Options: `product_ids` (handpicked), `category` / `tag` / `brand` (collection), `days` (best_sellers), `show_price`, `show_compare_at`, `show_button`, `button_text`, `hide_out_of_stock`. Templates can also use `{{ organization.catalog.products["TEE-1"].title }}`, `organization.catalog.best_sellers`, `.newest`, `.on_sale` and `person.recommendations` (lists of products with `title`, `url`, `image_url`, `price_text`, ...). The short names `catalog` and `recommendations` work too unless a profile on the account has a property with that name (then the property keeps it).
+
+Unique coupon codes: `{% coupon_code 'WELCOME' %}` in the body of an email (a text block, button, link) or an SMS gives each person their own code from the coupon named WELCOME (the same code in every message, unless the coupon is set to a new code each time); `{% coupon_expiry 'WELCOME' %}` is its expiry date. Write the name in quotes. Not allowed in the subject or preheader, or in transactional email. Or add a coupon block: `{"type": "coupon", "coupon": "WELCOME", "title": "Your code", "show_expiry": true, "button_text": "Shop now", "href": "https://..."}` (the code in a dashed box). Previews and test sends show SAMPLE-CODE and use no code. If the coupon runs out, the message waits until codes are added. See dumbmail://docs/coupons.
 
 Variables (Jinja): `first_name`, `last_name`, `email`, `phone_number`, any custom property by name, `person.properties.x`, `event.properties.x` and `event.value` (flows), `organization.name`, `organization.website`, `unsubscribe_url`. Filters: `default('x')`, `upper`, `title`, `round`. The footer with the mailing address and unsubscribe link is added automatically; links are click-tracked automatically.
 
@@ -960,7 +1009,7 @@ mod tests {
     fn form_config_schema_matches_validation() {
         let schema = form_config_schema();
         let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 25);
+        assert_eq!(keys.len(), 26);
         for k in &keys {
             let probe = serde_json::json!({ k.as_str(): null });
             assert!(crate::forms::check_config(&probe).is_ok(), "{k} is in the schema but rejected");
