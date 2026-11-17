@@ -20,7 +20,8 @@ export const contentApi = {
   savedBlockShown: (id: string) => api<SavedBlockDetail & { deleted?: boolean }>("GET", withQuery(`/api/content/saved-blocks/${id}`, { include_deleted: true })),
   createSaved: (input: SavedBlockInput) => api<SavedBlock>("POST", "/api/content/saved-blocks", input),
   updateSaved: (id: string, input: SavedBlockInput) => api<SavedBlockDetail>("PATCH", `/api/content/saved-blocks/${id}`, input),
-  removeSaved: (id: string) => api<{ ok: true }>("DELETE", `/api/content/saved-blocks/${id}`),
+  /** Called after the person confirmed in the dashboard. */
+  removeSaved: (id: string) => api<{ ok: true }>("DELETE", withQuery(`/api/content/saved-blocks/${id}`, { confirm: true })),
   starters: (preview: boolean) => api<{ data: Starter[] }>("GET", withQuery("/api/content/starters", { preview: preview || undefined })),
   starter: (key: string) => api<StarterDetail>("GET", `/api/content/starters/${encodeURIComponent(key)}`),
   templateFromStarter: (key: string, name?: string) => api<Template>("POST", `/api/content/starters/${encodeURIComponent(key)}/template`, { name }),

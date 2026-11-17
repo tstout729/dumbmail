@@ -618,7 +618,9 @@ async fn rule_counts(state: &AppState, account: &Account, audience: Option<&Audi
     Ok(counts)
 }
 
-pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<Value> {
+/// Run the checks. `people`: the caller may read profiles; without it, nothing that counts
+/// recipients or reads their data runs (those findings are left out, with a note saying so).
+pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_people: bool) -> AppResult<Value> {
     // One check at a time per account, before any of its work (audience counts included).
     let _slot = take_slot(account_id).await?;
     let account = campaigns::load_account(&state.db, account_id).await?;
@@ -793,6 +795,10 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
     let try_rules = !rules.is_empty() && !(is_flow && rules.contains("event"));
     let mut rule_result = None;
     let (people, never, missing) = match &audience {
+        _ if !may_read_people => {
+            findings.push(finding("people_not_checked", "info", "Recipient counts weren't checked", "Counting who gets this email, and trying its display rules and personalization on them, needs permission to read profiles."));
+            (None, 0, Vec::new())
+        }
         Some(a) if a.include.is_empty() => (None, 0, Vec::new()),
         a => {
             let work = async {
@@ -838,7 +844,7 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
                 "Its block is hidden for them. Guard values that may be missing with `is defined`, or use a simple rule.",
             ));
         }
-    } else if !rules.is_empty() && is_flow {
+    } else if !rules.is_empty() && is_flow && may_read_people {
         findings.push(finding("rules_event", "info", "Display rules depend on the event", "Check the email with \"Preview as\" and a sample event: rules about the event can't be tried on your audience ahead of time."));
     }
     if let (Some(0), Some(_)) = (people, &audience) {

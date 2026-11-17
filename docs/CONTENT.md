@@ -172,18 +172,17 @@ Transactional email (`dumbmail://docs/transactional`) renders on its own path, s
 
 ## Who may use what
 
-Until the team-and-roles layer lands, every signed-in user and API key can use all of this. When it does, these are the permissions each route and tool needs:
+Each route and tool needs a permission (see `dumbmail://docs/team`; API keys need a scope that covers it):
 
 | Route or tool | Needs |
 | --- | --- |
-| `GET /api/content/saved-blocks`, `GET /api/content/saved-blocks/{id}`, `GET .../usage`, `list_saved_blocks` | read content |
-| `GET /api/content/starters`, `GET /api/content/starters/{key}`, `list_starter_templates` | read content |
-| `POST /api/content/saved-blocks`, `PATCH /api/content/saved-blocks/{id}`, `save_block`, `update_saved_block` | edit content |
-| `POST /api/content/starters/{key}/template`, `create_template_from_starter` | edit content |
-| `POST /api/content/video-thumbnail`, `make_video_thumbnail` (stores an image; requests the address) | edit content |
-| `DELETE /api/content/saved-blocks/{id}`, `delete_saved_block` (needs `confirm: true`; the dashboard asks first) | delete content |
-| `POST /api/content/check`, `check_email` | read content, plus read profiles and audiences (it counts people and tries rules on their data); it requests the email's links unless `skip_links` |
-| `/e/icons/*`, `/e/assets/*` | public |
-| `/e/countdown/*` | public; the address is signed |
+| `GET /api/content/saved-blocks`, `GET /api/content/saved-blocks/{id}`, `GET .../usage`, `list_saved_blocks` | `content.read` |
+| `GET /api/content/starters`, `GET /api/content/starters/{key}`, `list_starter_templates` | `content.read` |
+| `POST /api/content/saved-blocks`, `PATCH /api/content/saved-blocks/{id}`, `save_block`, `update_saved_block` | `content.write` |
+| `POST /api/content/starters/{key}/template`, `create_template_from_starter` | `content.write` |
+| `POST /api/content/video-thumbnail`, `make_video_thumbnail` (stores an image; requests the address) | `content.write` |
+| `DELETE /api/content/saved-blocks/{id}?confirm=true`, `delete_saved_block` with `confirm: true` (without it, a dry run that says where it's used) | `content.write`, like deleting a template |
+| `POST /api/content/check`, `check_email` | `content.write`; counting recipients and trying personalization and display rules on them also needs `profiles.read` (without it those findings are left out and `people_not_checked` says so) |
+| `/e/icons/{file}`, `/e/assets/{file}`, `/e/countdown/{file}` | none (images in sent email; countdown addresses are signed) |
 
-Previewing as a real person ("Preview as", `render_preview` with `profile_id`) shows that person's data, so it needs read profiles; test sends are real sends and need send.
+Previewing as a real person (`POST /api/render` with `profile_id`) needs `profiles.read`; without it the preview uses the sample person. Saved-block changes and templates made from starters are recorded in the audit log.

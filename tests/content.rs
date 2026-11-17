@@ -242,7 +242,7 @@ async fn saved_blocks_update_unsent_emails_and_sent_ones_keep_what_they_sent() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
     // Deleting hides it from the list; emails that use it keep its last content.
-    h.ok("DELETE", &format!("/api/content/saved-blocks/{id}"), None).await;
+    h.ok("DELETE", &format!("/api/content/saved-blocks/{id}?confirm=true"), None).await;
     assert_eq!(h.ok("GET", "/api/content/saved-blocks", None).await["data"].as_array().unwrap().len(), 0);
     assert!(preview(&mut h, content.clone(), None).await["html"].as_str().unwrap().contains("Version two"));
     let (s, _) = h.req("GET", &format!("/api/content/saved-blocks/{id}"), None).await;
@@ -290,13 +290,11 @@ async fn saved_block_limit_holds_under_racing_requests() {
     let mut tasks = Vec::new();
     for i in 0..4 {
         let router = h.router.clone();
-        let cookie = h.cookie.clone().unwrap();
+        // Cookie writes carry the app's origin and the open account, as the dashboard sends them.
+        let builder = h.page_headers("POST", axum::http::Request::builder().method("POST").uri("/api/content/saved-blocks")).await;
         tasks.push(tokio::spawn(async move {
             use tower::ServiceExt;
-            let req = axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/content/saved-blocks")
-                .header("cookie", cookie)
+            let req = builder
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(json!({"name": format!("race{i}"), "blocks": [{"type": "divider"}]}).to_string()))
                 .unwrap();
@@ -661,7 +659,7 @@ async fn saved_block_edits_cant_break_emails_set_to_send() {
     let copy = h.ok("POST", &format!("/api/campaigns/{cid}/duplicate"), None).await;
     assert!(!copy["content"].to_string().contains("frozen") && !copy["ab_test"].to_string().contains("frozen"), "{copy}");
     // Detaching copies what the email shows, also after the saved block was deleted.
-    h.ok("DELETE", &format!("/api/content/saved-blocks/{id}"), None).await;
+    h.ok("DELETE", &format!("/api/content/saved-blocks/{id}?confirm=true"), None).await;
     let shown = h.ok("GET", &format!("/api/content/saved-blocks/{id}?include_deleted=true"), None).await;
     assert_eq!(shown["deleted"], true);
     assert_eq!(shown["blocks"][0]["html"], "{{ unclosed");
@@ -816,5 +814,42 @@ async fn heavy_image_lookup_stays_in_the_account() {
     h.ok("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
     let r = h.ok("POST", "/api/content/check", Some(json!({"content": {"subject": "s", "preheader": "p", "blocks": [{"type": "image", "src": format!("https://pl.test/i/{img}"), "alt": "x"}]}}))).await;
     assert!(!r["findings"].as_array().unwrap().iter().any(|f| f["id"] == "heavy_images"), "another account's image says nothing: {r}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn permissions_follow_the_table() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    profile(&h, acct, "ann@x.test", "subscribed", None, json!({})).await;
+    // Deleting needs confirm=true; without it nothing changes.
+    let sb = h.ok("POST", "/api/content/saved-blocks", Some(json!({"name": "F", "blocks": [{"type": "divider"}]}))).await;
+    let id = sb["id"].as_str().unwrap();
+    let dry = h.ok("DELETE", &format!("/api/content/saved-blocks/{id}"), None).await;
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    h.ok("GET", &format!("/api/content/saved-blocks/{id}"), None).await;
+    // A key that may edit content but not read profiles gets the checks without people's data.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "writer", "scopes": ["content"]}))).await["key"].as_str().unwrap().to_string();
+    let body = json!({"content": {"subject": "Hi {{ first_name }}", "preheader": "p", "blocks": [{"type": "text", "html": "<p>Hi {{ first_name }}</p>"}]}, "skip_links": true}).to_string();
+    let auth = format!("Bearer {key}");
+    let (s, _, out) = h.raw("POST", "/api/content/check", &[("authorization", &auth), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let r: Value = serde_json::from_str(&out).unwrap();
+    let ids: Vec<&str> = r["findings"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"people_not_checked") && !ids.contains(&"personalization_empty") && r["recipients"].is_null(), "{r}");
+    // The owner gets the counts.
+    let r = h.ok("POST", "/api/content/check", Some(serde_json::from_str(&body).unwrap())).await;
+    assert_eq!(r["recipients"], 1, "{r}");
+    // A key that may only read content can't run checks or change saved blocks.
+    let reader = h.ok("POST", "/api/api-keys", Some(json!({"name": "reader", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let auth = format!("Bearer {reader}");
+    let (s, _, _) = h.raw("POST", "/api/content/check", &[("authorization", &auth), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = h.raw("GET", "/api/content/saved-blocks", &[("authorization", &auth)], "").await;
+    assert_eq!(s, StatusCode::OK);
+    // Hosted images need no sign-in.
+    let (s, _, _) = h.raw("GET", "/e/assets/placeholder-hero.png", &[], "").await;
+    assert_eq!(s, StatusCode::OK);
     h.cleanup().await;
 }

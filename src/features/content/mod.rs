@@ -26,10 +26,44 @@ use super::{Feature, McpDoc};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{public, rule, Access, Perm, RouteRule, ToolRule};
 use crate::mcp::{from, obj, tool};
 use crate::state::AppState;
 
 pub struct Module;
+
+/// Who may use each route (see `features::team::access`). Deleting uses content.write, like
+/// deleting a template, and needs `confirm=true`. The check needs content.write; the parts that
+/// count recipients or try display rules on their data also need profiles.read (checked in
+/// [`check::run`]; without it those parts are left out).
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/content/saved-blocks", Perm::ContentRead),
+    rule("POST", "/api/content/saved-blocks", Perm::ContentWrite),
+    rule("GET", "/api/content/saved-blocks/{id}", Perm::ContentRead),
+    rule("PATCH", "/api/content/saved-blocks/{id}", Perm::ContentWrite),
+    rule("DELETE", "/api/content/saved-blocks/{id}", Perm::ContentWrite),
+    rule("GET", "/api/content/saved-blocks/{id}/usage", Perm::ContentRead),
+    rule("GET", "/api/content/starters", Perm::ContentRead),
+    rule("GET", "/api/content/starters/{key}", Perm::ContentRead),
+    rule("POST", "/api/content/starters/{key}/template", Perm::ContentWrite),
+    rule("POST", "/api/content/check", Perm::ContentWrite),
+    rule("POST", "/api/content/video-thumbnail", Perm::ContentWrite),
+    // Images in sent email: no sign-in. Countdown addresses are signed.
+    public("GET", "/e/icons/{file}"),
+    public("GET", "/e/assets/{file}"),
+    public("GET", "/e/countdown/{file}"),
+];
+
+static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_saved_blocks", perm: Perm::ContentRead },
+    ToolRule { name: "save_block", perm: Perm::ContentWrite },
+    ToolRule { name: "update_saved_block", perm: Perm::ContentWrite },
+    ToolRule { name: "delete_saved_block", perm: Perm::ContentWrite },
+    ToolRule { name: "list_starter_templates", perm: Perm::ContentRead },
+    ToolRule { name: "create_template_from_starter", perm: Perm::ContentWrite },
+    ToolRule { name: "check_email", perm: Perm::ContentWrite },
+    ToolRule { name: "make_video_thumbnail", perm: Perm::ContentWrite },
+];
 
 const BODY_LIMIT: usize = 512 * 1024;
 
@@ -75,7 +109,31 @@ async fn list_saved_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json
 }
 
 async fn create_saved_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<saved::Input>) -> AppResult<(StatusCode, Json<Value>)> {
-    Ok((StatusCode::CREATED, Json(saved::create(&state, ctx.account_id, ctx.user_id, b).await?)))
+    Ok((StatusCode::CREATED, Json(create_saved(&state, &ctx, b).await?)))
+}
+
+async fn create_saved(state: &AppState, ctx: &Ctx, b: saved::Input) -> AppResult<Value> {
+    let v = saved::create(state, ctx.account_id, ctx.user_id, b).await?;
+    crate::features::team::audit(state, ctx, "saved_block.create", v["id"].as_str(), json!({})).await;
+    Ok(v)
+}
+
+async fn update_saved(state: &AppState, ctx: &Ctx, id: Uuid, b: saved::Input) -> AppResult<Value> {
+    let v = saved::update(state, ctx.account_id, id, b).await?;
+    crate::features::team::audit(state, ctx, "saved_block.update", Some(&id.to_string()), json!({})).await;
+    Ok(v)
+}
+
+/// Delete a saved block; without `confirm`, only say where it's used.
+async fn delete_saved(state: &AppState, ctx: &Ctx, id: Uuid, confirm: bool) -> AppResult<Value> {
+    let block = saved::get(state, ctx.account_id, id).await?;
+    if !confirm {
+        let n = block["used_in"].as_array().map(|u| u.len()).unwrap_or(0);
+        return Ok(json!({"dry_run": true, "used_in": block["used_in"], "note": format!("Nothing deleted. This removes the saved block {:?} from the list; the {n} email(s) using it keep its current content. Call again with confirm=true once the user approves.", block["name"].as_str().unwrap_or(""))}));
+    }
+    saved::delete(state, ctx.account_id, id).await?;
+    crate::features::team::audit(state, ctx, "saved_block.delete", Some(&id.to_string()), json!({})).await;
+    Ok(json!({"ok": true}))
 }
 
 #[derive(Deserialize, Default)]
@@ -90,12 +148,17 @@ async fn get_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uui
 }
 
 async fn patch_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<saved::Input>) -> AppResult<Json<Value>> {
-    Ok(Json(saved::update(&state, ctx.account_id, id, b).await?))
+    Ok(Json(update_saved(&state, &ctx, id, b).await?))
 }
 
-async fn delete_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    saved::delete(&state, ctx.account_id, id).await?;
-    Ok(Json(json!({"ok": true})))
+#[derive(Deserialize, Default)]
+struct ConfirmQuery {
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn delete_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<ConfirmQuery>) -> AppResult<Json<Value>> {
+    Ok(Json(delete_saved(&state, &ctx, id, q.confirm).await?))
 }
 
 async fn usage_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -157,7 +220,8 @@ struct FromStarter {
     name: Option<String>,
 }
 
-pub async fn template_from_starter(state: &AppState, account_id: Uuid, key: &str, name: Option<String>) -> AppResult<Value> {
+pub async fn template_from_starter(state: &AppState, ctx: &Ctx, key: &str, name: Option<String>) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let (s, content) = starter_content(state, account_id, key).await?;
     let t = crate::api::messaging::create_template(
         state,
@@ -165,18 +229,19 @@ pub async fn template_from_starter(state: &AppState, account_id: Uuid, key: &str
         crate::api::messaging::TemplateBody { name: Some(name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| s.name.to_string())), channel: Some("email".into()), content: Some(content) },
     )
     .await?;
+    crate::features::team::audit(state, ctx, "template.create", Some(&t.id.to_string()), json!({"starter": s.key})).await;
     Ok(serde_json::to_value(t)?)
 }
 
 async fn from_starter_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path<String>, body: axum::body::Bytes) -> AppResult<(StatusCode, Json<Value>)> {
     let b: FromStarter = if body.iter().all(u8::is_ascii_whitespace) { FromStarter::default() } else { serde_json::from_slice(&body)? };
-    Ok((StatusCode::CREATED, Json(template_from_starter(&state, ctx.account_id, &key, b.name).await?)))
+    Ok((StatusCode::CREATED, Json(template_from_starter(&state, &ctx, &key, b.name).await?)))
 }
 
 // ---------- Checks, video thumbnails ----------
 
 async fn check_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<check::Input>) -> AppResult<Json<Value>> {
-    Ok(Json(check::run(&state, ctx.account_id, b).await?))
+    Ok(Json(check::run(&state, ctx.account_id, b, ctx.can(Perm::ProfilesRead)).await?))
 }
 
 #[derive(Deserialize)]
@@ -220,6 +285,10 @@ impl Feature for Module {
             .route("/e/countdown/{file}", get(countdown::image_h))
     }
 
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOLS }
+    }
+
     fn mcp_tools(&self) -> Vec<Value> {
         let block = json!({"type": "object", "required": ["type"], "properties": {"type": {"enum": BLOCK_TYPES}}, "description": "An email block (see dumbmail://docs/email and dumbmail://docs/content)."});
         let blocks = json!({"type": "array", "minItems": 1, "maxItems": saved::MAX_BLOCKS, "items": block});
@@ -246,24 +315,18 @@ impl Feature for Module {
         let r = async {
             match name {
                 "list_saved_blocks" => saved::list(state, acct).await,
-                "save_block" => saved::create(state, acct, ctx.user_id, from(json!({"name": a["name"], "blocks": a["blocks"]}))?).await,
+                "save_block" => create_saved(state, ctx, from(json!({"name": a["name"], "blocks": a["blocks"]}))?).await,
                 "update_saved_block" => {
                     let id = id_arg(&a)?;
                     let mut b = a.clone();
                     if let Some(o) = b.as_object_mut() {
                         o.remove("id");
                     }
-                    saved::update(state, acct, id, from(b)?).await
+                    update_saved(state, ctx, id, from(b)?).await
                 }
                 "delete_saved_block" => {
                     let id = id_arg(&a)?;
-                    let block = saved::get(state, acct, id).await?;
-                    if a["confirm"].as_bool() != Some(true) {
-                        let n = block["used_in"].as_array().map(|u| u.len()).unwrap_or(0);
-                        return Ok(json!({"dry_run": true, "used_in": block["used_in"], "note": format!("Nothing deleted. This removes the saved block {:?} from the list; the {n} email(s) using it keep its current content. Call again with confirm=true once the user approves.", block["name"].as_str().unwrap_or(""))}));
-                    }
-                    saved::delete(state, acct, id).await?;
-                    Ok(json!({"ok": true}))
+                    delete_saved(state, ctx, id, a["confirm"].as_bool() == Some(true)).await
                 }
                 "list_starter_templates" => match a["key"].as_str() {
                     Some(key) => {
@@ -276,9 +339,9 @@ impl Feature for Module {
                 },
                 "create_template_from_starter" => {
                     let key = a["key"].as_str().ok_or_else(|| AppError::bad("key is required"))?;
-                    template_from_starter(state, acct, key, a["name"].as_str().map(String::from)).await
+                    template_from_starter(state, ctx, key, a["name"].as_str().map(String::from)).await
                 }
-                "check_email" => check::run(state, acct, from(a.clone())?).await,
+                "check_email" => check::run(state, acct, from(a.clone())?, ctx.can(Perm::ProfilesRead)).await,
                 "make_video_thumbnail" => video::thumbnail(state, acct, a["video_url"].as_str(), a["image_url"].as_str()).await,
                 _ => unreachable!("checked above"),
             }
