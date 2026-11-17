@@ -205,8 +205,17 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_public(IpAddr::V4(v4));
             }
-            let seg = v6.segments();
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80)
+            let (seg, o) = (v6.segments(), v6.octets());
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses carry an IPv4 address: judge that one.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])));
+            }
+            if seg[0] == 0x2002 {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5])));
+            }
+            // Otherwise only global unicast (2000::/3), minus Teredo tunnels and the documentation range.
+            // That leaves out loopback, IPv4-compatible, unique-local, link-local, site-local and multicast.
+            (seg[0] & 0xe000) == 0x2000 && !(seg[0] == 0x2001 && (seg[1] == 0 || seg[1] == 0x0db8))
         }
     }
 }
@@ -873,6 +882,18 @@ pub async fn from_blueprint(db: &PgPool, account_id: Uuid, key: &str, name: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_public_addresses() {
+        let public = |s: &str| super::ip_is_public(s.parse().unwrap());
+        for ok in ["8.8.8.8", "2606:4700:4700::1111", "2002:808:808::1", "64:ff9b::808:808"] {
+            assert!(public(ok), "{ok}");
+        }
+        for no in ["10.0.0.1", "127.0.0.1", "169.254.169.254", "::1", "::ffff:10.0.0.1", "::10.0.0.1", "64:ff9b::a00:1", "64:ff9b::a9fe:a9fe",
+            "2002:a00:1::1", "2001:0:4136:e378::1", "2001:db8::1", "fec0::1", "fd00::1", "fe80::1", "ff02::1"] {
+            assert!(!public(no), "{no}");
+        }
+    }
+
     use super::*;
 
     #[test]
