@@ -655,7 +655,7 @@ async fn brand_import_and_google_sign_in() {
 
     // The sign-in pages learn Google is on; starting sends the browser to Google with PKCE.
     let opts = h.ok("GET", "/api/auth/options", None).await;
-    assert_eq!(opts, json!({"google": true, "signup": true}));
+    assert_eq!(opts, json!({"google": true, "signup": true, "site_url": null}));
     let (s, hdrs, _) = h.raw("GET", "/api/auth/google?next=/campaigns", &[], "").await;
     assert_eq!(s, StatusCode::SEE_OTHER);
     let loc = hdrs.get(header::LOCATION).unwrap().to_str().unwrap().to_string();
@@ -736,6 +736,178 @@ async fn public_pages_and_site_verification() {
     // Other google*.html paths fall through to the dashboard, not the verification file.
     let (_, _, body) = h.raw("GET", "/google9999.html", &[], "").await;
     assert!(!body.contains("google-site-verification"));
+    h.cleanup().await;
+}
+
+// ---------- Marketing site and app on separate hosts ----------
+
+#[tokio::test]
+async fn one_host_keeps_dashboard_at_root_and_landing_at_home() {
+    let h = harness!();
+    let (s, _, body) = h.raw("GET", "/", &[("host", "pl.test")], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!body.contains("Postage, not rent."), "/ stays the dashboard without SITE_URL");
+    let (s, _, body) = h.raw("GET", "/home", &[("host", "pl.test")], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Postage, not rent."));
+    assert!(body.contains("href=\"/signup\""), "links stay relative on one host");
+    assert!(body.contains("$0.20 per 1,000") || body.contains(">$0.20<"), "prices come from config");
+    assert!(body.contains("<link rel=\"canonical\" href=\"https://pl.test/home\">"));
+    let (s, _, body) = h.raw("GET", "/pricing", &[("host", "pl.test")], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("30,000 emails") && body.contains("$10<small>"), "plans come from the subscription tiers");
+    for path in ["/about", "/privacy", "/terms"] {
+        let (s, _, _) = h.raw("GET", path, &[("host", "pl.test")], "").await;
+        assert_eq!(s, StatusCode::OK, "{path}");
+    }
+    let (s, headers, _) = h.raw("GET", "/site/og.png", &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(headers[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+    // Host-only cookies without COOKIE_DOMAIN.
+    let (s, headers, _) = h
+        .raw("POST", "/api/auth/signup", &[("content-type", "application/json")], r#"{"email":"solo@acme.test","password":"correct horse","company":"Solo"}"#)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!headers[header::SET_COOKIE].to_str().unwrap().contains("Domain="));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn site_host_and_app_host_split() {
+    let Some(h) = Harness::with(|c| {
+        c.public_url = "https://app.pl.test".into();
+        c.site_url = Some("https://pl.test/".into());
+        c.cookie_domain = Some("pl.test".into());
+        c.google_redirect_base = Some("https://pl.test".into());
+    })
+    .await
+    else {
+        return;
+    };
+    let site = [("host", "pl.test")];
+    let app = [("host", "app.pl.test")];
+
+    // The site host serves the landing page and the site pages.
+    let (s, _, body) = h.raw("GET", "/", &site, "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("Postage, not rent."));
+    assert!(body.contains("href=\"https://app.pl.test/signup\"") && body.contains("href=\"https://app.pl.test/login\""), "sign-up and log-in go to the app");
+    assert!(body.contains("<link rel=\"canonical\" href=\"https://pl.test/\">"));
+    assert!(body.contains("first 25 emails") || body.contains("First 25 free"), "free emails come from config");
+    for path in ["/about", "/privacy", "/terms", "/pricing", "/robots.txt", "/sitemap.xml", "/site/og.png", "/google0123abcd.html"] {
+        let (s, _, _) = h.raw("GET", path, &site, "").await;
+        assert_eq!(s, StatusCode::OK, "{path} on the site host");
+    }
+    // Other page visits move to the app, keeping path and query.
+    for path in ["/login?next=/campaigns", "/signup", "/campaigns", "/forms/123?tab=design", "/settings/account"] {
+        let (s, headers, _) = h.raw("GET", path, &site, "").await;
+        assert_eq!(s, StatusCode::FOUND, "{path}");
+        assert_eq!(headers["location"], format!("https://app.pl.test{path}"));
+    }
+    // Everything existing clients and links use keeps working on the site host.
+    for path in ["/api/auth/options", "/healthz", "/onsite.js?k=x", "/client/dumbmail.js?k=x", "/t/o/bad-token", "/t/c/bad-token", "/u/bad-token", "/c/bad-token", "/f/bad-id", "/webhooks/stripe", "/mcp"] {
+        let (s, _, _) = h.raw("GET", path, &site, "").await;
+        assert_ne!(s, StatusCode::FOUND, "{path} stays on the site host");
+        assert_ne!(s, StatusCode::PERMANENT_REDIRECT, "{path} stays on the site host");
+    }
+    let (s, _, body) = h.raw("GET", "/api/auth/options", &site, "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains("\"site_url\":\"https://pl.test\""));
+    let (s, _, _) = h.raw("POST", "/webhooks/stripe", &site, "{}").await;
+    assert_ne!(s, StatusCode::FOUND, "webhooks aren't redirected");
+    // Google sends people back to the site host; the callback finishes there and lands in the app.
+    let (s, headers, _) = h.raw("GET", "/api/auth/google/callback?error=access_denied&state=x", &site, "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "https://app.pl.test/login?error=cancelled");
+
+    // The app host sends site pages to the site and keeps the dashboard at /.
+    for path in ["/about", "/privacy", "/terms", "/pricing"] {
+        let (s, headers, _) = h.raw("GET", &format!("{path}?ref=app"), &app, "").await;
+        assert_eq!(s, StatusCode::FOUND, "{path}");
+        assert_eq!(headers["location"], format!("https://pl.test{path}?ref=app"));
+    }
+    let (s, _, body) = h.raw("GET", "/", &app, "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!body.contains("Postage, not rent."), "the app host's / is the dashboard");
+    let (_, headers, _) = h.raw("GET", "/home", &app, "").await;
+    assert_eq!(headers["location"], "https://pl.test/");
+
+    // Sign-in starts on the app host; its state cookie and Google's redirect URI reach the site host.
+    let (s, headers, _) = h.raw("GET", "/api/auth/google?next=/campaigns", &app, "").await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let loc = headers[header::LOCATION].to_str().unwrap();
+    assert!(loc.contains("redirect_uri=https%3A%2F%2Fpl.test%2Fapi%2Fauth%2Fgoogle%2Fcallback"), "{loc}");
+    let oauth = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(oauth.starts_with("pl_oauth=") && oauth.contains("Domain=pl.test"), "{oauth}");
+    // A forged state is refused, and the error lands on the app's login page.
+    let cookie = oauth.split(';').next().unwrap().to_string();
+    let (_, headers, _) = h.raw("GET", "/api/auth/google/callback?code=abc&state=forged", &[("host", "pl.test"), ("cookie", &cookie)], "").await;
+    assert_eq!(headers["location"], "https://app.pl.test/login?error=expired");
+
+    // Session cookies cover both hosts, and logging out clears that same cookie.
+    let (s, headers, _) = h
+        .raw("POST", "/api/auth/signup", &[("host", "app.pl.test"), ("content-type", "application/json")], r#"{"email":"split@acme.test","password":"correct horse","company":"Split"}"#)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let set = headers[header::SET_COOKIE].to_str().unwrap().to_string();
+    assert!(set.starts_with("pl_session=") && set.contains("Domain=pl.test"), "{set}");
+    let session = set.split(';').next().unwrap().to_string();
+    let (s, _, _) = h.raw("GET", "/api/me", &[("host", "pl.test"), ("cookie", &session)], "").await;
+    assert_eq!(s, StatusCode::OK, "the session works on the site host's API too");
+    let (s, headers, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session)], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let cleared = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(cleared.starts_with("pl_session=;") && cleared.contains("Domain=pl.test") && cleared.contains("Max-Age=0"), "{cleared}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_files_point_back_to_the_host_that_served_them() {
+    let Some(mut h) = Harness::with(|c| {
+        c.public_url = "https://app.pl.test".into();
+        c.site_url = Some("https://pl.test".into());
+    })
+    .await
+    else {
+        return;
+    };
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Page", "kind": "page", "list_id": list["id"]}))).await;
+    let form_id = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{form_id}"), Some(json!({"status": "live"}))).await;
+
+    // Served on the site host, everything points back to the site host only, so snippets installed
+    // before the app moved keep talking to dumbmail.ai alone.
+    for (host, base, other) in [("pl.test", "https://pl.test", "app.pl.test"), ("app.pl.test", "https://app.pl.test", "\"https://pl.test")] {
+        let (s, _, js) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(js.contains(&format!("\"{base}\"")) && !js.contains(other), "onsite.js on {host}");
+        let (s, _, js) = h.raw("GET", &format!("/f/{form_id}/embed.js"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(js.contains(&format!("\"{base}\"")) && !js.contains(other), "embed.js on {host}");
+        let (s, _, html) = h.raw("GET", &format!("/f/{form_id}"), &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK, "hosted form on {host}");
+        assert!(html.contains(&format!("{base}/client/subscribe?k={pk}")), "subscribe URL on {host}");
+        assert!(html.contains(&format!("<script src=\"{base}/client/form-render.js\">")), "renderer on {host}");
+        assert!(!html.contains(other), "hosted form on {host} only names {base}");
+    }
+    // Any other Host header gets PUBLIC_URL, never itself.
+    let (_, _, js) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[("host", "evil.test")], "").await;
+    assert!(js.contains("\"https://app.pl.test\"") && !js.contains("evil.test"));
+    let (_, _, html) = h.raw("GET", &format!("/f/{form_id}"), &[("host", "evil.test")], "").await;
+    assert!(html.contains("https://app.pl.test/client/form-render.js") && !html.contains("evil.test"));
+
+    // www. + the site host moves permanently to SITE_URL; other methods aren't redirected.
+    let (s, headers, _) = h.raw("GET", "/pricing?ref=x", &[("host", "www.pl.test")], "").await;
+    assert_eq!(s, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers["location"], "https://pl.test/pricing?ref=x");
+    let (s, headers, _) = h.raw("HEAD", "/", &[("host", "www.pl.test")], "").await;
+    assert_eq!(s, StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(headers["location"], "https://pl.test/");
+    let (s, _, _) = h.raw("POST", "/webhooks/stripe", &[("host", "www.pl.test")], "{}").await;
+    assert_ne!(s, StatusCode::MOVED_PERMANENTLY);
     h.cleanup().await;
 }
 

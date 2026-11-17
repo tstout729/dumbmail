@@ -1,8 +1,14 @@
-//! Public pages served without the dashboard: About, Privacy and Terms. Google's sign-in consent
-//! screen links to these, so they're plain server-rendered HTML anyone (or any crawler) can read.
+//! Public pages served without the dashboard: the landing page, Pricing, About, Privacy and Terms.
+//! Google's sign-in consent screen links to these, so they're plain server-rendered HTML anyone (or
+//! any crawler) can read.
+//!
+//! With SITE_URL set, these pages live on the marketing host and the dashboard on PUBLIC_URL's host;
+//! `host_split` sends each page visit to the right one (see `Config::site_url`).
+
+mod landing;
 
 use axum::extract::State;
-use axum::http::{header, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -11,8 +17,51 @@ use crate::state::AppState;
 
 const UPDATED: &str = "November 16, 2026";
 
+/// Pages served on the marketing host, which PUBLIC_URL's host sends there.
+const SITE_PAGES: [&str; 4] = ["/about", "/privacy", "/terms", "/pricing"];
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/about", get(about)).route("/privacy", get(privacy)).route("/terms", get(terms))
+    Router::new().route("/about", get(about)).route("/privacy", get(privacy)).route("/terms", get(terms)).merge(landing::routes())
+}
+
+/// The request's hostname, lowercase and without a port.
+pub(crate) fn request_host(headers: &HeaderMap) -> String {
+    headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase()
+}
+
+/// With SITE_URL set: on its host, the site pages and everything that must keep answering there (API,
+/// MCP, webhooks, tracking links, hosted forms, the snippet, Google sign-in and verification) stay,
+/// and other page visits go to the app at PUBLIC_URL. On PUBLIC_URL's host, the site pages go to
+/// SITE_URL. Both redirects are 302s that keep the path and query. `www.` + the site host moves
+/// permanently (301) to SITE_URL.
+pub async fn host_split(State(state): State<AppState>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let (Some(site_url), Some(site_host)) = (state.cfg.site_url(), state.cfg.site_host()) else {
+        return next.run(req).await;
+    };
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return next.run(req).await;
+    }
+    let host = request_host(req.headers());
+    let path = req.uri().path();
+    let path_and_query = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let found = |to: String| (StatusCode::FOUND, [(header::LOCATION, to)]).into_response();
+    if host == site_host {
+        let stays = path == "/"
+            || path == "/home"
+            || SITE_PAGES.contains(&path)
+            || path.starts_with("/site/")
+            || matches!(path, "/robots.txt" | "/sitemap.xml" | "/favicon.svg")
+            || path.starts_with("/api/")
+            || crate::stays_on_old_host(path);
+        if !stays {
+            return found(format!("{}{path_and_query}", state.cfg.public_url()));
+        }
+    } else if host.strip_prefix("www.") == Some(site_host.as_str()) {
+        return (StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, format!("{site_url}{path_and_query}"))]).into_response();
+    } else if Some(host) == state.cfg.public_host() && SITE_PAGES.contains(&path) {
+        return found(format!("{site_url}{path_and_query}"));
+    }
+    next.run(req).await
 }
 
 /// Google Search Console's HTML-file check (GOOGLE_SITE_VERIFICATION=google0123abcd.html).
@@ -37,54 +86,9 @@ fn contact(state: &AppState) -> String {
     }
 }
 
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<style>
-:root {{ color-scheme: light dark; --fg:#18181b; --muted:#52525b; --bg:#ffffff; --line:#e4e4e7; --brand:#0f5132; --link:#0f5132; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --fg:#f4f4f5; --muted:#a1a1aa; --bg:#09090b; --line:#27272a; --link:#6ee7b7; }} }}
-* {{ box-sizing: border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; }}
-header, main, footer {{ max-width:720px; margin:0 auto; padding:0 16px; }}
-header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding-top:20px; padding-bottom:20px; border-bottom:1px solid var(--line); }}
-.mark {{ display:flex; align-items:center; gap:10px; font-weight:700; font-size:18px; color:var(--fg); text-decoration:none; }}
-.mark svg {{ width:28px; height:28px; }}
-nav a {{ margin-left:16px; color:var(--muted); text-decoration:none; font-size:14px; }}
-nav a:hover {{ color:var(--fg); }}
-main {{ padding-top:32px; padding-bottom:48px; }}
-h1 {{ font-size:32px; line-height:1.2; margin:0 0 8px; }}
-h2 {{ font-size:20px; margin:32px 0 8px; }}
-p, li {{ color:var(--fg); }}
-.muted {{ color:var(--muted); font-size:14px; }}
-a {{ color:var(--link); }}
-ul {{ padding-left:20px; }}
-table {{ border-collapse:collapse; width:100%; margin:8px 0; }}
-td {{ border-bottom:1px solid var(--line); padding:8px 0; }}
-td:last-child {{ text-align:right; font-variant-numeric:tabular-nums; }}
-.cta {{ display:inline-block; background:var(--brand); color:#fff; padding:10px 18px; border-radius:8px; text-decoration:none; font-weight:600; margin-right:8px; }}
-.cta.secondary {{ background:transparent; color:var(--fg); border:1px solid var(--line); }}
-footer {{ border-top:1px solid var(--line); padding-top:20px; padding-bottom:40px; color:var(--muted); font-size:14px; }}
-footer a {{ color:var(--muted); margin-right:16px; }}
-</style>
-</head>
-<body>
-<header>
-<a class="mark" href="/about"><svg aria-hidden="true" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#115f42"/><rect x="5.5" y="8.5" width="21" height="15" rx="2.5" fill="#fff"/><path d="M6.6 9.8 16 16.2l9.4-6.4" fill="none" stroke="#115f42" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="19.6" r="2.3" fill="#115f42"/><circle cx="20.2" cy="19.6" r="2.3" fill="#115f42"/><circle cx="12.9" cy="20.3" r="0.9" fill="#fff"/><circle cx="19.4" cy="18.8" r="0.9" fill="#fff"/></svg>DumbMail</a>
-<nav><a href="/login">Log in</a><a href="/signup">Sign up</a></nav>
-</header>
-<main>
-{body}
-</main>
-<footer><a href="/about">About</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></footer>
-</body>
-</html>"##
-    ))
+/// A text page (About, Privacy, Terms) in the site's chrome.
+fn page(state: &AppState, path: &str, title: &str, description: &str, body: &str) -> Html<String> {
+    landing::document(&state.cfg, &landing::Meta { title, description, path }, &format!("<article class=\"wrap doc\">\n{body}\n</article>"), "")
 }
 
 pub(crate) fn thousands(n: i64) -> String {
@@ -108,43 +112,28 @@ fn money(v: f64) -> String {
 
 async fn about(State(state): State<AppState>) -> Html<String> {
     let c = &state.cfg;
-    let plan_price = format!("${}", crate::subscription::price_cents(1) / 100);
-    let free = if c.free_emails_per_month > 0 { format!("<p>The first {} emails each month are free.</p>", thousands(c.free_emails_per_month)) } else { String::new() };
+    let l = landing::links(c);
+    let free = if c.free_emails_per_month > 0 { format!(" The first {} emails each month are free.", thousands(c.free_emails_per_month)) } else { String::new() };
     page(
-        "DumbMail: email and text marketing priced by what you send",
+        &state,
+        "/about",
+        "About DumbMail",
+        "DumbMail is open-source email and text marketing for online stores, priced by what you send.",
         &format!(
-            r#"<h1>Email and text marketing, priced by what you send.</h1>
-<p>DumbMail sends your store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow your list; flows follow up on browsing, carts and orders. You pay only for what you send, never for how many contacts you keep.</p>
-<p><a class="cta" href="/signup">Create an account</a><a class="cta secondary" href="/login">Log in</a></p>
-<h2>What it does</h2>
-<ul>
-<li>Email campaigns and automated flows, sent from your own domain.</li>
-<li>Text messages from your own phone number.</li>
-<li>Sign-up forms and a snippet for your website.</li>
-<li>Lists, segments and profiles for every subscriber.</li>
-<li>Pulls your logo, colors and links from your website when you sign up.</li>
-<li>An MCP server so AI assistants can run your marketing with you.</li>
-</ul>
-<h2>Pricing</h2>
-<table>
-<tr><td>Email</td><td>{email} per 1,000</td></tr>
-<tr><td>Text message (SMS)</td><td>{sms} per segment</td></tr>
-<tr><td>Picture message (MMS)</td><td>{mms} each</td></tr>
-<tr><td>Phone number</td><td>{num} per month</td></tr>
-<tr><td>Monthly email plan</td><td>From {plan_price} a month for {plan_emails} emails; each bigger plan doubles both</td></tr>
-</table>
-{free}
-<p class="muted">Add credit with a card and it's used as you send, or choose a monthly email plan for about 17% less per email. No contact tiers.</p>
+            r#"<h1>About DumbMail</h1>
+<p>DumbMail sends a store's newsletters, automated flows and text messages. Sign-up forms and a website snippet grow the list; flows follow up on browsing, carts and orders; reports show which messages earned money. You pay only for what you send, never for how many contacts you keep.</p>
+<p class="ctas"><a class="btn" href="{app}/signup">Create an account</a><a class="btn ghost" href="{app}/login">Log in</a></p>
+<h2>How pricing works</h2>
+<p>Email is {email} per 1,000 and texts are {sms} per segment.{free} Add credit with a card and it's used as you send, or choose a monthly email plan. There are no contact tiers. See <a href="{site}/pricing">all prices</a>.</p>
 <h2>Open source</h2>
-<p>DumbMail is open source under the AGPL-3.0 license, so you can also run it yourself.</p>
+<p>DumbMail is open source under the AGPL-3.0 license, so you can read the code and run it yourself: <a href="{github}">{github}</a>.</p>
 <h2>Contact</h2>
 <p>Questions: {contact}.</p>"#,
+            app = esc(&l.app),
+            site = esc(&l.site),
             email = money(c.price_email_per_1000),
             sms = money(c.price_sms_segment),
-            mms = money(c.price_mms),
-            num = money(c.price_number_monthly),
-            plan_price = plan_price,
-            plan_emails = thousands(crate::subscription::emails(1)),
+            github = landing::GITHUB,
             contact = contact(&state),
         ),
     )
@@ -152,7 +141,10 @@ async fn about(State(state): State<AppState>) -> Html<String> {
 
 async fn privacy(State(state): State<AppState>) -> Html<String> {
     page(
+        &state,
+        "/privacy",
         "Privacy Policy · DumbMail",
+        "How DumbMail collects, uses and protects information.",
         &format!(
             r#"<h1>Privacy Policy</h1>
 <p class="muted">Last updated {UPDATED}</p>
@@ -219,7 +211,10 @@ async fn privacy(State(state): State<AppState>) -> Html<String> {
 
 async fn terms(State(state): State<AppState>) -> Html<String> {
     page(
+        &state,
+        "/terms",
         "Terms of Service · DumbMail",
+        "The terms for using the hosted DumbMail service.",
         &format!(
             r#"<h1>Terms of Service</h1>
 <p class="muted">Last updated {UPDATED}</p>
@@ -240,7 +235,7 @@ async fn terms(State(state): State<AppState>) -> Html<String> {
 <p>We may pause sending, hold messages or suspend an account to protect deliverability, recipients or the service, for example after high bounce or complaint rates. We'll tell you why when we can.</p>
 
 <h2>Prices and payment</h2>
-<p>The hosted service is pay as you go. You add credit and it's used as you send, at the prices on our <a href="/about">About page</a>. We may change prices with at least 30 days' notice by email; changes don't apply to messages already sent.</p>
+<p>The hosted service is pay as you go. You add credit and it's used as you send, at the prices on our <a href="/pricing">Pricing page</a>. We may change prices with at least 30 days' notice by email; changes don't apply to messages already sent.</p>
 <p>You can also choose a monthly email plan: a set number of emails each month for a fixed price. It's charged to your card when you start it and again each month on the same date (Pacific time) until you cancel. Cancel any time in Settings → Billing; the plan stays active until the end of the month you've paid for and then stops renewing. If a renewal payment is already failing, cancelling ends the plan right away. Plan emails left at the end of a monthly period don't carry over. Moving to a bigger plan is charged right away for the difference in price; moving to a smaller one starts at your next renewal. If a renewal can't be charged, we try three times, a day apart, and then end the plan.</p>
 <p>Phone numbers are billed monthly from your credit and may be released if their rent goes unpaid. Taxes may apply. For billing questions or refund requests, contact us.</p>
 

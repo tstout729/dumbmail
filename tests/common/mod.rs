@@ -78,6 +78,9 @@ impl Harness {
             operator_alert_email: Some("ops@pl.test".into()),
             redirect_hosts: vec!["old.pl.test".into()],
             link_url: None,
+            site_url: None,
+            cookie_domain: None,
+            google_redirect_base: None,
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();

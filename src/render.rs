@@ -218,7 +218,7 @@ fn layout(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer
         .map(|u| format!(r#"<tr><td align="center" style="padding:24px 24px 8px;"><img src="{}" alt="{}" height="40" style="height:40px;width:auto;border:0;"></td></tr>"#, esc(u), esc(&account.name)))
         .unwrap_or_default();
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title></title><style>@media (max-width:620px){{.pl-card{{width:100%!important;border-radius:0!important}}.pl-col{{display:block!important;width:100%!important}}}}a{{color:inherit}}</style></head><body style="margin:0;padding:0;background:{bg};"><div style="display:none;max-height:0;overflow:hidden;opacity:0;">{pre}&#8199;&#847;&#8199;&#847;&#8199;&#847;</div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{bg};"><tr><td align="center" style="padding:24px 8px;"><table role="presentation" class="pl-card" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:600px;background:#ffffff;border-radius:10px;overflow:hidden;">{logo}<tr><td style="height:8px;"></td></tr>{inner}<tr><td style="height:16px;"></td></tr></table><table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;"><tr><td style="padding:16px 24px;text-align:center;font-family:{font};font-size:12px;line-height:1.5;color:#6b7280;">{footer}</td></tr></table></td></tr></table></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title></title><style>@media (max-width:620px){{.pl-card{{width:100%!important;border-radius:0!important}}.pl-col{{display:block!important;width:100%!important}}.pl-foot{{width:100%!important}}}}a{{color:inherit}}</style></head><body style="margin:0;padding:0;background:{bg};"><div style="display:none;max-height:0;overflow:hidden;opacity:0;">{pre}&#8199;&#847;&#8199;&#847;&#8199;&#847;</div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{bg};"><tr><td align="center" style="padding:24px 8px;"><table role="presentation" class="pl-card" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:600px;background:#ffffff;border-radius:10px;overflow:hidden;">{logo}<tr><td style="height:8px;"></td></tr>{inner}<tr><td style="height:16px;"></td></tr></table><table role="presentation" class="pl-foot" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:600px;"><tr><td style="padding:16px 24px;text-align:center;font-family:{font};font-size:12px;line-height:1.5;color:#6b7280;">{footer}</td></tr></table></td></tr></table></body></html>"#,
         pre = esc(preheader),
     )
 }
@@ -491,6 +491,20 @@ mod tests {
         let content: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "text", "html": "<p>{{ first_name }}</p>"}]})).unwrap();
         let out = render_email(&acct, &content, &ctx, None).unwrap();
         assert!(!out.html.contains("<script>"));
+    }
+
+    #[test]
+    fn fixed_width_tables_shrink_on_narrow_screens() {
+        // Outlook keeps the 600px width attribute; everything else follows the media query, so no
+        // table forces a narrow screen (or the dashboard preview) to scroll sideways.
+        let content: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]})).unwrap();
+        let html = render_email(&account(), &content, &json!({}), None).unwrap().html;
+        let tables: Vec<&str> = html.split("<table").skip(1).filter(|t| t.split('>').next().unwrap_or("").contains("width=\"600\"")).collect();
+        assert_eq!(tables.len(), 2, "the card and the footer");
+        for (t, class) in tables.iter().zip(["pl-card", "pl-foot"]) {
+            assert!(t.split('>').next().unwrap().contains(&format!("class=\"{class}\"")), "{class}");
+            assert!(html.contains(&format!(".{class}{{width:100%!important")), "{class} goes full width under 620px");
+        }
     }
 
     #[test]
