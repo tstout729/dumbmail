@@ -64,6 +64,10 @@ pub async fn request(method: Method, url: &str, max_bytes: usize, timeout: Durat
     }
     let checked = tokio::time::timeout(timeout, crate::flows::check_webhook_url(url)).await.map_err(|_| NetError::Timeout)?;
     let (host, addr) = checked.map_err(|e| if e.public_message().contains("doesn't resolve") { NetError::NoSuchDomain } else { NetError::NotPublic })?;
+    // Only web ports: an email's links mustn't turn into a scan of other services.
+    if !matches!(parsed.port(), None | Some(80 | 443 | 8080 | 8443)) {
+        return Err(NetError::Failed("uses a port we don't check"));
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .resolve(&host, addr)

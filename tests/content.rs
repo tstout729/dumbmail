@@ -525,3 +525,12 @@ async fn mcp_tools_cover_saved_blocks_starters_and_checks() {
     assert!(r["findings"].as_array().unwrap().iter().any(|f| f["id"] == "preheader_missing"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn link_checks_only_call_web_ports() {
+    let r = dumbmail::features::content::net::request(reqwest::Method::HEAD, "https://example.com:22/", 0, std::time::Duration::from_secs(5)).await;
+    // DNS may be unavailable where tests run; either way nothing is requested on port 22.
+    assert!(matches!(r, Err(dumbmail::features::content::net::NetError::Failed("uses a port we don't check")) | Err(dumbmail::features::content::net::NetError::NoSuchDomain) | Err(dumbmail::features::content::net::NetError::Timeout)), "{r:?}");
+    let r = dumbmail::features::content::net::request(reqwest::Method::HEAD, "http://user:pw@example.com/", 0, std::time::Duration::from_secs(5)).await;
+    assert!(matches!(r, Err(dumbmail::features::content::net::NetError::Invalid)));
+}
