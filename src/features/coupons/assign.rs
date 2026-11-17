@@ -335,14 +335,20 @@ async fn send_name(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid) -> A
     })
 }
 
-/// Just before a message renders (in `sending::send`): claim a code from every coupon its content
-/// shows. Messages without coupons return at once with no database work. Test sends show a sample
-/// and use no code.
+/// [`prepare_send_for`] the message's content as it is.
 pub async fn prepare_send(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid) -> AppResult<Prepared> {
-    if !template::may_use_coupons(spec.content) {
+    prepare_send_for(state, spec, spec.content, message_id).await
+}
+
+/// Just before a message renders (in `sending::send`): claim a code from every coupon `content` shows.
+/// `content` is the message as it will render for this person (saved blocks filled in and blocks
+/// hidden by display rules left out: see `features::content::prepare`). Messages without coupons
+/// return at once with no database work. Test sends show a sample and use no code.
+pub async fn prepare_send_for(state: &AppState, spec: &SendSpec<'_>, content: &Value, message_id: Uuid) -> AppResult<Prepared> {
+    if !template::may_use_coupons(content) {
         return Ok(Prepared::Ready(SendCoupons::default()));
     }
-    let names = template::message_names(spec.channel, spec.content)?;
+    let names = template::message_names(spec.channel, content)?;
     if names.is_empty() {
         return Ok(Prepared::Ready(SendCoupons::default()));
     }

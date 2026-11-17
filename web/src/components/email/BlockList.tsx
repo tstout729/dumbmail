@@ -1,18 +1,21 @@
 import { useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, Copy, GripVertical, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Bookmark, ChevronDown, Copy, GripVertical, Plus, Trash2 } from "lucide-react";
 import type { EmailBlock, EmailBlockType } from "../../api";
 import { IconButton, Menu, buttonClass, cx } from "../ui";
 import { BlockFields } from "./BlockFields";
 import { blockMeta, blockOrder, blockSummary, newBlock } from "./blocks";
+import { BlockOptionsPanel, SavedBlockPicker } from "../../features/content/BlockExtras";
 
 type BlockListProps = {
   blocks: EmailBlock[];
   onChange: (blocks: EmailBlock[]) => void;
   /** Nested lists (inside columns) can't contain more columns. */
   nested?: boolean;
+  /** Offer saved blocks (off when editing a saved block itself). */
+  savedBlocks?: boolean;
 };
 
-function AddBlockMenu({ onAdd, nested, label }: { onAdd: (t: EmailBlockType) => void; nested?: boolean; label?: string }) {
+function AddBlockMenu({ onAdd, nested, label, onSaved }: { onAdd: (t: EmailBlockType) => void; nested?: boolean; label?: string; onSaved?: () => void }) {
   return (
     <Menu
       align="left"
@@ -27,14 +30,23 @@ function AddBlockMenu({ onAdd, nested, label }: { onAdd: (t: EmailBlockType) => 
         .map((t) => {
           const Icon = blockMeta[t].icon;
           return { label: blockMeta[t].label, icon: <Icon className="size-3.5 text-zinc-400" />, onSelect: () => onAdd(t) };
-        })}
+        })
+        .concat(onSaved ? [{ label: "Saved block…", icon: <Bookmark className="size-3.5 text-zinc-400" />, onSelect: onSaved }] : [])}
     />
   );
 }
 
-export function BlockList({ blocks, onChange, nested }: BlockListProps) {
+export function BlockList({ blocks, onChange, nested, savedBlocks = true }: BlockListProps) {
   const [open, setOpen] = useState<number | null>(nested ? null : 0);
   const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  /** Put `items` in place of block `i` (detaching a saved block), or insert them at `i` when `count` is 0. */
+  const splice = (i: number, count: number, items: EmailBlock[]) => {
+    const next = [...blocks];
+    next.splice(i, count, ...items);
+    onChange(next);
+    setOpen(i);
+  };
 
   const update = (i: number, b: EmailBlock) => onChange(blocks.map((x, j) => (j === i ? b : x)));
   const remove = (i: number) => {
@@ -128,6 +140,7 @@ export function BlockList({ blocks, onChange, nested }: BlockListProps) {
             {isOpen ? (
               <div className="space-y-3 border-t border-zinc-100 px-3 py-3">
                 <BlockFields block={block} onChange={(b) => update(i, b)} />
+                <BlockOptionsPanel block={block} nested={nested || !savedBlocks} onChange={(b) => update(i, b)} onReplace={(items) => splice(i, 1, items)} />
                 {block.type === "columns" ? (
                   <div className={cx("grid gap-2", block.columns.length === 3 ? "lg:grid-cols-3" : "lg:grid-cols-2")}>
                     {block.columns.map((col, c) => (
@@ -144,7 +157,7 @@ export function BlockList({ blocks, onChange, nested }: BlockListProps) {
                 ) : null}
                 {!nested ? (
                   <div className="flex justify-end">
-                    <AddBlockMenu label="Insert below" onAdd={(t) => insert(i + 1, t)} />
+                    <AddBlockMenu label="Insert below" onAdd={(t) => insert(i + 1, t)} onSaved={savedBlocks ? () => setSavedAt(i + 1) : undefined} />
                   </div>
                 ) : null}
               </div>
@@ -152,7 +165,8 @@ export function BlockList({ blocks, onChange, nested }: BlockListProps) {
           </div>
         );
       })}
-      <AddBlockMenu nested={nested} onAdd={(t) => insert(blocks.length, t)} />
+      <AddBlockMenu nested={nested} onAdd={(t) => insert(blocks.length, t)} onSaved={nested || !savedBlocks ? undefined : () => setSavedAt(blocks.length)} />
+      {savedAt !== null ? <SavedBlockPicker onPick={(b) => splice(savedAt, 0, [b])} onClose={() => setSavedAt(null)} /> : null}
     </div>
   );
 }
