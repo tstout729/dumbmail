@@ -122,10 +122,11 @@ fn table_loop_is_capped_and_its_source_cannot_inject() {
 }
 
 #[test]
-fn markers_from_content_cannot_break_out_of_the_template() {
-    // Raw if_open/if_close are internal; a hostile expression is replaced by `false`.
-    let (html, _) = render(json!([{"type": "if_open", "expr": "true %}{{ 7*7 }}{% if true"}, {"type": "text", "html": "<p>SECRETTEXT</p>"}, {"type": "if_close"}]), json!({}));
-    assert!(!body(&html).contains("49") && !html.contains("SECRETTEXT"));
+fn display_rules_never_become_template_tags() {
+    // Rules are decided before rendering; nothing a block holds turns into `{% if %}`. Blocks named
+    // like the old markers are unknown types and render nothing, as on main.
+    let (html, _) = render(json!([{"type": "if_open", "expr": "true %}{{ 7*7 }}{% if true"}, {"type": "text", "html": "<p>VISIBLE</p>"}, {"type": "if_close"}]), json!({}));
+    assert!(!body(&html).contains("49") && html.contains("VISIBLE"));
 }
 
 async fn account_id(h: &Harness) -> Uuid {
@@ -427,7 +428,10 @@ async fn checks_report_fixable_problems_without_reaching_private_addresses() {
         assert_eq!(l["note"], "doesn't point to a public website");
         assert!(l["status"].is_null(), "never requested");
     }
-    assert!(!links.iter().any(|l| l["url"].as_str().unwrap().starts_with("https://pl.test")), "our own addresses aren't requested");
+    for l in links.iter().filter(|l| l["url"].as_str().unwrap().starts_with("https://pl.test")) {
+        assert_eq!(l["note"], "DumbMail link, not checked", "our own addresses aren't requested: {l}");
+        assert!(l["status"].is_null());
+    }
     assert!(r["findings"].as_array().unwrap().iter().all(|f| f["blocks_sending"] == false), "{r}");
 
     // An empty audience blocks sending, like the product does.
@@ -533,4 +537,281 @@ async fn link_checks_only_call_web_ports() {
     assert!(matches!(r, Err(dumbmail::features::content::net::NetError::Failed("uses a port we don't check")) | Err(dumbmail::features::content::net::NetError::NoSuchDomain) | Err(dumbmail::features::content::net::NetError::Timeout)), "{r:?}");
     let r = dumbmail::features::content::net::request(reqwest::Method::HEAD, "http://user:pw@example.com/", 0, std::time::Duration::from_secs(5)).await;
     assert!(matches!(r, Err(dumbmail::features::content::net::NetError::Invalid)));
+}
+
+// ---------- Review round: findings 1-12 ----------
+
+async fn list_of(h: &mut Harness, people: &[Uuid]) -> Value {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": format!("L{}", Uuid::now_v7().simple())}))).await;
+    h.ok("POST", &format!("/api/lists/{}/members", list["id"].as_str().unwrap()), Some(json!({"profile_ids": people}))).await;
+    list
+}
+
+#[tokio::test]
+async fn a_display_rule_never_breaks_a_send() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_id(&h).await;
+    let vip = profile(&h, acct, "vip@x.test", "subscribed", Some("Vee"), json!({"tier": "gold", "points": 5})).await;
+    let other = profile(&h, acct, "reg@x.test", "subscribed", Some("Reg"), json!({"tier": "silver", "points": "lots"})).await;
+    let list = list_of(&mut h, &[vip, other]).await;
+    let gold = json!({"field": "person.properties.tier", "op": "eq", "value": "gold"});
+    // Everything is for gold members; the advanced rule can't be worked out for "lots" of points.
+    let content = json!({"subject": "Gold only", "preheader": "p", "blocks": [
+        {"type": "heading", "text": "For gold members", "show_if": gold},
+        {"type": "text", "html": "<p>Points bonus</p>", "show_if": [gold, {"expr": "person.properties.points + 1 > 2"}]},
+    ], "html": "<p>OLD RAW HTML</p>"});
+
+    // The check panel says how many people would get nothing.
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Gold", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": content}))).await;
+    let r = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": c["id"], "skip_links": true}))).await;
+    let f = r["findings"].as_array().unwrap().iter().find(|f| f["id"] == "rules_hide_everything").unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(f["title"], "Display rules hide every block for 1 person");
+
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let row = h.ok("GET", &format!("/api/campaigns/{}", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(row["status"], "sent", "{row}");
+    let sent = h.state.email.sent();
+    let to_vip = sent.iter().find(|m| m.to == "vip@x.test").expect("the gold member gets it");
+    assert!(to_vip.html.contains("For gold members") && to_vip.html.contains("Points bonus"));
+    assert!(!sent.iter().any(|m| m.to == "reg@x.test"), "nobody gets an empty shell or the old raw html");
+    let why: (String, String) = sqlx::query_as("SELECT status, error FROM messages WHERE profile_id = $1").bind(other).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(why, ("skipped".into(), "nothing to show for this person".into()));
+    let progress = h.ok("GET", &format!("/api/campaigns/{}/send-progress", c["id"].as_str().unwrap()), None).await;
+    assert!(progress["skip_reasons"].as_array().unwrap().iter().any(|r| r["reason"] == "nothing to show for this person" && r["count"] == 1), "{progress}");
+
+    // A rule that fails for one person hides only its own block, for that person only.
+    let p3 = profile(&h, acct, "lots@x.test", "subscribed", None, json!({"tier": "gold", "points": "lots"})).await;
+    let list2 = list_of(&mut h, &[vip, p3]).await;
+    let c2 = h.ok("POST", "/api/campaigns", Some(json!({"name": "Gold 2", "audience": {"include": [{"type": "list", "id": list2["id"]}]}, "content": content}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c2["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let sent = h.state.email.sent();
+    let lots = sent.iter().find(|m| m.to == "lots@x.test").expect("sent");
+    assert!(lots.html.contains("For gold members") && !lots.html.contains("Points bonus"));
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{}", c2["id"].as_str().unwrap()), None).await["status"], "sent");
+
+    // Previews: a real person with nothing to show is told so; the sample preview shows every block.
+    let (s, e) = h.req("POST", "/api/render", Some(json!({"channel": "email", "content": content, "profile_id": other}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"]["message"].as_str().unwrap().starts_with("Nothing to show for this person"), "{e}");
+    assert!(preview(&mut h, content.clone(), None).await["html"].as_str().unwrap().contains("For gold members"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn saved_block_edits_cant_break_emails_set_to_send() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_id(&h).await;
+    let p = profile(&h, acct, "ann@x.test", "subscribed", Some("Ann"), json!({})).await;
+    let list = list_of(&mut h, &[p]).await;
+    let sb = h.ok("POST", "/api/content/saved-blocks", Some(json!({"name": "Footer", "blocks": [{"type": "text", "html": "<p>One</p>"}]}))).await;
+    let id = sb["id"].as_str().unwrap().to_string();
+    let r = json!({"type": "saved", "saved_block_id": id, "blocks": []});
+    let refs: Vec<Value> = (0..7).map(|_| r.clone()).collect();
+    let content = json!({"subject": "Hi", "preheader": "p", "blocks": refs});
+    let ab = json!({"metric": "click_rate", "pick": "auto", "test_percent": 100, "wait_hours": 4, "variants": [{"id": "b", "name": "B", "content": {"subject": "Hi B", "preheader": "p", "blocks": [r]}}]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Weekly", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": content, "ab_test": ab}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let at = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+    h.ok("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at}))).await;
+
+    // 7 uses × 50 blocks would add 350 blocks; a template error would fail every recipient.
+    let fifty: Vec<Value> = (0..50).map(|_| json!({"type": "divider"})).collect();
+    for bad in [json!(fifty), json!([{"type": "text", "html": "<p>{{ unclosed</p>"}])] {
+        let (s, e) = h.req("PATCH", &format!("/api/content/saved-blocks/{id}"), Some(json!({"blocks": bad}))).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains("campaign \"Weekly\""), "{e}");
+    }
+    assert_eq!(h.ok("GET", &format!("/api/content/saved-blocks/{id}"), None).await["blocks"][0]["html"], "<p>One</p>", "refused edits change nothing");
+    // A good edit is fine.
+    h.ok("PATCH", &format!("/api/content/saved-blocks/{id}"), Some(json!({"blocks": [{"type": "text", "html": "<p>Two</p>"}]}))).await;
+
+    // When the send starts, every version is copied in from one read, and checked as copied.
+    sqlx::query("UPDATE campaigns SET send_at = now() WHERE id = $1::uuid").bind(&cid).execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let row = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(row["content"]["blocks"][0]["frozen"], true, "{row}");
+    assert_eq!(row["content"]["blocks"][0]["blocks"][0]["html"], "<p>Two</p>");
+    assert_eq!(row["ab_test"]["variants"][0]["content"]["blocks"][0]["blocks"][0]["html"], "<p>Two</p>");
+
+    // A copy that can't be sent (here: the saved block changed behind the API's back) fails the
+    // campaign before anyone gets it.
+    let c2 = h.ok("POST", "/api/campaigns", Some(json!({"name": "Broken", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "B", "preheader": "p", "blocks": [{"type": "saved", "saved_block_id": id, "blocks": []}]}}))).await;
+    let c2id = c2["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{c2id}/schedule"), Some(json!({"send_at": at}))).await;
+    sqlx::query("UPDATE saved_blocks SET blocks = '[{\"type\": \"text\", \"html\": \"{{ unclosed\"}]' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE campaigns SET send_at = now() WHERE id = $1::uuid").bind(&c2id).execute(&h.state.db).await.unwrap();
+    let before = h.state.email.sent().len();
+    dumbmail::jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let row = h.ok("GET", &format!("/api/campaigns/{c2id}"), None).await;
+    assert_eq!(row["status"], "failed", "{row}");
+    assert!(row["error"].as_str().unwrap().contains("template"), "{row}");
+    assert_eq!(h.state.email.sent().len(), before, "nobody got it");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid").bind(&c2id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 0);
+
+    // Duplicating a sent campaign gives a new email whose saved blocks are linked again.
+    let copy = h.ok("POST", &format!("/api/campaigns/{cid}/duplicate"), None).await;
+    assert!(!copy["content"].to_string().contains("frozen") && !copy["ab_test"].to_string().contains("frozen"), "{copy}");
+    // Detaching copies what the email shows, also after the saved block was deleted.
+    h.ok("DELETE", &format!("/api/content/saved-blocks/{id}"), None).await;
+    let shown = h.ok("GET", &format!("/api/content/saved-blocks/{id}?include_deleted=true"), None).await;
+    assert_eq!(shown["deleted"], true);
+    assert_eq!(shown["blocks"][0]["html"], "{{ unclosed");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn personalized_links_are_checked_after_personalization() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let p = profile(&h, acct, "eve@x.test", "subscribed", Some("Eve"), json!({"site": "javascript:alert(document.cookie)", "pic": "data:image/png;base64,AAAA", "good": "https://eve.test/{{x}}"})).await;
+    let content = json!({"subject": "s", "blocks": [
+        {"type": "image_text", "src": "{{ person.properties.pic }}", "alt": "Pic", "heading": "Hello", "href": "{{ person.properties.site }}", "button_text": "Go", "button_href": "{{ person.properties.site }}"},
+        {"type": "nav", "links": [{"text": "Mine", "href": "{{ person.properties.site }}"}, {"text": "Good", "href": "{{ person.properties.good }}"}]},
+        {"type": "video", "url": "{{ person.properties.site }}", "thumbnail": "{{ person.properties.good }}", "alt": "Watch"},
+    ]});
+    let v = preview(&mut h, content, Some(p)).await;
+    let html = v["html"].as_str().unwrap();
+    let text = v["text"].as_str().unwrap();
+    for bad in ["javascript", "data:image"] {
+        assert!(!html.contains(bad) && !text.contains(bad), "{bad} survived:\n{html}\n{text}");
+    }
+    assert!(html.contains("Hello") && html.contains(">Mine<") && html.contains("Watch"), "the blocks still show, without the link");
+    assert!(html.contains(r#"href="https://eve.test/%7B%7Bx%7D%7D""#), "an allowed link is kept, and can't open a template tag: {html}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn link_checks_never_request_dumbmail_links() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_id(&h).await;
+    // Another account's branded link domain counts too.
+    h.cookie = None;
+    h.ok("POST", "/api/auth/signup", Some(json!({"email": "two@b.test", "password": "correct horse", "company": "Two"}))).await;
+    let other = account_id(&h).await;
+    sqlx::query("UPDATE accounts SET link_domain = 'links.two.test', link_domain_status = 'active' WHERE id = $1").bind(other).execute(&h.state.db).await.unwrap();
+    h.cookie = None;
+    h.ok("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
+
+    // A real email's pixel and tracked link, copied onto link domains.
+    let p = profile(&h, acct, "ann@x.test", "subscribed", Some("Ann"), json!({})).await;
+    let list = list_of(&mut h, &[p]).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Real", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": {"subject": "s", "blocks": [{"type": "button", "text": "Go", "href": "https://shop.example.com/x"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let m = h.state.email.sent().into_iter().find(|m| m.to == "ann@x.test").unwrap();
+    let pixel = find_link(&m.html, "https://pl.test/t/o/").replace("https://pl.test", "https://links.two.test");
+    let click = find_link(&m.html, "https://pl.test/t/c/").replace("https://pl.test", "https://old.pl.test");
+    let unsub = find_link(&m.html, "https://pl.test/u/");
+    let content = json!({"subject": "Copied", "preheader": "p", "blocks": [
+        {"type": "image", "src": pixel, "alt": "x"},
+        {"type": "text", "html": format!("<p><a href=\"{click}\">again</a> <a href=\"{unsub}\">unsub</a></p>")},
+    ]});
+    let r = h.ok("POST", "/api/content/check", Some(json!({"content": content}))).await;
+    let links = r["links"].as_array().unwrap();
+    for u in [&pixel, &unsub] {
+        let l = links.iter().find(|l| l["url"] == u.as_str()).unwrap_or_else(|| panic!("{u} in {links:?}"));
+        assert_eq!(l["note"], "DumbMail link, not checked");
+        assert!(l["status"].is_null());
+    }
+    assert!(links.iter().any(|l| l["url"] == "https://shop.example.com/x"), "the tracked link is checked as where it leads: {links:?}");
+    assert!(!links.iter().any(|l| l["url"] == click.as_str()));
+    let (opened, clicked): (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT opened_at, clicked_at FROM messages WHERE profile_id = $1").bind(p).fetch_one(&h.state.db).await.unwrap();
+    assert!(opened.is_none() && clicked.is_none(), "the check recorded no open or click");
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE profile_id = $1").bind(p).fetch_one(&h.state.db).await.unwrap_or(0);
+    let received: i64 = sqlx::query_scalar("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.profile_id = $1 AND m.name IN ('Opened Email', 'Clicked Email')").bind(p).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(received, 0, "{events} events, none of them opens or clicks");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_images_load_on_every_dumbmail_host() {
+    let h = harness!();
+    sqlx::query("INSERT INTO accounts (id, public_key, name, link_domain, link_domain_status) VALUES ($1, 'pk_links', 'L', 'links.acme.test', 'active')")
+        .bind(Uuid::now_v7())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    for host in ["pl.test", "old.pl.test", "links.acme.test"] {
+        let (s, headers, _) = h.raw("GET", "/e/icons/color-instagram.png", &[("host", host)], "").await;
+        assert_eq!(s, StatusCode::OK, "{host}: {headers:?}");
+        assert_eq!(headers["content-type"], "image/png");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn starters_take_the_website_as_data_and_pre_arrival_needs_a_paid_booking() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("PATCH", "/api/account", Some(json!({"website": "https://acme.test/o'brien's/"}))).await;
+    let all = h.ok("GET", "/api/content/starters?preview=true", None).await;
+    assert!(all["data"].as_array().unwrap().iter().all(|s| s["html"].as_str().is_some_and(|x| x.len() > 1000)), "every starter renders");
+    let bis = all["data"].as_array().unwrap().iter().find(|s| s["key"] == "back_in_stock").unwrap();
+    let html = bis["html"].as_str().unwrap();
+    assert!(html.contains("acme.test&#x2f;o&#x27;brien&#x27;s&#x2f;"), "the website is the fallback link");
+
+    let pre = h.ok("GET", "/api/content/starters/pre_arrival", None).await;
+    let content = pre["content"].clone();
+    let render = |event: Value| json!({"channel": "email", "content": content.clone(), "event": event});
+    let paid = h.ok("POST", "/api/render", Some(render(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}})))).await;
+    assert!(paid["html"].as_str().unwrap().contains("123 Ocean View Rd"));
+    for unpaid in [json!({"properties": {"address": "123 Ocean View Rd"}}), json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": false}})] {
+        let v = h.ok("POST", "/api/render", Some(render(unpaid))).await;
+        let html = v["html"].as_str().unwrap();
+        assert!(!html.contains("123 Ocean View Rd") && html.contains("once your booking is paid in full"), "{html}");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn transactional_email_refuses_what_it_cant_render() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("PATCH", "/api/transactional/settings", Some(json!({"enabled": true, "acknowledge": true}))).await;
+    for (blocks, says) in [
+        (json!([{"type": "text", "html": "<p>x</p>", "show_if": {"field": "first_name", "op": "set"}}]), "display rules"),
+        (json!([{"type": "saved", "saved_block_id": Uuid::now_v7(), "blocks": []}]), "saved blocks"),
+        (json!([{"type": "social"}]), "social block"),
+    ] {
+        let (s, e) = h.req("POST", "/api/transactional/templates", Some(json!({"name": "R", "content": {"subject": "Receipt", "blocks": blocks}}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains(says), "{e}");
+    }
+    // A table (order lines) is fine.
+    h.ok("POST", "/api/transactional/templates", Some(json!({"name": "R", "content": {"subject": "Receipt", "blocks": [{"type": "table", "columns": [{"label": "Item"}], "rows": [["Tote"]]}]}}))).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn heavy_image_lookup_stays_in_the_account() {
+    let mut h = harness!();
+    h.signup().await;
+    h.cookie = None;
+    h.ok("POST", "/api/auth/signup", Some(json!({"email": "two@b.test", "password": "correct horse", "company": "Two"}))).await;
+    let other = account_id(&h).await;
+    let img = Uuid::now_v7();
+    sqlx::query("INSERT INTO images (id, account_id, content_type, bytes, size, sha256) VALUES ($1, $2, 'image/png', '\\x00', 3000000, 'x')")
+        .bind(img)
+        .bind(other)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    h.cookie = None;
+    h.ok("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
+    let r = h.ok("POST", "/api/content/check", Some(json!({"content": {"subject": "s", "preheader": "p", "blocks": [{"type": "image", "src": format!("https://pl.test/i/{img}"), "alt": "x"}]}}))).await;
+    assert!(!r["findings"].as_array().unwrap().iter().any(|f| f["id"] == "heavy_images"), "another account's image says nothing: {r}");
+    h.cleanup().await;
 }

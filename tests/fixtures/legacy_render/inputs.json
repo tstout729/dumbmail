@@ -1,0 +1,1723 @@
+[
+ {
+  "name": "basic",
+  "content": {
+   "subject": "Hi {{ first_name|default('there') }}",
+   "preheader": "Pre {{ first_name }}",
+   "blocks": [
+    {
+     "type": "heading",
+     "text": "Hello {{ first_name|default('there') }}",
+     "level": 1,
+     "align": "center"
+    },
+    {
+     "type": "text",
+     "html": "<p>Plain <strong>text</strong> with a <a href=\"https://shop.test/a?x=1&y=2\">link</a> and {{ person.properties.city|default('your city') }}.</p>",
+     "align": "left"
+    },
+    {
+     "type": "button",
+     "text": "Shop now",
+     "href": "https://shop.test/sale",
+     "color": "#ff0000",
+     "align": "center"
+    },
+    {
+     "type": "button",
+     "text": "Personal",
+     "href": "{{ person.properties.url|default('https://shop.test/me') }}"
+    },
+    {
+     "type": "image",
+     "src": "https://cdn.test/hero.png",
+     "alt": "Hero",
+     "href": "https://shop.test",
+     "width": 400
+    },
+    {
+     "type": "image",
+     "src": "https://cdn.test/plain.png",
+     "alt": ""
+    },
+    {
+     "type": "divider"
+    },
+    {
+     "type": "spacer",
+     "height": 40
+    },
+    {
+     "type": "product",
+     "title": "Tote",
+     "price": "$48",
+     "image": "https://cdn.test/tote.png",
+     "href": "https://shop.test/tote",
+     "button_text": "Buy"
+    },
+    {
+     "type": "html",
+     "html": "<table><tr><td>raw {{ organization.name }}</td></tr></table>"
+    },
+    {
+     "type": "unknown_type",
+     "text": "ignored"
+    },
+    {
+     "type": "if_open",
+     "expr": "true"
+    },
+    {
+     "type": "text",
+     "html": "<p>after a marker</p>"
+    },
+    {
+     "type": "if_close"
+    }
+   ]
+  }
+ },
+ {
+  "name": "five_columns",
+  "content": {
+   "subject": "Columns",
+   "preheader": "cols",
+   "blocks": [
+    {
+     "type": "columns",
+     "columns": [
+      [
+       {
+        "type": "text",
+        "html": "<p>Col 1</p>"
+       },
+       {
+        "type": "image",
+        "src": "https://cdn.test/1.png",
+        "alt": "c1"
+       }
+      ],
+      [
+       {
+        "type": "text",
+        "html": "<p>Col 2</p>"
+       },
+       {
+        "type": "image",
+        "src": "https://cdn.test/2.png",
+        "alt": "c2"
+       }
+      ],
+      [
+       {
+        "type": "text",
+        "html": "<p>Col 3</p>"
+       },
+       {
+        "type": "image",
+        "src": "https://cdn.test/3.png",
+        "alt": "c3"
+       }
+      ],
+      [
+       {
+        "type": "text",
+        "html": "<p>Col 4</p>"
+       },
+       {
+        "type": "image",
+        "src": "https://cdn.test/4.png",
+        "alt": "c4"
+       }
+      ],
+      [
+       {
+        "type": "text",
+        "html": "<p>Col 5</p>"
+       },
+       {
+        "type": "image",
+        "src": "https://cdn.test/5.png",
+        "alt": "c5"
+       }
+      ]
+     ]
+    },
+    {
+     "type": "columns",
+     "columns": [
+      [
+       {
+        "type": "columns",
+        "columns": [
+         [
+          {
+           "type": "text",
+           "html": "nested"
+          }
+         ]
+        ]
+       }
+      ],
+      [
+       {
+        "type": "button",
+        "text": "B",
+        "href": "https://shop.test/b"
+       }
+      ]
+     ]
+    }
+   ]
+  }
+ },
+ {
+  "name": "over_300_blocks",
+  "content": {
+   "subject": "Long",
+   "blocks": [
+    {
+     "type": "text",
+     "html": "<p>Paragraph 0 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H1",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B3",
+     "href": "https://shop.test/3"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 4 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H5",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B7",
+     "href": "https://shop.test/7"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 8 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H9",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B11",
+     "href": "https://shop.test/11"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 12 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H13",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B15",
+     "href": "https://shop.test/15"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 16 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H17",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B19",
+     "href": "https://shop.test/19"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 20 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H21",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B23",
+     "href": "https://shop.test/23"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 24 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H25",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B27",
+     "href": "https://shop.test/27"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 28 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H29",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B31",
+     "href": "https://shop.test/31"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 32 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H33",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B35",
+     "href": "https://shop.test/35"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 36 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H37",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B39",
+     "href": "https://shop.test/39"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 40 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H41",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B43",
+     "href": "https://shop.test/43"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 44 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H45",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B47",
+     "href": "https://shop.test/47"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 48 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H49",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B51",
+     "href": "https://shop.test/51"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 52 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H53",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B55",
+     "href": "https://shop.test/55"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 56 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H57",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B59",
+     "href": "https://shop.test/59"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 60 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H61",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B63",
+     "href": "https://shop.test/63"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 64 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H65",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B67",
+     "href": "https://shop.test/67"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 68 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H69",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B71",
+     "href": "https://shop.test/71"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 72 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H73",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B75",
+     "href": "https://shop.test/75"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 76 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H77",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B79",
+     "href": "https://shop.test/79"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 80 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H81",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B83",
+     "href": "https://shop.test/83"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 84 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H85",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B87",
+     "href": "https://shop.test/87"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 88 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H89",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B91",
+     "href": "https://shop.test/91"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 92 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H93",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B95",
+     "href": "https://shop.test/95"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 96 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H97",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B99",
+     "href": "https://shop.test/99"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 100 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H101",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B103",
+     "href": "https://shop.test/103"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 104 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H105",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B107",
+     "href": "https://shop.test/107"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 108 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H109",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B111",
+     "href": "https://shop.test/111"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 112 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H113",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B115",
+     "href": "https://shop.test/115"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 116 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H117",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B119",
+     "href": "https://shop.test/119"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 120 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H121",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B123",
+     "href": "https://shop.test/123"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 124 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H125",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B127",
+     "href": "https://shop.test/127"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 128 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H129",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B131",
+     "href": "https://shop.test/131"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 132 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H133",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B135",
+     "href": "https://shop.test/135"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 136 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H137",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B139",
+     "href": "https://shop.test/139"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 140 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H141",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B143",
+     "href": "https://shop.test/143"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 144 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H145",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B147",
+     "href": "https://shop.test/147"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 148 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H149",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B151",
+     "href": "https://shop.test/151"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 152 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H153",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B155",
+     "href": "https://shop.test/155"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 156 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H157",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B159",
+     "href": "https://shop.test/159"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 160 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H161",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B163",
+     "href": "https://shop.test/163"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 164 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H165",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B167",
+     "href": "https://shop.test/167"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 168 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H169",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B171",
+     "href": "https://shop.test/171"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 172 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H173",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B175",
+     "href": "https://shop.test/175"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 176 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H177",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B179",
+     "href": "https://shop.test/179"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 180 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H181",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B183",
+     "href": "https://shop.test/183"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 184 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H185",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B187",
+     "href": "https://shop.test/187"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 188 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H189",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B191",
+     "href": "https://shop.test/191"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 192 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H193",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B195",
+     "href": "https://shop.test/195"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 196 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H197",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B199",
+     "href": "https://shop.test/199"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 200 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H201",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B203",
+     "href": "https://shop.test/203"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 204 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H205",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B207",
+     "href": "https://shop.test/207"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 208 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H209",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B211",
+     "href": "https://shop.test/211"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 212 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H213",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B215",
+     "href": "https://shop.test/215"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 216 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H217",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B219",
+     "href": "https://shop.test/219"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 220 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H221",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B223",
+     "href": "https://shop.test/223"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 224 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H225",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B227",
+     "href": "https://shop.test/227"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 228 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H229",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B231",
+     "href": "https://shop.test/231"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 232 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H233",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B235",
+     "href": "https://shop.test/235"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 236 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H237",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B239",
+     "href": "https://shop.test/239"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 240 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H241",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B243",
+     "href": "https://shop.test/243"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 244 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H245",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B247",
+     "href": "https://shop.test/247"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 248 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H249",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B251",
+     "href": "https://shop.test/251"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 252 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H253",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B255",
+     "href": "https://shop.test/255"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 256 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H257",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B259",
+     "href": "https://shop.test/259"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 260 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H261",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B263",
+     "href": "https://shop.test/263"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 264 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H265",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B267",
+     "href": "https://shop.test/267"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 268 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H269",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B271",
+     "href": "https://shop.test/271"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 272 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H273",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B275",
+     "href": "https://shop.test/275"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 276 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H277",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B279",
+     "href": "https://shop.test/279"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 280 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H281",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B283",
+     "href": "https://shop.test/283"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 284 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H285",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B287",
+     "href": "https://shop.test/287"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 288 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H289",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B291",
+     "href": "https://shop.test/291"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 292 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H293",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B295",
+     "href": "https://shop.test/295"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 296 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H297",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B299",
+     "href": "https://shop.test/299"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 300 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H301",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B303",
+     "href": "https://shop.test/303"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 304 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H305",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B307",
+     "href": "https://shop.test/307"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 308 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H309",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B311",
+     "href": "https://shop.test/311"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 312 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H313",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B315",
+     "href": "https://shop.test/315"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 316 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H317",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B319",
+     "href": "https://shop.test/319"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 320 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H321",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B323",
+     "href": "https://shop.test/323"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 324 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H325",
+     "level": 2
+    },
+    {
+     "type": "spacer",
+     "height": 8
+    },
+    {
+     "type": "button",
+     "text": "B327",
+     "href": "https://shop.test/327"
+    },
+    {
+     "type": "text",
+     "html": "<p>Paragraph 328 for {{ first_name|default('friend') }}</p>"
+    },
+    {
+     "type": "heading",
+     "text": "H329",
+     "level": 2
+    }
+   ]
+  }
+ },
+ {
+  "name": "theme",
+  "content": {
+   "subject": "Themed",
+   "blocks": [
+    {
+     "type": "text",
+     "html": "<p>t</p>"
+    }
+   ],
+   "theme": {
+    "brand_color": "#123abc",
+    "background": "#eeeeee",
+    "font": "Georgia, \"Times New Roman\", serif"
+   }
+  }
+ },
+ {
+  "name": "html_fragment",
+  "content": {
+   "subject": "Frag",
+   "html": "<p>Hello {{ first_name|default('x') }} <a href=\"https://shop.test/f\">f</a></p>"
+  }
+ },
+ {
+  "name": "html_document",
+  "content": {
+   "subject": "Doc",
+   "html": "<html><body><p>Full doc <a href=\"https://shop.test/d\">d</a></p></body></html>"
+  }
+ },
+ {
+  "name": "show_if_null",
+  "content": {
+   "subject": "Null rule",
+   "blocks": [
+    {
+     "type": "text",
+     "html": "<p>x</p>",
+     "show_if": null
+    }
+   ]
+  }
+ },
+ {
+  "name": "jinja_logic",
+  "content": {
+   "subject": "{% if first_name %}Hey {{ first_name }}{% else %}Hey{% endif %}",
+   "blocks": [
+    {
+     "type": "text",
+     "html": "{% for i in range(3) %}<p>{{ i }}</p>{% endfor %}"
+    }
+   ]
+  }
+ }
+]

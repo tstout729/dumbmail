@@ -2,7 +2,9 @@
 
 More email blocks, display rules, saved blocks, starter templates and checks before sending. The core blocks (heading, text, image, button, divider, spacer, columns, product, products, html) are in `dumbmail://docs/email`.
 
-Text in any block can use personalization tags like `{{ first_name|default('there') }}`. Links may start with `https://`, `http://`, `mailto:` or `tel:`, or be a tag like `{{ event.properties.url }}`; anything else is dropped.
+Text in any block can use personalization tags like `{{ first_name|default('there') }}`. Links and image addresses in these blocks can be tags too, like `{{ event.properties.url }}`: they're filled in for each recipient and then checked. A link must come out as `https://`, `http://`, `mailto:` or `tel:`, and an image as `https://` or `http://`; anything else (javascript:, data:, an address that's empty for this person) shows the block without that link or image.
+
+Email that uses none of this page's features (saved blocks, display rules, the blocks below) is rendered exactly as before they existed.
 
 ## Blocks
 
@@ -88,9 +90,16 @@ Any block can carry `show_if`, so one email varies by person:
 
 - `field`: a dotted path in the personalization data: `first_name`, `email`, `person.properties.<key>`, `event.value`, `event.properties.<key>`.
 - `op`: `set`, `not_set`, `eq`, `neq`, `contains` (text contains, or a list includes), `gt`, `lt` (numbers; text that isn't a number never matches). Text comparisons ignore case.
-- Advanced: `{"expr": "event.value > 100 and person.properties.vip"}`, any template expression (no `{`, `}`, `%` or `#`). An expression that refers to something missing can fail to render, so guard it with `is defined`.
+- Several rules that must all be true: a list, up to 5: `"show_if": [{"field": ...}, {"expr": ...}]`.
+- Advanced: `{"expr": "event.value > 100 and person.properties.vip"}`, a template expression that compares and combines values: `and`, `or`, `not`, `==`, `<`, `in`, `is defined`, and the filters `int`, `float`, `lower`, `upper`, `length`, `count`, `default`, `trim`, `first`, `last`, `string`, `bool`, `abs`, `round`, `title`, `capitalize`. No `{`, `}`, `%`, `#`, `*`, `~` or function calls. Each rule runs with a fixed work budget and sees only that recipient's data.
 
-Rules are checked for each recipient when the email is sent, and for the chosen person in previews. On a saved block reference, the rule applies to the whole saved block.
+Rules are checked for each recipient when the email is sent, and for the chosen person in previews ("Preview as"; the preview with no person picked shows every block when the sample person would see none). On a saved block reference, the rule applies to the whole saved block; detaching it puts the rule on each block it held.
+
+A rule never fails a send:
+
+- A rule that can't be worked out for someone (an advanced rule comparing text with a number, say) hides its block for that person only.
+- When rules hide every block for someone, that person is skipped with the reason "nothing to show for this person" (shown in the campaign report's delivery card and in `get_send_progress`); nobody gets an empty email. A test send to such a person says so.
+- The check (below) says how many people in the audience every block would be hidden for, and how many a rule can't be worked out for.
 
 ## Saved blocks
 
@@ -106,7 +115,14 @@ Put one in an email:
 {"type": "saved", "saved_block_id": "0193...", "name": "Footer", "blocks": [ ...a copy... ]}
 ```
 
-The email shows the saved block's current content. Editing a saved block changes every template, draft or scheduled campaign and flow email that uses it. When a campaign starts sending, the saved block's content is copied into it (`"frozen": true`), so later edits don't change what it sent. To edit one email's copy only, detach it: replace the `saved` block with its `blocks`. Deleting a saved block removes it from the list; emails that still use it keep its last content. A saved block can't contain another saved block.
+The email shows the saved block's current content. Editing a saved block changes every template, draft or scheduled campaign and flow email that uses it.
+
+- An edit is refused (409, naming them) when it would stop an email that's set to go out without anyone looking at it again from sending: a scheduled or starting campaign (or one of its A/B versions) or a live flow. For example, a change that makes the saved blocks in one email add more than 300 blocks, or text that doesn't render.
+- When a campaign's send starts (in the same step that fixes who gets it), the saved blocks in it and every A/B version are copied in from one read (`"frozen": true`) and checked as copied. Everyone gets that copy, also people whose email waits for their local or best time. A copy that can't be sent fails the campaign before anyone gets it.
+- Duplicating a campaign gives a new, unsent email: its saved blocks show their current content again.
+- To edit one email's copy only, detach it: replace the `saved` block with what it shows now (`GET /api/content/saved-blocks/{id}?include_deleted=true` gives the content even after the saved block was deleted).
+
+Deleting a saved block removes it from the list; emails that still use it keep its last content. A saved block can't contain another saved block.
 
 MCP: `list_saved_blocks`, `save_block`, `update_saved_block`, `delete_saved_block` (needs `confirm: true`).
 
@@ -116,6 +132,10 @@ MCP: `list_saved_blocks`, `save_block`, `update_saved_block`, `delete_saved_bloc
 
 - `GET /api/content/starters/{key}`: one starter's `content` (use it in a campaign or flow email).
 - `POST /api/content/starters/{key}/template` `{"name"}`: save it as a template.
+
+Links that fall back to your website read it when the email renders (`organization.website`), so the address isn't copied into the template.
+
+The pre-arrival starter is for stays. Start its flow from a booking event your booking system sends through the API or an integration, never from an event your website sends from the browser (anyone can send those). Have the event carry `paid_in_full`: the intro, the arrival table (check-in, check-out, address, parking) and the directions button show only when `event.properties.paid_in_full` is true; otherwise the email says the details come once the booking is paid in full. It has no door, lockbox or access codes.
 
 MCP: `list_starter_templates` (with `key` for one's content), `create_template_from_starter`.
 
@@ -129,12 +149,41 @@ MCP: `list_starter_templates` (with `key` for one's content), `create_template_f
 
 It returns `findings`, each with a `severity` (`error`, `warning`, `info`), a `title`, a `detail` that says what to fix, and `blocks_sending` (true only for what the product already refuses to send: a missing subject, sender or mailing address, an unverified sending domain where one is required, an empty audience, content that doesn't render). It checks:
 
-- links and images: broken or unreachable (requested from DumbMail's servers: public addresses only, redirects reported but not followed, up to 40 addresses, results kept for 10 minutes; `skip_links: true` skips this), images over 1 MB, missing alt text, sample images left in;
+- links and images: broken or unreachable (requested from DumbMail's servers: public addresses only, redirects not followed and so reported as not checked, up to 40 addresses, results kept for 10 minutes; `skip_links: true` skips this), image addresses that answer with a web page instead of an image, images over 1 MB, missing alt text, sample images left in. DumbMail's own addresses (tracking links and open pixels copied from a sent email, unsubscribe links, hosted images) on any DumbMail host or any account's branded link domain are never requested, since that would count as an open or click: they're listed as "DumbMail link, not checked", and a tracked link is checked as the address it leads to;
 - subject (missing, over 60 characters, all capitals, `!!`) and preview text (missing, too long, same as the subject);
 - Gmail clipping: the email as sent (with tracked links) over 102 KB;
 - personalization without a fallback, with how many recipients it would be empty for (in a campaign's audience, or everyone who can get email); event data in a campaign, where there is no event;
 - who it goes to: nobody reachable, and how many never subscribed;
+- display rules: how many people every block would be hidden for (they'd be skipped), and how many a rule can't be worked out for (tried on up to 5,000 people in the audience; for flows, only rules about the person);
 - spam signals: image-only emails, link shorteners, link text that shows a different address than the link opens;
 - whether the sending domain is authenticated.
 
 `recipients` is the reachable count, `size_bytes` the email's size, and `links` each address checked with its status.
+
+One check runs at a time per account; counting the audience and trying rules on it run behind that, a few at a time across the server, within 15 seconds.
+
+## Hosted images
+
+Social icons (`/e/icons/...`), starter sample images (`/e/assets/...`) and countdown images (`/e/countdown/...`, signed) load on every DumbMail host: the app, the marketing site, retired hosts, the shared link host and branded link domains. Countdown images are drawn once per timer per second and shared by every open in that second, at most 4 at a time and 16 waiting across the server, and 240 new drawings a minute per account. Video thumbnails (`make_video_thumbnail`) take pictures up to 24 megapixels, come out at most 1200 px on either side, and are made one at a time per account (two at a time across the server).
+
+## Transactional email
+
+Transactional email (`dumbmail://docs/transactional`) renders on its own path, so it takes the core blocks and the `table` block only. Saved blocks, display rules and the other blocks on this page are refused when a transactional template is saved and when one is sent.
+
+## Who may use what
+
+Until the team-and-roles layer lands, every signed-in user and API key can use all of this. When it does, these are the permissions each route and tool needs:
+
+| Route or tool | Needs |
+| --- | --- |
+| `GET /api/content/saved-blocks`, `GET /api/content/saved-blocks/{id}`, `GET .../usage`, `list_saved_blocks` | read content |
+| `GET /api/content/starters`, `GET /api/content/starters/{key}`, `list_starter_templates` | read content |
+| `POST /api/content/saved-blocks`, `PATCH /api/content/saved-blocks/{id}`, `save_block`, `update_saved_block` | edit content |
+| `POST /api/content/starters/{key}/template`, `create_template_from_starter` | edit content |
+| `POST /api/content/video-thumbnail`, `make_video_thumbnail` (stores an image; requests the address) | edit content |
+| `DELETE /api/content/saved-blocks/{id}`, `delete_saved_block` (needs `confirm: true`; the dashboard asks first) | delete content |
+| `POST /api/content/check`, `check_email` | read content, plus read profiles and audiences (it counts people and tries rules on their data); it requests the email's links unless `skip_links` |
+| `/e/icons/*`, `/e/assets/*` | public |
+| `/e/countdown/*` | public; the address is signed |
+
+Previewing as a real person ("Preview as", `render_preview` with `profile_id`) shows that person's data, so it needs read profiles; test sends are real sends and need send.
