@@ -133,7 +133,7 @@ async fn signup(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJs
     }
     let (user, account) = create_account(&state, &b.email, &b.password, b.name, &b.company).await?;
     let token = new_session(&state, user.id, account.id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": user, "account": account}))))
+    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email}))))
 }
 
 #[derive(Deserialize)]
@@ -162,7 +162,7 @@ async fn login(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJso
         .await?;
     let account = load_account(&state.db, account_id).await?;
     let token = new_session(&state, id, account_id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": User { id, email, name }, "account": account}))))
+    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": User { id, email, name }, "account": account, "support_email": state.cfg.support_email}))))
 }
 
 async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(CookieJar, Json<Value>)> {
@@ -178,7 +178,7 @@ async fn me(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
         Some(uid) => sqlx::query_as("SELECT id, email, name FROM users WHERE id = $1").bind(uid).fetch_optional(&state.db).await?,
         None => None,
     };
-    Ok(Json(json!({"user": user, "account": account})))
+    Ok(Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email})))
 }
 
 #[derive(Deserialize)]

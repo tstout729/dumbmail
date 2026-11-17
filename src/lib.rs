@@ -9,6 +9,7 @@ pub mod brand;
 pub mod campaigns;
 pub mod config;
 pub mod crypto;
+pub mod deliverability;
 pub mod domains;
 pub mod error;
 pub mod flows;

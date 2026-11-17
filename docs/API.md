@@ -30,6 +30,8 @@ type Account = {
   brand_color: string; logo_url: string | null; plan: "free" | "pro" | "scale" | "self_hosted";
   onboarding: { brand: boolean; sender: boolean; contacts: boolean; first_flow: boolean; dismissed: boolean };
   created_at: string;
+  // Set while email sending is paused for high bounces or spam complaints (see "Automatic email pause").
+  sending_paused_at: string | null; sending_paused_reason: string | null;
 };
 
 type User = { id: string; email: string; name: string | null };
@@ -134,7 +136,7 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | POST | `/api/auth/logout` | – | `{ok: true}` |
 | GET | `/api/auth/options` | – | `{google, signup}`: which sign-in methods this server offers |
 | GET | `/api/auth/google?next=/path` | – | Redirects to Google ("Continue with Google"). The callback (`/api/auth/google/callback`) signs in, joins an existing user with the same email (turning its password off and ending older sessions), or creates a new account and sends it to `/onboarding`. Failures redirect to `/login?error=<code>` |
-| GET | `/api/me` | – | `{user, account}` (401 if signed out) |
+| GET | `/api/me` | – | `{user, account, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too |
 | PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial. `social_links` is `{instagram\|facebook\|tiktok\|x\|youtube\|pinterest\|linkedin\|threads: https URL}`; a blank value removes that network. Social links appear in email footers | `Account` |
 | POST | `/api/brand/import` | `{url, apply?}` | `{brand: {website, name, logo_url, brand_color, colors[], address, from_email, from_email_found, social_links}}`. Reads the public website (and its stylesheets and logo) for brand suggestions. With `apply: true`, also saves website, logo, brand color and social links, plus name and address when the account has none, and returns `account` |
 | GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}}` |
@@ -220,6 +222,43 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 - `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
 - `GET /healthz`.
+
+## Automatic email pause
+
+Every account on a server sends through the same email provider account (Amazon SES on the hosted
+service), which AWS reviews at a 5% bounce rate or 0.1% complaint rate. To protect everyone, an
+account's email sending pauses automatically when either check below trips. Rates count real (non-test)
+emails the provider accepted; bounces are permanent (hard) bounces only, not counting addresses already on
+the provider's account suppression list.
+
+| Check | Window | Judged after | Pauses when |
+| --- | --- | --- | --- |
+| Account | emails created in the last 7 days, and since the pause was last lifted | 200 sent | hard bounces > 4% of sent, or at least 3 complaints and complaints > 0.08% of sent |
+| Campaign (circuit breaker) | that campaign's emails, since the pause was last lifted | 100 sent | hard bounces > 10% of sent, or at least 3 complaints and complaints > 0.5% of sent |
+
+Rates are recomputed when SES reports a bounce or complaint (at most every 10 seconds per account; the
+scheduler catches up within about 20 seconds). While paused:
+
+- `account.sending_paused_at` and `sending_paused_reason` are set (`/api/me`, MCP `get_account` as
+  `email_sending_paused`), and the web app shows a banner.
+- Email campaigns that are sending stop with `status: "failed"` and an `error` explaining the pause; their
+  unsent messages become `skipped` with `error: "sending paused"`. Scheduled campaigns stop when they come
+  due. New email campaigns can't be sent or scheduled (400, "Not ready to send: Email sending is paused…").
+- Flow emails are recorded as `skipped` messages with `error: "sending paused"`; the flow carries on.
+- Test emails return 409 with the reason.
+- SMS is not affected.
+- The operator is emailed at OPERATOR_ALERT_EMAIL (falling back to SUPPORT_EMAIL; the address sends to
+  itself, so its domain must be verified with the email provider), and the pause is logged at error level.
+
+## Operator endpoints
+
+Require `Authorization: Bearer <ADMIN_TOKEN>` (32+ characters). When ADMIN_TOKEN is unset or shorter they
+answer 404; a wrong token gets 401. The account is the one whose first member has `email`.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/admin/credit` | `{email, amount, note?}` (USD; negative debits, at most 10,000) | `{account, balance}` |
+| POST | `/admin/unpause` | `{email}` | `{account, was_paused, sending_paused: false}`. Lifts the automatic email pause and restarts the window the rates are measured over, so bounces from before don't pause the account again. Campaigns stopped by the pause stay failed |
 
 ## v0.2 additions: pay-as-you-go billing, phone numbers, domains, website snippet
 

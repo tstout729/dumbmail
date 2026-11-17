@@ -155,7 +155,7 @@ fn tools() -> Vec<Value> {
             "metric": {"enum": ["open_rate", "click_rate", "revenue"]}, "pick": {"enum": ["auto", "manual"]}}, "required": ["variants"]});
     let flow_def = json!({"type": "object", "description": "Flow graph: {entry: firstNodeId, nodes: [...], settings?: {reentry: 'never'|'always'|{after_days}, exit_condition?: segment rules, profile_filter?: segment rules, smart_sending_hours?}}. Node types (each has a unique id): delay{amount, unit: minutes|hours|days, next}, email{name?, content, next}, sms{name?, content:{body}, next}, condition{condition: segment rules, yes, no}, random_split{percent: 1-99 share sent down yes (path A), yes, no} for A/B testing paths, update_profile{properties, next}, add_to_list|remove_from_list{list_id, next}, webhook{url, method?, body?, next}. next/yes/no are node ids or null to end. Read postlark://docs/flows."});
     vec![
-        tool("get_account", "Get account overview", "Account settings, sending readiness (sender, domain, SMS number, mailing address), plan usage, counts of profiles/lists/segments/campaigns/flows and the setup checklist. Call this first.", obj(json!({}), &[]), true, false),
+        tool("get_account", "Get account overview", "Account settings, sending readiness (sender, domain, SMS number, mailing address), whether email sending is paused for high bounces/complaints (email_sending_paused; only support can lift it), plan usage, counts of profiles/lists/segments/campaigns/flows and the setup checklist. Call this first.", obj(json!({}), &[]), true, false),
         tool("update_account", "Update account settings", "Update brand and sender settings: name, website, from_name, from_email, reply_to, sms_from (E.164), timezone (IANA), address (mailing address shown in email footers, required to send), brand_color (hex), logo_url, social_links ({instagram|facebook|tiktok|x|youtube|pinterest|linkedin|threads: url}, blank removes), conversion_metric (metric used for revenue attribution, default 'Placed Order').",
             obj(json!({"name": {"type": "string"}, "website": {"type": "string"}, "from_name": {"type": "string"}, "from_email": {"type": "string"}, "reply_to": {"type": "string"}, "sms_from": {"type": "string"}, "timezone": {"type": "string"}, "address": {"type": "string"}, "brand_color": {"type": "string"}, "logo_url": {"type": "string"}, "social_links": {"type": "object", "additionalProperties": {"type": "string"}}, "conversion_metric": {"type": "string"}}), &[]), false, false),
         tool("import_brand", "Import brand from website", "Read the brand's website and return its name, logo URL, brand colors (best first), mailing address, a sender email on its domain and social profile links. With apply=true, saves the website, logo, brand color and social links, plus name and address if the account has none yet; sender email is never changed (it needs a verified domain). Show the user what was found.",
@@ -263,8 +263,15 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             if account.address.is_none() { missing.push("mailing address (update_account address; required in every marketing email)"); }
             if account.verified_domains.is_empty() { missing.push("verified sending domain (set_sending_domain) for best deliverability"); }
             if account.sms_from.is_none() { missing.push("texting number (find_phone_numbers + claim_phone_number, or connect your own provider in Settings → SMS)"); }
+            let paused = account.sending_paused_at.map(|at| json!({
+                "paused_at": at,
+                "reason": account.sending_paused_reason,
+                "note": crate::deliverability::paused_message(account.sending_paused_reason.as_deref()),
+                "support_email": state.cfg.support_email,
+            }));
             Ok(json!({
                 "account": account,
+                "email_sending_paused": paused,
                 "sending": crate::api::account::sending_json(state, &account).await?,
                 "billing": crate::api::account::billing_json(state, acct).await?,
                 "counts": {"profiles": counts.0, "lists": counts.1, "segments": counts.2, "campaigns": counts.3, "flows": counts.4, "live_flows": counts.5},

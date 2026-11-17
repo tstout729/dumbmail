@@ -59,7 +59,7 @@ DATABASE_URL=postgres://localhost/dumbmail cargo run --release -- serve
 
 ### Hosted billing (Stripe)
 
-Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stripe webhook at `https://YOUR_HOST/webhooks/stripe` with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `payment_intent.succeeded`. Prices are set with `PRICE_EMAIL_PER_1000`, `PRICE_SMS_SEGMENT`, `PRICE_MMS`, `PRICE_NUMBER_MONTHLY` and `FREE_EMAILS_PER_MONTH`. Operators can adjust a balance with `dumbmail admin-credit --email owner@brand.com --amount 25`.
+Set `HOSTED=true`, `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`. Point a Stripe webhook at `https://YOUR_HOST/webhooks/stripe` with the events `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `payment_intent.succeeded`. Prices are set with `PRICE_EMAIL_PER_1000`, `PRICE_SMS_SEGMENT`, `PRICE_MMS`, `PRICE_NUMBER_MONTHLY` and `FREE_EMAILS_PER_MONTH`. Operators can adjust a balance with `dumbmail admin-credit --email owner@brand.com --amount 25`. Email sending pauses automatically for an account whose bounces or spam complaints get high enough to put the shared SES account at risk; set `OPERATOR_ALERT_EMAIL` to be emailed when that happens and lift a pause with `POST /admin/unpause` (see [docs/API.md](docs/API.md#automatic-email-pause)).
 
 ### Branded link domains
 

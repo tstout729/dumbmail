@@ -66,6 +66,7 @@ impl Harness {
             google_client_secret: Some("test-google-secret".into()),
             google_site_verification: Some("google0123abcd.html".into()),
             support_email: Some("help@pl.test".into()),
+            operator_alert_email: Some("ops@pl.test".into()),
             redirect_hosts: vec!["old.pl.test".into()],
         };
         let state = AppState::build(cfg, db).await.unwrap();
@@ -1406,5 +1407,193 @@ async fn website_setup_test_and_late_events() {
     assert_eq!(rows.len(), 2, "duplicate order dropped: {rows:?}");
     assert!((rows[0].1 - 7200.0).abs() < 120.0, "held order keeps its time: {rows:?}");
     assert!(rows[1].1 < 60.0, "an old time is recorded as now: {rows:?}");
+    h.cleanup().await;
+}
+
+// ---------- Automatic email pause ----------
+
+/// A list of `n` subscribed email profiles named `{prefix}{i}@x.test`, returning the list id.
+async fn email_list(h: &mut Harness, prefix: &str, n: usize) -> String {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": prefix}))).await;
+    let mut csv = String::from("email\n");
+    for i in 0..n {
+        csv.push_str(&format!("{prefix}{i}@x.test\n"));
+    }
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    assert_eq!(imp["created"], n, "{imp}");
+    list["id"].as_str().unwrap().to_string()
+}
+
+/// Create an email campaign to the list and start sending it (jobs not yet run). Returns its id.
+async fn start_email_campaign(h: &mut Harness, list_id: &str, name: &str) -> String {
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": name, "channel": "email", "audience": {"include": [{"type": "list", "id": list_id}]},
+        "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{id}/send"), None).await;
+    id
+}
+
+/// Provider ids of `n` sent messages of a campaign.
+async fn sent_ids(h: &Harness, cid: &str, n: i64) -> Vec<String> {
+    sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE campaign_id = $1::uuid AND status = 'sent' AND NOT is_test ORDER BY to_address LIMIT $2")
+        .bind(cid)
+        .bind(n)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap()
+}
+
+/// Deliver an SES bounce ("Permanent" or "Transient") or complaint ("Complaint") through the webhook.
+async fn ses_event(h: &Harness, provider_id: &str, kind: &str) {
+    let msg = if kind == "Complaint" {
+        json!({"notificationType": "Complaint", "mail": {"messageId": provider_id}, "complaint": {}})
+    } else {
+        json!({"notificationType": "Bounce", "mail": {"messageId": provider_id}, "bounce": {"bounceType": kind, "bounceSubType": "General"}})
+    };
+    let sns = json!({"Type": "Notification", "Message": msg.to_string()});
+    let (s, _, body) = h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &sns.to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+}
+
+/// Bounce these messages, then let the scheduler run the rate checks the webhooks put off.
+async fn bounce_all(h: &Harness, ids: &[String], kind: &str) {
+    for id in ids {
+        ses_event(h, id, kind).await;
+    }
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+}
+
+async fn paused(h: &mut Harness) -> Option<String> {
+    let me = h.ok("GET", "/api/me", None).await;
+    me["account"]["sending_paused_at"].as_str().map(|_| me["account"]["sending_paused_reason"].as_str().unwrap_or("").to_string())
+}
+
+const ADMIN: (&str, &str) = ("authorization", "Bearer test-admin-token-0123456789abcdef0123");
+
+#[tokio::test]
+async fn account_pauses_past_the_bounce_threshold_and_operator_lifts_it() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+
+    // A small sender: half of 60 emails bounce, but 60 is below every minimum, so nothing pauses.
+    let small = email_list(&mut h, "small", 60).await;
+    let cid = start_email_campaign(&mut h, &small, "Small").await;
+    h.drain().await;
+    bounce_all(&h, &sent_ids(&h, &cid, 30).await, "Permanent").await;
+    assert_eq!(paused(&mut h).await, None, "60 emails is too few to judge");
+
+    // Another 190 emails: 250 sent. Checks run when a hard bounce or complaint arrives.
+    let more = email_list(&mut h, "more", 190).await;
+    let cid2 = start_email_campaign(&mut h, &more, "More").await;
+    h.drain().await;
+    assert_eq!(paused(&mut h).await, None);
+    bounce_all(&h, &sent_ids(&h, &cid2, 5).await, "Transient").await;
+    assert_eq!(paused(&mut h).await, None, "soft bounces don't count or trigger a check");
+    bounce_all(&h, &sent_ids(&h, &cid2, 1).await, "Permanent").await;
+    let reason = paused(&mut h).await.expect("12% hard bounces over 250 emails pauses the account");
+    assert_eq!(reason, "hard bounce rate 12.4% (31 of 250 emails) in the last 7 days");
+    let me = h.ok("GET", "/api/me", None).await;
+    assert_eq!(me["support_email"], "help@pl.test");
+
+    // The operator was emailed.
+    let alert = h.state.email.sent().into_iter().find(|m| m.to == "ops@pl.test").expect("operator alert");
+    assert_eq!(alert.subject, "Sending paused: Acme Goods");
+    assert!(alert.text.contains("owner@acme.test") && alert.text.contains("/admin/unpause"), "{}", alert.text);
+
+    // Paused: test sends, new campaigns and MCP all say so; SMS readiness is unaffected.
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["qa@acme.test"]}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("Email sending is paused"), "{v}");
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Blocked", "channel": "email", "audience": {"include": [{"type": "list", "id": more}]},
+        "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("Email sending is paused"), "{v}");
+    let before = h.state.email.sent().len();
+    h.drain().await;
+    assert_eq!(h.state.email.sent().len(), before, "nothing was sent while paused");
+
+    // A campaign scheduled before the pause stops when it comes due; its recipients are skipped with a reason.
+    sqlx::query("UPDATE campaigns SET status = 'scheduled', send_at = now() WHERE id = $1::uuid").bind(c["id"].as_str().unwrap()).execute(&h.state.db).await.unwrap();
+    jobs::scheduler_tick(&h.state, 1).await.unwrap();
+    h.drain().await;
+    let stopped = h.ok("GET", &format!("/api/campaigns/{}", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(stopped["status"], "failed", "{stopped}");
+    assert!(stopped["error"].as_str().unwrap().contains("Email sending is paused"), "{stopped}");
+    assert_eq!(h.state.email.sent().len(), before);
+
+    // A live welcome flow records its email as skipped, with the reason, instead of sending it.
+    let flow = h.ok("POST", "/api/flows/from-blueprint", Some(json!({"key": "welcome_series"}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@x.test", "email_consent": "subscribed", "list_ids": [flow["trigger"]["list_id"]]}))).await;
+    h.drain().await;
+    assert_eq!(h.state.email.sent().len(), before);
+    let row: (String, Option<String>) = sqlx::query_as("SELECT status, error FROM messages WHERE to_address = 'new@x.test' AND flow_id IS NOT NULL")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(row, ("skipped".to_string(), Some("sending paused".to_string())));
+
+    // Lifting the pause: wrong token refused, then the right one. Old bounces no longer count.
+    let body = json!({"email": "owner@acme.test"}).to_string();
+    let (s, _, _) = h.raw("POST", "/admin/unpause", &[("authorization", "Bearer wrong-token-0123456789abcdef01234567"), ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(paused(&mut h).await.is_some());
+    let (s, _, out) = h.raw("POST", "/admin/unpause", &[ADMIN, ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["was_paused"], true);
+    assert_eq!(paused(&mut h).await, None);
+    // A late bounce from before the unpause doesn't pause it again.
+    bounce_all(&h, &sent_ids(&h, &cid2, 3).await, "Permanent").await;
+    assert_eq!(paused(&mut h).await, None, "the window restarted at the unpause");
+    h.ok("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["qa@acme.test"]}))).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let list = email_list(&mut h, "bought", 300).await;
+    h.drain().await;
+    let cid = start_email_campaign(&mut h, &list, "Bought list").await;
+    // Prepare, then send only the first batch of 100.
+    assert!(jobs::run_one(&h.state).await.unwrap());
+    assert!(jobs::run_one(&h.state).await.unwrap());
+    let sent_before = h.state.email.sent().len();
+    assert_eq!(sent_before, 100);
+
+    // 9 hard bounces (9%) is under the campaign limit; 15 (15%) trips it, though the account
+    // as a whole (100 sent) is still below its 200-email minimum.
+    let ids = sent_ids(&h, &cid, 100).await;
+    bounce_all(&h, &ids[..9], "Permanent").await;
+    assert_eq!(paused(&mut h).await, None);
+    bounce_all(&h, &ids[9..15], "Permanent").await;
+    let reason = paused(&mut h).await.expect("the campaign breaker pauses the account");
+    assert_eq!(reason, "hard bounce rate 15.0% (15 of 100 emails) on campaign \"Bought list\"");
+
+    // The rest of the campaign never goes out; its recipients are skipped with the reason.
+    h.drain().await;
+    assert_eq!(h.state.email.sent().iter().filter(|m| m.to != "ops@pl.test").count(), sent_before);
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "failed", "{c}");
+    assert!(c["error"].as_str().unwrap().contains("on campaign"), "{c}");
+    let skipped: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND status = 'skipped' AND error = 'sending paused'")
+        .bind(&cid)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(skipped, 200);
+
+    // MCP get_account reports it.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "mcp"}))).await;
+    let bearer = format!("Bearer {}", key["key"].as_str().unwrap());
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_account", "arguments": {}}}).to_string();
+    let (s, _, out) = h.raw("POST", "/mcp", &[("authorization", &bearer), ("content-type", "application/json"), ("accept", "application/json, text/event-stream")], &call).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert!(out.contains("email_sending_paused") && out.contains("Bought list"), "{out}");
     h.cleanup().await;
 }

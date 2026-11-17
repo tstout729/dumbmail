@@ -229,6 +229,9 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         }
     }
     if c.channel == "email" {
+        if account.sending_paused_at.is_some() {
+            problems.push(crate::deliverability::paused_message(account.sending_paused_reason.as_deref()));
+        }
         if account.address.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
         }
@@ -275,6 +278,13 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;
     if c.status != "sending" {
         return Ok(());
+    }
+    if c.channel == "email" {
+        if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
+            tx.commit().await?;
+            crate::deliverability::stop_campaign(&state.db, c.id, &crate::deliverability::paused_message(reason.as_deref())).await?;
+            return Ok(());
+        }
     }
     let audience: Audience = serde_json::from_value(c.audience.clone())?;
     let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
@@ -358,6 +368,10 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     let account = load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    if c.channel == "email" && account.sending_paused_at.is_some() {
+        crate::deliverability::stop_campaign(&state.db, c.id, &crate::deliverability::paused_message(account.sending_paused_reason.as_deref())).await?;
+        return Ok(());
+    }
     let ab = ab_test(&c);
     let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
         .bind(ids)

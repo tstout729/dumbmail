@@ -56,6 +56,10 @@ export type Account = {
   plan: Plan;
   onboarding: Onboarding;
   created_at: string;
+  /** Set while email sending is paused for high bounces or spam complaints; only support can lift it. */
+  sending_paused_at: string | null;
+  /** What tripped the pause, e.g. "hard bounce rate 12.0% (12 of 100 emails) …". */
+  sending_paused_reason: string | null;
 };
 
 export type AccountPatch = Partial<
@@ -102,7 +106,7 @@ export type BrandKit = {
 
 export type User = { id: string; email: string; name: string | null };
 
-export type Session = { user: User; account: Account };
+export type Session = { user: User; account: Account; support_email: string | null };
 
 // ---- Segments and conditions ----
 

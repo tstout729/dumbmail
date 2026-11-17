@@ -7,6 +7,7 @@ import { isTypingTarget, useWindowKeydown } from "../../lib/hooks";
 import { Button, Skeleton } from "../ui";
 import { CommandPalette } from "./CommandPalette";
 import { Logo } from "./Logo";
+import { SendingPausedBanner } from "./SendingPausedBanner";
 import { Sidebar } from "./Sidebar";
 
 function Splash() {
@@ -101,6 +102,7 @@ export function AppShell() {
             <Search className="size-5" />
           </button>
         </header>
+        <SendingPausedBanner />
         <main>
           <Suspense fallback={<ContentFallback />}>
             <Outlet />

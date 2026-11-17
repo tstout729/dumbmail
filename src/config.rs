@@ -121,6 +121,11 @@ pub struct Config {
     /// Contact address shown on the About, Privacy and Terms pages.
     #[arg(long, env = "SUPPORT_EMAIL")]
     pub support_email: Option<String>,
+    /// Where operator alerts go (an account's email sending was paused for high bounces/complaints).
+    /// Falls back to SUPPORT_EMAIL. The address emails itself, so its domain must be verified with the
+    /// email provider. Alerts are always logged too.
+    #[arg(long, env = "OPERATOR_ALERT_EMAIL")]
+    pub operator_alert_email: Option<String>,
     /// Old hostnames (comma-separated) whose page visits are sent to PUBLIC_URL with a permanent
     /// redirect. Webhooks, the API, MCP, tracking links and the website snippet keep working there.
     #[arg(long, env = "REDIRECT_HOSTS", value_delimiter = ',')]

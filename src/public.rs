@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
         .route("/webhooks/twilio/{secret}", post(twilio_webhook))
         .route("/webhooks/stripe", post(stripe_webhook))
         .route("/admin/credit", post(admin_credit))
+        .route("/admin/unpause", post(admin_unpause))
         .route("/healthz", get(|| async { "ok" }))
 }
 
@@ -704,16 +705,27 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
         }
         "Bounce" => {
             let permanent = msg["bounce"]["bounceType"].as_str() == Some("Permanent");
-            sqlx::query("UPDATE messages SET status = 'bounced', error = $2 WHERE id = $1").bind(m.id).bind(msg["bounce"]["bounceSubType"].as_str()).execute(&state.db).await?;
+            sqlx::query("UPDATE messages SET status = 'bounced', error = $2, bounce_type = $3 WHERE id = $1")
+                .bind(m.id)
+                .bind(msg["bounce"]["bounceSubType"].as_str())
+                .bind(msg["bounce"]["bounceType"].as_str())
+                .execute(&state.db)
+                .await?;
             if permanent {
                 sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             }
             msg_event(&state, &m, "Bounced Email", json!({"bounce_type": msg["bounce"]["bounceType"]}), Some(format!("bounce:{}", m.id))).await?;
+            if permanent && !m.is_test {
+                crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
+            }
         }
         "Complaint" => {
             sqlx::query("UPDATE messages SET status = 'complained' WHERE id = $1").bind(m.id).execute(&state.db).await?;
             sqlx::query("UPDATE profiles SET email_suppressed_reason = 'complaint', email_consent = 'unsubscribed', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             msg_event(&state, &m, "Marked Email as Spam", json!({}), Some(format!("complaint:{}", m.id))).await?;
+            if !m.is_test {
+                crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
+            }
         }
         _ => {}
     }
@@ -808,30 +820,51 @@ async fn stripe_webhook(State(state): State<AppState>, headers: HeaderMap, body:
     Ok(StatusCode::OK)
 }
 
-/// Operator: credit (or debit) an account by its owner's email. Bearer ADMIN_TOKEN.
-async fn admin_credit(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
+/// Operator endpoints need `Authorization: Bearer ADMIN_TOKEN`; they don't exist when it's unset or short.
+fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     let want = state.cfg.admin_token.as_deref().filter(|t| t.len() >= 32).ok_or_else(|| AppError::NotFound("not found".into()))?;
     let got = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     if got.len() != want.len() || got.bytes().zip(want.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {
         return Err(AppError::Unauthorized);
     }
+    Ok(())
+}
+
+/// The account (id, name) whose earliest member has this email.
+async fn account_by_owner_email(state: &AppState, b: &Value) -> AppResult<(Uuid, String)> {
     let email = b["email"].as_str().unwrap_or("").trim().to_lowercase();
-    let amount = b["amount"].as_f64().ok_or_else(|| AppError::bad("amount (USD) is required"))?;
-    if amount.abs() > 10_000.0 {
-        return Err(AppError::bad("amount too large"));
-    }
     let row: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT a.id, a.name FROM accounts a JOIN memberships m ON m.account_id = a.id JOIN users u ON u.id = m.user_id WHERE u.email = $1 ORDER BY m.created_at LIMIT 1",
     )
     .bind(&email)
     .fetch_optional(&state.db)
     .await?;
-    let (id, name) = row.ok_or_else(|| AppError::not_found("account"))?;
+    row.ok_or_else(|| AppError::not_found("account"))
+}
+
+/// Operator: credit (or debit) an account by its owner's email. Bearer ADMIN_TOKEN.
+async fn admin_credit(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
+    check_admin(&state, &headers)?;
+    let amount = b["amount"].as_f64().ok_or_else(|| AppError::bad("amount (USD) is required"))?;
+    if amount.abs() > 10_000.0 {
+        return Err(AppError::bad("amount too large"));
+    }
+    let (id, name) = account_by_owner_email(&state, &b).await?;
     let note = b["note"].as_str().unwrap_or("Credit added by DumbMail");
     crate::billing::post_entry(&state.db, id, "adjustment", crate::billing::to_micros(amount), note, &Uuid::now_v7().to_string()).await?;
     let bal = crate::billing::balance(&state.db, id).await?;
     tracing::info!(account = %id, amount, "admin credit");
     Ok(Json(json!({"account": name, "balance": crate::billing::to_usd(bal)})))
+}
+
+/// Operator: lift an automatic email sending pause, by the owner's email. Also restarts the window
+/// the bounce and complaint rates are measured over, so bounces from before don't pause it again.
+async fn admin_unpause(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
+    check_admin(&state, &headers)?;
+    let (id, name) = account_by_owner_email(&state, &b).await?;
+    let was_paused = crate::deliverability::unpause(&state.db, id).await?;
+    tracing::warn!(account = %id, was_paused, "admin lifted email sending pause");
+    Ok(Json(json!({"account": name, "was_paused": was_paused, "sending_paused": false})))
 }
 
 #[cfg(test)]

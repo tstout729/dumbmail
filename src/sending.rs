@@ -124,6 +124,35 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     };
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
 
+    // A paused account sends no email (see `deliverability`). Tests say why; real sends keep a
+    // skipped message row with the reason instead of disappearing.
+    if spec.channel == "email" && spec.account.sending_paused_at.is_some() {
+        if spec.is_test {
+            return Err(AppError::Conflict(crate::deliverability::paused_message(spec.account.sending_paused_reason.as_deref())));
+        }
+        match spec.message_id {
+            Some(mid) => {
+                sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error)
+                     VALUES ($1, $2, $3, 'email', $4, $5, $6, $7, 'skipped', 'sending paused')",
+                )
+                .bind(Uuid::now_v7())
+                .bind(spec.account.id)
+                .bind(p.id)
+                .bind(spec.campaign_id)
+                .bind(spec.flow_id)
+                .bind(spec.flow_node_id)
+                .bind(&to)
+                .execute(&state.db)
+                .await?;
+            }
+        }
+        return Ok(Outcome::Skipped("sending paused"));
+    }
+
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let ctx = render::context(spec.account, Some(p), spec.event, &unsub);
@@ -304,6 +333,8 @@ mod tests {
             onboarding: json!({}),
             conversion_metric: "Placed Order".into(),
             created_at: chrono::Utc::now(),
+            sending_paused_at: None,
+            sending_paused_reason: None,
             link_domain: None,
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),

@@ -24,6 +24,10 @@ pub struct Account {
     pub onboarding: Value,
     pub conversion_metric: String,
     pub created_at: DateTime<Utc>,
+    /// Set when email sending was paused automatically for high bounces or spam complaints (see
+    /// `deliverability`); campaigns, flows and tests send no email until an operator lifts it.
+    pub sending_paused_at: Option<DateTime<Utc>>,
+    pub sending_paused_reason: Option<String>,
     #[serde(skip)]
     pub link_domain: Option<String>,
     #[serde(skip)]
