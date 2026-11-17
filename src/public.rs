@@ -715,7 +715,9 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
                 sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             }
             msg_event(&state, &m, "Bounced Email", json!({"bounce_type": msg["bounce"]["bounceType"]}), Some(format!("bounce:{}", m.id))).await?;
-            if permanent && !m.is_test {
+            // Addresses already on the SES account suppression list don't count toward AWS's bounce rate.
+            if permanent && !m.is_test && msg["bounce"]["bounceSubType"].as_str() != Some("OnAccountSuppressionList") {
+                crate::deliverability::record_strike(&state.db, m.id, false).await?;
                 crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
             }
         }
@@ -724,6 +726,7 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
             sqlx::query("UPDATE profiles SET email_suppressed_reason = 'complaint', email_consent = 'unsubscribed', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             msg_event(&state, &m, "Marked Email as Spam", json!({}), Some(format!("complaint:{}", m.id))).await?;
             if !m.is_test {
+                crate::deliverability::record_strike(&state.db, m.id, true).await?;
                 crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
             }
         }
@@ -857,11 +860,18 @@ async fn admin_credit(State(state): State<AppState>, headers: HeaderMap, Json(b)
     Ok(Json(json!({"account": name, "balance": crate::billing::to_usd(bal)})))
 }
 
-/// Operator: lift an automatic email sending pause, by the owner's email. Also restarts the window
+/// Operator: lift an automatic email sending pause, by account id or the owner's email. Also restarts the window
 /// the bounce and complaint rates are measured over, so bounces from before don't pause it again.
 async fn admin_unpause(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
     check_admin(&state, &headers)?;
-    let (id, name) = account_by_owner_email(&state, &b).await?;
+    let (id, name) = match b["account_id"].as_str() {
+        Some(raw) => {
+            let id: Uuid = raw.trim().parse().map_err(|_| AppError::bad("account_id must be a UUID"))?;
+            let name: Option<String> = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
+            (id, name.ok_or_else(|| AppError::not_found("account"))?)
+        }
+        None => account_by_owner_email(&state, &b).await?,
+    };
     let was_paused = crate::deliverability::unpause(&state.db, id).await?;
     tracing::warn!(account = %id, was_paused, "admin lifted email sending pause");
     Ok(Json(json!({"account": name, "was_paused": was_paused, "sending_paused": false})))

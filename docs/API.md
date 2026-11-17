@@ -229,7 +229,8 @@ Every account on a server sends through the same email provider account (Amazon 
 service), which AWS reviews at a 5% bounce rate or 0.1% complaint rate. To protect everyone, an
 account's email sending pauses automatically when either check below trips. Rates count real (non-test)
 emails the provider accepted; bounces are permanent (hard) bounces only, not counting addresses already on
-the provider's account suppression list.
+the provider's account suppression list. Sends and their outcomes are recorded separately from messages,
+so deleting profiles (which deletes their messages) doesn't change the rates.
 
 | Check | Window | Judged after | Pauses when |
 | --- | --- | --- | --- |
@@ -253,12 +254,12 @@ scheduler catches up within about 20 seconds). While paused:
 ## Operator endpoints
 
 Require `Authorization: Bearer <ADMIN_TOKEN>` (32+ characters). When ADMIN_TOKEN is unset or shorter they
-answer 404; a wrong token gets 401. The account is the one whose first member has `email`.
+answer 404; a wrong token gets 401. Given `email`, the account is the one whose first member has that email.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | POST | `/admin/credit` | `{email, amount, note?}` (USD; negative debits, at most 10,000) | `{account, balance}` |
-| POST | `/admin/unpause` | `{email}` | `{account, was_paused, sending_paused: false}`. Lifts the automatic email pause and restarts the window the rates are measured over, so bounces from before don't pause the account again. Campaigns stopped by the pause stay failed |
+| POST | `/admin/unpause` | `{account_id}` or `{email}` | `{account, was_paused, sending_paused: false}`. Lifts the automatic email pause and restarts the window the rates are measured over, so bounces from before don't pause the account again. Campaigns stopped by the pause stay failed |
 
 ## v0.2 additions: pay-as-you-go billing, phone numbers, domains, website snippet
 

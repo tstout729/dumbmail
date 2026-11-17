@@ -266,6 +266,9 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                 .bind(cost)
                 .execute(&state.db)
                 .await?;
+            if spec.channel == "email" && !spec.is_test {
+                crate::deliverability::record_send(&state.db, message_id, spec.account.id, spec.campaign_id).await?;
+            }
             if !spec.is_test {
                 let metric = if spec.channel == "email" { "Received Email" } else { "Received SMS" };
                 record_event(

@@ -15,6 +15,8 @@ pub struct Inner {
     pub email: Arc<dyn EmailProvider>,
     pub sms: Arc<dyn SmsProvider>,
     pub http: reqwest::Client,
+    /// Bounce/complaint rate checks put off by the per-account rate limit (see `deliverability`).
+    pub pending_checks: crate::deliverability::PendingChecks,
 }
 
 impl std::ops::Deref for AppState {
@@ -49,6 +51,6 @@ impl AppState {
             "log" => Arc::new(LogSms::new()),
             other => anyhow::bail!("unknown SMS_PROVIDER {other:?} (use telnyx, twilio or log)"),
         };
-        Ok(AppState(Arc::new(Inner { db, cfg, email, sms, http })))
+        Ok(AppState(Arc::new(Inner { db, cfg, email, sms, http, pending_checks: Default::default() })))
     }
 }

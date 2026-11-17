@@ -1499,7 +1499,8 @@ async fn account_pauses_past_the_bounce_threshold_and_operator_lifts_it() {
     // The operator was emailed.
     let alert = h.state.email.sent().into_iter().find(|m| m.to == "ops@pl.test").expect("operator alert");
     assert_eq!(alert.subject, "Sending paused: Acme Goods");
-    assert!(alert.text.contains("owner@acme.test") && alert.text.contains("/admin/unpause"), "{}", alert.text);
+    assert!(alert.text.contains("Owner email: owner@acme.test") && alert.text.contains("/admin/unpause"), "{}", alert.text);
+    assert!(alert.text.contains(r#"-d '{"account_id":""#), "the command carries only the account id: {}", alert.text);
 
     // Paused: test sends, new campaigns and MCP all say so; SMS readiness is unaffected.
     let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["qa@acme.test"]}))).await;
@@ -1571,6 +1572,15 @@ async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
     let ids = sent_ids(&h, &cid, 100).await;
     bounce_all(&h, &ids[..9], "Permanent").await;
     assert_eq!(paused(&mut h).await, None);
+    // Deleting the bounced profiles (which deletes their messages) doesn't erase the bounces or the sends.
+    let bounced: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT profile_id FROM messages WHERE provider_message_id = ANY($1)")
+        .bind(&ids[..9])
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    for pid in bounced {
+        h.ok("DELETE", &format!("/api/profiles/{pid}"), None).await;
+    }
     bounce_all(&h, &ids[9..15], "Permanent").await;
     let reason = paused(&mut h).await.expect("the campaign breaker pauses the account");
     assert_eq!(reason, "hard bounce rate 15.0% (15 of 100 emails) on campaign \"Bought list\"");
@@ -1595,5 +1605,13 @@ async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
     let (s, _, out) = h.raw("POST", "/mcp", &[("authorization", &bearer), ("content-type", "application/json"), ("accept", "application/json, text/event-stream")], &call).await;
     assert_eq!(s, StatusCode::OK, "{out}");
     assert!(out.contains("email_sending_paused") && out.contains("Bought list"), "{out}");
+
+    // The operator can also lift it by account id.
+    let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    let body = json!({"account_id": account_id}).to_string();
+    let (s, _, out) = h.raw("POST", "/admin/unpause", &[ADMIN, ("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert!(out.contains(r#""was_paused":true"#), "{out}");
+    assert_eq!(paused(&mut h).await, None);
     h.cleanup().await;
 }

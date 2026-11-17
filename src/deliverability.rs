@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::providers::email::OutgoingEmail;
@@ -37,8 +36,8 @@ pub const WINDOW_DAYS: i32 = 7;
 /// Per account, rates are recomputed at most this often from webhooks; the scheduler catches up the rest.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Email outcomes in a window. `sent` counts every email the provider accepted (sent, delivered,
-/// bounced or complained), the same denominator AWS uses.
+/// Email outcomes in a window, from `email_sends`: `sent` counts every real email the provider accepted
+/// (the denominator AWS uses), `bounced` the permanent (hard) bounces and `complained` the spam complaints.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct Outcomes {
     pub sent: i64,
@@ -63,21 +62,52 @@ pub fn verdict(o: &Outcomes, l: &Limits) -> Option<String> {
     None
 }
 
-/// Shared WHERE for both scopes: real email, created inside the window (7 days, and since the last unpause).
-const OUTCOMES_SELECT: &str = "SELECT
-        count(*) FILTER (WHERE m.status IN ('sent','delivered','bounced','complained'))::bigint AS sent,
-        count(*) FILTER (WHERE m.status = 'bounced' AND m.bounce_type = 'Permanent' AND m.error IS DISTINCT FROM 'OnAccountSuppressionList')::bigint AS bounced,
-        count(*) FILTER (WHERE m.status = 'complained')::bigint AS complained
-    FROM messages m JOIN accounts a ON a.id = m.account_id
-    WHERE m.account_id = $1 AND m.channel = 'email' AND NOT m.is_test
-      AND m.created_at > GREATEST(now() - make_interval(days => $2), COALESCE(a.sending_window_start, '-infinity'))";
+/// Emails sent inside the window: the last 7 days, and since the pause was last lifted.
+const OUTCOMES_SELECT: &str = "SELECT count(*)::bigint AS sent,
+        count(*) FILTER (WHERE s.hard_bounce)::bigint AS bounced,
+        count(*) FILTER (WHERE s.complaint)::bigint AS complained
+    FROM email_sends s JOIN accounts a ON a.id = s.account_id
+    WHERE s.account_id = $1
+      AND s.sent_at > GREATEST(now() - make_interval(days => $2), COALESCE(a.sending_window_start, '-infinity'))";
 
 pub async fn account_outcomes(db: &sqlx::PgPool, account_id: Uuid) -> sqlx::Result<Outcomes> {
     sqlx::query_as(OUTCOMES_SELECT).bind(account_id).bind(WINDOW_DAYS).fetch_one(db).await
 }
 
 pub async fn campaign_outcomes(db: &sqlx::PgPool, account_id: Uuid, campaign_id: Uuid) -> sqlx::Result<Outcomes> {
-    sqlx::query_as(&format!("{OUTCOMES_SELECT} AND m.campaign_id = $3")).bind(account_id).bind(WINDOW_DAYS).bind(campaign_id).fetch_one(db).await
+    sqlx::query_as(&format!("{OUTCOMES_SELECT} AND s.campaign_id = $3")).bind(account_id).bind(WINDOW_DAYS).bind(campaign_id).fetch_one(db).await
+}
+
+/// The provider accepted a real email: count it toward the account's rates.
+pub async fn record_send(db: &sqlx::PgPool, message_id: Uuid, account_id: Uuid, campaign_id: Option<Uuid>) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO email_sends (message_id, account_id, campaign_id) VALUES ($1, $2, $3) ON CONFLICT (message_id) DO NOTHING")
+        .bind(message_id)
+        .bind(account_id)
+        .bind(campaign_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// SES reported a hard bounce (`complaint` false) or a complaint for a sent email.
+pub async fn record_strike(db: &sqlx::PgPool, message_id: Uuid, complaint: bool) -> sqlx::Result<()> {
+    let q = if complaint { "UPDATE email_sends SET complaint = true WHERE message_id = $1" } else { "UPDATE email_sends SET hard_bounce = true WHERE message_id = $1" };
+    sqlx::query(q).bind(message_id).execute(db).await?;
+    Ok(())
+}
+
+/// Scheduler: send records only matter for the 7-day window.
+pub async fn prune(db: &sqlx::PgPool) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM email_sends WHERE sent_at < now() - interval '30 days'").execute(db).await?;
+    Ok(())
+}
+
+/// Tenant-chosen text (account and campaign names, emails) made safe to quote in a reason or an alert:
+/// one line, no control characters, at most `max` characters.
+pub fn plain(s: &str, max: usize) -> String {
+    let one_line: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let t = one_line.trim();
+    if t.chars().count() > max { format!("{}…", t.chars().take(max).collect::<String>()) } else { t.to_string() }
 }
 
 /// The message customers see on a stopped campaign or a blocked test send.
@@ -105,7 +135,7 @@ pub async fn check(state: &AppState, account_id: Uuid, campaign_ids: &[Uuid]) ->
         let o = campaign_outcomes(&state.db, account_id, cid).await?;
         if let Some(why) = verdict(&o, &CAMPAIGN) {
             let name: Option<String> = sqlx::query_scalar("SELECT name FROM campaigns WHERE id = $1").bind(cid).fetch_optional(&state.db).await?;
-            let reason = format!("{why} on campaign \"{}\"", name.unwrap_or_else(|| cid.to_string()));
+            let reason = format!("{why} on campaign \"{}\"", plain(&name.unwrap_or_else(|| cid.to_string()), 80));
             return pause(state, account_id, &reason).await;
         }
     }
@@ -175,6 +205,8 @@ fn esc(s: &str) -> String {
 
 /// Email OPERATOR_ALERT_EMAIL (or SUPPORT_EMAIL) through the platform's email provider. The address
 /// sends to itself, so its domain must be verified with the provider. Failures are only logged.
+/// Tenant-chosen text is flattened to one line and kept out of the ready-to-run command, which only
+/// carries the account id.
 async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: &str) {
     let Some(to) = state.cfg.operator_alert_email.as_deref().or(state.cfg.support_email.as_deref()).filter(|s| s.contains('@')) else {
         tracing::error!(account = %account_id, "no OPERATOR_ALERT_EMAIL or SUPPORT_EMAIL set; sending pause alert only logged");
@@ -188,11 +220,12 @@ async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: 
     .await
     .ok()
     .flatten();
-    let owner = owner.unwrap_or_else(|| "(unknown)".into());
+    let (name, reason) = (plain(name, 120), plain(reason, 300));
+    let owner = plain(owner.as_deref().unwrap_or("(unknown)"), 254);
     let text = format!(
-        "Email sending for {name} was paused automatically: {reason}.\n\nAccount: {account_id}\nOwner: {owner}\n\n\
+        "Email sending for an account was paused automatically.\n\nAccount name: {name}\nAccount id: {account_id}\nOwner email: {owner}\nReason: {reason}\n\n\
          Their email campaigns in progress were stopped and flow emails are skipped until the pause is lifted.\n\
-         Once the list is cleaned up, lift it with:\n\n  curl -X POST {}/admin/unpause -H 'Authorization: Bearer $ADMIN_TOKEN' -H 'Content-Type: application/json' -d '{{\"email\":\"{owner}\"}}'\n",
+         Once the list is cleaned up, lift it with:\n\n  curl -X POST {}/admin/unpause -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' -d '{{\"account_id\":\"{account_id}\"}}'\n",
         state.cfg.public_url()
     );
     let html = format!("<pre style=\"font-family:ui-monospace,monospace;white-space:pre-wrap\">{}</pre>", esc(&text));
@@ -201,8 +234,8 @@ async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: 
         to: to.to_string(),
         from_name: "DumbMail alerts".into(),
         from_email: to.to_string(),
-        reply_to: Some(owner.clone()).filter(|o| o.contains('@')),
-        subject: format!("Sending paused: {name}"),
+        reply_to: None,
+        subject: format!("Sending paused: {}", plain(&name, 60)),
         html,
         text,
         unsubscribe_url: None,
@@ -213,19 +246,20 @@ async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: 
 }
 
 #[derive(Default)]
-struct Pending {
+pub struct Pending {
     last_check: Option<Instant>,
     due: bool,
     campaigns: HashSet<Uuid>,
 }
 
-static PENDING: Lazy<Mutex<HashMap<Uuid, Pending>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Per account: when rates were last checked and what's waiting for the scheduler (lives in `AppState`).
+pub type PendingChecks = Mutex<HashMap<Uuid, Pending>>;
 
 /// A bounce or complaint arrived: check now unless this account was checked in the last few seconds,
 /// in which case the scheduler's `check_pending` does it shortly.
 pub async fn note_outcome(state: &AppState, account_id: Uuid, campaign_id: Option<Uuid>) {
     let campaigns = {
-        let Ok(mut map) = PENDING.lock() else { return };
+        let Ok(mut map) = state.pending_checks.lock() else { return };
         let p = map.entry(account_id).or_default();
         p.campaigns.extend(campaign_id);
         if p.last_check.is_some_and(|t| t.elapsed() < CHECK_INTERVAL) {
@@ -244,7 +278,7 @@ pub async fn note_outcome(state: &AppState, account_id: Uuid, campaign_id: Optio
 /// Scheduler: run the checks that `note_outcome` put off.
 pub async fn check_pending(state: &AppState) -> anyhow::Result<()> {
     let due: Vec<(Uuid, Vec<Uuid>)> = {
-        let Ok(mut map) = PENDING.lock() else { return Ok(()) };
+        let Ok(mut map) = state.pending_checks.lock() else { return Ok(()) };
         map.retain(|_, p| p.due || p.last_check.is_some_and(|t| t.elapsed() < CHECK_INTERVAL * 6));
         map.iter_mut()
             .filter(|(_, p)| p.due)
@@ -305,6 +339,12 @@ mod tests {
         // An account-level 5% would pause the account but not trip the campaign breaker.
         assert!(verdict(&o(1000, 50, 0), &ACCOUNT).is_some());
         assert_eq!(verdict(&o(1000, 50, 0), &CAMPAIGN), None);
+    }
+
+    #[test]
+    fn tenant_text_is_flattened_and_capped() {
+        assert_eq!(plain("Acme\r\nBcc: x@evil.test", 100), "Acme  Bcc: x@evil.test");
+        assert_eq!(plain("  abcdef ", 3), "abc…");
     }
 
     #[test]
