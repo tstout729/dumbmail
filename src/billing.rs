@@ -275,10 +275,27 @@ async fn stripe_get(state: &AppState, path: &str) -> AppResult<Value> {
     res.json().await.map_err(|e| AppError::Internal(e.into()))
 }
 
+/// True when Stripe says a saved customer doesn't exist under the current key: one saved in test
+/// mode before the server switched to live keys, or one deleted in the Dashboard.
+fn customer_gone(v: &Value) -> bool {
+    v["error"]["code"] == "resource_missing" || v["deleted"] == true
+}
+
+/// Forget a saved customer and card that no longer exist in Stripe, so the next top-up starts
+/// fresh and the billing page asks for a card again.
+async fn forget_stripe_customer(state: &AppState, account_id: Uuid) -> AppResult<()> {
+    sqlx::query("UPDATE accounts SET stripe_customer_id = NULL, stripe_payment_method_id = NULL WHERE id = $1").bind(account_id).execute(&state.db).await?;
+    Ok(())
+}
+
 async fn ensure_customer(state: &AppState, account_id: Uuid) -> AppResult<String> {
     let (existing, name): (Option<String>, String) = sqlx::query_as("SELECT stripe_customer_id, name FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
     if let Some(c) = existing {
-        return Ok(c);
+        if !customer_gone(&stripe_get(state, &format!("customers/{c}")).await?) {
+            return Ok(c);
+        }
+        tracing::info!(account = %account_id, "saved Stripe customer no longer exists; creating a new one");
+        forget_stripe_customer(state, account_id).await?;
     }
     let email: Option<String> = sqlx::query_scalar("SELECT u.email FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 1")
         .bind(account_id)
@@ -420,6 +437,11 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
     .fetch_all(&state.db)
     .await?;
     for (account_id, customer, pm, amount) in due {
+        if customer_gone(&stripe_get(state, &format!("customers/{customer}")).await.map_err(|e| anyhow::anyhow!(e.public_message()))?) {
+            tracing::info!(account = %account_id, "auto-recharge card belongs to a Stripe customer that no longer exists; forgetting it");
+            forget_stripe_customer(state, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            continue;
+        }
         let cents = amount / 10_000;
         let form: Vec<(String, String)> = vec![
             ("amount".into(), cents.to_string()),
@@ -504,6 +526,14 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripe_customer_gone() {
+        assert!(customer_gone(&serde_json::json!({"error": {"code": "resource_missing", "message": "No such customer: 'cus_test'"}})));
+        assert!(customer_gone(&serde_json::json!({"id": "cus_1", "deleted": true})));
+        assert!(!customer_gone(&serde_json::json!({"id": "cus_1", "object": "customer"})));
+        assert!(!customer_gone(&serde_json::json!({"error": {"code": "rate_limit"}})));
+    }
 
     #[test]
     fn stripe_signatures() {
