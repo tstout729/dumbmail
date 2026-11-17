@@ -6,7 +6,7 @@ DumbMail keeps a catalog of your products so emails can show the right products 
 
 There are five ways in. They all save products by **your store's id** (`external_id`): saving the same id again updates the product. Fields you leave out keep their saved value.
 
-1. **From your site, with no setup.** The website snippet and the Shopify checkout pixel already send Viewed Product, Added to Cart, Started Checkout and Placed Order with product details. DumbMail reads those events and adds the products it sees, as long as you have no feed (turn this off with `learn_from_events`). Products from a feed, the API or a CSV are never changed by events. Product activity (who viewed, carted and bought what) is always read from events, whatever the source of the product.
+1. **From your site, with no setup.** The website snippet and the Shopify checkout pixel already send Viewed Product, Added to Cart, Started Checkout and Placed Order with product details. DumbMail reads those events and adds the products it sees, as long as you have no feed (turn this off with `learn_from_events`). Anyone can send events from a browser, so a product is only learned when its page is on your own site: your website (Settings → Account) or a verified sending domain, or a subdomain of either. Products from a feed, the API or a CSV are never changed by events. Product activity (who viewed, carted and bought what) is always read from events, whatever the source of the product.
 2. **A feed**, fetched on a schedule (every 1 to 168 hours, default 6):
    - `json`: a JSON list of products, or an object holding one (`products`, `items`, `data`, `entries` or `results`; set `items_path` for anything else). Shopify's public `https://your-store.com/products.json` works as is.
    - `google_xml`: a Google Shopping / Merchant Center feed, RSS 2.0 or Atom with the `g:` namespace. Items sharing `g:item_group_id` become one product with variants. `g:sale_price` becomes the price and `g:price` the compare-at price. `g:product_type` becomes categories and `g:custom_label_0`–`4` become tags.
@@ -52,10 +52,10 @@ Add a `products` block to an email's `blocks`. It's filled for each person when 
 | --- | --- |
 | `handpicked` | The products in `product_ids` (your ids), in that order. |
 | `collection` | Products with a `category`, `tag` and/or `brand`, newest first. |
-| `best_sellers` | Most units ordered in the last `days` days (default 30). |
+| `best_sellers` | Bought by the most people in the last `days` days (default 30). |
 | `newest` | Most recently published. |
 | `on_sale` | Biggest discount (compare-at price above price) first. |
-| `event_items` | The triggering event's products: the cart for Added to Cart and Started Checkout, the viewed product for Viewed Product, the order's items for Placed Order, the product for Back in Stock and Price Dropped. Current prices and images come from the catalog when it has the product. |
+| `event_items` | The triggering event's products: the cart for Added to Cart and Started Checkout, the viewed product for Viewed Product, the order's items for Placed Order, the product for Back in Stock and Price Dropped. Current prices and images come from the catalog when it has the product; for a product it doesn't have, the link is kept only if it's on your own site. |
 | `recently_viewed` | What this person viewed, latest first. |
 | `recommended` | Picks for this person (see Recommendations). |
 
@@ -83,7 +83,7 @@ These only load when a template uses them, and lists that are the same for every
 
 Computed from what people did, not a trained model:
 
-- **Bought together**: how many orders had both products.
+- **Bought together**: how many people ordered both products in the same order.
 - **Viewed together**: how many people viewed both in the last 90 days.
 - **For a person**: products bought together with what they bought or carted, and viewed together with what they viewed; then popular products in the categories they browse most; leaving out anything they've bought; then best sellers to fill. Only published, in-stock products.
 

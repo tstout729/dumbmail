@@ -192,11 +192,13 @@ fn products_html(b: &Value, brand: &str, font: &str) -> String {
     let cell = |it: &Value| {
         let href = product_href(&it["url"]);
         let title = product_text(&it["title"]);
+        // Without a web link the product shows unlinked and without a button.
+        let link = |inner: String| if href == "#" { inner } else { format!(r#"<a href="{href}" style="text-decoration:none;color:#111827;">{inner}</a>"#) };
         let img = match it["image_url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
-            Some(u) => format!(
-                r#"<a href="{href}"><img src="{}" alt="{title}" width="{img_w}" style="display:block;width:100%;max-width:{img_w}px;height:auto;border:0;border-radius:6px;margin:0 auto 10px;"></a>"#,
+            Some(u) => link(format!(
+                r#"<img src="{}" alt="{title}" width="{img_w}" style="display:block;width:100%;max-width:{img_w}px;height:auto;border:0;border-radius:6px;margin:0 auto 10px;">"#,
                 esc(&u.replace('{', "%7B").replace('}', "%7D"))
-            ),
+            )),
             None => String::new(),
         };
         let mut price = String::new();
@@ -209,13 +211,14 @@ fn products_html(b: &Value, brand: &str, font: &str) -> String {
                 price = format!(r#"<div style="font-family:{font};font-size:15px;color:#4b5563;margin:2px 0 10px;">{}{was}</div>"#, product_text(&json!(p)));
             }
         }
-        let button = if show_button {
+        let button = if show_button && href != "#" {
             format!(r#"<a href="{href}" style="display:inline-block;padding:9px 18px;background:{brand};color:#fff;border-radius:6px;font-family:{font};font-size:14px;font-weight:600;text-decoration:none;">{btn}</a>"#)
         } else {
             String::new()
         };
         format!(
-            r#"<td class="pl-col" valign="top" width="{width}%" style="width:{width}%;padding:8px;text-align:center;">{img}<a href="{href}" style="font-family:{font};font-size:16px;font-weight:600;color:#111827;text-decoration:none;">{title}</a>{price}{button}</td>"#
+            r#"<td class="pl-col" valign="top" width="{width}%" style="width:{width}%;padding:8px;text-align:center;">{img}<div style="font-family:{font};font-size:16px;font-weight:600;color:#111827;">{}</div>{price}{button}</td>"#,
+            link(title.clone())
         )
     };
     let rows: String = items
@@ -247,7 +250,8 @@ fn block_text(b: &Value, out: &mut String) {
         "product" => out.push_str(&format!("{} {} {}\n\n", s(b, "title"), s(b, "price"), s(b, "href"))),
         "products" => {
             // Catalog text can't open a template tag in the plain-text part either.
-            let inert = |v: &Value| v.as_str().unwrap_or("").replace("{{", "{ {").replace("{%", "{ %").replace("{#", "{ #");
+            // A zero-width space after every brace: no sequence of them can open a tag.
+            let inert = |v: &Value| v.as_str().unwrap_or("").replace('{', "{\u{200B}");
             for it in b.get("items").and_then(|i| i.as_array()).into_iter().flatten().take(12) {
                 let line = [inert(&it["title"]), inert(&it["price_text"]), inert(&it["url"])].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" ");
                 out.push_str(&line);
@@ -615,8 +619,11 @@ mod tests {
         assert!(out.html.contains("line-through;\">$15.00"));
         assert!(out.html.contains("width=\"33%\""));
         assert!(!out.html.contains("javascript:"));
-        assert_eq!(out.html.matches(">Buy</a>").count(), 2);
-        assert!(out.text.contains("Mug { { oops }} $12.00 https://shop.test/mug"));
+        assert_eq!(out.html.matches(">Buy</a>").count(), 1, "no button without a web link");
+        assert!(out.text.contains("Mug {\u{200B}{\u{200B} oops }} $12.00 https://shop.test/mug"));
+        let tricky: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "products", "items": [{"title": "{{{ 7*7 }}}{% if 1 %}x{% endif %}"}]}]})).unwrap();
+        let out = render_email(&account(), &tricky, &json!({}), None).unwrap();
+        assert!(!out.text.contains("49") && out.text.contains("7*7"), "{}", out.text);
     }
 
     #[test]

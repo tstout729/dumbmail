@@ -1,7 +1,7 @@
 //! Product lists and recommendations, computed in SQL from what people did (no trained model).
 //!
-//! - Best sellers: units ordered in the last N days.
-//! - Bought together: how often two products were in the same order.
+//! - Best sellers: the most different buyers in the last N days.
+//! - Bought together: how many people bought two products in the same order.
 //! - Viewed together: how many people viewed both within 90 days.
 //! - For a person: products bought or viewed together with theirs, then popular products in the
 //!   categories they browse, leaving out what they've bought, then best sellers to fill.
@@ -98,11 +98,12 @@ pub async fn related(db: &PgPool, product_id: Uuid, kind: Related) -> AppResult<
     Ok(rows)
 }
 
-/// Best sellers by units ordered in the last `days` days; newest products fill in when there are few orders.
+/// Best sellers: the most different buyers in the last `days` days (so one shopper, or one made-up
+/// profile, can't push a product up); newest products fill in when there are few orders.
 pub async fn best_sellers(db: &PgPool, account_id: Uuid, days: i32, limit: i64, in_stock_only: bool, exclude: &[Uuid]) -> AppResult<Vec<Product>> {
     let q = format!(
         "SELECT {PRODUCT_COLS} FROM catalog_products cp
-         LEFT JOIN (SELECT product_id, sum(quantity) AS units FROM catalog_interactions
+         LEFT JOIN (SELECT product_id, count(DISTINCT profile_id) AS units FROM catalog_interactions
                     WHERE account_id = $1 AND kind = 'ordered' AND occurred_at > now() - make_interval(days => $2) GROUP BY product_id) s ON s.product_id = cp.id
          WHERE cp.account_id = $1 AND cp.published AND (NOT $3 OR cp.in_stock) AND NOT (cp.id = ANY($4))
          ORDER BY COALESCE(s.units, 0) DESC, cp.published_at DESC, cp.id LIMIT $5"
@@ -170,7 +171,7 @@ pub async fn for_person(db: &PgPool, account_id: Uuid, profile_id: Uuid, limit: 
     .await?;
     if !cats.is_empty() {
         let rows: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT cp.id, COALESCE((SELECT sum(quantity) FROM catalog_interactions o WHERE o.product_id = cp.id AND o.kind = 'ordered'
+            "SELECT cp.id, COALESCE((SELECT count(DISTINCT o.profile_id) FROM catalog_interactions o WHERE o.product_id = cp.id AND o.kind = 'ordered'
                                      AND o.occurred_at > now() - interval '90 days'), 0)::bigint AS units
              FROM catalog_products cp WHERE cp.account_id = $1 AND cp.published AND cp.in_stock AND cp.categories && $2
              ORDER BY units DESC, cp.published_at DESC LIMIT 30",

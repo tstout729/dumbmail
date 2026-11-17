@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::recs;
 use super::store::{self, card, Product, PRODUCT_COLS};
 use crate::error::AppResult;
-use crate::models::Profile;
+use crate::models::{Account, Profile};
 
 pub const SOURCES: &[&str] = &["handpicked", "collection", "best_sellers", "newest", "on_sale", "event_items", "recently_viewed", "recommended"];
 const MAX_COUNT: i64 = 12;
@@ -99,7 +99,8 @@ async fn list_query(db: &PgPool, account_id: Uuid, sql_where: &str, order: &str,
 }
 
 /// The products one source gives, as cards.
-async fn source_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, event: Option<&Value>, spec: &Spec<'_>, preview: bool) -> AppResult<Vec<Value>> {
+async fn source_cards(db: &PgPool, account: &Account, profile: Option<&Profile>, event: Option<&Value>, spec: &Spec<'_>, preview: bool) -> AppResult<Vec<Value>> {
+    let account_id = account.id;
     let (count, oos) = (spec.count, spec.hide_oos);
     let shared_key = match spec.source {
         "handpicked" | "collection" | "best_sellers" | "newest" | "on_sale" => Some(format!(
@@ -144,7 +145,7 @@ async fn source_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, 
             Some(p) => recs::for_person(db, account_id, p.id, count).await?,
             None => Vec::new(),
         },
-        "event_items" => return event_item_cards(db, account_id, profile, event, count, oos, preview).await,
+        "event_items" => return event_item_cards(db, account, profile, event, count, oos, preview).await,
         _ => Vec::new(),
     };
     let cards: Vec<Value> = products.iter().take(count as usize).map(card).collect();
@@ -154,9 +155,10 @@ async fn source_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, 
     Ok(cards)
 }
 
-/// The triggering event's items. A preview has no event, so it uses this person's latest
-/// cart, checkout or product view instead.
-async fn event_item_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, event: Option<&Value>, count: i64, oos: bool, preview: bool) -> AppResult<Vec<Value>> {
+/// The triggering event's items. A preview has no event, so it uses this person's latest cart
+/// or checkout (else their latest order or product view) instead.
+async fn event_item_cards(db: &PgPool, account: &Account, profile: Option<&Profile>, event: Option<&Value>, count: i64, oos: bool, preview: bool) -> AppResult<Vec<Value>> {
+    let account_id = account.id;
     let sample;
     let event = match (event.filter(|e| e.get("properties").is_some()), profile) {
         (Some(e), _) => e,
@@ -164,7 +166,7 @@ async fn event_item_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profil
             let row: Option<(String, Value)> = sqlx::query_as(
                 "SELECT m.name, e.properties FROM events e JOIN metrics m ON m.id = e.metric_id
                  WHERE e.profile_id = $1 AND m.name IN ('Started Checkout', 'Added to Cart', 'Placed Order', 'Viewed Product')
-                 ORDER BY e.occurred_at DESC LIMIT 1",
+                 ORDER BY (m.name IN ('Started Checkout', 'Added to Cart')) DESC, e.occurred_at DESC LIMIT 1",
             )
             .bind(p.id)
             .fetch_optional(db)
@@ -175,7 +177,8 @@ async fn event_item_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profil
         }
         _ => return Ok(Vec::new()),
     };
-    let items = super::learn::event_cards(db, account_id, event).await?;
+    let hosts = super::learn::hosts_of(account.website.as_deref(), &account.verified_domains);
+    let items = super::learn::event_cards(db, account_id, &hosts, event).await?;
     let ids: Vec<Uuid> = items.iter().filter_map(|(id, _)| *id).collect();
     let known = recs::products_by_ids(db, account_id, &ids, false).await?;
     let mut out = Vec::new();
@@ -205,15 +208,15 @@ async fn event_item_cards(db: &PgPool, account_id: Uuid, profile: Option<&Profil
 }
 
 /// The products a block shows for one recipient, trying its fallback when the source is empty.
-pub async fn resolve_block(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, event: Option<&Value>, block: &Value, preview: bool) -> AppResult<Vec<Value>> {
+pub async fn resolve_block(db: &PgPool, account: &Account, profile: Option<&Profile>, event: Option<&Value>, block: &Value, preview: bool) -> AppResult<Vec<Value>> {
     let count = block.get("count").and_then(|c| c.as_i64()).unwrap_or(4).clamp(1, MAX_COUNT);
     let hide_oos = block.get("hide_out_of_stock").and_then(|v| v.as_bool()).unwrap_or(true);
     let source = s(block, "source").unwrap_or("best_sellers");
     let spec = Spec { source, block, count, hide_oos };
-    let mut items = source_cards(db, account_id, profile, event, &spec, preview).await?;
+    let mut items = source_cards(db, account, profile, event, &spec, preview).await?;
     if items.is_empty() {
         if let Some(fb) = s(block, "fallback").filter(|f| *f != source && SOURCES.contains(f)) {
-            items = source_cards(db, account_id, profile, event, &Spec { source: fb, block, count, hide_oos }, preview).await?;
+            items = source_cards(db, account, profile, event, &Spec { source: fb, block, count, hide_oos }, preview).await?;
         }
     }
     Ok(items)
@@ -259,7 +262,8 @@ fn scan(v: &Value, refs: &mut Refs, ids: &mut Vec<String>, depth: usize) {
 
 /// Fill a message's product blocks and catalog variables for one recipient. Returns the content
 /// to render (unchanged and unqueried when it uses no catalog data).
-pub async fn personalize<'a>(db: &PgPool, account_id: Uuid, profile: Option<&Profile>, event: Option<&Value>, content: &'a Value, ctx: &mut Value, preview: bool) -> AppResult<Cow<'a, Value>> {
+pub async fn personalize<'a>(db: &PgPool, account: &Account, profile: Option<&Profile>, event: Option<&Value>, content: &'a Value, ctx: &mut Value, preview: bool) -> AppResult<Cow<'a, Value>> {
+    let account_id = account.id;
     let mut refs = Refs::default();
     let mut ids = Vec::new();
     scan(content, &mut refs, &mut ids, 0);
@@ -270,7 +274,7 @@ pub async fn personalize<'a>(db: &PgPool, account_id: Uuid, profile: Option<&Pro
     if refs.products_block {
         if let Some(blocks) = out.get_mut("blocks").and_then(|b| b.as_array_mut()) {
             for b in blocks.iter_mut().filter(|b| b["type"] == "products") {
-                let items = resolve_block(db, account_id, profile, event, b, preview).await?;
+                let items = resolve_block(db, account, profile, event, b, preview).await?;
                 b["items"] = Value::Array(items);
             }
         }
@@ -288,7 +292,7 @@ pub async fn personalize<'a>(db: &PgPool, account_id: Uuid, profile: Option<&Pro
         for (name, source) in [("best_sellers", "best_sellers"), ("newest", "newest"), ("on_sale", "on_sale")] {
             if text.contains(&format!("catalog.{name}")) {
                 let block = json!({});
-                let cards = source_cards(db, account_id, None, None, &Spec { source, block: &block, count: LIST_SIZE, hide_oos: true }, preview).await?;
+                let cards = source_cards(db, account, None, None, &Spec { source, block: &block, count: LIST_SIZE, hide_oos: true }, preview).await?;
                 catalog.insert(name.into(), Value::Array(cards));
             }
         }

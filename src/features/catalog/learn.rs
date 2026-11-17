@@ -174,36 +174,71 @@ async fn learn_product(db: &PgPool, account_id: Uuid, item: &Value, existing: Op
     Ok(Some((id, variant)))
 }
 
-/// New products come from events only while the store has no feed and hasn't turned this off.
-async fn learns(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
+/// The store's own hosts: its website and its verified sending domains, without `www.`.
+pub fn hosts_of(website: Option<&str>, domains: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = domains.iter().map(|d| d.trim().trim_start_matches("www.").to_lowercase()).filter(|d| !d.is_empty()).collect();
+    if let Some(w) = website.map(str::trim).filter(|w| !w.is_empty()) {
+        let w = if w.contains("://") { w.to_string() } else { format!("https://{w}") };
+        if let Some(h) = url::Url::parse(&w).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase())) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// Whether a link goes to the store's own site (or a subdomain of it).
+pub fn on_site(hosts: &[String], link: &str) -> bool {
+    let Some(h) = url::Url::parse(link).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase())) else { return false };
+    hosts.iter().any(|s| h == *s || h.ends_with(&format!(".{s}")))
+}
+
+pub async fn site_hosts(db: &PgPool, account_id: Uuid) -> sqlx::Result<Vec<String>> {
+    let website: Option<String> = sqlx::query_scalar("SELECT website FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.flatten();
+    let domains: Vec<String> = sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1 AND status = 'verified'").bind(account_id).fetch_all(db).await?;
+    Ok(hosts_of(website.as_deref(), &domains))
+}
+
+/// What the reader needs to know about an account.
+#[derive(Clone)]
+pub struct Rules {
+    /// New products come from events only while the store has no feed and hasn't turned this off.
+    learn: bool,
+    /// Anyone can send events from a browser, so a product is only learned (or refreshed) when its
+    /// page is on the store's own site: a made-up product can't link people elsewhere.
+    hosts: Vec<String>,
+}
+
+async fn rules_for(db: &PgPool, account_id: Uuid) -> sqlx::Result<Rules> {
+    let learn: bool = sqlx::query_scalar(
         "SELECT COALESCE((SELECT learn_from_events FROM catalog_settings WHERE account_id = $1), true)
             AND NOT EXISTS (SELECT 1 FROM catalog_feeds WHERE account_id = $1 AND enabled)",
     )
     .bind(account_id)
     .fetch_one(db)
-    .await
+    .await?;
+    Ok(Rules { learn, hosts: site_hosts(db, account_id).await? })
 }
 
 /// Record one event's products. Returns how many items it recorded.
-pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, bool>, ev: (Uuid, Uuid, Uuid, &str, &Value, DateTime<Utc>)) -> sqlx::Result<usize> {
+pub async fn record(db: &PgPool, rules_cache: &mut HashMap<Uuid, Rules>, ev: (Uuid, Uuid, Uuid, &str, &Value, DateTime<Utc>)) -> sqlx::Result<usize> {
     let (event_id, account_id, profile_id, metric, props, at) = ev;
     let Some(kind) = kind_for(metric) else { return Ok(0) };
     let mut n = 0;
     for item in event_items(metric, props) {
         let found = resolve(db, account_id, &item).await?;
-        let learn = match rules_cache.get(&account_id) {
-            Some(l) => *l,
+        let rules = match rules_cache.get(&account_id) {
+            Some(r) => r.clone(),
             None => {
-                let l = learns(db, account_id).await?;
-                rules_cache.insert(account_id, l);
-                l
+                let r = rules_for(db, account_id).await?;
+                rules_cache.insert(account_id, r.clone());
+                r
             }
         };
+        let trusted_link = http_url(&item, "url").is_some_and(|u| on_site(&rules.hosts, &u));
         let ids = match found {
-            Some((p, v, src)) if src == "events" => learn_product(db, account_id, &item, Some(p)).await?.map(|(p, v2)| (p, v.or(v2))),
+            Some((p, v, src)) if src == "events" && trusted_link => learn_product(db, account_id, &item, Some(p)).await?.map(|(p, v2)| (p, v.or(v2))),
             Some((p, v, _)) => Some((p, v)),
-            None if learn => learn_product(db, account_id, &item, None).await?,
+            None if rules.learn && trusted_link => learn_product(db, account_id, &item, None).await?,
             None => None,
         };
         let Some((product_id, variant_id)) = ids else { continue };
@@ -278,7 +313,8 @@ pub async fn catch_up(state: &AppState) -> anyhow::Result<()> {
 
 /// Items a flow's triggering event carries, as product cards: matched to the catalog where
 /// possible (for current prices and images), otherwise from what the event itself says.
-pub async fn event_cards(db: &PgPool, account_id: Uuid, event: &Value) -> sqlx::Result<Vec<(Option<Uuid>, Value)>> {
+/// An unmatched item's link is kept only when it goes to the store's own site (`hosts`).
+pub async fn event_cards(db: &PgPool, account_id: Uuid, hosts: &[String], event: &Value) -> sqlx::Result<Vec<(Option<Uuid>, Value)>> {
     let metric = event.get("metric").and_then(|m| m.as_str()).unwrap_or("");
     let props = event.get("properties").cloned().unwrap_or(json!({}));
     let mut out = Vec::new();
@@ -290,7 +326,7 @@ pub async fn event_cards(db: &PgPool, account_id: Uuid, event: &Value) -> sqlx::
             "id": text(&item, "product_id"),
             "title": text(&item, "name").or_else(|| text(&item, "title")),
             "name": text(&item, "name").or_else(|| text(&item, "title")),
-            "url": http_url(&item, "url"),
+            "url": http_url(&item, "url").filter(|u| on_site(hosts, u)),
             "image_url": http_url(&item, "image_url"),
             "price": price,
             "currency": currency,
@@ -301,4 +337,20 @@ pub async fn event_cards(db: &PgPool, account_id: Uuid, event: &Value) -> sqlx::
         out.push((found.map(|f| f.0), card));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_must_be_on_the_store_site() {
+        let hosts = hosts_of(Some("www.acme.test"), &["mail-brand.test".to_string()]);
+        assert!(on_site(&hosts, "https://acme.test/products/x"));
+        assert!(on_site(&hosts, "https://shop.acme.test/x"));
+        assert!(on_site(&hosts, "https://www.mail-brand.test/x"));
+        assert!(!on_site(&hosts, "https://acme.test.evil.example/x"));
+        assert!(!on_site(&hosts, "https://evilacme.test/x"));
+        assert!(!on_site(&[], "https://acme.test/x"));
+    }
 }

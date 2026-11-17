@@ -27,6 +27,8 @@ pub const PRICE_DROP_METRIC: &str = "Price Dropped";
 const BATCH: i64 = 200;
 /// Most products one person can wait on at once.
 const MAX_WAITING_PER_PERSON: i64 = 25;
+/// New back-in-stock requests an account takes per hour.
+const MAX_NEW_PER_HOUR: i64 = 2000;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Settings {
@@ -453,6 +455,14 @@ pub async fn subscribe(db: &PgPool, account_id: Uuid, email: &str, product_id: O
     let in_stock = v.as_ref().map(|v| v.in_stock).unwrap_or(p.in_stock);
     if in_stock {
         return Err(AppError::Conflict("Good news: it's in stock now.".into()));
+    }
+    // Anyone can type an email here, so the account takes a bounded number of new requests an hour.
+    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND created_at > now() - interval '1 hour'")
+        .bind(account_id)
+        .fetch_one(db)
+        .await?;
+    if recent >= MAX_NEW_PER_HOUR {
+        return Err(AppError::Conflict("We're getting a lot of requests right now. Please try again in a few minutes.".into()));
     }
     let input = ProfileInput { email: Some(email), ..Default::default() };
     let profile = audience::upsert_profile_public(db, account_id, &input).await?.profile;

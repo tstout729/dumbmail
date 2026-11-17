@@ -143,7 +143,7 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
-    let content = crate::features::catalog::personalize(&state.db, account_id, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
+    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
     if b.channel == "email" {
         let content: render::EmailContent = serde_json::from_value(content)?;
         let r = render::render_email(&account, &content, &ctx, None)?;

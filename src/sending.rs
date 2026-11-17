@@ -164,7 +164,7 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
-    let content = crate::features::catalog::personalize(&state.db, spec.account.id, Some(p), spec.event, spec.content, &mut ctx, false).await?;
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,
