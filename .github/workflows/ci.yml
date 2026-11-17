@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Never cancel a run on main: it may be deploying.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm build
+
+  server:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  # The one required check: passes only when every job above passed.
+  ci:
+    if: always()
+    needs: [web, server]
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.web.result }}" = success ] && [ "${{ needs.server.result }}" = success ]'
+
+  # Merging to main is the release: deploy the merged commit to Railway, then wait until
+  # https://dumbmail.ai/healthz reports it. Migrations run when the new server starts.
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ci]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "$GITHUB_SHA" > REVISION
+      - run: npx -y @railway/cli@5.74.1 up --ci --service postlark --environment production -m "deploy ${GITHUB_SHA::7}"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Wait for dumbmail.ai to serve this commit
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS https://dumbmail.ai/healthz | grep -q "\"$GITHUB_SHA\""; then echo "live: $GITHUB_SHA"; exit 0; fi
+            sleep 10
+          done
+          echo "dumbmail.ai is not serving $GITHUB_SHA after 10 minutes"; exit 1

@@ -13,11 +13,12 @@ RUN pnpm build
 FROM rust:1-bookworm AS server
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+# REVISION (the git commit) is written by the deploy job; /healthz reports it.
+COPY Cargo.toml Cargo.lock REVISION* ./
 COPY src ./src
 COPY migrations ./migrations
 COPY --from=web /web/dist ./web/dist
-RUN cargo build --release --locked
+RUN GIT_SHA="$(cat REVISION 2>/dev/null || true)" cargo build --release --locked
 
 # 3. Runtime: one small binary
 FROM debian:bookworm-slim
