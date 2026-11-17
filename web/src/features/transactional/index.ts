@@ -1,4 +1,7 @@
+import { Receipt } from "lucide-react";
 import type { DashboardFeature } from "../types";
 
-// Not built yet. This feature's pages, API hooks and types live in this folder.
-export const feature: DashboardFeature = {};
+export const feature: DashboardFeature = {
+  routes: [{ path: "transactional", lazy: () => import("./TransactionalPage").then((m) => ({ Component: m.TransactionalPage })) }],
+  nav: [{ label: "Transactional", to: "/transactional", icon: Receipt }],
+};

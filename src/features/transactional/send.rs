@@ -365,7 +365,12 @@ async fn deliver(state: &AppState, account: &Account, id: Uuid, b: &SendBody, to
     let profile = crate::audience::upsert_profile(&state.db, account.id, &input(to)).await?.profile;
     sqlx::query("UPDATE transactional_sends SET profile_id = $2 WHERE id = $1").bind(id).bind(profile.id).execute(&state.db).await?;
     if let Some(reason) = suppressed(&state.db, profile.id).await? {
-        sqlx::query("UPDATE transactional_sends SET status = 'skipped', error = $2 WHERE id = $1").bind(id).bind(suppressed_message(&reason)).execute(&state.db).await?;
+        sqlx::query("UPDATE transactional_sends SET status = 'skipped', error = $2, subject = $3 WHERE id = $1")
+            .bind(id)
+            .bind(suppressed_message(&reason))
+            .bind(content.get("subject").and_then(Value::as_str))
+            .execute(&state.db)
+            .await?;
         return Ok(());
     }
     let message_id = Uuid::now_v7();

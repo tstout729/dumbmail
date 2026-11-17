@@ -72,6 +72,8 @@ With `smart_sending` on, each recipient is checked when their message is about t
 
 Texts from campaigns and flows only go out between 9:00 and 20:00 in the recipient's own time zone (found as above, falling back to the account's). A text outside those hours waits until the window opens; the rest of the batch goes on. Test sends aren't held.
 
+A `timezone` property can come from a visitor's browser, so it never makes quiet hours looser than the phone number suggests: when the phone number points to a different zone, a text waits until it's within the hours in both zones. If the two windows never overlap, the phone number's zone decides.
+
 You can make the window narrower, never wider than 8:00 to 21:00, and it must be at least an hour long:
 
 ```sh

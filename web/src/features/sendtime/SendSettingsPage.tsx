@@ -43,7 +43,8 @@ function QuietHours({ settings }: { settings: SendSettings }) {
       <Card title="Text message hours">
         <p className="mb-4 text-sm text-zinc-600">
           Texts from campaigns and flows only go out during these hours on each recipient's own clock. A text outside them waits until they open. You can narrow
-          the window but not go past {clockLabel(legal.start)} to {clockLabel(legal.end)}.
+          the window but not go past {clockLabel(legal.start)} to {clockLabel(legal.end)}. When someone's saved time zone and their phone number point to
+          different zones, a text waits until it's within these hours in both.
         </p>
         <div className="flex flex-wrap items-end gap-3">
           <Field label="From">
