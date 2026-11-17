@@ -244,7 +244,7 @@ async fn dest_json(state: &AppState, d: &Dest) -> AppResult<Value> {
     let last: Option<RunRow> = sqlx::query_as(&format!("SELECT {RUN_COLS} FROM warehouse_runs WHERE destination_id = $1 ORDER BY created_at DESC LIMIT 1")).bind(d.id).fetch_optional(&state.db).await?;
     Ok(json!({
         "id": d.id, "name": d.name, "endpoint": d.endpoint, "region": d.region, "bucket": d.bucket, "prefix": d.prefix, "path_style": d.path_style,
-        "access_key_hint": d.access_key_hint, "format": d.format, "datasets": d.datasets, "schedule": d.schedule, "enabled": d.enabled,
+        "access_key_hint": d.access_key_hint, "format": d.format, "datasets": d.datasets, "schedule": d.schedule, "enabled": d.enabled, "revision": d.revision,
         "next_run_at": d.next_run_at.filter(|_| d.enabled && d.schedule != "manual"), "last_run_at": d.last_run_at,
         "last_test_at": d.last_test_at, "last_test_error": d.last_test_error, "created_at": d.created_at, "updated_at": d.updated_at,
         "last_run": last.as_ref().map(run_json),

@@ -535,3 +535,56 @@ async fn moving_a_destination_cancels_its_run_and_needs_its_keys_again() {
     assert_eq!(s, 400, "dot segments would change the signed path");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn exports_skip_no_rows_and_never_add_test_messages() {
+    let mut h = harness!();
+    let (s3, endpoint) = mock_s3().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    for i in 0..3 {
+        h.ok("POST", "/api/profiles", Some(json!({"email": format!("m{i}@x.test"), "email_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    }
+    let d = h.ok("POST", "/api/warehouse/destinations", Some(destination(&endpoint, json!({"datasets": ["messages", "profiles", "list_members"]})))).await;
+    let dest = d["id"].as_str().unwrap().to_string();
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Launch", "channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
+    let cid = c["id"].as_str().unwrap();
+    h.ok("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["owner@acme.test"]}))).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+
+    // A full read stages its keys and cuts files from them; nothing is left staged afterwards.
+    let run = run_export(&mut h, &dest, "full").await;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(s3.json_rows("list_members").len(), 3);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM warehouse_stage").fetch_one(&h.state.db).await.unwrap(), 0);
+    let test_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE is_test").fetch_one(&h.state.db).await.unwrap();
+    assert!(!s3.json_rows("messages").iter().any(|m| m["id"] == test_id.to_string()));
+
+    // The test message changes (a provider callback, say): the change pass leaves it out too.
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO warehouse_changes (account_id, dataset, row_id) VALUES ($1, 'messages', $2)").bind(account).bind(test_id).execute(&h.state.db).await.unwrap();
+    let inc = run_export(&mut h, &dest, "incremental").await;
+    assert_eq!(inc["status"], "succeeded", "{inc}");
+    assert!(!s3.json_rows("messages").iter().any(|m| m["id"] == test_id.to_string()), "test messages never reach the export");
+
+    // Taking a dataset off and putting it back starts it from a fresh baseline.
+    let rev = h.ok("GET", &format!("/api/warehouse/destinations/{dest}"), None).await["revision"].as_i64().unwrap();
+    h.ok("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"datasets": ["messages", "list_members"], "revision": rev}))).await;
+    h.ok("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"datasets": ["messages", "profiles", "list_members"]}))).await;
+    let again = run_export(&mut h, &dest, "incremental").await;
+    let profiles = again["datasets"].as_array().unwrap().iter().find(|d| d["name"] == "profiles").unwrap().clone();
+    assert!(profiles["after"].is_null(), "profiles start over: {again}");
+    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(profiles["rows"], all, "every profile, not just the changed ones");
+    let messages = again["datasets"].as_array().unwrap().iter().find(|d| d["name"] == "messages").unwrap().clone();
+    assert!(messages["after"].is_string(), "messages keep their place: {again}");
+
+    // An edit made against an older revision is refused.
+    h.ok("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"prefix": "moved/"}))).await;
+    let (s, v) = h.req("PATCH", &format!("/api/warehouse/destinations/{dest}"), Some(json!({"prefix": "dm/", "revision": rev}))).await;
+    assert_eq!(s, 409, "{v}");
+    h.cleanup().await;
+}

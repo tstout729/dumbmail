@@ -837,3 +837,251 @@ async fn skipped_and_transactional_messages_reach_the_message_topics() {
     assert!(!sent.to_string().contains("secret-reset-link-123"), "no content or variables: {sent}");
     h.cleanup().await;
 }
+
+// ---------- Last review round ----------
+
+#[tokio::test]
+async fn an_event_and_the_job_that_wakes_its_flows_commit_together() {
+    let mut h = harness!();
+    h.signup().await;
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"},
+        "definition": {"entry": "a", "nodes": [{"id": "a", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    // Make queuing the flow job fail.
+    sqlx::query("CREATE FUNCTION refuse_flow_jobs() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind = 'flow_event' THEN RAISE EXCEPTION 'no flow jobs'; END IF; RETURN NEW; END $$")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER refuse_flow_jobs BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION refuse_flow_jobs()").execute(&h.state.db).await.unwrap();
+    let ev = json!({"metric": "Placed Order", "unique_id": "order-1", "profile": {"email": "buyer@x.test"}});
+    let (s, v) = h.req("POST", "/api/events", Some(ev.clone())).await;
+    assert!(s.is_server_error(), "{s} {v}");
+    // Nothing was kept: no event without its flow job.
+    assert_eq!(count(&h, "SELECT count(*) FROM events WHERE unique_id = 'order-1'").await, 0);
+    // Once it can be queued, the same unique_id records it (and its job) normally.
+    sqlx::query("DROP TRIGGER refuse_flow_jobs ON jobs").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/events", Some(ev)).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM events WHERE unique_id = 'order-1'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'flow_event'").await, 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_observer_never_makes_what_it_watches_wait() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "batch_size": 1,
+        "topics": ["event.tracked", "profile.created", "segment.entered", "message.skipped"]}))).await;
+    let seg = h.ok("POST", "/api/segments", Some(json!({"name": "VIPs", "definition": {"match": "all", "conditions": [{"type": "property", "field": "vip", "op": "eq", "value": true}]}}))).await;
+    let seg_id: uuid::Uuid = seg["id"].as_str().unwrap().parse().unwrap();
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    h.ok("POST", "/api/profiles", Some(json!({"email": "vip@x.test", "properties": {"vip": true}}))).await;
+    h.drain().await;
+    let before = dumbmail::features::observe::misses();
+
+    // Someone else holds the lock every observer write needs, and keeps it.
+    let mut locker = h.state.db.begin().await.unwrap();
+    sqlx::query("LOCK TABLE webhook_outbox IN ACCESS EXCLUSIVE MODE").execute(&mut *locker).await.unwrap();
+    let prompt = std::time::Duration::from_secs(3);
+    // An event (its observer writes inside the event's transaction) ...
+    let (s, _) = tokio::time::timeout(prompt, h.req("POST", "/api/events", Some(json!({"metric": "Viewed", "profile": {"email": "vip@x.test"}})))).await.expect("event waited on its observer");
+    assert!(s.is_success());
+    // ... a segment refresh (inside the refresh's transaction) ...
+    tokio::time::timeout(prompt, dumbmail::flows::refresh_segment(&h.state, seg_id)).await.expect("refresh waited on its observer").unwrap();
+    // ... and a profile save (its own short transaction) all finish without it.
+    let (s, _) = tokio::time::timeout(prompt, h.req("POST", "/api/profiles", Some(json!({"email": "new@x.test"})))).await.expect("profile save waited on its observer");
+    assert!(s.is_success());
+    assert!(dumbmail::features::observe::misses() >= before + 3, "each skipped write is counted");
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Viewed'").await, 1, "the event itself was kept");
+    assert_eq!(count(&h, "SELECT count(*) FROM segment_members").await, 1);
+    locker.rollback().await.unwrap();
+
+    // With the lock gone, observing works as before.
+    let hits = rx.envelopes().len();
+    h.ok("POST", "/api/profiles", Some(json!({"email": "later@x.test"}))).await;
+    h.drain().await;
+    assert_eq!(rx.envelopes().len(), hits + 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn changes_captured_before_a_url_edit_never_go_to_the_new_url() {
+    let mut h = harness!();
+    let (rx_a, base_a) = receiver().await;
+    let (rx_b, base_b) = receiver().await;
+    h.signup().await;
+    let ep = h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base_a}/a"), "topics": ["profile.created"], "batch_size": 1}))).await;
+    let id = ep["id"].as_str().unwrap().to_string();
+    // Captured while the endpoint points at A, still waiting for fan-out.
+    for i in 0..3 {
+        h.ok("POST", "/api/profiles", Some(json!({"email": format!("early{i}@x.test")}))).await;
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 3);
+    h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"url": format!("{base_b}/b"), "revision": 1}))).await;
+    h.drain().await;
+    assert!(rx_b.envelopes().is_empty(), "captured for A, never sent to B: {:?}", rx_b.envelopes());
+    assert!(rx_a.envelopes().is_empty());
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 0);
+    // What's captured after the edit goes to B.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "late@x.test"}))).await;
+    h.drain().await;
+    assert_eq!(rx_b.envelopes().len(), 1);
+    assert_eq!(rx_b.envelopes()[0]["data"]["profile"]["email"], "late@x.test");
+    // An edit made against the old revision is refused instead of putting A back.
+    let (s, v) = h.req("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"url": format!("{base_a}/a"), "revision": 1}))).await;
+    assert_eq!(s, 409, "{v}");
+    assert_eq!(h.ok("GET", &format!("/api/webhooks/{id}"), None).await["url"], format!("{base_b}/b"));
+
+    // trusted_only is checked again when sending: a browser event already queued isn't sent once
+    // the endpoint takes trusted sources only (resends included).
+    let pk = h.ok("GET", "/api/me", None).await["account"]["public_key"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"topics": ["event.tracked"]}))).await;
+    rx_b.answer(&[503]);
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &json!({"metric": "Placed Order", "profile": {"email": "forger@x.test"}}).to_string()).await;
+    assert_eq!(s, 200);
+    h.drain().await;
+    let seen = rx_b.hits().len();
+    h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"trusted_only": true}))).await;
+    retry_now(&h).await;
+    assert_eq!(rx_b.hits().len(), seen, "the queued browser event wasn't sent");
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'cancelled' AND error = 'untrusted_source'").await, 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_rest_hook_is_its_keys_alone_on_every_route_and_tool() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    let key_a = h.ok("POST", "/api/api-keys", Some(json!({"name": "Zapier"}))).await["key"].as_str().unwrap().to_string();
+    let key_b = h.ok("POST", "/api/api-keys", Some(json!({"name": "Other"}))).await["key"].as_str().unwrap().to_string();
+    let (auth_a, auth_b) = (format!("Bearer {key_a}"), format!("Bearer {key_b}"));
+    let a = [("authorization", auth_a.as_str()), ("content-type", "application/json")];
+    let b = [("authorization", auth_b.as_str()), ("content-type", "application/json")];
+    let (s, _, body) = h.raw("POST", "/api/hooks", &a, &json!({"hookUrl": format!("{base}/zap/secret-path"), "topic": "profile.created", "source": "zapier"}).to_string()).await;
+    assert_eq!(s, 201, "{body}");
+    let hook: Value = serde_json::from_str(&body).unwrap();
+    let hid = hook["id"].as_str().unwrap();
+
+    // Another key doesn't see it on the generic routes either ...
+    let (_, _, list) = h.raw("GET", "/api/webhooks", &b, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&list).unwrap()["total"], 0, "{list}");
+    for (m, path, body) in [
+        ("GET", format!("/api/webhooks/{hid}"), String::new()),
+        ("PATCH", format!("/api/webhooks/{hid}"), json!({"url": format!("{base}/stolen")}).to_string()),
+        ("GET", format!("/api/webhooks/{hid}/deliveries"), String::new()),
+        ("POST", format!("/api/webhooks/{hid}/rotate-secret"), String::new()),
+        ("DELETE", format!("/api/webhooks/{hid}"), String::new()),
+    ] {
+        let (s, _, out) = h.raw(m, &path, &b, &body).await;
+        assert_eq!(s, 404, "{m} {path}: {out}");
+    }
+    // ... nor through MCP.
+    let call = |name: &str, args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+    let (_, _, out) = h.raw("POST", "/mcp", &b, &call("list_webhooks", json!({}))).await;
+    assert!(!out.contains("secret-path"), "{out}");
+    let (_, _, out) = h.raw("POST", "/mcp", &b, &call("update_webhook", json!({"id": hid, "url": format!("{base}/stolen")}))).await;
+    assert!(out.contains("not found") || out.contains("isError\":true"), "{out}");
+    // Its own key, and the signed-in owner, do.
+    let (s, _, _) = h.raw("GET", &format!("/api/webhooks/{hid}"), &a, "").await;
+    assert_eq!(s, 200);
+    assert_eq!(h.ok("GET", &format!("/api/webhooks/{hid}"), None).await["url"], format!("{base}/zap/secret-path"));
+
+    // Revoking the key stops deliveries at once, before the sweep removes the hook.
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE name = 'Zapier'").fetch_one(&h.state.db).await.unwrap();
+    rx.answer(&[503]);
+    h.ok("POST", "/api/profiles", Some(json!({"email": "one@x.test"}))).await;
+    h.drain().await;
+    let seen = rx.hits().len();
+    sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1").bind(key_id).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE webhook_endpoints SET retry_at = NULL").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE webhook_deliveries SET next_attempt_at = now() WHERE status = 'pending'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'webhooks_deliver'").execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::BACKGROUND).await.unwrap();
+    assert_eq!(rx.hits().len(), seen, "nothing more after the key was revoked");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_message_skipped_for_credit_is_reported_once() {
+    let Some(mut h) = Harness::with(|c| c.free_emails_per_month = 0).await else { return };
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["message.skipped"]}))).await;
+    let list = email_list(&mut h, "broke", 3).await;
+    // Enough credit to start the send, gone by the time the messages go out.
+    h.credit(0.01).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Launch", "channel": "email", "audience": {"include": [{"type": "list", "id": list}]},
+        "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::billing::post_entry(&h.state.db, account, "topup", -dumbmail::billing::to_micros(0.01), "test spend", "spend-1").await.unwrap();
+    h.drain().await;
+    let skipped: Vec<String> = sqlx::query_scalar("SELECT id::text FROM messages WHERE status = 'skipped' AND error = 'insufficient credit' AND NOT is_test").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(skipped.len(), 3);
+    let envs = rx.envelopes();
+    assert_eq!(envs.len(), 3, "one envelope per skip: {envs:?}");
+    let mut ids: Vec<String> = envs.iter().map(|e| e["data"]["message"]["id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3);
+    assert!(envs.iter().all(|e| e["data"]["reason"] == "insufficient credit"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_event_too_big_for_a_request_is_recorded_and_not_sent() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    let ep = h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["profile.created"], "batch_size": 10}))).await;
+    let (id, account): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT id, account_id FROM webhook_endpoints").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(ep["id"], id.to_string());
+    // One delivery over the request cap, one ordinary one behind it.
+    let big = json!({"id": uuid::Uuid::now_v7(), "topic": "profile.created", "data": {"blob": "x".repeat(1_100_000)}});
+    let small = json!({"id": uuid::Uuid::now_v7(), "topic": "profile.created", "data": {"ok": true}});
+    for p in [&big, &small] {
+        sqlx::query("INSERT INTO webhook_deliveries (id, account_id, endpoint_id, revision, event_id, topic, payload) VALUES ($1, $2, $3, 1, $4, 'profile.created', $5)")
+            .bind(uuid::Uuid::now_v7())
+            .bind(account)
+            .bind(id)
+            .bind(uuid::Uuid::now_v7())
+            .bind(p)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE webhook_endpoints SET pending = 2").execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue_background(&h.state.db, "webhooks_deliver", json!({"endpoint_id": id}), None).await.unwrap();
+    h.drain().await;
+    let raw: usize = rx.hits().iter().map(|h| h.raw.len()).max().unwrap_or(0);
+    assert!(raw < 1_000_000, "nothing over the cap was sent");
+    assert_eq!(rx.envelopes().len(), 1);
+    assert_eq!(rx.envelopes()[0]["data"]["ok"], true);
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'failed' AND error = 'too_large'").await, 1);
+    assert_eq!(count(&h, "SELECT pending::bigint FROM webhook_endpoints").await, 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn saving_consent_that_is_already_set_reports_no_transition() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "topics": ["profile.subscribed", "profile.unsubscribed"]}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "c@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "c@x.test", "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "c@x.test", "email_consent": "unsubscribed"}))).await;
+    h.drain().await;
+    let t: Vec<(String, String, String)> = rx
+        .envelopes()
+        .iter()
+        .map(|e| (e["topic"].as_str().unwrap().to_string(), e["data"]["before"].as_str().unwrap().to_string(), e["data"]["after"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(t, vec![
+        ("profile.subscribed".into(), "never_subscribed".into(), "subscribed".into()),
+        ("profile.unsubscribed".into(), "subscribed".into(), "unsubscribed".into()),
+    ]);
+    h.cleanup().await;
+}

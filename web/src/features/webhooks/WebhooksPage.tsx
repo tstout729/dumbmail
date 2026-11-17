@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { AlertTriangle, Plus, RotateCcw, Send, Trash2, Webhook } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import {
   Badge,
   Button,
@@ -70,6 +71,8 @@ const errorText: Record<string, string> = {
   expired: "Not delivered within 24 hours",
   backlog_full: "Dropped: too many waiting",
   url_changed: "Cancelled: the URL changed",
+  untrusted_source: "Cancelled: sent from a browser",
+  too_large: "Too large to send (over 1 MB)",
   internal: "DumbMail couldn't send it",
 };
 
@@ -80,6 +83,14 @@ function deliveryError(d: { error: string | null; response_code: number | null }
 }
 
 export function WebhooksPage() {
+  const canRead = useCan("webhooks.read");
+  if (!canRead) {
+    return (
+      <Notice tone="gray" title="Webhooks are for managers and admins">
+        Ask an owner or admin of this account if you need to see where its data is sent.
+      </Notice>
+    );
+  }
   return (
     <div className="space-y-4">
       <p className="text-sm text-zinc-500">
@@ -98,6 +109,7 @@ export function WebhooksPage() {
 
 function EndpointsCard() {
   const { account } = useSession();
+  const canManage = useCan("webhooks.manage");
   const endpoints = useEndpoints();
   const [adding, setAdding] = useState(false);
   const [secret, setSecret] = useState<{ title: string; secret: string } | null>(null);
@@ -110,9 +122,11 @@ function EndpointsCard() {
       title="Endpoints"
       padded={false}
       actions={
-        <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
-          Add endpoint
-        </Button>
+        canManage ? (
+          <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
+            Add endpoint
+          </Button>
+        ) : undefined
       }
     >
       <Table className="rounded-none border-0 shadow-none">
@@ -138,9 +152,11 @@ function EndpointsCard() {
                 title="No webhook endpoints"
                 description="Add a URL and pick what to send it. Zapier and Make hooks show up here too."
                 action={
-                  <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
-                    Add endpoint
-                  </Button>
+                  canManage ? (
+                    <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
+                      Add endpoint
+                    </Button>
+                  ) : undefined
                 }
               />
             </EmptyRow>
@@ -254,6 +270,7 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
       trusted_only: trustedOnly,
       batch_size: Number(batch),
       rate_per_second: Number(rate),
+      ...(endpoint ? { revision: endpoint.revision } : {}),
     };
     const onError = (err: unknown) => setError(errorMessage(err));
     if (endpoint) {
@@ -351,6 +368,7 @@ function EndpointForm({ endpoint, onClose, onCreated }: { endpoint?: Endpoint; o
 
 function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; onClose: () => void; onSecret: (secret: string) => void }) {
   const { account } = useSession();
+  const canManage = useCan("webhooks.manage");
   const update = useUpdateEndpoint();
   const remove = useDeleteEndpoint();
   const rotate = useRotateSecret();
@@ -393,22 +411,24 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
             {endpoint.stats.last_dropped_at ? ` (last ${formatRelative(endpoint.stats.last_dropped_at)})` : ""}. You can resend dropped events from the log for 14 days.
           </Notice>
         ) : null}
-        <div className="flex flex-wrap items-center gap-2">
-          <Toggle checked={endpoint.enabled} onChange={(on) => update.mutate({ id: endpoint.id, input: { enabled: on } })} label={endpoint.enabled ? "On" : "Off"} />
-          <span className="mx-1 h-5 w-px bg-zinc-200" aria-hidden />
-          <Button size="sm" icon={<Send className="size-3.5" />} onClick={onTest} loading={test.isPending}>
-            Send test event
-          </Button>
-          <Button size="sm" onClick={() => setEditing(true)}>
-            Edit
-          </Button>
-          <Button size="sm" icon={<RotateCcw className="size-3.5" />} onClick={() => setRotating(true)}>
-            Rotate secret
-          </Button>
-          <Button size="sm" variant="danger" icon={<Trash2 className="size-3.5" />} onClick={() => setDeleting(true)}>
-            Delete
-          </Button>
-        </div>
+        {canManage ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Toggle checked={endpoint.enabled} onChange={(on) => update.mutate({ id: endpoint.id, input: { enabled: on } })} label={endpoint.enabled ? "On" : "Off"} />
+            <span className="mx-1 h-5 w-px bg-zinc-200" aria-hidden />
+            <Button size="sm" icon={<Send className="size-3.5" />} onClick={onTest} loading={test.isPending}>
+              Send test event
+            </Button>
+            <Button size="sm" onClick={() => setEditing(true)}>
+              Edit
+            </Button>
+            <Button size="sm" icon={<RotateCcw className="size-3.5" />} onClick={() => setRotating(true)}>
+              Rotate secret
+            </Button>
+            <Button size="sm" variant="danger" icon={<Trash2 className="size-3.5" />} onClick={() => setDeleting(true)}>
+              Delete
+            </Button>
+          </div>
+        ) : null}
         <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
           <dt className="text-zinc-500">Topics</dt>
           <dd className="text-zinc-800">
@@ -435,7 +455,7 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
           <dt className="text-zinc-500">Last delivered</dt>
           <dd className="text-zinc-800">{formatRelative(endpoint.last_success_at)}</dd>
         </dl>
-        <DeliveryLog endpoint={endpoint} />
+        <DeliveryLog endpoint={endpoint} canManage={canManage} />
       </div>
       {editing ? <EndpointForm endpoint={endpoint} onClose={() => setEditing(false)} /> : null}
       {deleting ? (
@@ -477,7 +497,7 @@ function EndpointDrawer({ endpoint, onClose, onSecret }: { endpoint: Endpoint; o
   );
 }
 
-function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
+function DeliveryLog({ endpoint, canManage }: { endpoint: Endpoint; canManage: boolean }) {
   const { account } = useSession();
   const [status, setStatus] = useState<DeliveryStatus | "">("");
   const [openId, setOpenId] = useState<string | null>(null);
@@ -509,9 +529,11 @@ function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
               { value: "cancelled", label: "Cancelled" },
             ]}
           />
-          <Button size="sm" onClick={resendFailed} loading={resend.isPending} disabled={!endpoint.enabled}>
-            Resend failed
-          </Button>
+          {canManage ? (
+            <Button size="sm" onClick={resendFailed} loading={resend.isPending} disabled={!endpoint.enabled}>
+              Resend failed
+            </Button>
+          ) : null}
         </div>
       </div>
       <div className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 bg-white">
@@ -521,7 +543,13 @@ function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
           <p className="px-3 py-6 text-center text-sm text-zinc-500">No deliveries {status ? "with this status " : ""}in the last 14 days.</p>
         ) : (
           rows.map((d) => (
-            <button key={d.id} type="button" onClick={() => setOpenId(d.id)} className="flex w-full items-start justify-between gap-3 px-3 py-2.5 text-left hover:bg-zinc-50">
+            <button
+              key={d.id}
+              type="button"
+              disabled={!canManage}
+              onClick={() => setOpenId(d.id)}
+              className="flex w-full items-start justify-between gap-3 px-3 py-2.5 text-left enabled:hover:bg-zinc-50"
+            >
               <span className="min-w-0">
                 <code className="text-xs text-zinc-800">{d.topic}</code>
                 {d.test ? <span className="ml-1.5 text-xs text-zinc-400">test</span> : null}
@@ -538,7 +566,10 @@ function DeliveryLog({ endpoint }: { endpoint: Endpoint }) {
           ))
         )}
       </div>
-      <p className="mt-2 text-xs text-zinc-500">Deliveries are kept for 14 days. Each event has the same id on every try, so receivers can skip ones they've already handled.</p>
+      <p className="mt-2 text-xs text-zinc-500">
+        Deliveries are kept for 14 days. Each event has the same id on every try, so receivers can skip ones they've already handled.
+        {canManage ? "" : " Payloads hold people's details, so only admins can open them."}
+      </p>
       {openId ? <DeliveryModal endpointId={endpoint.id} deliveryId={openId} canResend={endpoint.enabled} onClose={() => setOpenId(null)} /> : null}
     </div>
   );
@@ -602,6 +633,7 @@ function DeliveryModal({ endpointId, deliveryId, canResend, onClose }: { endpoin
 
 function FlowSecretCard() {
   const { account } = useSession();
+  const canManage = useCan("webhooks.manage");
   const info = useFlowSecret();
   const rotate = useRotateFlowSecret();
   const [confirming, setConfirming] = useState(false);
@@ -626,9 +658,11 @@ function FlowSecretCard() {
             <span className="text-zinc-500">No secret yet. One is made the first time a flow webhook runs; make one now to see it.</span>
           )}
         </div>
-        <Button size="sm" icon={<RotateCcw className="size-3.5" />} onClick={() => (hint ? setConfirming(true) : rotate.mutate(undefined, { onSuccess: (r) => setSecret(r.secret) }))} loading={rotate.isPending}>
-          {hint ? "New secret" : "Make secret"}
-        </Button>
+        {canManage ? (
+          <Button size="sm" icon={<RotateCcw className="size-3.5" />} onClick={() => (hint ? setConfirming(true) : rotate.mutate(undefined, { onSuccess: (r) => setSecret(r.secret) }))} loading={rotate.isPending}>
+            {hint ? "New secret" : "Make secret"}
+          </Button>
+        ) : null}
       </div>
       {confirming ? (
         <ConfirmDialog

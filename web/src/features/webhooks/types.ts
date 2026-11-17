@@ -34,6 +34,8 @@ export type Endpoint = {
 export type CreatedEndpoint = Endpoint & { secret: string };
 
 export type EndpointInput = {
+  /** The revision the editor read; a change made against an older one is refused. */
+  revision?: number;
   url?: string;
   description?: string;
   topics?: string[];

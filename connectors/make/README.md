@@ -9,7 +9,9 @@ lists, and a profile search. Each file here is one tab of one component in Make'
 **Base** (`base.imljson`): every request goes to the connection's DumbMail address with
 `Authorization: Bearer <API key>`, shows DumbMail's error message, and hides the key in logs.
 
-**Connection** `dumbmail` (type: API key / basic custom connection)
+**Connection** `dumbmail` (type: API key / basic custom connection). The key must be made by an
+owner or admin, with the `full` scope (or `account` plus `audience` for the actions): REST hooks
+need the `webhooks.manage` permission.
 
 | Tab | File |
 | --- | --- |

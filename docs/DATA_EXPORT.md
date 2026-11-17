@@ -32,9 +32,12 @@ region, or bucket in the host name) needs the keys again.
 **Moving a destination.** Changing where or how files are written (the endpoint, region, bucket,
 prefix, path style or format) cancels a run that's still going (status `cancelled`) and starts a
 fresh baseline: the next run exports every row again, to the new place, so it has a complete copy.
-Turning a destination back on after it was off does the same. A run always uses the settings the
-destination had when the run started, so renaming it or changing its schedule mid-run changes
-nothing about that run.
+Turning a destination back on after it was off does the same, and so does taking a dataset off a
+destination and adding it back later (that dataset starts over with every row). A run always uses
+the settings the destination had when the run started, so renaming it or changing its schedule
+mid-run changes nothing about that run. Send the destination's `revision` with a change (the
+dashboard does): if someone moved the destination since you read it, the change is refused (409),
+so an old bucket isn't put back and keys meant for one place aren't attached to another.
 
 A minimal AWS IAM policy for the key:
 
@@ -67,14 +70,21 @@ Up to 10 destinations per account. SFTP isn't supported.
 - Changes are found two ways: by a row's own time column (`created_at` for new events and
   messages, `updated_at` for profiles) and, for changes that column doesn't show, by a change log
   DumbMail keeps for 7 days: a message's delivery, open, click, bounce, complaint or unsubscribe, and
-  a profile's last activity. So a message exported as `sent` comes again with its later status. A
-  destination that hasn't exported for more than 7 days starts again with a full baseline.
+  a profile's last activity. So a message exported as `sent` comes again with its later status (a
+  row that changed several times in a window can come more than once in the same run; every copy
+  is the row as it was when its file was written). Both ways use the same rules for which rows
+  belong (test sends never appear). A destination that hasn't exported for more than 7 days starts
+  again with a full baseline. The change log is kept only for accounts with an enabled
+  destination; a new one is noticed by every server within seconds, before its first run starts.
 - **Full exports** ("Full export", or `kind: "full"`) write every row of every dataset. Use one to
   backfill a new warehouse table. It also moves the watermarks forward.
 - Only one run per destination at a time, worked on by one server at a time. A run writes files of
   up to 250,000 rows (or 64 MB compressed). Each file is read in one consistent snapshot of the
-  database, so a file never mixes rows from before and after a change (a dataset spread over several
-  files is read file by file), then uploaded: one request for a small file, 8 MB parts for a big one.
+  database, so a file never mixes rows from before and after a change, then uploaded: one request
+  for a small file, 8 MB parts for a big one. When a run reads a whole dataset (a snapshot dataset,
+  a full export, or a first baseline), it first takes the list of every row's key in one go, then
+  writes the files from that list, so a row can't be missed because something changed while the
+  earlier files were being written.
   A file counts only once the storage service confirms the whole upload; anything else (an error, a
   timeout, an answer that doesn't say it worked) aborts it. The run saves its place after every
   file. If the bucket fails, the run retries (2, 4, 8, 16 minutes) from the file it was on,
@@ -309,13 +319,13 @@ add `MANIFEST` to the `COPY`.
 | GET | `/api/warehouse/datasets` | – | `{data: {name, mode, description, key, columns}[]}` |
 | GET | `/api/warehouse/destinations` | – | `{data: Destination[], total}` |
 | POST | `/api/warehouse/destinations` | `{name, region, bucket, access_key_id, secret_access_key, endpoint?, prefix?, path_style?, format?: "jsonl"\|"csv", datasets?, schedule?: "hourly"\|"daily"\|"manual", enabled?}` | `Destination`, 201. 400 with the status and error code when the test write fails |
-| GET/PATCH/DELETE | `/api/warehouse/destinations/:id` | partial body as above. A change that sends requests to another host needs both keys | `Destination`. Deleting keeps the files already written |
+| GET/PATCH/DELETE | `/api/warehouse/destinations/:id` | partial body as above, plus `revision` (the one you read). A change that sends requests to another host needs both keys | `Destination`; 409 if it was moved since that revision. Deleting keeps the files already written |
 | POST | `/api/warehouse/destinations/:id/test` | – | `{ok, error?}` |
 | POST | `/api/warehouse/destinations/:id/runs` | `{kind: "incremental"\|"full"}` | `Run`, 202. 409 while another run is going |
 | GET | `/api/warehouse/destinations/:id/runs` | `?limit=` | `{data: Run[], total}`, newest first |
 | GET | `/api/warehouse/runs/:id` | – | `Run` |
 
-`Destination` is `{id, name, endpoint, region, bucket, prefix, path_style, access_key_hint, format,
+`Destination` is `{id, revision, name, endpoint, region, bucket, prefix, path_style, access_key_hint, format,
 datasets, schedule, enabled, next_run_at, last_run_at, last_test_at, last_test_error, created_at,
 updated_at, last_run}`. `Run` is `{id, destination_id, kind, status: "queued"|"running"|"succeeded"|"failed"|"cancelled",
 rows, files, bytes, attempts, error, manifest_key, window_end, created_at, started_at, finished_at,
@@ -327,6 +337,7 @@ datasets: {name, mode, rows, files, done, after, through}[]}`.
 `update_export_destination`, `delete_export_destination` (needs `confirm: true`),
 `test_export_destination`, `start_warehouse_export` (a full export needs `confirm: true`), `list_export_runs`.
 
-Who should be allowed (for the team roles that are coming): read-only roles may list datasets,
-destinations (never keys) and runs; adding, changing, testing and deleting destinations and starting
-exports are for admins and the owner.
+Everything here (routes and tools) needs the `exports.manage` permission: admins and owners, and
+API keys they made with the `account` scope (or `full`). An export copies every profile out of
+DumbMail, so managers, analysts and content editors can't see or start one. Adding, changing and
+deleting destinations, and starting exports, are recorded in the audit log.

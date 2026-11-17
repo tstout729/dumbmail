@@ -45,8 +45,8 @@ pub(super) struct Endpoint {
     pub retry_at: Option<DateTime<Utc>>,
 }
 
-/// The endpoint (as `webhook_endpoints`) isn't a REST hook of a revoked API key.
-pub(super) const KEY_LIVE: &str = "(webhook_endpoints.api_key_id IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = webhook_endpoints.api_key_id AND k.revoked_at IS NULL))";
+/// The endpoint (as `webhook_endpoints`) isn't a REST hook of an API key that no longer works.
+pub(super) const KEY_LIVE: &str = crate::features::observe::key_live!("webhook_endpoints.api_key_id");
 
 pub(super) const ENDPOINT_COLS: &str =
     "id, account_id, url, description, source, revision, batch_size, rate_per_second, secret_enc, previous_secret_enc, previous_secret_until, retry_at";
@@ -376,10 +376,11 @@ pub(super) async fn disable(state: &AppState, id: Uuid, account_id: Uuid, url: &
 /// deliveries waiting but no job (after a crash or a resend), and clear a stale "job queued" flag.
 pub(super) async fn sweep(state: &AppState) -> anyhow::Result<()> {
     let db = &state.db;
-    // REST hooks whose API key was revoked are removed with it.
-    let revoked: Vec<Uuid> = sqlx::query_scalar(
-        "DELETE FROM webhook_endpoints e USING api_keys k WHERE e.api_key_id = k.id AND k.revoked_at IS NOT NULL RETURNING e.account_id",
-    )
+    // REST hooks whose API key no longer works (revoked or expired, itself or a key above it) are
+    // removed with it.
+    let revoked: Vec<Uuid> = sqlx::query_scalar(&format!(
+        "DELETE FROM webhook_endpoints WHERE api_key_id IS NOT NULL AND NOT {KEY_LIVE} RETURNING account_id"
+    ))
     .fetch_all(db)
     .await?;
     if !revoked.is_empty() {

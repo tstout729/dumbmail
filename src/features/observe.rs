@@ -101,14 +101,38 @@ fn key(db: &PgPool) -> String {
     db.connect_options().get_database().unwrap_or("").to_string()
 }
 
-const LOAD_SQL: &str = "
+/// SQL: the REST hook's API key (the column `$col`, NULL for other endpoints) still works, by the
+/// same rule as signing in with it: not revoked, not expired, and no key above it (the key that
+/// made it, and so on) revoked or expired.
+macro_rules! key_live {
+    ($col:expr) => {
+        concat!(
+            "(", $col, " IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = ", $col,
+            " AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now())
+               AND NOT EXISTS (
+                 WITH RECURSIVE up(id, parent, revoked_at, expires_at, depth) AS (
+                   SELECT p.id, p.parent_key_id, p.revoked_at, p.expires_at, 1 FROM api_keys p WHERE p.id = k.parent_key_id
+                   UNION ALL
+                   SELECT p.id, p.parent_key_id, p.revoked_at, p.expires_at, up.depth + 1 FROM api_keys p JOIN up ON p.id = up.parent WHERE up.depth < 50
+                 )
+                 SELECT 1 FROM up WHERE up.revoked_at IS NOT NULL OR (up.expires_at IS NOT NULL AND up.expires_at <= now()))))"
+        )
+    };
+}
+pub(crate) use key_live;
+
+const LOAD_SQL: &str = concat!(
+    "
     SELECT e.account_id, 'hook' AS kind, e.topics AS a, e.metrics AS b, e.trusted_only AS t, 0::bigint AS n, NULL::timestamptz AS at
     FROM webhook_endpoints e
-    WHERE e.enabled AND (e.api_key_id IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = e.api_key_id AND k.revoked_at IS NULL))
+    WHERE e.enabled AND ",
+    key_live!("e.api_key_id"),
+    "
     UNION ALL
     SELECT d.account_id, 'export', d.datasets, '{}'::text[], false, 0, NULL FROM warehouse_destinations d WHERE d.enabled
     UNION ALL
-    SELECT c.account_id, 'outbox', '{}'::text[], '{}'::text[], false, c.rows, c.counted_at FROM webhook_outbox_counts c";
+    SELECT c.account_id, 'outbox', '{}'::text[], '{}'::text[], false, c.rows, c.counted_at FROM webhook_outbox_counts c"
+);
 
 /// The `webhook_outbox_counts` row that records when the sweep last counted (see `webhooks::fanout`).
 pub(crate) const SWEPT: Uuid = Uuid::nil();

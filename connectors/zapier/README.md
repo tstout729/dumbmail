@@ -10,7 +10,8 @@ Zapier.
   List, Unsubscribe Profile.
 - **Search**: Find Profile (and Find or Create Profile).
 
-People connect with a DumbMail API key (Settings → Developers). Self-hosted servers enter their
+People connect with a DumbMail API key (Settings → Developers) made by an owner or admin, with the
+`full` scope (or `account` plus `audience` for the actions). Self-hosted servers enter their
 own address; it must be `https://`.
 
 ## How it works

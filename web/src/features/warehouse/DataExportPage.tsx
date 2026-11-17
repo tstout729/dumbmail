@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Database, Play, Plus, Trash2 } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import {
   Badge,
   Button,
@@ -66,6 +67,18 @@ function formatBytes(n: number): string {
 }
 
 export function DataExportPage() {
+  const canManage = useCan("exports.manage");
+  if (!canManage) {
+    return (
+      <Notice tone="gray" title="Data export is for admins">
+        Exports copy every profile out of DumbMail, so only owners and admins of this account can set them up or see them.
+      </Notice>
+    );
+  }
+  return <Destinations />;
+}
+
+function Destinations() {
   const destinations = useDestinations();
   const [adding, setAdding] = useState(false);
   const rows = destinations.data ?? [];
@@ -286,7 +299,7 @@ function DestinationForm({ destination, onClose }: { destination?: Destination; 
       return;
     }
     const storage = { endpoint: provider === "aws" ? "" : endpoint.trim(), region: region.trim(), bucket: bucket.trim(), prefix: prefix.trim() };
-    const input: DestinationInput = { name: name.trim(), format, schedule, datasets: selected };
+    const input: DestinationInput = { name: name.trim(), format, schedule, datasets: selected, ...(destination ? { revision: destination.revision } : {}) };
     // Only send storage settings that changed: any change there is checked with a test write.
     if (!destination || storage.endpoint !== (destination.endpoint ?? "")) input.endpoint = storage.endpoint;
     if (!destination || storage.region !== destination.region) input.region = storage.region;

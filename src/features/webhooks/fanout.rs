@@ -173,11 +173,11 @@ async fn batch(db: &PgPool, account_id: Uuid) -> anyhow::Result<(usize, Vec<Back
         return Ok((0, Vec::new()));
     }
     rows.sort_by_key(|r| r.id);
-    // A REST hook stops with its API key: a revoked key's hooks get nothing more.
-    let eps: Vec<Ep> = sqlx::query_as(
-        "SELECT e.id, e.revision, e.revision_started_at, e.topics, e.metrics, e.filter, e.trusted_only FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled
-           AND (e.api_key_id IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = e.api_key_id AND k.revoked_at IS NULL))",
-    )
+    // A REST hook stops with its API key: a revoked or expired key's hooks get nothing more.
+    let eps: Vec<Ep> = sqlx::query_as(concat!(
+        "SELECT e.id, e.revision, e.revision_started_at, e.topics, e.metrics, e.filter, e.trusted_only FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND ",
+        crate::features::observe::key_live!("e.api_key_id")
+    ))
         .bind(account_id)
         .fetch_all(&mut *tx)
         .await?;

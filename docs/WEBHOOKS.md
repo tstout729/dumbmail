@@ -218,14 +218,21 @@ secret, so you can switch your receiver over without dropping anything.
 - Webhooks never slow down or break what they report on. A change is written to a queue (in the
   same database transaction as the change, where there is one) and matched to endpoints and sent by
   separate background workers that never take sending work, so even a broken webhook queue can't
-  stop a campaign, an unsubscribe or a provider callback. Each endpoint gets one request at a time,
-  so a slow or broken endpoint holds up only itself.
+  stop a campaign, an unsubscribe or a provider callback. Writing to the queue never waits: if it
+  can't be done within a fraction of a second (the queue is locked, the database is busy), that
+  one change isn't reported and the change itself goes ahead. Each endpoint gets one request at a
+  time, so a slow or broken endpoint holds up only itself.
+- An account with no endpoints pays nothing for webhooks: each server keeps a list of which
+  accounts have endpoints for which topics, reloaded every 5 seconds, and nothing is written or
+  even put together for an account that isn't on it.
 - A request succeeds when your endpoint answers 2xx within 10 seconds (that includes looking up its
   address). Redirects count as failures (use the final URL). Your response body is never kept: the
   log records the status code, the time it took and, for a failure, one of these error classes:
   `address_rejected` (not a public `https://` address), `timeout`, `connect_failed`,
   `request_failed`, `redirect`, `http_error` (see the status code), `expired` (not delivered within
-  24 hours), `backlog_full` (dropped, see below), `url_changed` (cancelled, see below).
+  24 hours), `backlog_full` (dropped, see below), `url_changed` (cancelled, see below),
+  `untrusted_source` (cancelled: the endpoint now takes trusted sources only), `too_large` (one
+  event bigger than a request may be, about 1 MB: recorded and never sent).
 - A failed delivery is retried with exponential back-off (30 seconds, doubling, at most 2 hours
   apart) for 24 hours, then marked `failed`. After a failure the whole endpoint backs off too
   (30 seconds, doubling, at most an hour), so a broken endpoint isn't hit with every new event.
@@ -238,10 +245,19 @@ secret, so you can switch your receiver over without dropping anything.
   oldest are dropped (status `dropped`, error `backlog_full`), the endpoint counts them
   (`stats.dropped_total`, `stats.last_dropped_at`) and the account owner is told once. Dropped
   events can be resent for 14 days. An account also keeps at most 200,000 events waiting to be
-  matched to endpoints, and a request carries at most about 1 MB of events.
+  matched to endpoints (checked where they're written, against a count taken every minute, so it
+  can run over by at most a minute's worth; past it, new events are dropped and counted the same
+  way), and a request carries at most about 1 MB of events.
+- **One delivery per event per endpoint.** A change DumbMail learns about twice (a provider repeating
+  a callback, say) has the same event `id` and is delivered once.
 - **Changing an endpoint's URL** cancels everything still waiting for the old URL (status
-  `cancelled`, error `url_changed`): personal data queued for one receiver is never sent to another.
-  Resends only ever send deliveries made for the current URL.
+  `cancelled`, error `url_changed`), and changes that happened before the edit are never sent to the
+  new URL, even if they hadn't been matched to the endpoint yet: personal data meant for one
+  receiver is never sent to another. Resends only ever send deliveries made for the current URL.
+  Send the endpoint's `revision` with a `PATCH` (the dashboard does): if someone changed the URL
+  since you read it, the edit is refused (409) rather than putting an old address back.
+- `trusted_only`, turning an endpoint off, and revoking (or the expiry of) a REST hook's API key
+  take effect for deliveries already waiting, resends included.
 - An endpoint answering **410 Gone** is telling DumbMail to stop: REST hooks (Zapier, Make, API)
   are deleted, dashboard endpoints are turned off.
 - `rate_per_second` (1-100, default 10) caps requests per second to the endpoint; `batch_size`
@@ -252,7 +268,8 @@ secret, so you can switch your receiver over without dropping anything.
   `profile.email`) and `op` is a segment property operator (`eq`, `neq`, `contains`, `gt`, `gte`,
   `lt`, `lte`, `in`, `exists`, ...).
 - A new endpoint, a new topic on one, or one turned back on gets every matching event from 5 seconds
-  after the change (events in those first seconds may or may not reach it).
+  after the change (events in those first seconds may or may not reach it: each server reloads
+  its list of subscriptions every 5 seconds, and the one that made the change reloads at once).
 - Up to 100 endpoints per account. Delivery logs, with payloads, are kept for 14 days.
 
 ## Delivery log, resends and tests
@@ -285,7 +302,7 @@ empty body. The secret is created the first time a flow webhook runs.
 | GET | `/api/webhooks/topics` | – | `{data: {topic, group, description}[]}` |
 | GET | `/api/webhooks` | – | `{data: Endpoint[], total}` |
 | POST | `/api/webhooks` | `{url, topics, metrics?, filter?, trusted_only?, description?, enabled?, batch_size?, rate_per_second?}` | `Endpoint` plus `secret` (shown once), 201 |
-| GET/PATCH/DELETE | `/api/webhooks/:id` | partial body as above; `filter: null` removes it | `Endpoint` |
+| GET/PATCH/DELETE | `/api/webhooks/:id` | partial body as above, plus `revision` (the one you read); `filter: null` removes it | `Endpoint`; 409 if the URL changed since that revision |
 | POST | `/api/webhooks/:id/rotate-secret` | – | `{secret, secret_hint, previous_secret_valid_until}` |
 
 `Endpoint` is `{id, url, description, topics, metrics, filter, trusted_only, enabled, status: "active"|"failing"|"disabled",
@@ -308,9 +325,13 @@ Integration platforms subscribe a URL to one topic with an API key (`Authorizati
 REST hooks get one envelope per request (`batch_size` 1) and are signed like any endpoint. They
 show up in Settings → Webhooks with their source and can be managed there.
 
-A hook belongs to the API key that made it: that key can list and delete only its own hooks, never
-another key's or an endpoint made in the dashboard. Revoking the key removes its hooks. `/api/hooks`
-takes only API keys, not dashboard sessions.
+A hook belongs to the API key that made it. Only that key, or someone signed in to the dashboard
+who may manage webhooks, can see or change it, on every route and MCP tool; other API keys don't
+see it at all. A key can never touch another key's hooks or an endpoint made in the dashboard
+through `/api/hooks`. Revoking the key (or the key it was made from), or its expiry, stops its
+hooks' deliveries at once and removes the hooks. `/api/hooks` takes only API keys, not dashboard
+sessions, and needs the `webhooks.manage` permission (an admin's or owner's key with the `full`
+or `account` scope).
 
 **The hook URL is the credential.** Zapier and Make give each hook a long random URL and accept
 whatever is posted to it: they don't check DumbMail's signature. Anyone who learns the URL can send
@@ -324,27 +345,31 @@ profile; send `email_consent: "unsubscribed"` to unsubscribe), `POST /api/events
 `{profile_ids}` (remove; look the profile up with `GET /api/profiles?q=<email>`) and `GET /api/lists`.
 The apps in `connectors/zapier` and `connectors/make` in the DumbMail repository use them.
 
-## Who should be allowed to do what
+## Who can do what
 
-DumbMail's team roles are coming. Until they land, anyone signed in to the account (and any API
-key) can use all of this. When they do, these are the intended permissions:
+Seeing endpoints and their delivery log is for managers, admins and owners (`webhooks.read`).
+Everything that changes them or shows personal data is for admins and owners
+(`webhooks.manage`). Analysts and content editors get none of it. API keys need the `account`
+scope (or `full`), and the person who made the key needs the permission too; the plain `read`
+scope doesn't include webhooks, because an endpoint's URL can itself be a credential.
 
-| Route or tool | Read-only roles | Content editors | People who can send | Admins and owner |
-| --- | --- | --- | --- | --- |
-| `GET /api/webhooks/topics`, `list_webhook_topics` | yes | yes | yes | yes |
-| `GET /api/webhooks`, `GET /api/webhooks/:id`, `list_webhooks` (no secrets) | yes | – | yes | yes |
-| `GET /api/webhooks/:id/deliveries`, `list_webhook_deliveries` without `delivery_id` (no payloads) | yes | – | yes | yes |
-| `GET /api/webhooks/:id/deliveries/:delivery_id`, `list_webhook_deliveries` with `delivery_id` (payload: personal data) | – | – | – | yes |
-| `POST/PATCH/DELETE /api/webhooks…`, `create_webhook`, `update_webhook`, `delete_webhook` | – | – | – | yes |
-| `POST /api/webhooks/:id/rotate-secret`, `rotate_webhook_secret` | – | – | – | yes |
-| `POST /api/webhooks/:id/test`, `send_test_webhook` | – | – | – | yes |
-| `POST /api/webhooks/:id/resend`, `resend_webhook_deliveries` | – | – | – | yes |
-| `GET /api/webhooks/flow-secret`, `get_flow_webhook_secret` | yes | – | yes | yes |
-| `POST /api/webhooks/flow-secret/rotate`, `rotate_flow_webhook_secret` | – | – | – | yes |
-| `/api/hooks…` (REST hooks) | API keys only; each key manages its own hooks | | | |
+| Route or tool | Needs |
+| --- | --- |
+| `GET /api/webhooks/topics`, `list_webhook_topics` | `webhooks.read` |
+| `GET /api/webhooks`, `GET /api/webhooks/:id`, `list_webhooks` (no secrets) | `webhooks.read` |
+| `GET /api/webhooks/:id/deliveries`, `list_webhook_deliveries` without `delivery_id` (no payloads) | `webhooks.read` |
+| `GET /api/webhooks/flow-secret`, `get_flow_webhook_secret` (a hint only) | `webhooks.read` |
+| `GET /api/webhooks/:id/deliveries/:delivery_id`, `list_webhook_deliveries` with `delivery_id` (payload: personal data) | `webhooks.manage` |
+| `POST/PATCH/DELETE /api/webhooks…`, `create_webhook`, `update_webhook`, `delete_webhook` | `webhooks.manage` |
+| `POST /api/webhooks/:id/rotate-secret`, `rotate_webhook_secret` | `webhooks.manage` |
+| `POST /api/webhooks/:id/test`, `send_test_webhook` | `webhooks.manage` |
+| `POST /api/webhooks/:id/resend`, `resend_webhook_deliveries` | `webhooks.manage` |
+| `POST /api/webhooks/flow-secret/rotate`, `rotate_flow_webhook_secret` | `webhooks.manage` |
+| `/api/hooks…` (REST hooks) | `webhooks.manage`, API keys only |
 
-Data export destinations and runs (see the data export docs) are for admins and the owner too; read-only
-roles may see destinations and runs (never keys).
+Creating, changing and deleting endpoints, rotating secrets and resending are recorded in the audit
+log (with the endpoint's host, never its full URL or any payload). Data export destinations and
+runs are for admins and owners (`exports.manage`; see the data export docs).
 
 ## MCP tools
 

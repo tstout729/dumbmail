@@ -27,6 +27,8 @@ export type Format = "jsonl" | "csv";
 
 export type Destination = {
   id: string;
+  /** Goes up when where or how files are written changes. */
+  revision: number;
   name: string;
   endpoint: string | null;
   region: string;
@@ -48,6 +50,8 @@ export type Destination = {
 };
 
 export type DestinationInput = {
+  /** The revision the editor read; a change made against an older one is refused. */
+  revision?: number;
   name?: string;
   endpoint?: string;
   region?: string;
