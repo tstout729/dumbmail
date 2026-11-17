@@ -175,17 +175,15 @@ pub struct Config {
     pub google_ads_client_id: Option<String>,
     #[arg(long, env = "GOOGLE_ADS_CLIENT_SECRET", hide_env_values = true)]
     pub google_ads_client_secret: Option<String>,
-    /// Google Ads API developer token, used only to list the ad accounts a person can reach. Without
-    /// it people type their Google Ads customer ID.
-    #[arg(long, env = "GOOGLE_ADS_DEVELOPER_TOKEN", hide_env_values = true)]
-    pub google_ads_developer_token: Option<String>,
     /// TikTok API for Business app.
     #[arg(long, env = "TIKTOK_APP_ID")]
     pub tiktok_app_id: Option<String>,
     #[arg(long, env = "TIKTOK_APP_SECRET", hide_env_values = true)]
     pub tiktok_app_secret: Option<String>,
-    /// Base URL that replaces every ad platform API host (tests point it at a local stand-in).
-    #[arg(long, env = "AD_PLATFORM_API_BASE", hide = true)]
+    /// A loopback stand-in for every ad platform API host, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored.
+    #[arg(skip)]
     pub ad_platform_api_base: Option<String>,
 }
 

@@ -85,7 +85,6 @@ impl Harness {
             meta_app_secret: None,
             google_ads_client_id: None,
             google_ads_client_secret: None,
-            google_ads_developer_token: None,
             tiktok_app_id: None,
             tiktok_app_secret: None,
             ad_platform_api_base: None,

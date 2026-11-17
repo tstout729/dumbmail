@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sqlx::QueryBuilder;
 use uuid::Uuid;
 
-use super::platforms::{self, PErr, Platform, Target};
+use super::platforms::{self, Kind, PErr, Platform, Target};
 use super::store::{self, ConnRow, SyncRow, SYNC_COLS};
 use super::sync;
 use crate::api::ApiJson;
@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ad-audiences/connections/{platform}/start", post(start_h))
         .route("/api/ad-audiences/connections/{platform}/accounts", get(accounts_h))
         .route("/api/ad-audiences/oauth/{platform}/callback", get(callback_h))
+        .route("/api/ad-audiences/settings", get(settings_h).put(put_settings_h))
         .route("/api/ad-audiences/syncs", get(syncs_h).post(create_h))
         .route("/api/ad-audiences/syncs/{id}", get(sync_h).patch(update_h).delete(delete_h))
         .route("/api/ad-audiences/syncs/{id}/run", post(run_h))
@@ -36,15 +37,44 @@ fn platform(s: &str) -> AppResult<Platform> {
     Platform::parse(s).ok_or_else(|| AppError::bad("platform must be meta, google or tiktok"))
 }
 
-fn perr(e: PErr) -> AppError {
-    AppError::BadRequest(e.message().to_string())
+fn perr(p: Platform, e: PErr) -> AppError {
+    let msg = sync::error_words(p, e.code);
+    match e.kind {
+        Kind::RateLimited | Kind::Transient | Kind::Unclear => AppError::Busy(msg),
+        _ => AppError::BadRequest(msg),
+    }
 }
 
-// ---------- Connections ----------
+/// A person signed in to the dashboard (not an API key), and their role in the account.
+async fn member_role(state: &AppState, ctx: &Ctx) -> AppResult<(Uuid, String)> {
+    let user = ctx.user_id.filter(|_| !ctx.via_api_key).ok_or_else(|| AppError::Forbidden("This needs someone signed in to DumbMail in a browser, not an API key.".into()))?;
+    let role: Option<String> = sqlx::query_scalar("SELECT role FROM memberships WHERE user_id = $1 AND account_id = $2").bind(user).bind(ctx.account_id).fetch_optional(&state.db).await?;
+    Ok((user, role.ok_or(AppError::Unauthorized)?))
+}
+
+async fn owner_or_admin(state: &AppState, ctx: &Ctx) -> AppResult<(Uuid, String)> {
+    let (user, role) = member_role(state, ctx).await?;
+    if !matches!(role.as_str(), "owner" | "admin") {
+        return Err(AppError::Forbidden("Only the account's owner or an admin can change this.".into()));
+    }
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(user).fetch_one(&state.db).await?;
+    Ok((user, email))
+}
+
+// ---------- Connections and settings ----------
+
+fn settings_json(st: &store::Settings) -> Value {
+    json!({
+        "google_consent": st.google_consent_at.is_some(),
+        "google_consent_at": st.google_consent_at,
+        "google_consent_by": st.google_consent_by_email,
+    })
+}
 
 pub async fn connections(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     let rows: Vec<ConnRow> = sqlx::query_as(&format!("SELECT {} FROM ad_connections WHERE account_id = $1", store::CONN_COLS)).bind(account_id).fetch_all(&state.db).await?;
     let counts: Vec<(String, i64)> = sqlx::query_as("SELECT platform, count(*) FROM ad_audience_syncs WHERE account_id = $1 GROUP BY platform").bind(account_id).fetch_all(&state.db).await?;
+    let settings = store::settings(&state.db, account_id).await?;
     let out: Vec<Value> = Platform::ALL
         .iter()
         .map(|p| {
@@ -62,27 +92,30 @@ pub async fn connections(state: &AppState, account_id: Uuid) -> AppResult<Value>
                 "status": status,
                 "connected_as": c.filter(|_| connected).and_then(|c| c.connected_as.clone()),
                 "connected_at": c.filter(|_| connected).and_then(|c| c.connected_at),
-                "token_hint": c.filter(|_| connected).and_then(|c| c.token_hint.clone()),
                 "token_expires_at": c.filter(|_| connected).and_then(|c| c.token_expires_at),
-                "error": c.filter(|_| status == "needs_reconnect").and_then(|c| c.error.clone()),
-                "manual_account_entry": *p == Platform::Google && platforms::google_developer_token(&state.cfg).is_none(),
+                "error": c.filter(|_| status == "needs_reconnect").and_then(|c| c.error_code.as_deref()).map(|code| platforms::words(*p, code)),
+                "last_revoke": c.filter(|_| !connected).and_then(|c| c.revoke_status.clone()),
+                "manual_account_entry": *p == Platform::Google,
+                "verified_live": false,
                 "syncs": counts.iter().find(|(k, _)| k == p.as_str()).map(|(_, n)| *n).unwrap_or(0),
             })
         })
         .collect();
-    Ok(json!({"data": out, "connect_url": format!("{}{SETTINGS_PATH}", state.cfg.public_url())}))
+    Ok(json!({"data": out, "settings": settings_json(&settings), "connect_url": format!("{}{SETTINGS_PATH}", state.cfg.public_url())}))
 }
 
 async fn connections_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(connections(&state, ctx.account_id).await?))
 }
 
-/// Begin a sign-in: remember a random state (hashed) and, for Google, a PKCE verifier; return the
-/// platform's sign-in URL for the browser to open.
+/// Begin a sign-in for the signed-in person: remember a random state (hashed) and, for Google, a
+/// PKCE verifier; return the platform's sign-in URL for the browser to open. API keys can't start
+/// one (the MCP tool returns the settings page link instead).
 async fn start_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
     let p = platform(&p)?;
+    let (user, _) = owner_or_admin(&state, &ctx).await?;
     if platforms::app(&state.cfg, p).is_none() {
-        return Err(AppError::BadRequest(format!("{} isn't available on this server.", p.label())));
+        return Err(AppError::BadRequest(platforms::words(p, "not_available")));
     }
     let st = auth::random_token(32);
     let verifier = auth::random_token(48);
@@ -90,7 +123,7 @@ async fn start_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>)
     sqlx::query("INSERT INTO ad_oauth_states (state_hash, account_id, user_id, platform, verifier_enc) VALUES ($1, $2, $3, $4, $5)")
         .bind(auth::sha256_hex(&st))
         .bind(ctx.account_id)
-        .bind(ctx.user_id)
+        .bind(user)
         .bind(p.as_str())
         .bind(verifier_enc)
         .execute(&state.db)
@@ -107,29 +140,34 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-/// The platform sends the browser back here. Errors go to the settings page as a short code it
-/// explains, never as free text. The signed-in session must be the account (and person) that
-/// started the sign-in, so nobody can attach their ad account to someone else's DumbMail account or
-/// the reverse with a crafted link.
+/// The platform sends the browser back here. The state is consumed only by the same account,
+/// person and platform that started it, in one statement, so a different session can't use or
+/// burn it. Errors go to the settings page as a short code it explains, never as free text. The
+/// query string (code and state) is never logged.
 async fn callback_h(State(state): State<AppState>, ctx: Result<Ctx, AppError>, Path(p): Path<String>, Query(q): Query<CallbackQuery>) -> Redirect {
     let Some(p) = Platform::parse(&p) else { return Redirect::to(&format!("{SETTINGS_PATH}?error=failed")) };
     let back = |code: &str| Redirect::to(&format!("{SETTINGS_PATH}?platform={}&error={code}", p.as_str()));
     let Ok(ctx) = ctx else { return back("signed_out") };
+    let Some(user) = ctx.user_id.filter(|_| !ctx.via_api_key) else { return back("signed_out") };
     let Some(st) = q.state.as_deref().filter(|s| !s.is_empty()) else { return back("expired") };
-    let row: Option<(Uuid, Option<Uuid>, String, Option<String>)> = match sqlx::query_as(
-        "DELETE FROM ad_oauth_states WHERE state_hash = $1 AND created_at > now() - interval '15 minutes' RETURNING account_id, user_id, platform, verifier_enc",
+    let hash = auth::sha256_hex(st);
+    let row: Result<Option<Option<String>>, _> = sqlx::query_scalar(
+        "DELETE FROM ad_oauth_states WHERE state_hash = $1 AND account_id = $2 AND user_id = $3 AND platform = $4 AND created_at > now() - interval '15 minutes' RETURNING verifier_enc",
     )
-    .bind(auth::sha256_hex(st))
+    .bind(&hash)
+    .bind(ctx.account_id)
+    .bind(user)
+    .bind(p.as_str())
     .fetch_optional(&state.db)
-    .await
-    {
-        Ok(r) => r,
+    .await;
+    let verifier_enc = match row {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            let someone_elses: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ad_oauth_states WHERE state_hash = $1)").bind(&hash).fetch_one(&state.db).await.unwrap_or(false);
+            return back(if someone_elses { "wrong_account" } else { "expired" });
+        }
         Err(_) => return back("failed"),
     };
-    let Some((account_id, user_id, started_platform, verifier_enc)) = row else { return back("expired") };
-    if account_id != ctx.account_id || started_platform != p.as_str() || (user_id.is_some() && user_id != ctx.user_id) {
-        return back("wrong_account");
-    }
     if let Some(e) = q.error.as_deref() {
         return back(if e.contains("denied") || e == "access_denied" { "cancelled" } else { "failed" });
     }
@@ -138,35 +176,28 @@ async fn callback_h(State(state): State<AppState>, ctx: Result<Ctx, AppError>, P
     let tokens = match platforms::exchange(&state, p, code, &verifier).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(platform = p.as_str(), error = e.message(), "ad platform sign-in failed");
+            tracing::warn!(platform = p.as_str(), code = e.code, "ad platform sign-in failed");
             return back("failed");
         }
     };
-    if store::save_tokens(&state, account_id, ctx.user_id, p, &tokens).await.is_err() {
+    if store::save_tokens(&state, ctx.account_id, user, p, &tokens).await.is_err() {
         return back("failed");
     }
     Redirect::to(&format!("{SETTINGS_PATH}?connected={}", p.as_str()))
 }
 
 pub async fn disconnect(state: &AppState, account_id: Uuid, p: Platform) -> AppResult<Value> {
-    let c = store::connection(&state.db, account_id, p).await?.filter(|c| c.status != "disconnected").ok_or_else(|| AppError::NotFound(format!("{} isn't connected", p.label())))?;
-    let key = &state.cfg.secret_key;
-    let access = c.access_token_enc.as_deref().and_then(|t| crate::crypto::decrypt(key, t).ok());
-    let refresh = c.refresh_token_enc.as_deref().and_then(|t| crate::crypto::decrypt(key, t).ok());
-    let mut revoked = false;
-    if let Some(a) = access.as_deref() {
-        match platforms::revoke(state, p, a, refresh.as_deref()).await {
-            Ok(()) => revoked = true,
-            Err(e) => tracing::info!(platform = p.as_str(), error = e.message(), "couldn't revoke ad platform access; deleting tokens anyway"),
-        }
-    }
-    sqlx::query(
-        "UPDATE ad_connections SET status = 'disconnected', access_token_enc = NULL, refresh_token_enc = NULL, token_hint = NULL, token_expires_at = NULL, error = NULL, updated_at = now() WHERE id = $1",
-    )
-    .bind(c.id)
-    .execute(&state.db)
-    .await?;
-    Ok(json!({"disconnected": true, "revoked": revoked, "note": format!("Syncs to {} wait until you connect it again.", p.label())}))
+    let d = store::disconnect(state, account_id, p).await?.ok_or_else(|| AppError::NotFound(format!("{} isn't connected", p.label())))?;
+    let note = if d.revoked {
+        format!("DumbMail's access was revoked on {} and its sign-in deleted. Syncs to {} wait until you connect it again.", p.label(), p.label())
+    } else {
+        format!(
+            "DumbMail deleted its sign-in, but {} didn't confirm it revoked DumbMail's access. Remove DumbMail from your {} account's connected apps to be sure. Syncs wait until you connect again.",
+            p.label(),
+            p.label()
+        )
+    };
+    Ok(json!({"disconnected": true, "revoked": d.revoked, "note": note}))
 }
 
 async fn disconnect_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
@@ -175,7 +206,7 @@ async fn disconnect_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<Str
 
 async fn connected(state: &AppState, account_id: Uuid, p: Platform) -> AppResult<(ConnRow, String)> {
     let c = store::connection(&state.db, account_id, p).await?.filter(|c| c.status != "disconnected").ok_or_else(|| AppError::BadRequest(format!("Connect {} first.", p.label())))?;
-    let token = store::access_token(state, &c).await.map_err(perr)?;
+    let token = store::access_token(state, &c).await.map_err(|e| perr(p, e))?;
     Ok((c, token))
 }
 
@@ -183,16 +214,65 @@ pub async fn ad_accounts(state: &AppState, account_id: Uuid, p: Platform) -> App
     let (c, token) = connected(state, account_id, p).await?;
     match platforms::list_accounts(state, p, &token).await {
         Ok(a) => Ok(json!({"data": a.accounts, "manual_entry": a.manual_entry})),
-        Err(PErr::Auth(m)) => {
-            store::mark_needs_reconnect(&state.db, c.id, &m).await?;
-            Err(AppError::BadRequest(m))
+        Err(e) if e.kind == Kind::Auth => {
+            store::mark_needs_reconnect(&state.db, c.id, c.generation, e.code).await?;
+            Err(perr(p, e))
         }
-        Err(e) => Err(perr(e)),
+        Err(e) => Err(perr(p, e)),
     }
 }
 
 async fn accounts_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
     Ok(Json(ad_accounts(&state, ctx.account_id, platform(&p)?).await?))
+}
+
+pub async fn get_settings(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+    Ok(settings_json(&store::settings(&state.db, account_id).await?))
+}
+
+async fn settings_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    Ok(Json(get_settings(&state, ctx.account_id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsBody {
+    pub google_consent: bool,
+}
+
+/// The Google consent setting: an owner or admin confirms the account's marketing consent covers
+/// advertising use. Turning it off pauses every Google sync.
+async fn put_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<SettingsBody>) -> AppResult<Json<Value>> {
+    let (user, email) = owner_or_admin(&state, &ctx).await?;
+    let mut tx = state.db.begin().await?;
+    if b.google_consent {
+        sqlx::query(
+            "INSERT INTO ad_audience_settings (account_id, google_consent_at, google_consent_by, google_consent_by_email) VALUES ($1, now(), $2, $3)
+             ON CONFLICT (account_id) DO UPDATE SET google_consent_at = COALESCE(ad_audience_settings.google_consent_at, now()),
+                 google_consent_by = CASE WHEN ad_audience_settings.google_consent_at IS NULL THEN EXCLUDED.google_consent_by ELSE ad_audience_settings.google_consent_by END,
+                 google_consent_by_email = CASE WHEN ad_audience_settings.google_consent_at IS NULL THEN EXCLUDED.google_consent_by_email ELSE ad_audience_settings.google_consent_by_email END,
+                 updated_at = now()",
+        )
+        .bind(ctx.account_id)
+        .bind(user)
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO ad_audience_settings (account_id) VALUES ($1)
+             ON CONFLICT (account_id) DO UPDATE SET google_consent_at = NULL, google_consent_by = NULL, google_consent_by_email = NULL, updated_at = now()",
+        )
+        .bind(ctx.account_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE ad_audience_syncs SET status = 'paused', pause_reason = 'google_consent', updated_at = now() WHERE account_id = $1 AND platform = 'google' AND status = 'active'")
+            .bind(ctx.account_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(get_settings(&state, ctx.account_id).await?))
 }
 
 // ---------- Syncs ----------
@@ -244,16 +324,31 @@ async fn syncs_h(State(state): State<AppState>, ctx: Ctx, Query(f): Query<SyncFi
 
 pub async fn get_sync(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
     let mut v = load_syncs(state, account_id, Some(id), &SyncFilter::default()).await?.pop().ok_or_else(|| AppError::not_found("sync"))?;
-    let runs: Vec<Value> = sqlx::query_scalar(
-        "SELECT jsonb_build_object('id', id, 'trigger', trigger, 'status', status, 'phase', phase, 'added', added, 'removed', removed, 'invalid', invalid,
-                'skipped', skipped, 'error', error, 'started_at', started_at, 'finished_at', finished_at)
+    let p = Platform::parse(v["platform"].as_str().unwrap_or_default()).unwrap_or(Platform::Meta);
+    let runs: Vec<(Value, Option<String>)> = sqlx::query_as(
+        "SELECT jsonb_build_object('id', id, 'trigger', trigger, 'mode', mode, 'status', status, 'phase', phase, 'added', added, 'removed', removed,
+                'rejected', rejected, 'skipped', skipped, 'started_at', started_at, 'finished_at', finished_at), error_code
          FROM ad_audience_runs WHERE sync_id = $1 AND account_id = $2 ORDER BY started_at DESC LIMIT 30",
     )
     .bind(id)
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
+    let runs: Vec<Value> = runs
+        .into_iter()
+        .map(|(mut r, code)| {
+            r["error_code"] = json!(code);
+            r["error"] = json!(code.as_deref().map(|c| sync::error_words(p, c)));
+            r
+        })
+        .collect();
+    // Batches still waiting for the platform, by what they're waiting for.
+    let open: Vec<(String, String, i64)> = sqlx::query_as("SELECT op, status, coalesce(sum(row_count), 0)::bigint FROM ad_audience_batches WHERE sync_id = $1 AND status IN ('pending', 'accepted') GROUP BY 1, 2")
+        .bind(id)
+        .fetch_all(&state.db)
+        .await?;
     v["runs"] = json!(runs);
+    v["waiting"] = json!(open.iter().map(|(op, st, n)| json!({"op": op, "status": st, "count": n})).collect::<Vec<_>>());
     Ok(v)
 }
 
@@ -270,7 +365,6 @@ pub struct CreateBody {
     pub source_type: String,
     pub source_id: Uuid,
     pub name: Option<String>,
-    pub include_unsubscribed: Option<bool>,
     pub match_fields: Option<String>,
     pub interval_hours: Option<i32>,
     pub accept_terms: Option<bool>,
@@ -288,8 +382,13 @@ fn account_digits(p: Platform, raw: &str) -> AppResult<String> {
     Ok(s)
 }
 
-fn check_match_fields(m: &str) -> AppResult<()> {
-    if matches!(m, "contact" | "contact_and_location") { Ok(()) } else { Err(AppError::bad("match_fields must be contact or contact_and_location")) }
+fn check_match_fields(p: Platform, m: &str) -> AppResult<()> {
+    match m {
+        "contact" => Ok(()),
+        "contact_and_location" if p == Platform::Meta => Ok(()),
+        "contact_and_location" => Err(AppError::bad(format!("{} syncs match on email and phone only", p.label()))),
+        _ => Err(AppError::bad("match_fields must be contact or contact_and_location")),
+    }
 }
 
 fn check_interval(h: i32) -> AppResult<()> {
@@ -305,15 +404,18 @@ async fn source_name(state: &AppState, account_id: Uuid, source_type: &str, id: 
     sqlx::query_scalar(sql).bind(id).bind(account_id).fetch_optional(&state.db).await?.ok_or_else(|| AppError::not_found(source_type))
 }
 
-/// How many people in the source could be sent now (before checking each has an identifier the
-/// platform takes).
-pub async fn estimate(state: &AppState, account_id: Uuid, source_type: &str, source_id: Uuid, include_unsubscribed: bool) -> AppResult<i64> {
-    let mut qb = QueryBuilder::new("SELECT count(*)");
-    if let Err(msg) = sync::push_source(&mut qb, &state.db, account_id, source_type, source_id, include_unsubscribed).await? {
-        return Err(AppError::BadRequest(msg));
+/// How many people in the source qualify now (before checking each has an identifier the platform takes).
+pub async fn estimate(state: &AppState, account_id: Uuid, source_type: &str, source_id: Uuid) -> AppResult<i64> {
+    let src = sync::load_source(&state.db, account_id, source_type, source_id).await?;
+    if let sync::Source::Gone(code) = src {
+        return Err(AppError::BadRequest(sync::error_words(Platform::Meta, code)));
     }
+    let mut qb = QueryBuilder::new("SELECT count(*) FROM profiles p WHERE ");
+    sync::push_live(&mut qb, account_id, &src);
     Ok(qb.build_query_scalar().fetch_one(&state.db).await?)
 }
+
+const GOOGLE_CONSENT_NEEDED: &str = "Google syncs need the account's owner or an admin to confirm, in Settings → Ad audiences, that your marketing consent covers using customer data for advertising.";
 
 pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_run: bool) -> AppResult<Value> {
     let p = platform(&b.platform)?;
@@ -323,44 +425,38 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
         Some(_) => return Err(AppError::bad("login_account_id is only for Google Ads manager accounts")),
         None => None,
     };
+    if p == Platform::Google && store::settings(&state.db, account_id).await?.google_consent_at.is_none() {
+        return Err(AppError::BadRequest(GOOGLE_CONSENT_NEEDED.into()));
+    }
     let source = source_name(state, account_id, &b.source_type, b.source_id).await?;
     let name = b.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| format!("{source} (DumbMail)"));
     if name.chars().count() > 100 {
         return Err(AppError::bad("name must be 100 characters or fewer"));
     }
     let match_fields = b.match_fields.unwrap_or_else(|| "contact".into());
-    check_match_fields(&match_fields)?;
+    check_match_fields(p, &match_fields)?;
     let interval = b.interval_hours.unwrap_or(6);
     check_interval(interval)?;
-    let include_unsub = b.include_unsubscribed.unwrap_or(false);
-    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM ad_audience_syncs WHERE account_id = $1").bind(account_id).fetch_one(&state.db).await?;
-    if existing >= MAX_SYNCS {
-        return Err(AppError::LimitReached(format!("An account can have up to {MAX_SYNCS} audience syncs. Delete one first.")));
-    }
-    let dup: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ad_audience_syncs WHERE account_id = $1 AND platform = $2 AND ad_account_id = $3 AND source_type = $4 AND source_id = $5)")
-        .bind(account_id)
-        .bind(p.as_str())
-        .bind(&ad_account)
-        .bind(&b.source_type)
-        .bind(b.source_id)
-        .fetch_one(&state.db)
-        .await?;
-    if dup {
-        return Err(AppError::Conflict(format!("This {} already syncs to that {} ad account.", b.source_type, p.label())));
-    }
     let (conn, token) = connected(state, account_id, p).await?;
     // Check the ad account is one this sign-in can reach, and pick up its name.
     let mut account_name = None;
-    let listed = platforms::list_accounts(state, p, &token).await.map_err(perr)?;
-    if !listed.accounts.is_empty() || !listed.manual_entry {
+    if p == Platform::Google {
+        let t = Target { platform: p, token: &token, ad_account_id: &ad_account, login_account_id: login.as_deref() };
+        platforms::verify_google_account(state, &t).await.map_err(|e| match e.kind {
+            Kind::Permission | Kind::NotFound | Kind::Refused => AppError::BadRequest(format!(
+                "This Google sign-in can't manage audiences in Google Ads account {ad_account}{}. Check the customer ID (and the manager account ID, if you reach it through one).",
+                login.as_deref().map(|l| format!(" through manager account {l}")).unwrap_or_default()
+            )),
+            _ => perr(p, e),
+        })?;
+    } else {
+        let listed = platforms::list_accounts(state, p, &token).await.map_err(|e| perr(p, e))?;
         match listed.accounts.iter().find(|a| a.id == ad_account) {
-            Some(a) if a.manager => return Err(AppError::bad("That's a Google Ads manager account. Pick one of the client accounts under it, and enter the manager's ID as login_account_id.")),
             Some(a) => account_name = a.name.clone(),
-            None if login.is_none() => return Err(AppError::BadRequest(format!("{} doesn't list ad account {ad_account} for this sign-in. Pick one from the list.", p.label()))),
-            None => {}
+            None => return Err(AppError::BadRequest(format!("{} doesn't list ad account {ad_account} for this sign-in. Pick one from the list.", p.label()))),
         }
     }
-    let people = estimate(state, account_id, &b.source_type, b.source_id, include_unsub).await?;
+    let people = estimate(state, account_id, &b.source_type, b.source_id).await?;
     if dry_run {
         return Ok(json!({
             "dry_run": true,
@@ -371,7 +467,7 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
             "name": name,
             "people_now": people,
             "note": format!(
-                "Nothing created. This would create the audience \"{name}\" in {} and upload hashed contact details for about {people} people from \"{source}\", then keep it in step every {interval} hours. Call again with confirm=true and accept_terms=true once the user approves.",
+                "Nothing created. This would create the audience \"{name}\" in {} and upload hashed contact details for about {people} people from \"{source}\" who are subscribed to email and haven't opted out, then keep it in step every {interval} hours. Call again with confirm=true and accept_terms=true once the user approves.",
                 p.label()
             ),
         }));
@@ -383,10 +479,17 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
         )));
     }
     let id = Uuid::now_v7();
-    sqlx::query(
+    let mut tx = state.db.begin().await?;
+    // The per-account cap is checked under a per-account lock, so two requests can't both pass it.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('ad_audience_syncs:' || $1::text, 0))").bind(account_id).execute(&mut *tx).await?;
+    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM ad_audience_syncs WHERE account_id = $1").bind(account_id).fetch_one(&mut *tx).await?;
+    if existing >= MAX_SYNCS {
+        return Err(AppError::LimitReached(format!("An account can have up to {MAX_SYNCS} audience syncs. Delete one first.")));
+    }
+    let inserted = sqlx::query(
         "INSERT INTO ad_audience_syncs (id, account_id, connection_id, platform, ad_account_id, ad_account_name, login_account_id, source_type, source_id, name,
-             include_unsubscribed, match_fields, interval_hours, terms_accepted_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())",
+             match_fields, interval_hours, terms_accepted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now()) ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(account_id)
@@ -398,11 +501,15 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
     .bind(&b.source_type)
     .bind(b.source_id)
     .bind(&name)
-    .bind(include_unsub)
     .bind(&match_fields)
     .bind(interval)
-    .execute(&state.db)
-    .await?;
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Err(AppError::Conflict(format!("This {} already syncs to that {} ad account.", b.source_type, p.label())));
+    }
+    tx.commit().await?;
     sync::start_run(state, id, "created").await?;
     get_sync(state, account_id, id).await
 }
@@ -411,17 +518,39 @@ async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<C
     Ok(Json(create_sync(&state, ctx.account_id, b, false).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateBody {
     pub status: Option<String>,
     pub interval_hours: Option<i32>,
-    pub include_unsubscribed: Option<bool>,
     pub match_fields: Option<String>,
+    /// After the platform said the audience no longer exists (or a TikTok create couldn't be
+    /// confirmed): make a new audience and upload everyone again. Needs `confirm: true`.
+    pub recreate_audience: Option<bool>,
+    pub confirm: Option<bool>,
+}
+
+/// Take the sync's lease for an API change that must not overlap a batch in flight.
+async fn api_lease(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Uuid> {
+    let tok: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE ad_audience_syncs SET lease_token = $3, lease_until = now() + interval '5 minutes' WHERE id = $1 AND account_id = $2 AND (lease_until IS NULL OR lease_until < now()) RETURNING lease_token",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(Uuid::new_v4())
+    .fetch_optional(&state.db)
+    .await?;
+    tok.ok_or_else(|| AppError::Busy("This sync is sending a batch to the platform right now. Try again in a minute.".into()))
+}
+
+async fn api_release(state: &AppState, id: Uuid, tok: Uuid) -> AppResult<()> {
+    sqlx::query("UPDATE ad_audience_syncs SET lease_token = NULL, lease_until = NULL WHERE id = $1 AND lease_token = $2").bind(id).bind(tok).execute(&state.db).await?;
+    Ok(())
 }
 
 pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: UpdateBody) -> AppResult<Value> {
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
+    let p = s.platform();
     if let Some(st) = b.status.as_deref() {
         if !matches!(st, "active" | "paused") {
             return Err(AppError::bad("status must be active or paused"));
@@ -431,13 +560,50 @@ pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: Update
         check_interval(h)?;
     }
     if let Some(m) = b.match_fields.as_deref() {
-        check_match_fields(m)?;
+        check_match_fields(p, m)?;
+    }
+    if b.recreate_audience == Some(true) {
+        if !matches!(s.pause_reason.as_deref(), Some("audience_missing" | "create_unclear")) {
+            return Err(AppError::bad("recreate_audience is only for a sync whose audience the platform says is gone, or whose TikTok audience couldn't be confirmed"));
+        }
+        if b.confirm != Some(true) {
+            return Err(AppError::bad(format!("This makes a new audience on {} and uploads everyone who qualifies. Send confirm=true to go ahead.", p.label())));
+        }
+        if p == Platform::Google && store::settings(&state.db, account_id).await?.google_consent_at.is_none() {
+            return Err(AppError::BadRequest(GOOGLE_CONSENT_NEEDED.into()));
+        }
+        let tok = api_lease(state, account_id, id).await?;
+        let mut tx = state.db.begin().await?;
+        sqlx::query("DELETE FROM ad_audience_members WHERE sync_id = $1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE ad_audience_batches SET status = 'abandoned', result_code = 'recreated', settled_at = now() WHERE sync_id = $1 AND status IN ('pending', 'accepted')").bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE ad_audience_syncs SET external_audience_id = NULL, audience_created_at = NULL, status = 'active', pause_reason = NULL, last_error_code = NULL,
+                 platform_size = NULL, platform_size_upper = NULL, match_rate = NULL, platform_status = NULL, next_run_at = now(), updated_at = now()
+             WHERE id = $1 AND lease_token = $2",
+        )
+        .bind(id)
+        .bind(tok)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        api_release(state, id, tok).await?;
+        sync::start_run(state, id, "manual").await?;
+        return get_sync(state, account_id, id).await;
     }
     let resumed = b.status.as_deref() == Some("active") && s.status == "paused";
-    let changed_who = b.include_unsubscribed.is_some_and(|v| v != s.include_unsubscribed) || b.match_fields.as_deref().is_some_and(|m| m != s.match_fields);
+    if resumed {
+        match s.pause_reason.as_deref() {
+            Some("google_consent") if store::settings(&state.db, account_id).await?.google_consent_at.is_none() => return Err(AppError::BadRequest(GOOGLE_CONSENT_NEEDED.into())),
+            Some("audience_missing" | "create_unclear") => return Err(AppError::bad("Make a new audience for this sync instead (recreate_audience=true with confirm=true).")),
+            _ => {}
+        }
+    }
+    let paused = b.status.as_deref() == Some("paused") && s.status == "active";
+    let widened = b.match_fields.as_deref().is_some_and(|m| m != s.match_fields);
     sqlx::query(
-        "UPDATE ad_audience_syncs SET status = COALESCE($3, status), interval_hours = COALESCE($4, interval_hours), include_unsubscribed = COALESCE($5, include_unsubscribed),
-             match_fields = COALESCE($6, match_fields), next_run_at = CASE WHEN $7 THEN now() WHEN $4::int IS NOT NULL THEN COALESCE(last_run_at, now()) + make_interval(hours => $4::int) ELSE next_run_at END,
+        "UPDATE ad_audience_syncs SET status = COALESCE($3, status), pause_reason = CASE WHEN $8 THEN 'user' WHEN $7 THEN NULL ELSE pause_reason END,
+             interval_hours = COALESCE($4, interval_hours), match_fields = COALESCE($5, match_fields),
+             next_run_at = CASE WHEN $6 THEN now() WHEN $4::int IS NOT NULL THEN COALESCE(last_run_at, now()) + make_interval(hours => $4::int) ELSE next_run_at END,
              updated_at = now()
          WHERE id = $1 AND account_id = $2",
     )
@@ -445,9 +611,10 @@ pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: Update
     .bind(account_id)
     .bind(&b.status)
     .bind(b.interval_hours)
-    .bind(b.include_unsubscribed)
     .bind(&b.match_fields)
-    .bind(resumed || changed_who)
+    .bind(resumed || widened)
+    .bind(resumed)
+    .bind(paused)
     .execute(&state.db)
     .await?;
     get_sync(state, account_id, id).await
@@ -459,7 +626,7 @@ async fn update_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>,
 
 pub async fn run_now(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
-    if s.status == "paused" {
+    if s.status == "paused" && s.pause_reason.as_deref() != Some("tiktok_minimum") {
         return Err(AppError::bad("This sync is paused. Resume it first."));
     }
     let started = sync::start_run(state, id, "manual").await?;
@@ -478,28 +645,61 @@ async fn run_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) ->
 #[derive(Deserialize, Default)]
 pub struct DeleteQuery {
     pub delete_on_platform: Option<bool>,
+    pub confirm: Option<bool>,
+}
+
+/// What deleting would do, for a dry run.
+pub fn delete_note(s: &SyncRow, on_platform: bool) -> String {
+    let l = s.platform().label();
+    if on_platform {
+        format!("Nothing deleted. This would stop syncing \"{}\" and delete the audience on {l}; ads that use it stop. Call again with confirm=true once the user approves.", s.name)
+    } else {
+        format!(
+            "Nothing deleted. This would stop syncing \"{}\" and leave the audience on {l} as it is now. DumbMail would no longer remove people who opt out from it. Call again with confirm=true once the user approves.",
+            s.name
+        )
+    }
 }
 
 /// Delete a sync. With `delete_on_platform` the audience is deleted on the ad platform first (ads
-/// that use it stop); if that fails, nothing is deleted.
+/// that use it stop); if the platform doesn't confirm that, nothing is deleted here. Waits for no
+/// batch: refuses while one is in flight.
 pub async fn delete_sync(state: &AppState, account_id: Uuid, id: Uuid, on_platform: bool) -> AppResult<Value> {
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
     let p = s.platform();
+    let tok = api_lease(state, account_id, id).await?;
     let mut deleted_on_platform = false;
     if on_platform {
         if let Some(aud) = s.external_audience_id.as_deref() {
-            let (_, token) = connected(state, account_id, p).await?;
-            let t = Target { platform: p, token: &token, ad_account_id: &s.ad_account_id, login_account_id: s.login_account_id.as_deref() };
-            match platforms::delete_audience(state, &t, aud).await {
-                Ok(()) | Err(PErr::NotFound(_)) => deleted_on_platform = true,
-                Err(e) => return Err(perr(e)),
+            let res = async {
+                let (_, token) = connected(state, account_id, p).await?;
+                let t = Target { platform: p, token: &token, ad_account_id: &s.ad_account_id, login_account_id: s.login_account_id.as_deref() };
+                platforms::delete_audience(state, &t, aud).await.map_err(|e| match e.kind {
+                    Kind::NotFound => AppError::BadRequest(format!(
+                        "{} says this audience doesn't exist, so DumbMail can't confirm deleting it. Check {}, then delete the sync without deleting on the platform.",
+                        p.label(),
+                        p.label()
+                    )),
+                    _ => perr(p, e),
+                })
             }
+            .await;
+            if let Err(e) = res {
+                api_release(state, id, tok).await?;
+                return Err(e);
+            }
+            deleted_on_platform = true;
         }
     }
-    sqlx::query("DELETE FROM ad_audience_syncs WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).execute(&state.db).await?;
+    sqlx::query("DELETE FROM ad_audience_syncs WHERE id = $1 AND account_id = $2 AND lease_token = $3").bind(id).bind(account_id).bind(tok).execute(&state.db).await?;
     Ok(json!({"deleted": true, "deleted_on_platform": deleted_on_platform, "audience_id": s.external_audience_id}))
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<DeleteQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(delete_sync(&state, ctx.account_id, id, q.delete_on_platform.unwrap_or(false)).await?))
+    let on_platform = q.delete_on_platform.unwrap_or(false);
+    if q.confirm != Some(true) {
+        let s = store::account_sync(&state.db, ctx.account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
+        return Ok(Json(json!({"dry_run": true, "note": delete_note(&s, on_platform)})));
+    }
+    Ok(Json(delete_sync(&state, ctx.account_id, id, on_platform).await?))
 }
