@@ -136,14 +136,14 @@ function ConnectCard({ s }: { s: ShopifyStatus }) {
           </Notice>
         ) : null}
         <form onSubmit={onSubmit} className="flex flex-wrap items-end gap-2">
-          <Field label="Store address" hint="Your store's myshopify.com address, or just its name." className="min-w-0 flex-1">
+          <Field label="Store address" className="min-w-0 flex-1">
             <Input name="shop" required maxLength={200} defaultValue={params.get("shop") ?? previous?.shop ?? ""} placeholder="your-store.myshopify.com" autoComplete="off" />
           </Field>
           <Button type="submit" variant="primary" icon={<ShoppingBag className="size-3.5" />} loading={connect.isPending}>
             Connect
           </Button>
         </form>
-        <p className="text-xs text-zinc-500">You'll approve the app in Shopify, then come back here.</p>
+        <p className="text-xs text-zinc-500">Your store's myshopify.com address, or just its name. You'll approve the app in Shopify, then come back here.</p>
       </div>
     </Card>
   );

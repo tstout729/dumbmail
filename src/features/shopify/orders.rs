@@ -367,6 +367,7 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         p.insert("items".into(), json!(items));
         p.insert("item_names".into(), json!(o.lines.iter().filter_map(|l| l.title.clone()).collect::<Vec<_>>()));
         p.insert("item_count".into(), json!(o.lines.iter().map(|l| l.quantity).sum::<i64>()));
+        p.insert("line_item_ids".into(), json!(o.lines.iter().map(|l| l.id.to_string()).collect::<Vec<_>>()));
         p.insert("total".into(), json!(o.total));
         for (k, v) in [("subtotal", o.subtotal), ("discount_total", o.discounts), ("shipping_total", o.shipping), ("tax_total", o.tax)] {
             if let Some(v) = v {
@@ -519,10 +520,11 @@ pub async fn apply_refund(cx: &mut Ctx<'_>, body: &Value) -> anyhow::Result<()> 
         sqlx::query("UPDATE events SET properties = $2, value = $3 WHERE id = $1").bind(event_id).bind(&np).bind(value).execute(db).await?;
         // Its lines.
         let line_metric = cx.metrics.id(db, cx.account_id, "Ordered Product").await?;
-        let line_rows: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id LIKE $3")
+        let line_ids: Vec<String> = props["line_item_ids"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).take(MAX_LINES).map(|l| format!("order:{order_id}:{l}")).collect()).unwrap_or_default();
+        let line_rows: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, properties FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = ANY($3)")
             .bind(cx.account_id)
             .bind(line_metric)
-            .bind(format!("order:{order_id}:%"))
+            .bind(&line_ids)
             .fetch_all(db)
             .await?;
         for (lid_event, lp) in line_rows {
