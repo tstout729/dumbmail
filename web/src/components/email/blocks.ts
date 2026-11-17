@@ -6,11 +6,13 @@ import {
   Image,
   Minus,
   MousePointerClick,
+  LayoutGrid,
   MoveVertical,
   ShoppingBag,
   type LucideIcon,
 } from "lucide-react";
 import type { EmailBlock, EmailBlockType, EmailContent } from "../../api";
+import { newProductsBlock, sourceLabel } from "../../features/catalog/ProductsBlockFields";
 
 export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon }> = {
   heading: { label: "Heading", icon: Heading },
@@ -21,10 +23,11 @@ export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon
   spacer: { label: "Spacer", icon: MoveVertical },
   columns: { label: "Columns", icon: Columns2 },
   product: { label: "Product", icon: ShoppingBag },
+  products: { label: "Products from catalog", icon: LayoutGrid },
   html: { label: "HTML", icon: Code },
 };
 
-export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "product", "columns", "divider", "spacer", "html"];
+export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "columns", "divider", "spacer", "html"];
 
 export function newBlock(type: EmailBlockType): EmailBlock {
   switch (type) {
@@ -52,6 +55,8 @@ export function newBlock(type: EmailBlockType): EmailBlock {
       return { type, title: "Product name", price: "$29", href: "https://", button_text: "Buy now" };
     case "html":
       return { type, html: "<p>Custom HTML</p>" };
+    case "products":
+      return newProductsBlock();
   }
 }
 
@@ -79,6 +84,8 @@ export function blockSummary(b: EmailBlock): string {
       return [b.title, b.price].filter(Boolean).join(" · ");
     case "html":
       return stripTags(b.html) || "Custom HTML";
+    case "products":
+      return `${b.count ?? 4} × ${sourceLabel(b.source)}`;
   }
 }
 
@@ -98,5 +105,7 @@ export const templateVariables: { label: string; value: string }[] = [
   { label: "Custom property", value: "{{ person.properties.city }}" },
   { label: "Company name", value: "{{ organization.name }}" },
   { label: "Event item (flows)", value: "{{ event.properties.items[0].name }}" },
+  { label: "A product by its ID", value: '{{ catalog.products["YOUR-ID"].title }}' },
+  { label: "Top pick for this person", value: "{{ recommendations[0].title }} {{ recommendations[0].url }}" },
   { label: "Unsubscribe link", value: "{{ unsubscribe_url }}" },
 ];

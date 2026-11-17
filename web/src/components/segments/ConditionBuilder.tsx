@@ -14,7 +14,9 @@ import type {
   SegmentDefinition,
   TimeOp,
 } from "../../api";
-import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, isValuelessOp, numericOps, predictions, propOps, timeOps } from "./conditions";
+import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, isValuelessOp, numericOps, predictions, productActions, propOps, timeOps } from "./conditions";
+import { useCatalogFacets } from "../../features/catalog/api";
+import type { ProductCondition } from "../../features/catalog/types";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
 import { IconButton, Input, Select, cx } from "../ui";
 
@@ -320,6 +322,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
           <WindowFields value={c} onChange={(w) => onChange({ ...c, ...w })} />
         </>
       );
+    case "product":
+      return <ProductFields condition={c} onChange={onChange} />;
     case "list":
       return (
         <>
@@ -512,6 +516,71 @@ function EventFields({ condition: c, onChange }: { condition: EventCondition; on
       ) : null}
       <WindowFields value={c} onChange={(w) => onChange({ ...c, ...w })} />
       <WhereFilters where={c.where ?? []} onChange={(where) => onChange({ ...c, where })} />
+    </>
+  );
+}
+
+type ProductTarget = "any" | "product_id" | "category" | "tag" | "brand";
+
+/** Product activity from the catalog: one product (by the store's id), or any in a category, with a tag or of a brand. */
+function ProductFields({ condition: c, onChange }: { condition: ProductCondition; onChange: (c: Condition) => void }) {
+  const facets = useCatalogFacets();
+  const target: ProductTarget = c.product_id !== undefined ? "product_id" : c.category !== undefined ? "category" : c.tag !== undefined ? "tag" : c.brand !== undefined ? "brand" : "any";
+  const value = c.product_id ?? c.category ?? c.tag ?? c.brand ?? "";
+  const options = target === "category" ? facets.data?.categories : target === "tag" ? facets.data?.tags : target === "brand" ? facets.data?.brands : undefined;
+  const setTarget = (t: ProductTarget, v = "") =>
+    onChange({ ...c, product_id: undefined, category: undefined, tag: undefined, brand: undefined, ...(t === "any" ? {} : { [t]: v }) });
+  return (
+    <>
+      <Select value={c.action} onChange={(e) => onChange({ ...c, action: e.target.value as ProductCondition["action"] })} className={small} aria-label="Action">
+        {productActions.map((a) => (
+          <option key={a.value} value={a.value}>
+            {a.label}
+          </option>
+        ))}
+      </Select>
+      <Select value={target} onChange={(e) => setTarget(e.target.value as ProductTarget)} className={small} aria-label="Which products">
+        <option value="any">any product</option>
+        <option value="product_id">the product with ID</option>
+        <option value="category">any product in category</option>
+        <option value="tag">any product tagged</option>
+        <option value="brand">any product by brand</option>
+      </Select>
+      {target === "product_id" ? (
+        <Input value={value} onChange={(e) => setTarget("product_id", e.target.value)} placeholder="product ID" className="h-8 w-36 text-xs" aria-label="Product ID" />
+      ) : target !== "any" ? (
+        <Select value={value} onChange={(e) => setTarget(target, e.target.value)} className={cx(small, "min-w-36")} aria-label="Value">
+          {!value ? <option value="">Choose…</option> : null}
+          {value && !(options ?? []).includes(value) ? <option value={value}>{value}</option> : null}
+          {(options ?? []).map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </Select>
+      ) : null}
+      <Select
+        value={c.op}
+        onChange={(e) => {
+          const op = e.target.value as ProductCondition["op"];
+          onChange({ ...c, op, count: op === "zero" ? undefined : (c.count ?? 1) });
+        }}
+        className={small}
+        aria-label="Count operator"
+      >
+        {eventOps.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </Select>
+      {c.op !== "zero" ? (
+        <>
+          <NumInput value={c.count} onChange={(count) => onChange({ ...c, count })} label="Count" className="w-16" min={0} step={1} />
+          <Hint>times</Hint>
+        </>
+      ) : null}
+      <WindowFields value={c} onChange={(w) => onChange({ ...c, ...w })} />
     </>
   );
 }
