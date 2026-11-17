@@ -507,40 +507,157 @@ export type EmailRender = { subject: string; preheader: string; html: string; te
 export type SmsRender = { body: string; segments: number; characters: number };
 
 // ---- Forms ----
+// Mirrors docs/FORMS.md. Every config key is optional (left out = the default); `null` resets a key on update.
 
 export type FormKind = "popup" | "embed" | "flyout" | "page";
+/** The older `collect` field list. Forms without `fields` derive their fields from it. */
 export type FormField = "email" | "phone_number" | "first_name";
+export type StandardFieldKey = "email" | "phone_number" | "first_name" | "last_name" | "birthday";
+export type CustomFieldType = "text" | "number" | "date" | "select" | "radio" | "checkboxes" | "checkbox";
+
+export type FormFieldDef = {
+  /** A standard key, or a custom profile property (lowercase letters, digits and _, starting with a letter, ≤ 40). */
+  key: string;
+  /** Custom fields only; default "text". */
+  type?: CustomFieldType;
+  label?: string;
+  placeholder?: string;
+  /** Default true for email, false for the rest. */
+  required?: boolean;
+  /** Required for select, radio and checkboxes: 1-20 options. */
+  options?: string[];
+};
+
+export type PhoneStep = {
+  enabled?: boolean;
+  headline?: string;
+  body?: string;
+  button_text?: string;
+  skip_text?: string;
+};
+
+export type FormLayout = "stacked" | "image_left" | "image_right" | "background";
+export type FormAlign = "center" | "left";
+export type FormFont =
+  | "system"
+  | "inherit"
+  | "serif"
+  | "Inter"
+  | "Poppins"
+  | "Montserrat"
+  | "Lato"
+  | "DM Sans"
+  | "Space Grotesk"
+  | "Playfair Display"
+  | "Lora"
+  | "Merriweather"
+  | "Oswald";
+export type FormShadow = "none" | "soft" | "strong";
+export type FormAnimation = "fade" | "slide" | "zoom" | "none";
+export type PopupPosition = "center" | "top" | "bottom";
+export type FlyoutPosition = "bottom_right" | "bottom_left" | "top_right" | "top_left";
+export type HeadlineWeight = 400 | 500 | 600 | 700 | 800;
+
+/** One look shared by every A/B version. Sent whole on update. */
+export type FormStyle = {
+  layout?: FormLayout;
+  width?: number;
+  align?: FormAlign;
+  font?: FormFont;
+  headline_size?: number;
+  headline_weight?: HeadlineWeight;
+  body_size?: number;
+  background_color?: string;
+  headline_color?: string;
+  text_color?: string;
+  button_color?: string;
+  button_text_color?: string;
+  button_full_width?: boolean;
+  input_background?: string;
+  input_border_color?: string;
+  input_text_color?: string;
+  corner_radius?: number;
+  button_radius?: number;
+  input_radius?: number;
+  padding?: number;
+  border_width?: number;
+  border_color?: string;
+  shadow?: FormShadow;
+  overlay_color?: string;
+  overlay_opacity?: number;
+  close_on_overlay?: boolean;
+  close_color?: string;
+  position?: PopupPosition | FlyoutPosition;
+  animation?: FormAnimation;
+  page_background?: string;
+  custom_css?: string;
+};
+
+export type TeaserPosition = "bottom_left" | "bottom_right" | "left" | "right";
+export type TeaserShow = "after_close" | "always";
+export type Teaser = { enabled?: boolean; text?: string; position?: TeaserPosition; show?: TeaserShow };
 
 export type FormConfig = {
-  headline: string;
-  body: string;
-  button_text: string;
-  success_message: string;
-  collect: FormField[];
-  sms_consent_text?: string;
-  delay_seconds?: number;
-  brand_color?: string;
-  image_url?: string;
-  targeting?: Targeting;
-  /** A/B test: versions b-d in order override these fields; the form itself is version A. */
+  // Content (also per A/B version)
+  headline?: string | null;
+  body?: string | null;
+  button_text?: string | null;
+  image_url?: string | null;
+  image_alt?: string | null;
+  no_thanks_text?: string | null;
+  success_message?: string | null;
+  success_body?: string | null;
+  discount_code?: string | null;
+  // Shared by every version
+  legal_text?: string | null;
+  success_button_text?: string | null;
+  success_button_url?: string | null;
+  redirect_url?: string | null;
+  auto_close_seconds?: number | null;
+  confirm_message?: string | null;
+  sms_consent_text?: string | null;
+  brand_color?: string | null;
+  fields?: FormFieldDef[] | null;
+  /** Legacy field list; used only while `fields` is absent. */
+  collect?: FormField[] | null;
+  phone_step?: PhoneStep | null;
+  style?: FormStyle | null;
+  teaser?: Teaser | null;
+  delay_seconds?: number | null;
+  targeting?: Targeting | null;
+  /** A/B test: versions b-d in order override the per-version keys; the form itself is version A. */
   variants?: FormVariant[] | null;
 };
 
-export type FormVariantField = "headline" | "body" | "button_text" | "image_url";
-export type FormVariant = { id: Exclude<VersionId, "a"> } & Partial<Record<FormVariantField, string>>;
+export type FormVariantField =
+  | "headline"
+  | "body"
+  | "button_text"
+  | "image_url"
+  | "image_alt"
+  | "no_thanks_text"
+  | "success_message"
+  | "success_body"
+  | "discount_code";
+export type FormVariant = { id: Exclude<VersionId, "a"> } & Partial<Record<FormVariantField, string | null>>;
 
-export type FormTrigger = "delay" | "scroll" | "exit_intent";
+export type FormTrigger = "delay" | "scroll" | "exit_intent" | "manual";
 export type FormDevices = "all" | "desktop" | "mobile";
+export type FormVisitors = "all" | "new" | "returning";
 
-/** Popup and flyout display rules (v0.2). Every field is optional; defaults are noted. */
+/** Popup and flyout display rules. Every field is optional; defaults are noted. Sent whole on update. */
 export type Targeting = {
   trigger?: FormTrigger; // default "delay" (uses config.delay_seconds)
   scroll_percent?: number; // for "scroll", default 40
   devices?: FormDevices; // default "all"
   url_contains?: string[];
   url_excludes?: string[];
+  page_views?: number; // default 1
+  visitors?: FormVisitors; // default "all"
   frequency_days?: number; // default 7
   hide_for_subscribers?: boolean; // default true
+  start_at?: string; // ISO 8601
+  end_at?: string;
 };
 
 export type Form = {
@@ -552,10 +669,15 @@ export type Form = {
   config: FormConfig;
   created_at: string;
   updated_at: string;
+  /** The hosted page, drafts included; nothing is counted or saved there. */
+  preview_url: string;
   stats: { views: number; submits: number };
   /** Per-version counts while an A/B test runs (empty otherwise). */
   variant_stats: { id: VersionId; views: number; submits: number; submit_rate: number }[];
 };
+
+/** An uploaded image (`POST /api/images`). The URL is public and permanent. */
+export type UploadedImage = { id: string; url: string; content_type: string; size: number; created_at: string };
 
 // ---- Events and metrics ----
 

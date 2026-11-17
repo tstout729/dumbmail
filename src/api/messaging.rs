@@ -4,7 +4,6 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{page, ApiJson};
@@ -751,7 +750,7 @@ async fn from_blueprint_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): A
 // ---------- Forms ----------
 
 /// The fields a form A/B variant can change; everything else comes from the form itself (version A).
-pub const FORM_VARIANT_FIELDS: [&str; 4] = ["headline", "body", "button_text", "image_url"];
+pub const FORM_VARIANT_FIELDS: [&str; 9] = crate::forms::VARIANT_FIELDS;
 
 /// A form's A/B test versions ("a" plus each variant's id), or none when it isn't testing.
 pub fn form_versions(config: &Value) -> Vec<&str> {
@@ -774,7 +773,12 @@ pub fn form_version_config(config: &Value, version: &str) -> Value {
     c
 }
 
-fn form_json(f: &FormRow, variant_stats: &[(Uuid, String, i64, i64)]) -> Value {
+/// The hosted page for a form with its preview token: drafts show, nothing is counted or saved.
+pub fn form_preview_url(state: &AppState, id: Uuid) -> String {
+    format!("{}/f/{id}?preview={}", state.cfg.public_url(), crate::forms::preview_token(&state.cfg.secret_key, id))
+}
+
+fn form_json(state: &AppState, f: &FormRow, variant_stats: &[(Uuid, String, i64, i64)]) -> Value {
     let mut v = serde_json::to_value(f).unwrap_or_default();
     let versions: Vec<Value> = form_versions(&f.config)
         .into_iter()
@@ -786,24 +790,30 @@ fn form_json(f: &FormRow, variant_stats: &[(Uuid, String, i64, i64)]) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("stats".into(), json!({"views": f.views, "submits": f.submits}));
         o.insert("variant_stats".into(), json!(versions));
+        o.insert("preview_url".into(), json!(form_preview_url(state, f.id)));
     }
     v
 }
 
-pub async fn forms_json(db: &PgPool, rows: &[FormRow]) -> AppResult<Vec<Value>> {
+pub async fn forms_json(state: &AppState, rows: &[FormRow]) -> AppResult<Vec<Value>> {
     let ids: Vec<Uuid> = rows.iter().map(|f| f.id).collect();
-    let stats: Vec<(Uuid, String, i64, i64)> = sqlx::query_as("SELECT form_id, variant, views, submits FROM form_variant_stats WHERE form_id = ANY($1)").bind(&ids).fetch_all(db).await?;
-    Ok(rows.iter().map(|f| form_json(f, &stats)).collect())
+    let stats: Vec<(Uuid, String, i64, i64)> = sqlx::query_as("SELECT form_id, variant, views, submits FROM form_variant_stats WHERE form_id = ANY($1)").bind(&ids).fetch_all(&state.db).await?;
+    Ok(rows.iter().map(|f| form_json(state, f, &stats)).collect())
 }
 
-async fn form_one(db: &PgPool, f: &FormRow) -> AppResult<Value> {
-    Ok(forms_json(db, std::slice::from_ref(f)).await?.remove(0))
+pub async fn form_one(state: &AppState, f: &FormRow) -> AppResult<Value> {
+    Ok(forms_json(state, std::slice::from_ref(f)).await?.remove(0))
+}
+
+pub async fn load_form(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<FormRow> {
+    let f: Option<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).fetch_optional(&state.db).await?;
+    f.ok_or_else(|| AppError::not_found("form"))
 }
 
 async fn forms_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     let rows: Vec<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(ctx.account_id).fetch_all(&state.db).await?;
     let n = rows.len() as i64;
-    Ok(page(forms_json(&state.db, &rows).await?, n))
+    Ok(page(forms_json(&state, &rows).await?, n))
 }
 
 #[derive(Deserialize, Default)]
@@ -816,43 +826,10 @@ pub struct FormBody {
 }
 
 fn check_form_config(config: &Option<Value>) -> AppResult<()> {
-    if let Some(c) = config.as_ref().and_then(|c| c.get("brand_color")).and_then(|v| v.as_str()) {
-        if crate::render::safe_color(c, "") != c {
-            return Err(AppError::bad("brand_color must be a hex color like #1f6f5c"));
-        }
+    match config {
+        Some(c) => crate::forms::check_config(c),
+        None => Ok(()),
     }
-    let check_image = |c: &Value| -> AppResult<()> {
-        match c.get("image_url").and_then(|v| v.as_str()) {
-            Some(u) if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") => Err(AppError::bad("image_url must be an http(s) URL")),
-            _ => Ok(()),
-        }
-    };
-    let Some(c) = config else { return Ok(()) };
-    check_image(c)?;
-    match c.get("variants") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(vs)) => {
-            if vs.len() > 3 {
-                return Err(AppError::bad("a form A/B test can have at most 3 extra versions (B, C and D)"));
-            }
-            for (i, v) in vs.iter().enumerate() {
-                let want = campaigns::VERSION_IDS[i + 1];
-                let o = v.as_object().filter(|o| o.get("id").and_then(|x| x.as_str()) == Some(want));
-                let Some(o) = o else { return Err(AppError::bad(format!("form variant {} must be an object with id {want:?}", i + 1))) };
-                for (k, val) in o {
-                    if k != "id" && !FORM_VARIANT_FIELDS.contains(&k.as_str()) {
-                        return Err(AppError::bad(format!("form variants can change only {}, not {k:?}", FORM_VARIANT_FIELDS.join(", "))));
-                    }
-                    if !(val.is_string() || val.is_null()) {
-                        return Err(AppError::bad(format!("form variant {want} {k} must be text")));
-                    }
-                }
-                check_image(v)?;
-            }
-        }
-        Some(_) => return Err(AppError::bad("variants must be a list")),
-    }
-    Ok(())
 }
 
 fn default_form_config() -> Value {
@@ -871,32 +848,37 @@ pub async fn create_form(state: &AppState, account_id: Uuid, b: FormBody) -> App
     if !matches!(kind.as_str(), "popup" | "embed" | "flyout" | "page") {
         return Err(AppError::bad("kind must be popup, embed, flyout or page"));
     }
+    if let Some(s) = &b.status {
+        if !matches!(s.as_str(), "draft" | "live") {
+            return Err(AppError::bad("status must be draft or live"));
+        }
+    }
     if let Some(l) = b.list_id {
         crate::audience::list_belongs(&state.db, account_id, l).await?;
     }
     check_form_config(&b.config)?;
     let mut config = default_form_config();
-    if let (Some(o), Some(Value::Object(extra))) = (config.as_object_mut(), b.config) {
-        o.extend(extra);
+    if let Some(patch) = b.config {
+        crate::forms::apply(&mut config, patch);
     }
-    Ok(sqlx::query_as("INSERT INTO forms (id, account_id, name, kind, list_id, config) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *")
+    Ok(sqlx::query_as("INSERT INTO forms (id, account_id, name, kind, list_id, config, status) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 'draft')) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
         .bind(b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Sign-up form".into()))
         .bind(kind)
         .bind(b.list_id)
         .bind(config)
+        .bind(b.status)
         .fetch_one(&state.db)
         .await?)
 }
 
 async fn create_form_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<FormBody>) -> AppResult<Json<Value>> {
-    Ok(Json(form_one(&state.db, &create_form(&state, ctx.account_id, b).await?).await?))
+    Ok(Json(form_one(&state, &create_form(&state, ctx.account_id, b).await?).await?))
 }
 
 async fn get_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let f: Option<FormRow> = sqlx::query_as("SELECT * FROM forms WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).fetch_optional(&state.db).await?;
-    Ok(Json(form_one(&state.db, &f.ok_or_else(|| AppError::not_found("form"))?).await?))
+    Ok(Json(form_one(&state, &load_form(&state, ctx.account_id, id).await?).await?))
 }
 
 pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBody) -> AppResult<FormRow> {
@@ -914,10 +896,17 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
         crate::audience::list_belongs(&state.db, account_id, l).await?;
     }
     check_form_config(&b.config)?;
-    let before: Option<Value> = sqlx::query_scalar("SELECT config FROM forms WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).fetch_optional(&state.db).await?;
-    let f: Option<FormRow> = sqlx::query_as(
+    let mut tx = state.db.begin().await?;
+    let before: Option<Value> = sqlx::query_scalar("SELECT config FROM forms WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(id).bind(account_id).fetch_optional(&mut *tx).await?;
+    let before = before.ok_or_else(|| AppError::not_found("form"))?;
+    let config = b.config.map(|patch| {
+        let mut c = before.clone();
+        crate::forms::apply(&mut c, patch);
+        c
+    });
+    let f: FormRow = sqlx::query_as(
         "UPDATE forms SET name = COALESCE($3, name), kind = COALESCE($4, kind), list_id = COALESCE($5, list_id),
-           config = CASE WHEN $6::jsonb IS NULL THEN config ELSE config || $6 END, status = COALESCE($7, status), updated_at = now()
+           config = COALESCE($6, config), status = COALESCE($7, status), updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING *",
     )
     .bind(id)
@@ -925,26 +914,25 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
     .bind(b.name.filter(|n| !n.trim().is_empty()))
     .bind(b.kind)
     .bind(b.list_id)
-    .bind(b.config)
+    .bind(config)
     .bind(b.status)
-    .fetch_optional(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
-    let f = f.ok_or_else(|| AppError::not_found("form"))?;
     // A version's counts only describe what it showed: reset any version that was removed or now
     // shows different content (including re-lettered ones), so ending a test and starting a new one starts from zero.
-    let before = before.unwrap_or_default();
     let shown = |c: &Value, v: &str| -> Vec<Value> {
         let c = form_version_config(c, v);
         FORM_VARIANT_FIELDS.iter().map(|k| c.get(*k).cloned().unwrap_or(Value::Null)).collect()
     };
     let now = form_versions(&f.config);
     let keep: Vec<&str> = form_versions(&before).into_iter().filter(|v| now.contains(v) && shown(&before, v) == shown(&f.config, v)).collect();
-    sqlx::query("DELETE FROM form_variant_stats WHERE form_id = $1 AND NOT (variant = ANY($2))").bind(f.id).bind(&keep).execute(&state.db).await?;
+    sqlx::query("DELETE FROM form_variant_stats WHERE form_id = $1 AND NOT (variant = ANY($2))").bind(f.id).bind(&keep).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(f)
 }
 
 async fn patch_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<FormBody>) -> AppResult<Json<Value>> {
-    Ok(Json(form_one(&state.db, &update_form(&state, ctx.account_id, id, b).await?).await?))
+    Ok(Json(form_one(&state, &update_form(&state, ctx.account_id, id, b).await?).await?))
 }
 
 async fn delete_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

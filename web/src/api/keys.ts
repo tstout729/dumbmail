@@ -33,5 +33,6 @@ export const keys = {
   blueprints: ["blueprints"] as const,
   forms: ["forms"] as const,
   form: (id: string) => ["form", id] as const,
+  images: ["images"] as const,
   overview: (days: number) => ["analytics-overview", days] as const,
 };

@@ -95,7 +95,8 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
         "resources/list" => Ok(json!({"resources": [
             {"uri": "dumbmail://docs/segments", "name": "Segment rules", "description": "How to write segment definitions, flow splits and filters", "mimeType": "text/markdown"},
             {"uri": "dumbmail://docs/email", "name": "Email content blocks", "description": "Email block types and personalization variables", "mimeType": "text/markdown"},
-            {"uri": "dumbmail://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"}
+            {"uri": "dumbmail://docs/flows", "name": "Flow definitions", "description": "Triggers, steps and settings for flows", "mimeType": "text/markdown"},
+            {"uri": "dumbmail://docs/forms", "name": "Sign-up form reference", "description": "Every form config key: content, fields, phone step, style, teaser, targeting, A/B versions, images and previews", "mimeType": "text/markdown"}
         ]})),
         "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
         "resources/read" => {
@@ -104,6 +105,7 @@ async fn dispatch(state: &AppState, ctx: &Ctx, req: Value) -> Option<Value> {
                 "dumbmail://docs/segments" | "postlark://docs/segments" => Some(SEGMENT_DOC),
                 "dumbmail://docs/email" | "postlark://docs/email" => Some(EMAIL_DOC),
                 "dumbmail://docs/flows" | "postlark://docs/flows" => Some(FLOW_DOC),
+                "dumbmail://docs/forms" => Some(FORMS_DOC),
                 _ => None,
             };
             text.map(|t| json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": t}]})).ok_or((-32002, format!("resource not found: {uri}")))
@@ -124,6 +126,7 @@ Messaging: campaigns are one-off sends to lists/segments; flows are automations 
 Email content is a list of blocks (see the dumbmail://docs/email resource) personalized with Jinja tags like {{ first_name|default('there') }}. \
 Always render_preview new content and send_test before sending. Sending a campaign or turning a flow live reaches real people: \
 the tools require confirm=true and you should get the user's explicit go-ahead first. Data: get_analytics, query_metric, campaign_performance, get_campaign_report, get_flow_report. \
+Sign-up forms: create_form / update_form take a config described in the dumbmail://docs/forms resource; check one with get_form's preview_url before publishing, and upload images with upload_image. \
 Times are ISO 8601; the account has a time zone (default America/Los_Angeles) used for reporting buckets.";
 
 fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool, destructive: bool) -> Value {
@@ -137,7 +140,124 @@ fn obj(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
+/// JSON Schema for a sign-up form's `config` (docs/FORMS.md has the full reference).
+fn form_config_schema() -> Value {
+    let text = |max: u64, d: &str| json!({"type": ["string", "null"], "maxLength": max, "description": d});
+    let url = |d: &str| json!({"type": ["string", "null"], "format": "uri", "description": d});
+    let int = |lo: i64, hi: i64, d: &str| json!({"type": ["integer", "null"], "minimum": lo, "maximum": hi, "description": d});
+    let color = |d: &str| json!({"type": ["string", "null"], "pattern": "^#[0-9a-fA-F]{3,8}$", "description": d});
+    let one_of = |opts: &[&str], d: &str| json!({"type": ["string", "null"], "enum": opts.iter().map(|o| json!(o)).chain(std::iter::once(Value::Null)).collect::<Vec<_>>(), "description": d});
+    let boolean = |d: &str| json!({"type": ["boolean", "null"], "description": d});
+    let nested = |props: Value, d: &str| json!({"type": ["object", "null"], "properties": props, "additionalProperties": false, "description": d});
+    let mut variant_props = json!({"id": {"enum": ["b", "c", "d"]}});
+    let content = [
+        ("headline", text(200, "Per version. Default \"Get 10% off your first order\".")),
+        ("body", text(1000, "Per version. Line breaks are kept.")),
+        ("button_text", text(60, "Per version. Default \"Sign up\".")),
+        ("image_url", url("Per version. http(s) URL; upload with upload_image. Placement follows style.layout.")),
+        ("image_alt", text(200, "Per version. Alt text for the image.")),
+        ("no_thanks_text", text(60, "Per version. A \"No thanks\" link under the button that closes the form (popup/flyout).")),
+        ("success_message", text(200, "Per version. Thank-you headline. Default \"Thanks! Check your inbox.\"")),
+        ("success_body", text(1000, "Per version. Text under the thank-you headline.")),
+        ("discount_code", text(60, "Per version. Shown on the thank-you screen with a Copy button.")),
+    ];
+    let mut props = serde_json::Map::new();
+    for (k, v) in content {
+        // The base key's own schema (format, maxLength...), plus null, so nothing copied can be missing.
+        let mut vp = v.clone();
+        vp["type"] = json!(["string", "null"]);
+        vp["description"] = json!("Empty or missing falls back to version A.");
+        variant_props[k] = vp;
+        props.insert(k.into(), v);
+    }
+    let field = json!({"type": "object", "additionalProperties": false, "required": ["key"], "properties": {
+        "key": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,39}$", "description": "email, phone_number, first_name, last_name, birthday, or a custom profile property key"},
+        "type": {"enum": ["text", "number", "date", "select", "radio", "checkboxes", "checkbox"], "description": "Custom fields only (default text). checkbox saves true/false; checkboxes saves a list."},
+        "label": {"type": "string", "maxLength": 100},
+        "placeholder": {"type": "string", "maxLength": 100},
+        "required": {"type": "boolean", "description": "Default true for email, false otherwise. Checked on the server."},
+        "options": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "maxLength": 80}, "description": "Required for select, radio and checkboxes."}
+    }});
+    let style = nested(json!({
+            "layout": one_of(&["stacked", "image_left", "image_right", "background"], "Where image_url goes. Default stacked."),
+            "width": int(280, 900, "px. Default popup 420, flyout 360, embed 480, page 440."),
+            "align": one_of(&["center", "left"], "Text alignment. Default center."),
+            "font": one_of(&["system", "inherit", "serif", "Inter", "Poppins", "Montserrat", "Lato", "DM Sans", "Space Grotesk", "Playfair Display", "Lora", "Merriweather", "Oswald"], "Default system; inherit uses the website's font."),
+            "headline_size": int(14, 56, "px. Default 24."),
+            "headline_weight": {"enum": [400, 500, 600, 700, 800, null], "description": "Default 700."},
+            "body_size": int(12, 22, "px. Default 15."),
+            "background_color": color("Default #ffffff."),
+            "headline_color": color("Default #111827."),
+            "text_color": color("Body, labels and small print. Default #4b5563."),
+            "button_color": color("Default brand_color."),
+            "button_text_color": color("Default white or black, whichever reads better."),
+            "button_full_width": boolean("Default true."),
+            "input_background": color("Default #ffffff."),
+            "input_border_color": color("Default #d1d5db."),
+            "input_text_color": color("Default #111827."),
+            "corner_radius": int(0, 40, "Default 14."),
+            "button_radius": int(0, 40, "Default 8; 40 makes a pill."),
+            "input_radius": int(0, 40, "Default 8."),
+            "padding": int(12, 64, "Default 28."),
+            "border_width": int(0, 8, "Default 0 (embed and page 1)."),
+            "border_color": color("Default #e5e7eb."),
+            "shadow": one_of(&["none", "soft", "strong"], "Default popup/flyout strong, embed/page none."),
+            "overlay_color": color("Popup only. Default #111827."),
+            "overlay_opacity": int(0, 90, "Percent. Default 55."),
+            "close_on_overlay": boolean("Popup only. Default true."),
+            "close_color": color("The close button. Default #9ca3af."),
+            "position": one_of(&["center", "top", "bottom", "bottom_right", "bottom_left", "top_right", "top_left"], "Popup: center, top, bottom (default center). Flyout: bottom_right (default), bottom_left, top_right, top_left."),
+            "animation": one_of(&["fade", "slide", "zoom", "none"], "Default fade."),
+            "page_background": color("Hosted page only. Default a light tint of the button color."),
+            "custom_css": {"type": ["string", "null"], "maxLength": 10000, "description": "Extra CSS inside the form's shadow root (no '<'). Hooks: .dm-card, .dm-media, .dm-content, .dm-headline, .dm-body, .dm-field, .dm-label, .dm-input, .dm-consent, .dm-button, .dm-no-thanks, .dm-legal, .dm-error, .dm-success, .dm-code, .dm-close, .dm-overlay, .dm-teaser."}
+        }), "Look of the form, shared by every A/B version. Replaced whole on update.");
+    let teaser = nested(json!({
+            "enabled": {"type": "boolean"},
+            "text": {"type": "string", "maxLength": 40, "description": "Default: headline."},
+            "position": {"enum": ["bottom_left", "bottom_right", "left", "right"]},
+            "show": {"enum": ["after_close", "always"], "description": "Default after_close."}
+        }), "Popup/flyout: a small tab that reopens the form.");
+    let targeting = nested(json!({
+            "trigger": {"enum": ["delay", "scroll", "exit_intent", "manual"], "description": "Default delay (uses delay_seconds). manual opens only from the teaser, a data-dumbmail-open element or dumbmail.showForm(id)."},
+            "scroll_percent": {"type": "integer", "minimum": 1, "maximum": 100, "description": "For scroll. Default 40."},
+            "devices": {"enum": ["all", "desktop", "mobile"]},
+            "url_contains": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 500}},
+            "url_excludes": {"type": "array", "maxItems": 50, "items": {"type": "string", "maxLength": 500}},
+            "page_views": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Pages seen this visit before it shows. Default 1."},
+            "visitors": {"enum": ["all", "new", "returning"]},
+            "frequency_days": {"type": "integer", "minimum": 0, "maximum": 365, "description": "Wait after a close. Default 7."},
+            "hide_for_subscribers": {"type": "boolean", "description": "Default true."},
+            "start_at": {"type": "string", "format": "date-time", "description": "Only show from this time (also closes the hosted page before it)."},
+            "end_at": {"type": "string", "format": "date-time", "description": "Only show until this time."}
+        }), "When a popup or flyout opens; start_at/end_at schedule every kind.");
+    let more = json!({
+        "legal_text": text(1000, "Small print under the button; [label](https://url) becomes a link."),
+        "success_button_text": text(60, "A button on the thank-you screen."),
+        "success_button_url": url("Where that button goes; without it the button closes the form."),
+        "redirect_url": url("Go here right after a sign-up instead of showing the thank-you screen."),
+        "auto_close_seconds": int(0, 60, "Popup/flyout: close the thank-you screen after this many seconds; 0 keeps it open. Default 3 (0 with a discount code or success button)."),
+        "confirm_message": text(300, "Shown instead of the thank-you screen when the list uses double opt-in."),
+        "sms_consent_text": text(1000, "Shown next to the SMS consent checkbox under any phone field. Default: the standard carrier disclosure."),
+        "brand_color": color("Default button color. Default: the account's brand color."),
+        "delay_seconds": int(0, 600, "For targeting.trigger delay. Default 5."),
+        "collect": {"type": ["array", "null"], "items": {"enum": ["email", "phone_number", "first_name"]}, "description": "Older way to pick fields; ignored when fields is set (it's kept in step automatically)."},
+        "fields": {"type": ["array", "null"], "maxItems": 12, "items": field, "description": "Ordered list of what the form asks for. Must include email or phone_number."},
+        "phone_step": nested(json!({"enabled": {"type": "boolean"}, "headline": {"type": "string", "maxLength": 200}, "body": {"type": "string", "maxLength": 1000}, "button_text": {"type": "string", "maxLength": 60}, "skip_text": {"type": "string", "maxLength": 60}}), "Second screen asking for a phone number after an email sign-up. Skipped when the form already has a phone field."),
+        "style": style,
+        "teaser": teaser,
+        "targeting": targeting,
+        "variants": {"type": ["array", "null"], "maxItems": 3, "items": {"type": "object", "additionalProperties": false, "required": ["id"], "properties": variant_props},
+            "description": "A/B test: versions b, c, d in that order; the form itself is version A. Only per-version content keys. End a test with []."}
+    });
+    if let Value::Object(m) = more {
+        props.extend(m);
+    }
+    json!({"type": "object", "additionalProperties": false, "properties": props,
+        "description": "Form config. Every key is optional. On update_form each top-level key you send replaces the stored one (objects and lists whole), keys you leave out are kept and null resets a key to its default. Unknown keys are rejected. Full reference: the dumbmail://docs/forms resource."})
+}
+
 fn tools() -> Vec<Value> {
+    let form_config = form_config_schema();
     let audience_schema = json!({"type": "object", "description": "Who receives it. include: lists/segments to send to (union); exclude: lists/segments to remove.",
         "properties": {
             "include": {"type": "array", "items": {"type": "object", "properties": {"type": {"enum": ["list", "segment"]}, "id": {"type": "string"}}, "required": ["type", "id"]}},
@@ -241,12 +361,17 @@ Read dumbmail://docs/segments for the details and examples.",
         tool("update_flow", "Update a flow", "Rename a flow or replace its trigger or definition (the whole graph). Live flows apply changes to people already waiting in them.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "trigger": trigger, "definition": flow_def}), &["id"]), false, false),
         tool("set_flow_status", "Turn a flow on, pause or draft", "live starts sending to people who trigger it; paused holds people in place; draft stops and exits everyone. Turning live requires confirm=true and the user's approval.", obj(json!({"id": {"type": "string"}, "status": {"enum": ["live", "paused", "draft"]}, "confirm": {"type": "boolean"}}), &["id", "status"]), false, true),
         tool("get_flow_report", "Flow report", "Flow totals plus per-step entered counts, opens, clicks and revenue.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
-        tool("list_forms", "List sign-up forms", "Sign-up forms with views, submits, per-version A/B test stats (variant_stats) and install snippets.", obj(json!({}), &[]), true, false),
-        tool("create_form", "Create a sign-up form", "Create a popup, embed, flyout or hosted page form that adds subscribers to a list. config: headline, body, button_text, success_message, collect (email, phone_number, first_name), sms_consent_text, delay_seconds, brand_color, image_url, variants (A/B test: [{id: 'b'|'c'|'d' in order, headline?, body?, button_text?, image_url?}]; the form itself is version A and each visitor sees one version at random). Set status 'live' to publish.",
-            obj(json!({"name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": {"type": "object"}, "status": {"enum": ["draft", "live"]}}), &["list_id"]), false, false),
-        tool("update_form", "Update a sign-up form", "Change a form's text, fields, list, kind or status (draft/live). config is merged into the current one. A/B test: set config.variants (see create_form); end it with variants [] after copying the winner's fields into the base config.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": {"type": "object"}, "status": {"enum": ["draft", "live"]}}), &["id"]), false, false),
+        tool("list_forms", "List sign-up forms", "Sign-up forms with views, submits, per-version A/B test stats (variant_stats), preview_url, hosted_url and install snippets.", obj(json!({}), &[]), true, false),
+        tool("get_form", "Get a sign-up form", "One form: full config, stats, per-version A/B stats (variant_stats), preview_url (the hosted page showing drafts too, counting and saving nothing: open or share it to review before publishing), hosted_url and install snippets.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
+        tool("create_form", "Create a sign-up form", "Create a popup, flyout, embed or hosted page form that adds sign-ups to a list. config covers content, fields (email, phone, names, birthday, custom questions), an optional phone step, style, teaser, targeting and schedule, and A/B versions; read the dumbmail://docs/forms resource for every key. Upload images with upload_image first. Starts as a draft unless status is live (publishing shows it to real visitors; check preview_url and get the user's go-ahead first).",
+            obj(json!({"name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"], "description": "Default popup"}, "list_id": {"type": "string"}, "config": form_config.clone(), "status": {"enum": ["draft", "live"]}}), &["list_id"]), false, false),
+        tool("update_form", "Update a sign-up form", "Change a form's name, kind, list, status (live publishes, draft unpublishes) or config. config merges one level deep: each top-level key sent replaces the stored one (style, targeting, teaser, phone_step, fields and variants are replaced whole, so send the complete object), keys left out are kept, null resets a key to its default. A/B test: set config.variants; end it with variants [] after copying the winning version's keys into the base config. See the dumbmail://docs/forms resource.",
+            obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "kind": {"enum": ["popup", "embed", "flyout", "page"]}, "list_id": {"type": "string"}, "config": form_config, "status": {"enum": ["draft", "live"]}}), &["id"]), false, false),
+        tool("upload_image", "Upload an image", "Store a PNG, JPEG, GIF or WebP image (up to 5 MB) and get a permanent public URL for a form's image_url or an email image block. Give url to copy an image from the web, or data_base64 with the file's contents. Uploading the same file again returns the existing image. Each account keeps up to 500 images.",
+            obj(json!({"url": {"type": "string", "description": "Public http(s) URL of the image"}, "data_base64": {"type": "string", "description": "Base64 file contents (a data: URL works too)"}}), &[]), false, false),
+        tool("list_images", "List uploaded images", "The account's uploaded images, newest first (up to 200), with their public URLs.", obj(json!({}), &[]), true, false),
         tool("get_analytics", "Analytics overview", "Dashboard for the last `days` (default 30): total and attributed revenue (campaigns vs flows), emails/SMS sent, open/click/unsubscribe/bounce rates, profile growth, a daily series and top campaigns and flows.", obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}}), &[]), true, false),
-        tool("delete", "Delete something", "Delete a draft campaign, a non-live flow, a segment, a list, a template, a form or a profile. Permanent.", obj(json!({"type": {"enum": ["campaign", "flow", "segment", "list", "template", "form", "profile"]}, "id": {"type": "string"}}), &["type", "id"]), false, true),
+        tool("delete", "Delete something", "Delete a draft campaign, a non-live flow, a segment, a list, a template, a form, an uploaded image (anything still using its URL shows a broken image) or a profile. Permanent.", obj(json!({"type": {"enum": ["campaign", "flow", "segment", "list", "template", "form", "image", "profile"]}, "id": {"type": "string"}}), &["type", "id"]), false, true),
     ]
 }
 
@@ -532,29 +657,45 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
         "get_flow_report" => msg::flow_report(state, acct, uuid_arg(&a, "id")?).await,
         "list_forms" => {
             let rows: Vec<crate::models::FormRow> = sqlx::query_as("SELECT * FROM forms WHERE account_id = $1 ORDER BY updated_at DESC").bind(acct).fetch_all(&state.db).await?;
-            let base = state.cfg.public_url();
-            let forms = msg::forms_json(&state.db, &rows).await?;
-            Ok(json!({"forms": rows.iter().zip(forms).map(|(f, form)| json!({"form": form, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }})).collect::<Vec<_>>()}))
+            let forms = msg::forms_json(state, &rows).await?;
+            Ok(json!({"forms": rows.iter().zip(forms).map(|(f, form)| form_detail(state, f, form)).collect::<Vec<_>>()}))
+        }
+        "get_form" => {
+            let f = msg::load_form(state, acct, uuid_arg(&a, "id")?).await?;
+            let form = msg::form_one(state, &f).await?;
+            Ok(form_detail(state, &f, form))
         }
         "create_form" => {
-            let status = a["status"].as_str().map(String::from);
-            let f = msg::create_form(state, acct, from(json!({"name": a["name"], "kind": a["kind"], "list_id": a["list_id"], "config": a["config"]}))?).await?;
-            let f = match status {
-                Some(s) => msg::update_form(state, acct, f.id, msg::FormBody { status: Some(s), ..Default::default() }).await?,
-                None => f,
-            };
-            let base = state.cfg.public_url();
-            Ok(json!({"form": f, "hosted_url": format!("{base}/f/{}", f.id), "install": if f.kind == "embed" { format!("<div data-dumbmail-form=\"{}\"></div> (with the website snippet from get_website_snippet)", f.id) } else { "Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules.".to_string() }}))
+            let f = msg::create_form(state, acct, from(json!({"name": a["name"], "kind": a["kind"], "list_id": a["list_id"], "config": a["config"], "status": a["status"]}))?).await?;
+            let form = msg::form_one(state, &f).await?;
+            Ok(form_detail(state, &f, form))
         }
         "update_form" => {
             let id = uuid_arg(&a, "id")?;
             let f = msg::update_form(state, acct, id, from(json!({"name": a["name"], "kind": a["kind"], "list_id": a["list_id"], "config": a["config"], "status": a["status"]}))?).await?;
-            Ok(serde_json::to_value(f)?)
+            let form = msg::form_one(state, &f).await?;
+            Ok(form_detail(state, &f, form))
+        }
+        "upload_image" => crate::api::images::store_json(state, acct, &a).await,
+        "list_images" => {
+            let (images, total) = crate::api::images::list(state, acct).await?;
+            Ok(json!({"images": images, "total": total}))
         }
         "get_analytics" => analytics::overview(state, acct, a["days"].as_i64().unwrap_or(30)).await,
         "delete" => delete(state, acct, a["type"].as_str().unwrap_or(""), uuid_arg(&a, "id")?).await,
         other => Err(AppError::bad(format!("unknown tool {other:?}"))),
     }
+}
+
+/// A form with its links and how to put it on a site.
+fn form_detail(state: &AppState, f: &crate::models::FormRow, form: Value) -> Value {
+    let base = state.cfg.public_url();
+    let install = match f.kind.as_str() {
+        "embed" => format!("<div data-dumbmail-form=\"{}\"></div> where it should appear (with the website snippet from get_website_snippet), or <script async src=\"{base}/f/{}/embed.js\"></script> on its own", f.id, f.id),
+        "page" => "Share hosted_url, or link to it from the site, emails or social profiles.".to_string(),
+        _ => format!("Shows automatically on sites with the website snippet (get_website_snippet), using the form's targeting rules. Any element with data-dumbmail-open=\"{}\" opens it on click.", f.id),
+    };
+    json!({"form": form, "hosted_url": format!("{base}/f/{}", f.id), "preview_url": msg::form_preview_url(state, f.id), "status": f.status, "install": install})
 }
 
 async fn campaign_with_readiness(state: &AppState, acct: Uuid, id: Uuid) -> AppResult<Value> {
@@ -588,8 +729,9 @@ async fn delete(state: &AppState, acct: Uuid, kind: &str, id: Uuid) -> AppResult
         "list" => "lists",
         "template" => "templates",
         "form" => "forms",
+        "image" => "images",
         "profile" => "profiles",
-        _ => return Err(AppError::bad("type must be campaign, flow, segment, list, template, form or profile")),
+        _ => return Err(AppError::bad("type must be campaign, flow, segment, list, template, form, image or profile")),
     };
     let n = sqlx::query(&format!("DELETE FROM {table} WHERE id = $1 AND account_id = $2")).bind(id).bind(acct).execute(&state.db).await?.rows_affected();
     if n == 0 {
@@ -623,6 +765,8 @@ fn prompt(name: &str, args: &Value) -> Option<Value> {
     };
     Some(json!({"description": name, "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}))
 }
+
+const FORMS_DOC: &str = include_str!("../docs/FORMS.md");
 
 const SEGMENT_DOC: &str = r#"# Segment rules
 
@@ -746,6 +890,18 @@ mod tests {
     #[test]
     fn tool_names_are_unique_and_schemas_are_objects() {
         let t = tools();
+        // A null schema keyword (e.g. "maxLength": null) makes strict clients reject the whole tool list.
+        fn no_null_keywords(v: &Value, path: &str) {
+            match v {
+                Value::Object(o) => o.iter().for_each(|(k, x)| {
+                    assert!(!x.is_null() || k == "default", "null schema value at {path}.{k}");
+                    no_null_keywords(x, &format!("{path}.{k}"));
+                }),
+                Value::Array(a) => a.iter().enumerate().for_each(|(i, x)| no_null_keywords(x, &format!("{path}[{i}]"))),
+                _ => {}
+            }
+        }
+        t.iter().for_each(|x| no_null_keywords(&x["inputSchema"], x["name"].as_str().unwrap()));
         let mut names: Vec<&str> = t.iter().map(|x| x["name"].as_str().unwrap()).collect();
         let n = names.len();
         names.sort();
@@ -754,5 +910,22 @@ mod tests {
         for x in &t {
             assert_eq!(x["inputSchema"]["type"], "object", "{}", x["name"]);
         }
+        for name in ["get_form", "upload_image", "list_images"] {
+            assert!(t.iter().any(|x| x["name"] == name), "{name}");
+        }
+    }
+
+    /// The config schema lists exactly the keys the server accepts.
+    #[test]
+    fn form_config_schema_matches_validation() {
+        let schema = form_config_schema();
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 25);
+        for k in &keys {
+            let probe = serde_json::json!({ k.as_str(): null });
+            assert!(crate::forms::check_config(&probe).is_ok(), "{k} is in the schema but rejected");
+        }
+        assert_eq!(schema["properties"]["variants"]["items"]["properties"].as_object().unwrap().len(), crate::forms::VARIANT_FIELDS.len() + 1);
+        assert!(FORMS_DOC.contains("phone_step"));
     }
 }

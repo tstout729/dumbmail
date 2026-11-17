@@ -6,6 +6,7 @@ import { Button, Field, InlineError, Input, Modal, Select, Textarea } from "../.
 import { formatPhone } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { hostnameOf } from "./shared";
+import { hasPhoneField } from "../forms/formConfig";
 
 const useCases: TollFreeUseCase[] = ["Marketing", "Mixed", "Account Notifications", "Customer Care", "Delivery Notifications"];
 const volumes: MonthlyVolume[] = ["10", "100", "1,000", "10,000", "100,000"];
@@ -40,7 +41,7 @@ export function parseAddress(raw: string | null): Address {
 /** Carriers want to see the opt-in. A live form that collects phone numbers is the best evidence; any live form will do. */
 function optInFormUrl(forms: Form[], origin: string): string {
   const live = forms.filter((f) => f.status === "live");
-  const best = live.find((f) => f.config.collect.includes("phone_number")) ?? live[0];
+  const best = live.find((f) => hasPhoneField(f.config) || Boolean(f.config.phone_step?.enabled)) ?? live[0];
   return best ? `${origin}/f/${best.id}` : "";
 }
 

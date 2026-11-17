@@ -7,3 +7,4 @@ export * from "./Toaster";
 export * from "./Code";
 export { cx } from "./cx";
 export * from "./Step";
+export * from "./Collapsible";
