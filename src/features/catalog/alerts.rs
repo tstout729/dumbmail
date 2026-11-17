@@ -31,11 +31,9 @@ const MAX_PER_VISITOR_HOUR: i64 = 30;
 /// New back-in-stock requests an account takes per hour, whatever addresses they come from. High
 /// enough that a real store never meets it; it only stops a flood.
 const MAX_NEW_PER_ACCOUNT_HOUR: i64 = 5000;
-/// Requests an account takes per hour from visitors it can't vouch for. Each one sends an unbilled
-/// confirmation email to an address a stranger typed, so this matches the double opt-in limit. It
-/// counts confirmation emails sent in the hour (so asking again for an old request counts too) and
-/// requests still waiting for one.
-const MAX_UNCONFIRMED_PER_ACCOUNT_HOUR: i64 = 200;
+/// Confirmation emails an account sends per hour. Each goes unbilled to an address a stranger
+/// typed, so this matches the double opt-in limit.
+const MAX_CONFIRMS_PER_ACCOUNT_HOUR: i64 = 200;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Settings {
@@ -618,19 +616,6 @@ pub async fn subscribe(state: &AppState, account: &crate::models::Account, r: &R
     if from_ip(&mut tx, ip_hash.as_deref()).await? >= MAX_PER_VISITOR_HOUR {
         return Err(AppError::Conflict("Too many requests from here. Please try again later.".into()));
     }
-    if !trusted {
-        let unvouched: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM catalog_stock_subscriptions
-             WHERE account_id = $1
-               AND (confirm_sent_at > now() - interval '1 hour' OR (confirmed_at IS NULL AND created_at > now() - interval '1 hour'))",
-        )
-        .bind(account_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if unvouched >= MAX_UNCONFIRMED_PER_ACCOUNT_HOUR {
-            return Err(AppError::Conflict("We're getting a lot of requests right now. Please try again later.".into()));
-        }
-    }
     let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE profile_id = $1 AND notified_at IS NULL").bind(profile.id).fetch_one(&mut *tx).await?;
     let id = Uuid::now_v7();
     let inserted: Option<Uuid> = if waiting >= MAX_WAITING_PER_PERSON {
@@ -704,25 +689,38 @@ fn sub_from_token(state: &AppState, token: &str) -> Option<Uuid> {
     crate::auth::verify(&state.cfg.secret_key, token)?.strip_prefix("bis")?.parse().ok()
 }
 
-/// Email the confirmation link, at most `MAX_CONFIRMS_PER_INBOX_DAY` a day to one inbox. A
+/// Email the confirmation link: at most `MAX_CONFIRMS_PER_INBOX_DAY` a day to one inbox and
+/// `MAX_CONFIRMS_PER_ACCOUNT_HOUR` an hour for the account, counting every email sent. A
 /// suppressed address (it bounced or complained) gets nothing, but the visitor isn't told why.
 async fn send_confirmation(state: &AppState, account: &crate::models::Account, profile_id: Uuid, sub_id: Uuid, email: &str, p: &Product) -> AppResult<Result<(), String>> {
     let db = &state.db;
     let suppressed: bool = sqlx::query_scalar("SELECT email_suppressed_reason IS NOT NULL FROM profiles WHERE id = $1").bind(profile_id).fetch_one(db).await?;
-    // The per-inbox count and the send mark are taken under the inbox's lock.
+    if suppressed {
+        return Ok(Ok(()));
+    }
+    // Both caps count emails actually sent, and each send is written down under the account's and
+    // the inbox's locks before it goes out, so parallel requests and repeat requests can't get past.
     let mut tx = db.begin().await?;
     let key = crate::optin::email_key(email);
+    lock(&mut tx, &format!("bis:{}", account.id)).await?;
     lock(&mut tx, &format!("bis-inbox:{}:{key}", account.id)).await?;
-    let sent_today: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND email_key = $2 AND confirm_sent_at > now() - interval '24 hours'",
+    sqlx::query("DELETE FROM catalog_stock_confirm_sends WHERE account_id = $1 AND sent_at < now() - interval '2 days'").bind(account.id).execute(&mut *tx).await?;
+    let (this_hour, inbox_today): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE sent_at > now() - interval '1 hour'),
+                count(*) FILTER (WHERE email_key = $2 AND sent_at > now() - interval '24 hours')
+         FROM catalog_stock_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'",
     )
     .bind(account.id)
     .bind(&key)
     .fetch_one(&mut *tx)
     .await?;
-    if suppressed || sent_today >= MAX_CONFIRMS_PER_INBOX_DAY {
+    if inbox_today >= MAX_CONFIRMS_PER_INBOX_DAY {
         return Ok(Ok(()));
     }
+    if this_hour >= MAX_CONFIRMS_PER_ACCOUNT_HOUR {
+        return Ok(Err("this account has sent its confirmation emails for the hour".into()));
+    }
+    sqlx::query("INSERT INTO catalog_stock_confirm_sends (id, account_id, email_key) VALUES ($1, $2, $3)").bind(Uuid::now_v7()).bind(account.id).bind(&key).execute(&mut *tx).await?;
     sqlx::query("UPDATE catalog_stock_subscriptions SET confirm_sent_at = now() WHERE id = $1").bind(sub_id).execute(&mut *tx).await?;
     tx.commit().await?;
     // Product text from browser events isn't confirmed yet: it mustn't reach someone else's inbox.
@@ -737,9 +735,7 @@ async fn send_confirmation(state: &AppState, account: &crate::models::Account, p
         didnt: "ask for this",
     };
     let res = crate::optin::deliver(state, account, profile_id, email, crate::optin::confirm_email(account, &url, &copy)).await?;
-    if res.is_err() {
-        sqlx::query("UPDATE catalog_stock_subscriptions SET confirm_sent_at = NULL WHERE id = $1").bind(sub_id).execute(db).await?;
-    }
+    // A failed send still counts toward the caps: the row written above stays.
     Ok(res)
 }
 

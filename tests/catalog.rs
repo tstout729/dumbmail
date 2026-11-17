@@ -921,6 +921,18 @@ async fn back_in_stock_requests_are_confirmed_and_bounded() {
     let sent = h.state.email.sent().iter().filter(|m| m.to == "greedy@x.test").count();
     assert_eq!(sent, 3, "one inbox gets at most three confirmations a day");
 
+    // Asking again and again for the same product doesn't get around the inbox's daily limit.
+    for i in 0..6 {
+        ask(&h, &pk, json!({"email": "again@x.test", "product_id": "G"}), Some(&format!("203.0.113.{i}"))).await;
+    }
+    assert_eq!(h.state.email.sent().iter().filter(|m| m.to == "again@x.test").count(), 3, "repeat requests count toward the three a day");
+
+    // An account that has sent its confirmation emails for the hour sends no more.
+    sqlx::query("INSERT INTO catalog_stock_confirm_sends (id, account_id, email_key) SELECT gen_random_uuid(), $1, 'k' || g FROM generate_series(1, 200) g").bind(account).execute(&h.state.db).await.unwrap();
+    let (st, _) = ask(&h, &pk, json!({"email": "onemore@x.test", "product_id": "G"}), Some("203.0.113.50")).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert!(h.state.email.sent().iter().all(|m| m.to != "onemore@x.test"));
+
     // An account at its hourly limit takes no more.
     sqlx::query(
         "INSERT INTO catalog_stock_subscriptions (id, account_id, profile_id, product_id, created_at, notified_at)

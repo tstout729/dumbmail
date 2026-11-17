@@ -29,3 +29,14 @@ CREATE INDEX catalog_stock_subscriptions_claim_idx ON catalog_stock_subscription
 
 -- Which price drop last claimed each person, so a retried job can finish its own claims.
 ALTER TABLE catalog_price_drop_notices ADD COLUMN drop_key text;
+
+-- One row per confirmation email sent, so the hourly cap for an account and the daily cap for an
+-- inbox count emails (asking again for the same request sends another one), not requests.
+CREATE TABLE catalog_stock_confirm_sends (
+    id         uuid PRIMARY KEY,
+    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email_key  text NOT NULL,
+    sent_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX catalog_stock_confirm_sends_account_idx ON catalog_stock_confirm_sends(account_id, sent_at DESC);
+CREATE INDEX catalog_stock_confirm_sends_inbox_idx ON catalog_stock_confirm_sends(account_id, email_key, sent_at DESC);
