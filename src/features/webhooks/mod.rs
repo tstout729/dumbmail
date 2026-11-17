@@ -1,17 +1,20 @@
 //! Outgoing webhooks, REST hooks for Zapier and Make, and the signature on flow webhook steps.
 //!
 //! Watching a change must never break or slow the change. So the rest of the app reports changes
-//! through the small `pub` functions here ([`emit`], [`event_recorded`], [`profile_saved`],
-//! [`list_changed`] ...), and each one does at most one cheap `INSERT` into `webhook_outbox`:
-//! inside the caller's transaction when there is one (under a savepoint, so a failure can't spoil
-//! it), otherwise on its own, with any failure logged and swallowed. None of them returns
-//! anything a caller could propagate. Accounts with no endpoint wanting the topic skip even that
-//! (a short-lived cache, see [`SUBSCRIBE_DELAY_SECS`]).
+//! through the small `pub` functions here ([`emit`], [`profile_saved`], [`list_changed`] ...),
+//! and each one first asks the server's snapshot of who is subscribed (`features::observe`, no
+//! SQL): an account with no endpoint wanting the topic costs nothing, not even building the
+//! payload. Otherwise it does one append-only `INSERT` into `webhook_outbox`: inside the caller's
+//! transaction when there is one (under a savepoint with short timeouts, so it can neither spoil
+//! nor stall it), otherwise in a short transaction of its own. Failures are logged and counted,
+//! never returned.
 //!
-//! The insert also queues one `webhooks_fanout` job per account in the background job lane (see
-//! `jobs::BACKGROUND`), which turns outbox rows into per-endpoint deliveries in bounded batches
-//! (`fanout`). A `webhooks_deliver` job per endpoint sends them (`deliver`), one request at a time,
-//! so a slow or dead endpoint never holds up sending, other accounts or other endpoints.
+//! The insert also queues a `webhooks_fanout` job for the account in the background job lane (see
+//! `jobs::BACKGROUND`) unless one is waiting, which turns outbox rows into per-endpoint deliveries
+//! in bounded batches (`fanout`). A `webhooks_deliver` job per endpoint sends them (`deliver`), one
+//! request at a time, so a slow or dead endpoint never holds up sending, other accounts or other
+//! endpoints. Upkeep (expiry, disabling, missed wake-ups) runs as a `webhooks_sweep` job in the
+//! same lane, queued by the scheduler.
 
 mod api;
 mod deliver;
@@ -21,8 +24,8 @@ mod tools;
 pub mod topics;
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -33,6 +36,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::team::access::Access;
 use super::{Feature, McpDoc};
 pub use crate::audience::EventSource as Source;
 pub use fanout::{max_outbox, max_pending, set_limits_for_tests};
@@ -44,10 +48,6 @@ use crate::state::AppState;
 /// The `api_version` in every envelope. Bumped only for changes that could break a receiver.
 pub const API_VERSION: &str = "2026-11-17";
 
-/// A new endpoint (or a new topic on one, or one turned back on) receives every matching event
-/// from this many seconds after the change; events in those first seconds may or may not reach it.
-/// It's how long a server may keep believing an account has no endpoint for a topic.
-pub const SUBSCRIBE_DELAY_SECS: u64 = 5;
 
 pub struct Module;
 
@@ -89,37 +89,44 @@ impl Feature for Module {
                 Some(e) => deliver::run(state, e).await,
                 None => Ok(()),
             }),
+            "webhooks_sweep" => Some(sweep(state, payload["hourly"].as_bool() == Some(true)).await),
             _ => None,
         }
     }
 
+    /// The scheduler only queues the upkeep; it runs in the background lane, off the shared tick.
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
         if tick.is_multiple_of(3) {
-            fanout::sweep(state).await?;
-            deliver::sweep(state).await?;
-        }
-        if tick.is_multiple_of(180) {
-            deliver::prune(&state.db).await?;
-            deliver::recount(&state.db).await?;
+            sqlx::query(
+                "INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_sweep', jsonb_build_object('hourly', $1::bool), 'background'
+                 WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE kind = 'webhooks_sweep' AND lane = 'background' AND locked_at IS NULL)",
+            )
+            .bind(tick.is_multiple_of(180))
+            .execute(&state.db)
+            .await?;
         }
         Ok(())
     }
+
+    fn access(&self) -> Access {
+        Access { routes: api::ROUTES, tools: tools::TOOLS }
+    }
 }
 
-// ---------- Who is subscribed (cached briefly) ----------
-
-pub(crate) struct Sub {
-    topics: Vec<String>,
-    metrics: Vec<String>,
-    trusted_only: bool,
+/// Upkeep: fan out what was missed, expire and disable, count the outbox; hourly, prune and recount.
+async fn sweep(state: &AppState, hourly: bool) -> anyhow::Result<()> {
+    fanout::sweep(state).await?;
+    deliver::sweep(state).await?;
+    if hourly {
+        deliver::prune(&state.db).await?;
+        deliver::recount(&state.db).await?;
+    }
+    Ok(())
 }
 
-type SubCache = Mutex<HashMap<Uuid, (Instant, Arc<Vec<Sub>>)>>;
-static SUBS: LazyLock<SubCache> = LazyLock::new(Default::default);
-/// "Yes, someone wants this" is trusted this long: a stale yes only costs an insert that matches nothing.
-const POSITIVE_TTL: Duration = Duration::from_secs(30);
-/// "Nobody wants this" is trusted only briefly, so a new endpoint starts receiving within seconds.
-const NEGATIVE_TTL: Duration = Duration::from_secs(SUBSCRIBE_DELAY_SECS);
+// ---------- Who is subscribed ----------
+
+use crate::features::observe::{self, Sub};
 
 fn wanted(subs: &[Sub], topic: &str, metric: Option<&str>, source: Source) -> bool {
     subs.iter().any(|s| {
@@ -129,59 +136,67 @@ fn wanted(subs: &[Sub], topic: &str, metric: Option<&str>, source: Source) -> bo
     })
 }
 
-fn cached(account_id: Uuid) -> Option<(Duration, Arc<Vec<Sub>>)> {
-    SUBS.lock().ok().and_then(|m| m.get(&account_id).map(|(at, s)| (at.elapsed(), s.clone())))
-}
-
-/// What a cache entry of this age says, or None when it's too old to say it.
-fn decide(age: Duration, subs: &[Sub], topic: &str, metric: Option<&str>, source: Source) -> Option<bool> {
-    let yes = wanted(subs, topic, metric, source);
-    if age < NEGATIVE_TTL || (yes && age < POSITIVE_TTL) {
-        Some(yes)
-    } else {
-        None
-    }
-}
-
-async fn load_subs(db: &PgPool, account_id: Uuid) -> Option<Arc<Vec<Sub>>> {
-    let rows: Vec<(Vec<String>, Vec<String>, bool)> =
-        sqlx::query_as("SELECT topics, metrics, trusted_only FROM webhook_endpoints WHERE account_id = $1 AND enabled").bind(account_id).fetch_all(db).await.ok()?;
-    let s = Arc::new(rows.into_iter().map(|(topics, metrics, trusted_only)| Sub { topics, metrics, trusted_only }).collect::<Vec<_>>());
-    if let Ok(mut m) = SUBS.lock() {
-        if m.len() > 20_000 {
-            m.retain(|_, (at, _)| at.elapsed() < POSITIVE_TTL);
-        }
-        m.insert(account_id, (Instant::now(), s.clone()));
-    }
-    Some(s)
-}
-
-/// Whether an endpoint of the account may want this. When unsure (the database didn't answer) it
-/// says yes, and the insert itself checks again.
-async fn may_want(db: &PgPool, account_id: Uuid, topic: &str, metric: Option<&str>, source: Source) -> bool {
-    if let Some((age, s)) = cached(account_id) {
-        if let Some(d) = decide(age, &s, topic, metric, source) {
-            return d;
-        }
-    }
-    match load_subs(db, account_id).await {
-        Some(s) => wanted(&s, topic, metric, source),
+/// What the account's endpoints want, from the server's snapshot (no SQL). `Some(false)`: nothing
+/// configured for any of `topics`, so don't build anything. `None`: the snapshot isn't loaded yet;
+/// the insert checks.
+fn wants(db: &PgPool, account_id: Uuid, topics: &[&str]) -> bool {
+    match observe::peek(db) {
+        Some(i) => i.account(account_id).is_some_and(|a| topics.iter().any(|t| wanted(&a.subs, t, None, Source::System) || wanted(&a.subs, t, None, Source::Browser))),
         None => true,
     }
 }
 
-/// [`may_want`] without touching the database (inside a caller's transaction).
-fn may_want_cached(account_id: Uuid, topic: &str) -> bool {
-    match cached(account_id) {
-        Some((age, s)) => decide(age, &s, topic, None, Source::System).unwrap_or(true),
-        None => true,
+/// Keep the rows some endpoint of the account may want, within the account's outbox limit.
+fn keep(db: &PgPool, account_id: Uuid, rows: Vec<Out>) -> Vec<Out> {
+    let mut rows: Vec<Out> = match observe::peek(db) {
+        Some(i) => match i.account(account_id) {
+            Some(a) => rows.into_iter().filter(|r| wanted(&a.subs, &r.topic, r.metric.as_deref(), r.source)).collect(),
+            None => return Vec::new(),
+        },
+        None => rows,
+    };
+    let room = observe::outbox_room(db, account_id, rows.len() as i64, max_outbox()) as usize;
+    if room < rows.len() {
+        dropped(db, account_id, (rows.len() - room) as i64);
+        rows.truncate(room);
     }
+    rows
 }
 
-/// Drop the cached subscriptions after an endpoint changes on this server.
-fn forget(account_id: Uuid) {
-    if let Ok(mut m) = SUBS.lock() {
-        m.remove(&account_id);
+/// Reload the subscriptions after an endpoint changes on this server.
+async fn forget(db: &PgPool) {
+    observe::changed(db).await;
+}
+
+type DropCounts = Mutex<HashMap<Uuid, i64>>;
+static DROPPED: LazyLock<DropCounts> = LazyLock::new(Default::default);
+
+/// Rows not queued because the account's outbox was full: counted on its endpoints a second later
+/// (one update for all the drops of that second), off the caller's path. The sweep tells the owner.
+fn dropped(db: &PgPool, account_id: Uuid, n: i64) {
+    let first = match DROPPED.lock() {
+        Ok(mut m) => {
+            let e = m.entry(account_id).or_insert(0);
+            *e += n;
+            *e == n
+        }
+        Err(_) => return,
+    };
+    tracing::warn!(account = %account_id, rows = n, "webhook outbox full; events dropped");
+    if first {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let n = DROPPED.lock().ok().and_then(|mut m| m.remove(&account_id)).unwrap_or(0);
+            let res = sqlx::query("UPDATE webhook_endpoints SET dropped_total = dropped_total + $2, last_dropped_at = now() WHERE account_id = $1 AND enabled")
+                .bind(account_id)
+                .bind(n)
+                .execute(&db)
+                .await;
+            if let Err(e) = res {
+                tracing::error!(account = %account_id, rows = n, error = %e, "couldn't count dropped webhook events");
+            }
+        });
     }
 }
 
@@ -216,74 +231,75 @@ pub(crate) fn stable_id(parts: &[&str]) -> Uuid {
     uuid::Builder::from_custom_bytes(b).into_uuid()
 }
 
-/// Rows only an endpoint wants are kept; the first row for an account with nothing queued also
-/// queues its fan-out job. One statement, so the job can't be lost between two writes.
-const OUTBOX_INSERT: &str = "
-    WITH o AS (
+/// After an outbox insert (a CTE named `o` returning a row per inserted row): queue a fan-out job
+/// for the account unless one is already waiting. Both are plain inserts: nothing here waits on a
+/// row lock. Two writers at once may both queue one; the second finds nothing left to do.
+macro_rules! wake_fanout {
+    () => {
+        "INSERT INTO jobs (kind, payload, lane)
+         SELECT 'webhooks_fanout', jsonb_build_object('account_id', $1::uuid), 'background'
+         WHERE EXISTS (SELECT 1 FROM o)
+           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'webhooks_fanout' AND j.lane = 'background' AND j.locked_at IS NULL AND j.payload->>'account_id' = $1::text)"
+    };
+}
+pub(super) use wake_fanout;
+
+/// Rows only an endpoint wants are kept (the snapshot may be a few seconds old).
+const OUTBOX_INSERT: &str = concat!(
+    "WITH o AS (
         INSERT INTO webhook_outbox (account_id, event_id, topic, metric, source, data)
         SELECT $1, x.ev, x.topic, x.metric, x.source, x.data
         FROM UNNEST($2::uuid[], $3::text[], $4::text[], $5::text[], $6::jsonb[]) AS x(ev, topic, metric, source, data)
         WHERE EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND x.topic = ANY(e.topics)
                         AND (x.metric IS NULL OR cardinality(e.metrics) = 0 OR x.metric = ANY(e.metrics))
                         AND NOT (e.trusted_only AND x.source = 'browser'))
-        RETURNING account_id
-    ), m AS (
-        INSERT INTO webhook_fanout_pending (account_id) SELECT $1 WHERE EXISTS (SELECT 1 FROM o)
-        ON CONFLICT DO NOTHING RETURNING account_id
-    )
-    INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', m.account_id), 'background' FROM m";
+        RETURNING 1
+    ) ",
+    wake_fanout!()
+);
 
-async fn write<'c>(db: impl sqlx::PgExecutor<'c>, account_id: Uuid, rows: &[Out]) -> sqlx::Result<()> {
-    if rows.is_empty() {
-        return Ok(());
+/// Write rows (already filtered by [`keep`]) on a connection the caller set up with `observe`.
+pub(crate) async fn write_out(conn: &mut PgConnection, account_id: Uuid, rows: &[Out]) -> sqlx::Result<()> {
+    for chunk in rows.chunks(500) {
+        let ids: Vec<Uuid> = chunk.iter().map(|r| r.event_id).collect();
+        let topics: Vec<&str> = chunk.iter().map(|r| r.topic.as_str()).collect();
+        let metrics: Vec<Option<&str>> = chunk.iter().map(|r| r.metric.as_deref()).collect();
+        let sources: Vec<&str> = chunk.iter().map(|r| r.source.as_str()).collect();
+        let data: Vec<&Value> = chunk.iter().map(|r| &r.data).collect();
+        sqlx::query(OUTBOX_INSERT).bind(account_id).bind(&ids).bind(&topics).bind(&metrics).bind(&sources).bind(&data).execute(&mut *conn).await?;
     }
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.event_id).collect();
-    let topics: Vec<&str> = rows.iter().map(|r| r.topic.as_str()).collect();
-    let metrics: Vec<Option<&str>> = rows.iter().map(|r| r.metric.as_deref()).collect();
-    let sources: Vec<&str> = rows.iter().map(|r| r.source.as_str()).collect();
-    let data: Vec<&Value> = rows.iter().map(|r| &r.data).collect();
-    sqlx::query(OUTBOX_INSERT).bind(account_id).bind(&ids).bind(&topics).bind(&metrics).bind(&sources).bind(&data).execute(db).await?;
     Ok(())
 }
 
-/// Queue `rows` for the account's endpoints. Never fails the caller: problems are logged.
-pub(crate) async fn emit_rows(db: &PgPool, account_id: Uuid, mut rows: Vec<Out>) {
-    let mut keep = Vec::with_capacity(rows.len());
-    for r in rows.drain(..) {
-        if may_want(db, account_id, &r.topic, r.metric.as_deref(), r.source).await {
-            keep.push(r);
-        }
-    }
-    for chunk in keep.chunks(500) {
-        if let Err(e) = write(db, account_id, chunk).await {
-            tracing::error!(account = %account_id, topic = %chunk[0].topic, rows = chunk.len(), error = %e, "couldn't queue webhook events");
-        }
-    }
-}
-
-/// Queue `rows` inside the caller's transaction, so they go out only if it commits. A failure
-/// rolls back only this insert (a savepoint), is logged, and leaves the caller's transaction fine.
-pub(crate) async fn emit_rows_in(conn: &mut PgConnection, account_id: Uuid, rows: Vec<Out>) {
-    let rows: Vec<Out> = rows.into_iter().filter(|r| may_want_cached(account_id, &r.topic)).collect();
+/// Queue `rows` for the account's endpoints in a short transaction of their own. Never fails or
+/// holds up the caller (see `observe`).
+pub(crate) async fn emit_rows(db: &PgPool, account_id: Uuid, rows: Vec<Out>) {
+    let rows = keep(db, account_id, rows);
     if rows.is_empty() {
         return;
     }
-    let res: sqlx::Result<()> = async {
-        let mut sp = sqlx::Connection::begin(&mut *conn).await?;
-        for chunk in rows.chunks(500) {
-            write(&mut *sp, account_id, chunk).await?;
-        }
-        sp.commit().await
+    let Some(mut tx) = observe::begin(db, "webhooks").await else { return };
+    let res = write_out(&mut tx, account_id, &rows).await;
+    observe::commit(tx, res, "webhooks").await;
+}
+
+/// Queue `rows` inside the caller's transaction, so they go out only if it commits; under a
+/// savepoint with short timeouts, so it can neither spoil nor stall that transaction.
+pub(crate) async fn emit_rows_in(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, rows: Vec<Out>) {
+    let rows = keep(db, account_id, rows);
+    if rows.is_empty() {
+        return;
     }
-    .await;
-    if let Err(e) = res {
-        tracing::error!(account = %account_id, topic = %rows[0].topic, error = %e, "couldn't queue webhook events");
-    }
+    let Some(saved) = observe::enter(conn, "webhooks").await else { return };
+    let res = write_out(conn, account_id, &rows).await;
+    observe::leave(conn, saved, res, "webhooks").await;
 }
 
 /// Send `data` to every endpoint of the account subscribed to `topic`. Never fails the caller.
 pub async fn emit(db: &PgPool, account_id: Uuid, topic: &str, source: Source, data: Value) {
-    emit_rows(db, account_id, vec![Out::new(topic, source, data)]).await
+    if wants(db, account_id, &[topic]) {
+        emit_rows(db, account_id, vec![Out::new(topic, source, data)]).await
+    }
 }
 
 fn profile_ref(id: Uuid) -> Value {
@@ -297,33 +313,50 @@ pub(crate) fn profile_summary(p: &Profile) -> Value {
 }
 
 /// An event was recorded: `event.tracked`, and for DumbMail's own message events the message
-/// topic it stands for (`message.sent`, `message.opened` ...). Called by `audience::record_event`.
-pub async fn event_recorded(db: &PgPool, account_id: Uuid, event_id: Uuid, metric: &str, source: Source, message_id: Option<Uuid>, properties: &Value) {
-    let mut rows = vec![Out { event_id, topic: "event.tracked".into(), metric: Some(metric.to_string()), source, data: json!({"$event": event_id}) }];
-    // Message topics come only from DumbMail's own records of its messages, never from an event
-    // someone sent in with the same name.
-    if let (Source::System, Some(mid)) = (source, message_id) {
-        if let Some(topic) = topics::message_topic(metric) {
-            let mut data = json!({"$message": mid});
-            match topic {
-                "message.clicked" => data["url"] = properties.get("url").cloned().unwrap_or(Value::Null),
-                "message.bounced" => data["bounce_type"] = properties.get("bounce_type").cloned().unwrap_or(Value::Null),
-                _ => {}
-            }
-            rows.push(Out { event_id: stable_id(&[topic, &event_id.to_string()]), topic: topic.into(), metric: None, source, data });
-        }
+/// topic it stands for (`message.sent`, `message.opened` ...). The rows to write, inside
+/// `audience::record_event`'s transaction; empty (and nothing built) when no endpoint wants them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn event_rows(db: &PgPool, account_id: Uuid, event_id: Uuid, metric: &str, source: Source, message_id: Option<Uuid>, properties: &Value) -> Vec<Out> {
+    let message_topic = match (source, message_id) {
+        // Message topics come only from DumbMail's own records of its messages, never from an
+        // event someone sent in with the same name.
+        (Source::System, Some(_)) => topics::message_topic(metric),
+        _ => None,
+    };
+    let mut want = vec!["event.tracked"];
+    want.extend(message_topic);
+    if !wants(db, account_id, &want) {
+        return Vec::new();
     }
-    emit_rows(db, account_id, rows).await
+    let mut rows = vec![Out { event_id, topic: "event.tracked".into(), metric: Some(metric.to_string()), source, data: json!({"$event": event_id}) }];
+    if let (Some(topic), Some(mid)) = (message_topic, message_id) {
+        let mut data = json!({"$message": mid});
+        match topic {
+            "message.clicked" => data["url"] = properties.get("url").cloned().unwrap_or(Value::Null),
+            "message.bounced" => data["bounce_type"] = properties.get("bounce_type").cloned().unwrap_or(Value::Null),
+            _ => {}
+        }
+        rows.push(Out { event_id: stable_id(&[topic, &event_id.to_string()]), topic: topic.into(), metric: None, source, data });
+    }
+    keep(db, account_id, rows)
 }
+
+const PROFILE_TOPICS: &[&str] = &["profile.created", "profile.updated", "profile.subscribed", "profile.unsubscribed"];
 
 /// After a profile is created or saved: `profile.created`, or `profile.updated` when something
 /// actually changed, plus `profile.subscribed` / `profile.unsubscribed` for consent changes.
-pub async fn profile_saved(db: &PgPool, account_id: Uuid, before: Option<&Profile>, after: &Profile, source: Source) {
+/// `consent_before` is (email, sms) consent as the saving statement found it (None for a new
+/// profile), so a transition is reported only when that write made it.
+pub async fn profile_saved(db: &PgPool, account_id: Uuid, before: Option<&Profile>, consent_before: Option<(&str, &str)>, after: &Profile, source: Source) {
+    if !wants(db, account_id, PROFILE_TOPICS) {
+        return;
+    }
     let summary = profile_summary(after);
     let mut out: Vec<Out> = Vec::new();
     match before {
         None => out.push(Out::new("profile.created", source, json!({"profile": after}))),
         Some(b) => {
+            let (email_was, sms_was) = consent_before.unwrap_or((b.email_consent.as_str(), b.sms_consent.as_str()));
             let changed: Vec<&str> = [
                 ("email", b.email == after.email),
                 ("phone_number", b.phone_number == after.phone_number),
@@ -331,8 +364,8 @@ pub async fn profile_saved(db: &PgPool, account_id: Uuid, before: Option<&Profil
                 ("first_name", b.first_name == after.first_name),
                 ("last_name", b.last_name == after.last_name),
                 ("properties", b.properties == after.properties),
-                ("email_consent", b.email_consent == after.email_consent),
-                ("sms_consent", b.sms_consent == after.sms_consent),
+                ("email_consent", email_was == after.email_consent),
+                ("sms_consent", sms_was == after.sms_consent),
             ]
             .into_iter()
             .filter(|(_, same)| !same)
@@ -344,8 +377,13 @@ pub async fn profile_saved(db: &PgPool, account_id: Uuid, before: Option<&Profil
         }
     }
     let reason = if before.is_none() { "created" } else { "profile_update" };
-    for (channel, b, a) in [("email", before.map(|b| b.email_consent.as_str()), after.email_consent.as_str()), ("sms", before.map(|b| b.sms_consent.as_str()), after.sms_consent.as_str())] {
-        if let Some(o) = consent_row(channel, b.unwrap_or("never_subscribed"), a, reason, None, source, summary.clone()) {
+    let (email_was, sms_was) = match (before, consent_before) {
+        (None, _) => ("never_subscribed", "never_subscribed"),
+        (Some(_), Some(c)) => c,
+        (Some(b), None) => (b.email_consent.as_str(), b.sms_consent.as_str()),
+    };
+    for (channel, b, a) in [("email", email_was, after.email_consent.as_str()), ("sms", sms_was, after.sms_consent.as_str())] {
+        if let Some(o) = consent_row(channel, b, a, reason, None, source, summary.clone()) {
             out.push(o);
         }
     }
@@ -370,6 +408,9 @@ fn consent_row(channel: &str, before: &str, after: &str, reason: &str, message_i
 /// text, a spam complaint, a double opt-in). `before` and `after` are what the write changed.
 #[allow(clippy::too_many_arguments)]
 pub async fn consent_changed(db: &PgPool, account_id: Uuid, profile_id: Uuid, channel: &str, before: &str, after: &str, reason: &str, message_id: Option<Uuid>) {
+    if !wants(db, account_id, &["profile.subscribed", "profile.unsubscribed"]) {
+        return;
+    }
     if let Some(o) = consent_row(channel, before, after, reason, message_id, Source::System, profile_ref(profile_id)) {
         emit_rows(db, account_id, vec![o]).await
     }
@@ -377,6 +418,9 @@ pub async fn consent_changed(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch
 
 /// An address was suppressed (`hard_bounce` or `complaint`) and wasn't before.
 pub async fn suppressed(db: &PgPool, account_id: Uuid, profile_id: Uuid, reason: &str, message_id: Uuid) {
+    if !wants(db, account_id, &["profile.suppressed"]) {
+        return;
+    }
     let data = json!({"channel": "email", "reason": reason, "message_id": message_id, "profile": profile_ref(profile_id)});
     let o = Out { event_id: stable_id(&["profile.suppressed", &message_id.to_string()]), ..Out::new("profile.suppressed", Source::System, data) };
     emit_rows(db, account_id, vec![o]).await
@@ -387,105 +431,124 @@ pub async fn profile_deleted(db: &PgPool, account_id: Uuid, summary: Value) {
     emit(db, account_id, "profile.deleted", Source::Api, json!({"profile": summary})).await
 }
 
+/// Whether an endpoint of the account wants list membership changes (`added` or removed). Lets the
+/// caller skip collecting who changed.
+pub fn wants_list_changes(db: &PgPool, account_id: Uuid, added: bool) -> bool {
+    wants(db, account_id, &[if added { "list.member_added" } else { "list.member_removed" }])
+}
+
 /// Profiles joined (`added`) or left a list.
 pub async fn list_changed(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid], added: bool) {
     let topic = if added { "list.member_added" } else { "list.member_removed" };
-    if profile_ids.is_empty() || !may_want(db, account_id, topic, None, Source::System).await {
+    if profile_ids.is_empty() || !wants(db, account_id, &[topic]) {
         return;
     }
-    if let Err(e) = fanout::insert_members(db, account_id, topic, "list", list_id, profile_ids).await {
-        tracing::error!(account = %account_id, topic, error = %e, "couldn't queue webhook events");
+    let Some(ids) = members_room(db, account_id, profile_ids) else { return };
+    let Some(mut tx) = observe::begin(db, "webhooks").await else { return };
+    let res = fanout::insert_members(&mut tx, account_id, topic, "list", list_id, ids).await;
+    observe::commit(tx, res, "webhooks").await;
+}
+
+fn members_room<'a>(db: &PgPool, account_id: Uuid, ids: &'a [Uuid]) -> Option<&'a [Uuid]> {
+    let room = observe::outbox_room(db, account_id, ids.len() as i64, max_outbox()) as usize;
+    if room < ids.len() {
+        dropped(db, account_id, (ids.len() - room) as i64);
     }
+    (room > 0).then(|| &ids[..room])
+}
+
+/// Whether an endpoint of the account wants segment entries or exits. Lets a segment refresh skip
+/// collecting who left.
+pub fn wants_segment_changes(db: &PgPool, account_id: Uuid) -> bool {
+    wants(db, account_id, &["segment.entered", "segment.left"])
 }
 
 /// A segment refresh found people who entered and left. Called inside the refresh's transaction.
-pub async fn segment_changed_in(conn: &mut PgConnection, account_id: Uuid, segment_id: Uuid, entered: &[Uuid], left: &[Uuid]) {
+pub async fn segment_changed_in(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, segment_id: Uuid, entered: &[Uuid], left: &[Uuid]) {
+    let mut work: Vec<(&str, &[Uuid])> = Vec::new();
     for (topic, ids) in [("segment.entered", entered), ("segment.left", left)] {
-        if ids.is_empty() || !may_want_cached(account_id, topic) {
+        if ids.is_empty() || !wants(db, account_id, &[topic]) {
             continue;
         }
-        let res: sqlx::Result<()> = async {
-            let mut sp = sqlx::Connection::begin(&mut *conn).await?;
-            fanout::insert_members(&mut *sp, account_id, topic, "segment", segment_id, ids).await?;
-            sp.commit().await
-        }
-        .await;
-        if let Err(e) = res {
-            tracing::error!(account = %account_id, topic, error = %e, "couldn't queue webhook events");
+        if let Some(ids) = members_room(db, account_id, ids) {
+            work.push((topic, ids));
         }
     }
+    if work.is_empty() {
+        return;
+    }
+    let Some(saved) = observe::enter(conn, "webhooks").await else { return };
+    let mut res = Ok(());
+    for (topic, ids) in work {
+        res = fanout::insert_members(&mut *conn, account_id, topic, "segment", segment_id, ids).await;
+        if res.is_err() {
+            break;
+        }
+    }
+    observe::leave(conn, saved, res, "webhooks").await;
 }
 
 /// Messages ended `skipped` or `failed`: `message.skipped` / `message.failed`, with the reason.
-/// One statement over the ids (reading what the write left), for any number of them.
-const UNSENT_INSERT: &str = "
-    WITH o AS (
+/// One statement over the ids (reading what the write left), for any number of them. The event id
+/// is the message's and its status, so a second report of the same outcome goes out once.
+const UNSENT_INSERT: &str = concat!(
+    "WITH o AS (
         INSERT INTO webhook_outbox (account_id, event_id, topic, source, data)
         SELECT $1, md5('message.' || m.status || ':' || m.id::text)::uuid, 'message.' || m.status, 'system',
                jsonb_build_object('$message', m.id, 'reason', left(m.error, 200))
         FROM messages m
         WHERE m.account_id = $1 AND m.id = ANY($2) AND m.status IN ('skipped', 'failed') AND NOT m.is_test
           AND EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND ('message.' || m.status) = ANY(e.topics))
-        RETURNING account_id
-    ), mk AS (
-        INSERT INTO webhook_fanout_pending (account_id) SELECT $1 WHERE EXISTS (SELECT 1 FROM o)
-        ON CONFLICT DO NOTHING RETURNING account_id
-    )
-    INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', mk.account_id), 'background' FROM mk";
+        RETURNING 1
+    ) ",
+    wake_fanout!()
+);
 
-fn wants_unsent_cached(account_id: Uuid) -> bool {
-    may_want_cached(account_id, "message.skipped") || may_want_cached(account_id, "message.failed")
+/// Whether an endpoint of the account wants skipped or failed messages.
+pub fn wants_unsent(db: &PgPool, account_id: Uuid) -> bool {
+    wants(db, account_id, &["message.skipped", "message.failed"])
 }
 
-/// See [`crate::features::messages_unsent`].
-pub async fn messages_unsent(db: &PgPool, account_id: Uuid, ids: &[Uuid]) {
-    if !(may_want(db, account_id, "message.skipped", None, Source::System).await || may_want(db, account_id, "message.failed", None, Source::System).await) {
-        return;
+/// Write `message.skipped` / `message.failed` rows for these ids on a connection set up with `observe`.
+pub(crate) async fn write_unsent(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, ids: &[Uuid]) -> sqlx::Result<()> {
+    let Some(ids) = members_room(db, account_id, ids) else { return Ok(()) };
+    for chunk in ids.chunks(5_000) {
+        sqlx::query(UNSENT_INSERT).bind(account_id).bind(chunk).execute(&mut *conn).await?;
     }
-    for chunk in ids.chunks(10_000) {
-        if let Err(e) = sqlx::query(UNSENT_INSERT).bind(account_id).bind(chunk).execute(db).await {
-            tracing::error!(account = %account_id, error = %e, "couldn't queue webhook events");
-        }
-    }
-}
-
-/// [`messages_unsent`] in the caller's transaction, under a savepoint.
-pub async fn messages_unsent_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) {
-    if !wants_unsent_cached(account_id) {
-        return;
-    }
-    let res: sqlx::Result<()> = async {
-        let mut sp = sqlx::Connection::begin(&mut *conn).await?;
-        for chunk in ids.chunks(10_000) {
-            sqlx::query(UNSENT_INSERT).bind(account_id).bind(chunk).execute(&mut *sp).await?;
-        }
-        sp.commit().await
-    }
-    .await;
-    if let Err(e) = res {
-        tracing::error!(account = %account_id, error = %e, "couldn't queue webhook events");
-    }
+    Ok(())
 }
 
 /// The provider confirmed a message was delivered (called only the first time it does).
 pub async fn message_delivered(db: &PgPool, account_id: Uuid, message_id: Uuid) {
+    if !wants(db, account_id, &["message.delivered"]) {
+        return;
+    }
     let o = Out { event_id: stable_id(&["message.delivered", &message_id.to_string()]), ..Out::new("message.delivered", Source::System, json!({"$message": message_id})) };
     emit_rows(db, account_id, vec![o]).await
 }
 
 /// Someone signed up through a form.
 pub async fn form_submitted(db: &PgPool, account_id: Uuid, form_id: Uuid, profile_id: Uuid, variant: Option<&str>) {
-    emit(db, account_id, "form.submitted", Source::Browser, json!({"form": {"$form": form_id}, "variant": variant.unwrap_or("a"), "profile": profile_ref(profile_id)})).await
+    if !wants(db, account_id, &["form.submitted"]) {
+        return;
+    }
+    emit_rows(db, account_id, vec![Out::new("form.submitted", Source::Browser, json!({"form": {"$form": form_id}, "variant": variant.unwrap_or("a"), "profile": profile_ref(profile_id)}))]).await
 }
 
 /// A campaign started sending. Called inside the transaction that marks it sent.
-pub async fn campaign_sent_in(conn: &mut PgConnection, account_id: Uuid, campaign_id: Uuid) {
+pub async fn campaign_sent_in(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, campaign_id: Uuid) {
+    if !wants(db, account_id, &["campaign.sent"]) {
+        return;
+    }
     let o = Out { event_id: stable_id(&["campaign.sent", &campaign_id.to_string()]), ..Out::new("campaign.sent", Source::System, json!({"campaign": {"$campaign": campaign_id}})) };
-    emit_rows_in(conn, account_id, vec![o]).await
+    emit_rows_in(conn, db, account_id, vec![o]).await
 }
 
 /// A campaign finished sending.
 pub async fn campaign_finished(db: &PgPool, account_id: Uuid, campaign_id: Uuid) {
+    if !wants(db, account_id, &["campaign.finished"]) {
+        return;
+    }
     let o =
         Out { event_id: stable_id(&["campaign.finished", &campaign_id.to_string()]), ..Out::new("campaign.finished", Source::System, json!({"campaign": {"$campaign": campaign_id}})) };
     emit_rows(db, account_id, vec![o]).await
@@ -493,7 +556,7 @@ pub async fn campaign_finished(db: &PgPool, account_id: Uuid, campaign_id: Uuid)
 
 /// A flow was turned on, paused or set to draft.
 pub async fn flow_status_changed(db: &PgPool, account_id: Uuid, flow_id: Uuid, name: &str, previous: &str, status: &str, trigger: &Value) {
-    if previous != status {
+    if previous != status && wants(db, account_id, &["flow.status_changed"]) {
         emit(db, account_id, "flow.status_changed", Source::Api, json!({"flow": {"id": flow_id, "name": name, "status": status, "previous_status": previous, "trigger": trigger}}))
             .await;
     }
@@ -634,16 +697,6 @@ mod tests {
         assert!(!wanted(&subs, "event.tracked", Some("Viewed Product"), Source::Api));
         assert!(wanted(&subs, "message.opened", None, Source::System));
         assert!(!wanted(&subs, "profile.created", None, Source::System));
-    }
-
-    #[test]
-    fn a_stale_no_is_never_trusted_for_long() {
-        let none: Vec<Sub> = Vec::new();
-        assert_eq!(decide(Duration::from_secs(1), &none, "profile.created", None, Source::System), Some(false));
-        assert_eq!(decide(NEGATIVE_TTL + Duration::from_millis(1), &none, "profile.created", None, Source::System), None);
-        let some = vec![Sub { topics: vec!["profile.created".into()], metrics: vec![], trusted_only: false }];
-        assert_eq!(decide(Duration::from_secs(20), &some, "profile.created", None, Source::System), Some(true));
-        assert_eq!(decide(POSITIVE_TTL, &some, "profile.created", None, Source::System), None);
     }
 
     #[test]

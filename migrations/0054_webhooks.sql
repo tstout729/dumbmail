@@ -17,6 +17,7 @@ CREATE TABLE webhook_endpoints (
     batch_size             integer NOT NULL DEFAULT 50,
     rate_per_second        integer NOT NULL DEFAULT 10,
     revision               integer NOT NULL DEFAULT 1,       -- bumped when the URL changes; older deliveries are cancelled
+    revision_started_at    timestamptz NOT NULL DEFAULT now(), -- only changes captured since then go to this revision's URL
     secret_enc             text NOT NULL,
     secret_hint            text NOT NULL,
     previous_secret_enc    text,                             -- still signs for a day after a rotation
@@ -42,10 +43,12 @@ CREATE INDEX webhook_endpoints_key_idx ON webhook_endpoints (api_key_id) WHERE a
 
 -- Changes waiting to be matched to endpoints. Written with one cheap insert where the change
 -- happens (in the same transaction when there is one); a background job per account moves them
--- into webhook_deliveries.
+-- into webhook_deliveries. Append-only, with no foreign key, so writing a row never waits on a
+-- lock someone else holds (an account row locked for billing, say). Rows of a deleted account
+-- match no endpoint and are dropped when they fan out.
 CREATE TABLE webhook_outbox (
     id         bigserial PRIMARY KEY,
-    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    account_id uuid NOT NULL,
     event_id   uuid NOT NULL,                     -- the envelope id receivers dedupe on
     topic      text NOT NULL,
     metric     text,                              -- event.tracked: the metric's name
@@ -55,10 +58,12 @@ CREATE TABLE webhook_outbox (
 );
 CREATE INDEX webhook_outbox_account_idx ON webhook_outbox (account_id, id);
 
--- An account whose outbox has a fan-out job queued (at most one per account).
-CREATE TABLE webhook_fanout_pending (
-    account_id uuid PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-    created_at timestamptz NOT NULL DEFAULT now()
+-- How many rows each account has waiting in the outbox, counted by the background sweep. Servers
+-- read it with their cached subscriptions and stop adding rows for an account that is full.
+CREATE TABLE webhook_outbox_counts (
+    account_id uuid PRIMARY KEY,
+    rows       bigint NOT NULL,
+    counted_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE webhook_deliveries (
@@ -85,6 +90,8 @@ CREATE INDEX webhook_deliveries_due_idx ON webhook_deliveries (endpoint_id, crea
 CREATE INDEX webhook_deliveries_expiry_idx ON webhook_deliveries (expires_at) WHERE status = 'pending';
 CREATE INDEX webhook_deliveries_log_idx ON webhook_deliveries (endpoint_id, created_at DESC);
 CREATE INDEX webhook_deliveries_created_idx ON webhook_deliveries (created_at);
+-- One delivery per event per endpoint: a change reported twice goes out once.
+CREATE UNIQUE INDEX webhook_deliveries_event_uq ON webhook_deliveries (endpoint_id, event_id) WHERE NOT is_test;
 
 CREATE TABLE webhook_signing_secrets (
     account_id  uuid PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,

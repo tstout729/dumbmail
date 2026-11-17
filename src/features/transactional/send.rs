@@ -600,7 +600,7 @@ async fn finish_unsent(db: &PgPool, id: Uuid, message_id: Uuid, status: &str, ms
         .fetch_optional(&mut *tx)
         .await?;
     if let Some(account) = account {
-        crate::features::messages_unsent_in(&mut tx, account, &[message_id]).await;
+        crate::features::messages_unsent_in(&mut tx, db, account, &[message_id]).await;
     }
     tx.commit().await
 }
@@ -772,12 +772,13 @@ pub async fn sweep(db: &PgPool) -> sqlx::Result<()> {
     .await?;
     let ids: Vec<Uuid> = interrupted.into_iter().chain(expired).flatten().collect();
     if !ids.is_empty() {
-        let failed: Vec<(Uuid, Uuid)> =
-            sqlx::query_as("UPDATE messages SET status = 'failed', error = 'transactional send interrupted or expired' WHERE id = ANY($1) AND status = 'queued' RETURNING account_id, id")
-                .bind(&ids)
-                .fetch_all(db)
-                .await?;
-        crate::features::messages_unsent_rows(db, &failed).await;
+        const FAIL: &str = "UPDATE messages SET status = 'failed', error = 'transactional send interrupted or expired' WHERE id = ANY($1) AND status = 'queued'";
+        if crate::features::observes_any(db) {
+            let failed: Vec<(Uuid, Uuid)> = sqlx::query_as(&format!("{FAIL} RETURNING account_id, id")).bind(&ids).fetch_all(db).await?;
+            crate::features::messages_unsent_rows(db, &failed).await;
+        } else {
+            sqlx::query(FAIL).bind(&ids).execute(db).await?;
+        }
     }
     Ok(())
 }

@@ -1,15 +1,20 @@
 //! Turning outbox rows into deliveries, in the background job lane.
 //!
-//! One `webhooks_fanout` job per account at a time (`webhook_fanout_pending` holds the account
-//! while one is queued). A run takes up to [`OUTBOX_BATCH`] rows at a time, fills in the parts the
-//! emitter only referenced (the event, the message, the profile ...), matches them against the
-//! account's endpoints and writes the deliveries, all in one transaction, so a crash either keeps
-//! the rows in the outbox or has written their deliveries. It stops after a few seconds and queues
-//! itself again if more is waiting.
+//! A `webhooks_fanout` job runs per account (an outbox insert queues one unless one is waiting). A
+//! run takes up to [`OUTBOX_BATCH`] rows at a time, fills in the parts the emitter only referenced
+//! (the event, the message, the profile ...), matches them against the account's endpoints and
+//! writes the deliveries, all in one transaction, so a crash either keeps the rows in the outbox or
+//! has written their deliveries. It stops after a few seconds and queues itself again if more is
+//! waiting.
+//!
+//! An endpoint gets only rows captured since its current revision started (a URL change starts a
+//! new one), so nothing captured for one address goes to another; and an event id reaches an
+//! endpoint once, however many times it was reported.
 //!
 //! Backlogs are bounded: an endpoint keeps at most [`max_pending`] undelivered rows (the oldest are
 //! dropped beyond that, counted on the endpoint, and the owner is told once), and an account keeps
-//! at most [`max_outbox`] rows waiting to fan out.
+//! at most [`max_outbox`] rows waiting to fan out (checked where rows are written, against the
+//! sweep's count; see `observe::outbox_room`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -45,49 +50,40 @@ pub fn set_limits_for_tests(pending: i64, outbox: i64) {
 }
 
 /// Membership changes (a list or a segment) for many profiles in one statement, without building
-/// them in memory. Who they are is taken now (someone who left may be deleted by the time it fans out). `kind` is "list" or "segment". At most what fits under the account's outbox
-/// limit is kept; the rest is counted as dropped on the endpoints that wanted it.
-pub(super) async fn insert_members<'c>(db: impl sqlx::PgExecutor<'c>, account_id: Uuid, topic: &str, kind: &str, group_id: Uuid, ids: &[Uuid]) -> sqlx::Result<()> {
-    sqlx::query(
-        "WITH room AS (SELECT GREATEST(0, $6 - (SELECT count(*) FROM (SELECT 1 FROM webhook_outbox WHERE account_id = $1 LIMIT $6) c)) AS n),
-         wanted AS (SELECT EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND $2 = ANY(e.topics)) AS yes),
-         o AS (
-            INSERT INTO webhook_outbox (account_id, event_id, topic, source, data)
-            SELECT $1, md5($2 || ':' || $3::text || ':' || x.pid::text || ':' || clock_timestamp()::text)::uuid, $2, 'system',
-                   jsonb_build_object($4::text, jsonb_build_object('$' || $4, $3), 'profile',
-                       CASE WHEN p.id IS NULL THEN jsonb_build_object('id', x.pid)
-                            ELSE jsonb_build_object('id', p.id, 'email', p.email, 'phone_number', p.phone_number, 'external_id', p.external_id,
-                                                    'first_name', p.first_name, 'last_name', p.last_name) END)
-            FROM unnest($5::uuid[]) AS x(pid) LEFT JOIN profiles p ON p.id = x.pid AND p.account_id = $1
-            WHERE (SELECT yes FROM wanted)
-            LIMIT (SELECT n FROM room)
-            RETURNING 1
-         ), d AS (
-            UPDATE webhook_endpoints SET dropped_total = dropped_total + (cardinality($5::uuid[]) - (SELECT count(*) FROM o)), last_dropped_at = now()
-            WHERE account_id = $1 AND enabled AND $2 = ANY(topics) AND (SELECT count(*) FROM o) < cardinality($5::uuid[])
-            RETURNING 1
-         ), m AS (
-            INSERT INTO webhook_fanout_pending (account_id) SELECT $1 WHERE EXISTS (SELECT 1 FROM o)
-            ON CONFLICT DO NOTHING RETURNING account_id
-         )
-         INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', m.account_id), 'background' FROM m",
-    )
-    .bind(account_id)
-    .bind(topic)
-    .bind(group_id)
-    .bind(kind)
-    .bind(ids)
-    .bind(max_outbox())
-    .execute(db)
-    .await?;
+/// them in memory. Who they are is taken now (someone who left may be deleted by the time it fans
+/// out). `kind` is "list" or "segment". The caller has checked the account's outbox has room.
+pub(super) async fn insert_members(conn: &mut PgConnection, account_id: Uuid, topic: &str, kind: &str, group_id: Uuid, ids: &[Uuid]) -> sqlx::Result<()> {
+    for chunk in ids.chunks(5_000) {
+        sqlx::query(concat!(
+            "WITH o AS (
+                INSERT INTO webhook_outbox (account_id, event_id, topic, source, data)
+                SELECT $1, md5($2 || ':' || $3::text || ':' || x.pid::text || ':' || clock_timestamp()::text)::uuid, $2, 'system',
+                       jsonb_build_object($4::text, jsonb_build_object('$' || $4, $3), 'profile',
+                           CASE WHEN p.id IS NULL THEN jsonb_build_object('id', x.pid)
+                                ELSE jsonb_build_object('id', p.id, 'email', p.email, 'phone_number', p.phone_number, 'external_id', p.external_id,
+                                                        'first_name', p.first_name, 'last_name', p.last_name) END)
+                FROM unnest($5::uuid[]) AS x(pid) LEFT JOIN profiles p ON p.id = x.pid AND p.account_id = $1
+                WHERE EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND $2 = ANY(e.topics))
+                RETURNING 1
+             ) ",
+            super::wake_fanout!()
+        ))
+        .bind(account_id)
+        .bind(topic)
+        .bind(group_id)
+        .bind(kind)
+        .bind(chunk)
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(())
 }
 
-/// Queue a fan-out job for the account unless one is queued already.
+/// Queue a fan-out job for the account unless one is waiting.
 async fn rearm(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
     sqlx::query(
-        "WITH m AS (INSERT INTO webhook_fanout_pending (account_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING account_id)
-         INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', m.account_id), 'background' FROM m",
+        "INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', $1::uuid), 'background'
+         WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'webhooks_fanout' AND j.lane = 'background' AND j.locked_at IS NULL AND j.payload->>'account_id' = $1::text)",
     )
     .bind(account_id)
     .execute(db)
@@ -95,11 +91,10 @@ async fn rearm(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Job: fan out the account's outbox.
+/// Job: fan out the account's outbox. A row written while this runs queues another job (this one
+/// is claimed, so it doesn't count as waiting), so nothing is left behind.
 pub(super) async fn run(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
     let db = &state.db;
-    // From here on, a new outbox row queues a new job; this one drains what's there now.
-    sqlx::query("DELETE FROM webhook_fanout_pending WHERE account_id = $1").bind(account_id).execute(db).await?;
     let started = Instant::now();
     loop {
         let (n, alerts) = batch(db, account_id).await?;
@@ -131,6 +126,7 @@ struct Row {
 struct Ep {
     id: Uuid,
     revision: i32,
+    revision_started_at: DateTime<Utc>,
     topics: Vec<String>,
     metrics: Vec<String>,
     filter: Option<Value>,
@@ -139,7 +135,9 @@ struct Ep {
 
 impl Ep {
     fn wants(&self, r: &Row, data: &Value) -> bool {
-        self.topics.contains(&r.topic)
+        // Captured before this revision (an earlier URL): not this address's to receive.
+        r.created_at >= self.revision_started_at
+            && self.topics.contains(&r.topic)
             && (r.metric.is_none() || self.metrics.is_empty() || r.metric.as_ref().is_some_and(|m| self.metrics.contains(m)))
             && !(self.trusted_only && r.source == "browser")
             && passes(&self.filter, data)
@@ -177,7 +175,7 @@ async fn batch(db: &PgPool, account_id: Uuid) -> anyhow::Result<(usize, Vec<Back
     rows.sort_by_key(|r| r.id);
     // A REST hook stops with its API key: a revoked key's hooks get nothing more.
     let eps: Vec<Ep> = sqlx::query_as(
-        "SELECT e.id, e.revision, e.topics, e.metrics, e.filter, e.trusted_only FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled
+        "SELECT e.id, e.revision, e.revision_started_at, e.topics, e.metrics, e.filter, e.trusted_only FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled
            AND (e.api_key_id IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = e.api_key_id AND k.revoked_at IS NULL))",
     )
         .bind(account_id)
@@ -185,11 +183,17 @@ async fn batch(db: &PgPool, account_id: Uuid) -> anyhow::Result<(usize, Vec<Back
         .await?;
     let lookups = Lookups::load(&mut tx, account_id, &rows).await?;
     let (mut ids, mut ep_ids, mut revs, mut events, mut topics, mut payloads) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // One delivery per event per endpoint, even when a change was reported twice (also enforced by
+    // a unique index, against rows from an earlier batch).
+    let mut seen: HashSet<(Uuid, Uuid)> = HashSet::new();
     for r in &rows {
         let Some(data) = lookups.fill(&r.data) else { continue };
         let env = json!({"id": r.event_id, "topic": r.topic, "created_at": r.created_at, "account_id": account_id, "api_version": super::API_VERSION,
             "source": r.source, "data": data});
         for e in eps.iter().filter(|e| e.wants(r, &data)) {
+            if !seen.insert((e.id, r.event_id)) {
+                continue;
+            }
             ids.push(Uuid::now_v7());
             ep_ids.push(e.id);
             revs.push(e.revision);
@@ -200,9 +204,11 @@ async fn batch(db: &PgPool, account_id: Uuid) -> anyhow::Result<(usize, Vec<Back
     }
     let mut alerts = Vec::new();
     if !ids.is_empty() {
-        sqlx::query(
+        let added: Vec<Uuid> = sqlx::query_scalar(
             "INSERT INTO webhook_deliveries (id, account_id, endpoint_id, revision, event_id, topic, payload)
-             SELECT x.id, $2, x.ep, x.rev, x.ev, x.topic, x.payload FROM UNNEST($1::uuid[], $3::uuid[], $4::int[], $5::uuid[], $6::text[], $7::jsonb[]) AS x(id, ep, rev, ev, topic, payload)",
+             SELECT x.id, $2, x.ep, x.rev, x.ev, x.topic, x.payload FROM UNNEST($1::uuid[], $3::uuid[], $4::int[], $5::uuid[], $6::text[], $7::jsonb[]) AS x(id, ep, rev, ev, topic, payload)
+             ON CONFLICT (endpoint_id, event_id) WHERE NOT is_test DO NOTHING
+             RETURNING endpoint_id",
         )
         .bind(&ids)
         .bind(account_id)
@@ -211,10 +217,10 @@ async fn batch(db: &PgPool, account_id: Uuid) -> anyhow::Result<(usize, Vec<Back
         .bind(&events)
         .bind(&topics)
         .bind(&payloads)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
         let mut per: HashMap<Uuid, i32> = HashMap::new();
-        for e in &ep_ids {
+        for e in &added {
             *per.entry(*e).or_default() += 1;
         }
         for (ep, added) in &per {
@@ -463,50 +469,98 @@ impl Lookups {
 
 // ---------- Upkeep ----------
 
-/// Every minute: queue fan-out for accounts whose rows are waiting without a job (after a crash,
-/// or a job that gave up), and keep each account's outbox under its limit.
+/// Accounts the sweep looks at per run.
+const SWEEP_ACCOUNTS: i64 = 10_000;
+/// Rows trimmed from one account's outbox per statement, and statements per sweep.
+const TRIM_BATCH: i64 = 5_000;
+const TRIM_BATCHES: usize = 20;
+
+/// Every minute (a background job): for each account with rows in its outbox, count them (servers
+/// read the count to stop adding rows once it's full), trim it back under the limit in bounded
+/// batches, and queue fan-out where rows have waited without a job (after a crash, or a job that
+/// gave up). Then tell owners whose endpoints started dropping events.
 pub(super) async fn sweep(state: &AppState) -> anyhow::Result<()> {
     let db = &state.db;
-    let stale: Vec<Uuid> = sqlx::query_scalar(
-        "DELETE FROM webhook_fanout_pending p WHERE p.created_at < now() - interval '5 minutes'
-           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'webhooks_fanout' AND j.payload->>'account_id' = p.account_id::text AND j.run_at <> 'infinity')
-         RETURNING account_id",
+    // The accounts with outbox rows, read off the (account_id, id) index one account at a time.
+    let accounts: Vec<Uuid> = sqlx::query_scalar(
+        "WITH RECURSIVE a AS (
+            (SELECT account_id FROM webhook_outbox ORDER BY account_id LIMIT 1)
+            UNION ALL
+            SELECT (SELECT o.account_id FROM webhook_outbox o WHERE o.account_id > a.account_id ORDER BY o.account_id LIMIT 1) FROM a WHERE a.account_id IS NOT NULL
+         )
+         SELECT account_id FROM a WHERE account_id IS NOT NULL LIMIT $1",
     )
+    .bind(SWEEP_ACCOUNTS)
     .fetch_all(db)
     .await?;
-    let waiting: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT o.account_id FROM (SELECT account_id FROM webhook_outbox WHERE created_at < now() - interval '1 minute' ORDER BY id LIMIT 1000) o
-         WHERE NOT EXISTS (SELECT 1 FROM webhook_fanout_pending p WHERE p.account_id = o.account_id)",
-    )
-    .fetch_all(db)
-    .await?;
-    for a in stale.into_iter().chain(waiting) {
-        rearm(db, a).await?;
-    }
-    let over: Vec<(Uuid, i64)> = sqlx::query_as("SELECT account_id, count(*) FROM webhook_outbox GROUP BY account_id HAVING count(*) > $1 LIMIT 100")
-        .bind(max_outbox())
-        .fetch_all(db)
-        .await?;
-    for (account_id, n) in over {
-        let excess = n - max_outbox();
-        let dropped = sqlx::query("DELETE FROM webhook_outbox WHERE id IN (SELECT id FROM webhook_outbox WHERE account_id = $1 ORDER BY id LIMIT $2)")
-            .bind(account_id)
-            .bind(excess)
-            .execute(db)
-            .await?
-            .rows_affected();
-        let first: Vec<(String, String)> = sqlx::query_as(
-            "WITH u AS (UPDATE webhook_endpoints SET dropped_total = dropped_total + $2, last_dropped_at = now() WHERE account_id = $1 AND enabled RETURNING id, drop_alerted, url, description)
-             SELECT url, description FROM u WHERE NOT drop_alerted",
+    let max = max_outbox();
+    for &account_id in &accounts {
+        let (n, oldest): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT count(*), min(created_at) FROM (SELECT created_at FROM webhook_outbox WHERE account_id = $1 ORDER BY id LIMIT $2) c",
         )
         .bind(account_id)
-        .bind(dropped as i64)
-        .fetch_all(db)
+        // Counted as far as one sweep can trim, so the count stays cheap.
+        .bind(max + TRIM_BATCH * TRIM_BATCHES as i64)
+        .fetch_one(db)
         .await?;
-        sqlx::query("UPDATE webhook_endpoints SET drop_alerted = true WHERE account_id = $1 AND enabled").bind(account_id).execute(db).await?;
-        for (url, description) in first {
-            backlog_alert(state, &BacklogAlert { account_id, url, description }).await;
+        let mut left = n;
+        if n > max {
+            let mut dropped = 0i64;
+            for _ in 0..TRIM_BATCHES {
+                let want = (left - max).min(TRIM_BATCH);
+                if want <= 0 {
+                    break;
+                }
+                let d = sqlx::query("DELETE FROM webhook_outbox WHERE id IN (SELECT id FROM webhook_outbox WHERE account_id = $1 ORDER BY id LIMIT $2)")
+                    .bind(account_id)
+                    .bind(want)
+                    .execute(db)
+                    .await?
+                    .rows_affected() as i64;
+                dropped += d;
+                left -= d;
+                if d < want {
+                    break;
+                }
+            }
+            sqlx::query("UPDATE webhook_endpoints SET dropped_total = dropped_total + $2, last_dropped_at = now() WHERE account_id = $1 AND enabled")
+                .bind(account_id)
+                .bind(dropped)
+                .execute(db)
+                .await?;
         }
+        sqlx::query(
+            "INSERT INTO webhook_outbox_counts (account_id, rows, counted_at) VALUES ($1, $2, now())
+             ON CONFLICT (account_id) DO UPDATE SET rows = EXCLUDED.rows, counted_at = EXCLUDED.counted_at",
+        )
+        .bind(account_id)
+        .bind(left)
+        .execute(db)
+        .await?;
+        if oldest.is_some_and(|t| t < Utc::now() - chrono::Duration::minutes(1)) {
+            rearm(db, account_id).await?;
+        }
+    }
+    sqlx::query("DELETE FROM webhook_outbox_counts WHERE account_id <> $2 AND NOT (account_id = ANY($1))").bind(&accounts).bind(crate::features::observe::SWEPT).execute(db).await?;
+    // When this count was taken: servers forget the rows they added before it.
+    sqlx::query(
+        "INSERT INTO webhook_outbox_counts (account_id, rows, counted_at) VALUES ($1, 0, now())
+         ON CONFLICT (account_id) DO UPDATE SET counted_at = EXCLUDED.counted_at",
+    )
+    .bind(crate::features::observe::SWEPT)
+    .execute(db)
+    .await?;
+    // Endpoints that started dropping (a full outbox, counted above or by a server that refused
+    // rows) and whose owner hasn't been told yet.
+    let first: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "UPDATE webhook_endpoints SET drop_alerted = true
+         WHERE id IN (SELECT id FROM webhook_endpoints WHERE NOT drop_alerted AND last_dropped_at > now() - interval '1 day' LIMIT 100)
+         RETURNING account_id, url, description",
+    )
+    .fetch_all(db)
+    .await?;
+    for (account_id, url, description) in first {
+        backlog_alert(state, &BacklogAlert { account_id, url, description }).await;
     }
     Ok(())
 }

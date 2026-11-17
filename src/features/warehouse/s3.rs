@@ -254,9 +254,14 @@ impl Bucket {
     }
 }
 
-/// A CompleteMultipartUpload answer that says it worked.
+/// A CompleteMultipartUpload answer that says it worked: a whole, well-formed XML document (S3
+/// may send whitespace first) whose root is `CompleteMultipartUploadResult` with a non-empty ETag.
+/// A cut-off document doesn't parse, so it never counts.
 fn completed(body: &str) -> bool {
-    body.contains("<CompleteMultipartUploadResult") && !body.contains("<Error>") && xml_tag(body, "ETag").is_some_and(|e| !e.is_empty())
+    let Ok(doc) = roxmltree::Document::parse(body.trim_start()) else { return false };
+    let root = doc.root_element();
+    root.tag_name().name() == "CompleteMultipartUploadResult"
+        && root.children().any(|c| c.is_element() && c.tag_name().name() == "ETag" && c.text().is_some_and(|t| !t.trim().is_empty()))
 }
 
 fn xml_tag(body: &str, tag: &str) -> Option<String> {
@@ -328,6 +333,11 @@ mod tests {
         assert!(!completed("  \n  \n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>"));
         assert!(!completed(""));
         assert!(!completed("<CompleteMultipartUploadResult><Bucket>b</Bucket>"));
+        // Cut off after the ETag: everything a success has, except its end.
+        assert!(!completed("<?xml version=\"1.0\"?>\n<CompleteMultipartUploadResult><Bucket>b</Bucket><ETag>\"abc-2\"</ETag>"));
+        assert!(!completed("<CompleteMultipartUploadResult><Bucket>b</Bucket><ETag>\"abc-2\"</ETag></CompleteMultipartUploadResu"));
+        assert!(!completed("<CompleteMultipartUploadResult><ETag> </ETag></CompleteMultipartUploadResult>"));
+        assert!(completed("   \n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>\"e\"</ETag></CompleteMultipartUploadResult>"));
         let r = Response { status: 403, etag: None, body: "<Error><Code>AccessDenied</Code><Message>signature abc123 for AKIA...</Message></Error>".into(), complete: true };
         assert_eq!(failure("upload", &r).to_string(), "upload failed: HTTP 403 AccessDenied");
         let r = Response { status: 400, etag: None, body: "<Error><Code>Reflected AKIA123</Code></Error>".into(), complete: true };

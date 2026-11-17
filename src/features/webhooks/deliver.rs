@@ -25,7 +25,8 @@ use crate::state::AppState;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const RUN_BUDGET: Duration = Duration::from_secs(20);
 const MAX_REQUESTS_PER_RUN: usize = 100;
-/// A request carries at most this many bytes of events (one bigger event still goes alone).
+/// A request carries at most this many bytes of events. A single event bigger than this isn't sent:
+/// it's recorded as failed with `too_large`.
 pub(super) const MAX_REQUEST_BYTES: usize = 1_000_000;
 
 #[derive(sqlx::FromRow)]
@@ -43,6 +44,9 @@ pub(super) struct Endpoint {
     pub previous_secret_until: Option<DateTime<Utc>>,
     pub retry_at: Option<DateTime<Utc>>,
 }
+
+/// The endpoint (as `webhook_endpoints`) isn't a REST hook of a revoked API key.
+pub(super) const KEY_LIVE: &str = "(webhook_endpoints.api_key_id IS NULL OR EXISTS (SELECT 1 FROM api_keys k WHERE k.id = webhook_endpoints.api_key_id AND k.revoked_at IS NULL))";
 
 pub(super) const ENDPOINT_COLS: &str =
     "id, account_id, url, description, source, revision, batch_size, rate_per_second, secret_enc, previous_secret_enc, previous_secret_until, retry_at";
@@ -96,7 +100,9 @@ pub(super) fn secrets(state: &AppState, ep: &Endpoint) -> anyhow::Result<Vec<Str
 
 /// What happened to a request. `error` is one of: `address_rejected` (the URL isn't a public
 /// HTTPS address), `timeout`, `connect_failed`, `request_failed`, `redirect` (a 3xx: use the final
-/// URL), `http_error` (any other non-2xx; see the code), `internal`.
+/// URL), `http_error` (any other non-2xx; see the code), `internal`. Deliveries never sent say
+/// `too_large` (one event over [`MAX_REQUEST_BYTES`]) or, cancelled, `untrusted_source` (the
+/// endpoint now takes only trusted sources) or `url_changed`.
 pub(super) struct Outcome {
     pub ok: bool,
     pub code: Option<i32>,
@@ -151,6 +157,18 @@ async fn left_pending<'c>(db: impl sqlx::PgExecutor<'c>, endpoint_id: Uuid, n: i
     Ok(())
 }
 
+/// End pending deliveries without sending them (`status` failed or cancelled, with a short class).
+async fn close(db: &PgPool, endpoint_id: Uuid, ids: &[Uuid], status: &str, error: &str) -> sqlx::Result<()> {
+    let n = sqlx::query("UPDATE webhook_deliveries SET status = $2, error = $3 WHERE id = ANY($1) AND status = 'pending'")
+        .bind(ids)
+        .bind(status)
+        .bind(error)
+        .execute(db)
+        .await?
+        .rows_affected();
+    left_pending(db, endpoint_id, n as i64).await
+}
+
 /// Record an attempt on pending deliveries. Failed ones back off (30s doubling, at most 2 hours)
 /// and are marked failed once the next try would be past their 24 hours.
 pub(super) async fn record(db: &PgPool, endpoint_id: Uuid, ids: &[Uuid], o: &Outcome) -> anyhow::Result<()> {
@@ -188,9 +206,11 @@ pub(super) async fn record(db: &PgPool, endpoint_id: Uuid, ids: &[Uuid], o: &Out
 pub(super) async fn run(state: &AppState, id: Uuid) -> anyhow::Result<()> {
     let db = &state.db;
     sqlx::query("UPDATE webhook_endpoints SET wake_queued = false WHERE id = $1").bind(id).execute(db).await?;
+    // A REST hook whose API key was revoked gets nothing more, from this moment (the sweep then
+    // deletes it).
     let ep: Option<Endpoint> = sqlx::query_as(&format!(
         "UPDATE webhook_endpoints SET lease_until = now() + interval '2 minutes'
-         WHERE id = $1 AND enabled AND (lease_until IS NULL OR lease_until < now()) RETURNING {ENDPOINT_COLS}"
+         WHERE id = $1 AND enabled AND (lease_until IS NULL OR lease_until < now()) AND {KEY_LIVE} RETURNING {ENDPOINT_COLS}"
     ))
     .bind(id)
     .fetch_optional(db)
@@ -220,14 +240,16 @@ async fn send_due(state: &AppState, ep: &Endpoint) -> anyhow::Result<()> {
             }
             tokio::time::sleep(pause).await;
         }
-        // The endpoint's revision is checked on every batch, so a URL change stops this run from
-        // sending anything more to the old address.
-        let batch: Vec<(Uuid, String, Value)> = sqlx::query_as(
-            "SELECT d.id, d.topic, d.payload FROM webhook_deliveries d
+        // The endpoint is checked on every batch: a URL change (a new revision), turning it off, a
+        // revoked API key or switching to trusted sources only stops this run from sending
+        // anything it no longer should, including deliveries queued again by a resend.
+        let batch: Vec<(Uuid, String, Value, bool)> = sqlx::query_as(&format!(
+            "SELECT d.id, d.topic, d.payload, (webhook_endpoints.trusted_only AND d.payload->>'source' = 'browser') AS untrusted
+             FROM webhook_deliveries d JOIN webhook_endpoints ON webhook_endpoints.id = d.endpoint_id
              WHERE d.endpoint_id = $1 AND d.status = 'pending' AND d.revision = $2 AND d.next_attempt_at <= now() AND d.expires_at > now()
-               AND EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.id = $1 AND e.enabled AND e.revision = $2)
-             ORDER BY d.created_at, d.id LIMIT $3",
-        )
+               AND webhook_endpoints.enabled AND webhook_endpoints.revision = $2 AND {KEY_LIVE}
+             ORDER BY d.created_at, d.id LIMIT $3"
+        ))
         .bind(ep.id)
         .bind(ep.revision)
         .bind(ep.batch_size.clamp(1, 100) as i64)
@@ -236,22 +258,41 @@ async fn send_due(state: &AppState, ep: &Endpoint) -> anyhow::Result<()> {
         if batch.is_empty() {
             break;
         }
-        // Keep the request under the byte limit (one event always goes, however big).
-        let mut take = 0;
+        let untrusted: Vec<Uuid> = batch.iter().filter(|b| b.3).map(|b| b.0).collect();
+        if !untrusted.is_empty() {
+            close(db, ep.id, &untrusted, "cancelled", "untrusted_source").await?;
+        }
+        // Keep the request under the byte limit. An event too big to go in any request is recorded
+        // as such and never sent.
+        let mut take: Vec<usize> = Vec::new();
+        let mut too_large: Vec<Uuid> = Vec::new();
         let mut bytes = 0;
         let mut bodies = Vec::new();
-        for (_, _, payload) in &batch {
+        for (i, (id, _, payload, skip)) in batch.iter().enumerate() {
+            if *skip {
+                continue;
+            }
             let b = serde_json::to_vec(payload)?;
-            if take > 0 && bytes + b.len() > MAX_REQUEST_BYTES {
+            if b.len() + 2 > MAX_REQUEST_BYTES {
+                too_large.push(*id);
+                continue;
+            }
+            if bytes + b.len() + 2 > MAX_REQUEST_BYTES {
                 break;
             }
             bytes += b.len() + 1;
             bodies.push(b);
-            take += 1;
+            take.push(i);
         }
-        let ids: Vec<Uuid> = batch[..take].iter().map(|b| b.0).collect();
+        if !too_large.is_empty() {
+            close(db, ep.id, &too_large, "failed", "too_large").await?;
+        }
+        if take.is_empty() {
+            continue;
+        }
+        let ids: Vec<Uuid> = take.iter().map(|&i| batch[i].0).collect();
         let (body, topic) = if ep.batch_size <= 1 {
-            (bodies.swap_remove(0), Some(batch[0].1.as_str()))
+            (bodies.swap_remove(0), Some(batch[take[0]].1.as_str()))
         } else {
             let mut out = Vec::with_capacity(bytes + 2);
             out.push(b'[');
@@ -305,7 +346,7 @@ async fn gone(state: &AppState, ep: &Endpoint) -> anyhow::Result<()> {
         disable(state, ep.id, ep.account_id, &ep.url, &ep.description, "It answered 410 Gone, which means it no longer wants deliveries, so it was turned off.").await
     } else {
         sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1").bind(ep.id).execute(&state.db).await?;
-        super::forget(ep.account_id);
+        super::forget(&state.db).await;
         Ok(())
     }
 }
@@ -321,7 +362,7 @@ pub(super) async fn disable(state: &AppState, id: Uuid, account_id: Uuid, url: &
     if changed.is_none() {
         return Ok(());
     }
-    super::forget(account_id);
+    super::forget(&state.db).await;
     let text = format!(
         "Your webhook endpoint {} was turned off. {why}\n\nNothing more is sent to it until you turn it back on in Settings → Webhooks. After you fix it, you can resend the failed deliveries from its log there for up to 14 days.",
         super::display_name(description, url)
@@ -341,8 +382,8 @@ pub(super) async fn sweep(state: &AppState) -> anyhow::Result<()> {
     )
     .fetch_all(db)
     .await?;
-    for a in revoked {
-        super::forget(a);
+    if !revoked.is_empty() {
+        super::forget(db).await;
     }
     for _ in 0..10 {
         let expired: Vec<(Uuid, i64)> = sqlx::query_as(

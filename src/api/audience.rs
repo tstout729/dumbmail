@@ -193,7 +193,10 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
                 AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
                 other => other,
             })?;
-        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), &saved, core::EventSource::Api).await;
+        // This statement doesn't touch consent (the save above reported any consent change), so
+        // it reports none.
+        let consent = (saved.email_consent.as_str(), saved.sms_consent.as_str());
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), Some(consent), &saved, core::EventSource::Api).await;
         return Ok(saved);
     }
     Ok(p)

@@ -255,6 +255,7 @@ async fn failures_back_off_retry_and_turn_the_endpoint_off_after_three_days() {
     retry_now(&h).await;
     // The every-minute sweep fails it, whether or not anything else is sent.
     dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'failed'").await, 1);
     assert_eq!(count(&h, "SELECT pending::bigint FROM webhook_endpoints").await, 0);
 
@@ -770,6 +771,7 @@ async fn rest_hooks_belong_to_the_key_that_made_them() {
     let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE name = 'Zapier'").fetch_one(&h.state.db).await.unwrap();
     h.ok("DELETE", &format!("/api/api-keys/{key_id}"), None).await;
     dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    h.drain().await;
     assert_eq!(h.ok("GET", "/api/webhooks", None).await["total"], 1);
     h.cleanup().await;
 }
@@ -788,6 +790,7 @@ async fn a_failing_endpoint_is_turned_off_after_three_days_even_with_no_more_tra
     sqlx::query("UPDATE webhook_deliveries SET expires_at = now() - interval '1 day'").execute(&h.state.db).await.unwrap();
     sqlx::query("UPDATE webhook_endpoints SET failing_since = now() - interval '4 days', retry_at = NULL").execute(&h.state.db).await.unwrap();
     dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    h.drain().await;
     let e = h.ok("GET", &format!("/api/webhooks/{id}"), None).await;
     assert_eq!(e["status"], "disabled", "{e}");
     let alert = h.state.email.sent().into_iter().find(|m| m.subject == "A webhook endpoint was turned off").unwrap();

@@ -1267,9 +1267,14 @@ async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, de
     .fetch_all(&state.db)
     .await?;
     for (id, account_id, first, is_test) in rows {
-        crate::features::warehouse::changed(&state.db, account_id, "messages", id).await;
-        if delivered && first && !is_test {
-            crate::features::webhooks::message_delivered(&state.db, account_id, id).await;
+        match (delivered, first && !is_test) {
+            (true, true) => {
+                crate::features::warehouse::changed(&state.db, account_id, "messages", id).await;
+                crate::features::webhooks::message_delivered(&state.db, account_id, id).await;
+            }
+            // The carrier failed it after the provider accepted it: `message.failed`, once.
+            (false, true) => crate::features::messages_unsent(&state.db, account_id, &[id]).await,
+            _ => crate::features::warehouse::changed(&state.db, account_id, "messages", id).await,
         }
     }
     Ok(())

@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod integrations;
 pub mod klaviyo_import;
 pub mod objects;
+pub mod observe;
 pub mod push;
 pub mod reports;
 pub mod reviews;
@@ -177,16 +178,46 @@ pub async fn wants_event(db: &sqlx::PgPool, account_id: Uuid, metric: &str) -> b
     false
 }
 
+// ---- Observers (webhooks and data exports) ----
+//
+// The rest of the app reports changes here. Each check below reads a per-server snapshot of who
+// has anything set up (`observe`), with no SQL, so an account with no webhook endpoint or export
+// pays nothing; observer writes never fail, block or slow the caller (see `observe`).
+
+/// Whether anything wants to hear about this account's messages that ended without being sent.
+/// When it says no, don't collect the ids (a plain `UPDATE`, as if nothing were watching).
+pub fn observes_unsent(db: &sqlx::PgPool, account_id: Uuid) -> bool {
+    webhooks::wants_unsent(db, account_id) || warehouse::exports(db, account_id, "messages")
+}
+
+/// Whether any account on this server's snapshot has anything set up (for sweeps that span
+/// accounts). When it says no, sweeps don't collect rows just to report them.
+pub fn observes_any(db: &sqlx::PgPool) -> bool {
+    observe::peek(db).is_none_or(|i| i.any())
+}
+
 /// Messages that ended without being sent: `skipped` (with the reason in `error`: smart sending,
 /// time zones, a cancelled campaign ...) or `failed`. Call it right after the write, with the ids
 /// it changed. Lets webhooks and data exports report the outcome. Never fails or blocks the caller.
 pub async fn messages_unsent(db: &sqlx::PgPool, account_id: Uuid, ids: &[Uuid]) {
-    if ids.is_empty() {
+    if ids.is_empty() || !observes_unsent(db, account_id) {
         return;
     }
-    webhooks::messages_unsent(db, account_id, ids).await;
+    let Some(mut tx) = observe::begin(db, "messages unsent").await else { return };
+    let res = unsent_writes(&mut tx, db, account_id, ids).await;
+    observe::commit(tx, res, "messages unsent").await;
+}
+
+async fn unsent_writes(conn: &mut sqlx::PgConnection, db: &sqlx::PgPool, account_id: Uuid, ids: &[Uuid]) -> sqlx::Result<()> {
+    if webhooks::wants_unsent(db, account_id) {
+        webhooks::write_unsent(conn, db, account_id, ids).await?;
+    }
     let rows: Vec<(&str, Uuid)> = ids.iter().map(|id| ("messages", *id)).collect();
-    warehouse::changed_many(db, account_id, &rows).await;
+    let rows = warehouse::change_rows(db, account_id, &rows);
+    if !rows.is_empty() {
+        warehouse::write_changes(conn, account_id, &rows).await?;
+    }
+    Ok(())
 }
 
 /// [`messages_unsent`] for (account id, message id) pairs from more than one account.
@@ -200,14 +231,49 @@ pub async fn messages_unsent_rows(db: &sqlx::PgPool, rows: &[(Uuid, Uuid)]) {
     }
 }
 
-/// [`messages_unsent`] inside the caller's transaction (it goes out only if that commits; a failure
-/// here can't spoil it).
-pub async fn messages_unsent_in(conn: &mut sqlx::PgConnection, account_id: Uuid, ids: &[Uuid]) {
-    if ids.is_empty() {
+/// [`messages_unsent`] inside the caller's transaction (it goes out only if that commits; it can't
+/// spoil or stall it).
+pub async fn messages_unsent_in(conn: &mut sqlx::PgConnection, db: &sqlx::PgPool, account_id: Uuid, ids: &[Uuid]) {
+    if ids.is_empty() || !observes_unsent(db, account_id) {
         return;
     }
-    webhooks::messages_unsent_in(conn, account_id, ids).await;
-    warehouse::changed_in(conn, account_id, "messages", ids).await;
+    let Some(saved) = observe::enter(conn, "messages unsent").await else { return };
+    let res = unsent_writes(conn, db, account_id, ids).await;
+    observe::leave(conn, saved, res, "messages unsent").await;
+}
+
+/// An event was recorded (inside `audience::record_event`'s transaction): webhooks' `event.tracked`
+/// and message topics, and the export change log. Nothing is built or written unless the account
+/// has something that wants it.
+#[allow(clippy::too_many_arguments)]
+pub async fn event_recorded_in(
+    conn: &mut sqlx::PgConnection,
+    db: &sqlx::PgPool,
+    account_id: Uuid,
+    event_id: Uuid,
+    profile_id: Uuid,
+    metric: &str,
+    source: crate::audience::EventSource,
+    message_id: Option<Uuid>,
+    properties: &Value,
+) {
+    let hooks = webhooks::event_rows(db, account_id, event_id, metric, source, message_id, properties);
+    let changes = warehouse::event_change_rows(db, account_id, profile_id, message_id);
+    if hooks.is_empty() && changes.is_empty() {
+        return;
+    }
+    let Some(saved) = observe::enter(conn, "event recorded").await else { return };
+    let res = async {
+        if !hooks.is_empty() {
+            webhooks::write_out(conn, account_id, &hooks).await?;
+        }
+        if !changes.is_empty() {
+            warehouse::write_changes(conn, account_id, &changes).await?;
+        }
+        Ok(())
+    }
+    .await;
+    observe::leave(conn, saved, res, "event recorded").await;
 }
 
 /// Run every feature's [`Feature::after_start`] on its own task and return at once. Errors are logged.

@@ -3,11 +3,28 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::api;
+use super::api::{self, Who};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{Perm, ToolRule};
 use crate::mcp::{from, obj, tool};
 use crate::state::AppState;
+
+/// Who may use each tool (the same rules as the REST routes).
+pub static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_webhook_topics", perm: Perm::WebhooksRead },
+    ToolRule { name: "list_webhooks", perm: Perm::WebhooksRead },
+    ToolRule { name: "create_webhook", perm: Perm::WebhooksManage },
+    ToolRule { name: "update_webhook", perm: Perm::WebhooksManage },
+    ToolRule { name: "delete_webhook", perm: Perm::WebhooksManage },
+    ToolRule { name: "rotate_webhook_secret", perm: Perm::WebhooksManage },
+    ToolRule { name: "send_test_webhook", perm: Perm::WebhooksManage },
+    // With delivery_id it returns a payload, which also needs webhooks.manage (checked below).
+    ToolRule { name: "list_webhook_deliveries", perm: Perm::WebhooksRead },
+    ToolRule { name: "resend_webhook_deliveries", perm: Perm::WebhooksManage },
+    ToolRule { name: "get_flow_webhook_secret", perm: Perm::WebhooksRead },
+    ToolRule { name: "rotate_flow_webhook_secret", perm: Perm::WebhooksManage },
+];
 
 fn endpoint_props() -> Value {
     json!({
@@ -27,6 +44,7 @@ fn endpoint_props() -> Value {
 pub fn defs() -> Vec<Value> {
     let mut update = endpoint_props();
     update["id"] = json!({"type": "string"});
+    update["revision"] = json!({"type": "integer", "description": "The endpoint's revision as you read it (list_webhooks). If its URL changed since, the update is refused, so an old address is never put back."});
     vec![
         tool("list_webhook_topics", "List webhook topics", "Every topic an outgoing webhook can subscribe to, with what it means.", obj(json!({}), &[]), true, false),
         tool("list_webhooks", "List webhook endpoints", "The account's webhook endpoints (including Zapier/Make hooks): URL, topics, on/off, failing state and 24-hour delivery counts. Secrets are never shown, only a hint.", obj(json!({}), &[]), true, false),
@@ -59,36 +77,38 @@ fn without(a: &Value, keys: &[&str]) -> Value {
 
 pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<AppResult<Value>> {
     let acct = ctx.account_id;
+    let who = Who::of(ctx);
     let r = match name {
         "list_webhook_topics" => Ok(json!({"topics": super::topics::list_json()})),
-        "list_webhooks" => api::list(state, acct).await.map(|v| json!({"webhooks": v})),
-        "create_webhook" => api::create(state, acct, a, "api", 50, None).await,
+        "list_webhooks" => api::list(state, who).await.map(|v| json!({"webhooks": v})),
+        "create_webhook" => api::create(state, ctx, a, "api", 50, None).await,
         "update_webhook" => match id_arg(a, "id") {
-            Ok(id) => api::update(state, acct, id, &without(a, &["id"])).await,
+            Ok(id) => api::update(state, ctx, id, &without(a, &["id"])).await,
             Err(e) => Err(e),
         },
         "delete_webhook" => async {
             let id = id_arg(a, "id")?;
-            let ep = api::get_one(state, acct, id).await?;
+            let ep = api::get_one(state, who, id).await?;
             if a["confirm"].as_bool() != Some(true) {
                 return Ok(json!({"dry_run": true, "webhook": ep, "note": "Nothing deleted. This stops all deliveries to this URL and deletes its delivery log. Call again with confirm=true once the user approves."}));
             }
-            api::delete(state, acct, id).await?;
+            api::delete(state, ctx, id).await?;
             Ok(json!({"deleted": true}))
         }
         .await,
         "rotate_webhook_secret" => match id_arg(a, "id") {
-            Ok(id) => api::rotate(state, acct, id).await,
+            Ok(id) => api::rotate(state, ctx, id).await,
             Err(e) => Err(e),
         },
         "send_test_webhook" => match id_arg(a, "id") {
-            Ok(id) => api::send_test(state, acct, id, a["topic"].as_str()).await,
+            Ok(id) => api::send_test(state, ctx, id, a["topic"].as_str()).await,
             Err(e) => Err(e),
         },
         "list_webhook_deliveries" => async {
             let id = id_arg(a, "id")?;
             if a.get("delivery_id").is_some_and(|v| !v.is_null()) {
-                return api::delivery(state, acct, id, id_arg(a, "delivery_id")?).await;
+                crate::features::team::access::require(ctx, Perm::WebhooksManage)?;
+                return api::delivery(state, who, id, id_arg(a, "delivery_id")?).await;
             }
             let q = api::DeliveryQuery {
                 status: a["status"].as_str().map(String::from),
@@ -96,17 +116,17 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
                 limit: a["limit"].as_i64(),
                 offset: a["offset"].as_i64(),
             };
-            let (rows, total) = api::deliveries(state, acct, id, &q).await?;
+            let (rows, total) = api::deliveries(state, who, id, &q).await?;
             Ok(json!({"deliveries": rows, "total": total}))
         }
         .await,
         "resend_webhook_deliveries" => async {
             let id = id_arg(a, "id")?;
-            api::resend(state, acct, id, from(without(a, &["id"]))?).await
+            api::resend(state, ctx, id, from(without(a, &["id"]))?).await
         }
         .await,
         "get_flow_webhook_secret" => api::flow_secret_info(state, acct).await,
-        "rotate_flow_webhook_secret" => api::rotate_flow_secret(state, acct).await,
+        "rotate_flow_webhook_secret" => api::rotate_flow_secret(state, ctx).await,
         _ => return None,
     };
     Some(r)

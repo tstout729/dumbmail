@@ -2,7 +2,7 @@
 //! REST hooks (subscribe / unsubscribe / sample) for Zapier and Make.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -10,12 +10,38 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::deliver::{self, Endpoint, ENDPOINT_COLS};
+use super::deliver::{self, Endpoint};
 use super::{net, topics};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{rule, Perm, RouteRule};
+use crate::features::team::audit;
 use crate::state::AppState;
+
+/// Who may use each route. Seeing endpoints and their log (no payloads) is for Managers and up;
+/// changing them, secrets, tests, payloads, resends and REST hooks are for Admins and owners.
+/// REST hooks are also made only with an API key (checked in the handlers).
+pub static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/webhooks", Perm::WebhooksRead),
+    rule("POST", "/api/webhooks", Perm::WebhooksManage),
+    rule("GET", "/api/webhooks/topics", Perm::WebhooksRead),
+    rule("GET", "/api/webhooks/flow-secret", Perm::WebhooksRead),
+    rule("POST", "/api/webhooks/flow-secret/rotate", Perm::WebhooksManage),
+    rule("GET", "/api/webhooks/{id}", Perm::WebhooksRead),
+    rule("PATCH", "/api/webhooks/{id}", Perm::WebhooksManage),
+    rule("DELETE", "/api/webhooks/{id}", Perm::WebhooksManage),
+    rule("POST", "/api/webhooks/{id}/rotate-secret", Perm::WebhooksManage),
+    rule("POST", "/api/webhooks/{id}/test", Perm::WebhooksManage),
+    rule("GET", "/api/webhooks/{id}/deliveries", Perm::WebhooksRead),
+    rule("GET", "/api/webhooks/{id}/deliveries/{delivery_id}", Perm::WebhooksManage),
+    rule("POST", "/api/webhooks/{id}/resend", Perm::WebhooksManage),
+    rule("GET", "/api/hooks", Perm::WebhooksManage),
+    rule("POST", "/api/hooks", Perm::WebhooksManage),
+    rule("GET", "/api/hooks/me", Perm::WebhooksManage),
+    rule("GET", "/api/hooks/samples", Perm::WebhooksManage),
+    rule("DELETE", "/api/hooks/{id}", Perm::WebhooksManage),
+];
 
 const MAX_ENDPOINTS: i64 = 100;
 
@@ -95,30 +121,65 @@ fn row_json(r: &Row) -> Value {
     })
 }
 
-pub(super) async fn list(state: &AppState, account_id: Uuid) -> AppResult<Vec<Value>> {
-    let rows: Vec<Row> = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM webhook_endpoints e WHERE e.account_id = $1 ORDER BY e.created_at"))
-        .bind(account_id)
+/// Who is asking. A REST hook (made through `/api/hooks`) belongs to its API key: only that key,
+/// or a signed-in member who may manage webhooks, can see or change it. Other API keys and other
+/// members don't see it at all, on any route or MCP tool.
+#[derive(Clone, Copy)]
+pub(super) struct Who {
+    pub account_id: Uuid,
+    key: Option<Uuid>,
+    manager: bool,
+}
+
+impl Who {
+    pub fn of(ctx: &Ctx) -> Who {
+        Who { account_id: ctx.account_id, key: if ctx.via_api_key { ctx.api_key_id } else { None }, manager: !ctx.via_api_key && ctx.can(Perm::WebhooksManage) }
+    }
+
+    fn key(account_id: Uuid, key: Uuid) -> Who {
+        Who { account_id, key: Some(key), manager: false }
+    }
+}
+
+/// The endpoint `e` is visible to `$2` (the API key, or NULL) / `$3` (a member who may manage).
+const VISIBLE: &str = "e.account_id = $1 AND (e.api_key_id IS NULL OR e.api_key_id = $2 OR $3)";
+
+pub(super) async fn list(state: &AppState, who: Who) -> AppResult<Vec<Value>> {
+    let rows: Vec<Row> = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM webhook_endpoints e WHERE {VISIBLE} ORDER BY e.created_at"))
+        .bind(who.account_id)
+        .bind(who.key)
+        .bind(who.manager)
         .fetch_all(&state.db)
         .await?;
     Ok(rows.iter().map(row_json).collect())
 }
 
-pub(super) async fn get_one(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
-    let row: Option<Row> = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM webhook_endpoints e WHERE e.id = $1 AND e.account_id = $2"))
+pub(super) async fn get_one(state: &AppState, who: Who, id: Uuid) -> AppResult<Value> {
+    let row: Option<Row> = sqlx::query_as(&format!("SELECT {LIST_COLS} FROM webhook_endpoints e WHERE {VISIBLE} AND e.id = $4"))
+        .bind(who.account_id)
+        .bind(who.key)
+        .bind(who.manager)
         .bind(id)
-        .bind(account_id)
         .fetch_optional(&state.db)
         .await?;
     row.as_ref().map(row_json).ok_or_else(|| AppError::not_found("webhook endpoint"))
 }
 
-async fn endpoint(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Endpoint> {
-    sqlx::query_as::<_, Endpoint>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = $1 AND account_id = $2"))
+async fn endpoint(state: &AppState, who: Who, id: Uuid) -> AppResult<Endpoint> {
+    let cols = deliver::ENDPOINT_COLS.split(", ").map(|c| format!("e.{}", c.trim())).collect::<Vec<_>>().join(", ");
+    sqlx::query_as::<_, Endpoint>(&format!("SELECT {cols} FROM webhook_endpoints e WHERE {VISIBLE} AND e.id = $4"))
+        .bind(who.account_id)
+        .bind(who.key)
+        .bind(who.manager)
         .bind(id)
-        .bind(account_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::not_found("webhook endpoint"))
+}
+
+/// The host of a URL, for the audit log (never the full URL: it can be a credential).
+fn host(url: &str) -> String {
+    url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default()
 }
 
 // ---------- Validation ----------
@@ -139,7 +200,7 @@ struct Fields {
 
 async fn parse_fields(b: &Value) -> AppResult<Fields> {
     let obj = b.as_object().ok_or_else(|| AppError::bad("send a JSON object"))?;
-    let allowed = ["url", "description", "topics", "metrics", "filter", "trusted_only", "enabled", "batch_size", "rate_per_second"];
+    let allowed = ["url", "description", "topics", "metrics", "filter", "trusted_only", "enabled", "batch_size", "rate_per_second", "revision"];
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
         return Err(AppError::bad(format!("unknown field {k:?}; allowed: {}", allowed.join(", "))));
     }
@@ -213,7 +274,8 @@ async fn parse_fields(b: &Value) -> AppResult<Fields> {
 
 // ---------- Actions (shared by the REST API and MCP) ----------
 
-pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, source: &str, default_batch: i32, api_key_id: Option<Uuid>) -> AppResult<Value> {
+pub(super) async fn create(state: &AppState, ctx: &Ctx, body: &Value, source: &str, default_batch: i32, api_key_id: Option<Uuid>) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let f = parse_fields(body).await?;
     let url = f.url.ok_or_else(|| AppError::bad("url is required"))?;
     let topics = f.topics.ok_or_else(|| AppError::bad("topics is required"))?;
@@ -245,32 +307,50 @@ pub(super) async fn create(state: &AppState, account_id: Uuid, body: &Value, sou
     .bind(api_key_id)
     .execute(&state.db)
     .await?;
-    super::forget(account_id);
-    let mut out = get_one(state, account_id, id).await?;
+    super::forget(&state.db).await;
+    audit(state, ctx, "webhook.create", Some(&id.to_string()), json!({"host": host(&url), "topics": topics, "source": source})).await;
+    let who = match api_key_id {
+        Some(k) => Who::key(account_id, k),
+        None => Who::of(ctx),
+    };
+    let mut out = get_one(state, who, id).await?;
     out["secret"] = json!(secret);
     Ok(out)
 }
 
-/// Changing the URL starts a new revision: deliveries queued for the old URL are cancelled, never
-/// sent to the new one.
-pub(super) async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &Value) -> AppResult<Value> {
-    let ep = endpoint(state, account_id, id).await?;
+/// Changing the URL starts a new revision: deliveries queued for the old URL are cancelled, and
+/// changes captured before the edit never go to the new one. The edit applies only to the revision
+/// the editor read (`revision` in the body, or the one read here), so a stale edit can't put an old
+/// address back.
+pub(super) async fn update(state: &AppState, ctx: &Ctx, id: Uuid, body: &Value) -> AppResult<Value> {
+    let who = Who::of(ctx);
+    let account_id = ctx.account_id;
+    let ep = endpoint(state, who, id).await?;
     let f = parse_fields(body).await?;
+    let read = match body.get("revision") {
+        None | Some(Value::Null) => ep.revision,
+        Some(v) => v.as_i64().ok_or_else(|| AppError::bad("revision must be a whole number"))? as i32,
+    };
+    let stale = || AppError::Conflict("this endpoint's address changed since you opened it; reload it and try again".into());
+    if read != ep.revision {
+        return Err(stale());
+    }
     let turning_on = f.enabled == Some(true);
     let new_url = f.url.as_deref().is_some_and(|u| u != ep.url);
     let mut tx = state.db.begin().await?;
-    sqlx::query(
+    let n = sqlx::query(
         "UPDATE webhook_endpoints SET url = COALESCE($3, url), description = COALESCE($4, description), topics = COALESCE($5, topics),
            metrics = COALESCE($6, metrics), filter = CASE WHEN $7 THEN $8 ELSE filter END, batch_size = COALESCE($9, batch_size),
            rate_per_second = COALESCE($10, rate_per_second), enabled = COALESCE($11, enabled), trusted_only = COALESCE($14, trusted_only),
            revision = revision + CASE WHEN $13 THEN 1 ELSE 0 END,
+           revision_started_at = CASE WHEN $13 THEN clock_timestamp() ELSE revision_started_at END,
            disabled_reason = CASE WHEN $12 THEN NULL ELSE disabled_reason END,
            failing_since = CASE WHEN ($12 AND NOT enabled) OR $13 THEN NULL ELSE failing_since END,
            consecutive_failures = CASE WHEN ($12 AND NOT enabled) OR $13 THEN 0 ELSE consecutive_failures END,
            retry_at = CASE WHEN $12 OR $13 THEN NULL ELSE retry_at END,
            drop_alerted = CASE WHEN $13 THEN false ELSE drop_alerted END,
            updated_at = now()
-         WHERE id = $1 AND account_id = $2",
+         WHERE id = $1 AND account_id = $2 AND revision = $15",
     )
     .bind(id)
     .bind(account_id)
@@ -286,8 +366,13 @@ pub(super) async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &
     .bind(turning_on)
     .bind(new_url)
     .bind(f.trusted_only)
+    .bind(read)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(stale());
+    }
     if new_url {
         sqlx::query(
             "WITH c AS (UPDATE webhook_deliveries SET status = 'cancelled', error = 'url_changed'
@@ -307,22 +392,31 @@ pub(super) async fn update(state: &AppState, account_id: Uuid, id: Uuid, body: &
         deliver::wake(&mut tx, &[id]).await?;
     }
     tx.commit().await?;
-    super::forget(account_id);
-    get_one(state, account_id, id).await
+    super::forget(&state.db).await;
+    let fields: Vec<&str> = body.as_object().map(|o| o.keys().map(String::as_str).filter(|k| *k != "revision").collect()).unwrap_or_default();
+    let mut details = json!({"fields": fields});
+    if new_url {
+        details["host"] = json!(host(f.url.as_deref().unwrap_or("")));
+    }
+    audit(state, ctx, "webhook.update", Some(&id.to_string()), details).await;
+    get_one(state, who, id).await
 }
 
-pub(super) async fn delete(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
-    let n = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).execute(&state.db).await?.rows_affected();
+pub(super) async fn delete(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<()> {
+    let ep = endpoint(state, Who::of(ctx), id).await?;
+    let n = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&state.db).await?.rows_affected();
     if n == 0 {
         return Err(AppError::not_found("webhook endpoint"));
     }
-    super::forget(account_id);
+    super::forget(&state.db).await;
+    audit(state, ctx, "webhook.delete", Some(&id.to_string()), json!({"host": host(&ep.url)})).await;
     Ok(())
 }
 
 /// New signing secret; the old one keeps signing (as a second `v1=`) for 24 hours.
-pub(super) async fn rotate(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
-    endpoint(state, account_id, id).await?;
+pub(super) async fn rotate(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let account_id = ctx.account_id;
+    endpoint(state, Who::of(ctx), id).await?;
     let secret = super::new_secret();
     let until: DateTime<Utc> = sqlx::query_scalar(
         "UPDATE webhook_endpoints SET previous_secret_enc = secret_enc, previous_secret_until = now() + interval '24 hours', secret_enc = $3, secret_hint = $4, updated_at = now()
@@ -334,6 +428,7 @@ pub(super) async fn rotate(state: &AppState, account_id: Uuid, id: Uuid) -> AppR
     .bind(super::secret_hint(&secret))
     .fetch_one(&state.db)
     .await?;
+    audit(state, ctx, "webhook.rotate_secret", Some(&id.to_string()), json!({})).await;
     Ok(json!({"secret": secret, "secret_hint": super::secret_hint(&secret), "previous_secret_valid_until": until}))
 }
 
@@ -365,11 +460,14 @@ fn delivery_json(d: &DeliveryRow) -> Value {
 
 /// Send one sample event now and record it in the log. It goes out on the same one-at-a-time
 /// lease as real deliveries, and its row is never one the delivery job would pick up.
-pub(super) async fn send_test(state: &AppState, account_id: Uuid, id: Uuid, topic: Option<&str>) -> AppResult<Value> {
-    endpoint(state, account_id, id).await?;
+pub(super) async fn send_test(state: &AppState, ctx: &Ctx, id: Uuid, topic: Option<&str>) -> AppResult<Value> {
+    let account_id = ctx.account_id;
+    endpoint(state, Who::of(ctx), id).await?;
     let ep: Option<Endpoint> = sqlx::query_as(&format!(
         "UPDATE webhook_endpoints SET lease_until = now() + interval '30 seconds'
-         WHERE id = $1 AND account_id = $2 AND (lease_until IS NULL OR lease_until < now()) RETURNING {ENDPOINT_COLS}"
+         WHERE id = $1 AND account_id = $2 AND (lease_until IS NULL OR lease_until < now()) AND {} RETURNING {}",
+        deliver::KEY_LIVE,
+        deliver::ENDPOINT_COLS
     ))
     .bind(id)
     .bind(account_id)
@@ -431,8 +529,9 @@ pub(super) struct DeliveryQuery {
     pub offset: Option<i64>,
 }
 
-pub(super) async fn deliveries(state: &AppState, account_id: Uuid, id: Uuid, q: &DeliveryQuery) -> AppResult<(Vec<Value>, i64)> {
-    endpoint(state, account_id, id).await?;
+pub(super) async fn deliveries(state: &AppState, who: Who, id: Uuid, q: &DeliveryQuery) -> AppResult<(Vec<Value>, i64)> {
+    let account_id = who.account_id;
+    endpoint(state, who, id).await?;
     let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
     if status.is_some_and(|s| !matches!(s, "pending" | "sending" | "delivered" | "failed" | "dropped" | "cancelled")) {
         return Err(AppError::bad("status must be pending, sending, delivered, failed, dropped, cancelled or all"));
@@ -463,7 +562,9 @@ pub(super) async fn deliveries(state: &AppState, account_id: Uuid, id: Uuid, q: 
 }
 
 /// One delivery with its payload (personal data: for people allowed to read payloads).
-pub(super) async fn delivery(state: &AppState, account_id: Uuid, id: Uuid, delivery_id: Uuid) -> AppResult<Value> {
+pub(super) async fn delivery(state: &AppState, who: Who, id: Uuid, delivery_id: Uuid) -> AppResult<Value> {
+    let account_id = who.account_id;
+    endpoint(state, who, id).await?;
     let payload: Option<Value> = sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = $1 AND endpoint_id = $2 AND account_id = $3")
         .bind(delivery_id)
         .bind(id)
@@ -495,8 +596,9 @@ const MAX_RESEND: i64 = 10_000;
 
 /// Queue earlier deliveries again (same event ids, so receivers can drop duplicates). Only
 /// deliveries made for the endpoint's current URL; at most one resend a minute per endpoint.
-pub(super) async fn resend(state: &AppState, account_id: Uuid, id: Uuid, b: ResendBody) -> AppResult<Value> {
-    endpoint(state, account_id, id).await?;
+pub(super) async fn resend(state: &AppState, ctx: &Ctx, id: Uuid, b: ResendBody) -> AppResult<Value> {
+    let account_id = ctx.account_id;
+    endpoint(state, Who::of(ctx), id).await?;
     if b.delivery_ids.as_ref().is_none_or(|v| v.is_empty()) && b.since.is_none() {
         return Err(AppError::bad("give delivery_ids, or a since time (and optionally until) to resend a range"));
     }
@@ -545,6 +647,7 @@ pub(super) async fn resend(state: &AppState, account_id: Uuid, id: Uuid, b: Rese
     sqlx::query("UPDATE webhook_endpoints SET pending = pending + $2 WHERE id = $1").bind(id).bind(n as i32).execute(&mut *tx).await?;
     deliver::wake(&mut tx, &[id]).await?;
     tx.commit().await?;
+    audit(state, ctx, "webhook.resend", Some(&id.to_string()), json!({"resent": n, "status": status})).await;
     Ok(json!({"resent": n, "limit": MAX_RESEND}))
 }
 
@@ -559,7 +662,8 @@ pub(super) async fn flow_secret_info(state: &AppState, account_id: Uuid) -> AppR
     })
 }
 
-pub(super) async fn rotate_flow_secret(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+pub(super) async fn rotate_flow_secret(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let secret = super::new_secret();
     sqlx::query(
         "INSERT INTO webhook_signing_secrets (account_id, secret_enc, secret_hint) VALUES ($1, $2, $3)
@@ -570,25 +674,21 @@ pub(super) async fn rotate_flow_secret(state: &AppState, account_id: Uuid) -> Ap
     .bind(super::secret_hint(&secret))
     .execute(&state.db)
     .await?;
+    audit(state, ctx, "webhook.rotate_flow_secret", None, json!({})).await;
     Ok(json!({"secret": secret, "secret_hint": super::secret_hint(&secret)}))
 }
 
-/// The API key a request was made with (REST hooks belong to the key that made them).
-pub(super) async fn key_of(state: &AppState, ctx: &Ctx, headers: &HeaderMap) -> AppResult<Uuid> {
-    let key = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
-    let (true, Some(key)) = (ctx.via_api_key, key) else {
-        return Err(AppError::Forbidden("REST hooks are made with an API key (Zapier, Make or your own code); in the dashboard, use Settings → Webhooks".into()));
-    };
-    let id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM api_keys WHERE key_hash = $1 AND account_id = $2 AND revoked_at IS NULL")
-        .bind(crate::auth::sha256_hex(key))
-        .bind(ctx.account_id)
-        .fetch_optional(&state.db)
-        .await?;
-    id.ok_or(AppError::Unauthorized)
+/// The API key a request was made with (REST hooks belong to the key that made them). Dashboard
+/// sessions can't make REST hooks.
+pub(super) fn key_of(ctx: &Ctx) -> AppResult<Uuid> {
+    match (ctx.via_api_key, ctx.api_key_id) {
+        (true, Some(k)) => Ok(k),
+        _ => Err(AppError::Forbidden("REST hooks are made with an API key (Zapier, Make or your own code); in the dashboard, use Settings → Webhooks".into())),
+    }
 }
 
 /// REST hook subscribe: one topic, one URL, one event per request. The hook belongs to `key_id`.
-pub(super) async fn subscribe(state: &AppState, account_id: Uuid, key_id: Uuid, b: &Value) -> AppResult<Value> {
+pub(super) async fn subscribe(state: &AppState, ctx: &Ctx, key_id: Uuid, b: &Value) -> AppResult<Value> {
     let obj = b.as_object().ok_or_else(|| AppError::bad("send a JSON object"))?;
     let url = ["url", "target_url", "hookUrl"].iter().find_map(|k| obj.get(*k).and_then(|v| v.as_str())).ok_or_else(|| AppError::bad("url is required"))?;
     let topic = obj.get("topic").and_then(|v| v.as_str()).ok_or_else(|| AppError::bad("topic is required"))?;
@@ -608,7 +708,7 @@ pub(super) async fn subscribe(state: &AppState, account_id: Uuid, key_id: Uuid, 
             body.insert(k.into(), v.clone());
         }
     }
-    let ep = create(state, account_id, &Value::Object(body), source, 1, Some(key_id)).await?;
+    let ep = create(state, ctx, &Value::Object(body), source, 1, Some(key_id)).await?;
     Ok(json!({"id": ep["id"], "url": ep["url"], "topic": topic, "metric": ep["metrics"].get(0), "secret": ep["secret"]}))
 }
 
@@ -630,12 +730,13 @@ pub(super) async fn hooks(state: &AppState, account_id: Uuid, key_id: Uuid) -> A
 }
 
 /// Delete one of the key's own REST hooks. Other endpoints, including dashboard ones, aren't its to delete.
-pub(super) async fn unsubscribe(state: &AppState, account_id: Uuid, key_id: Uuid, id: Uuid) -> AppResult<()> {
-    let n = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1 AND account_id = $2 AND api_key_id = $3").bind(id).bind(account_id).bind(key_id).execute(&state.db).await?.rows_affected();
+pub(super) async fn unsubscribe(state: &AppState, ctx: &Ctx, key_id: Uuid, id: Uuid) -> AppResult<()> {
+    let n = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1 AND account_id = $2 AND api_key_id = $3").bind(id).bind(ctx.account_id).bind(key_id).execute(&state.db).await?.rows_affected();
     if n == 0 {
         return Err(AppError::not_found("hook"));
     }
-    super::forget(account_id);
+    super::forget(&state.db).await;
+    audit(state, ctx, "webhook.delete", Some(&id.to_string()), json!({"rest_hook": true})).await;
     Ok(())
 }
 
@@ -688,30 +789,30 @@ async fn topics_h(_ctx: Ctx) -> Json<Value> {
 }
 
 async fn list_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let rows = list(&state, ctx.account_id).await?;
+    let rows = list(&state, Who::of(&ctx)).await?;
     let n = rows.len() as i64;
     Ok(Json(json!({"data": rows, "total": n})))
 }
 
 async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
-    Ok((StatusCode::CREATED, Json(create(&state, ctx.account_id, &b, if ctx.via_api_key { "api" } else { "dashboard" }, 50, None).await?)))
+    Ok((StatusCode::CREATED, Json(create(&state, &ctx, &b, if ctx.via_api_key { "api" } else { "dashboard" }, 50, None).await?)))
 }
 
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(get_one(&state, ctx.account_id, id).await?))
+    Ok(Json(get_one(&state, Who::of(&ctx), id).await?))
 }
 
 async fn patch_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Value>> {
-    Ok(Json(update(&state, ctx.account_id, id, &b).await?))
+    Ok(Json(update(&state, &ctx, id, &b).await?))
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    delete(&state, ctx.account_id, id).await?;
+    delete(&state, &ctx, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn rotate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(rotate(&state, ctx.account_id, id).await?))
+    Ok(Json(rotate(&state, &ctx, id).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -721,20 +822,20 @@ struct TestBody {
 
 async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, body: axum::body::Bytes) -> AppResult<Json<Value>> {
     let b: TestBody = if body.iter().all(|c| c.is_ascii_whitespace()) { TestBody::default() } else { serde_json::from_slice(&body)? };
-    Ok(Json(send_test(&state, ctx.account_id, id, b.topic.as_deref()).await?))
+    Ok(Json(send_test(&state, &ctx, id, b.topic.as_deref()).await?))
 }
 
 async fn deliveries_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<DeliveryQuery>) -> AppResult<Json<Value>> {
-    let (rows, total) = deliveries(&state, ctx.account_id, id, &q).await?;
+    let (rows, total) = deliveries(&state, Who::of(&ctx), id, &q).await?;
     Ok(Json(json!({"data": rows, "total": total})))
 }
 
 async fn delivery_h(State(state): State<AppState>, ctx: Ctx, Path((id, delivery_id)): Path<(Uuid, Uuid)>) -> AppResult<Json<Value>> {
-    Ok(Json(delivery(&state, ctx.account_id, id, delivery_id).await?))
+    Ok(Json(delivery(&state, Who::of(&ctx), id, delivery_id).await?))
 }
 
 async fn resend_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ResendBody>) -> AppResult<Json<Value>> {
-    Ok(Json(resend(&state, ctx.account_id, id, b).await?))
+    Ok(Json(resend(&state, &ctx, id, b).await?))
 }
 
 async fn flow_secret_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -742,28 +843,29 @@ async fn flow_secret_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Jso
 }
 
 async fn rotate_flow_secret_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(rotate_flow_secret(&state, ctx.account_id).await?))
+    Ok(Json(rotate_flow_secret(&state, &ctx).await?))
 }
 
-async fn subscribe_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
-    let key = key_of(&state, &ctx, &headers).await?;
-    Ok((StatusCode::CREATED, Json(subscribe(&state, ctx.account_id, key, &b).await?)))
+async fn subscribe_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Value>) -> AppResult<(StatusCode, Json<Value>)> {
+    let key = key_of(&ctx)?;
+    Ok((StatusCode::CREATED, Json(subscribe(&state, &ctx, key, &b).await?)))
 }
 
-async fn hooks_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap) -> AppResult<Json<Value>> {
-    let key = key_of(&state, &ctx, &headers).await?;
+async fn hooks_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    let key = key_of(&ctx)?;
     let rows = hooks(&state, ctx.account_id, key).await?;
     let n = rows.len();
     Ok(Json(json!({"data": rows, "total": n})))
 }
 
-async fn unsubscribe_h(State(state): State<AppState>, ctx: Ctx, headers: HeaderMap, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let key = key_of(&state, &ctx, &headers).await?;
-    unsubscribe(&state, ctx.account_id, key, id).await?;
+async fn unsubscribe_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    let key = key_of(&ctx)?;
+    unsubscribe(&state, &ctx, key, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn me_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
+    key_of(&ctx)?;
     let name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(ctx.account_id).fetch_one(&state.db).await?;
     Ok(Json(json!({"account": {"id": ctx.account_id, "name": name}})))
 }
@@ -775,5 +877,6 @@ struct SampleQuery {
 }
 
 async fn samples_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<SampleQuery>) -> AppResult<Json<Value>> {
+    key_of(&ctx)?;
     Ok(Json(samples(&state, ctx.account_id, &q.topic, q.metric.as_deref().filter(|m| !m.is_empty())).await?))
 }

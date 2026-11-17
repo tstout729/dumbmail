@@ -5,3 +5,5 @@
 -- builds quickly.
 ALTER TABLE jobs ADD COLUMN lane text NOT NULL DEFAULT 'main';
 CREATE INDEX jobs_lane_ready_idx ON jobs (lane, run_at, id) WHERE locked_at IS NULL;
+-- Finding whether an account already has a webhook fan-out job waiting (see webhooks/mod.rs).
+CREATE INDEX jobs_background_account_idx ON jobs (kind, (payload->>'account_id')) WHERE locked_at IS NULL AND lane = 'background';

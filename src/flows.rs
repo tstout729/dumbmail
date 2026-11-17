@@ -301,13 +301,14 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
 }
 
 /// Signed with the account's flow webhook secret (see docs/WEBHOOKS.md); a GET signs an empty body.
-/// One 10-second deadline covers resolving and checking the address and the request; no proxy is
-/// used, so the connection goes to the address that was checked.
+/// One 10-second deadline covers resolving and checking the address, reading the signing secret
+/// (only once the address passed) and the request; no proxy is used, so the connection goes to the
+/// address that was checked.
 async fn call_webhook(state: &AppState, account_id: Uuid, url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
     let body = if get { Vec::new() } else { serde_json::to_vec(payload)? };
-    let headers = crate::features::webhooks::flow_signature_headers(state, account_id, &body).await;
     let send = async {
         let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let headers = crate::features::webhooks::flow_signature_headers(state, account_id, &body).await;
         let client = reqwest::Client::builder()
             .no_proxy()
             .resolve(&host, addr)

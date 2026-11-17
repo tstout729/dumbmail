@@ -14,6 +14,11 @@
 //!
 //! Incremental windows start [`OVERLAP_MINUTES`] before the last watermark, so a row committed
 //! late isn't skipped; rows carry their key and `_updated_at`, and warehouses dedupe on the key.
+//!
+//! A full read of a dataset (snapshot datasets every run, every dataset in a full export, and an
+//! incremental dataset's first baseline) first stages all of its keys in one statement, so the set
+//! is fixed at that moment, then cuts files from the staged keys in order (see `datasets`). The
+//! staged keys are removed when the run ends.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -65,6 +70,16 @@ pub(super) struct DatasetProgress {
     pub files: Vec<FileInfo>,
     pub rows: i64,
     pub done: bool,
+    /// A full read whose keys are staged (see the module docs).
+    #[serde(default)]
+    pub staged: bool,
+}
+
+impl DatasetProgress {
+    /// Read in full from staged keys, rather than by a window.
+    fn full_read(&self) -> bool {
+        !self.incremental || self.from.is_none()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +197,7 @@ pub(super) async fn start(state: &AppState, d: &Dest, kind: &str) -> AppResult<U
                 files: Vec::new(),
                 rows: 0,
                 done: false,
+                staged: false,
             })
             .collect(),
     };
@@ -265,6 +281,7 @@ async fn step_claimed(state: &AppState, run: &RunRow) -> anyhow::Result<()> {
                     .bind(&msg)
                     .execute(&state.db)
                     .await?;
+                clear_stage(&state.db, Some(run.id)).await?;
                 let text = format!(
                     "The {} export to \"{}\" (bucket {}) failed after {attempts} tries: {msg}\n\nCheck the destination in Settings → Data export. The next scheduled export starts from where the last good one ended, so nothing is skipped once it works again.",
                     run.kind,
@@ -282,13 +299,51 @@ async fn step_claimed(state: &AppState, run: &RunRow) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stop a run that hasn't finished, saying why.
+/// Stop a run that hasn't finished, saying why. Its staged keys go with the next prune.
 pub(super) async fn cancel<'c>(db: impl sqlx::PgExecutor<'c>, run_id: Uuid, why: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE warehouse_runs SET status = 'cancelled', error = $2, finished_at = now() WHERE id = $1 AND status IN ('queued', 'running')")
         .bind(run_id)
         .bind(why)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+/// Take every key of a dataset for a full read, in one statement (one snapshot). Replaces any keys
+/// a crashed attempt staged before its first file was saved.
+async fn stage(state: &AppState, run: &RunRow, ds: &Dataset) -> anyhow::Result<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM warehouse_stage WHERE run_id = $1 AND dataset = $2").bind(run.id).bind(ds.name).execute(&mut *tx).await?;
+    sqlx::query(&format!(
+        "INSERT INTO warehouse_stage (run_id, dataset, seq, key_a, key_b) SELECT $2, $3, row_number() OVER (ORDER BY k.a, k.b), k.a, k.b FROM ({}) k",
+        ds.stage
+    ))
+    .bind(run.account_id)
+    .bind(run.id)
+    .bind(ds.name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Remove a finished run's staged keys, in bounded batches.
+async fn clear_stage(db: &sqlx::PgPool, run_id: Option<Uuid>) -> sqlx::Result<()> {
+    for _ in 0..100 {
+        let n = sqlx::query(
+            "DELETE FROM warehouse_stage WHERE (run_id, dataset, seq) IN (
+                SELECT st.run_id, st.dataset, st.seq FROM warehouse_stage st
+                WHERE ($1::uuid IS NULL AND NOT EXISTS (SELECT 1 FROM warehouse_runs r WHERE r.id = st.run_id AND r.status IN ('queued', 'running'))) OR st.run_id = $1
+                LIMIT 10000)",
+        )
+        .bind(run_id)
+        .execute(db)
+        .await?
+        .rows_affected();
+        if n < 10_000 {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -369,16 +424,21 @@ async fn read_file(state: &AppState, run: &RunRow, csv: bool, ds: &Dataset, sql:
     let mut cursor = p.cursor.clone();
     let mut rows = 0usize;
     let done = loop {
-        let batch: Vec<(Value, String, String)> = sqlx::query_as(sql)
-            .bind(run.account_id)
-            .bind(p.from)
-            .bind(p.to)
-            .bind(cursor.as_ref().map(|c| c.0.clone()))
-            .bind(cursor.as_ref().map(|c| c.1.clone()).filter(|s| !s.is_empty()))
-            .bind(BATCH_ROWS)
-            .bind(ds.name)
-            .fetch_all(&mut *tx)
-            .await?;
+        let batch: Vec<(Value, String, String)> = if p.staged {
+            let after: i64 = cursor.as_ref().and_then(|c| c.0.parse().ok()).unwrap_or(0);
+            sqlx::query_as(sql).bind(run.account_id).bind(run.id).bind(ds.name).bind(after).bind(BATCH_ROWS).fetch_all(&mut *tx).await?
+        } else {
+            sqlx::query_as(sql)
+                .bind(run.account_id)
+                .bind(p.from)
+                .bind(p.to)
+                .bind(cursor.as_ref().map(|c| c.0.clone()))
+                .bind(cursor.as_ref().map(|c| c.1.clone()).filter(|s| !s.is_empty()))
+                .bind(BATCH_ROWS)
+                .bind(ds.name)
+                .fetch_all(&mut *tx)
+                .await?
+        };
         let n = batch.len();
         for (mut row, a, b) in batch {
             row["_updated_at"] = json!(as_of);
@@ -415,7 +475,12 @@ async fn write_file(
     p: &mut DatasetProgress,
 ) -> anyhow::Result<Option<FileInfo>> {
     let csv = format == "csv";
-    let passes = ds.passes(p.from.is_none());
+    if p.full_read() && !p.staged && p.pass == 0 {
+        stage(state, run, ds).await?;
+        p.staged = true;
+        p.cursor = None;
+    }
+    let passes = if p.full_read() { vec![ds.staged] } else { ds.passes(false) };
     let Some(sql) = passes.get(p.pass).copied() else {
         p.done = true;
         return Ok(None);
@@ -489,6 +554,7 @@ async fn finish(state: &AppState, run: &RunRow, settings: &Settings, bucket: &Bu
     }
     sqlx::query("UPDATE warehouse_destinations SET last_run_at = now() WHERE id = $1").bind(run.destination_id).execute(&mut *tx).await?;
     tx.commit().await?;
+    clear_stage(&state.db, Some(run.id)).await?;
     Ok(())
 }
 
@@ -531,9 +597,11 @@ pub(super) async fn tick(state: &AppState) -> anyhow::Result<()> {
 }
 
 pub(super) async fn prune(state: &AppState) -> anyhow::Result<()> {
+    // Keys staged by runs that ended without finishing (cancelled, or a crash after failing).
+    clear_stage(&state.db, None).await?;
     sqlx::query("DELETE FROM warehouse_runs WHERE created_at < now() - interval '90 days' AND status IN ('succeeded', 'failed', 'cancelled')").execute(&state.db).await?;
     for _ in 0..20 {
-        let n = sqlx::query("DELETE FROM warehouse_changes WHERE (account_id, dataset, row_id) IN (SELECT account_id, dataset, row_id FROM warehouse_changes WHERE changed_at < now() - make_interval(days => $1) LIMIT 10000)")
+        let n = sqlx::query("DELETE FROM warehouse_changes WHERE id IN (SELECT id FROM warehouse_changes WHERE changed_at < now() - make_interval(days => $1) LIMIT 10000)")
             .bind(CHANGE_DAYS as i32)
             .execute(&state.db)
             .await?

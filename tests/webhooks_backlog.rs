@@ -44,15 +44,41 @@ async fn a_dead_endpoint_keeps_only_so_many_undelivered_events_and_the_owner_is_
     assert_eq!(alerts.len(), 1);
     assert!(alerts[0].text.contains("\"CRM\" (127.0.0.1)") && !alerts[0].text.contains("/hook"), "{}", alerts[0].text);
 
-    // An account's outbox is bounded too: a batch past the limit keeps what fits.
+    // An account's outbox is bounded too, where rows are written: against the sweep's count, a
+    // batch past the limit keeps what fits and the rest is counted as dropped.
     dumbmail::features::webhooks::set_limits_for_tests(5, 3);
     h.ok("PATCH", &format!("/api/webhooks/{id}"), Some(json!({"topics": ["profile.created", "list.member_added"]}))).await;
+    dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    h.drain().await;
+    dumbmail::features::observe::refresh(&h.state.db).await.unwrap();
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "L"}))).await;
     let ids: Vec<String> = sqlx::query_scalar("SELECT id::text FROM profiles LIMIT 6").fetch_all(&h.state.db).await.unwrap();
     h.ok("POST", &format!("/api/lists/{}/members", list["id"].as_str().unwrap()), Some(json!({"profile_ids": ids}))).await;
     assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox WHERE topic = 'list.member_added'").await, 3);
+    // A second batch finds no room left until the sweep counts again.
+    let more: Vec<String> = sqlx::query_scalar("SELECT id::text FROM profiles ORDER BY id DESC LIMIT 2").fetch_all(&h.state.db).await.unwrap();
+    let list2 = h.ok("POST", "/api/lists", Some(json!({"name": "L2"}))).await;
+    h.ok("POST", &format!("/api/lists/{}/members", list2["id"].as_str().unwrap()), Some(json!({"profile_ids": more}))).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox WHERE topic = 'list.member_added'").await, 3);
+    // Drops are counted on the endpoint a moment later, off the caller's path.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     let e = h.ok("GET", &format!("/api/webhooks/{id}"), None).await;
-    assert!(e["stats"]["dropped_total"].as_i64().unwrap() >= 6, "{e}");
+    // 3 + 3 from the endpoint's own backlog above, then 3 of the 6 and both of the 2 here.
+    assert_eq!(e["stats"]["dropped_total"].as_i64(), Some(3 + 3 + 3 + 2), "{e}");
+    // The sweep trims an outbox that got past the limit anyway (here: rows written while the limit
+    // was higher), oldest first.
+    h.drain().await;
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM webhook_endpoints").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO webhook_outbox (account_id, event_id, topic, data, created_at) SELECT $1, gen_random_uuid(), 'profile.created', '{}', now() - interval '2 minutes' FROM generate_series(1, 10)")
+        .bind(account)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    dumbmail::features::webhooks::set_limits_for_tests(5, 4);
+    dumbmail::jobs::scheduler_tick(&h.state, 3).await.unwrap();
+    assert!(dumbmail::jobs::run_one_in(&h.state, dumbmail::jobs::BACKGROUND).await.unwrap());
+    assert_eq!(count(&h, "SELECT count(*) FROM webhook_outbox").await, 4);
+    assert_eq!(count(&h, &format!("SELECT rows FROM webhook_outbox_counts WHERE account_id = '{account}'")).await, 4);
     dumbmail::features::webhooks::set_limits_for_tests(100_000, 200_000);
     h.cleanup().await;
 }

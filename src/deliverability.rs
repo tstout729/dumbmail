@@ -195,17 +195,23 @@ pub async fn pause(state: &AppState, account_id: Uuid, reason: &str) -> anyhow::
 /// at the same moment (see `campaigns::claim`) can't leave one queued behind it.
 pub async fn stop_campaign(db: &sqlx::PgPool, campaign_id: Uuid, msg: &str) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
-    sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1 AND status IN ('sending','scheduled','testing')")
-        .bind(campaign_id)
-        .bind(msg)
-        .execute(&mut *tx)
-        .await?;
-    let skipped: Vec<(Uuid, Uuid)> = sqlx::query_as("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test RETURNING account_id, id")
-        .bind(campaign_id)
-        .fetch_all(&mut *tx)
-        .await?;
-    if let Some((account, _)) = skipped.first() {
-        crate::features::messages_unsent_in(&mut tx, *account, &skipped.iter().map(|r| r.1).collect::<Vec<_>>()).await;
+    let account: Option<Uuid> =
+        sqlx::query_scalar("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1 AND status IN ('sending','scheduled','testing') RETURNING account_id")
+            .bind(campaign_id)
+            .bind(msg)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match account.filter(|a| crate::features::observes_unsent(db, *a)) {
+        Some(account) => {
+            let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test RETURNING id")
+                .bind(campaign_id)
+                .fetch_all(&mut *tx)
+                .await?;
+            crate::features::messages_unsent_in(&mut tx, db, account, &skipped).await;
+        }
+        None => {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test").bind(campaign_id).execute(&mut *tx).await?;
+        }
     }
     tx.commit().await?;
     Ok(())
