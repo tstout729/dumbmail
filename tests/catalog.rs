@@ -822,6 +822,16 @@ async fn alert_jobs_tell_each_person_once() {
     assert!(other.unwrap().is_empty(), "inside the cooldown, nobody is claimed twice");
     assert_eq!(retry.0.len(), retry.1.len());
 
+    // The alert is queued in the same transaction as the price change: if it can't be queued, the
+    // change isn't saved either (and the next save tries both again), so no drop is ever lost.
+    sqlx::query("CREATE FUNCTION refuse_job() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'queue unavailable'; END $$ LANGUAGE plpgsql").execute(&h.state.db).await.unwrap();
+    sqlx::query("CREATE TRIGGER refuse_drop BEFORE INSERT ON jobs FOR EACH ROW WHEN (NEW.kind = 'catalog_price_drop') EXECUTE FUNCTION refuse_job()").execute(&h.state.db).await.unwrap();
+    h.req("POST", "/api/catalog/products", Some(json!({"external_id": "P", "price": 50}))).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/P", None).await["price"], 70.0, "the price change rolled back with its alert");
+    sqlx::query("DROP TRIGGER refuse_drop ON jobs").execute(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "P", "price": 50}))).await;
+    assert_eq!(jobs_of(&h, "catalog_price_drop").await, 1);
+
     // A restock with six people waiting and a limit of three.
     h.ok("PATCH", "/api/catalog/settings", Some(json!({"back_in_stock_limit": 3}))).await;
     h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "R", "title": "Rack", "inventory": 0}))).await;
