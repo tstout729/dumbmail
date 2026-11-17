@@ -108,7 +108,7 @@ pub fn parse(p: &Value, hold_never: bool, run: uuid::Uuid) -> Result<KProfile, (
     });
     if email.is_none() && phone.is_none() && ext.is_none() {
         let why = match raw_email {
-            Some(e) => format!("Its email address {e:?} isn't valid and it has no phone number or external id."),
+            Some(e) => format!("Its email address ({}) isn't valid and it has no phone number or external id.", consent::mask_email(e)),
             None => "It has no email address, phone number or external id (often an anonymous website visitor).".to_string(),
         };
         let mut d = detail;
@@ -494,7 +494,7 @@ impl Run<'_> {
                 Ok(k) => ks.push(k),
                 Err((kid, label, d)) => {
                     let why = d["skipped"].as_str().unwrap_or("").to_string();
-                    issues.push(("skipped".into(), Some(kid.clone()), None, label.clone(), why));
+                    issues.push(("skipped".into(), Some(kid.clone()), None, mask_text(&label), why));
                     refs.push((kid, None, label, d));
                     skipped += 1;
                 }
@@ -540,14 +540,14 @@ impl Run<'_> {
         let mut done = 0i64;
         for (i, k) in ks.iter().enumerate() {
             for n in &k.notes {
-                issues.push(("skipped".into(), Some(k.kid.clone()), None, k.label.clone(), n.clone()));
+                issues.push(("skipped".into(), Some(k.kid.clone()), None, masked_label(k), n.clone()));
             }
             let mut d = k.detail.clone();
             d["fp"] = json!(k.fp);
             let Some(w) = out.get(&i) else {
                 let why = "Its email, phone number or external id belongs to another profile that couldn't be merged with it. Klaviyo's opt-outs for its address and number were still applied.";
                 d["skipped"] = json!(why);
-                issues.push(("skipped".into(), Some(k.kid.clone()), None, k.label.clone(), why.into()));
+                issues.push(("skipped".into(), Some(k.kid.clone()), None, masked_label(k), why.into()));
                 refs.push((k.kid.clone(), None, k.label.clone(), d));
                 skipped += 1;
                 continue;
@@ -590,12 +590,24 @@ impl Run<'_> {
     }
 }
 
-/// A profile's label with its email and phone partly hidden, for an identity conflict.
+/// A profile's label with its email and phone partly hidden: issues and the report never show whole
+/// addresses.
 fn masked_label(k: &KProfile) -> String {
     match (&k.email, &k.phone) {
         (Some(e), _) => consent::mask_email(e),
         (None, Some(p)) => consent::mask_phone(p),
-        _ => k.kid.clone(),
+        _ => mask_text(&k.label),
+    }
+}
+
+/// A raw label (an email, a phone number or a Klaviyo id), partly hidden if it's an address.
+fn mask_text(label: &str) -> String {
+    if label.contains('@') {
+        consent::mask_email(label)
+    } else if label.starts_with('+') || label.chars().filter(|c| c.is_ascii_digit()).count() >= 7 {
+        consent::mask_phone(label)
+    } else {
+        label.to_string()
     }
 }
 

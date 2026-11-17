@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "./client";
+import { api, ApiError, reloadIfAccountChanged, writeHeaders } from "./client";
 import { keys } from "./keys";
 import type { ApiErrorCode, UploadedImage } from "./types";
 
@@ -21,6 +21,7 @@ function upload(file: File, onProgress?: (fraction: number) => void): Promise<Up
     xhr.withCredentials = true;
     xhr.setRequestHeader("Content-Type", file.type);
     xhr.setRequestHeader("Accept", "application/json");
+    for (const [k, v] of Object.entries(writeHeaders())) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress?.(e.loaded / e.total);
     };
@@ -34,6 +35,7 @@ function upload(file: File, onProgress?: (fraction: number) => void): Promise<Up
       }
       if (xhr.status >= 200 && xhr.status < 300) return resolve(json as UploadedImage);
       const err = (json as { error?: { code?: ApiErrorCode; message?: string } } | null)?.error;
+      reloadIfAccountChanged(xhr.status, err?.code);
       reject(new ApiError(xhr.status, err?.code ?? "internal", err?.message ?? `Upload failed (${xhr.status})`));
     };
     xhr.send(file);

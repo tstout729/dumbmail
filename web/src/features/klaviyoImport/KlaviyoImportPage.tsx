@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link } from "react-router";
 import { AlertTriangle, CheckCircle2, CircleDashed, Download, KeyRound, Loader2, Pause, Play, Search, XCircle } from "lucide-react";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import { Badge, Button, Card, Checkbox, ConfirmDialog, Field, InlineError, Input, Notice, Select, Skeleton, StatusBadge, Table, Td, Th, cx, type Tone } from "../../components/ui";
 import { formatCurrency, formatDate, formatDateTime, formatNumber, formatPercent } from "../../lib/format";
 import {
@@ -39,10 +40,12 @@ const lineBadge: Record<LineState, { tone: Tone; label: string }> = {
   match: { tone: "green", label: "Match" },
   mismatch: { tone: "red", label: "Mismatch" },
   not_verified: { tone: "amber", label: "Not verified" },
+  info: { tone: "gray", label: "Diagnostic" },
 };
 
-const reviewKindLabel: Record<KlaviyoReview["kind"], string> = { campaign: "Campaign", flow: "Flow", template: "Template" };
-const reviewLink = (r: KlaviyoReview) => (r.kind === "campaign" ? `/campaigns/${r.id}` : r.kind === "flow" ? `/flows/${r.id}` : `/content/templates/${r.id}`);
+const reviewKindLabel: Record<KlaviyoReview["kind"], string> = { campaign: "Campaign", flow: "Flow", template: "Template", form: "Form" };
+const reviewLinks: Record<KlaviyoReview["kind"], string> = { campaign: "/campaigns", flow: "/flows", template: "/content/templates", form: "/forms" };
+const reviewLink = (r: KlaviyoReview) => `${reviewLinks[r.kind]}/${r.id}`;
 
 const partLabels: Record<string, string> = {
   lists: "Lists and members",
@@ -75,7 +78,11 @@ export function KlaviyoImportPage() {
     );
   }
   if (q.error) return <InlineError message={q.error.message} />;
-  const s = q.data;
+  return <KlaviyoImportView s={q.data} />;
+}
+
+function KlaviyoImportView({ s }: { s: KlaviyoState }) {
+  const canImport = useCan("imports.manage");
   const imp = s.import;
   const fresh = !imp || imp.status === "cancelled" || imp.status === "failed";
   return (
@@ -92,15 +99,20 @@ export function KlaviyoImportPage() {
           {imp.error}
         </Notice>
       ) : null}
-      {fresh ? <ConnectCard s={s} again={!!imp} /> : null}
+      {!canImport && (fresh || imp?.status === "ready" || imp?.status === "done") ? (
+        <Notice tone="gray" title="Only admins can run an import">
+          Connecting Klaviyo and running an import bring in your whole customer list and its consent, so they're limited to admins and the owner.
+        </Notice>
+      ) : null}
+      {fresh && canImport ? <ConnectCard s={s} again={!!imp} /> : null}
       {imp?.status === "surveying" ? <SurveyingCard imp={imp} /> : null}
-      {imp?.status === "ready" && imp.survey ? <SurveyCard imp={imp} survey={imp.survey} s={s} /> : null}
-      {imp && ["importing", "paused", "done"].includes(imp.status) ? <ProgressCard imp={imp} s={s} /> : null}
+      {imp?.status === "ready" && imp.survey && canImport ? <SurveyCard imp={imp} survey={imp.survey} s={s} /> : null}
+      {imp && ["importing", "paused", "done"].includes(imp.status) ? <ProgressCard imp={imp} s={s} canImport={canImport} /> : null}
       {imp?.status === "done" && imp.compared_at ? <ReportCard imp={imp} /> : null}
       {s.reviews.length > 0 ? <ReviewCard reviews={s.reviews} /> : null}
       {imp?.status === "done" ? <CampaignsCard imp={imp} /> : null}
       <ChecklistCard s={s} />
-      {imp?.status === "done" ? <ConnectCard s={s} again /> : null}
+      {imp?.status === "done" && canImport ? <ConnectCard s={s} again /> : null}
     </div>
   );
 }
@@ -278,7 +290,7 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
   );
 }
 
-function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
+function ProgressCard({ imp, s, canImport }: { imp: KlaviyoImport; s: KlaviyoState; canImport: boolean }) {
   const pause = usePauseKlaviyo();
   const cancel = useCancelKlaviyo();
   const [confirmCancel, setConfirmCancel] = useState(false);
@@ -291,17 +303,17 @@ function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
       actions={
         <div className="flex items-center gap-2">
           <StatusBadge status={imp.status === "importing" ? "sending" : imp.status === "done" ? "sent" : imp.status} label={statusLabels[imp.status]} />
-          {imp.status === "importing" ? (
+          {imp.status === "importing" && canImport ? (
             <Button size="sm" icon={<Pause className="size-3.5" />} onClick={() => pause.mutate(false)} loading={pause.isPending}>
               Pause
             </Button>
           ) : null}
-          {imp.status === "paused" ? (
+          {imp.status === "paused" && canImport ? (
             <Button size="sm" icon={<Play className="size-3.5" />} onClick={() => pause.mutate(true)} loading={pause.isPending}>
               Resume
             </Button>
           ) : null}
-          {imp.status === "importing" || imp.status === "paused" ? (
+          {(imp.status === "importing" || imp.status === "paused") && canImport ? (
             <Button size="sm" variant="danger" onClick={() => setConfirmCancel(true)}>
               Cancel
             </Button>
@@ -487,12 +499,14 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
 
 function ReviewCard({ reviews }: { reviews: KlaviyoReview[] }) {
   const clear = useClearReviewKlaviyo();
+  const canSend = useCan("campaigns.send");
   const [confirm, setConfirm] = useState<KlaviyoReview | null>(null);
   return (
     <Card title={`Needs review (${reviews.length})`}>
       <p className="mb-3 text-sm text-zinc-600">
-        These came across from Klaviyo but needed some guessing. Until you mark one reviewed, a campaign can't be sent and a flow can't be turned
-        on. Open each one, fix what the notes say, then mark it reviewed.
+        These came across from Klaviyo but needed some guessing. Until one is marked reviewed, a campaign can't be sent or test-sent, a flow can't
+        be turned on, and a form without a list can't be published. Copies made from them need the review too. Open each one, fix what the notes
+        say, then mark it reviewed{canSend ? "" : " (someone who can send campaigns does this)"}.
       </p>
       <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 text-sm">
         {reviews.map((r) => (
@@ -510,9 +524,11 @@ function ReviewCard({ reviews }: { reviews: KlaviyoReview[] }) {
                 ))}
               </ul>
             </div>
-            <Button size="sm" className="shrink-0 self-start" onClick={() => setConfirm(r)}>
-              Mark reviewed
-            </Button>
+            {canSend ? (
+              <Button size="sm" className="shrink-0 self-start" onClick={() => setConfirm(r)}>
+                Mark reviewed
+              </Button>
+            ) : null}
           </li>
         ))}
       </ul>
@@ -524,7 +540,9 @@ function ReviewCard({ reviews }: { reviews: KlaviyoReview[] }) {
               ? "Check its audience, exclusions and content first. Once reviewed it can be sent like any other campaign."
               : confirm.kind === "flow"
                 ? "Check every step first. Once reviewed it can be turned on."
-                : "Check the content first. Campaigns and flows made from it afterwards won't carry the review."
+                : confirm.kind === "form"
+                  ? "Choose the list it signs people up to first. Once reviewed it can be published."
+                  : "Check the content first. Campaigns and flows made from it afterwards won't carry the review."
           }
           confirmLabel="Mark reviewed"
           loading={clear.isPending}

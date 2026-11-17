@@ -761,7 +761,10 @@ pub async fn finish_due_tests(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>) -> AppResult<usize> {
+/// Send tests of `c`. `create_profiles`: an address with no profile gets one (for realistic
+/// personalization next time); without it such an address is refused. Callers check who may send
+/// tests where (`features::team::sends`).
+pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>, create_profiles: bool) -> AppResult<usize> {
     if to.is_empty() || to.len() > 10 {
         return Err(AppError::bad("send tests to 1-10 addresses"));
     }
@@ -794,7 +797,8 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
                 }
                 p
             }
-            None => crate::audience::upsert_profile(&state.db, account.id, &input).await?.profile,
+            None if create_profiles => crate::audience::upsert_profile(&state.db, account.id, &input).await?.profile,
+            None => return Err(AppError::bad(format!("{addr} isn't a profile in this account yet; ask a manager or admin to send it the first test"))),
         };
         let out = sending::send(
             state,

@@ -17,7 +17,7 @@ pub enum AppError {
     Conflict(String),
     #[error("{0}")]
     LimitReached(String),
-    /// Too much running at once; try again shortly (429).
+    /// Too much at once (too many attempts, or too much running); try again shortly (429).
     #[error("{0}")]
     Busy(String),
     #[error(transparent)]

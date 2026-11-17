@@ -28,6 +28,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::team::access::{rule, Access, Perm, RouteRule, ToolRule};
+use super::team::audit;
 use super::{Feature, McpDoc};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
@@ -43,6 +45,40 @@ pub use lists::remove_members;
 const DOC: &str = include_str!("../../../docs/MOVING_FROM_KLAVIYO.md");
 
 pub struct Module;
+
+/// Who may do what. Connecting Klaviyo and running an import bring in a whole customer list and its
+/// consent: admins and owners (`Perm::Import`). Reading the survey, progress, report and checklist: anyone
+/// who can read the audience (the report and issues show addresses partly hidden). Clearing a review lets
+/// imported content be sent: people who can send.
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/klaviyo", Perm::AudienceRead),
+    rule("POST", "/api/klaviyo/connect", Perm::Import),
+    rule("POST", "/api/klaviyo/start", Perm::Import),
+    rule("POST", "/api/klaviyo/pause", Perm::Import),
+    rule("POST", "/api/klaviyo/resume", Perm::Import),
+    rule("POST", "/api/klaviyo/cancel", Perm::Import),
+    rule("GET", "/api/klaviyo/report", Perm::AudienceRead),
+    rule("GET", "/api/klaviyo/report.csv", Perm::AudienceRead),
+    rule("GET", "/api/klaviyo/issues", Perm::AudienceRead),
+    rule("GET", "/api/klaviyo/campaigns", Perm::MessagingRead),
+    rule("POST", "/api/klaviyo/checklist", Perm::SettingsWrite),
+    rule("POST", "/api/klaviyo/checklist/check-site", Perm::SettingsWrite),
+    rule("POST", "/api/klaviyo/review", Perm::CampaignSend),
+];
+
+static TOOLS: &[ToolRule] = &[
+    // With an api_key it connects Klaviyo; the survey itself is also in klaviyo_import_status.
+    ToolRule { name: "klaviyo_survey", perm: Perm::Import },
+    ToolRule { name: "klaviyo_start_import", perm: Perm::Import },
+    ToolRule { name: "klaviyo_import_status", perm: Perm::AudienceRead },
+    ToolRule { name: "klaviyo_pause_import", perm: Perm::Import },
+    ToolRule { name: "klaviyo_cancel_import", perm: Perm::Import },
+    ToolRule { name: "klaviyo_comparison_report", perm: Perm::AudienceRead },
+    ToolRule { name: "klaviyo_import_issues", perm: Perm::AudienceRead },
+    ToolRule { name: "klaviyo_clear_review", perm: Perm::CampaignSend },
+    // Ticks hand-checked items and checks the site; the checklist alone is in klaviyo_import_status.
+    ToolRule { name: "klaviyo_checklist", perm: Perm::SettingsWrite },
+];
 
 // ---------- Actions shared by the REST API and the MCP tools ----------
 
@@ -451,11 +487,29 @@ struct MarkBody {
 async fn status_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(status_json(&s, ctx.account_id).await?))
 }
+/// Audit an action that went through (fixed fields only: never the key or the request body).
+async fn audit_import(state: &AppState, ctx: &Ctx, action: &str, v: &Value) {
+    if v["dry_run"] == true {
+        return;
+    }
+    let target = v["import"]["id"].as_str().map(String::from);
+    let details = json!({"status": v["import"]["status"], "klaviyo_account": v["import"]["klaviyo_account"]["id"], "options": v["import"]["options"]});
+    audit(state, ctx, action, target.as_deref(), details).await;
+}
+
+async fn audit_review(state: &AppState, ctx: &Ctx, kind: &str, id: Uuid) {
+    audit(state, ctx, "klaviyo.review_clear", Some(&id.to_string()), json!({"kind": kind})).await;
+}
+
 async fn connect_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ConnectBody>) -> AppResult<Json<Value>> {
-    Ok(Json(connect(&s, ctx.account_id, &b.api_key).await?))
+    let v = connect(&s, ctx.account_id, &b.api_key).await?;
+    audit_import(&s, &ctx, "klaviyo.connect", &v).await;
+    Ok(Json(v))
 }
 async fn start_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<StartBody>) -> AppResult<Json<Value>> {
-    Ok(Json(start(&s, ctx.account_id, b).await?))
+    let v = start(&s, ctx.account_id, b).await?;
+    audit_import(&s, &ctx, "klaviyo.start", &v).await;
+    Ok(Json(v))
 }
 async fn pause_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(pause(&s, ctx.account_id, false).await?))
@@ -464,7 +518,9 @@ async fn resume_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>>
     Ok(Json(pause(&s, ctx.account_id, true).await?))
 }
 async fn cancel_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(cancel(&s, ctx.account_id).await?))
+    let v = cancel(&s, ctx.account_id).await?;
+    audit_import(&s, &ctx, "klaviyo.cancel", &v).await;
+    Ok(Json(v))
 }
 async fn report_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(comparison(&s, ctx.account_id).await?))
@@ -484,7 +540,9 @@ async fn mark_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<MarkBod
     Ok(Json(mark(&s, ctx.account_id, &b.item, b.done).await?))
 }
 async fn review_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ReviewBody>) -> AppResult<Json<Value>> {
-    Ok(Json(clear_review(&s, ctx.account_id, &b.kind, b.id).await?))
+    let v = clear_review(&s, ctx.account_id, &b.kind, b.id).await?;
+    audit_review(&s, &ctx, &b.kind, b.id).await;
+    Ok(Json(v))
 }
 async fn check_site_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(check_site(&s, ctx.account_id).await?))
@@ -500,6 +558,10 @@ fn args_start(a: &Value) -> AppResult<StartBody> {
 impl Feature for Module {
     fn name(&self) -> &'static str {
         "klaviyo_import"
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOLS }
     }
 
     fn routes(&self) -> Router<AppState> {
@@ -551,23 +613,47 @@ impl Feature for Module {
         let acct = ctx.account_id;
         Some(match name {
             "klaviyo_survey" => match a["api_key"].as_str() {
-                Some(k) => connect(state, acct, k).await,
+                Some(k) => {
+                    let r = connect(state, acct, k).await;
+                    if let Ok(v) = &r {
+                        audit_import(state, ctx, "klaviyo.connect", v).await;
+                    }
+                    r
+                }
                 None => status_json(state, acct).await,
             },
             "klaviyo_start_import" => match args_start(a) {
-                Ok(b) => start(state, acct, b).await,
+                Ok(b) => {
+                    let r = start(state, acct, b).await;
+                    if let Ok(v) = &r {
+                        audit_import(state, ctx, "klaviyo.start", v).await;
+                    }
+                    r
+                }
                 Err(e) => Err(e),
             },
             "klaviyo_import_status" => status_json(state, acct).await,
             "klaviyo_pause_import" => pause(state, acct, a["resume"].as_bool().unwrap_or(false)).await,
-            "klaviyo_cancel_import" => cancel(state, acct).await,
+            "klaviyo_cancel_import" => {
+                let r = cancel(state, acct).await;
+                if let Ok(v) = &r {
+                    audit_import(state, ctx, "klaviyo.cancel", v).await;
+                }
+                r
+            }
             "klaviyo_comparison_report" => comparison(state, acct).await,
             "klaviyo_import_issues" => {
                 let q = IssueQuery { step: a["step"].as_str().map(String::from), limit: a["limit"].as_i64(), offset: a["offset"].as_i64() };
                 issues(state, acct, &q).await
             }
             "klaviyo_clear_review" => match (a["kind"].as_str(), a["id"].as_str().and_then(|i| i.parse::<Uuid>().ok())) {
-                (Some(k), Some(id)) if a["confirm"].as_bool() == Some(true) => clear_review(state, acct, k, id).await,
+                (Some(k), Some(id)) if a["confirm"].as_bool() == Some(true) => {
+                    let r = clear_review(state, acct, k, id).await;
+                    if r.is_ok() {
+                        audit_review(state, ctx, k, id).await;
+                    }
+                    r
+                }
                 (Some(k), Some(id)) => clear_review_dry_run(state, acct, k, id).await,
                 _ => Err(AppError::bad("kind and id are required")),
             },

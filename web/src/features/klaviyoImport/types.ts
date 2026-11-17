@@ -44,7 +44,7 @@ export type KlaviyoImport = {
 
 export type ChecklistItem = { key: string; label: string; done: boolean; auto: boolean; detail: string; link?: string; checked_at?: string | null };
 
-export type ReviewKind = "campaign" | "flow" | "template";
+export type ReviewKind = "campaign" | "flow" | "template" | "form";
 
 export type KlaviyoReview = { kind: ReviewKind; id: string; name: string | null; notes: string[] };
 
@@ -58,9 +58,9 @@ export type KlaviyoState = {
   scopes: { label: string; scope: string }[];
 };
 
-export type LineState = "match" | "mismatch" | "not_verified";
+export type LineState = "match" | "mismatch" | "not_verified" | "info";
 
-export type ReportLine = { section: string; label: string; klaviyo: number | null; dumbmail: number | null; state: LineState; ok: boolean; note: string };
+export type ReportLine = { section: string; label: string; klaviyo: number | null; dumbmail: number | null; state: LineState; ok: boolean; diagnostic: boolean; note: string };
 
 export type KlaviyoReport = {
   compared_at: string | null;

@@ -173,6 +173,7 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     remove(&state, ctx.account_id, id).await?;
+    crate::features::team::audit(&state, &ctx, "image.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
