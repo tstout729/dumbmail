@@ -1,11 +1,11 @@
 import { useState } from "react";
-import { AlertTriangle, Pause, Play, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, Clock, Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useSession } from "../../api";
 import { Badge, Button, Checkbox, ConfirmDialog, Drawer, Field, Notice, Select, Skeleton, type Tone } from "../../components/ui";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useAudienceSync, useDeleteSync, useRunSync, useUpdateSync } from "./api";
-import type { AudienceRun, AudienceSync, MatchFields } from "./types";
+import type { AudienceRun, AudienceSync, MatchFields, WaitingBatch } from "./types";
 
 export const intervalOptions = [
   { hours: 1, label: "Every hour" },
@@ -16,12 +16,21 @@ export const intervalOptions = [
   { hours: 168, label: "Once a week" },
 ];
 
+const pausedLabel: Record<string, string> = {
+  user: "Paused",
+  google_consent: "Paused: Google consent setting is off",
+  tiktok_minimum: "Paused: below TikTok's minimum",
+  audience_missing: "Paused: audience not found",
+  create_unclear: "Paused: check TikTok",
+};
+
 export function syncState(s: AudienceSync): { label: string; tone: Tone } {
   if (s.running) return { label: "Syncing", tone: "blue" };
-  if (s.status === "paused") return { label: "Paused", tone: "amber" };
+  if (s.status === "paused") return { label: pausedLabel[s.pause_reason ?? "user"] ?? "Paused", tone: "amber" };
   if (s.connection_status !== "connected") return { label: "Reconnect needed", tone: "amber" };
   if (s.error) return { label: "Problem", tone: "red" };
   if (!s.last_success_at) return { label: "Waiting", tone: "gray" };
+  if (s.pending_removal > 0) return { label: "Removals pending", tone: "amber" };
   return { label: "Up to date", tone: "green" };
 }
 
@@ -33,6 +42,14 @@ function sizeText(s: AudienceSync): string {
 
 const triggerLabel: Record<AudienceRun["trigger"], string> = { created: "First sync", scheduled: "Scheduled", manual: "Sync now" };
 
+const modeLabel: Record<AudienceRun["mode"], string> = { full: "", remove_only: " · removals only (paused)", veto_only: " · opt-outs only (list or segment gone)" };
+
+function waitingText(w: WaitingBatch, platform: string): string {
+  const n = formatNumber(w.count);
+  if (w.status === "accepted") return `${n} ${w.op === "add" ? "additions" : "removals"} taken by ${platform}, waiting for it to confirm`;
+  return `${n} ${w.op === "add" ? "additions" : "removals"} waiting to be resent (${platform}'s last answer couldn't be read)`;
+}
+
 export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { account } = useSession();
   const sync = useAudienceSync(id);
@@ -41,7 +58,8 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
   const remove = useDeleteSync();
   const [deleting, setDeleting] = useState(false);
   const [alsoOnPlatform, setAlsoOnPlatform] = useState(false);
-  const [widen, setWiden] = useState<{ include_unsubscribed?: boolean; match_fields?: MatchFields } | null>(null);
+  const [widen, setWiden] = useState<MatchFields | null>(null);
+  const [recreating, setRecreating] = useState(false);
   const s = sync.data;
 
   const save = (input: Parameters<typeof update.mutate>[0]) => update.mutate(input, { onSuccess: () => toast.success("Sync updated") });
@@ -66,6 +84,10 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             {s.status === "active" ? (
               <Button icon={<Pause className="size-3.5" />} onClick={() => save({ status: "paused" })}>
                 Pause
+              </Button>
+            ) : s.pause_reason === "audience_missing" || s.pause_reason === "create_unclear" ? (
+              <Button icon={<Plus className="size-3.5" />} onClick={() => setRecreating(true)}>
+                Create a new audience
               </Button>
             ) : (
               <Button icon={<Play className="size-3.5" />} onClick={() => save({ status: "active" })}>
@@ -94,6 +116,7 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
                 {syncState(s).label}
               </Badge>
               {s.platform_status ? <span className="text-xs text-zinc-500">{s.platform_label}: {s.platform_status}</span> : null}
+              {!s.verified_live ? <Badge tone="amber">Not yet verified against a live account</Badge> : null}
             </div>
             <p className="text-zinc-600">
               {s.source.type === "list" ? "List" : "Segment"} <span className="font-medium text-zinc-900">{s.source.name ?? "(deleted)"}</span> to{" "}
@@ -102,15 +125,31 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             {s.audience_id ? <p className="text-xs text-zinc-500">Audience ID on {s.platform_label}: {s.audience_id}</p> : null}
           </div>
 
+          {s.pause_message && s.pause_reason !== "user" ? (
+            <Notice tone="amber" icon={<Pause />} title="Paused">
+              {s.pause_message}
+            </Notice>
+          ) : null}
           {s.error ? (
-            <Notice tone="red" icon={<AlertTriangle />} title="Last sync didn't finish">
+            <Notice tone="red" icon={<AlertTriangle />} title="Last sync had a problem">
               {s.error}
+            </Notice>
+          ) : null}
+          {s.waiting.length > 0 ? (
+            <Notice tone="blue" icon={<Clock />} title="Waiting for the platform">
+              {s.waiting.map((w) => waitingText(w, s.platform_label)).join(". ")}.
             </Notice>
           ) : null}
 
           <dl className="grid grid-cols-2 gap-3">
-            <Metric label="People sent" value={formatNumber(s.members_sent)} sub={s.last_run_at ? `+${formatNumber(s.last_added)} added, −${formatNumber(s.last_removed)} removed last time` : "Not synced yet"} />
-            <Metric label={`Size on ${s.platform_label}`} value={sizeText(s)} sub={s.platform === "meta" ? "Meta's estimate of matched people" : "Matched people"} />
+            <Metric
+              label={`Confirmed by ${s.platform_label}`}
+              value={formatNumber(s.confirmed)}
+              sub={s.last_run_at ? `+${formatNumber(s.last_added)} added, −${formatNumber(s.last_removed)} removed last time (confirmed)` : "Not synced yet"}
+            />
+            <Metric label="Sent, not confirmed" value={formatNumber(Math.max(0, s.sent - s.confirmed))} sub="Treated as in the audience until confirmed" />
+            <Metric label="Still pending removal" value={formatNumber(s.pending_removal)} sub={s.pending_removal > 0 ? `Not removed until ${s.platform_label} confirms` : "Nothing waiting"} />
+            <Metric label={`Size on ${s.platform_label}`} value={sizeText(s)} sub={`${s.platform_label}'s estimate of matched people`} />
             <Metric label="Match rate" value={s.match_rate !== null ? `${Math.round(s.match_rate)}%` : "—"} sub={s.match_rate !== null ? "Reported by Google" : `${s.platform_label} doesn't report one`} />
             <Metric
               label="Last sync"
@@ -133,22 +172,17 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             <Field label="Match on" hint="More fields can raise the match rate.">
               <Select
                 value={s.match_fields}
+                disabled={s.platform !== "meta"}
                 onChange={(e) => {
                   const v = e.target.value as MatchFields;
-                  if (v === "contact_and_location") setWiden({ match_fields: v });
+                  if (v === "contact_and_location") setWiden(v);
                   else save({ match_fields: v });
                 }}
               >
                 <option value="contact">{s.platform === "tiktok" ? "Email" : "Email and phone"}</option>
-                {s.platform !== "tiktok" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
+                {s.platform === "meta" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
               </Select>
             </Field>
-            <Checkbox
-              label="Exclusion audience: include people who unsubscribed"
-              description="Only for audiences you exclude from ads. People who opted out of ads are still never sent."
-              checked={s.include_unsubscribed}
-              onChange={(e) => (e.target.checked ? setWiden({ include_unsubscribed: true }) : save({ include_unsubscribed: false }))}
-            />
           </div>
 
           <div>
@@ -164,9 +198,10 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
                       <RunBadge run={r} />
                     </div>
                     <div className="text-xs text-zinc-500">
-                      {triggerLabel[r.trigger]} · +{formatNumber(r.added)} / −{formatNumber(r.removed)}
-                      {r.skipped ? ` · ${formatNumber(r.skipped)} left out (no usable contact details or no ad consent)` : ""}
-                      {r.invalid ? ` · ${formatNumber(r.invalid)} not readable by the platform` : ""}
+                      {triggerLabel[r.trigger]}
+                      {modeLabel[r.mode]} · +{formatNumber(r.added)} / −{formatNumber(r.removed)} confirmed
+                      {r.skipped ? ` · ${formatNumber(r.skipped)} had no email the platform can use` : ""}
+                      {r.rejected ? ` · ${formatNumber(r.rejected)} not confirmed by the platform` : ""}
                     </div>
                     {r.error ? <div className="mt-0.5 text-xs text-red-700">{r.error}</div> : null}
                   </li>
@@ -179,17 +214,27 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
       {widen && s ? (
         <ConfirmDialog
           title="Send more to the ad platform?"
-          body={
-            widen.include_unsubscribed
-              ? `People who unsubscribed from your email will be sent to ${s.platform_label}. Use this only for an audience you exclude from your ads.`
-              : `Hashed names, cities, states, ZIP codes and countries will also be sent to ${s.platform_label} to improve matching.`
-          }
+          body={`Hashed names, cities, states, ZIP codes and countries will also be sent to ${s.platform_label} to improve matching.`}
           confirmLabel="Send them"
           onConfirm={() => {
-            save(widen);
+            save({ match_fields: widen });
             setWiden(null);
           }}
           onClose={() => setWiden(null)}
+        />
+      ) : null}
+      {recreating && s ? (
+        <ConfirmDialog
+          title="Create a new audience?"
+          body={`DumbMail makes a new audience on ${s.platform_label} and uploads everyone who qualifies. ${
+            s.pause_reason === "create_unclear" ? `Delete any audience called "${s.name}" that's already on ${s.platform_label} first.` : ""
+          }`}
+          confirmLabel="Create and upload"
+          onConfirm={() => {
+            save({ recreate_audience: true, confirm: true });
+            setRecreating(false);
+          }}
+          onClose={() => setRecreating(false)}
         />
       ) : null}
       {deleting && s ? (
@@ -198,6 +243,9 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
           body={
             <div className="space-y-3">
               <p>DumbMail stops updating this audience.</p>
+              {!alsoOnPlatform && s.audience_id ? (
+                <p className="text-amber-700">If you keep it on {s.platform_label}, DumbMail can no longer remove people who unsubscribe or opt out from it.</p>
+              ) : null}
               {s.audience_id ? (
                 <Checkbox
                   label={`Also delete the audience on ${s.platform_label}`}

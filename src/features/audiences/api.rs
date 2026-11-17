@@ -27,7 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ad-audiences/connections/{platform}/start", post(start_h))
         .route("/api/ad-audiences/connections/{platform}/accounts", get(accounts_h))
         .route("/api/ad-audiences/oauth/{platform}/callback", get(callback_h))
-        .route("/api/ad-audiences/settings", get(settings_h).put(put_settings_h))
+        .route("/api/ad-audiences/settings", get(settings_h).patch(patch_settings_h))
         .route("/api/ad-audiences/syncs", get(syncs_h).post(create_h))
         .route("/api/ad-audiences/syncs/{id}", get(sync_h).patch(update_h).delete(delete_h))
         .route("/api/ad-audiences/syncs/{id}/run", post(run_h))
@@ -93,6 +93,8 @@ pub async fn connections(state: &AppState, account_id: Uuid) -> AppResult<Value>
                 "connected_as": c.filter(|_| connected).and_then(|c| c.connected_as.clone()),
                 "connected_at": c.filter(|_| connected).and_then(|c| c.connected_at),
                 "token_expires_at": c.filter(|_| connected).and_then(|c| c.token_expires_at),
+                // Meta's sign-ins aren't renewed on the server: ask for a reconnect in the last week.
+                "expires_soon": c.filter(|_| status == "connected").and_then(|c| c.token_expires_at).is_some_and(|e| e < chrono::Utc::now() + chrono::Duration::days(7)),
                 "error": c.filter(|_| status == "needs_reconnect").and_then(|c| c.error_code.as_deref()).map(|code| platforms::words(*p, code)),
                 "last_revoke": c.filter(|_| !connected).and_then(|c| c.revoke_status.clone()),
                 "manual_account_entry": *p == Platform::Google,
@@ -200,7 +202,13 @@ pub async fn disconnect(state: &AppState, account_id: Uuid, p: Platform) -> AppR
     Ok(json!({"disconnected": true, "revoked": d.revoked, "note": note}))
 }
 
+/// Signed-in members need to be the owner or an admin to disconnect, as to connect. API keys
+/// carry the whole account's access until the team-and-roles layer gives them scopes (see the
+/// permissions table in docs/AD_AUDIENCES.md).
 async fn disconnect_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
+    if !ctx.via_api_key {
+        owner_or_admin(&state, &ctx).await?;
+    }
     Ok(Json(disconnect(&state, ctx.account_id, platform(&p)?).await?))
 }
 
@@ -242,7 +250,7 @@ pub struct SettingsBody {
 
 /// The Google consent setting: an owner or admin confirms the account's marketing consent covers
 /// advertising use. Turning it off pauses every Google sync.
-async fn put_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<SettingsBody>) -> AppResult<Json<Value>> {
+async fn patch_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<SettingsBody>) -> AppResult<Json<Value>> {
     let (user, email) = owner_or_admin(&state, &ctx).await?;
     let mut tx = state.db.begin().await?;
     if b.google_consent {

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api/client";
-import type { AdAccount, AdConnection, AdPlatform, AudienceSync, AudienceSyncDetail, CreateSyncInput, UpdateSyncInput } from "./types";
+import type { AdAccount, AdConnection, AdPlatform, AdSettings, AudienceSync, AudienceSyncDetail, CreateSyncInput, UpdateSyncInput } from "./types";
 
 const base = "/api/ad-audiences";
 
@@ -12,9 +12,10 @@ export const adKeys = {
 };
 
 const adApi = {
-  connections: () => api<{ data: AdConnection[]; connect_url: string }>("GET", `${base}/connections`),
+  connections: () => api<{ data: AdConnection[]; settings: AdSettings; connect_url: string }>("GET", `${base}/connections`),
+  saveSettings: (input: { google_consent: boolean }) => api<AdSettings>("PATCH", `${base}/settings`, input),
   start: (platform: AdPlatform) => api<{ url: string }>("POST", `${base}/connections/${platform}/start`),
-  disconnect: (platform: AdPlatform) => api<{ disconnected: boolean }>("DELETE", `${base}/connections/${platform}`),
+  disconnect: (platform: AdPlatform) => api<{ disconnected: boolean; revoked: boolean; note: string }>("DELETE", `${base}/connections/${platform}`),
   accounts: (platform: AdPlatform) => api<{ data: AdAccount[]; manual_entry: boolean }>("GET", `${base}/connections/${platform}/accounts`),
   syncs: () => api<{ data: AudienceSync[] }>("GET", `${base}/syncs`),
   sync: (id: string) => api<AudienceSyncDetail>("GET", `${base}/syncs/${id}`),
@@ -22,7 +23,7 @@ const adApi = {
   update: (id: string, input: UpdateSyncInput) => api<AudienceSyncDetail>("PATCH", `${base}/syncs/${id}`, input),
   run: (id: string) => api<AudienceSyncDetail & { started: boolean }>("POST", `${base}/syncs/${id}/run`),
   remove: (id: string, deleteOnPlatform: boolean) =>
-    api<{ deleted: boolean; deleted_on_platform: boolean }>("DELETE", `${base}/syncs/${id}?delete_on_platform=${deleteOnPlatform}`),
+    api<{ deleted: boolean; deleted_on_platform: boolean }>("DELETE", `${base}/syncs/${id}?delete_on_platform=${deleteOnPlatform}&confirm=true`),
 };
 
 /** Poll every few seconds while a sync runs, so its numbers fill in. */
@@ -60,6 +61,11 @@ function useInvalidate() {
 
 export function useStartConnect() {
   return useMutation({ mutationFn: adApi.start });
+}
+
+export function useSaveAdSettings() {
+  const invalidate = useInvalidate();
+  return useMutation({ mutationFn: adApi.saveSettings, onSuccess: invalidate });
 }
 
 export function useDisconnect() {

@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router";
 import { AlertTriangle, CheckCircle2, Megaphone, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, XCircle } from "lucide-react";
+import { useSession } from "../../api";
 import {
   Badge,
   Button,
   Card,
+  Checkbox,
   ConfirmDialog,
   EmptyRow,
   EmptyState,
@@ -17,18 +19,18 @@ import {
   Td,
   Th,
 } from "../../components/ui";
-import { formatNumber, formatRelative, pluralize } from "../../lib/format";
+import { formatDate, formatNumber, formatRelative, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
-import { useAdConnections, useAudienceSyncs, useDisconnect, useRunSync, useStartConnect, useUpdateSync } from "./api";
+import { useAdConnections, useAudienceSyncs, useDisconnect, useRunSync, useSaveAdSettings, useStartConnect, useUpdateSync } from "./api";
 import { NewSyncModal } from "./NewSyncModal";
 import { SyncDrawer, syncState } from "./SyncDrawer";
-import type { AdConnection, AdPlatform, AudienceSync } from "./types";
+import type { AdConnection, AdPlatform, AdSettings, AudienceSync } from "./types";
 
 const callbackErrors: Record<string, string> = {
   cancelled: "The sign-in was cancelled, so nothing was connected.",
   expired: "That sign-in link expired. Start again.",
   signed_out: "You were signed out of DumbMail during the sign-in. Sign in and try again.",
-  wrong_account: "That sign-in was started from a different DumbMail account or person. Start again from here.",
+  wrong_account: "That sign-in was started by a different person or DumbMail account. Start again from here.",
   failed: "The platform didn't finish the sign-in. Try again; if it keeps failing, check the app setup in docs/AD_AUDIENCES.md.",
 };
 
@@ -37,7 +39,7 @@ const platformNames: Record<AdPlatform, string> = { meta: "Meta", google: "Googl
 const platformBlurb: Record<AdPlatform, string> = {
   meta: "Facebook and Instagram ads, from customer list audiences.",
   google: "Search, YouTube, Gmail and Display ads, with Customer Match.",
-  tiktok: "TikTok ads, from customer file audiences.",
+  tiktok: "TikTok ads, from customer file audiences (email only, at least 1,000 people).",
 };
 
 export function AdAudiencesPage() {
@@ -51,12 +53,14 @@ export function AdAudiencesPage() {
   const error = params.get("error");
   const clearParams = () => setParams({}, { replace: true });
   const anyConnected = (connections.data?.data ?? []).some((c) => c.status === "connected");
+  const googleConnected = (connections.data?.data ?? []).some((c) => c.platform === "google" && c.status !== "not_connected");
 
   return (
     <div className="space-y-4">
       <p className="text-sm text-zinc-500">
-        Send a list or segment to Meta, Google Ads or TikTok as an ad audience, and keep it current as people join and leave. Contact details are hashed before
-        they leave DumbMail. People who unsubscribed or opted out of ads are never sent.
+        Send a list or segment to Meta, Google Ads or TikTok as an ad audience, and keep it current as people join and leave. Only people who are subscribed to
+        your email, aren't suppressed and haven't opted out of ads are sent, as hashed email addresses (and phone numbers they opted in to texts with). Anyone
+        who unsubscribes or opts out is removed on the next sync.
       </p>
       {connected && connected in platformNames ? (
         <Notice tone="green" icon={<CheckCircle2 />} title={`${platformNames[connected as AdPlatform]} is connected`}>
@@ -88,6 +92,8 @@ export function AdAudiencesPage() {
         </div>
       </Card>
 
+      {connections.data && (googleConnected || connections.data.settings.google_consent) ? <GoogleConsent settings={connections.data.settings} /> : null}
+
       <Card
         title="Synced audiences"
         padded={false}
@@ -103,6 +109,7 @@ export function AdAudiencesPage() {
       {newSync !== false ? (
         <NewSyncModal
           connections={connections.data?.data ?? []}
+          settings={connections.data?.settings ?? null}
           initialSource={newSync}
           onClose={() => {
             setNewSync(false);
@@ -120,10 +127,53 @@ export function AdAudiencesPage() {
   );
 }
 
+function GoogleConsent({ settings }: { settings: AdSettings }) {
+  const { account } = useSession();
+  const save = useSaveAdSettings();
+  const [turningOff, setTurningOff] = useState(false);
+  const set = (on: boolean) =>
+    save.mutate({ google_consent: on }, { onSuccess: () => toast.success(on ? "Google consent setting turned on" : "Google consent setting turned off; Google syncs are paused") });
+  return (
+    <Card title="Google consent">
+      <div className="space-y-2">
+        <Checkbox
+          label="The marketing consent we collect covers using customer data for advertising, as Google requires for users in the EEA, the UK and Switzerland."
+          description="With this on, DumbMail sends everyone it uploads to Google with both of Google's consent signals granted. With it off, Google syncs can't be created and existing ones pause. Only the account's owner or an admin can change it."
+          checked={settings.google_consent}
+          disabled={save.isPending}
+          onChange={(e) => (e.target.checked ? set(true) : setTurningOff(true))}
+        />
+        {settings.google_consent && settings.google_consent_at ? (
+          <p className="pl-6 text-xs text-zinc-500">
+            Turned on {formatDate(settings.google_consent_at, account.timezone)}
+            {settings.google_consent_by ? ` by ${settings.google_consent_by}` : ""}.
+          </p>
+        ) : null}
+      </div>
+      {turningOff ? (
+        <ConfirmDialog
+          title="Turn off the Google consent setting?"
+          body="Every Google sync pauses. Paused syncs add nobody, but still remove people who leave or opt out."
+          confirmLabel="Turn off"
+          danger
+          loading={save.isPending}
+          onConfirm={() => {
+            set(false);
+            setTurningOff(false);
+          }}
+          onClose={() => setTurningOff(false)}
+        />
+      ) : null}
+    </Card>
+  );
+}
+
 function ConnectionRow({ connection: c }: { connection: AdConnection }) {
+  const { account } = useSession();
   const start = useStartConnect();
   const disconnect = useDisconnect();
   const [confirming, setConfirming] = useState(false);
+  const expiresSoon = c.expires_soon;
 
   const connect = () =>
     start.mutate(c.platform, {
@@ -148,11 +198,20 @@ function ConnectionRow({ connection: c }: { connection: AdConnection }) {
               Reconnect needed
             </Badge>
           ) : null}
+          {c.available && !c.verified_live ? <Badge tone="amber">Not yet verified against a live account</Badge> : null}
         </div>
         <p className="mt-0.5 text-xs text-zinc-500">
           {c.status === "connected" && c.connected_as ? `Connected as ${c.connected_as}${c.syncs ? ` · ${pluralize(c.syncs, "sync")}` : ""}` : platformBlurb[c.platform]}
         </p>
+        {expiresSoon && c.token_expires_at ? (
+          <p className="mt-0.5 text-xs text-amber-700">The sign-in expires {formatDate(c.token_expires_at, account.timezone)}. Reconnect before then so syncs keep running.</p>
+        ) : null}
         {c.status === "needs_reconnect" && c.error ? <p className="mt-0.5 text-xs text-amber-700">{c.error}</p> : null}
+        {c.status === "not_connected" && c.last_revoke === "not_confirmed" ? (
+          <p className="mt-0.5 text-xs text-amber-700">
+            {c.label} didn't confirm it revoked DumbMail's access when you disconnected. Remove DumbMail from your {c.label} account's connected apps to be sure.
+          </p>
+        ) : null}
       </div>
       {c.available ? (
         <div className="flex items-center gap-2">
@@ -161,9 +220,9 @@ function ConnectionRow({ connection: c }: { connection: AdConnection }) {
               Disconnect
             </Button>
           ) : null}
-          {c.status !== "connected" ? (
-            <Button size="sm" variant={c.status === "needs_reconnect" ? "primary" : "secondary"} loading={start.isPending} onClick={connect}>
-              {c.status === "needs_reconnect" ? "Reconnect" : "Connect"}
+          {c.status !== "connected" || expiresSoon ? (
+            <Button size="sm" variant={c.status === "needs_reconnect" || expiresSoon ? "primary" : "secondary"} loading={start.isPending} onClick={connect}>
+              {c.status === "not_connected" ? "Connect" : "Reconnect"}
             </Button>
           ) : null}
         </div>
@@ -171,15 +230,16 @@ function ConnectionRow({ connection: c }: { connection: AdConnection }) {
       {confirming ? (
         <ConfirmDialog
           title={`Disconnect ${c.label}?`}
-          body={`DumbMail's access is revoked and its sign-in deleted. Audiences already on ${c.label} stay as they are, and syncs wait until you connect again.`}
+          body={`DumbMail deletes its sign-in and asks ${c.label} to revoke its access. Audiences already on ${c.label} stay as they are, and syncs wait until you connect again.`}
           confirmLabel="Disconnect"
           danger
           loading={disconnect.isPending}
           onConfirm={() =>
             disconnect.mutate(c.platform, {
-              onSuccess: () => {
+              onSuccess: (r) => {
                 setConfirming(false);
-                toast.success(`${c.label} disconnected`);
+                if (r.revoked) toast.success(`${c.label} disconnected`);
+                else toast.error(r.note);
               },
             })
           }
@@ -207,7 +267,7 @@ function SyncTable({ syncs, loading, error, anyConnected, onOpen, onNew }: SyncT
           <Th>Audience</Th>
           <Th>Platform</Th>
           <Th>Status</Th>
-          <Th className="text-right">People sent</Th>
+          <Th className="text-right">Confirmed</Th>
           <Th>Last sync</Th>
           <Th className="w-10" />
         </tr>
@@ -246,6 +306,7 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
   const run = useRunSync();
   const update = useUpdateSync(s.id);
   const state = syncState(s);
+  const unconfirmed = s.sent - s.confirmed;
   return (
     <tr
       tabIndex={0}
@@ -259,7 +320,6 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
         <div className="font-medium text-zinc-900">{s.name}</div>
         <div className="text-xs text-zinc-500">
           {s.source.type === "list" ? "List" : "Segment"}: {s.source.name ?? "deleted"}
-          {s.include_unsubscribed ? " · includes unsubscribed" : ""}
         </div>
       </Td>
       <Td>
@@ -278,10 +338,12 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
         ) : null}
       </Td>
       <Td className="text-right tabular-nums">
-        {formatNumber(s.members_sent)}
-        {s.last_run_at && (s.last_added || s.last_removed) ? (
+        {formatNumber(s.confirmed)}
+        {unconfirmed > 0 || s.pending_removal > 0 ? (
           <div className="text-xs text-zinc-500">
-            +{formatNumber(s.last_added)} / −{formatNumber(s.last_removed)}
+            {unconfirmed > 0 ? `${formatNumber(unconfirmed)} not confirmed` : ""}
+            {unconfirmed > 0 && s.pending_removal > 0 ? " · " : ""}
+            {s.pending_removal > 0 ? `${formatNumber(s.pending_removal)} pending removal` : ""}
           </div>
         ) : null}
       </Td>
@@ -302,7 +364,7 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
             },
             s.status === "active"
               ? { label: "Pause", icon: <Pause className="size-3.5" />, onSelect: () => update.mutate({ status: "paused" }) }
-              : { label: "Resume", icon: <Play className="size-3.5" />, onSelect: () => update.mutate({ status: "active" }) },
+              : { label: "Resume", icon: <Play className="size-3.5" />, disabled: s.pause_reason !== "user", onSelect: () => update.mutate({ status: "active" }) },
             { label: "Details and delete", icon: <Trash2 className="size-3.5" />, onSelect: onOpen },
           ]}
         />

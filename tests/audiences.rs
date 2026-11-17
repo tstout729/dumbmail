@@ -642,7 +642,7 @@ async fn malformed_and_partial_answers_are_not_success() {
     // failed removal stays pending.
     sqlx::query("DELETE FROM ad_audience_syncs").execute(&h.state.db).await.unwrap();
     connect(&mut h, "google", "g-code").await;
-    h.ok("PUT", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
+    h.ok("PATCH", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
     m.fail_next("audienceMembers:ingest", 200, json!({}));
     m.google_status_next(json!({"requestStatusPerDestination": [{"requestStatus": "PARTIAL_SUCCESS", "errorInfo": {"errorCounts": [{"recordCount": "1", "reason": "PROCESSING_ERROR_REASON_INVALID_FORMAT", "recordIndices": [1]}]}}]}));
     let gid = h.ok("POST", "/api/ad-audiences/syncs", Some(json!({"platform": "google", "ad_account_id": "1234567890", "source_type": "list", "source_id": list, "accept_terms": true}))).await["id"]
@@ -853,9 +853,9 @@ async fn google_needs_the_consent_setting_and_matches_on_hashed_email_and_phone(
     let (s, _) = h.req("POST", "/api/ad-audiences/syncs", Some(create.clone())).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "agent"}))).await["key"].as_str().unwrap().to_string();
-    let (s, _, _) = h.raw("PUT", "/api/ad-audiences/settings", &[("authorization", &format!("Bearer {key}")), ("content-type", "application/json")], r#"{"google_consent": true}"#).await;
+    let (s, _, _) = h.raw("PATCH", "/api/ad-audiences/settings", &[("authorization", &format!("Bearer {key}")), ("content-type", "application/json")], r#"{"google_consent": true}"#).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let settings = h.ok("PUT", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
+    let settings = h.ok("PATCH", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
     assert_eq!((settings["google_consent"].as_bool(), settings["google_consent_by"].as_str()), (Some(true), Some("owner@acme.test")));
     // Google matches on email and phone only; an ad account the sign-in can't reach is refused.
     let mut loc = create.clone();
@@ -893,7 +893,7 @@ async fn google_needs_the_consent_setting_and_matches_on_hashed_email_and_phone(
     assert_eq!(m.calls("requestStatus:retrieve")[0].query()["requestId"], "req-1");
 
     // Turning the setting off pauses Google syncs; resuming needs it on again.
-    h.ok("PUT", "/api/ad-audiences/settings", Some(json!({"google_consent": false}))).await;
+    h.ok("PATCH", "/api/ad-audiences/settings", Some(json!({"google_consent": false}))).await;
     let st = sync_status(&mut h, &id).await;
     assert_eq!((st["status"].as_str(), st["pause_reason"].as_str()), (Some("paused"), Some("google_consent")));
     assert_eq!(h.req("PATCH", &format!("/api/ad-audiences/syncs/{id}"), Some(json!({"status": "active"}))).await.0, StatusCode::BAD_REQUEST);
@@ -908,7 +908,7 @@ async fn aliases_share_a_key_and_an_opt_out_wins() {
     let (mut h, m) = mock_harness!();
     h.signup().await;
     connect(&mut h, "google", "g-code").await;
-    h.ok("PUT", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
+    h.ok("PATCH", "/api/ad-audiences/settings", Some(json!({"google_consent": true}))).await;
     let list = new_list(&mut h, "VIPs").await;
     let a = sub(&mut h, "a.b+x@gmail.com", &list, json!({})).await;
     sub(&mut h, "ab@gmail.com", &list, json!({})).await;
@@ -918,6 +918,16 @@ async fn aliases_share_a_key_and_an_opt_out_wins() {
         .to_string();
     h.drain().await;
     assert_eq!(m.calls("audienceMembers:ingest")[0].json()["audienceMembers"].as_array().unwrap().len(), 1);
+    // Google drops members after 540 days: an entry confirmed long ago that still qualifies is sent again.
+    m.clear();
+    sqlx::query("UPDATE ad_audience_members SET confirmed_at = now() - interval '460 days'").execute(&h.state.db).await.unwrap();
+    run(&mut h, &id).await;
+    assert_eq!(m.calls("audienceMembers:ingest").len(), 1, "refreshed");
+    let fresh: bool = sqlx::query_scalar("SELECT confirmed_at > now() - interval '1 hour' FROM ad_audience_members").fetch_one(&h.state.db).await.unwrap();
+    assert!(fresh);
+    m.clear();
+    run(&mut h, &id).await;
+    assert!(m.calls("audienceMembers:ingest").is_empty(), "and not again until it's due");
     // One alias leaves the list: the shared hash stays.
     m.clear();
     h.ok("DELETE", &format!("/api/lists/{list}/members"), Some(json!({"profile_ids": [a]}))).await;

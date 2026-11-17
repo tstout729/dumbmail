@@ -1,24 +1,25 @@
 import { useState, type FormEvent } from "react";
 import { useLists, useSegments } from "../../api";
 import { errorMessage } from "../../api/client";
-import { Button, Checkbox, Field, InlineError, Input, Modal, Select, Skeleton } from "../../components/ui";
+import { Button, Checkbox, Field, InlineError, Input, Modal, Notice, Select, Skeleton } from "../../components/ui";
 import { formatNumber } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useAdAccounts, useCreateSync } from "./api";
 import { intervalOptions } from "./SyncDrawer";
-import type { AdConnection, AdPlatform, MatchFields } from "./types";
+import type { AdConnection, AdPlatform, AdSettings, MatchFields } from "./types";
 
 const OTHER = "__other__";
 
 type Props = {
   connections: AdConnection[];
+  settings: AdSettings | null;
   /** "list:<id>" or "segment:<id>" from a list or segment page's "Sync to ads". */
   initialSource: string | null;
   onClose: () => void;
   onCreated: (id: string) => void;
 };
 
-export function NewSyncModal({ connections, initialSource, onClose, onCreated }: Props) {
+export function NewSyncModal({ connections, settings, initialSource, onClose, onCreated }: Props) {
   const usable = connections.filter((c) => c.status === "connected");
   const [chosenPlatform, setPlatform] = useState<AdPlatform | null>(null);
   // Connections may still be loading when this opens from a "Sync to ads" link.
@@ -30,7 +31,6 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
   const [name, setName] = useState("");
   const [matchFields, setMatchFields] = useState<MatchFields>("contact");
   const [intervalHours, setIntervalHours] = useState(6);
-  const [exclusion, setExclusion] = useState(false);
   const [terms, setTerms] = useState(false);
   const lists = useLists();
   const segments = useSegments();
@@ -41,18 +41,19 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
   const accountList = accounts.data?.data ?? [];
   const manual = accounts.data?.manual_entry ?? false;
   const typing = manual && (accountList.length === 0 || account === OTHER);
+  const needsConsent = platform === "google" && !settings?.google_consent;
   const chosenAccount = typing ? otherAccount.trim() : account;
   const [sourceType, sourceId] = source.split(":") as ["list" | "segment" | "", string | undefined];
   const sourceName =
     sourceType === "list" ? lists.data?.find((l) => l.id === sourceId)?.name : sourceType === "segment" ? segments.data?.find((s) => s.id === sourceId)?.name : undefined;
-  const ready = platform !== null && chosenAccount !== "" && sourceType !== "" && sourceId !== undefined && terms;
+  const ready = platform !== null && chosenAccount !== "" && sourceType !== "" && sourceId !== undefined && terms && !needsConsent;
 
   const choosePlatform = (p: AdPlatform) => {
     setPlatform(p);
     setAccount("");
     setOtherAccount("");
     setManager("");
-    if (p === "tiktok") setMatchFields("contact");
+    if (p !== "meta") setMatchFields("contact");
   };
 
   const onSubmit = (e: FormEvent) => {
@@ -66,7 +67,6 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
         source_type: sourceType,
         source_id: sourceId,
         name: name.trim() || undefined,
-        include_unsubscribed: exclusion,
         match_fields: matchFields,
         interval_hours: intervalHours,
         accept_terms: terms,
@@ -108,29 +108,36 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
           </Select>
         </Field>
 
-        <Field label="Ad account" error={accounts.error ? errorMessage(accounts.error) : undefined}>
-          {accounts.isPending ? (
-            <Skeleton className="h-8.5 w-full" />
-          ) : accountList.length > 0 ? (
-            <Select value={account} onChange={(e) => setAccount(e.target.value)} required>
-              <option value="" disabled>
-                Choose an ad account
-              </option>
-              {accountList.map((a) => (
-                <option key={a.id} value={a.id} disabled={a.manager}>
-                  {a.name ? `${a.name} (${a.id})` : a.id}
-                  {a.manager ? " · manager account" : ""}
+        {needsConsent ? (
+          <Notice tone="amber" title="Turn on the Google consent setting first">
+            Google syncs need the account's owner or an admin to confirm, under Google consent on this page, that your marketing consent covers advertising use.
+          </Notice>
+        ) : null}
+
+        {manual && accountList.length === 0 && !accounts.error ? null : (
+          <Field label="Ad account" error={accounts.error ? errorMessage(accounts.error) : undefined}>
+            {accounts.isPending ? (
+              <Skeleton className="h-8.5 w-full" />
+            ) : accountList.length > 0 ? (
+              <Select value={account} onChange={(e) => setAccount(e.target.value)} required>
+                <option value="" disabled>
+                  Choose an ad account
                 </option>
-              ))}
-              {manual ? <option value={OTHER}>Another account (enter its ID)</option> : null}
-            </Select>
-          ) : !manual ? (
-            <p className="text-sm text-zinc-500">This sign-in can't reach any {label} ad accounts. Check its permissions on {label}, then reconnect.</p>
-          ) : null}
-        </Field>
+                {accountList.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name ? `${a.name} (${a.id})` : a.id}
+                  </option>
+                ))}
+                {manual ? <option value={OTHER}>Another account (enter its ID)</option> : null}
+              </Select>
+            ) : !manual ? (
+              <p className="text-sm text-zinc-500">This sign-in can't reach any {label} ad accounts. Check its permissions on {label}, then reconnect.</p>
+            ) : null}
+          </Field>
+        )}
         {typing ? (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Google Ads customer ID" hint="10 digits, like 123-456-7890.">
+            <Field label="Google Ads customer ID" hint="10 digits, like 123-456-7890. DumbMail checks this sign-in can manage its audiences.">
               <Input value={otherAccount} onChange={(e) => setOtherAccount(e.target.value)} inputMode="numeric" placeholder="123-456-7890" required />
             </Field>
             <Field label="Manager account ID" hint="Only if you reach it through a manager account.">
@@ -169,7 +176,7 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
           <Field label="Match on">
             <Select value={matchFields} onChange={(e) => setMatchFields(e.target.value as MatchFields)}>
               <option value="contact">{platform === "tiktok" ? "Email" : "Email and phone"}</option>
-              {platform !== "tiktok" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
+              {platform === "meta" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
             </Select>
           </Field>
           <Field label="How often">
@@ -183,12 +190,10 @@ export function NewSyncModal({ connections, initialSource, onClose, onCreated }:
           </Field>
         </div>
 
-        <Checkbox
-          label="Exclusion audience: include people who unsubscribed"
-          description="Turn on only for an audience you'll exclude from ads, so people who unsubscribed stop seeing them. People who opted out of ads are never sent."
-          checked={exclusion}
-          onChange={(e) => setExclusion(e.target.checked)}
-        />
+        <p className="text-xs text-zinc-500">
+          Only people subscribed to your email who aren't suppressed and haven't opted out of ads are sent: their hashed email, and their phone number if they opted in
+          to texts.{platform === "tiktok" ? " TikTok audiences use email only, and TikTok needs at least 1,000 people before it makes one." : ""}
+        </p>
         <Checkbox
           label={`These people gave us their contact details directly, and I accept ${label}'s customer list terms`}
           description="Contact details are hashed before they leave DumbMail."
