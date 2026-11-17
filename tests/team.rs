@@ -39,6 +39,10 @@ async fn send(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Val
     if let Some(c) = &s.cookie {
         b = b.header(header::COOKIE, c);
     }
+    // A page that's loaded knows its account; one that never asked yet has the session's.
+    if method != "GET" && s.account.is_none() {
+        s.account = session_account(h, s).await;
+    }
     if let Some(a) = s.account.as_deref().filter(|_| method != "GET") {
         b = b.header("x-dumbmail-account", a);
     }
@@ -61,6 +65,13 @@ async fn send(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Val
         s.account = Some(a.to_string());
     }
     (status, v, headers)
+}
+
+/// The account this browser's session has open.
+async fn session_account(h: &Harness, s: &S) -> Option<String> {
+    let token = s.cookie.as_deref()?.strip_prefix("pl_session=")?;
+    let a: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM sessions WHERE token_hash = $1").bind(dumbmail::auth::sha256_hex(token)).fetch_optional(&h.state.db).await.unwrap();
+    a.map(|a| a.to_string())
 }
 
 async fn call(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -142,6 +153,10 @@ fn probe(r: &access::RouteRule) -> (String, Body, bool) {
 }
 
 async fn probe_status(h: &Harness, r: &access::RouteRule, auth: Option<(&str, String)>) -> StatusCode {
+    probe_with(h, r, auth, &[]).await
+}
+
+async fn probe_with(h: &Harness, r: &access::RouteRule, auth: Option<(&str, String)>, extra: &[(&str, String)]) -> StatusCode {
     let (path, body, has_body) = probe(r);
     let mut b = Request::builder().method(r.method).uri(&path).header("x-real-ip", "198.51.100.200");
     if has_body {
@@ -149,6 +164,9 @@ async fn probe_status(h: &Harness, r: &access::RouteRule, auth: Option<(&str, St
     }
     if let Some((name, value)) = auth {
         b = b.header(name, value);
+    }
+    for (k, v) in extra {
+        b = b.header(*k, v.as_str());
     }
     h.router.clone().oneshot(b.body(body).unwrap()).await.unwrap().status()
 }
@@ -175,7 +193,9 @@ async fn every_route_and_tool_has_a_permission_rule() {
 
     // The role matrix: each role gets exactly the routes its permissions allow.
     let mut owner = S::new("198.51.100.1");
-    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let acme = signup(&h, &mut owner, "owner@acme.test", "Acme").await["account"]["id"].as_str().unwrap().to_string();
+    // Sent like the dashboard does: from the app, naming the open account.
+    let page = [("origin", h.state.cfg.public_url().to_string()), ("x-dumbmail-account", acme)];
     let mut people = vec![(access::Role::Owner, owner.cookie.clone().unwrap())];
     for role in [access::Role::Admin, access::Role::Manager, access::Role::Analyst, access::Role::Content] {
         let (s, _) = join(&h, &mut owner, &format!("{}@acme.test", role.as_str()), role.as_str()).await;
@@ -188,7 +208,7 @@ async fn every_route_and_tool_has_a_permission_rule() {
             if allowed && SELF_ENDING.contains(&(r.method, r.path)) {
                 continue;
             }
-            let st = probe_status(&h, r, Some(("cookie", cookie.clone()))).await;
+            let st = probe_with(&h, r, Some(("cookie", cookie.clone())), &page).await;
             if allowed == (st == StatusCode::FORBIDDEN) || st == StatusCode::UNAUTHORIZED {
                 wrong.push(format!("{} {} as {}: {st} (allowed: {allowed})", r.method, r.path, role.as_str()));
             }
@@ -1031,8 +1051,19 @@ async fn single_sign_on_with_openid_connect() {
 
 // ---- Review findings: each one attacked directly ----
 
-/// Like `call`, with extra headers.
+/// Like `call`, with exactly these extra headers (plus the app's own `Origin` on writes, unless
+/// `extra` names an `Origin` or `Referer`).
 async fn call_with(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> (StatusCode, Value) {
+    let origin = h.state.cfg.public_url().to_string();
+    let mut all: Vec<(&str, &str)> = extra.to_vec();
+    if method != "GET" && !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("origin") || k.eq_ignore_ascii_case("referer")) {
+        all.push(("origin", &origin));
+    }
+    bare(h, s, method, path, body, &all).await
+}
+
+/// A request with the cookie and exactly `extra`: no `Origin`, no account header unless given.
+async fn bare(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> (StatusCode, Value) {
     let mut b = Request::builder().method(method).uri(path).header("x-real-ip", &s.ip);
     if let Some(c) = &s.cookie {
         b = b.header(header::COOKIE, c);
@@ -1183,7 +1214,11 @@ async fn a_stale_tab_cannot_write_to_the_other_account() {
     let mut s = S::new("198.51.100.84");
     let me = signup(&h, &mut s, "owner@acme.test", "Brand A").await;
     let a = me["account"]["id"].as_str().unwrap().to_string();
-    // One account: older pages and scripts without the header still work.
+    // Even with one account, a page from before the header existed is told to reload.
+    let (st, err) = call_with(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "Old page"})), &[]).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["error"]["code"], "account_changed");
+    assert!(err["error"]["message"].as_str().unwrap().contains("Reload"), "{err}");
     ok(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "A list"}))).await;
     let me = ok(&h, &mut s, "POST", "/api/accounts", Some(json!({"name": "Brand B"}))).await;
     let b = me["account"]["id"].as_str().unwrap().to_string();
@@ -1195,8 +1230,7 @@ async fn a_stale_tab_cannot_write_to_the_other_account() {
     let (st, _) = call_with(&h, &mut s, "PATCH", "/api/account", Some(json!({"name": "Renamed"})), &[("x-dumbmail-account", &a)]).await;
     assert_eq!(st, StatusCode::CONFLICT);
     // With two accounts, a write that doesn't say which is refused too.
-    let mut no_header = S { cookie: s.cookie.clone(), ip: s.ip.clone(), account: None };
-    let (st, _) = call(&h, &mut no_header, "POST", "/api/lists", Some(json!({"name": "Unsure"}))).await;
+    let (st, _) = call_with(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "Unsure"})), &[]).await;
     assert_eq!(st, StatusCode::CONFLICT);
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM lists WHERE account_id = $1::uuid").bind(&b).fetch_all(&h.state.db).await.unwrap();
     assert!(names.is_empty(), "nothing landed in Brand B: {names:?}");
@@ -1417,6 +1451,11 @@ async fn sso_counts_as_two_factor_only_with_proof_of_a_second_factor() {
     let mut pat = sso_round(&h, &idp, "pat@acme.test", "idp-pat", |_| {}).await.unwrap();
     assert_eq!(status(&h, &mut pat, "POST", "/api/me/two-factor/setup", None).await, StatusCode::FORBIDDEN);
 
+    // One method on its own isn't two factors, even a one-time code or a security key.
+    for one in ["otp", "hwk"] {
+        let mut lone = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |g| g.amr = Some(vec![one.into()])).await.unwrap();
+        assert_eq!(ok(&h, &mut lone, "GET", "/api/me", None).await["restriction"], "two_factor_code", "{one}");
+    }
     // A second factor at the provider (amr) counts.
     let mut jo3 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |g| g.amr = Some(vec!["pwd".into(), "otp".into()])).await.unwrap();
     assert!(ok(&h, &mut jo3, "GET", "/api/me", None).await["restriction"].is_null());
@@ -1426,6 +1465,13 @@ async fn sso_counts_as_two_factor_only_with_proof_of_a_second_factor() {
     assert!(ok(&h, &mut pat2, "GET", "/api/me", None).await["restriction"].is_null());
     let log = ok(&h, &mut owner, "GET", "/api/audit?action=sso.update", None).await;
     assert_eq!(log["data"][0]["details"]["idp_enforces_mfa"], true);
+    // Taking that promise back ends the sessions that relied on it.
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "idp_enforces_mfa": false})))).await;
+    assert_eq!(status(&h, &mut pat2, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    // Settings that don't decide who gets in leave sessions alone.
+    let mut jo4 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |g| g.amr = Some(vec!["mfa".into()])).await.unwrap();
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "default_role": "analyst"})))).await;
+    ok(&h, &mut jo4, "GET", "/api/campaigns", None).await;
     h.cleanup().await;
 }
 
@@ -1473,5 +1519,378 @@ async fn catalog_and_reports_keep_people_data_behind_profile_and_export_permissi
     for action in ["export.start", "reports.attribution_change"] {
         assert_eq!(ok(&h, &mut owner, "GET", &format!("/api/audit?action={action}"), None).await["total"], 1, "{action}");
     }
+    h.cleanup().await;
+}
+
+// ---- Second review: each point attacked directly ----
+
+/// Make a session's last "confirm it's you" an hour old (a session left open).
+async fn make_stale(h: &Harness, s: &S) {
+    let token = s.cookie.as_deref().unwrap().strip_prefix("pl_session=").unwrap();
+    sqlx::query("UPDATE sessions SET reauth_at = now() - interval '1 hour', created_at = now() - interval '1 hour' WHERE token_hash = $1")
+        .bind(dumbmail::auth::sha256_hex(token))
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn setting_up_a_factor_does_not_confirm_it_is_you() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.120");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (_, pat) = join(&h, &mut owner, "pat@acme.test", "admin").await;
+    // Someone finds the owner's open session from an hour ago, with no two-factor yet.
+    make_stale(&h, &owner).await;
+    let setup = ok(&h, &mut owner, "POST", "/api/me/two-factor/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let enabled = ok(&h, &mut owner, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(&secret, 0)}))).await;
+    let recovery = enabled["recovery_codes"][0].as_str().unwrap().to_string();
+    // Turning it on didn't count as confirming...
+    let (st, v) = call(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": pat}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    // ...and neither does a code from the factor they just added.
+    let (st, v) = call(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(call(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": pat}))).await.0, StatusCode::FORBIDDEN);
+    let role: String = sqlx::query_scalar("SELECT role FROM memberships WHERE user_id = $1").bind(pat).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(role, "admin");
+    // The password does.
+    ok(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"password": "correct horse"}))).await;
+    ok(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": pat}))).await;
+
+    // After signing in again with that factor, its codes count.
+    let mut back = S::new("198.51.100.121");
+    login(&h, &mut back, "owner@acme.test", "correct horse").await;
+    ok(&h, &mut back, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    // Time passes: the factor was on well before this session last confirmed, which was a while ago.
+    sqlx::query("UPDATE users SET totp_enabled_at = now() - interval '1 day' WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE sessions SET reauth_at = now() - interval '20 minutes' WHERE user_id = (SELECT id FROM users WHERE email = 'owner@acme.test')").execute(&h.state.db).await.unwrap();
+    ok(&h, &mut back, "POST", "/api/me/reauth", Some(json!({"code": recovery}))).await;
+    h.cleanup().await;
+}
+
+/// Stand in for Google's token endpoint: answers each code with an ID token carrying `claims`.
+async fn mock_google(claims: Arc<Mutex<Value>>) -> String {
+    use axum::routing::post;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/token",
+        post(move || {
+            let claims = claims.clone();
+            async move {
+                use base64::Engine;
+                let c = claims.lock().unwrap().clone();
+                let b64 = |v: &Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+                axum::Json(json!({"access_token": "at", "token_type": "Bearer", "id_token": format!("{}.{}.sig", b64(&json!({"alg": "RS256"})), b64(&c))}))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+/// Ask to confirm with Google, have "Google" answer with `claims`, and return where the browser
+/// lands. `keep_session`: the callback still carries the session cookie.
+async fn google_confirm(h: &Harness, s: &S, claims: &Arc<Mutex<Value>>, set: Value, keep_session: bool) -> String {
+    let cookie = s.cookie.clone().unwrap();
+    let (st, headers, _) = h.raw("GET", "/api/auth/google?reauth=1&next=/settings/team", &[("cookie", &cookie)], "").await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let loc = headers[header::LOCATION].to_str().unwrap().to_string();
+    assert!(loc.starts_with("https://accounts.google.com/"), "{loc}");
+    let q: HashMap<String, String> = url::Url::parse(&loc).unwrap().query_pairs().into_owned().collect();
+    assert_eq!(q["max_age"], "0", "Google is asked to sign them in again");
+    assert!(q["claims"].contains("auth_time"));
+    let oauth = headers.get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string()).find(|c| c.starts_with("pl_oauth=")).unwrap();
+    *claims.lock().unwrap() = set;
+    let both = if keep_session { format!("{oauth}; {cookie}") } else { oauth };
+    let (st, headers, _) = h.raw("GET", &format!("/api/auth/google/callback?code=c&state={}", urlencode(&q["state"])), &[("cookie", &both)], "").await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    // Never a new session.
+    assert!(headers.get_all(header::SET_COOKIE).iter().all(|c| !c.to_str().unwrap().starts_with("pl_session=")));
+    headers[header::LOCATION].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn google_logins_confirm_it_is_them_with_a_fresh_google_sign_in() {
+    let h = harness!();
+    let claims = Arc::new(Mutex::new(json!({})));
+    dumbmail::api::google::use_token_url_for_tests(&mock_google(claims.clone()).await);
+    let mut owner = S::new("198.51.100.130");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (_, pat) = join(&h, &mut owner, "pat@acme.test", "admin").await;
+    // A login that signs in with Google only.
+    sqlx::query("UPDATE users SET google_sub = 'g-owner', password_hash = NULL WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    assert_eq!(ok(&h, &mut owner, "GET", "/api/me", None).await["login_methods"], json!({"password": false, "google": true}));
+    make_stale(&h, &owner).await;
+    let now = chrono::Utc::now().timestamp();
+    let token = |sub: &str, auth_time: i64| {
+        json!({"iss": "https://accounts.google.com", "aud": "test-client.apps.googleusercontent.com", "sub": sub, "email": "owner@acme.test", "email_verified": true, "exp": now + 600, "auth_time": auth_time})
+    };
+    // Another Google account, an old Google sign-in, or a browser without the session: nothing.
+    assert!(google_confirm(&h, &owner, &claims, token("g-someone-else", now), true).await.ends_with("confirm_error=google_other_account"));
+    assert!(google_confirm(&h, &owner, &claims, token("g-owner", now - 3600), true).await.ends_with("confirm_error=google_not_fresh"));
+    let mut no_time = token("g-owner", now);
+    no_time.as_object_mut().unwrap().remove("auth_time");
+    assert!(google_confirm(&h, &owner, &claims, no_time, true).await.ends_with("confirm_error=google_not_fresh"));
+    assert!(google_confirm(&h, &owner, &claims, token("g-owner", now), false).await.ends_with("confirm_error=google_session"));
+    assert_eq!(call(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": pat}))).await.0, StatusCode::FORBIDDEN);
+    // The login's own Google account, just signed in: confirmed, back on the page.
+    let back = google_confirm(&h, &owner, &claims, token("g-owner", now), true).await;
+    assert!(back.ends_with("/settings/team?confirmed=google"), "{back}");
+    ok(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": pat}))).await;
+    assert_eq!(ok(&h, &mut owner, "GET", "/api/audit?action=login.reauth", None).await["data"][0]["details"]["method"], "google");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn accepting_ownership_needs_a_fresh_sign_in() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.140");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    // Pat already has a login (their own brand), signed in long ago.
+    let mut pat = S::new("198.51.100.141");
+    signup(&h, &mut pat, "pat@acme.test", "Pat's brand").await;
+    ok(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"password": "correct horse"}))).await;
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "pat@acme.test", "role": "owner"}))).await;
+    let token = invite_token(&h, "pat@acme.test");
+    make_stale(&h, &pat).await;
+    let shown = ok(&h, &mut pat, "GET", &format!("/api/invites/{token}"), None).await;
+    assert_eq!(shown["confirm_identity_first"], true);
+    let (st, v) = call(&h, &mut pat, "POST", &format!("/api/invites/{token}/accept"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = 'pat@acme.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(members, 1, "not an owner of Acme yet");
+    // Confirming first lets them in.
+    ok(&h, &mut pat, "POST", "/api/me/reauth", Some(json!({"password": "correct horse"}))).await;
+    assert_eq!(ok(&h, &mut pat, "GET", &format!("/api/invites/{token}"), None).await["confirm_identity_first"], false);
+    assert_eq!(ok(&h, &mut pat, "POST", &format!("/api/invites/{token}/accept"), None).await["role"], "owner");
+
+    // A brand-new login made with its password right there counts as fresh.
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "new@acme.test", "role": "owner"}))).await;
+    let token = invite_token(&h, "new@acme.test");
+    let mut fresh = S::new("198.51.100.142");
+    assert_eq!(ok(&h, &mut fresh, "POST", &format!("/api/invites/{token}/accept"), Some(json!({"password": "brand new pass"}))).await["role"], "owner");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn cookie_writes_must_come_from_the_app_and_name_the_account() {
+    let h = harness!();
+    let mut s = S::new("198.51.100.150");
+    let me = signup(&h, &mut s, "owner@acme.test", "Acme").await;
+    let a = me["account"]["id"].as_str().unwrap().to_string();
+    let acct = [("x-dumbmail-account", a.as_str())];
+    let lists = |name: &str| json!({"name": name});
+    // Another host on the same site posting a form with the cookie: refused.
+    for origin in ["https://book.pl.test", "https://evil.test", "null"] {
+        let (st, v) = bare(&h, &mut s, "POST", "/api/lists", Some(lists("x")), &[("origin", origin), acct[0]]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{origin}: {v}");
+    }
+    let (st, _) = bare(&h, &mut s, "POST", "/api/lists", Some(lists("x")), &[("referer", "https://book.pl.test/page"), acct[0]]).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // Neither header at all: refused too.
+    assert_eq!(bare(&h, &mut s, "POST", "/api/lists", Some(lists("x")), &acct).await.0, StatusCode::FORBIDDEN);
+    // From the app (Origin, or Referer when there's no Origin) with the account: fine.
+    assert_eq!(bare(&h, &mut s, "POST", "/api/lists", Some(lists("ok 1")), &[("origin", "https://pl.test"), acct[0]]).await.0, StatusCode::OK);
+    assert_eq!(bare(&h, &mut s, "POST", "/api/lists", Some(lists("ok 2")), &[("referer", "https://pl.test/lists"), acct[0]]).await.0, StatusCode::OK);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM lists WHERE account_id = $1::uuid").bind(&a).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 2);
+
+    // Without the account header, even from the app: 409 telling the page to reload, including
+    // routes with no body and ones about the login itself.
+    for (m, path) in [("POST", "/api/lists"), ("POST", "/api/me/sessions/revoke-others"), ("POST", "/api/team/leave"), ("POST", "/api/auth/logout"), ("POST", "/api/accounts/switch")] {
+        let (st, v) = call_with(&h, &mut s, m, path, None, &[]).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{path}: {v}");
+        assert_eq!(v["error"]["code"], "account_changed", "{path}");
+    }
+    // Signing out from another site doesn't work either; the session is still there.
+    assert_eq!(bare(&h, &mut s, "POST", "/api/auth/logout", None, &[("origin", "https://book.pl.test"), acct[0]]).await.0, StatusCode::FORBIDDEN);
+    ok(&h, &mut s, "GET", "/api/me", None).await;
+    // Sign-in forms posted from another site are refused; scripts without an Origin still work.
+    let mut other = S::new("198.51.100.151");
+    let creds = json!({"email": "owner@acme.test", "password": "correct horse"});
+    assert_eq!(bare(&h, &mut other, "POST", "/api/auth/login", Some(creds.clone()), &[("origin", "https://book.pl.test")]).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(bare(&h, &mut other, "POST", "/api/auth/login", Some(creds), &[]).await.0, StatusCode::OK);
+    // API keys don't use the cookie and aren't affected.
+    let key = ok(&h, &mut s, "POST", "/api/api-keys", Some(json!({"name": "k"}))).await["key"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&h, &key, "POST", "/api/lists", Some(lists("by key"))).await.0, StatusCode::OK);
+    let (st, v) = bearer(&h, &key, "POST", "/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_lists", "arguments": {}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // The dashboard's own way still works, and signing out with it does.
+    ok(&h, &mut s, "POST", "/api/lists", Some(lists("page"))).await;
+    ok(&h, &mut s, "POST", "/api/auth/logout", None).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn reports_need_profile_access_to_show_peoples_own_values() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.160");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (mut content, _) = join(&h, &mut owner, "writer@acme.test", "content").await;
+    let (mut analyst, _) = join(&h, &mut owner, "numbers@acme.test", "analyst").await;
+    ok(&h, &mut owner, "POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "buyer@customer.test"}, "properties": {"email": "buyer@customer.test"}}))).await;
+    let by_prop = json!({"source": "metric", "metric": "Placed Order", "group_by": ["property"], "property": "email", "measures": ["events"]});
+    let by_country = json!({"source": "metric", "metric": "Placed Order", "group_by": ["country"], "measures": ["events"]});
+    let by_day = json!({"source": "metric", "metric": "Placed Order", "group_by": ["day"], "measures": ["events"]});
+    let metric_by_prop = json!({"metric": "Placed Order", "group_by": "email"});
+    let funnel = json!({"steps": ["Placed Order", "Placed Order"], "split_by": {"type": "event_property", "key": "email"}});
+    // Content members see totals and time series, never the values.
+    for (path, body) in [("/api/reports/run", &by_prop), ("/api/reports/run", &by_country), ("/api/reports/run.csv", &by_prop), ("/api/metrics/query", &metric_by_prop), ("/api/reports/funnel", &funnel)] {
+        let (st, v) = call(&h, &mut content, "POST", path, Some(body.clone())).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{path}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("see profiles"), "{v}");
+    }
+    ok(&h, &mut content, "POST", "/api/reports/run", Some(by_day.clone())).await;
+    ok(&h, &mut content, "POST", "/api/metrics/query", Some(json!({"metric": "Placed Order"}))).await;
+    ok(&h, &mut content, "POST", "/api/metrics/query", Some(json!({"metric": "Placed Order", "group_by": "campaign"}))).await;
+    // A saved report grouped that way can't be opened by them either.
+    let saved = ok(&h, &mut owner, "POST", "/api/reports", Some(json!({"name": "By buyer", "spec": by_prop}))).await;
+    let run = format!("/api/reports/{}/run", saved["id"].as_str().unwrap());
+    assert_eq!(status(&h, &mut content, "GET", &run, None).await, StatusCode::FORBIDDEN);
+    // Analysts may see profiles, so they get it.
+    // (and so does the owner, live)
+    assert!(ok(&h, &mut owner, "POST", "/api/reports/run", Some(by_prop.clone())).await.to_string().contains("buyer@customer.test"));
+    let v = ok(&h, &mut analyst, "GET", &run, None).await;
+    assert!(v.to_string().contains("buyer@customer.test"), "{v}");
+
+    // An analytics-only key: totals yes, people's values no, over REST and MCP.
+    let analytics = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "charts", "scopes": ["analytics"]}))).await["key"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&h, &analytics, "POST", "/api/reports/run", Some(by_prop.clone())).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&h, &analytics, "POST", "/api/metrics/query", Some(metric_by_prop.clone())).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&h, &analytics, "POST", "/api/reports/run", Some(by_day)).await.0, StatusCode::OK);
+    let (err, text, _) = mcp(&h, &analytics, "run_report", json!({"spec": by_prop})).await;
+    assert!(err && text.contains("see profiles"), "{text}");
+    let (err, text, _) = mcp(&h, &analytics, "query_metric", metric_by_prop).await;
+    assert!(err && text.contains("see profiles"), "{text}");
+    let (err, _, _) = mcp(&h, &analytics, "get_report", json!({"id": saved["id"]})).await;
+    assert!(err);
+
+    // A read-only key can't start an export (or read one); analysts and full keys can.
+    let read = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "ro", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let aread = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "ar", "scopes": ["audience:read"]}))).await["key"].as_str().unwrap().to_string();
+    for k in [&read, &aread] {
+        assert_eq!(bearer(&h, k, "POST", "/api/reports/exports", Some(json!({"kind": "profiles"}))).await.0, StatusCode::FORBIDDEN);
+        let (err, _, _) = mcp(&h, k, "start_export", json!({"kind": "profiles"})).await;
+        assert!(err);
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM exports").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 0, "no export was queued");
+    let (st, v) = call(&h, &mut analyst, "POST", "/api/reports/exports", Some(json!({"kind": "profiles"}))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(ok(&h, &mut owner, "GET", "/api/audit?action=export.start", None).await["total"], 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn sso_links_belong_to_one_account_and_settings_changes_stop_sign_ins() {
+    let h = harness!();
+    let idp = oidc::start().await;
+    let (mut owner, a, cfg) = sso_account(&h, &idp).await;
+    let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    let jo_id: Uuid = ok(&h, &mut jo, "GET", "/api/me", None).await["user"]["id"].as_str().unwrap().parse().unwrap();
+    // Another account uses the same provider and has its own link for Jo.
+    let b = Uuid::now_v7();
+    sqlx::query("INSERT INTO accounts (id, public_key, name, from_name) VALUES ($1, 'pk_b', 'Other', 'Other')").bind(b).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, 'analyst')").bind(jo_id).bind(b).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO sso_identities (account_id, issuer, subject, user_id) VALUES ($1, $2, 'idp-jo', $3)").bind(b).bind(&idp.base).bind(jo_id).execute(&h.state.db).await.unwrap();
+    // Resetting Jo's link in Acme leaves the other account's alone.
+    ok(&h, &mut owner, "DELETE", &format!("/api/team/members/{jo_id}/sso"), None).await;
+    let links: Vec<Uuid> = sqlx::query_scalar("SELECT account_id FROM sso_identities WHERE user_id = $1").bind(jo_id).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(links, vec![b]);
+    let _ = a;
+
+    // A sign-in started under the old settings gets no session after they change.
+    let mut s = S::new("198.51.100.170");
+    let (_, _, headers) = send(&h, &mut s, "GET", "/api/auth/sso?email=jo%40acme.test", None).await;
+    let loc = headers[header::LOCATION].to_str().unwrap().to_string();
+    let q: HashMap<String, String> = url::Url::parse(&loc).unwrap().query_pairs().into_owned().collect();
+    let sso_cookie = headers.get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string()).find(|c| c.starts_with("pl_sso=")).unwrap();
+    let mut jo2 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": "a-new-secret"})))).await;
+    let g = oidc::Grant { email: "jo@acme.test".into(), sub: "idp-jo".into(), nonce: q["nonce"].clone(), challenge: q["code_challenge"].clone(), audience: q["client_id"].clone(), bad_key: false, verified: Some(true), amr: None };
+    idp.grants.lock().unwrap().insert("late-code".into(), g);
+    s.cookie = Some(sso_cookie);
+    let (st, _, headers) = send(&h, &mut s, "GET", &format!("/api/auth/sso/callback?code=late-code&state={}", urlencode(&q["state"])), None).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(headers[header::LOCATION].to_str().unwrap().ends_with("error=sso_changed"), "{headers:?}");
+    assert!(!s.cookie.as_deref().unwrap_or("").starts_with("pl_session="), "no session");
+    // A session made under the old settings stops working too.
+    assert_eq!(status(&h, &mut jo2, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    // Even one written straight in with the old revision is refused when it's used.
+    let rev: i32 = sqlx::query_scalar("SELECT revision FROM account_sso WHERE account_id = $1::uuid").bind(&a).fetch_one(&h.state.db).await.unwrap();
+    assert!(rev >= 2);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_right_password_gets_in_from_an_address_where_others_failed() {
+    let h = harness!();
+    let mut setup = S::new("198.51.100.180");
+    signup(&h, &mut setup, "owner@acme.test", "Acme").await;
+    // An office address: some colleagues mistype, and someone sprays guesses at many emails.
+    let mut office = S::new("203.0.113.77");
+    for i in 0..34 {
+        let (st, v) = call(&h, &mut office, "POST", "/api/auth/login", Some(json!({"email": format!("guess{i}@acme.test"), "password": "nope"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{i}: {v}");
+    }
+    // 34 failures from the address, past the old per-address limit (30): the right password still
+    // gets in, after a short wait.
+    let started = std::time::Instant::now();
+    let me = login(&h, &mut office, "owner@acme.test", "correct horse").await;
+    assert!(me["user"].is_object());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(800), "it waited {:?}", started.elapsed());
+    // A wrong password still gets the plain answer, never a lockout.
+    let (st, _) = call(&h, &mut S::new("203.0.113.77"), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "wrong"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn managers_see_the_team_but_not_its_security_details() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.190");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (mut manager, _) = join(&h, &mut owner, "boss@acme.test", "manager").await;
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "later@acme.test", "role": "analyst"}))).await;
+    let t = ok(&h, &mut manager, "GET", "/api/team", None).await;
+    assert_eq!(t["members"].as_array().unwrap().len(), 2);
+    assert!(t["members"][0].get("role").is_some() && t["members"][0].get("two_factor").is_none() && t["members"][0].get("last_active_at").is_none(), "{t}");
+    assert_eq!(t["invites"], json!([]));
+    assert_eq!(status(&h, &mut manager, "GET", "/api/team/security", None).await, StatusCode::FORBIDDEN);
+    let t = ok(&h, &mut owner, "GET", "/api/team", None).await;
+    assert!(t["members"][0].get("two_factor").is_some() && t["invites"].as_array().unwrap().len() == 1);
+    ok(&h, &mut owner, "GET", "/api/team/security", None).await;
+    // Invites are in the audit log even when sending the email is what fails later.
+    assert_eq!(ok(&h, &mut owner, "GET", "/api/audit?action=team.invite", None).await["total"], 2);
+    // Catalog feeds: added and changed are recorded (without the feed's address).
+    let f = ok(&h, &mut owner, "POST", "/api/catalog/feeds", Some(json!({"name": "Shop", "url": "https://shop.example.com/feed.json?token=s3cret"}))).await;
+    ok(&h, &mut owner, "PATCH", &format!("/api/catalog/feeds/{}", f["id"].as_str().unwrap()), Some(json!({"name": "Shop 2"}))).await;
+    let log = ok(&h, &mut owner, "GET", "/api/audit?action=product_feed.", None).await;
+    assert_eq!(log["total"], 2, "{log}");
+    assert!(!log.to_string().contains("s3cret"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn transactional_sending_needs_its_own_permission() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.200");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (mut analyst, _) = join(&h, &mut owner, "numbers@acme.test", "analyst").await;
+    let body = json!({"to": "buyer@customer.test", "content": {"subject": "Your receipt", "text": "Order 1042"}});
+    let (st, v) = call(&h, &mut analyst, "POST", "/api/transactional/send", Some(body.clone())).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(v["error"]["message"].as_str().unwrap().contains("role"), "{v}");
+    let messaging = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "m", "scopes": ["messaging"]}))).await["key"].as_str().unwrap().to_string();
+    let (st, v) = bearer(&h, &messaging, "POST", "/api/transactional/send", Some(body.clone())).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(v["error"]["message"].as_str().unwrap().contains("transactional.send"), "{v}");
+    let (err, text, _) = mcp(&h, &messaging, "send_transactional_email", body).await;
+    assert!(err && text.contains("transactional.send"), "{text}");
+    // Reading the log is like reading messages.
+    ok(&h, &mut analyst, "GET", "/api/transactional/sends", None).await;
     h.cleanup().await;
 }

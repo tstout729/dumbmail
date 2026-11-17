@@ -14,7 +14,7 @@ API and, for members, invites, API keys and the audit log, over MCP.
 | --- | --- |
 | Owner | Everything, including billing and transferring ownership. |
 | Admin | Everything except transferring ownership and setting up single sign-on. |
-| Manager | Campaigns (including sending), flows (including turning them live), forms, audience, content and account settings. No billing, team, API keys, domains or phone numbers. |
+| Manager | Campaigns (including sending), flows (including turning them live), forms, audience, content and account settings. Sees who's on the team and their roles. No billing, team changes, invites or sign-in activity, API keys, domains or phone numbers. |
 | Analyst | Read everything except billing, team management and the audit log, and export. Changes nothing. |
 | Content | Edit templates, images and campaign drafts, and send test emails to teammates. Can't send or schedule campaigns, change a scheduled campaign, send test texts, see profiles or export. |
 
@@ -22,10 +22,22 @@ The server checks every request, whatever the dashboard shows. A request a role 
 `403 forbidden` with a message naming the role.
 
 Reports and the product catalog: everyone who sees analytics reads reports; exports (people's data)
-need the export permission (analysts and up); saving, scheduling and deleting reports and changing
+need the export permission (analysts and up; API keys need the `audience` scope or `full`, never a
+read-only one); saving, scheduling and deleting reports and changing
 attribution are for managers and up. Everyone who sees content reads the catalog (who's waiting for
 a restock, and picks for a person, also need permission to read profiles); managers and up change
 products, feeds and alert settings; admins and up delete products and feeds.
+
+People's own values: grouping a report, a metric query (`group_by` an event property) or a funnel
+(`split_by` an event or profile property) by a raw property shows each value, which can be an
+email address. So it needs permission to read profiles, checked every time the report runs (REST,
+MCP, saved reports, CSV). Without it the request is refused with `403`; totals, time series and
+groups like day, campaign, flow or channel still work. A scheduled report grouped that way is only
+emailed to recipients who may read profiles.
+
+Transactional email (`POST /api/transactional/send`, the `send_transactional_email` tool) needs
+`transactional.send`: managers and up, and API keys with the `transactional.send` scope (or
+`full`). Reading the transactional log is like reading messages.
 
 Test sends: owners, admins and managers send tests to any address or number. Content members send
 test **emails** only, and only to the email addresses of the account's members that already have
@@ -35,8 +47,19 @@ Rules for owners:
 
 - Only owners can make someone an owner (invite as owner, promote, resend an owner invite), demote
   or remove an owner, or transfer ownership. These only work in the dashboard, from a session
-  that re-entered its password or a two-factor code in the last 10 minutes
-  (`POST /api/me/reauth` `{password}` or `{code}`). Never through an API key or MCP.
+  that confirmed it's you in the last 10 minutes. Never through an API key or MCP. Confirming
+  takes something that was already there:
+  - the current password (`POST /api/me/reauth` `{password}`);
+  - a code (`{code}`) from a two-factor app that was on before this session last confirmed it's
+    you (signing in with a code counts). Setting up a factor doesn't confirm anything, so a code
+    from a factor this session just added doesn't count until you sign in again with it;
+  - for logins that use Google: Continue with Google, which asks Google to make you sign in again
+    (`GET /api/auth/google?reauth=1&next=<page>`). It must be the login's own Google account and a
+    sign-in from the last 5 minutes (Google's `auth_time`); you come back to the page with
+    `?confirmed=google`, or `?confirm_error=<code>` when it didn't work. No new session starts.
+- Accepting an owner invite needs the same: a session that confirmed it's you, or a password or
+  Google sign-in, in the last 10 minutes. `GET /api/invites/{token}` says
+  `confirm_identity_first: true` when the page should ask first.
 - The last owner can't be removed or demoted. Make someone else an owner first, or transfer
   ownership (`POST /api/team/transfer`), which makes the other member the owner and you an admin.
 - An owner invite stops working if the owner who sent it isn't an owner anymore.
@@ -44,7 +67,9 @@ Rules for owners:
 
 ## Members and invites
 
-- `GET /api/team`: members (role, two-factor status, last active) and open invites.
+- `GET /api/team`: members and their roles. Admins and owners also get each member's two-factor
+  and single sign-on status, last activity and the open invites (`security_details: true`);
+  `GET /api/team/security` (the account's sign-in rules) is theirs too.
 - `POST /api/team/invites` `{email, role}`: emails an invite link. Links work for 7 days. When the
   server has no `SUPPORT_EMAIL`, the response includes `invite_url` to pass on yourself.
 - `POST /api/team/invites/{id}/resend`: a new link (the old one stops working) and 7 more days.
@@ -54,7 +79,8 @@ Rules for owners:
   single sign-on won't add them back until an owner or admin invites them again.
 - `DELETE /api/team/members/{user_id}/sso` (owners): unlink a member from the account's identity
   provider, for example after the provider gave them a new identity. Their single sign-on
-  sessions here end; their next single sign-on links by verified email again.
+  sessions here end; their next single sign-on links by verified email again. Links belong to
+  the account: another account that uses the same provider keeps its own.
 - `POST /api/team/leave`: take yourself off the account.
 
 Accepting an invite (`/invite/{token}` in the dashboard, `POST /api/invites/{token}/accept`):
@@ -79,9 +105,20 @@ can belong to up to 50 accounts.
 
 The dashboard sends the account a page was loaded for on every change (`X-DumbMail-Account:
 <account id>`). If the session has since opened another account (in another tab), the change is
-refused with `409 account_changed` and the page reloads. A browser-session change without the
-header is refused the same way when the login belongs to more than one account. API keys belong
-to one account and don't send it.
+refused with `409 account_changed` and the page reloads.
+
+Changes made with the session cookie (anything but GET, HEAD and OPTIONS) must come from the app
+itself, because other hosts under the same domain count as the same site and the browser sends
+them the cookie on a form post:
+
+- the `Origin` header (or, without one, the `Referer`) must name PUBLIC_URL's host. Another host,
+  `Origin: null`, or neither header is refused with `403`;
+- the `X-DumbMail-Account` header must be there, on every change, including ones with no body
+  (signing out, leaving a team, signing out other sessions). Without it the answer is `409
+  account_changed` with a message to reload; changes to the open account must name it.
+
+Sign-in, sign-up and password reset refuse a request whose `Origin` names another site; scripts
+that send no `Origin` still work. API keys don't use the cookie and aren't affected.
 
 ## Two-factor login
 
@@ -101,10 +138,13 @@ Owners and admins can require two-factor login for every member (`PATCH /api/tea
 (`restriction: "two_factor_setup"`). This also applies to Google sign-ins: we can't tell whether
 someone's Google account uses two-step verification, so they enter our code too.
 
-A single sign-on sign-in counts as two-factor only when the ID token's `amr` claim shows a second
-factor (`mfa`, `otp`, `hwk`, `swk`, `sms`, `fpt`, `face` and the other RFC 8176 values that mean
-one), or when the owner ticked "Our identity provider enforces two-step verification". Otherwise
-the person also enters their DumbMail code. A login that exists only through single sign-on (no
+A single sign-on sign-in counts as two-factor only when the ID token's `amr` claim shows two
+factors: `mfa`, or at least two different kinds (something known, `pwd`, `pin` or `kba`, with
+something held, `otp`, `hwk`, `swk`, `sms`, `tel`, `sc` or `pop`, or something you are, `fpt`,
+`face`, `iris`, `retina` or `vbm`). One method on its own, even `otp` or `hwk`, isn't enough. It
+also counts when the owner ticked "Our identity provider enforces two-step verification";
+unticking it ends the single sign-on sessions that relied on it. Otherwise the person also enters
+their DumbMail code. A login that exists only through single sign-on (no
 password, no Google) can set its code up in that session; others set it up after signing in with
 their password or Google.
 
@@ -125,9 +165,12 @@ sessions that never entered one).
   session. The forgot answer is the same whether or not the email has a login.
 
 Sign-in, reset, invite and code attempts are rate limited and answer `429 busy` when
-exceeded. For password sign-in only failures count: 30 per address and 10 per email from one
-address in 15 minutes. Failures for one email from everywhere only make the next check wait a
-little (up to 3 seconds), so strangers guessing can't lock the real person out. A password change
+exceeded. For password sign-in only failures count, and only one thing is refused: 10 wrong
+passwords for one email from one address in 15 minutes. Everything else only makes the next check
+wait: failures for one email from everywhere (up to 3 seconds), and failures from one address
+across emails, after the first 30 (up to 8 seconds). An address can have only 4 password checks
+running at once. So a shared address (an office) is slowed down, never locked out, and the right
+password gets in once its wait is over. A password change
 or reset also stops any sign-in that checked the old password from getting a session.
 
 ## API keys
@@ -208,8 +251,11 @@ Workspace, Auth0 and others) in Settings → Security, or with `PUT /api/team/ss
   removed from the account isn't added back until an owner or admin invites them again; signing
   in through the provider then accepts that invite.
 - `idp_enforces_mfa` ("Our identity provider enforces two-step verification"): see Two-factor login.
-- Turning single sign-on off, removing it, or changing the issuer or client ID signs out everyone
-  who signed in through it.
+- Changing anything that decides who gets in (the issuer, client ID or secret, the domains,
+  turning it off, `verified_emails_only` or `idp_enforces_mfa`), or removing single sign-on, signs
+  out everyone who signed in through it, and a sign-in that was already at the provider gets no
+  session (the login page says `sso_changed`; they sign in again). Changing `enforce`,
+  `auto_join` or `default_role` leaves sessions alone.
 - `enforce` makes members on those domains sign in with single sign-on. Owners can still use
   their password, so a broken identity provider can't lock everyone out.
 - The client secret is stored encrypted and never shown again; responses show its last 4

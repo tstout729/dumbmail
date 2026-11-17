@@ -941,7 +941,9 @@ fn growth_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
 fn metric_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
     let (s, e) = (q.bind(Arg::Ts(w.start)), q.bind(Arg::Ts(w.end)));
     let metric = q.bind(Arg::Text(c.spec.metric.clone().unwrap_or_default()));
-    let prop = c.spec.property.clone().map(|p| q.bind(Arg::Text(p)));
+    // Bound only when this query groups by it: the totals query (no groups) mustn't carry an
+    // unused parameter, which Postgres refuses.
+    let prop = c.spec.property.clone().filter(|_| groups.iter().any(|g| g == "property")).map(|p| q.bind(Arg::Text(p)));
     let (k, by) = keys_simple(groups, |g| {
         time_key(g, "e.occurred_at", &c.tz).unwrap_or_else(|| match g {
             "country" => "p.properties->>'country'".into(),
