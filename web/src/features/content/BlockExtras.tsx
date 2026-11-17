@@ -4,8 +4,25 @@ import { Bookmark, Eye, Unlink } from "lucide-react";
 import type { EmailBlock } from "../../api/types";
 import { Button, EmptyState, Field, Input, Modal, Select, Skeleton, cx } from "../../components/ui";
 import { toast } from "../../lib/toast";
-import { useCreateSavedBlock, useSavedBlocks } from "./api";
-import type { DisplayRule, RuleOp } from "./types";
+import { contentApi, useCreateSavedBlock, useSavedBlocks } from "./api";
+import type { DisplayRule, RuleOp, ShowIf } from "./types";
+
+const maxRules = 5;
+
+function ruleList(v: ShowIf | null | undefined): DisplayRule[] {
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function fromList(list: DisplayRule[]): ShowIf | null {
+  if (list.length === 0) return null;
+  return list.length === 1 ? list[0] : list;
+}
+
+/** Both rules must hold: a detached saved block keeps its own rule on top of each block's. */
+export function combineRules(outer: ShowIf | null | undefined, inner: ShowIf | null | undefined): ShowIf | null {
+  return fromList([...ruleList(outer), ...ruleList(inner)].slice(0, maxRules));
+}
 
 type Subject = "first_name" | "email" | "property" | "event_property" | "event_value" | "advanced";
 
@@ -52,7 +69,41 @@ function fieldOf(subject: Subject, key: string): string {
   }
 }
 
-/** "Show this block only when…": a simple rule or an advanced expression. */
+/** "Show this block only when…": one rule, or several that must all be true. */
+export function ShowIfEditor({ value, onChange }: { value: ShowIf | null | undefined; onChange: (v: ShowIf | null) => void }) {
+  const list = ruleList(value);
+  if (list.length <= 1) {
+    return (
+      <div className="space-y-1.5">
+        <DisplayRuleEditor rule={list[0]} onChange={(r) => onChange(r)} />
+        {list.length === 1 ? (
+          <button type="button" className="text-xs font-medium text-zinc-600 hover:text-zinc-900" onClick={() => onChange([list[0], { field: "person.properties.", op: "eq", value: "" }])}>
+            + Add another rule (all must be true)
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs font-medium text-zinc-700">Show this block only when all of these are true</p>
+      {list.map((r, i) => (
+        <DisplayRuleEditor
+          key={i}
+          rule={r}
+          onChange={(next) => onChange(fromList(next ? list.map((x, j) => (j === i ? next : x)) : list.filter((_, j) => j !== i)))}
+        />
+      ))}
+      {list.length < maxRules ? (
+        <button type="button" className="text-xs font-medium text-zinc-600 hover:text-zinc-900" onClick={() => onChange([...list, { field: "person.properties.", op: "eq", value: "" }])}>
+          + Add another rule
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** One display rule: a simple rule or an advanced expression. */
 export function DisplayRuleEditor({ rule, onChange }: { rule: DisplayRule | null | undefined; onChange: (r: DisplayRule | null) => void }) {
   const [open, setOpen] = useState(Boolean(rule));
   if (!open && !rule) {
@@ -116,7 +167,7 @@ export function DisplayRuleEditor({ rule, onChange }: { rule: DisplayRule | null
         )}
       </div>
       {advanced && rule && "expr" in rule ? (
-        <Field label="Expression" hint="Any template expression, like: event.value > 100 and person.properties.vip">
+        <Field label="Expression" hint="Compare and combine values, like: event.value > 100 and person.properties.vip. If it can't be worked out for someone, the block is hidden for them.">
           <Input value={rule.expr} onChange={(e) => onChange({ expr: e.target.value })} className="font-mono text-xs" />
         </Field>
       ) : null}
@@ -169,8 +220,25 @@ export function SaveAsSavedBlock({ block, onSaved }: { block: EmailBlock; onSave
   );
 }
 
-/** Actions for a saved block in an email: edit it everywhere, or detach a copy. */
+/** Actions for a saved block in an email: edit it everywhere, or detach a copy of what it shows now. */
 export function SavedRefActions({ block, onDetach }: { block: Extract<EmailBlock, { type: "saved" }>; onDetach: (blocks: EmailBlock[]) => void }) {
+  const [detaching, setDetaching] = useState(false);
+  const detach = async () => {
+    // A copied-in (sent) reference shows its copy; a linked one shows the saved block as it is now.
+    if (block.frozen || !block.saved_block_id) {
+      onDetach(block.blocks);
+      return;
+    }
+    setDetaching(true);
+    try {
+      const shown = await contentApi.savedBlockShown(block.saved_block_id);
+      onDetach(shown.blocks);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Couldn't load the saved block; try again.");
+    } finally {
+      setDetaching(false);
+    }
+  };
   return (
     <div className="flex flex-wrap gap-1.5">
       {block.saved_block_id && !block.frozen ? (
@@ -178,7 +246,7 @@ export function SavedRefActions({ block, onDetach }: { block: Extract<EmailBlock
           Edit saved block
         </Link>
       ) : null}
-      <Button size="sm" variant="ghost" icon={<Unlink className="size-3.5" />} onClick={() => onDetach(block.blocks)}>
+      <Button size="sm" variant="ghost" icon={<Unlink className="size-3.5" />} loading={detaching} onClick={() => void detach()}>
         Detach and edit here
       </Button>
     </div>
@@ -232,9 +300,9 @@ export function SavedBlockPicker({ onPick, onClose }: { onPick: (b: EmailBlock) 
 export function BlockOptionsPanel({ block, nested, onChange, onReplace }: { block: EmailBlock; nested?: boolean; onChange: (b: EmailBlock) => void; onReplace: (items: EmailBlock[]) => void }) {
   return (
     <div className="space-y-2 border-t border-zinc-100 pt-3">
-      <DisplayRuleEditor rule={block.show_if} onChange={(show_if) => onChange({ ...block, show_if: show_if ?? undefined })} />
+      <ShowIfEditor value={block.show_if} onChange={(show_if) => onChange({ ...block, show_if: show_if ?? undefined })} />
       {block.type === "saved" ? (
-        <SavedRefActions block={block} onDetach={(items) => onReplace(items.map((b) => (block.show_if && !b.show_if ? { ...b, show_if: block.show_if } : b)))} />
+        <SavedRefActions block={block} onDetach={(items) => onReplace(items.map((b) => ({ ...b, show_if: combineRules(block.show_if, b.show_if) ?? undefined })))} />
       ) : !nested ? (
         <SaveAsSavedBlock block={block} onSaved={(ref) => onChange({ ...ref, show_if: block.show_if })} />
       ) : null}

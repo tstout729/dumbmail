@@ -4,8 +4,11 @@ import type { Align, EmailBlock, EmailContent, Template } from "../../api/types"
 export type RuleOp = "set" | "not_set" | "eq" | "neq" | "contains" | "gt" | "lt";
 export type DisplayRule = { field: string; op: RuleOp; value?: string } | { expr: string };
 
+/** One rule, or several that must all be true (at most 5). */
+export type ShowIf = DisplayRule | DisplayRule[];
+
 /** Options every block can carry. */
-export type BlockOptions = { show_if?: DisplayRule | null };
+export type BlockOptions = { show_if?: ShowIf | null };
 
 export type SocialNetwork = "instagram" | "facebook" | "tiktok" | "x" | "youtube" | "pinterest" | "linkedin" | "threads" | "website" | "email";
 export type IconStyle = "color" | "dark" | "light" | "white";

@@ -16,6 +16,8 @@ export type SavedBlockInput = { name?: string; blocks?: EmailBlock[] };
 export const contentApi = {
   savedBlocks: () => api<{ data: SavedBlock[]; total: number }>("GET", "/api/content/saved-blocks"),
   savedBlock: (id: string) => api<SavedBlockDetail>("GET", `/api/content/saved-blocks/${id}`),
+  /** The content an email using this saved block shows now (also after it was deleted). */
+  savedBlockShown: (id: string) => api<SavedBlockDetail & { deleted?: boolean }>("GET", withQuery(`/api/content/saved-blocks/${id}`, { include_deleted: true })),
   createSaved: (input: SavedBlockInput) => api<SavedBlock>("POST", "/api/content/saved-blocks", input),
   updateSaved: (id: string, input: SavedBlockInput) => api<SavedBlockDetail>("PATCH", `/api/content/saved-blocks/${id}`, input),
   removeSaved: (id: string) => api<{ ok: true }>("DELETE", `/api/content/saved-blocks/${id}`),
