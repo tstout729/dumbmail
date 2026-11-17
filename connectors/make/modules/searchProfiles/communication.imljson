@@ -1,0 +1,13 @@
+{
+	"url": "/api/profiles",
+	"method": "GET",
+	"qs": {
+		"q": "{{parameters.query}}",
+		"limit": "{{ifempty(parameters.limit, 10)}}"
+	},
+	"response": {
+		"iterate": "{{body.data}}",
+		"output": "{{item}}",
+		"limit": "{{ifempty(parameters.limit, 10)}}"
+	}
+}

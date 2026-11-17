@@ -1,0 +1,11 @@
+{
+	"url": "/api/profiles",
+	"method": "POST",
+	"body": {
+		"phone_number": "{{parameters.phone_number}}",
+		"sms_consent": "unsubscribed"
+	},
+	"response": {
+		"output": "{{body}}"
+	}
+}

@@ -1,0 +1,3 @@
+[
+	{ "name": "phone_number", "type": "text", "label": "Phone number", "required": true, "help": "International format, e.g. +15035550100." }
+]

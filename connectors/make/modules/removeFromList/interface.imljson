@@ -1,0 +1,5 @@
+[
+	{ "name": "list_id", "type": "text", "label": "List ID" },
+	{ "name": "profile_id", "type": "text", "label": "Profile ID" },
+	{ "name": "removed", "type": "number", "label": "Removed (0 if not on the list)" }
+]

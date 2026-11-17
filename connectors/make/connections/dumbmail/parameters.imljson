@@ -1,0 +1,19 @@
+[
+	{
+		"name": "apiKey",
+		"type": "password",
+		"label": "API key",
+		"help": "A private API key from DumbMail: Settings → Developers → Create key. It starts with `pl_sk_`.",
+		"required": true,
+		"editable": true
+	},
+	{
+		"name": "baseUrl",
+		"type": "url",
+		"label": "DumbMail address",
+		"help": "Leave as is unless you run your own DumbMail server; then enter its https:// address.",
+		"default": "https://dumbmail.ai",
+		"advanced": true,
+		"editable": true
+	}
+]
