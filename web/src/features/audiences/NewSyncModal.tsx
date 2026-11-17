@@ -130,7 +130,7 @@ export function NewSyncModal({ connections, settings, initialSource, onClose, on
                 ))}
                 {manual ? <option value={OTHER}>Another account (enter its ID)</option> : null}
               </Select>
-            ) : !manual ? (
+            ) : !manual && !accounts.error ? (
               <p className="text-sm text-zinc-500">This sign-in can't reach any {label} ad accounts. Check its permissions on {label}, then reconnect.</p>
             ) : null}
           </Field>

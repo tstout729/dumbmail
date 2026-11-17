@@ -200,7 +200,7 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
                     <div className="text-xs text-zinc-500">
                       {triggerLabel[r.trigger]}
                       {modeLabel[r.mode]} · +{formatNumber(r.added)} / −{formatNumber(r.removed)} confirmed
-                      {r.skipped ? ` · ${formatNumber(r.skipped)} had no email the platform can use` : ""}
+                      {r.skipped ? ` · ${formatNumber(r.skipped)} had nothing the platform can match on` : ""}
                       {r.rejected ? ` · ${formatNumber(r.rejected)} not confirmed by the platform` : ""}
                     </div>
                     {r.error ? <div className="mt-0.5 text-xs text-red-700">{r.error}</div> : null}

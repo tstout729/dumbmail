@@ -94,7 +94,7 @@ pub async fn connections(state: &AppState, account_id: Uuid) -> AppResult<Value>
                 "connected_at": c.filter(|_| connected).and_then(|c| c.connected_at),
                 "token_expires_at": c.filter(|_| connected).and_then(|c| c.token_expires_at),
                 // Meta's sign-ins aren't renewed on the server: ask for a reconnect in the last week.
-                "expires_soon": c.filter(|_| status == "connected").and_then(|c| c.token_expires_at).is_some_and(|e| e < chrono::Utc::now() + chrono::Duration::days(7)),
+                "expires_soon": c.filter(|_| status == "connected" && *p == Platform::Meta).and_then(|c| c.token_expires_at).is_some_and(|e| e < chrono::Utc::now() + chrono::Duration::days(7)),
                 "error": c.filter(|_| status == "needs_reconnect").and_then(|c| c.error_code.as_deref()).map(|code| platforms::words(*p, code)),
                 "last_revoke": c.filter(|_| !connected).and_then(|c| c.revoke_status.clone()),
                 "manual_account_entry": *p == Platform::Google,
