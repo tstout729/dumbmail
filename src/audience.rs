@@ -244,7 +244,8 @@ pub fn is_reserved_metric(name: &str) -> bool {
     is_server_only_metric(name) || named(BROWSER_RESERVED_METRICS, name)
 }
 
-/// Record an event and wake any live flows triggered by that metric. Returns None for duplicates.
+/// Record an event and wake any live flows triggered by that metric (and features that asked to
+/// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
     insert_event(db, ev, false).await
 }
@@ -293,7 +294,7 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppR
     .bind(ev.metric)
     .fetch_one(db)
     .await?;
-    if has_flow {
+    if has_flow || crate::features::wants_event(db, ev.account_id, ev.metric).await {
         crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await?;
     }
     Ok(Some(event_id))

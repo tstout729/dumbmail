@@ -371,7 +371,9 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
     }
     let account = load_account(&state.db, account_id).await?;
-    let problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    // Coupons the content uses: they exist, haven't expired and have codes for the audience.
+    problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &c).await?);
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }

@@ -283,7 +283,9 @@ async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Respo
         Confirmed::Joined(a) | Confirmed::Already(a) => {
             let acct = account_of(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
-            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>", esc(&name)))
+            // A form with a coupon hands out its code once the address is confirmed.
+            let code = crate::features::coupons::assign::confirmation_code(state, id).await.map(|c| format!("<p>Your code: <strong>{}</strong></p>", esc(&c))).unwrap_or_default();
+            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>{code}", esc(&name)))
         }
         Confirmed::Expired(a) => (account_of(a).await, "<h1>This link has expired</h1><p>Sign up again and we'll send you a new one.</p>".to_string()),
     };
@@ -773,6 +775,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(code) = crate::forms::discount_code(&form.config, version) {
         out["discount_code"] = json!(code);
     }
+    // A form with a coupon gives each person it signed up their own code instead (see features::coupons).
+    crate::features::coupons::assign::form_sign_up(state, account, &form, p.id, upserted.created, ip, &mut out).await;
     Ok(out)
 }
 

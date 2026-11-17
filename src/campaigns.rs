@@ -172,7 +172,7 @@ pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &A
 }
 
 /// Appends `FROM profiles p WHERE ...` selecting a campaign's reachable recipients.
-async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+pub async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
     if audience.include.is_empty() {
         return Err(AppError::bad("choose at least one list or segment to send to"));
     }
