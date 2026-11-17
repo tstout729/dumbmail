@@ -40,7 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/credit", post(admin_credit))
         .route("/admin/unpause", post(admin_unpause))
         .route("/admin/sending-limit", post(admin_sending_limit))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
 }
 
 const GIF: &[u8] = &[
@@ -70,6 +70,11 @@ async fn load_msg(state: &AppState, id: Uuid) -> AppResult<Option<Msg>> {
         .bind(id)
         .fetch_optional(&state.db)
         .await?)
+}
+
+/// Liveness, plus the commit this build came from (set by the deploy job; empty for local builds).
+async fn healthz() -> Json<Value> {
+    Json(json!({"ok": true, "git_sha": option_env!("GIT_SHA").unwrap_or("")}))
 }
 
 async fn msg_event(state: &AppState, m: &Msg, metric: &str, extra: Value, unique: Option<String>) -> AppResult<()> {
