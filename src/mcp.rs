@@ -370,7 +370,7 @@ Read dumbmail://docs/segments for the details and examples.",
             obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 365}, "channel": {"enum": ["email", "sms"]}, "sort": {"enum": ["revenue", "open_rate", "click_rate", "recipients", "sent_at"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}), &[]), true, false),
         tool("list_flows", "List flows", "All flows with status, trigger and performance.", obj(json!({}), &[]), true, false),
         tool("get_flow", "Get a flow", "One flow's trigger, full step graph, settings and per-step stats.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
-        tool("list_flow_blueprints", "List flow blueprints", "Proven starter flows (welcome series, abandoned checkout, browse abandonment, post-purchase, winback, birthday) with their full definitions.", obj(json!({}), &[]), true, false),
+        tool("list_flow_blueprints", "List flow blueprints", "Proven starter flows (welcome series, abandoned checkout, browse abandonment, post-purchase, winback, back in stock, price drop, birthday) with their full definitions.", obj(json!({}), &[]), true, false),
         tool("create_flow_from_blueprint", "Create a flow from a blueprint", "Create a draft flow from a blueprint key (creates the list/segment it needs). Edit its content with update_flow, then set_flow_status live.", obj(json!({"key": {"type": "string"}, "name": {"type": "string"}}), &["key"]), false, false),
         tool("create_flow", "Create a custom flow", "Create a draft flow from a trigger and a step graph. Validated for missing fields, dangling edges and loops. Nothing runs until it is set live.", obj(json!({"name": {"type": "string"}, "trigger": trigger, "definition": flow_def}), &["name", "trigger", "definition"]), false, false),
         tool("update_flow", "Update a flow", "Rename a flow or replace its trigger or definition (the whole graph). Live flows apply changes to people already waiting in them.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "trigger": trigger, "definition": flow_def}), &["id"]), false, false),
@@ -847,6 +847,10 @@ A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up 
 
 Numeric measures use `eq`, `neq`, `gt`, `gte`, `lt`, `lte` and `between`. People with no orders match only where a figure exists for them: `historic_clv` and `predicted_clv` are 0 and `order_count` is 0.
 
+## Products
+
+`{"type": "product", "action": "ordered" | "viewed" | "carted" | "checkout", "product_id": "TEE-1", "category": "Shirts", "tag": "organic", "brand": "Acme", "op": "at_least" | "at_most" | "exactly" | "zero", "count": 1, "within_days": 90}` counts the events in which someone did that with one product (the store's id) or any product in a category, with a tag or of a brand. Leave all four out for any product. `since` and `until` work too. It reads the product catalog (dumbmail://docs/catalog), so products a store sells but the catalog doesn't know yet don't count. To match on a property the event carries itself, use an `event` rule with `where`, e.g. Viewed Product where `product_id` eq `TEE-1`.
+
 ## Random sample
 
 `{"type": "random", "percent": 10, "seed": "holdout-nov"}` keeps a stable share of profiles: the same seed always picks the same people. Use a seed per test, and pair it with `"op": "not_in"` on a saved segment (or a group) for the rest.
@@ -870,6 +874,8 @@ const EMAIL_DOC: &str = r#"# Email content
   {"type": "text", "html": "<p>Questions? Just reply to this email.</p>"}
  ]}
 ```
+
+Products from the catalog (dumbmail://docs/catalog): `{"type": "products", "source": "handpicked" | "collection" | "best_sellers" | "newest" | "on_sale" | "event_items" | "recently_viewed" | "recommended", "count": 4, "columns": 2, "fallback": "best_sellers"}` is filled for each person when the email sends: `event_items` shows the triggering event's cart, viewed product or order; `recommended` picks for the person. Options: `product_ids` (handpicked), `category` / `tag` / `brand` (collection), `days` (best_sellers), `show_price`, `show_compare_at`, `show_button`, `button_text`, `hide_out_of_stock`. Templates can also use `{{ catalog.products["TEE-1"].title }}`, `catalog.best_sellers`, `catalog.newest`, `catalog.on_sale` and `recommendations` (lists of products with `title`, `url`, `image_url`, `price_text`, ...).
 
 Variables (Jinja): `first_name`, `last_name`, `email`, `phone_number`, any custom property by name, `person.properties.x`, `event.properties.x` and `event.value` (flows), `organization.name`, `organization.website`, `unsubscribe_url`. Filters: `default('x')`, `upper`, `title`, `round`. The footer with the mailing address and unsubscribe link is added automatically; links are click-tracked automatically.
 

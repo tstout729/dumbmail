@@ -721,6 +721,11 @@ fn email(id: &str, name: &str, subject: &str, preheader: &str, heading: &str, bo
     })
 }
 
+/// The cart's products, filled from the triggering event (see `features::catalog`).
+fn cart_items() -> Value {
+    json!({"type": "products", "source": "event_items", "count": 6, "columns": 2, "button_text": "View", "hide_out_of_stock": false})
+}
+
 fn delay(id: &str, amount: f64, unit: &str, next: Option<&str>) -> Value {
     json!({"id": id, "type": "delay", "amount": amount, "unit": unit, "next": next})
 }
@@ -757,12 +762,20 @@ pub fn blueprints(website: &str) -> Vec<Value> {
                     "blocks": [
                         {"type": "heading", "text": "Still thinking it over?"},
                         {"type": "text", "html": "<p>We saved your cart. Finish checking out whenever you're ready.</p>"},
+                        cart_items(),
                         {"type": "button", "text": "Return to my cart", "href": cart}
                     ]}}),
                 delay("a2", 1.0, "days", Some("a3")),
                 json!({"id": "a3", "type": "condition", "condition": {"match": "all", "conditions": [{"type": "consent", "channel": "sms", "status": "subscribed"}]}, "yes": "a4", "no": "a5"}),
                 json!({"id": "a4", "type": "sms", "name": "SMS nudge", "next": null, "content": {"body": "Hi {{ first_name|default('there') }}, your cart is waiting: " .to_string() + cart}}),
-                email("a5", "Last call", "Last chance: your cart expires soon", "Don't miss out", "Your cart is about to expire", "<p>Items in your cart are popular. Complete your order before they sell out.</p>", ("Complete my order", cart), None)
+                json!({"id": "a5", "type": "email", "name": "Last call", "next": null, "content": {
+                    "subject": "Last chance: your cart expires soon", "preheader": "Don't miss out",
+                    "blocks": [
+                        {"type": "heading", "text": "Your cart is about to expire", "align": "left"},
+                        {"type": "text", "html": "<p>Items in your cart are popular. Complete your order before they sell out.</p>"},
+                        cart_items(),
+                        {"type": "button", "text": "Complete my order", "href": cart}
+                    ]}})
             ]}
         }),
         json!({
@@ -778,7 +791,9 @@ pub fn blueprints(website: &str) -> Vec<Value> {
                     "subject": "Still thinking about {{ event.properties.name|default('it') }}?", "preheader": "Take another look",
                     "blocks": [
                         {"type": "heading", "text": "Take another look"},
-                        {"type": "product", "title": "{{ event.properties.name }}", "image": "{{ event.properties.image_url }}", "price": "{{ event.properties.price }}", "href": "{{ event.properties.url|default(organization.website) }}", "button_text": "View it again"}
+                        {"type": "products", "source": "event_items", "count": 1, "columns": 1, "button_text": "View it again", "hide_out_of_stock": false},
+                        {"type": "text", "html": "<p>You might also like:</p>"},
+                        {"type": "products", "source": "recommended", "count": 3, "columns": 3, "button_text": "Shop now", "fallback": "best_sellers"}
                     ]}})
             ]}
         }),
@@ -802,6 +817,37 @@ pub fn blueprints(website: &str) -> Vec<Value> {
                 {"type": "event", "metric": "Placed Order", "op": "zero", "within_days": 90}]}},
             "definition": {"entry": "x1", "settings": {"reentry": {"after_days": 180}}, "nodes": [
                 email("x1", "We miss you", "We miss you, {{ first_name|default('friend') }}", "Here's what's new", "It's been a while", "<p>A lot has changed since your last visit. Come see what's new.</p>", ("See what's new", site), None)
+            ]}
+        }),
+        json!({
+            "key": "back_in_stock", "name": "Back in stock",
+            "description": "Email people the moment a product they asked about is back. Needs the back-in-stock widget on your product pages and a product catalog.",
+            "channel_mix": ["email"],
+            "trigger": {"type": "metric", "metric": "Back in Stock"},
+            "definition": {"entry": "k1", "settings": {"reentry": "always"}, "nodes": [
+                json!({"id": "k1", "type": "email", "name": "It's back", "next": null, "content": {
+                    "subject": "{{ event.properties.name|default('It') }} is back in stock", "preheader": "Get it before it sells out again",
+                    "blocks": [
+                        {"type": "heading", "text": "It's back!"},
+                        {"type": "text", "html": "<p>You asked us to tell you when this was back. It is, but stock is limited.</p>"},
+                        {"type": "products", "source": "event_items", "count": 1, "columns": 1, "button_text": "Get it now", "hide_out_of_stock": false}
+                    ]}})
+            ]}
+        }),
+        json!({
+            "key": "price_drop", "name": "Price drop",
+            "description": "Tell people who viewed or carted a product that its price just dropped. Needs a product catalog (a feed, CSV or the API) to see price changes.",
+            "channel_mix": ["email"],
+            "trigger": {"type": "metric", "metric": "Price Dropped"},
+            "definition": {"entry": "r1", "settings": {"reentry": "always", "smart_sending_hours": 16, "exit_condition": {"match": "all", "conditions": [
+                {"type": "event", "metric": "Placed Order", "op": "at_least", "count": 1, "within_days": 1}]}}, "nodes": [
+                json!({"id": "r1", "type": "email", "name": "Price dropped", "next": null, "content": {
+                    "subject": "Price drop: {{ event.properties.name|default('something you liked') }}", "preheader": "Now {{ event.properties.new_price_text }}",
+                    "blocks": [
+                        {"type": "heading", "text": "Good news: it's cheaper now"},
+                        {"type": "text", "html": "<p>{{ event.properties.name }} was {{ event.properties.old_price_text }}. It's now {{ event.properties.new_price_text }}.</p>"},
+                        {"type": "products", "source": "event_items", "count": 1, "columns": 1, "button_text": "Take a look"}
+                    ]}})
             ]}
         }),
         json!({
