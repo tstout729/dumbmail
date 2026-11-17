@@ -219,15 +219,56 @@ pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str
     Ok(())
 }
 
+/// Metrics only DumbMail itself records, from a real stock or price change or a confirmed request:
+/// nobody may send them, not even with an API key. Feature modules add theirs here.
+pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock"];
+
+/// Metrics the server records about messages, consent and sign-ups. Flows trust them, so a browser
+/// (the public `/client/events` endpoint) may not send them. The API and MCP still may (for imports).
+/// Feature modules add theirs here.
+pub const BROWSER_RESERVED_METRICS: &[&str] = &[
+    "Subscribed to List", "Unsubscribed from List", "Unsubscribed", "Subscribed to SMS", "Unsubscribed from SMS",
+    "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam",
+    "Received SMS", "Clicked SMS", "Received SMS Reply",
+];
+
+fn named(list: &[&str], name: &str) -> bool {
+    let n = name.trim();
+    list.iter().any(|m| m.eq_ignore_ascii_case(n))
+}
+
+/// Only the server records this metric (see [`SERVER_ONLY_METRICS`]).
+pub fn is_server_only_metric(name: &str) -> bool {
+    named(SERVER_ONLY_METRICS, name)
+}
+
+/// A browser may not record this metric (see [`BROWSER_RESERVED_METRICS`] and [`SERVER_ONLY_METRICS`]).
+pub fn is_reserved_metric(name: &str) -> bool {
+    is_server_only_metric(name) || named(BROWSER_RESERVED_METRICS, name)
+}
+
 /// Record an event and wake any live flows triggered by that metric (and features that asked to
 /// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
+    insert_event(db, ev, false).await
+}
+
+/// Record an event a browser sent through the public endpoint. It's marked as such, so features
+/// can tell it from server-confirmed data (e.g. browser orders don't make best sellers).
+pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
+    if is_reserved_metric(ev.metric) {
+        return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", ev.metric.trim())));
+    }
+    insert_event(db, ev, true).await
+}
+
+async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
     let id = Uuid::now_v7();
     let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
     let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id)
-         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9)
+        "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
+         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
          ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
          RETURNING id",
     )
@@ -240,6 +281,7 @@ pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uui
     .bind(ev.occurred_at)
     .bind(&ev.unique_id)
     .bind(ev.message_id)
+    .bind(from_browser)
     .fetch_optional(db)
     .await?;
     let Some(event_id) = inserted else { return Ok(None) };
