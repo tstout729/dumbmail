@@ -287,16 +287,27 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
-    // Unique coupon codes are claimed here, after the checks above and just before rendering; a code
-    // stays the person's if a later check skips or defers this attempt. An empty pool holds the
-    // message. Messages without coupons do no coupon work (see features::coupons).
-    let coupons = match crate::features::coupons::assign::prepare_send(state, &spec, message_id).await? {
+    // Saved blocks, display rules and the content module's blocks are worked out per recipient (see
+    // features::content); email that uses none of them goes on untouched. When every block is hidden
+    // for this person they get nothing (a test send says why). This runs before coupon codes are
+    // claimed, so a code is only used for what this person will see.
+    let Some(prepared) = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await? else {
+        if spec.is_test {
+            return Err(AppError::bad("Nothing to show for this person: every block is hidden by a display rule, so they'd be skipped."));
+        }
+        return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
+    };
+    // Unique coupon codes are claimed here, after the checks above and just before rendering, for the
+    // coupons the prepared content shows; a code stays the person's if a later check skips or defers
+    // this attempt. An empty pool holds the message. Messages without coupons do no coupon work (see
+    // features::coupons).
+    let coupons = match crate::features::coupons::assign::prepare_send_for(state, &spec, &prepared, message_id).await? {
         crate::features::coupons::Prepared::Ready(c) => c,
         crate::features::coupons::Prepared::Hold(until) => return Ok(Outcome::Deferred(until)),
     };
     coupons.fill(&mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
-    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,

@@ -421,7 +421,8 @@ pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
     for f in flows {
         if let Ok(Trigger::Metric { filters, .. }) = parse_trigger(&f.trigger) {
             if filters.iter().all(|flt| segments::json_filter_matches(&obj, flt)) {
-                let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at}});
+                // `from_browser`: recorded by the website script (anyone can send those); unknown counts as true.
+                let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at, "from_browser": from_browser != Some(false)}});
                 start(state, &f, profile_id, ctx).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
             }
         }

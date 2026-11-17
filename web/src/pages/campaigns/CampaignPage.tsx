@@ -18,6 +18,7 @@ import {
 } from "../../api";
 import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
@@ -313,6 +314,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
                 defaultTo={campaign.channel === "email" ? user.email : ""}

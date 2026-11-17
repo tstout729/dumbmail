@@ -939,6 +939,24 @@ const EMAIL_DOC: &str = r#"# Email content
 
 Products from the catalog (dumbmail://docs/catalog): `{"type": "products", "source": "handpicked" | "collection" | "best_sellers" | "newest" | "on_sale" | "event_items" | "recently_viewed" | "recommended", "count": 4, "columns": 2, "fallback": "best_sellers"}` is filled for each person when the email sends: `event_items` shows the triggering event's cart, viewed product or order; `recommended` picks for the person. Options: `product_ids` (handpicked), `category` / `tag` / `brand` (collection), `days` (best_sellers), `show_price`, `show_compare_at`, `show_button`, `button_text`, `hide_out_of_stock`. Templates can also use `{{ organization.catalog.products["TEE-1"].title }}`, `organization.catalog.best_sellers`, `.newest`, `.on_sale` and `person.recommendations` (lists of products with `title`, `url`, `image_url`, `price_text`, ...). The short names `catalog` and `recommendations` work too unless a profile on the account has a property with that name (then the property keeps it).
 
+More blocks (full reference: dumbmail://docs/content):
+
+```json
+{"type": "social", "links": [{"network": "instagram", "url": "https://..."}], "style": "color" | "dark" | "light" | "white", "size": 24 | 32 | 40, "align": "center"}
+{"type": "video", "url": "https://youtu.be/...", "thumbnail": "https://...", "alt": "Watch the launch", "caption": "1 minute"}
+{"type": "countdown", "ends_at": "2026-12-01T08:00:00-08:00", "ended_text": "This sale has ended"}
+{"type": "table", "columns": [{"label": "Item"}, {"label": "Price", "align": "right"}], "rows": [["Gift wrap", "$0"]],
+ "loop": {"source": "event.properties.items", "cells": ["{{ item.name }}", "{{ item.price }}"]}, "footer": [["Total", "{{ event.value }}"]]}
+{"type": "quote", "text": "Love it.", "author": "Jo", "role": "Customer", "image": "https://...", "style": "plain" | "card"}
+{"type": "header", "logo": "https://...", "links": [{"text": "Shop", "href": "https://..."}]}
+{"type": "nav", "links": [{"text": "New", "href": "https://..."}]}
+{"type": "footer", "text": "Questions? Reply.", "links": [{"text": "FAQ", "href": "https://..."}], "show_social": true}
+{"type": "image_text", "src": "https://...", "alt": "Tote", "heading": "Built to last", "html": "<p>...</p>", "button_text": "Shop", "button_href": "https://...", "image_position": "left" | "right"}
+{"type": "saved", "saved_block_id": "..."}
+```
+
+Leave social `links` out to use the account's social links. Countdown and menu bar colors (`background`, `color`, `label_color`) are hex colors. Make a video thumbnail with make_video_thumbnail. Image blocks take `radius` (0-40). Any block can take `"show_if": {"field": "person.properties.tier", "op": "eq", "value": "gold"}` (ops `set`, `not_set`, `eq`, `neq`, `contains`, `gt`, `lt`) or `"show_if": {"expr": "event.value > 100"}` (or a list of up to 5 rules, all must hold) to show it only to some people; someone every block is hidden for is skipped, never sent an empty email. Links and images in these blocks may be tags; they must come out as http(s), mailto: or tel: links (http(s) images) or the block shows without them. Transactional email takes only the core blocks and table. `saved` blocks reuse a saved block (list_saved_blocks); starter designs come from list_starter_templates; check an email with check_email before sending.
+
 Unique coupon codes: `{% coupon_code 'WELCOME' %}` in the body of an email (a text block, button, link) or an SMS gives each person their own code from the coupon named WELCOME (the same code in every message, unless the coupon is set to a new code each time); `{% coupon_expiry 'WELCOME' %}` is its expiry date. Write the name in quotes. Not allowed in the subject or preheader, or in transactional email. Or add a coupon block: `{"type": "coupon", "coupon": "WELCOME", "title": "Your code", "show_expiry": true, "button_text": "Shop now", "href": "https://..."}` (the code in a dashed box). Previews and test sends show SAMPLE-CODE and use no code. If the coupon runs out, the message waits until codes are added. See dumbmail://docs/coupons.
 
 Variables (Jinja): `first_name`, `last_name`, `email`, `phone_number`, any custom property by name, `person.properties.x`, `event.properties.x` and `event.value` (flows), `organization.name`, `organization.website`, `unsubscribe_url`. Filters: `default('x')`, `upper`, `title`, `round`. The footer with the mailing address and unsubscribe link is added automatically; links are click-tracked automatically.

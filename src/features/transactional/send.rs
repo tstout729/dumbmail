@@ -235,6 +235,9 @@ async fn resolve_content(db: &PgPool, account_id: Uuid, b: &SendBody) -> AppResu
         o.insert("subject".into(), json!(s));
     }
     check_review(&content)?;
+    if let Some(p) = crate::features::content::prepare::transactional_problem(&content) {
+        return Err(AppError::bad(p));
+    }
     // Coupon codes aren't supported in transactional email (templates saved before that rule included).
     crate::features::coupons::template::forbid(&content)?;
     let o = content.as_object().ok_or_else(|| AppError::bad("content must be an object"))?;
