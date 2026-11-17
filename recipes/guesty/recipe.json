@@ -1,0 +1,144 @@
+{
+  "key": "guesty",
+  "name": "Guesty",
+  "category": "Vacation rentals",
+  "description": "Guesty reservations become events on each guest's profile: Reservation Confirmed, Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests, total and booking channel. Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Past reservations import through the Guesty Open API.",
+  "docs": [
+    "https://open-api-docs.guesty.com/docs/webhooks",
+    "https://open-api-docs.guesty.com/docs/webhooks-reservations",
+    "https://open-api-docs.guesty.com/docs/reservation-webhooks-migration-guide",
+    "https://open-api-docs.guesty.com/docs/authentication",
+    "https://open-api-docs.guesty.com/docs/how-to-search-for-reservations"
+  ],
+  "signature": { "type": "hmac", "header": "svix-signature", "format": "svix" },
+  "signature_secret": {
+    "label": "Guesty webhook signing secret",
+    "help": "Starts with whsec_. Get it from GET https://open-api.guesty.com/v1/webhooks-v2/secret, or from the webhooks page of Guesty's developer dashboard."
+  },
+  "credentials": [
+    { "name": "client_id", "label": "Open API client ID", "help": "In Guesty: Integrations → API & Webhooks (Open API) → create an API key. Used only to import reservations." },
+    { "name": "client_secret", "label": "Open API client secret", "help": "Shown once when you create the API key." }
+  ],
+  "settings": { "skip_owner_stays": true },
+  "pull": {
+    "method": "GET",
+    "url": "https://open-api.guesty.com/v1/reservations",
+    "query": {
+      "limit": 100,
+      "skip": 0,
+      "sort": "lastUpdatedAt",
+      "fields": "_id status confirmationCode source checkIn checkOut checkInDateLocalized checkOutDateLocalized nightsCount guestsCount listingId listing guest guestId integration money.hostPayout money.totalPaid money.balanceDue money.currency confirmedAt createdAt canceledAt lastUpdatedAt",
+      "filters": "[{\"operator\":\"$between\",\"field\":\"lastUpdatedAt\",\"from\":\"{{state.cursor|since}}\",\"to\":\"{{now}}\"}]"
+    },
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://open-api.guesty.com/oauth2/token",
+      "client_id": "{{secret.client_id}}",
+      "client_secret": "{{secret.client_secret}}",
+      "scope": "open-api",
+      "max_tokens_per_day": 4
+    },
+    "interval_minutes": 15,
+    "max_pages": 10
+  },
+  "setup": [
+    "Create the integration from this recipe. Copy its inbound URL.",
+    "In Guesty, create an Open API key (Integrations → API & Webhooks) and save its client ID and secret as the credentials client_id and client_secret. DumbMail asks Guesty for an access token at most 4 times a day (Guesty allows 5) and reuses it until it expires.",
+    "Subscribe the inbound URL to reservation webhooks: POST https://open-api.guesty.com/v1/webhooks with {\"url\": \"<inbound URL>\", \"events\": [\"reservation.new\", \"reservation.updated\"]}. These events include the guest's details. Guesty retires them on 1 March 2027; after that, subscribe to reservation.created.v2 and reservation.updated.v2 and the 15-minute pull fills in the guest details.",
+    "Save the webhook signing secret (GET https://open-api.guesty.com/v1/webhooks-v2/secret, starts with whsec_) as the integration's signing secret.",
+    "Run test_integration with pull: true to see the first page of reservations and what would be written.",
+    "Import history with run_integration_pull and backfill_since (for example a year ago). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
+    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on."
+  ],
+  "flows": [
+    {
+      "name": "Guesty: booking confirmation",
+      "description": "Thanks the guest ten minutes after a booking is confirmed. Skips imported history, and stops if the booking is cancelled or changed first.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Reservation Confirmed",
+        "filters": [{ "field": "historical", "op": "neq", "value": true }],
+        "key": "reservation_id",
+        "cancelled_by": ["Reservation Cancelled"]
+      },
+      "definition": {
+        "entry": "c1",
+        "settings": { "reentry": "always" },
+        "nodes": [
+          { "id": "c1", "type": "delay", "amount": 10, "unit": "minutes", "next": "c2" },
+          {
+            "id": "c2", "type": "email", "name": "Booking confirmed", "next": null,
+            "content": {
+              "subject": "You're booked at {{ event.properties.listing_name|default('our place') }}",
+              "preheader": "{{ event.properties.check_in }} to {{ event.properties.check_out }}",
+              "blocks": [
+                { "type": "heading", "text": "Thanks for booking, {{ first_name|default('there') }}!" },
+                { "type": "text", "html": "<p>Your stay at <strong>{{ event.properties.listing_name|default('our place') }}</strong> is confirmed.</p><p>Check-in: {{ event.properties.check_in }}<br>Check-out: {{ event.properties.check_out }}<br>Guests: {{ event.properties.guests|default('') }}<br>Confirmation code: {{ event.properties.confirmation_code|default('') }}</p><p>We'll send arrival details a couple of days before you come.</p>" }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Guesty: pre-arrival",
+      "description": "Two days before check-in at 10am, sends arrival details. Skipped if the booking was cancelled; follows the new date if it moved.",
+      "trigger": {
+        "type": "event_date",
+        "metric": "Reservation Confirmed",
+        "field": "check_in",
+        "offset_days": -2,
+        "hour": 10,
+        "key": "reservation_id",
+        "cancelled_by": ["Reservation Cancelled"]
+      },
+      "definition": {
+        "entry": "p1",
+        "settings": {},
+        "nodes": [
+          {
+            "id": "p1", "type": "email", "name": "Arrival details", "next": null,
+            "content": {
+              "subject": "See you soon at {{ event.properties.listing_name|default('our place') }}",
+              "preheader": "Check-in is {{ event.properties.check_in }}",
+              "blocks": [
+                { "type": "heading", "text": "Your stay starts in two days" },
+                { "type": "text", "html": "<p>Hi {{ first_name|default('there') }}, we're getting <strong>{{ event.properties.listing_name|default('the place') }}</strong> ready for you.</p><p>Check-in: {{ event.properties.check_in }}<br>Check-out: {{ event.properties.check_out }}</p><p>Reply to this email if you have any questions before you arrive.</p>" }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Guesty: review request",
+      "description": "The day after check-out at 11am, thanks the guest and asks for a review. Skipped for cancelled bookings.",
+      "trigger": {
+        "type": "event_date",
+        "metric": "Reservation Confirmed",
+        "field": "check_out",
+        "offset_days": 1,
+        "hour": 11,
+        "key": "reservation_id",
+        "cancelled_by": ["Reservation Cancelled"]
+      },
+      "definition": {
+        "entry": "r1",
+        "settings": {},
+        "nodes": [
+          {
+            "id": "r1", "type": "email", "name": "Review request", "next": null,
+            "content": {
+              "subject": "How was your stay at {{ event.properties.listing_name|default('our place') }}?",
+              "preheader": "Thanks for staying with us",
+              "blocks": [
+                { "type": "heading", "text": "Thanks for staying with us, {{ first_name|default('there') }}" },
+                { "type": "text", "html": "<p>We hope you enjoyed <strong>{{ event.properties.listing_name|default('your stay') }}</strong>. A short review helps other guests find us and helps us keep improving.</p><p>Just reply to this email and tell us how it went.</p>" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

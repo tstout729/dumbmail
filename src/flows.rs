@@ -21,6 +21,13 @@ pub enum Trigger {
         metric: String,
         #[serde(default)]
         filters: Vec<Filter>,
+        /// With `cancelled_by`: the event property that identifies the thing (e.g. `reservation_id`).
+        /// People leave the flow when a cancelling event with the same value comes later, or a newer
+        /// event of this metric replaces this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cancelled_by: Vec<String>,
     },
     List {
         list_id: Uuid,
@@ -105,8 +112,8 @@ impl FlowDef {
 
 pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
     let t: Trigger = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))?;
-    if let Trigger::EventDate { metric, field, offset_days, hour, filters, key, cancelled_by } = &t {
-        let name_ok = |s: &str| !s.trim().is_empty() && s.len() <= 128;
+    let name_ok = |s: &str| !s.trim().is_empty() && s.len() <= 128;
+    if let Trigger::EventDate { metric, field, offset_days, hour, .. } = &t {
         if !name_ok(metric) || !name_ok(field) {
             return Err(AppError::bad("an event date trigger needs a metric and the event property holding the date"));
         }
@@ -116,6 +123,8 @@ pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
         if hour.is_some_and(|h| h > 23) {
             return Err(AppError::bad("hour must be 0-23"));
         }
+    }
+    if let Trigger::EventDate { filters, key, cancelled_by, .. } | Trigger::Metric { filters, key, cancelled_by, .. } = &t {
         if filters.len() > 20 || cancelled_by.len() > 5 || !cancelled_by.iter().all(|m| name_ok(m)) {
             return Err(AppError::bad("at most 20 filters and 5 cancelling metrics"));
         }
@@ -680,9 +689,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     };
     let mut context = run.context.clone();
     let mut current = run.current_node.clone();
-    // Event-date flows: stop when the booking was cancelled or its date changed.
+    // Flows keyed to an event (event-date flows, and metric flows with a key): stop when the thing
+    // was cancelled or a newer event replaced it (e.g. the booking's dates changed).
     let event_date = match parse_trigger(&flow.trigger) {
         Ok(Trigger::EventDate { key, cancelled_by, .. }) => context["event"]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).map(|id| (id, key, cancelled_by)),
+        Ok(Trigger::Metric { key: Some(key), cancelled_by, .. }) => context["event"]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).map(|id| (id, Some(key), cancelled_by)),
         _ => None,
     };
 

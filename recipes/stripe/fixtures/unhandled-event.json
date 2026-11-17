@@ -1,0 +1,30 @@
+{
+  "description": "other events are logged and ignored",
+  "expect": [
+    {
+      "message": "ignored Stripe event payment_intent.created",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "id": "pi_x",
+          "object": "payment_intent"
+        }
+      },
+      "id": "evt_1QaIII",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "payment_intent.created"
+    }
+  }
+}

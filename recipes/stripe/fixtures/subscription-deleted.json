@@ -1,0 +1,73 @@
+{
+  "description": "subscription cancelled: matched by stripe_customer_id",
+  "expect": [
+    {
+      "metric": "Subscription Cancelled",
+      "profile": {
+        "property": "stripe_customer_id",
+        "value": "cus_TQ1aBcD2eF3gHi"
+      },
+      "properties": {
+        "amount": 15,
+        "currency": "usd",
+        "interval": "month",
+        "plan": "Coffee Club monthly",
+        "reason": "cancellation_requested",
+        "status": "canceled",
+        "subscription_id": "sub_1QaSubXyZ123"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:subscription:sub_1QaSubXyZ123:cancelled"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "cancel_at_period_end": false,
+          "canceled_at": 1763400000,
+          "cancellation_details": {
+            "comment": null,
+            "feedback": "too_expensive",
+            "reason": "cancellation_requested"
+          },
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "id": "sub_1QaSubXyZ123",
+          "items": {
+            "data": [
+              {
+                "id": "si_1",
+                "price": {
+                  "currency": "usd",
+                  "id": "price_1QaCoffee",
+                  "nickname": "Coffee Club monthly",
+                  "recurring": {
+                    "interval": "month",
+                    "interval_count": 1
+                  },
+                  "unit_amount": 1500
+                },
+                "quantity": 1
+              }
+            ],
+            "object": "list"
+          },
+          "object": "subscription",
+          "status": "canceled"
+        }
+      },
+      "id": "evt_1QaGGG",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "customer.subscription.deleted"
+    }
+  }
+}

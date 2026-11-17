@@ -1,0 +1,32 @@
+{
+  "description": "v2 events have no guest details",
+  "expect": [
+    {
+      "message": "reservation.created.v2 for 69c0d1e2f3: no guest details in v2 events; the next pull picks it up",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "now": "2026-11-17T18:00:00.000Z",
+    "payload": {
+      "data": {
+        "accountId": "5f1a",
+        "checkIn": "2026-12-01T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-01",
+        "confirmationCode": "GY-zz",
+        "guestId": "69guest",
+        "guestsCount": 2,
+        "platform": "direct",
+        "reservationId": "69c0d1e2f3",
+        "source": "manual",
+        "status": "confirmed"
+      },
+      "event": "reservation.created.v2",
+      "meta": {
+        "eventId": "e7",
+        "publishedAt": "2026-11-17T17:59:58.000Z"
+      }
+    },
+    "source": "webhook"
+  }
+}

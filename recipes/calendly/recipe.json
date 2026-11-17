@@ -1,0 +1,73 @@
+{
+  "key": "calendly",
+  "name": "Calendly",
+  "category": "Scheduling",
+  "description": "Calendly bookings become events: Meeting Scheduled when someone books, Meeting Cancelled when they cancel or reschedule. Use them for reminders and follow-ups that skip cancelled meetings.",
+  "docs": [
+    "https://developer.calendly.com/api-docs/overview/webhooks/webhook-signatures",
+    "https://developer.calendly.com/receive-data-from-scheduled-events-in-real-time-with-webhook-subscriptions",
+    "https://developer.calendly.com/openapi/calendly-api.yaml"
+  ],
+  "signature": { "type": "hmac", "header": "Calendly-Webhook-Signature", "format": "stripe" },
+  "signature_secret": {
+    "label": "Calendly webhook signing key",
+    "help": "The signing_key you choose when creating the webhook subscription. Calendly signs each webhook with it."
+  },
+  "credentials": [],
+  "settings": {},
+  "pull": null,
+  "setup": [
+    "Create the integration from this recipe. Copy its inbound URL.",
+    "Pick a long random signing key and save it as the integration's signing secret.",
+    "Create a webhook subscription with Calendly's API (a Standard plan or higher is needed): POST https://api.calendly.com/webhook_subscriptions with your personal access token and {\"url\": \"<inbound URL>\", \"events\": [\"invitee.created\", \"invitee.canceled\"], \"organization\": \"<your organization URI>\", \"scope\": \"organization\", \"signing_key\": \"<the same key>\"}. GET https://api.calendly.com/users/me shows your organization URI.",
+    "Book a test meeting and check the delivery log.",
+    "Review the draft reminder and follow-up flows and turn them on."
+  ],
+  "flows": [
+    {
+      "name": "Calendly: meeting reminder",
+      "description": "The day before a meeting at 9am, reminds the invitee with the cancel and reschedule links. Skipped if the meeting was cancelled or moved.",
+      "trigger": { "type": "event_date", "metric": "Meeting Scheduled", "field": "start_time", "offset_days": -1, "hour": 9, "key": "invitee_uri", "cancelled_by": ["Meeting Cancelled"] },
+      "definition": {
+        "entry": "m1",
+        "settings": {},
+        "nodes": [
+          {
+            "id": "m1", "type": "email", "name": "Reminder", "next": null,
+            "content": {
+              "subject": "Reminder: {{ event.properties.event_name|default('your meeting') }} tomorrow",
+              "preheader": "Need to change it? Reschedule in one click",
+              "blocks": [
+                { "type": "heading", "text": "See you tomorrow, {{ first_name|default('there') }}" },
+                { "type": "text", "html": "<p>Your <strong>{{ event.properties.event_name|default('meeting') }}</strong> starts {{ event.properties.start_time }}.</p><p>Where: {{ event.properties.location|default('see your calendar invite') }}</p>" },
+                { "type": "button", "text": "Reschedule", "href": "{{ event.properties.reschedule_url }}" }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Calendly: follow-up",
+      "description": "The day after a meeting at 10am, thanks the invitee. Skipped if the meeting was cancelled.",
+      "trigger": { "type": "event_date", "metric": "Meeting Scheduled", "field": "start_time", "offset_days": 1, "hour": 10, "key": "invitee_uri", "cancelled_by": ["Meeting Cancelled"] },
+      "definition": {
+        "entry": "f1",
+        "settings": {},
+        "nodes": [
+          {
+            "id": "f1", "type": "email", "name": "Thanks for meeting", "next": null,
+            "content": {
+              "subject": "Thanks for meeting, {{ first_name|default('there') }}",
+              "preheader": "Here's what's next",
+              "blocks": [
+                { "type": "heading", "text": "Thanks for your time" },
+                { "type": "text", "html": "<p>It was good to talk. Reply to this email with any questions, or book another time whenever you like.</p>" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

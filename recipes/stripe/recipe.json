@@ -1,0 +1,53 @@
+{
+  "key": "stripe",
+  "name": "Stripe",
+  "category": "Payments",
+  "description": "Stripe payments become events: Placed Order for paid Checkout sessions and subscription invoices, Refunded Order for refunds, and Subscription Started and Subscription Cancelled. Customers who tick Checkout's promotional-emails box are subscribed to email; nobody else is.",
+  "docs": [
+    "https://docs.stripe.com/webhooks",
+    "https://docs.stripe.com/webhooks/signature",
+    "https://docs.stripe.com/api/events/types",
+    "https://docs.stripe.com/payments/checkout/promotional-emails-consent"
+  ],
+  "signature": { "type": "hmac", "header": "Stripe-Signature", "format": "stripe" },
+  "signature_secret": {
+    "label": "Stripe webhook signing secret",
+    "help": "Starts with whsec_. In the Stripe Dashboard: Developers → Webhooks → your endpoint → Signing secret."
+  },
+  "credentials": [],
+  "settings": {},
+  "pull": null,
+  "setup": [
+    "Create the integration from this recipe. Copy its inbound URL.",
+    "In the Stripe Dashboard, go to Developers → Webhooks → Add endpoint. Paste the inbound URL and choose these events: checkout.session.completed, invoice.paid, charge.refunded, customer.subscription.created, customer.subscription.deleted.",
+    "Copy the endpoint's signing secret (whsec_…) and save it as the integration's signing secret.",
+    "Send a test event from Stripe (or use test_integration with a sample event) and check the delivery log.",
+    "To subscribe buyers to email, turn on Checkout's promotional emails consent (consent_collection.promotions = auto). Only people who tick the box are subscribed."
+  ],
+  "flows": [
+    {
+      "name": "Stripe: subscription win-back",
+      "description": "A day after a subscription is cancelled, asks what went wrong and invites them back.",
+      "trigger": { "type": "metric", "metric": "Subscription Cancelled" },
+      "definition": {
+        "entry": "w1",
+        "settings": { "reentry": { "after_days": 30 }, "exit_condition": { "match": "all", "conditions": [{ "type": "event", "metric": "Subscription Started", "op": "at_least", "count": 1, "within_days": 2 }] } },
+        "nodes": [
+          { "id": "w1", "type": "delay", "amount": 1, "unit": "days", "next": "w2" },
+          {
+            "id": "w2", "type": "email", "name": "We'd love you back", "next": null,
+            "content": {
+              "subject": "Sorry to see you go, {{ first_name|default('friend') }}",
+              "preheader": "Tell us what we could do better",
+              "blocks": [
+                { "type": "heading", "text": "Your subscription has ended" },
+                { "type": "text", "html": "<p>Thanks for being a subscriber. If something wasn't right, reply and tell us; we read every answer.</p><p>You're welcome back any time.</p>" },
+                { "type": "button", "text": "Come back", "href": "{{ organization.website }}" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

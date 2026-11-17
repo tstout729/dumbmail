@@ -1,0 +1,67 @@
+{
+  "description": "partial refund",
+  "expect": [
+    {
+      "email": "jordan@example.com",
+      "first_name": "Jordan",
+      "last_name": "Lee Park",
+      "properties": {
+        "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "amount_charged": 51.84,
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "fully_refunded": false,
+        "payment_intent": "pi_3QabCdEfGh1234"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:ch_3QabCdEfGh1234:2000",
+      "value": 20
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount": 5184,
+          "amount_captured": 5184,
+          "amount_refunded": 2000,
+          "billing_details": {
+            "address": {},
+            "email": "jordan@example.com",
+            "name": "Jordan Lee Park",
+            "phone": null
+          },
+          "currency": "usd",
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "id": "ch_3QabCdEfGh1234",
+          "object": "charge",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "receipt_email": "jordan@example.com",
+          "refunded": false,
+          "status": "succeeded"
+        }
+      },
+      "id": "evt_1QaFFF",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "charge.refunded"
+    }
+  }
+}

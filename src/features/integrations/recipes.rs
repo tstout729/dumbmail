@@ -126,4 +126,62 @@ mod tests {
             assert!(!fixtures(&r.key).is_empty(), "{} has no fixtures", r.key);
         }
     }
+
+    /// The script input a fixture describes, filled in the way the engine fills it.
+    fn fixture_input(r: &Recipe, f: &Value) -> Value {
+        let mut input = f["input"].clone();
+        let body = input["payload"].to_string();
+        let defaults = json!({
+            "source": "webhook", "replay": false, "body": body, "headers": {}, "query": {},
+            "settings": r.manifest["settings"].clone(), "state": {}, "now": "2026-11-17T18:00:00.000Z",
+            "integration": {"id": "00000000-0000-0000-0000-000000000000", "name": r.manifest["name"].clone()},
+        });
+        for (k, v) in defaults.as_object().unwrap() {
+            if input.get(k).is_none_or(Value::is_null) {
+                input[k] = v.clone();
+            }
+        }
+        if input["source"] == "pull" && input.get("backfill").is_none() {
+            input["backfill"] = Value::Null;
+        }
+        input
+    }
+
+    /// Every fixture's script output matches what's recorded. To record new fixtures, run with
+    /// RECIPE_FIXTURES_WRITE=1, then read the recorded `expect` and check it by hand.
+    #[test]
+    fn recipe_scripts_match_their_fixtures() {
+        let write = std::env::var("RECIPE_FIXTURES_WRITE").is_ok();
+        for r in all() {
+            for (name, f) in fixtures(&r.key) {
+                let input = fixture_input(&r, &f);
+                let pull = input["source"] == "pull";
+                let out = super::super::sandbox::run_blocking(&r.script, &input.to_string(), std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|e| panic!("{}/{name}: {e}", r.key));
+                super::super::actions::parse(&out, pull).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
+                // Long outputs are checked by their action counts and last two actions.
+                let summary_only = f["summary_only"] == true;
+                let got = if summary_only {
+                    let arr = out.as_array().cloned().unwrap_or_default();
+                    let mut types = serde_json::Map::new();
+                    for a in &arr {
+                        let t = a["type"].as_str().unwrap_or("").to_string();
+                        let n = types.get(&t).and_then(Value::as_u64).unwrap_or(0);
+                        types.insert(t, json!(n + 1));
+                    }
+                    json!({"types": types, "tail": arr[arr.len().saturating_sub(2)..]})
+                } else {
+                    out
+                };
+                if write {
+                    let mut f = f.clone();
+                    f["expect"] = got;
+                    let path = format!("{}/recipes/{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"), r.key);
+                    std::fs::write(path, serde_json::to_string_pretty(&f).unwrap() + "\n").unwrap();
+                    continue;
+                }
+                assert_eq!(got, f["expect"], "{}/{name}: script output differs from the fixture's expect", r.key);
+            }
+        }
+    }
 }
