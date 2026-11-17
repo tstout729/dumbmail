@@ -317,7 +317,7 @@ fn railway_records(d: &Value) -> (Vec<Value>, bool) {
 
 pub async fn set_link_domain(state: &AppState, account_id: Uuid, raw: &str) -> AppResult<()> {
     let domain = clean_domain(raw)?;
-    if domain == public_host(state) {
+    if domain == public_host(state) || state.cfg.shared_link_host().is_some_and(|h| h == domain) {
         return Err(AppError::bad("use a domain you own, like links.yourbrand.com"));
     }
     // Active domains are exclusive; an unfinished claim by someone else lapses after 48 hours.
@@ -402,11 +402,11 @@ pub async fn remove_link_domain(state: &AppState, account_id: Uuid) -> AppResult
     Ok(())
 }
 
-/// Base URL for links in this account's messages and forms: the branded domain when active.
+/// Base URL for links in this account's email: its branded domain when active, else LINK_URL.
 pub fn link_base(state: &AppState, account: &Account) -> String {
     match (&account.link_domain, account.link_domain_status.as_str()) {
         (Some(d), "active") => format!("https://{d}"),
-        _ => state.cfg.public_url().to_string(),
+        _ => state.cfg.link_url().to_string(),
     }
 }
 

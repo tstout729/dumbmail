@@ -62,8 +62,9 @@ async fn legacy_host_redirect(
     next.run(req).await
 }
 
-/// Requests arriving on a customer's branded link domain may only reach public pages
-/// (tracking, unsubscribe, forms, the onsite script). Everything else goes to the main app.
+/// Requests arriving on a customer's branded link domain or the shared LINK_URL domain may only
+/// reach public pages (tracking, unsubscribe, forms, the onsite script). Everything else goes to the
+/// main app.
 async fn link_domain_guard(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -76,7 +77,8 @@ async fn link_domain_guard(
     if public_ok || host.is_empty() {
         return next.run(req).await;
     }
-    let is_link_domain: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE link_domain = $1)")
+    let is_link_domain: bool = state.cfg.shared_link_host().is_some_and(|h| h == host)
+        || sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE link_domain = $1)")
         .bind(&host)
         .fetch_one(&state.db)
         .await
