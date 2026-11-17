@@ -175,7 +175,22 @@ export function useRecentBulk() {
 }
 
 export function usePrivacyRequests() {
-  return useQuery({ queryKey: peopleKeys.requests, queryFn: () => api<{ data: PrivacyRequest[]; total: number }>("GET", "/api/people/privacy/requests?limit=100") });
+  return useQuery({
+    queryKey: peopleKeys.requests,
+    queryFn: () => api<{ data: PrivacyRequest[]; total: number }>("GET", "/api/people/privacy/requests?limit=100"),
+    // Exports are built in the background: refresh while one is.
+    refetchInterval: (q) => ((q.state.data?.data ?? []).some((r) => r.status === "building") ? 2000 : false),
+  });
+}
+
+/** One privacy request, refreshed until its export is built. */
+export function usePrivacyRequest(id: string | null) {
+  return useQuery({
+    queryKey: [...peopleKeys.requests, id],
+    queryFn: () => api<PrivacyRequest>("GET", `/api/people/privacy/requests/${id}`),
+    enabled: id !== null,
+    refetchInterval: (q) => (q.state.data?.status === "building" || !q.state.data ? 1500 : false),
+  });
 }
 
 export function useExportPerson() {

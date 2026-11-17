@@ -84,7 +84,7 @@ export function PrivacyPage() {
             </Button>
           </div>
           <p className="text-xs text-zinc-500">
-            An export is a JSON file with everything you hold about them and a readable page to send them. Downloads need you to be signed in and last 7 days. Deleting removes the profile and everything tied to it; if they had unsubscribed, a one-way code of the address is kept so they stay unsubscribed if they're imported again.
+            An export is a JSON file with everything you hold about them and a readable page to send them. Downloads need you to be signed in and last 7 days. Deleting removes the profile and everything tied to it, and your stored export files (they may include them); if they had unsubscribed, a one-way code of the address is kept so they stay unsubscribed if they're imported again.
           </p>
           {exportPerson.error ? <InlineError message={errorMessage(exportPerson.error)} /> : null}
           {deletePerson.error && !toDelete ? <InlineError message={errorMessage(deletePerson.error)} /> : null}
@@ -124,6 +124,10 @@ export function PrivacyPage() {
                     "Nobody found"
                   ) : r.kind === "delete" ? (
                     `Deleted ${pluralize(Number(r.result.deleted_profiles ?? r.profiles_found), "profile")}`
+                  ) : r.status === "building" ? (
+                    "Building…"
+                  ) : r.status === "failed" ? (
+                    <span className="text-red-600">{typeof r.result.error === "string" ? r.result.error : "Didn't finish"}</span>
                   ) : r.files.length > 0 ? (
                     <span className="flex flex-wrap gap-x-3">
                       {r.files.map((f) => (
@@ -194,7 +198,7 @@ function ConfirmDelete({ pending, onClose, onDone }: { pending: { input: PersonI
     >
       <div className="space-y-3 text-sm text-zinc-600">
         <p>
-          This deletes {pluralize(found, "profile")} with {formatNumber(counts.events)} events, {formatNumber(counts.messages)} messages, their list memberships, notes and consent history, plus any earlier exports of their data. It can't be undone.
+          This deletes {pluralize(found, "profile")} with {formatNumber(counts.events)} events, {formatNumber(counts.messages)} messages, their list memberships, notes and consent history, plus any earlier exports of their data. Your other stored export files (bulk and report exports) are deleted too, since they may include this person. It can't be undone.
         </p>
         <Field label="Type delete to confirm">
           <Input value={typed} onChange={(e) => setTyped(e.target.value)} autoFocus aria-label="Type delete to confirm" />

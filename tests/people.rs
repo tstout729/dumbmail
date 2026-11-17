@@ -1122,6 +1122,8 @@ async fn merging_profiles_with_queued_messages_sends_each_campaign_once() {
     assert_eq!(second, vec!["keep@x.test".to_string()], "one email, to the kept address");
     let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE subject = 'Second' AND status = 'sent'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(sent, 1, "and one billed send");
+    let why: Vec<Option<String>> = sqlx::query_scalar("SELECT error FROM messages WHERE subject IS NULL AND status = 'skipped'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(why, vec![Some("merged into another profile".to_string())], "the duplicate was cancelled by the merge, not left for a worker");
 
     // The confirmation sent to old@ can't subscribe keep@.
     let (_, _, page) = h.raw("POST", link.trim_start_matches("https://pl.test"), &[], "").await;

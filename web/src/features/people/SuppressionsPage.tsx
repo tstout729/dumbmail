@@ -41,6 +41,7 @@ const reasonTone: Record<SuppressionReason, Tone> = {
   complaint: "red",
   manual: "amber",
   pending: "blue",
+  not_subscribed: "gray",
 };
 
 const reasonOptions: { value: SuppressionReason; label: string }[] = [
@@ -49,6 +50,7 @@ const reasonOptions: { value: SuppressionReason; label: string }[] = [
   { value: "complaint", label: "Spam complaint" },
   { value: "manual", label: "Suppressed by hand" },
   { value: "pending", label: "Hasn't confirmed sign-up" },
+  { value: "not_subscribed", label: "Never agreed to texts" },
 ];
 
 export function SuppressionsPage() {
@@ -164,7 +166,7 @@ export function SuppressionsPage() {
                   <Badge tone={reasonTone[r.reason]}>{r.reason_text}</Badge>
                   {r.how ? <div className="mt-0.5 text-xs text-zinc-500">{r.how}</div> : null}
                 </Td>
-                <Td className="whitespace-nowrap text-zinc-600">{formatDateTime(r.since, tz)}</Td>
+                <Td className="whitespace-nowrap text-zinc-600">{r.since ? formatDateTime(r.since, tz) : "Before history started"}</Td>
                 <Td className="text-right">
                   {r.can_unsuppress ? (
                     <Button size="sm" onClick={() => setLifting(r)}>

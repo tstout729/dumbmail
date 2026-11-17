@@ -40,7 +40,7 @@ export type PeopleSummary = {
   notes: ProfileNote[];
 };
 
-export type SuppressionReason = "unsubscribed" | "hard_bounce" | "complaint" | "manual" | "pending";
+export type SuppressionReason = "unsubscribed" | "hard_bounce" | "complaint" | "manual" | "pending" | "not_subscribed";
 
 export type Suppression = {
   profile_id: string;
@@ -50,7 +50,8 @@ export type Suppression = {
   last_name: string | null;
   reason: SuppressionReason;
   reason_text: string;
-  since: string;
+  /** When the recorded change happened; null for a block from before consent history started. */
+  since: string | null;
   how: string | null;
   can_unsuppress: boolean;
   why_not: string | null;
@@ -152,16 +153,18 @@ export type BulkInput = {
   value?: unknown;
   channels?: Channel[];
   confirm?: boolean;
-  expected_count?: number;
+  /** The saved set from the preview; required to confirm. */
+  set_id?: string;
 };
 
-export type BulkDryRun = { dry_run: true; count: number; destructive: boolean; note: string };
+export type BulkDryRun = { dry_run: true; count: number; set_id: string | null; expires_at?: string; destructive: boolean; note: string };
 
 export type PrivacyFile = { id: string; name: string; url: string; expires_at?: string };
 
 export type PrivacyRequest = {
   id: string;
   kind: "export" | "delete";
+  status: "building" | "ready" | "failed" | "done";
   identified_by: "email" | "phone_number";
   requested_by: string | null;
   via: string;
@@ -173,7 +176,7 @@ export type PrivacyRequest = {
 
 export type PersonInput = { email?: string; phone_number?: string; confirm?: boolean };
 
-export type ExportResult = { request_id: string; found: number; files: PrivacyFile[]; expires_at?: string; note?: string };
+export type ExportResult = { request_id: string; status: "building" | "done"; found: number; note?: string };
 
 export type DeleteResult = {
   dry_run?: boolean;

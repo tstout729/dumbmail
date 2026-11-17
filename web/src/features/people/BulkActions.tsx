@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, Download, History, Loader2 } from "lucide-react";
 import { errorMessage, useLists, useSession } from "../../api";
 import { Badge, Button, Checkbox, Drawer, Field, InlineError, Input, Menu, Modal, Select, Skeleton } from "../../components/ui";
@@ -117,11 +117,15 @@ function BulkDialog({ action, selection, onClose }: { action: BulkActionName; se
     channels: action === "suppress" ? channels : undefined,
   };
   const ready = (!needsList || listId !== "") && (!needsKey || key.trim() !== "") && (action !== "suppress" || channels.length > 0);
-  // The count, from the server, of exactly who this would act on now.
-  const count = useBulkCount(ready ? input : null);
+  // The preview: the server counts and saves exactly who this would act on; confirming runs on that set.
+  // Waits for typing to pause, since each preview saves a set.
+  const preview = useDebounced(ready ? input : null, 400);
+  const count = useBulkCount(preview);
+  const current = preview !== null && JSON.stringify(preview) === JSON.stringify(input);
   const n = count.data?.count ?? null;
   const mustType = destructive.includes(action);
   const typedOk = !mustType || (n !== null && typed.trim().replace(/,/g, "") === String(n));
+  const setId = current && !count.isFetching ? (count.data?.set_id ?? null) : null;
 
   if (startedId) return <BulkProgress id={startedId} onClose={onClose} />;
 
@@ -137,9 +141,9 @@ function BulkDialog({ action, selection, onClose }: { action: BulkActionName; se
           </Button>
           <Button
             variant={action === "delete" ? "danger" : "primary"}
-            disabled={!ready || n === null || n === 0 || !typedOk}
+            disabled={!ready || n === null || n === 0 || !typedOk || setId === null}
             loading={start.isPending}
-            onClick={() => n !== null && start.mutate({ ...input, expected_count: n }, { onSuccess: (b) => setStartedId(b.id) })}
+            onClick={() => setId !== null && start.mutate({ ...input, set_id: setId }, { onSuccess: (b) => setStartedId(b.id) })}
           >
             {n === null ? "Counting…" : `${actionLabels[action]}: ${pluralize(n, "profile")}`}
           </Button>
@@ -180,7 +184,9 @@ function BulkDialog({ action, selection, onClose }: { action: BulkActionName; se
         ) : null}
         {action === "add_to_list" ? <p className="text-xs text-zinc-500">Adding someone to a list doesn't subscribe them. List flows start for people new to the list.</p> : null}
         {action === "delete" ? (
-          <p className="text-zinc-600">Their events, messages and consent history are deleted too. This can't be undone. People who had unsubscribed or were suppressed stay suppressed if they're imported again.</p>
+          <p className="text-zinc-600">
+            Their events, messages and consent history are deleted too. This can't be undone. People who had unsubscribed or were suppressed stay suppressed if they're imported again. Your stored export files are deleted as well, since they may include these people.
+          </p>
         ) : null}
         {action === "export" ? <p className="text-zinc-600">You'll get a CSV file to download. It's kept for 7 days.</p> : null}
 
@@ -193,9 +199,11 @@ function BulkDialog({ action, selection, onClose }: { action: BulkActionName; se
             </span>
           ) : count.error ? (
             <InlineError message={errorMessage(count.error)} />
+          ) : count.data && count.data.set_id === null ? (
+            <InlineError message={count.data.note} />
           ) : (
             <>
-              This affects <strong>{pluralize(n ?? 0, "profile")}</strong>. It runs in the background; you can leave this page.
+              This affects <strong>{pluralize(n ?? 0, "profile")}</strong>: the people counted now, even if the list or segment changes before you confirm. It runs in the background; you can leave this page.
             </>
           )}
         </div>
@@ -208,6 +216,17 @@ function BulkDialog({ action, selection, onClose }: { action: BulkActionName; se
       </div>
     </Modal>
   );
+}
+
+/** `value`, once it has stayed the same for `ms`. */
+function useDebounced<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value);
+  const key = JSON.stringify(value);
+  useEffect(() => {
+    const t = window.setTimeout(() => setSettled(JSON.parse(key) as T), ms);
+    return () => window.clearTimeout(t);
+  }, [key, ms]);
+  return settled;
 }
 
 function parseValue(raw: string): unknown {

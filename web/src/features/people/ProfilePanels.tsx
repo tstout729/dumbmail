@@ -1,10 +1,10 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { useNavigate } from "react-router";
-import { CheckCircle2, Download, GitMerge, History, Mail, MessageSquare, Trash2, XCircle } from "lucide-react";
+import { CheckCircle2, Download, GitMerge, History, Loader2, Mail, MessageSquare, Trash2, XCircle } from "lucide-react";
 import { Button, Card, ConfirmDialog, IconButton, Modal, Skeleton, Textarea, Toggle, cx } from "../../components/ui";
 import { formatDate, formatDateTime, formatPhone, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
-import { useAddNote, useConsentPage, useDeleteNote, useExportPerson, usePeopleSummary, useSetAdsOptOut } from "./api";
+import { useAddNote, useConsentPage, useDeleteNote, useExportPerson, usePeopleSummary, usePrivacyRequest, useSetAdsOptOut } from "./api";
 import { MergePicker } from "./MergeDialog";
 import type { ChannelReach, ConsentEvent, ExportResult } from "./types";
 
@@ -97,14 +97,31 @@ export function ProfileSidePanels({ profileId, email, phone, tz }: PanelProps) {
   );
 }
 
+/** After asking for an export: waits while it's built, then offers the downloads. */
 export function ExportReady({ result, tz, onClose }: { result: ExportResult; tz: string; onClose: () => void }) {
+  const req = usePrivacyRequest(result.found ? result.request_id : null);
+  const r = req.data;
+  const title = !result.found ? "Nothing to export" : r?.status === "ready" ? "Their data is ready" : r?.status === "failed" ? "The export didn't finish" : "Building the export…";
   return (
-    <Modal title={result.found ? "Their data is ready" : "Nothing to export"} onClose={onClose} size="sm" footer={<Button onClick={onClose}>Done</Button>}>
-      {result.found ? (
+    <Modal title={title} onClose={onClose} size="sm" footer={<Button onClick={onClose}>{r?.status === "building" || !r ? "Close" : "Done"}</Button>}>
+      {!result.found ? (
+        <p className="text-sm text-zinc-600">{result.note ?? "Nobody with that address is in this account."}</p>
+      ) : !r || r.status === "building" ? (
+        <div className="space-y-2 text-sm text-zinc-600">
+          <p className="flex items-center gap-2">
+            <Loader2 className="size-3.5 animate-spin" /> Collecting everything you hold about them. This usually takes under a minute.
+          </p>
+          <p className="text-xs text-zinc-500">You can close this. The files appear on the Privacy requests page when they're ready.</p>
+        </div>
+      ) : r.status === "failed" ? (
+        <p className="text-sm text-zinc-600">{typeof r.result.error === "string" ? r.result.error : "Something went wrong. Run the export again."}</p>
+      ) : (
         <div className="space-y-3 text-sm text-zinc-600">
-          <p>Download both files and send them to the person. The links need you to be signed in{result.expires_at ? ` and work until ${formatDate(result.expires_at, tz)}` : ""}.</p>
+          <p>
+            Download both files and send them to the person. The links need you to be signed in{r.files[0]?.expires_at ? ` and work until ${formatDate(r.files[0].expires_at, tz)}` : ""}.
+          </p>
           <ul className="space-y-1.5">
-            {result.files.map((f) => (
+            {r.files.map((f) => (
               <li key={f.id}>
                 <a href={f.url} download className="inline-flex items-center gap-1.5 font-medium text-accent-700 hover:underline">
                   <Download className="size-3.5" /> {f.name}
@@ -114,8 +131,6 @@ export function ExportReady({ result, tz, onClose }: { result: ExportResult; tz:
           </ul>
           <p className="text-xs text-zinc-500">The request is recorded on the Privacy requests page.</p>
         </div>
-      ) : (
-        <p className="text-sm text-zinc-600">{result.note ?? "Nobody with that address is in this account."}</p>
       )}
     </Modal>
   );
