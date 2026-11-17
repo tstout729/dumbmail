@@ -142,7 +142,6 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
             if let Some((_, t)) = filter_time(&filter, "subscriptions.email.marketing.list_suppressions.timestamp") {
                 items.retain(|p| p["attributes"]["subscriptions"]["email"]["marketing"]["list_suppressions"].as_array().is_some_and(|s| s.iter().any(|x| time_of(&x["timestamp"]) > t)));
             }
-            let mut items = items;
             if let Some(list) = filter.strip_prefix("any(id,[").and_then(|r| r.strip_suffix("])")) {
                 let ids: Vec<String> = list.split(',').map(|x| x.trim_matches(['"', '\'']).to_string()).collect();
                 items = arr("profiles").into_iter().chain(arr("hidden_profiles")).filter(|p| ids.iter().any(|i| p["id"] == i.as_str())).collect();
