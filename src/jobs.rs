@@ -123,6 +123,7 @@ pub async fn drain(state: &AppState) -> anyhow::Result<usize> {
 }
 
 pub fn spawn_workers(state: AppState) {
+    crate::features::spawn_after_start(state.clone());
     for i in 0..state.cfg.workers.max(1) {
         let st = state.clone();
         tokio::spawn(async move {
