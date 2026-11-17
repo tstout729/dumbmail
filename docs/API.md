@@ -241,7 +241,7 @@ Form `config` (content, fields, phone step, style, teaser, targeting and schedul
 | GET | `/api/analytics/flows` | `?days=30` | `{days, totals: {revenue, orders, store_revenue, messages_sent, recipients, delivered, opens, clicks, open_rate, click_rate, revenue_per_recipient}, previous: (the same totals for the `days` before), series: {date, revenue, messages_sent}[]}`. Flow messages and flow-attributed orders only. |
 | GET | `/api/analytics/forms` | `?days=30` | `{days, totals: {views, submits, submit_rate}, previous: (the same for the `days` before), series: {date, views, submits}[], forms: {id, name, views, submits, submit_rate}[]}`. Counts start when hourly form stats began (migration 0020); `forms[].views` and `submits` on `/api/forms` stay all-time. |
 
-Attribution: a conversion event (`Placed Order` by default) is credited to the newest email the person opened or clicked in the previous 5 days, or the newest SMS they clicked in the previous 24 hours.
+Attribution: by default a conversion event (`Placed Order`) is credited to the newest email the person opened or clicked in the previous 5 days, or the newest SMS they clicked in the previous 24 hours. Each account can change the windows, count clicks only, use first touch or count more metrics (`/api/reports/attribution`, see `docs/REPORTS.md`); every revenue number follows those settings.
 
 ## Public endpoints (no auth)
 
