@@ -416,6 +416,21 @@ pub async fn consent_changed(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch
     }
 }
 
+/// Whether an endpoint of the account wants consent changes. Lets the writer skip reading the old value.
+pub fn wants_consent(db: &PgPool, account_id: Uuid) -> bool {
+    wants(db, account_id, &["profile.subscribed", "profile.unsubscribed"])
+}
+
+/// [`consent_changed`] inside the writer's transaction (it goes out only if that commits; it can't
+/// spoil or stall it). `changed` is (profile id, consent before) for each profile the write changed.
+pub async fn consent_changed_in(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, changed: &[(Uuid, String)], channel: &str, after: &str, reason: &str) {
+    if changed.is_empty() || !wants_consent(db, account_id) {
+        return;
+    }
+    let rows: Vec<Out> = changed.iter().filter_map(|(pid, before)| consent_row(channel, before, after, reason, None, Source::System, profile_ref(*pid))).collect();
+    emit_rows_in(conn, db, account_id, rows).await
+}
+
 /// An address was suppressed (`hard_bounce` or `complaint`) and wasn't before.
 pub async fn suppressed(db: &PgPool, account_id: Uuid, profile_id: Uuid, reason: &str, message_id: Uuid) {
     if !wants(db, account_id, &["profile.suppressed"]) {

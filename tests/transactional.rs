@@ -1010,7 +1010,10 @@ async fn a_key_accepted_while_this_request_was_checked_replays_instead_of_hittin
     // its key not yet committed) while a retry arrives and finds the per-minute cap used up.
     sqlx::query("UPDATE transactional_sends SET idempotency_key = NULL WHERE id = $1::uuid").bind(&first_id).execute(&h.state.db).await.unwrap();
     let mut tx = h.state.db.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('transactional:' || $1::text, 0))").bind(&id).execute(&mut *tx).await.unwrap();
+    // Bind the id as a uuid, the way the server does: sqlx caches prepared statements per connection
+    // by their text, so the same statement bound here as a string fails when this connection already
+    // ran the server's copy.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('transactional:' || $1::text, 0))").bind(id.parse::<uuid::Uuid>().unwrap()).execute(&mut *tx).await.unwrap();
     sqlx::query("UPDATE transactional_sends SET idempotency_key = 'order-9' WHERE id = $1::uuid").bind(&first_id).execute(&mut *tx).await.unwrap();
     let finish = async {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;

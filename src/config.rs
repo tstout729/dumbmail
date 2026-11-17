@@ -35,6 +35,10 @@ pub struct Config {
     pub telnyx_api_key: Option<String>,
     #[arg(long, env = "TELNYX_MESSAGING_PROFILE_ID")]
     pub telnyx_messaging_profile_id: Option<String>,
+    /// Telnyx's webhook signing public key (base64; Telnyx portal → Keys & Credentials → Public Key).
+    /// Set, inbound texts on the platform's Telnyx are verified and forged ones rejected.
+    #[arg(long, env = "TELNYX_PUBLIC_KEY")]
+    pub telnyx_public_key: Option<String>,
     #[arg(long, env = "TWILIO_ACCOUNT_SID")]
     pub twilio_account_sid: Option<String>,
     #[arg(long, env = "TWILIO_AUTH_TOKEN", hide_env_values = true)]

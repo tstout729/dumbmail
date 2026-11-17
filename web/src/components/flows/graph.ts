@@ -1,13 +1,13 @@
-import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowTrigger, List, RandomSplitNode, Segment } from "../../api";
+import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowTrigger, List, RandomSplitNode, Segment, WaitForReplyNode } from "../../api";
 import { shortId } from "../../lib/id";
 import { starterEmail } from "../email/blocks";
 
 /** A pointer in the graph that can hold a node id: the entry, a node's `next`, or a split's yes/no. */
 export type Slot = { kind: "entry" } | { kind: "next" | "yes" | "no"; nodeId: string };
 
-/** Nodes with two paths (yes/no) instead of a single `next`: conditional and random splits. */
-export function isBranch(node: FlowNode): node is ConditionNode | RandomSplitNode {
-  return node.type === "condition" || node.type === "random_split";
+/** Nodes with two paths (yes/no) instead of a single `next`: conditional and random splits, and waiting for a reply. */
+export function isBranch(node: FlowNode): node is ConditionNode | RandomSplitNode | WaitForReplyNode {
+  return node.type === "condition" || node.type === "random_split" || node.type === "wait_for_reply";
 }
 
 export function getSlot(def: FlowDefinition, slot: Slot): string | null {
@@ -41,6 +41,8 @@ export function newNode(type: FlowNodeType, brandColor?: string, firstListId?: s
       return { id, type, condition: { match: "all", conditions: [] }, yes: null, no: null };
     case "random_split":
       return { id, type, percent: 50, yes: null, no: null };
+    case "wait_for_reply":
+      return { id, type, amount: 1, unit: "days", yes: null, no: null };
     case "update_profile":
       return { id, type, properties: {}, next: null };
     case "add_to_list":
@@ -104,13 +106,14 @@ export const nodeLabels: Record<FlowNodeType, string> = {
   sms: "SMS",
   condition: "Conditional split",
   random_split: "Random split",
+  wait_for_reply: "Wait for a reply",
   update_profile: "Update profile",
   add_to_list: "Add to list",
   remove_from_list: "Remove from list",
   webhook: "Webhook",
 };
 
-export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "condition", "random_split", "update_profile", "add_to_list", "remove_from_list", "webhook"];
+export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook"];
 
 export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Segment[] = []): string {
   switch (t.type) {
