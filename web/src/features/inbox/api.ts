@@ -36,24 +36,21 @@ export function useConversations(f: ConversationFilter) {
   return useInfiniteQuery({
     queryKey: inboxKeys.conversations(f),
     queryFn: ({ pageParam }) =>
-      api<ConversationList>("GET", withQuery("/api/inbox/conversations", { status: f.status, unread: f.unread || undefined, q: f.q, limit: PAGE, offset: pageParam })),
-    initialPageParam: 0,
-    getNextPageParam: (last, pages) => {
-      const loaded = pages.reduce((n, p) => n + p.data.length, 0);
-      return loaded < last.total && last.data.length > 0 ? loaded : undefined;
-    },
+      api<ConversationList>("GET", withQuery("/api/inbox/conversations", { status: f.status, unread: f.unread || undefined, q: f.q, limit: PAGE, cursor: pageParam ?? undefined })),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     placeholderData: keepPreviousData,
     refetchInterval: LIVE,
   });
 }
 
-/** A thread: the newest texts first, then older pages by date (`before`). */
+/** A thread: the newest texts first, then older pages (`cursor`). */
 export function useConversation(id: string) {
   return useInfiniteQuery({
     queryKey: inboxKeys.conversation(id),
-    queryFn: ({ pageParam }) => api<ConversationDetail>("GET", withQuery(`/api/inbox/conversations/${id}`, { limit: PAGE, before: pageParam ?? undefined })),
+    queryFn: ({ pageParam }) => api<ConversationDetail>("GET", withQuery(`/api/inbox/conversations/${id}`, { limit: PAGE, cursor: pageParam ?? undefined })),
     initialPageParam: null as string | null,
-    getNextPageParam: (last) => last.next_before ?? undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     refetchInterval: LIVE,
   });
 }

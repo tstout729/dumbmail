@@ -5,7 +5,6 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -35,8 +34,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<conversations::ListQuery>) -> AppResult<Json<Value>> {
-    let (rows, total) = conversations::list(&state.db, ctx.account_id, &q).await?;
-    Ok(crate::api::page(rows, total))
+    Ok(Json(conversations::list(&state.db, ctx.account_id, &q).await?.json()))
 }
 
 async fn unread_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -45,12 +43,12 @@ async fn unread_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Val
 
 #[derive(Deserialize)]
 struct ThreadQuery {
-    before: Option<DateTime<Utc>>,
+    cursor: Option<String>,
     limit: Option<i64>,
 }
 
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<ThreadQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(conversations::get(&state.db, ctx.account_id, id, q.before, q.limit).await?))
+    Ok(Json(conversations::get(&state.db, ctx.account_id, id, q.cursor.as_deref(), q.limit).await?))
 }
 
 async fn for_profile_h(State(state): State<AppState>, ctx: Ctx, Path(profile_id): Path<Uuid>) -> AppResult<Json<Value>> {

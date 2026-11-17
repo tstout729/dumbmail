@@ -12,9 +12,18 @@ Everything here works in the dashboard (Inbox), the REST API (`/api/inbox/...`) 
    refused). Twilio signs with `X-Twilio-Signature` (HMAC-SHA1 of the exact URL and the sorted
    parameters, keyed by the auth token). Where a key is configured, a webhook that fails the check
    is refused. See [Verifying inbound texts](#verifying-inbound-texts).
-2. The receiving number must belong to exactly one account. If it belongs to none, or to several,
-   nothing is stored (an opt-out is still applied in each account it could be for). A text without
-   the provider's message id is refused the same way.
+   The key is always the one for the provider whose address the webhook used, and for that
+   connection (the platform's, or your own Telnyx or Twilio): a Telnyx webhook sent to the address
+   of an account that texts through Twilio (or the other way round) is refused, never treated as
+   "no key configured".
+2. The receiving number must belong to exactly one account, and through the connection that sent
+   the webhook: the platform's address for numbers the platform carries, your own address for your
+   numbers (and your own provider's, if you connected one). If not, nothing is stored and it's
+   logged. A text without the provider's message id is refused. One exception: an opt-out is still
+   recorded when the number belongs to exactly one account and the address used is the platform's
+   or that account's, even without a message id, a signing key or a matching connection. An
+   opt-out is never written into several accounts: a number that several accounts claim is a setup
+   mistake to fix, and nothing is stored until it is.
 3. **Opt-out is decided first**, before anything else looks at the text, and it errs toward opting
    out (see [Opting out](#opting-out)). The text is stored, and its effect on consent (an opt-out, or
    START lifting one) is written in the same transaction. A provider retry of the same text is
@@ -50,29 +59,53 @@ opt-out, and records **Unsubscribed from SMS**. It also cancels the number's que
 pending double opt-in. Opt-outs are honored even from texts that couldn't be verified.
 
 The number is then **opted out at the carrier level**: nothing can be sent to it from the account
-(HELP answers excepted). This is kept separate from the profile's marketing consent. Every text
-DumbMail sends (campaigns, flows, replies, automatic texts) is checked against it in the database
-immediately before it goes to the provider, under the same lock an incoming opt-out takes, so an
-opt-out that arrived first always wins.
+(HELP answers excepted). This is kept separate from the profile's marketing consent. The opt-out is
+recorded for the pair: their number and the number of yours that got it.
 
-Only the provider's own opt-back-in words lift it: **START** and **UNSTOP** (and **YES** on Twilio,
-except on toll-free numbers, where Twilio documents that YES doesn't work), or the provider saying
-it handled the text as START. As before the inbox, START also marks the person subscribed to texts.
+Every text DumbMail sends (campaigns, flows, replies, automatic texts, test sends) is checked
+against it after it has waited for its turn at the sending rate limit and immediately before it
+goes to the provider, in one short transaction under the same lock an incoming opt-out takes: the
+check and the message's claim happen together, so an opt-out that committed first always wins, even
+over a text that was already on its way out of the queue. The number is put in one form
+(+15035550100) before that check, so a test send typed as "(503) 555-0100" is checked like any
+other. A text the provider has already taken can't be called back; its result is written only over
+its own claim. The provider gets 30 seconds to answer; a text it doesn't answer in time counts as
+failed and isn't sent again.
+
+Only the provider's own opt-back-in words lift an opt-out, and only when sent to the number of yours
+that got it (with a single number, that's always the case): **START** and **UNSTOP** on both
+providers and every kind of number, **YES** on Twilio long codes (Twilio documents that YES doesn't
+opt anyone back in on toll-free numbers; Telnyx documents only START and UNSTOP), or the provider
+saying it handled the text as START. If they opted out on two of your numbers, they stay blocked
+until both are lifted. As before the inbox, START also marks the person subscribed to texts.
 Anything else from an opted-out number, a sign-up keyword such as JOIN included, does nothing and
 sends nothing; the thread shows "Texted JOIN while opted out".
 
-People who are not opted out and already have a profile can still text START, UNSTOP, YES or
-SUBSCRIBE to subscribe, as before the inbox.
+Words that grant permission (START, UNSTOP, YES, Y and sign-up keywords) count only as the whole
+text, after trimming spaces and punctuation from its ends: "Start!" is START, "start now" isn't.
+Opt-out wording stays forgiving, as above.
+
+People who are not opted out and already have a profile can still text **START** or **UNSTOP** to
+subscribe, as before the inbox. **YES** and **Y** count only as the answer to a double opt-in prompt
+(see [Keywords](#keywords)); otherwise they're ordinary texts. **SUBSCRIBE** no longer subscribes
+anyone on its own: nobody is subscribed by a word that didn't answer a disclosed sign-up.
+
+People who texted STOP before the inbox existed are protected as they were then: their profile's
+SMS consent is `unsubscribed`, so no marketing text reaches them. The carrier-level opt-out list
+starts empty; it isn't rebuilt from old events.
 
 ## HELP
 
-**HELP** and **INFO** get one fixed, non-promotional answer, at most once an hour per number:
+**HELP** and **INFO** get one fixed, non-promotional answer, at most once an hour per number (the
+write that records the answer refuses a second within the hour, however many arrive at once):
 
 > {program name}: For help, contact {support contact}. Msg & data rates may apply. Reply STOP to cancel.
 
 It also goes to a number that opted out (it's administrative; the provider still applies its own
-block). It never starts a keyword, an automatic reply or a flow. Who answers is the `help_replies`
-setting:
+block). It never starts a keyword, an automatic reply or a flow, and it doesn't open the reply
+window. HELP answers have their own hourly allowance (30 per account), separate from the
+automatic-text budgets, so ordinary automatic replies can't use it up. Who answers is the
+`help_replies` setting:
 
 - `auto` (default): Twilio answers HELP itself on long-code and toll-free numbers, so DumbMail
   doesn't; Telnyx documents no default HELP answer for those numbers, so DumbMail answers. A text
@@ -82,9 +115,12 @@ setting:
 ## Verifying inbound texts
 
 Keywords, automatic replies, HELP answers, the 24-hour reply window and waking flows all need
-verified texts. Without a signing key the inbox still keeps every text and honors every opt-out,
-but an unverified text can't subscribe anyone, open a reply window, get an automatic reply or
-start or wake a flow, and the thread marks it **Not verified**. The settings response's
+verified texts. **Without a signing key, START, UNSTOP and keywords do nothing**: texts are still
+kept and STOP still works, but an unverified text can't opt anyone back in, subscribe anyone, run
+a keyword, open a reply window, get an automatic reply or start or wake a flow, and the thread
+marks it **Not verified**. An unverified text also never chooses which of your numbers a reply goes
+from: with only unverified texts in a conversation, a reply (allowed only if they're subscribed on
+that number) goes from your account's sending number. The settings response's
 `verification` says whether texts are verified and where the key comes from:
 
 - The platform's Telnyx: the server's `TELNYX_PUBLIC_KEY` (Telnyx portal → Keys & Credentials → Public Key).
@@ -101,8 +137,11 @@ they text again. A thread shows the full history with that person: their texts, 
 automatic replies, and every campaign and flow text they were sent (texts sent before the inbox
 existed show without their words, which weren't kept then).
 
-- `GET /api/inbox/conversations?status=open|closed|all&unread=true&q=…&limit=50&offset=0`
-- `GET /api/inbox/conversations/{id}?before=<time>&limit=50`: newest first; `next_before` pages back.
+- `GET /api/inbox/conversations?status=open|closed|all&unread=true&q=…&limit=50&cursor=…`: newest
+  activity first; pass the response's `next_cursor` as `cursor` for the next page (null on the last).
+  A cursor is a time and an id, so conversations sharing a time are neither skipped nor repeated.
+  `offset` still works but can skip or repeat conversations that move while you page.
+- `GET /api/inbox/conversations/{id}?cursor=…&limit=50`: newest first; `next_cursor` pages back.
   Also returns `reply` (`allowed`, `reason`, `window_ends_at`, `to`, `from`). Each conversation has
   `opted_out`, `their_number` and `our_number`.
 - `POST /api/inbox/conversations/{id}/read`
@@ -122,7 +161,7 @@ require them) and its segment count.
 The rules, checked when you compose and again right before the text goes to the provider:
 
 - A reply goes **to the number that texted** and **from the number they texted**, from their
-  latest text. Editing the profile's phone number doesn't move it.
+  latest verified text (HELP and opt-outs aside). Editing the profile's phone number doesn't move it.
 - **Never** to a number that opted out (until it texts START again), or to someone unsubscribed.
 - People **subscribed** to texts on that number can be replied to any time.
 - Anyone else can be replied to for **24 hours after their last verified text**, timed from when
@@ -172,9 +211,13 @@ With `double_opt_in`, they first get:
 Nobody is subscribed until the confirmation, with the full disclosure, has been **accepted by the
 provider**. If it can't go (a limit was reached, the provider refused it, they opted out
 meanwhile), they aren't subscribed. With double opt-in, a **Y** or **YES** counts only if the
-question actually went out to that number, from the number they texted, within the last 7 days,
-and the keyword is still on and still subscribes; then the confirmation goes, and they're
-subscribed once it's accepted.
+question was accepted by the provider for that number, from the number they texted, within the last
+7 days, the keyword is still on and still subscribes, and their answer was received after the
+question went out (by the provider's clock where it gives one, as Telnyx does; otherwise when it
+reached DumbMail). Then the confirmation goes, and they're subscribed once it's accepted, and only
+if their profile still has the number that answered: if someone changed the profile's number in
+the meantime, nobody is subscribed. A sign-up keyword, like Y and YES, counts only as the whole
+text ("Join!" is JOIN; "j-o-i-n" isn't).
 
 Each sign-up keeps a consent record: the exact disclosure text sent, the keyword and its version
 (it goes up on every edit), both phone numbers and the provider's message ids (the sign-up text,
@@ -197,7 +240,8 @@ out only within 24 hours of the text they answer (checked again when they send),
   texts of any kind an hour, so two automated numbers can't text each other forever;
 - per account and per receiving number, every hour: `auto_budget_account` (default 200, at most
   2,000) and `auto_budget_number` (default 100, at most 1,000) automatic texts of every kind
-  (keyword answers, sign-up texts, default and away replies, HELP answers). When one runs out,
+  (keyword answers, sign-up texts, default and away replies; HELP answers have their own
+  allowance, see [HELP](#help)). When one runs out,
   automatic texts stop for the rest of the hour and the inbox shows it (`auto_paused`,
   `auto_budget_hit_scope`).
 
@@ -226,8 +270,9 @@ keyword or certain words, add a filter:
 ```
 
 **Step, "wait for a reply"**: waits until the person texts back or the time runs out, then goes
-down `yes` (they replied) or `no` (they didn't). Only verified texts received before the deadline
-count, however late the step runs; opt-outs, START and HELP don't count. The longest wait is 30 days.
+down `yes` (they replied) or `no` (they didn't). Only verified texts received during the wait
+count, however late the step runs; opt-outs, START and HELP don't count. An older text the provider
+delivers late doesn't end the wait or bring its timeout forward. The longest wait is 30 days.
 
 ```json
 {"id": "w1", "type": "wait_for_reply", "amount": 2, "unit": "days", "yes": "thanks", "no": "nudge"}
@@ -237,4 +282,6 @@ count, however late the step runs; opt-outs, START and HELP don't count. The lon
 
 Each SMS's kind is kept in `sms_sent_texts.kind`: `marketing` for campaigns and flows, and `reply`,
 `auto_reply`, `keyword_reply`, `confirmation`, `optin_request` or `help` for conversational texts.
-Smart sending counts only `marketing` ones, and never delays the others.
+Smart sending, for campaigns and for flows, counts only `marketing` ones, and never delays the
+others: answering someone in the inbox doesn't hold back the next campaign text to them. Quiet hours
+in the person's own time zone and opt-outs still apply to that campaign text as to any other.

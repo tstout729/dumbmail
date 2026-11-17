@@ -138,6 +138,16 @@ mod tests {
     }
 
     #[test]
+    fn permission_words_match_only_the_whole_text() {
+        assert_eq!(strict_word("  Start! "), "start");
+        assert_eq!(strict_word("YES."), "yes");
+        assert_eq!(strict_word("yes please"), "yes please");
+        assert_eq!(strict_word("s-t-a-r-t"), "s-t-a-r-t");
+        assert!(!START_WORDS.contains(&strict_word("start now").as_str()));
+        assert!(!START_WORDS.contains(&"yes") && !START_WORDS.contains(&"subscribe"));
+    }
+
+    #[test]
     fn re_opt_in_words_follow_each_provider() {
         assert!(lifts_opt_out("telnyx", "+15035550100", "start"));
         assert!(lifts_opt_out("telnyx", "+18335550100", "unstop"));

@@ -869,6 +869,19 @@ async fn help_gets_one_fixed_answer() {
     assert_eq!(runs, 0);
     let kind: String = sqlx::query_scalar("SELECT kind FROM sms_sent_texts t JOIN messages m ON m.id = t.message_id WHERE m.to_address = $1").bind(a).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(kind, "help");
+    // A HELP doesn't open the reply window: only a subscriber could be answered.
+    let c = conversation_for(&mut h, a).await;
+    assert_eq!(c["can_reply"], false, "{c}");
+    // HELP answers have their own allowance: used-up automatic-text budgets don't stop them. And
+    // two HELPs landing at once from one number get one answer (the write itself refuses the second).
+    h.ok("PATCH", "/api/inbox/settings", Some(json!({"auto_budget_account": 0, "auto_budget_number": 0}))).await;
+    let twice = "+15035550806";
+    let (b1, b2) = (telnyx_body("h-9", twice, &ours, "HELP", json!({})), telnyx_body("h-10", twice, &ours, "help", json!({})));
+    let (one, two) = tokio::join!(telnyx_post(&h, &b1, true), telnyx_post(&h, &b2, true));
+    assert_eq!((one.0, two.0), (StatusCode::OK, StatusCode::OK));
+    h.drain().await;
+    assert_eq!(texts_to(&h, twice).len(), 1);
+    h.ok("PATCH", "/api/inbox/settings", Some(json!({"auto_budget_account": 200, "auto_budget_number": 100}))).await;
     // Telnyx already answered it (its autoresponse said HELP): not answered twice.
     let b = "+15035550802";
     assert_eq!(telnyx_post(&h, &telnyx_body("h-4", b, &ours, "HELP", json!({"autoresponse_type": "HELP"})), true).await.0, StatusCode::OK);
@@ -978,6 +991,7 @@ async fn flows_can_wait_for_a_reply() {
     let a = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035551201", "list_ids": [list_id]}))).await;
     let b = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035551202", "list_ids": [list_id]}))).await;
     let c = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035551203", "list_ids": [list_id]}))).await;
+    let d = h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035551204", "list_ids": [list_id]}))).await;
     h.drain().await;
     let replied = |h: &Harness, id: Value| {
         let db = h.state.db.clone();
@@ -996,12 +1010,43 @@ async fn flows_can_wait_for_a_reply() {
     h.drain().await;
     assert_eq!(replied(&h, a["id"].clone()).await, Some(true));
     assert_eq!(replied(&h, b["id"].clone()).await, None);
-    // C's deadline passed before the worker got to it; a reply after the deadline doesn't count.
-    sqlx::query("UPDATE flow_runs SET context = jsonb_set(context, '{_reply_until}', to_jsonb(now() - interval '1 minute')) WHERE profile_id = $1::uuid")
-        .bind(c["id"].as_str().unwrap())
+    // D's text from before the wait began, delivered late: it doesn't end the wait or bring the
+    // timeout forward, and a wake without a reply inside the wait just keeps waiting.
+    let body = telnyx_body("fw-4", "+15035551204", &ours, "old news", json!({"received_at": (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()}));
+    assert_eq!(telnyx_post(&h, &body, true).await.0, StatusCode::OK);
+    h.drain().await;
+    assert_eq!(replied(&h, d["id"].clone()).await, None);
+    let due = || {
+        let db = h.state.db.clone();
+        let id = d["id"].as_str().unwrap().to_string();
+        async move {
+            sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT max(j.run_at) FROM jobs j JOIN flow_runs r ON r.id::text = j.payload->>'run_id' WHERE j.kind = 'flow_step' AND r.profile_id = $1::uuid AND j.locked_at IS NULL",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    assert!(due().await > chrono::Utc::now() + chrono::Duration::days(1), "still due at the deadline");
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'flow_step' AND payload->>'run_id' IN (SELECT id::text FROM flow_runs WHERE profile_id = $1::uuid)")
+        .bind(d["id"].as_str().unwrap())
         .execute(&h.state.db)
         .await
         .unwrap();
+    h.drain().await;
+    assert_eq!(replied(&h, d["id"].clone()).await, None, "woken early, it keeps waiting");
+    assert!(due().await > chrono::Utc::now() + chrono::Duration::days(1));
+    // B's and C's deadlines passed before the worker got to them (the clock is moved by hand: a
+    // job made due early keeps waiting until its deadline); a reply after the deadline doesn't count.
+    for p in [&b, &c] {
+        sqlx::query("UPDATE flow_runs SET context = jsonb_set(context, '{_reply_until}', to_jsonb(now() - interval '1 minute')) WHERE profile_id = $1::uuid")
+            .bind(p["id"].as_str().unwrap())
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
     telnyx(&h, "fw-3", "+15035551203", &ours, "sorry, late!").await;
     h.fast_forward().await;
     assert_eq!(replied(&h, b["id"].clone()).await, Some(false));
@@ -1295,7 +1340,7 @@ async fn a_verified_text_belongs_to_exactly_one_account() {
     // Signed with its own token, for its own number: stored there, verified.
     assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-2", "+15035559202", byo_number, "hello", &[]), "own-token").await, StatusCode::OK);
     assert_eq!(stored(&h, "+15035559202").await, vec!["Own Twilio".to_string()]);
-    assert_eq!(inbound_kind(&h, "x-2").await.2, true);
+    assert!(inbound_kind(&h, "x-2").await.2);
     // Signed with its own token but for the other account's number: nothing stored anywhere, not even a STOP.
     assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-3", "+15035559203", &ours, "question", &[]), "own-token").await, StatusCode::OK);
     assert_eq!(twilio_post_to(&h, &own_path, &twilio_params("x-4", "+15035559204", &ours, "STOP", &[]), "own-token").await, StatusCode::OK);
@@ -1442,5 +1487,133 @@ async fn yes_is_consent_only_as_the_answer_to_a_prompt() {
     h.drain().await;
     let (c, n): (String, i64) = sqlx::query_as("SELECT sms_consent, (SELECT count(*) FROM sms_consents WHERE profile_id = p.id) FROM profiles p WHERE id = $1::uuid").bind(&pid).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((c.as_str(), n), ("never_subscribed", 0));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn paging_never_skips_or_repeats_items_that_share_a_time() {
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    for i in 0..3 {
+        telnyx(&h, &format!("pg-{i}"), &person(2300 + i), &ours, "hi").await;
+    }
+    // Three conversations with the same last activity, to the microsecond.
+    sqlx::query("UPDATE sms_conversations SET last_message_at = '2026-11-17 18:00:00+00'").execute(&h.state.db).await.unwrap();
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/api/inbox/conversations?limit=1&cursor={}", url::form_urlencoded::byte_serialize(c.as_bytes()).collect::<String>()),
+            None => "/api/inbox/conversations?limit=1".to_string(),
+        };
+        let page = h.ok("GET", &path, None).await;
+        seen.extend(page["data"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()));
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!((seen.len(), unique.len()), (3, 3), "{seen:?}");
+    let (s, _) = h.req("GET", "/api/inbox/conversations?cursor=nonsense", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // A thread whose texts share a time.
+    let them = person(2300);
+    for i in 0..3 {
+        telnyx(&h, &format!("pt-{i}"), &them, &ours, &format!("text {i}")).await;
+    }
+    sqlx::query("UPDATE sms_inbound SET received_at = '2026-11-17 18:00:00+00' WHERE from_number = $1").bind(&them).execute(&h.state.db).await.unwrap();
+    let id = conversation_for(&mut h, &them).await["id"].as_str().unwrap().to_string();
+    let mut bodies = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/api/inbox/conversations/{id}?limit=1&cursor={}", url::form_urlencoded::byte_serialize(c.as_bytes()).collect::<String>()),
+            None => format!("/api/inbox/conversations/{id}?limit=1"),
+        };
+        let page = h.ok("GET", &path, None).await;
+        bodies.extend(page["messages"].as_array().unwrap().iter().map(|m| m["body"].as_str().unwrap().to_string()));
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    bodies.sort();
+    assert_eq!(bodies, vec!["hi", "text 0", "text 1", "text 2"]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_unverified_text_never_picks_which_number_a_reply_goes_from() {
+    // No signing keys: texts are kept but unverified.
+    let mut h = harness!();
+    let first = setup(&mut h).await;
+    let default = h.claim_number().await;
+    let them = "+15035552401";
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": them, "sms_consent": "subscribed"}))).await;
+    assert_eq!(telnyx_post(&h, &telnyx_body("uv-1", them, &first, "is this the shop?", json!({})), false).await.0, StatusCode::OK);
+    let c = conversation_for(&mut h, them).await;
+    let id = c["id"].as_str().unwrap();
+    // They're subscribed, so a reply may go, but from the account's sending number, not the one
+    // the unverified text named.
+    let dry = h.ok("POST", &format!("/api/inbox/conversations/{id}/reply"), Some(json!({"body": "Yes!"}))).await;
+    assert_eq!((dry["to"].as_str(), dry["from"].as_str()), (Some(them), Some(default.as_str())), "{dry}");
+    h.ok("POST", &format!("/api/inbox/conversations/{id}/reply"), Some(json!({"body": "Yes!", "confirm": true}))).await;
+    let out: Vec<_> = h.state.sms.sent().into_iter().filter(|s| s.to == them).collect();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].from, default);
+    h.cleanup().await;
+}
+
+/// A number whose own time zone is in the middle of the night now (texts to it are held).
+fn nighttime_number(n: u32) -> String {
+    let candidates = [
+        format!("+1808555{:04}", n), format!("+1503555{:04}", n), format!("+1303555{:04}", n), format!("+1312555{:04}", n), format!("+1212555{:04}", n),
+        format!("+4420794{:05}", n), format!("+9198123{:05}", n), format!("+97798123{:04}", n), format!("+8190123{:05}", n),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| {
+            dumbmail::features::sendtime::zone::phone_zone(c).is_some_and(|tz| {
+                let hour = chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&tz));
+                !(7..22).contains(&hour)
+            })
+        })
+        .expect("some zone is in the middle of the night")
+}
+
+#[tokio::test]
+async fn an_inbox_reply_doesnt_hold_the_next_campaign_text_but_quiet_hours_and_stop_still_do() {
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Texters"}))).await;
+    let day = daytime_number(1);
+    let night = nighttime_number(2);
+    let stopped = daytime_number(3);
+    for (i, p) in [&day, &night, &stopped].into_iter().enumerate() {
+        telnyx(&h, &format!("sm-{i}"), p, &ours, "is my order shipped?").await;
+        let c = conversation_for(&mut h, p).await;
+        h.ok("POST", &format!("/api/inbox/conversations/{}/reply", c["id"].as_str().unwrap()), Some(json!({"body": "Yes, today!", "confirm": true}))).await;
+        sqlx::query("UPDATE profiles SET sms_consent = 'subscribed' WHERE phone_number = $1").bind(p).execute(&h.state.db).await.unwrap();
+        h.ok("POST", &format!("/api/lists/{}/members", list["id"].as_str().unwrap()), Some(json!({"profile_ids": [c["profile"]["id"]]}))).await;
+    }
+    telnyx(&h, "sm-stop", &stopped, &ours, "STOP").await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "New in", "channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+        "content": {"body": "New arrivals are in. Reply STOP to opt out."}, "send_options": {"smart_sending": true, "smart_sending_hours": 24}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let preview = h.ok("POST", "/api/sendtime/preview", Some(json!({"campaign_id": cid}))).await;
+    assert_eq!(preview["smart_sending_skips"], 0, "inbox replies aren't marketing: {preview}");
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert!(texts_to(&h, &day).iter().any(|t| t.contains("New arrivals")), "the reply didn't hold it: {:?}", texts_to(&h, &day));
+    assert_eq!(texts_to(&h, &night).len(), 1, "quiet hours in their own zone still hold it: {:?}", texts_to(&h, &night));
+    assert_eq!(texts_to(&h, &stopped).len(), 1, "only the reply before the STOP");
+    let to_stopped: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND to_address = $2 AND status NOT IN ('skipped')").bind(&cid).bind(&stopped).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(to_stopped, 0, "the STOP left them out");
+    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND to_address = $2 AND status = 'queued'").bind(&cid).bind(&night).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(held, 1, "held for their morning, not dropped");
     h.cleanup().await;
 }

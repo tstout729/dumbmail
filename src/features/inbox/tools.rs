@@ -29,10 +29,11 @@ pub fn definitions() -> Vec<Value> {
                 "unread": {"type": "boolean", "description": "Only conversations with unread texts."},
                 "q": {"type": "string", "maxLength": 100, "description": "Search names, phone numbers, emails and the words in their texts."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "offset": {"type": "integer", "minimum": 0}
+                "cursor": {"type": "string", "description": "next_cursor from the previous page."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Skip this many (ignored with cursor). Prefer cursor: it doesn't skip or repeat conversations that move while you page."}
             }), &[]), true, false),
-        tool("get_conversation", "Read an SMS conversation", "One conversation's two-way history, newest first (their texts, your replies, automatic replies, and campaign and flow texts), plus whether you can reply now and why not. Page back with `before` set to the oldest `at` you have.",
-            obj(json!({"conversation_id": id("From list_conversations."), "before": {"type": "string", "format": "date-time"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}), &["conversation_id"]), true, false),
+        tool("get_conversation", "Read an SMS conversation", "One conversation's two-way history, newest first (their texts, your replies, automatic replies, and campaign and flow texts), plus whether you can reply now and why not. Page back with `cursor` set to the `next_cursor` you got.",
+            obj(json!({"conversation_id": id("From list_conversations."), "cursor": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}), &["conversation_id"]), true, false),
         tool("send_sms_reply", "Reply to a text", "Text a reply to someone who texted in, to the number that texted and from the number they texted. Allowed when they're subscribed to texts on that number, or within 24 hours of their last verified text; never after they opted out. The rules are checked again at send time. Billed like any text. Without confirm=true it returns the text as it would go out (personalization filled in, sender name and STOP line added where required). Get the user's go-ahead before confirming.",
             obj(json!({"conversation_id": id("From list_conversations."), "body": {"type": "string", "maxLength": 1600, "description": "The reply. Personalization tags like {{ first_name|default('there') }} work."}, "confirm": {"type": "boolean"}}), &["conversation_id", "body"]), false, true),
         tool("close_conversation", "Close or reopen a conversation", "Close a conversation once it's handled (it reopens by itself when they text again), or reopen it with reopen=true.",
@@ -90,16 +91,11 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
     let r = match name {
         "list_conversations" => async {
             let q: conversations::ListQuery = crate::mcp::from(a.clone())?;
-            let (rows, total) = conversations::list(&state.db, acct, &q).await?;
-            Ok(json!({"data": rows, "total": total}))
+            Ok(conversations::list(&state.db, acct, &q).await?.json())
         }
         .await,
         "get_conversation" => async {
-            let before = match a["before"].as_str() {
-                Some(s) => Some(chrono::DateTime::parse_from_rfc3339(s).map_err(|_| AppError::bad("before must be an ISO 8601 time"))?.with_timezone(&chrono::Utc)),
-                None => None,
-            };
-            conversations::get(&state.db, acct, uuid_arg(a, "conversation_id")?, before, a["limit"].as_i64()).await
+            conversations::get(&state.db, acct, uuid_arg(a, "conversation_id")?, a["cursor"].as_str(), a["limit"].as_i64()).await
         }
         .await,
         "send_sms_reply" => async {

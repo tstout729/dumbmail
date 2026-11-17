@@ -19,6 +19,20 @@ pub struct ListQuery {
     pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// `next_cursor` from the previous page: the next page starts after it (offset is then ignored).
+    pub cursor: Option<String>,
+}
+
+/// A paging cursor: a time and an id, so items sharing a time are neither skipped nor repeated.
+pub fn encode_cursor(at: DateTime<Utc>, id: Uuid) -> String {
+    format!("{}~{}", at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), id)
+}
+
+pub fn decode_cursor(raw: &str) -> AppResult<(DateTime<Utc>, Uuid)> {
+    let bad = || AppError::bad("cursor isn't one this API returned; pass next_cursor from the previous page");
+    let (at, id) = raw.trim().split_once('~').ok_or_else(bad)?;
+    let at = DateTime::parse_from_rfc3339(at).map_err(|_| bad())?.with_timezone(&Utc);
+    Ok((at, id.parse().map_err(|_| bad())?))
 }
 
 #[derive(sqlx::FromRow)]
@@ -72,19 +86,29 @@ fn row_json(r: &Row, now: DateTime<Utc>) -> Value {
     })
 }
 
-/// Each conversation with its reply target (their number and ours, from their latest text), the
-/// start of that pair's reply window, and whether their number opted out.
-const SELECT: &str = "SELECT c.id, c.profile_id, c.status, c.unread_count, c.last_message_at, c.last_inbound_at, c.last_direction, c.last_preview,
-        p.first_name, p.last_name, p.phone_number, p.email, p.sms_consent,
-        t.from_number AS target_from, t.to_number AS target_to, t.verified AS target_verified, w.start AS window_start,
-        EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = c.account_id AND o.phone_number = COALESCE(t.from_number, p.phone_number)) AS opted_out
-    FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id
-    LEFT JOIN LATERAL (SELECT i.from_number, i.to_number, i.verified FROM sms_inbound i WHERE i.conversation_id = c.id AND i.kind NOT IN ('stop', 'blocked')
-                       ORDER BY i.provider_received_at DESC, i.id DESC LIMIT 1) t ON true
-    LEFT JOIN LATERAL (SELECT max(i.provider_received_at) AS start FROM sms_inbound i
-                       WHERE i.account_id = c.account_id AND i.from_number = t.from_number AND i.to_number = t.to_number AND i.verified AND i.kind NOT IN ('stop', 'blocked')) w ON true";
+/// Each conversation with its reply target (as `store::reply_target`: their number and ours from
+/// their latest verified text, else the profile's number and the account's sending number), the
+/// start of that pair's reply window, whether their latest text was verified, and whether their
+/// number opted out.
+static SELECT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let skip = super::store::NO_WINDOW_KINDS;
+    format!(
+        "SELECT c.id, c.profile_id, c.status, c.unread_count, c.last_message_at, c.last_inbound_at, c.last_direction, c.last_preview,
+            p.first_name, p.last_name, p.phone_number, p.email, p.sms_consent,
+            CASE WHEN t.from_number IS NOT NULL THEN t.from_number WHEN a.sms_from IS NOT NULL THEN p.phone_number END AS target_from,
+            CASE WHEN t.from_number IS NOT NULL THEN t.to_number WHEN p.phone_number IS NOT NULL THEN a.sms_from END AS target_to,
+            lv.verified AS target_verified, w.start AS window_start,
+            EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = c.account_id AND o.phone_number = COALESCE(t.from_number, p.phone_number)) AS opted_out
+        FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id JOIN accounts a ON a.id = c.account_id
+        LEFT JOIN LATERAL (SELECT i.from_number, i.to_number FROM sms_inbound i WHERE i.conversation_id = c.id AND i.verified AND i.kind NOT IN {skip}
+                           ORDER BY i.provider_received_at DESC, i.id DESC LIMIT 1) t ON true
+        LEFT JOIN LATERAL (SELECT i.verified FROM sms_inbound i WHERE i.conversation_id = c.id ORDER BY i.provider_received_at DESC, i.id DESC LIMIT 1) lv ON true
+        LEFT JOIN LATERAL (SELECT max(i.provider_received_at) AS start FROM sms_inbound i
+                           WHERE i.account_id = c.account_id AND i.from_number = t.from_number AND i.to_number = t.to_number AND i.verified AND i.kind NOT IN {skip}) w ON true"
+    )
+});
 
-pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Vec<Value>, i64)> {
+pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<ConversationPage> {
     let status = match q.status.as_deref().unwrap_or("open") {
         "all" => None,
         s @ ("open" | "closed") => Some(s.to_string()),
@@ -93,7 +117,8 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Ve
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.chars().take(100).collect::<String>());
     let digits = search.as_deref().map(|s| s.chars().filter(char::is_ascii_digit).collect::<String>()).filter(|d| d.len() >= 3);
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
-    let offset = q.offset.unwrap_or(0).clamp(0, 100_000);
+    let cursor = q.cursor.as_deref().map(decode_cursor).transpose()?;
+    let offset = if cursor.is_some() { 0 } else { q.offset.unwrap_or(0).clamp(0, 100_000) };
     let filter = "WHERE c.account_id = $1 AND ($2::text IS NULL OR c.status = $2) AND (NOT $3 OR c.unread_count > 0)
         AND ($4::text IS NULL OR p.first_name ILIKE $4 OR p.last_name ILIKE $4 OR (p.first_name || ' ' || p.last_name) ILIKE $4 OR p.email ILIKE $4
              OR ($5::text IS NOT NULL AND p.phone_number LIKE $5)
@@ -101,14 +126,19 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Ve
     let pattern = search.as_deref().map(like);
     let digits = digits.map(|d| like(&d));
     let unread = q.unread.unwrap_or(false);
-    let sql = format!("{SELECT} {filter} ORDER BY c.last_message_at DESC, c.id DESC LIMIT $6 OFFSET $7");
+    let sql = format!(
+        "{} {filter} AND ($6::timestamptz IS NULL OR (c.last_message_at, c.id) < ($6, $7)) ORDER BY c.last_message_at DESC, c.id DESC LIMIT $8 OFFSET $9",
+        *SELECT
+    );
     let rows: Vec<Row> = sqlx::query_as(&sql)
         .bind(account_id)
         .bind(&status)
         .bind(unread)
         .bind(&pattern)
         .bind(&digits)
-        .bind(limit)
+        .bind(cursor.map(|c| c.0))
+        .bind(cursor.map(|c| c.1))
+        .bind(limit + 1)
         .bind(offset)
         .fetch_all(db)
         .await?;
@@ -116,7 +146,22 @@ pub async fn list(db: &PgPool, account_id: Uuid, q: &ListQuery) -> AppResult<(Ve
     // The filter refers only to c and p, so the count doesn't need the reply-target joins.
     let total: i64 = sqlx::query_scalar(&count_sql).bind(account_id).bind(&status).bind(unread).bind(&pattern).bind(&digits).fetch_one(db).await?;
     let now = Utc::now();
-    Ok((rows.iter().map(|r| row_json(r, now)).collect(), total))
+    let page = &rows[..rows.len().min(limit as usize)];
+    let next = (rows.len() as i64 > limit).then(|| page.last().map(|r| encode_cursor(r.last_message_at, r.id))).flatten();
+    Ok(ConversationPage { data: page.iter().map(|r| row_json(r, now)).collect(), total, next_cursor: next })
+}
+
+/// One page of conversations; `next_cursor` fetches the next (None on the last page).
+pub struct ConversationPage {
+    pub data: Vec<Value>,
+    pub total: i64,
+    pub next_cursor: Option<String>,
+}
+
+impl ConversationPage {
+    pub fn json(self) -> Value {
+        json!({"data": self.data, "total": self.total, "next_cursor": self.next_cursor})
+    }
 }
 
 pub async fn unread(db: &PgPool, account_id: Uuid) -> AppResult<Value> {
@@ -165,9 +210,10 @@ fn media_json(media: &Value) -> Value {
 }
 
 /// A conversation with its newest texts (both directions, campaign and flow texts included),
-/// newest first. Page back with `before` (the `at` of the oldest text you have).
-pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTime<Utc>>, limit: Option<i64>) -> AppResult<Value> {
-    let rows: Vec<Row> = sqlx::query_as(&format!("{SELECT} WHERE c.id = $1 AND c.account_id = $2")).bind(id).bind(account_id).fetch_all(db).await?;
+/// newest first. Page back with `cursor` (the `next_cursor` of the page before).
+pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, cursor: Option<&str>, limit: Option<i64>) -> AppResult<Value> {
+    let cursor = cursor.map(decode_cursor).transpose()?;
+    let rows: Vec<Row> = sqlx::query_as(&format!("{} WHERE c.id = $1 AND c.account_id = $2", *SELECT)).bind(id).bind(account_id).fetch_all(db).await?;
     let conv = rows.first().ok_or_else(|| AppError::not_found("conversation"))?;
     let limit = limit.unwrap_or(50).clamp(1, 500);
     let items: Vec<Item> = sqlx::query_as(
@@ -185,11 +231,12 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTim
             LEFT JOIN flows f ON f.id = m.flow_id
             LEFT JOIN users u ON u.id = t.sent_by
             WHERE m.account_id = $1 AND m.profile_id = $2 AND m.channel = 'sms' AND NOT m.is_test AND m.status NOT IN ('queued', 'skipped')
-         ) x WHERE ($3::timestamptz IS NULL OR x.at < $3) ORDER BY x.at DESC, x.id DESC LIMIT $4",
+         ) x WHERE ($3::timestamptz IS NULL OR (x.at, x.id) < ($3, $4)) ORDER BY x.at DESC, x.id DESC LIMIT $5",
     )
     .bind(account_id)
     .bind(conv.profile_id)
-    .bind(before)
+    .bind(cursor.map(|c| c.0))
+    .bind(cursor.map(|c| c.1))
     .bind(limit + 1)
     .fetch_all(db)
     .await?;
@@ -209,13 +256,13 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid, before: Option<DateTim
         .collect();
     let now = Utc::now();
     let f = facts(conv);
-    let oldest = items.iter().take(limit as usize).next_back().map(|m| m.at);
+    let oldest = items.iter().take(limit as usize).next_back().map(|m| encode_cursor(m.at, m.id));
     Ok(json!({
         "conversation": row_json(conv, now),
         "messages": messages,
         "has_more": has_more,
-        // Pass as `before` to get the next older page.
-        "next_before": if has_more { json!(oldest) } else { Value::Null },
+        // Pass as `cursor` to get the next older page.
+        "next_cursor": if has_more { json!(oldest) } else { Value::Null },
         "reply": {
             "allowed": f.block(now).is_none(),
             "reason": f.block(now),

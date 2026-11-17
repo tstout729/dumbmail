@@ -64,9 +64,9 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
             Each text's signature from {v.provider === "twilio" ? "Twilio" : "Telnyx"} is checked, and forged ones are refused.
           </Notice>
         ) : (
-          <Notice tone="amber" title="Keywords, automatic replies and reply windows need your provider's signing key">
-            Without it, texts are still kept and STOP is always honored, but a text can't sign anyone up, get an automatic reply, open the 24-hour reply window or start a
-            flow, because anyone who learned your webhook address could fake one. {v.how}
+          <Notice tone="amber" title="Without your provider's signing key, START, UNSTOP and keywords do nothing">
+            Texts are still kept and STOP still works. But START and UNSTOP don't opt anyone back in, keywords don't run, and a text can't sign anyone up, get an
+            automatic reply, open the 24-hour reply window or start a flow, because anyone who learned your webhook address could fake one. {v.how}
           </Notice>
         )}
         {v.provider === "telnyx" && (s.telnyx_public_key_hint !== null || !v.configured) ? (

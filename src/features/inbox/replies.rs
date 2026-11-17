@@ -73,23 +73,20 @@ impl ReplyFacts {
 }
 
 pub async fn reply_facts(db: &sqlx::PgPool, account_id: Uuid, conversation_id: Uuid, profile: &Profile) -> AppResult<ReplyFacts> {
-    let target = store::reply_target(db, conversation_id).await?;
+    let target = store::reply_target(db, account_id, conversation_id).await?;
     let mut conn = db.acquire().await?;
-    let (opted_out, window_start, latest_unverified) = match &target {
-        Some((theirs, ours)) => {
-            let latest_verified: Option<bool> = sqlx::query_scalar("SELECT verified FROM sms_inbound WHERE conversation_id = $1 ORDER BY provider_received_at DESC, id DESC LIMIT 1")
-                .bind(conversation_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-            (store::is_opted_out(&mut conn, account_id, theirs).await?, store::window_start(&mut conn, account_id, theirs, ours).await?, latest_verified == Some(false))
-        }
-        // Only an opt-out (or texts while opted out) so far: their number is the profile's.
+    let latest_verified: Option<bool> = sqlx::query_scalar("SELECT verified FROM sms_inbound WHERE conversation_id = $1 ORDER BY provider_received_at DESC, id DESC LIMIT 1")
+        .bind(conversation_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let (opted_out, window_start) = match &target {
+        Some((theirs, ours)) => (store::is_opted_out(&mut conn, account_id, theirs).await?, store::window_start(&mut conn, account_id, theirs, ours).await?),
         None => match &profile.phone_number {
-            Some(phone) => (store::is_opted_out(&mut conn, account_id, phone).await?, None, false),
-            None => (false, None, false),
+            Some(phone) => (store::is_opted_out(&mut conn, account_id, phone).await?, None),
+            None => (false, None),
         },
     };
-    Ok(ReplyFacts { consent: profile.sms_consent.clone(), phone: profile.phone_number.clone(), target, opted_out, window_start, latest_unverified })
+    Ok(ReplyFacts { consent: profile.sms_consent.clone(), phone: profile.phone_number.clone(), target, opted_out, window_start, latest_unverified: latest_verified == Some(false) })
 }
 
 pub async fn load_profile(db: &sqlx::PgPool, account_id: Uuid, id: Uuid) -> AppResult<Profile> {
@@ -193,6 +190,24 @@ async fn take_budget(conn: &mut PgConnection, account_id: Uuid, scope: &str, lim
     Ok(n.is_some())
 }
 
+/// HELP answers per account per hour, counted apart from the automatic-text budgets.
+pub const HELP_PER_HOUR: i32 = 30;
+const HELP_BUDGET_SCOPE: &str = "help";
+
+/// Claim this hour's HELP answer for a number: true unless one went in the last hour.
+async fn take_help_slot(conn: &mut PgConnection, account_id: Uuid, phone: &str) -> AppResult<bool> {
+    let ok: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO sms_help_answers (account_id, phone_number, last_at) VALUES ($1, $2, now())
+         ON CONFLICT (account_id, phone_number) DO UPDATE SET last_at = now() WHERE sms_help_answers.last_at <= now() - interval '1 hour'
+         RETURNING 1",
+    )
+    .bind(account_id)
+    .bind(phone)
+    .fetch_optional(conn)
+    .await?;
+    Ok(ok.is_some())
+}
+
 fn static_purpose(p: &str) -> Option<&'static str> {
     ["auto_reply", "keyword_reply", "confirmation", "optin_request", "help"].into_iter().find(|k| *k == p)
 }
@@ -209,18 +224,7 @@ pub async fn queue_auto(state: &AppState, rx: &Received, purpose: &'static str, 
     let id = Uuid::now_v7();
     let mut tx = state.db.begin().await?;
     let help = purpose == "help";
-    if help {
-        let recent: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM sms_auto_sends WHERE account_id = $1 AND to_number = $2 AND purpose = 'help' AND created_at > now() - interval '1 hour')",
-        )
-        .bind(rx.account_id)
-        .bind(&rx.from)
-        .fetch_one(&mut *tx)
-        .await?;
-        if recent {
-            return Ok(None);
-        }
-    } else if store::is_opted_out(&mut tx, rx.account_id, &rx.from).await? {
+    if !help && store::is_opted_out(&mut tx, rx.account_id, &rx.from).await? {
         return Ok(None);
     }
     let inserted: Option<Uuid> = sqlx::query_scalar(
@@ -246,15 +250,27 @@ pub async fn queue_auto(state: &AppState, rx: &Received, purpose: &'static str, 
         // A retry of a text already answered.
         return Ok(None);
     }
-    if !help && !take_person_slot(&mut tx, rx.conversation_id, purpose == "auto_reply").await? {
-        tracing::info!(conversation = %rx.conversation_id, purpose, "automatic text limit for this person reached; not sending");
-        return Ok(None);
-    }
-    for (scope, limit) in [("account", s.auto_budget_account), (rx.to.as_str(), s.auto_budget_number)] {
-        if !take_budget(&mut tx, rx.account_id, scope, limit).await? {
-            tx.rollback().await?;
-            budget_hit(state, rx.account_id, scope).await?;
+    if help {
+        // HELP answers have their own small allowance, so ordinary automatic texts can't use it up,
+        // and go at most once an hour to a number (the write itself refuses a second).
+        if !take_help_slot(&mut tx, rx.account_id, &rx.from).await? {
             return Ok(None);
+        }
+        if !take_budget(&mut tx, rx.account_id, HELP_BUDGET_SCOPE, HELP_PER_HOUR).await? {
+            tracing::warn!(account = %rx.account_id, "hourly allowance for HELP answers reached; not answering");
+            return Ok(None);
+        }
+    } else {
+        if !take_person_slot(&mut tx, rx.conversation_id, purpose == "auto_reply").await? {
+            tracing::info!(conversation = %rx.conversation_id, purpose, "automatic text limit for this person reached; not sending");
+            return Ok(None);
+        }
+        for (scope, limit) in [("account", s.auto_budget_account), (rx.to.as_str(), s.auto_budget_number)] {
+            if !take_budget(&mut tx, rx.account_id, scope, limit).await? {
+                tx.rollback().await?;
+                budget_hit(state, rx.account_id, scope).await?;
+                return Ok(None);
+            }
         }
     }
     sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address) VALUES ($1, $2, $3, 'sms', $4)")

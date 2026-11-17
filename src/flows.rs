@@ -660,13 +660,19 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let at = |k: &str| context.get(k).and_then(|v| serde_json::from_value::<chrono::DateTime<Utc>>(v.clone()).ok());
                 let since = at("_reply_since").unwrap_or_else(Utc::now);
                 // A deadline that can't be read counts nothing after the wait began.
-                let until = at("_reply_until").unwrap_or(since).min(Utc::now());
+                let deadline = at("_reply_until").unwrap_or(since);
+                let now = Utc::now();
+                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                if !replied && now < deadline {
+                    // Woken before the deadline without a reply inside the wait: keep waiting.
+                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(deadline)).await?;
+                    return Ok(());
+                }
                 if let Some(o) = context.as_object_mut() {
                     o.remove("_waited");
                     o.remove("_reply_since");
                     o.remove("_reply_until");
                 }
-                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, until).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if replied { "yes" } else { "no" }).map(str::to_string);
             }
             "random_split" => {

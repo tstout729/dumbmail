@@ -56,7 +56,6 @@ CREATE TABLE sms_auto_sends (
 );
 
 CREATE INDEX sms_auto_sends_queued ON sms_auto_sends (account_id, to_number) WHERE status = 'queued';
-CREATE INDEX sms_auto_sends_help ON sms_auto_sends (account_id, to_number, created_at DESC) WHERE purpose = 'help';
 
 -- Automatic texts counted per hour, per account ('account') and per receiving number.
 CREATE TABLE sms_auto_budget (

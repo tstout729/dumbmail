@@ -28,7 +28,8 @@ export type Conversation = {
   profile: ConversationProfile;
 };
 
-export type ConversationList = { data: Conversation[]; total: number };
+/** One page; pass `next_cursor` as `cursor` for the next (null on the last page). */
+export type ConversationList = { data: Conversation[]; total: number; next_cursor: string | null };
 
 /**
  * inbound: message | stop | start | help | keyword | confirm | blocked (texted while opted out).
@@ -74,8 +75,8 @@ export type ConversationDetail = {
   conversation: Conversation;
   messages: ThreadMessage[];
   has_more: boolean;
-  /** Pass as `before` for the next older page. */
-  next_before: string | null;
+  /** Pass as `cursor` for the next older page. */
+  next_cursor: string | null;
   reply: { allowed: boolean; reason: string | null; window_ends_at: string | null; to: string | null; from: string | null };
 };
 

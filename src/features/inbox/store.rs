@@ -386,13 +386,29 @@ pub async fn mark_processed(db: &PgPool, inbound_id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// The numbers a reply in this conversation goes between: theirs and ours, from their latest text.
-/// It never follows later edits to the profile's phone number.
-pub async fn reply_target(db: &PgPool, conversation_id: Uuid) -> AppResult<Option<(String, String)>> {
+/// The numbers a reply in this conversation goes between: theirs and ours, from their latest
+/// verified text that can be answered. Without one (only unverified texts so far), the profile's
+/// number and the account's sending number: a reply can then go only if they're subscribed on that
+/// number, and an unverified text never picks which of our numbers it goes from. It never follows
+/// later edits to the profile's phone number while there's a verified text.
+pub async fn reply_target(db: &PgPool, account_id: Uuid, conversation_id: Uuid) -> AppResult<Option<(String, String)>> {
+    let verified: Option<(String, String)> = sqlx::query_as(&format!(
+        "SELECT from_number, to_number FROM sms_inbound WHERE conversation_id = $1 AND account_id = $2 AND verified AND kind NOT IN {NO_WINDOW_KINDS}
+         ORDER BY provider_received_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(conversation_id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    if verified.is_some() {
+        return Ok(verified);
+    }
     Ok(sqlx::query_as(
-        &format!("SELECT from_number, to_number FROM sms_inbound WHERE conversation_id = $1 AND kind NOT IN {NO_WINDOW_KINDS} ORDER BY provider_received_at DESC, id DESC LIMIT 1"),
+        "SELECT p.phone_number, a.sms_from FROM sms_conversations c JOIN profiles p ON p.id = c.profile_id JOIN accounts a ON a.id = c.account_id
+         WHERE c.id = $1 AND c.account_id = $2 AND p.phone_number IS NOT NULL AND a.sms_from IS NOT NULL",
     )
     .bind(conversation_id)
+    .bind(account_id)
     .fetch_optional(db)
     .await?)
 }
@@ -488,14 +504,17 @@ pub async fn record_sent(db: &PgPool, account_id: Uuid, profile_id: Uuid, messag
     Ok(())
 }
 
-/// Wake flow runs waiting for this person's reply, so they take the "replied" path now.
-pub async fn wake_waiting_flows(db: &PgPool, profile_id: Uuid) -> AppResult<()> {
+/// Wake flow runs waiting for this person's reply, so they take the "replied" path now: only the
+/// waits whose window this text was received in (an older text delivered late wakes nothing).
+pub async fn wake_waiting_flows(db: &PgPool, profile_id: Uuid, received_at: DateTime<Utc>) -> AppResult<()> {
     sqlx::query(
         "UPDATE jobs SET run_at = now()
          WHERE kind = 'flow_step' AND locked_at IS NULL AND run_at > now() AND run_at <> 'infinity'
-           AND payload->>'run_id' IN (SELECT id::text FROM flow_runs WHERE profile_id = $1 AND status = 'active' AND context ? '_reply_since')",
+           AND payload->>'run_id' IN (SELECT id::text FROM flow_runs WHERE profile_id = $1 AND status = 'active' AND context ? '_reply_since'
+                                       AND (context->>'_reply_since')::timestamptz <= $2 AND (context->>'_reply_until')::timestamptz >= $2)",
     )
     .bind(profile_id)
+    .bind(received_at)
     .execute(db)
     .await?;
     Ok(())

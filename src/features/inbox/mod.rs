@@ -131,7 +131,7 @@ pub async fn process(state: &AppState, rx: &Received) -> AppResult<()> {
                 store::set_kind(&state.db, rx.id, "message", None).await?;
                 store::record_reply_event(&state.db, rx, None).await?;
             }
-            store::wake_waiting_flows(&state.db, rx.profile_id).await?;
+            store::wake_waiting_flows(&state.db, rx.profile_id, rx.received_at).await?;
         }
         "keyword" => {
             let k = match rx.keyword.as_deref() {
@@ -142,12 +142,12 @@ pub async fn process(state: &AppState, rx: &Received) -> AppResult<()> {
             if let Some(k) = k {
                 keywords::run(state, rx, &k).await?;
             }
-            store::wake_waiting_flows(&state.db, rx.profile_id).await?;
+            store::wake_waiting_flows(&state.db, rx.profile_id, rx.received_at).await?;
         }
         "message" => {
             store::record_reply_event(&state.db, rx, None).await?;
             replies::default_reply(state, rx).await?;
-            store::wake_waiting_flows(&state.db, rx.profile_id).await?;
+            store::wake_waiting_flows(&state.db, rx.profile_id, rx.received_at).await?;
         }
         // "blocked": texted while opted out. Nothing happens and nothing is sent.
         _ => {}
