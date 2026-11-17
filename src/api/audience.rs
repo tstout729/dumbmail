@@ -214,9 +214,19 @@ pub struct ImportBody {
     pub list_id: Option<Uuid>,
     pub email_consent: Option<String>,
     pub sms_consent: Option<String>,
+    /// The importer confirms everyone on the list agreed to get email from them (required on the
+    /// hosted service unless the whole file is imported as unsubscribed).
+    #[serde(default)]
+    pub permission_confirmed: bool,
 }
 
 pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> AppResult<Value> {
+    let as_unsubscribed = b.email_consent.as_deref() == Some("unsubscribed");
+    if state.cfg.hosted && !as_unsubscribed && !b.permission_confirmed {
+        return Err(AppError::bad(
+            "Confirm that everyone in this file agreed to get email from you (permission_confirmed: true). Bought, rented or scraped lists aren't allowed.",
+        ));
+    }
     match b.list_id {
         Some(l) => core::list_belongs(&state.db, account_id, l).await?,
         // No list chosen: keep imports together so the first campaign has an obvious audience.
@@ -236,7 +246,8 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
     if b.csv.len() > 50 * 1024 * 1024 {
         return Err(AppError::bad("CSV is larger than 50 MB; split it into smaller files"));
     }
-    let r = core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent).await?;
+    // Role and throwaway addresses are left out of marketing imports; an unsubscribe file keeps them.
+    let r = core::import_csv(&state.db, account_id, &b.csv, b.list_id, b.email_consent, b.sms_consent, !as_unsubscribed).await?;
     if r.created + r.updated > 0 {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"contacts\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }

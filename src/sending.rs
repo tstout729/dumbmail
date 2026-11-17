@@ -43,8 +43,8 @@ pub enum Outcome {
 
 static LIMITER: Lazy<Mutex<HashMap<&'static str, Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-async fn throttle(channel: &'static str, per_sec: u32) {
-    let gap = Duration::from_secs_f64(1.0 / per_sec.max(1) as f64);
+async fn throttle(channel: &'static str, per_sec: f64) {
+    let gap = Duration::from_secs_f64(1.0 / per_sec.max(0.1));
     let wait = {
         let mut m = LIMITER.lock().await;
         let now = Instant::now();
@@ -220,6 +220,14 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         return Ok(Outcome::Skipped("insufficient credit"));
     }
 
+    // Warm-up: real email counts against the account's 24-hour limit; past it, the email waits.
+    let limited = spec.channel == "email" && !spec.is_test;
+    if limited {
+        if let Err(until) = crate::deliverability::take_daily_slot(state, spec.account.id).await.map_err(AppError::Internal)? {
+            return Ok(Outcome::Deferred(until));
+        }
+    }
+
     if spec.message_id.is_none() {
         sqlx::query(
             "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
@@ -248,11 +256,13 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
 
     let result = match &rendered {
         Rendered::Email(e) => {
-            throttle("email", state.cfg.send_rate_per_sec).await;
+            // Never faster than the provider allows (SES's rate for the account), nor than configured.
+            let configured = f64::from(state.cfg.send_rate_per_sec.max(1));
+            throttle("email", state.email.max_send_rate().map_or(configured, |r| r.min(configured))).await;
             state.email.send(e).await
         }
         Rendered::Sms(s, provider, _) => {
-            throttle("sms", state.cfg.send_rate_per_sec).await;
+            throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
             provider.send(s).await
         }
     };
@@ -289,6 +299,23 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             Ok(Outcome::Sent(message_id))
         }
         Err(e) => {
+            if limited {
+                crate::deliverability::return_daily_slot(state, spec.account.id);
+            }
+            // The provider can't take mail right now (quota used up, throttled, paused on its side): wait.
+            if let Some(busy) = e.downcast_ref::<crate::providers::email::ProviderBusy>() {
+                tracing::warn!(message = %message_id, reason = %busy.reason, "email provider busy; holding the email");
+                if spec.is_test {
+                    sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1").bind(message_id).bind(busy.to_string()).execute(&state.db).await?;
+                    return Err(AppError::Conflict("Amazon isn't accepting more email from DumbMail right now. Try the test again later.".into()));
+                }
+                if spec.message_id.is_none() {
+                    // A flow re-runs this step later and creates a new message then.
+                    sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id).execute(&state.db).await?;
+                }
+                let wait = chrono::Duration::from_std(busy.retry_after).unwrap_or(chrono::Duration::hours(1));
+                return Ok(Outcome::Deferred(Utc::now() + wait));
+            }
             let msg = format!("{e:#}");
             tracing::warn!(message = %message_id, error = %msg, "send failed");
             sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1")
@@ -338,6 +365,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             sending_paused_at: None,
             sending_paused_reason: None,
+            email_daily_limit_override: None,
+            email_sunset_enabled: true,
             link_domain: None,
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),

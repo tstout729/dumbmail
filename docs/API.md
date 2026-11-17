@@ -32,6 +32,8 @@ type Account = {
   created_at: string;
   // Set while email sending is paused for high bounces or spam complaints (see "Automatic email pause").
   sending_paused_at: string | null; sending_paused_reason: string | null;
+  // Campaign email skips people who never engage (see "Sending guardrails"). Editable with PATCH /api/account.
+  email_sunset_enabled: boolean;
 };
 
 type User = { id: string; email: string; name: string | null };
@@ -139,7 +141,7 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | GET | `/api/me` | – | `{user, account, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too |
 | PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial. `social_links` is `{instagram\|facebook\|tiktok\|x\|youtube\|pinterest\|linkedin\|threads: https URL}`; a blank value removes that network. Social links appear in email footers | `Account` |
 | POST | `/api/brand/import` | `{url, apply?}` | `{brand: {website, name, logo_url, brand_color, colors[], address, from_email, from_email_found, social_links}}`. Reads the public website (and its stylesheets and logo) for brand suggestions. With `apply: true`, also saves website, logo, brand color and social links, plus name and address when the account has none, and returns `account` |
-| GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}}` |
+| GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}, email_limit?: {limit, sent_last_24h, remaining, fixed, start}, unengaged_skip: {enabled, days, min_emails}}`. `email_limit` is the hosted service's 24-hour warm-up limit (see "Sending guardrails") |
 | POST | `/api/account/domain` | `{domain}` | same as GET sending |
 | POST | `/api/account/domain/verify` | – | same as GET sending |
 | GET | `/api/api-keys` | – | `{data: {id, name, prefix, created_at, last_used_at}[]}` |
@@ -156,9 +158,9 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | GET | `/api/profiles/:id` | – | `{profile, lists: List[], segments: Segment[], events: EventRow[], messages: {id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at}[]}` |
 | PATCH | `/api/profiles/:id` | partial Profile | `Profile` |
 | DELETE | `/api/profiles/:id` | – | `{ok: true}` |
-| POST | `/api/profiles/import` | `{csv: string, list_id?: string, email_consent?: Consent, sms_consent?: Consent}` | `{created, updated, skipped, errors: string[]}` |
+| POST | `/api/profiles/import` | `{csv: string, list_id?: string, email_consent?: Consent, sms_consent?: Consent, permission_confirmed?: boolean}` | `{created, updated, skipped, errors: string[]}`. On the hosted service `permission_confirmed: true` (everyone in the file agreed to get email) is required unless `email_consent` is `unsubscribed`; without it the import is refused with 400. Unless importing as unsubscribed, shared inboxes (info@, sales@, no-reply@ …) and throwaway addresses (mailinator.com …) are skipped and summarized at the top of `errors` |
 | GET | `/api/lists` | – | `{data: List[], total}` |
-| POST | `/api/lists` | `{name, double_opt_in?}` | `List` |
+| POST | `/api/lists` | `{name, double_opt_in?}` | `List`. With `double_opt_in`, people who sign up through a form get a confirmation email and join only after confirming (see "Sending guardrails") |
 | GET/PATCH/DELETE | `/api/lists/:id` | `{name?}` | `List` |
 | POST | `/api/lists/:id/members` | `{profile_ids?: string[], emails?: string[]}` | `{added}` |
 | DELETE | `/api/lists/:id/members` | `{profile_ids: string[]}` | `{removed}` |
@@ -216,7 +218,8 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 ## Public endpoints (no auth)
 
 - `POST /client/events?k=<public_key>` – browser tracking (`{metric, profile, properties}`), CORS open.
-- `POST /client/subscribe?k=<public_key>` – form submit (`{form_id, email?, phone_number?, first_name?, sms_consent?}`).
+- `POST /client/subscribe?k=<public_key>` – form submit (`{form_id, email?, phone_number?, first_name?, sms_consent?}`). Returns `{ok, message}`, plus `confirm: true` when the form's list is double opt-in and a confirmation email went out (the message then asks them to check their inbox; set `config.confirm_message` on the form to change it).
+- `GET|POST /c/:token` – double opt-in confirmation. GET shows a "Yes, subscribe me" button; only the POST confirms, so link scanners can't. Links work for 7 days.
 - `GET /f/:form_id` hosted sign-up page, `GET /f/:form_id/embed.js` embed script.
 - `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click).
 - `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
@@ -251,6 +254,35 @@ scheduler catches up within about 20 seconds). While paused:
 - The operator is emailed at OPERATOR_ALERT_EMAIL (falling back to SUPPORT_EMAIL; the address sends to
   itself, so its domain must be verified with the email provider), and the pause is logged at error level.
 
+## Sending guardrails
+
+These protect the shared SES account's reputation along with the automatic pause above.
+
+- **Warm-up limit (hosted service).** Real email (not tests) counts against a rolling 24-hour limit per
+  account. New accounts start at `WARMUP_START_DAILY` (500). Each day the limit becomes twice the account's
+  busiest finished day of the last 30 (in the account's time zone), as long as its last 7 days stay under
+  2% hard bounces and (with 2 or more complaints) 0.03% complaints. Otherwise it holds at the busiest day.
+  Today's sends never raise it. An account that sent nothing for 30 days starts over. Emails past the limit
+  aren't dropped: campaign and flow emails wait (`queued`, the batch job is rescheduled) until the oldest
+  send in the window turns 24 hours old, at least 15 minutes later. Operators can set a fixed limit with
+  `POST /admin/sending-limit`.
+- **Provider limits.** Sends never go faster than the SES account's own maximum rate (read at startup and
+  every 10 minutes) or `SEND_RATE_PER_SEC`, whichever is lower. When SES throttles, the email is retried
+  up to 3 times (1, 2, 4 seconds). When SES's daily quota is used up or sending is paused on SES's side,
+  campaign and flow emails wait an hour instead of failing, and test sends return 409.
+- **Unengaged profiles.** With `email_sunset_enabled` (on by default), email campaigns and their estimates
+  leave out anyone who got 10 or more emails in the last 180 days and had no other event in that time:
+  no open, click, sign-up, order or site activity. Flows aren't affected.
+- **Imports** need `permission_confirmed` and skip role and throwaway addresses (see `/api/profiles/import`).
+- **Double opt-in.** A form sign-up to a double opt-in list sets no email consent and doesn't join the list.
+  A confirmation email (from the account's sender, not billed, no unsubscribe header) links to `/c/:token`.
+  Confirming sets `email_consent: "subscribed"`, records "Subscribed to List" (with
+  `double_opt_in: true`) and adds them to the list, which starts list-triggered flows. People already
+  subscribed to email join straight away. An address waiting to confirm gets no second email for 24 hours,
+  and an account sends at most 200 confirmations an hour. If the account can't send email (no verified
+  sender, or sending paused), the sign-up goes through without confirmation and a warning is logged.
+  Confirmation emails count toward bounce and complaint rates, and a bounce suppresses the address.
+
 ## Operator endpoints
 
 Require `Authorization: Bearer <ADMIN_TOKEN>` (32+ characters). When ADMIN_TOKEN is unset or shorter they
@@ -260,6 +292,7 @@ answer 404; a wrong token gets 401. Given `email`, the account is the one whose 
 | --- | --- | --- | --- |
 | POST | `/admin/credit` | `{email, amount, note?}` (USD; negative debits, at most 10,000) | `{account, balance}` |
 | POST | `/admin/unpause` | `{account_id}` or `{email}` | `{account, was_paused, sending_paused: false}`. Lifts the automatic email pause and restarts the window the rates are measured over, so bounces from before don't pause the account again. Campaigns stopped by the pause stay failed |
+| POST | `/admin/sending-limit` | `{account_id or email, daily_limit: number \| null}` | `{account, daily_limit, fixed, sent_last_24h}`. A fixed 24-hour email limit (0 to 10,000,000) in place of the warm-up, or `null` to return to it |
 
 ## v0.2 additions: pay-as-you-go billing, phone numbers, domains, website snippet
 

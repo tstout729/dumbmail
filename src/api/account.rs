@@ -200,6 +200,8 @@ pub struct AccountPatch {
     /// Network → profile URL; a blank value removes that network.
     pub social_links: Option<serde_json::Map<String, Value>>,
     pub onboarding: Option<serde_json::Map<String, Value>>,
+    /// Skip campaign email to people who haven't engaged in months.
+    pub email_sunset_enabled: Option<bool>,
 }
 
 fn blank_to_none(v: Option<String>) -> Option<Option<String>> {
@@ -275,6 +277,9 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     if let Some(m) = b.conversion_metric.filter(|m| !m.trim().is_empty()) {
         account.conversion_metric = m;
     }
+    if let Some(v) = b.email_sunset_enabled {
+        account.email_sunset_enabled = v;
+    }
     if let Some(o) = b.onboarding {
         if let Some(cur) = account.onboarding.as_object_mut() {
             for (k, v) in o {
@@ -286,7 +291,7 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     }
     let saved: Account = sqlx::query_as(
         "UPDATE accounts SET name=$2, website=$3, from_name=$4, from_email=$5, reply_to=$6, sms_from=$7, timezone=$8, address=$9,
-            brand_color=$10, logo_url=$11, conversion_metric=$12, onboarding=$13, social_links=$14 WHERE id=$1 RETURNING *",
+            brand_color=$10, logo_url=$11, conversion_metric=$12, onboarding=$13, social_links=$14, email_sunset_enabled=$15 WHERE id=$1 RETURNING *",
     )
     .bind(account.id)
     .bind(&account.name)
@@ -302,6 +307,7 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     .bind(&account.conversion_metric)
     .bind(&account.onboarding)
     .bind(&account.social_links)
+    .bind(account.email_sunset_enabled)
     .fetch_one(&state.db)
     .await?;
     Ok(saved)
@@ -342,6 +348,7 @@ pub async fn import_brand(state: &AppState, account_id: Uuid, url: &str, apply: 
         conversion_metric: None,
         social_links: Some(social),
         onboarding: None,
+        email_sunset_enabled: None,
     };
     let account = patch_account(state, account_id, patch).await?;
     Ok(json!({"brand": kit, "account": account}))
@@ -356,7 +363,24 @@ async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
 }
 
 pub async fn sending_json(state: &AppState, a: &Account) -> AppResult<Value> {
-    crate::domains::sending_json(state, a).await
+    let mut out = crate::domains::sending_json(state, a).await?;
+    // The hosted service's 24-hour email limit (warm-up). Self-hosted installs have none.
+    if state.cfg.hosted {
+        let l = crate::deliverability::daily_limit(state, a.id).await?;
+        out["email_limit"] = json!({
+            "limit": l.limit,
+            "sent_last_24h": l.sent_24h,
+            "remaining": l.remaining(),
+            "fixed": l.fixed,
+            "start": state.cfg.warmup_start_daily,
+        });
+    }
+    out["unengaged_skip"] = json!({
+        "enabled": a.email_sunset_enabled,
+        "days": crate::deliverability::SUNSET_DAYS,
+        "min_emails": crate::deliverability::SUNSET_MIN_EMAILS,
+    });
+    Ok(out)
 }
 
 async fn sending_now(state: &AppState, account_id: Uuid) -> AppResult<Json<Value>> {

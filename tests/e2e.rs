@@ -52,6 +52,8 @@ impl Harness {
             hosted: true,
             allow_signup: true,
             send_rate_per_sec: 1000,
+            // Most tests send more than a new account's first-day limit; the warm-up test sets its own.
+            warmup_start_daily: 1_000_000,
             workers: 1,
             secure_cookies: false,
             stripe_secret_key: None,
@@ -188,7 +190,7 @@ async fn signup_import_segment_campaign_tracking_unsubscribe() {
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter"}))).await;
     let list_id = list["id"].as_str().unwrap().to_string();
     let csv = "Email,First Name,City,Orders\nann@x.test,Ann,Portland,3\nbob@x.test,Bob,Seattle,0\nnot-an-email,Bad,Nowhere,1\ncat@x.test,Cat,portland,7\n";
-    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list_id, "email_consent": "subscribed"}))).await;
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list_id, "email_consent": "subscribed", "permission_confirmed": true}))).await;
     assert_eq!(imp["created"], 3);
     assert_eq!(imp["skipped"], 1);
 
@@ -552,7 +554,7 @@ async fn billing_numbers_onsite_and_domains() {
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "All"}))).await;
     let mut csv = String::from("email\n");
     for i in 0..30 { csv.push_str(&format!("p{i}@x.test\n")); }
-    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
     let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
         "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
     let cid = c["id"].as_str().unwrap().to_string();
@@ -882,7 +884,7 @@ async fn ab_list(h: &mut Harness, n: usize) -> String {
     for i in 0..n {
         csv.push_str(&format!("ab{i}@x.test\n"));
     }
-    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
     list["id"].as_str().unwrap().to_string()
 }
 
@@ -1426,7 +1428,7 @@ async fn email_list(h: &mut Harness, prefix: &str, n: usize) -> String {
     for i in 0..n {
         csv.push_str(&format!("{prefix}{i}@x.test\n"));
     }
-    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
     assert_eq!(imp["created"], n, "{imp}");
     list["id"].as_str().unwrap().to_string()
 }
@@ -1764,7 +1766,7 @@ async fn monthly_email_plans() {
     for i in 0..30 {
         csv.push_str(&format!("p{i}@x.test\n"));
     }
-    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed"}))).await;
+    h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "list_id": list["id"], "email_consent": "subscribed", "permission_confirmed": true}))).await;
     let c = h.ok("POST", "/api/campaigns", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]},
         "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]}}))).await;
     h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
@@ -1872,4 +1874,237 @@ async fn monthly_email_plans() {
     let pm: Option<String> = sqlx::query_scalar("SELECT stripe_payment_method_id FROM accounts WHERE id = $1").bind(acct_id).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(pm.as_deref(), Some("pm_card"));
     assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "active");
+}
+
+// ---------- Sending guardrails: warm-up, imports, double opt-in, unengaged profiles ----------
+
+#[tokio::test]
+async fn warmup_limit_holds_extra_email_until_room_opens() {
+    let mut h = match Harness::with(|c| c.warmup_start_daily = 5).await {
+        Some(h) => h,
+        None => return,
+    };
+    let me = h.signup().await;
+    let account_id = me["account"]["id"].as_str().unwrap().to_string();
+    h.credit(5.0).await;
+    let list = email_list(&mut h, "warm", 8).await;
+    let cid = start_email_campaign(&mut h, &list, "First send").await;
+    h.drain().await;
+
+    let pool = h.state.db.clone();
+    let count = |status: &'static str| {
+        let db = pool.clone();
+        let cid = cid.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND status = $2 AND NOT is_test")
+                .bind(cid)
+                .bind(status)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count("sent").await, 5, "a new account sends 5 in its first 24 hours here");
+    assert_eq!(count("queued").await, 3, "the rest wait, they aren't dropped");
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sending");
+    let wait: f64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM min(run_at) - now())::float8 FROM jobs WHERE kind = 'campaign_batch'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(wait > 23.0 * 3600.0, "the batch waits until the oldest send is a day old, not {wait}s");
+
+    let s = h.ok("GET", "/api/account/sending", None).await;
+    assert_eq!(s["email_limit"], json!({"limit": 5, "sent_last_24h": 5, "remaining": 0, "fixed": false, "start": 5}));
+
+    // Tests aren't limited.
+    let tc = h.ok("POST", "/api/campaigns", Some(json!({"name": "T", "channel": "email", "audience": {"include": [{"type": "list", "id": list}]},
+        "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/test", tc["id"].as_str().unwrap()), Some(json!({"to": ["me@acme.test"]}))).await;
+
+    // An operator raises the limit: the held email goes out on the next run.
+    let (st, _, body) = h
+        .raw("POST", "/admin/sending-limit", &[ADMIN, ("content-type", "application/json")], &json!({"account_id": account_id, "daily_limit": 100}).to_string())
+        .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    h.fast_forward().await;
+    assert_eq!(count("sent").await, 8);
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(c["status"], "sent");
+    let s = h.ok("GET", "/api/account/sending", None).await;
+    assert_eq!(s["email_limit"]["fixed"], true);
+    assert_eq!(s["email_limit"]["limit"], 100);
+
+    // Back to the automatic limit. Today's sends never raise it (or it could double all day long)...
+    let (st, _, _) = h
+        .raw("POST", "/admin/sending-limit", &[ADMIN, ("content-type", "application/json")], &json!({"account_id": account_id, "daily_limit": null}).to_string())
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let s = h.ok("GET", "/api/account/sending", None).await;
+    assert_eq!(s["email_limit"]["limit"], 5);
+    assert_eq!(s["email_limit"]["fixed"], false);
+    // ...but once those 8 clean sends are a finished day, the limit is twice that.
+    sqlx::query("UPDATE email_sends SET sent_at = now() - interval '2 days'").execute(&h.state.db).await.unwrap();
+    let s = h.ok("GET", "/api/account/sending", None).await;
+    assert_eq!(s["email_limit"], json!({"limit": 16, "sent_last_24h": 0, "remaining": 16, "fixed": false, "start": 5}));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn import_requires_permission_and_skips_risky_addresses() {
+    let mut h = harness!();
+    h.signup().await;
+    let csv = "email\nreal@shop.test\ninfo@shop.test\nno-reply@shop.test\njane@mailinator.com\n";
+    let (s, v) = h.req("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "subscribed"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("agreed to get email"), "{v}");
+
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "subscribed", "permission_confirmed": true}))).await;
+    assert_eq!(imp["created"], 1, "{imp}");
+    assert_eq!(imp["skipped"], 3);
+    let errors = imp["errors"].to_string();
+    assert!(errors.contains("Skipped 2 shared inbox addresses"), "{errors}");
+    assert!(errors.contains("Skipped 1 throwaway addresses"), "{errors}");
+
+    // A suppression file needs no confirmation and keeps every address, so they're never emailed.
+    let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "unsubscribed"}))).await;
+    assert_eq!(imp["created"].as_i64().unwrap() + imp["updated"].as_i64().unwrap(), 4, "{imp}");
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'info@shop.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(consent, "unsubscribed");
+
+    // MCP imports need the same confirmation.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "mcp"}))).await;
+    let auth = format!("Bearer {}", key["key"].as_str().unwrap());
+    let call = |args: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "import_profiles", "arguments": args}}).to_string();
+    let (_, _, body) = h.raw("POST", "/mcp", &[("authorization", &auth), ("content-type", "application/json")], &call(json!({"csv": "email\nmcp@shop.test\n"}))).await;
+    assert!(body.contains("agreed to get email"), "{body}");
+    let (_, _, body) = h
+        .raw("POST", "/mcp", &[("authorization", &auth), ("content-type", "application/json")], &call(json!({"csv": "email\nmcp@shop.test\n", "permission_confirmed": true})))
+        .await;
+    assert!(body.contains("created"), "{body}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn double_opt_in_form_confirms_before_joining() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Newsletter", "double_opt_in": true}))).await;
+    let list_id = list["id"].as_str().unwrap().to_string();
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Popup", "list_id": list_id, "config": {"headline": "Join"}}))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "live"}))).await;
+    let subscribe = |email: &str| json!({"form_id": fid, "email": email}).to_string();
+    let pool = h.state.db.clone();
+    let member = |email: &'static str| {
+        let db = pool.clone();
+        let list_id = list_id.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM list_members lm JOIN profiles p ON p.id = lm.profile_id WHERE lm.list_id = $1::uuid AND p.email = $2)")
+                .bind(list_id)
+                .bind(email)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+
+    let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("new@x.test")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["confirm"], true, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("Check your inbox"));
+    assert!(!member("new@x.test").await, "not on the list until they confirm");
+    let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_ne!(consent, "subscribed");
+
+    let mails: Vec<_> = h.state.email.sent().into_iter().filter(|m| m.to == "new@x.test").collect();
+    assert_eq!(mails.len(), 1);
+    assert_eq!(mails[0].subject, "Confirm your subscription to Acme Goods");
+    assert!(mails[0].unsubscribe_url.is_none());
+    let link = find_link(&mails[0].html, "https://pl.test/c/");
+    let path = link.trim_start_matches("https://pl.test");
+
+    // Signing up again while waiting doesn't send another email.
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("new@x.test")).await;
+    assert_eq!(h.state.email.sent().into_iter().filter(|m| m.to == "new@x.test").count(), 1);
+
+    // Opening the link (as a link scanner would) changes nothing; the button confirms.
+    let (s, _, page) = h.raw("GET", path, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("Yes, subscribe me") && page.contains("method=\"post\""), "{page}");
+    assert!(!member("new@x.test").await);
+    let (s, _, page) = h.raw("POST", path, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("You're subscribed"), "{page}");
+    assert!(member("new@x.test").await);
+    let (consent, events): (String, i64) = sqlx::query_as(
+        "SELECT p.email_consent, (SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.profile_id = p.id AND m.name = 'Subscribed to List')
+         FROM profiles p WHERE p.email = 'new@x.test'",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!((consent.as_str(), events), ("subscribed", 1));
+    let (s, _, page) = h.raw("POST", path, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("You're subscribed"));
+    let (s, _, _) = h.raw("GET", "/c/not-a-real-token", &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Someone already subscribed to email joins straight away.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "fan@x.test", "email_consent": "subscribed"}))).await;
+    let (_, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe("fan@x.test")).await;
+    assert!(!body.contains("\"confirm\""), "{body}");
+    assert!(member("fan@x.test").await);
+
+    // A confirmation bounce suppresses the address like any other bounce.
+    let pid: String = sqlx::query_scalar("SELECT provider_message_id FROM messages WHERE to_address = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
+    ses_event(&h, &pid, "Permanent").await;
+    let suppressed: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE email = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(suppressed.as_deref(), Some("hard_bounce"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn campaigns_skip_people_who_never_engage() {
+    let mut h = harness!();
+    h.signup().await;
+    let list = email_list(&mut h, "eng", 3).await;
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    // eng0: 10 emails, nothing else. eng1: 10 emails and an open. eng2: 9 emails.
+    for (email, n) in [("eng0@x.test", 10), ("eng1@x.test", 10), ("eng2@x.test", 9)] {
+        sqlx::query(
+            "INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, sent_at, created_at)
+             SELECT gen_random_uuid(), p.account_id, p.id, 'email', p.email, 'delivered', now() - interval '20 days', now() - interval '20 days'
+             FROM profiles p, generate_series(1, $2) WHERE p.email = $1",
+        )
+        .bind(email)
+        .bind(n)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'eng1@x.test'").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::audience::record_event(
+        &h.state.db,
+        dumbmail::audience::NewEvent { account_id: account, profile_id: pid, metric: "Opened Email", properties: json!({}), value: None, occurred_at: None, unique_id: None, message_id: None },
+    )
+    .await
+    .unwrap();
+    let audience = json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list}]}});
+    let est = h.ok("POST", "/api/campaigns/estimate", Some(audience.clone())).await;
+    assert_eq!(est["count"], 2, "eng0 is skipped");
+    let cid = start_email_campaign(&mut h, &list, "Engaged only").await;
+    h.drain().await;
+    let to: Vec<String> = sqlx::query_scalar("SELECT to_address FROM messages WHERE campaign_id = $1::uuid ORDER BY to_address").bind(&cid).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(to, ["eng1@x.test", "eng2@x.test"]);
+
+    let s = h.ok("GET", "/api/account/sending", None).await;
+    assert_eq!(s["unengaged_skip"], json!({"enabled": true, "days": 180, "min_emails": 10}));
+    h.ok("PATCH", "/api/account", Some(json!({"email_sunset_enabled": false}))).await;
+    let est = h.ok("POST", "/api/campaigns/estimate", Some(audience)).await;
+    assert_eq!(est["count"], 3, "turned off, everyone is reachable");
+    h.cleanup().await;
 }

@@ -305,9 +305,231 @@ pub async fn check_pending(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------- Warm-up: a 24-hour email limit that grows with clean sending ----------
+//
+// A new account can't send its whole list on day one. It starts at `WARMUP_START` emails per 24 hours,
+// and each day the limit becomes twice its busiest finished day (in the account's time zone) of the last 30, as long as its recent bounces and
+// complaints stay well under the pause limits. A bought or stale list then shows up (and pauses the
+// account) within a few hundred emails instead of tens of thousands. An account that sent nothing for
+// 30 days starts over, because a list left alone that long has gone stale. Operators can set a fixed
+// limit instead (`POST /admin/sending-limit`).
+
+/// Emails a new account may send in its first 24 hours, unless `WARMUP_START_DAILY` says otherwise.
+pub const WARMUP_START: i64 = 500;
+/// Days of history the warm-up looks back over for the busiest day.
+pub const WARMUP_LOOKBACK_DAYS: i32 = 30;
+/// Grows only while recent email is this clean (judged once there are 100 emails to judge).
+pub const HEALTHY: Limits = Limits { min_sent: 100, max_bounce_rate: 0.02, max_complaint_rate: 0.0003 };
+/// How long a computed limit is reused before it's read again from the database.
+const LIMIT_CACHE: Duration = Duration::from_secs(60);
+/// The earliest a deferred send tries again, so a full limit doesn't re-run batches every few seconds.
+const MIN_RETRY: chrono::Duration = chrono::Duration::minutes(15);
+
+/// The 24-hour limit for an account with this history. `peak` is its busiest finished day in the lookback;
+/// today never counts, or the limit could double again and again within one day.
+pub fn warmup_limit(start: i64, peak: i64, recent: &Outcomes) -> i64 {
+    let healthy = recent.sent < HEALTHY.min_sent
+        || (recent.bounced as f64 / recent.sent as f64 <= HEALTHY.max_bounce_rate
+            && (recent.complained < 2 || recent.complained as f64 / recent.sent as f64 <= HEALTHY.max_complaint_rate));
+    let earned = if healthy { peak.saturating_mul(2) } else { peak };
+    earned.max(start)
+}
+
+/// An account's 24-hour email limit right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DailyLimit {
+    pub limit: i64,
+    /// Real emails accepted by the provider in the last 24 hours.
+    pub sent_24h: i64,
+    /// Set by an operator rather than earned.
+    pub fixed: bool,
+}
+
+impl DailyLimit {
+    pub fn remaining(&self) -> i64 {
+        (self.limit - self.sent_24h).max(0)
+    }
+}
+
+pub async fn daily_limit(state: &AppState, account_id: Uuid) -> sqlx::Result<DailyLimit> {
+    let db = &state.db;
+    let (fixed, sent_24h, peak): (Option<i32>, i64, i64) = sqlx::query_as(
+        "SELECT a.email_daily_limit_override,
+            (SELECT count(*) FROM email_sends s WHERE s.account_id = a.id AND s.sent_at > now() - interval '24 hours')::bigint,
+            COALESCE((SELECT max(n) FROM (SELECT count(*) AS n FROM email_sends s WHERE s.account_id = a.id
+                AND s.sent_at > now() - make_interval(days => $2)
+                AND (s.sent_at AT TIME ZONE a.timezone)::date < (now() AT TIME ZONE a.timezone)::date
+                GROUP BY (s.sent_at AT TIME ZONE a.timezone)::date) d), 0)::bigint
+         FROM accounts a WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .bind(WARMUP_LOOKBACK_DAYS)
+    .fetch_one(db)
+    .await?;
+    if let Some(f) = fixed {
+        return Ok(DailyLimit { limit: i64::from(f.max(0)), sent_24h, fixed: true });
+    }
+    let recent = account_outcomes(db, account_id).await?;
+    Ok(DailyLimit { limit: warmup_limit(state.cfg.warmup_start_daily.max(1), peak, &recent), sent_24h, fixed: false })
+}
+
+#[derive(Debug)]
+pub struct CachedLimit {
+    read_at: Instant,
+    limit: DailyLimit,
+    /// Sends counted in this process since `read_at`.
+    since: i64,
+}
+
+/// Per account: the last limit read and the sends since (lives in `AppState`).
+pub type LimitCache = Mutex<HashMap<Uuid, CachedLimit>>;
+
+/// Take one email from the account's 24-hour limit. Ok(()) means send it; Err(when) means the limit is
+/// used up and the email should wait until then. Only real email on the hosted service is limited.
+pub async fn take_daily_slot(state: &AppState, account_id: Uuid) -> anyhow::Result<Result<(), chrono::DateTime<chrono::Utc>>> {
+    if !state.cfg.hosted {
+        return Ok(Ok(()));
+    }
+    let fresh = {
+        let map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
+        map.get(&account_id).is_some_and(|c| c.read_at.elapsed() < LIMIT_CACHE)
+    };
+    if !fresh {
+        let limit = daily_limit(state, account_id).await?;
+        let mut map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
+        map.insert(account_id, CachedLimit { read_at: Instant::now(), limit, since: 0 });
+    }
+    let allowed = {
+        let mut map = state.daily_limits.lock().map_err(|_| anyhow::anyhow!("limit cache poisoned"))?;
+        let Some(c) = map.get_mut(&account_id) else { return Ok(Ok(())) };
+        if c.limit.sent_24h + c.since < c.limit.limit {
+            c.since += 1;
+            true
+        } else {
+            false
+        }
+    };
+    if allowed {
+        return Ok(Ok(()));
+    }
+    // Room opens up as the oldest sends in the window turn 24 hours old.
+    let oldest: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT min(sent_at) FROM email_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'")
+            .bind(account_id)
+            .fetch_one(&state.db)
+            .await?;
+    let now = chrono::Utc::now();
+    let when = oldest.map(|t| t + chrono::Duration::hours(24)).unwrap_or(now).max(now + MIN_RETRY);
+    Ok(Err(when))
+}
+
+/// Give back a slot taken for an email that then wasn't sent (it failed, or the provider was busy).
+pub fn return_daily_slot(state: &AppState, account_id: Uuid) {
+    if let Ok(mut map) = state.daily_limits.lock() {
+        if let Some(c) = map.get_mut(&account_id) {
+            c.since = (c.since - 1).max(0);
+        }
+    }
+}
+
+/// Forget cached limits (an operator changed one).
+pub fn forget_daily_limit(state: &AppState, account_id: Uuid) {
+    if let Ok(mut map) = state.daily_limits.lock() {
+        map.remove(&account_id);
+    }
+}
+
+// ---------- Unengaged profiles (sunset) ----------
+
+/// Campaign email skips people who got at least `SUNSET_MIN_EMAILS` emails in the last `SUNSET_DAYS` days
+/// and did nothing else in that time: no open, click, sign-up, order, site visit or any other event.
+/// Mailbox providers judge a sender on whether people engage; mailing people who never do is what slowly
+/// sends a domain to spam. Flows are exempt: their triggers (a checkout, a sign-up) are engagement.
+pub const SUNSET_DAYS: i32 = 180;
+pub const SUNSET_MIN_EMAILS: i64 = 10;
+/// Events that don't show the person did anything.
+const PASSIVE_METRICS: &[&str] = &["Received Email", "Received SMS", "Bounced Email", "Marked Email as Spam", "Unsubscribed", "Unsubscribed from SMS"];
+
+/// Appends ` AND NOT (<p is unengaged>)` for a query over `profiles p`.
+pub fn push_not_unengaged(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>) {
+    qb.push(" AND NOT ((SELECT count(*) FROM (SELECT 1 FROM messages sm WHERE sm.profile_id = p.id AND sm.channel = 'email' AND NOT sm.is_test AND sm.status IN ('sent','delivered','bounced','complained') AND sm.created_at > now() - make_interval(days => ")
+        .push_bind(SUNSET_DAYS)
+        .push(") LIMIT ")
+        .push_bind(SUNSET_MIN_EMAILS)
+        .push(") r) >= ")
+        .push_bind(SUNSET_MIN_EMAILS)
+        .push(" AND NOT EXISTS (SELECT 1 FROM events se JOIN metrics sx ON sx.id = se.metric_id WHERE se.profile_id = p.id AND se.occurred_at > now() - make_interval(days => ")
+        .push_bind(SUNSET_DAYS)
+        .push(") AND sx.name <> ALL(")
+        .push_bind(PASSIVE_METRICS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .push(")))");
+}
+
+// ---------- Risky addresses in imports ----------
+
+/// Shared inboxes: nobody in particular signed up, and they report spam and bounce more often.
+const ROLE_LOCAL_PARTS: &[&str] = &[
+    "abuse", "admin", "administrator", "billing", "compliance", "devnull", "dns", "ftp", "hostmaster", "info", "inquiries",
+    "inquiry", "mailerdaemon", "marketing", "noc", "noreply", "donotreply", "postmaster", "privacy", "root", "sales", "security",
+    "spam", "support", "sysadmin", "webmaster", "www", "office", "contact", "help", "helpdesk", "enquiries", "legal", "jobs",
+    "careers", "hr", "press", "media", "newsletter", "list", "listserv", "unsubscribe",
+];
+
+/// Throwaway inbox services: addresses stop existing within hours and hard bounce.
+const DISPOSABLE_DOMAINS: &[&str] = &[
+    "mailinator.com", "guerrillamail.com", "guerrillamail.net", "guerrillamail.org", "sharklasers.com", "grr.la", "10minutemail.com",
+    "10minutemail.net", "temp-mail.org", "tempmail.com", "tempmail.net", "tempmailo.com", "yopmail.com", "yopmail.net", "trashmail.com",
+    "trashmail.de", "getnada.com", "nada.email", "dispostable.com", "maildrop.cc", "throwawaymail.com", "fakeinbox.com", "mintemail.com",
+    "mohmal.com", "emailondeck.com", "burnermail.io", "mailnesia.com", "mytemp.email", "tempinbox.com", "spamgourmet.com",
+    "getairmail.com", "moakt.com", "tempr.email", "discard.email", "mailcatch.com", "inboxkitten.com", "33mail.com", "emailfake.com",
+    "tmpmail.org", "tmpmail.net", "minuteinbox.com", "mail.tm", "linshiyouxiang.net", "spambox.us", "trbvm.com",
+];
+
+/// Why an (already normalized) address shouldn't be imported as a marketing contact, if it shouldn't.
+pub fn risky_address(email: &str) -> Option<&'static str> {
+    let (local, domain) = email.rsplit_once('@')?;
+    let local = local.split('+').next().unwrap_or(local);
+    let compact: String = local.chars().filter(|c| !matches!(c, '.' | '-' | '_')).collect::<String>().to_lowercase();
+    if ROLE_LOCAL_PARTS.contains(&compact.as_str()) {
+        return Some("role");
+    }
+    let domain = domain.to_lowercase();
+    if DISPOSABLE_DOMAINS.iter().any(|d| domain == *d || domain.ends_with(&format!(".{d}"))) {
+        return Some("disposable");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warmup_starts_small_and_doubles_while_clean() {
+        let clean = o(1000, 5, 0);
+        assert_eq!(warmup_limit(WARMUP_START, 0, &Outcomes::default()), WARMUP_START, "a new account");
+        assert_eq!(warmup_limit(WARMUP_START, 100, &o(100, 0, 0)), WARMUP_START, "never below the start");
+        assert_eq!(warmup_limit(WARMUP_START, 500, &clean), 1000);
+        assert_eq!(warmup_limit(WARMUP_START, 8000, &clean), 16000);
+        // Over 2% bounces or 0.03% complaints: the limit stops growing but doesn't shrink below the best day.
+        assert_eq!(warmup_limit(WARMUP_START, 8000, &o(1000, 25, 0)), 8000);
+        assert_eq!(warmup_limit(WARMUP_START, 8000, &o(10000, 0, 4)), 8000);
+        // One complaint is never enough to stop growth; too few emails are never judged.
+        assert_eq!(warmup_limit(WARMUP_START, 8000, &o(1000, 0, 1)), 16000);
+        assert_eq!(warmup_limit(WARMUP_START, 500, &o(50, 10, 0)), 1000);
+    }
+
+    #[test]
+    fn risky_addresses() {
+        assert_eq!(risky_address("info@shop.com"), Some("role"));
+        assert_eq!(risky_address("no-reply@shop.com"), Some("role"));
+        assert_eq!(risky_address("sales+eu@shop.com"), Some("role"));
+        assert_eq!(risky_address("jane@mailinator.com"), Some("disposable"));
+        assert_eq!(risky_address("jane@eu.mailinator.com"), Some("disposable"));
+        assert_eq!(risky_address("jane@shop.com"), None);
+        assert_eq!(risky_address("information.jane@shop.com"), None);
+        assert_eq!(risky_address("jane@notmailinator.com"), None);
+    }
 
     fn o(sent: i64, bounced: i64, complained: i64) -> Outcomes {
         Outcomes { sent, bounced, complained }

@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -26,9 +28,33 @@ pub struct DomainState {
     pub records: Vec<DnsRecord>,
 }
 
+/// The provider can't take mail right now: its daily quota is used up, it keeps asking us to slow down,
+/// or sending is paused on its side. The message should wait and try again later instead of failing.
+#[derive(Debug)]
+pub struct ProviderBusy {
+    pub retry_after: Duration,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ProviderBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "email provider busy: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ProviderBusy {}
+
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Most emails per second the provider accepts, when it says (SES: the account's sending rate).
+    fn max_send_rate(&self) -> Option<f64> {
+        None
+    }
+    /// Re-read the provider's sending limits.
+    async fn refresh_limits(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Sends the message and returns the provider's message id.
     async fn send(&self, email: &OutgoingEmail) -> anyhow::Result<String>;
     async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState>;
@@ -147,12 +173,47 @@ fn fake_records(domain: &str) -> Vec<DnsRecord> {
 pub struct SesEmail {
     client: aws_sdk_sesv2::Client,
     configuration_set: Option<String>,
+    /// The account's maximum send rate (f64 bits; 0 until read).
+    max_rate: AtomicU64,
+}
+
+/// Retries of one email when SES asks us to slow down, and the wait before the first.
+const SES_RETRIES: u32 = 3;
+const SES_FIRST_BACKOFF: Duration = Duration::from_millis(1000);
+/// How long an email waits when the daily quota is used up or sending is paused on SES's side.
+const SES_BUSY_WAIT: Duration = Duration::from_secs(3600);
+
+/// What to do about a failed SendEmail call.
+#[derive(Debug, PartialEq, Eq)]
+enum SesFailure {
+    /// Sending too fast: wait a moment and try the same email again.
+    SlowDown,
+    /// Daily quota used up, or sending paused or suspended: hold the email for a while.
+    Busy,
+    /// Anything else (a bad address, an unverified sender): the email fails.
+    Fail,
+}
+
+fn classify_ses_error(code: Option<&str>, message: &str) -> SesFailure {
+    let m = message.to_lowercase();
+    match code.unwrap_or("") {
+        "TooManyRequestsException" | "Throttling" | "ThrottlingException" => SesFailure::SlowDown,
+        "LimitExceededException" if m.contains("rate") => SesFailure::SlowDown,
+        "LimitExceededException" | "SendingPausedException" | "AccountSuspendedException" => SesFailure::Busy,
+        _ if m.contains("maximum sending rate") => SesFailure::SlowDown,
+        _ if m.contains("daily message quota") => SesFailure::Busy,
+        _ => SesFailure::Fail,
+    }
 }
 
 impl SesEmail {
     pub async fn new(configuration_set: Option<String>) -> Self {
         let conf = aws_config::load_from_env().await;
-        Self { client: aws_sdk_sesv2::Client::new(&conf), configuration_set }
+        let ses = Self { client: aws_sdk_sesv2::Client::new(&conf), configuration_set, max_rate: AtomicU64::new(0) };
+        if let Err(e) = ses.refresh_limits().await {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't read the SES sending rate; using SEND_RATE_PER_SEC");
+        }
+        ses
     }
 
     fn records_from(domain: &str, tokens: &[String], dkim_status: &str) -> Vec<DnsRecord> {
@@ -186,25 +247,58 @@ impl EmailProvider for SesEmail {
         "ses"
     }
 
+    fn max_send_rate(&self) -> Option<f64> {
+        let r = f64::from_bits(self.max_rate.load(Ordering::Relaxed));
+        (r > 0.0).then_some(r)
+    }
+
+    async fn refresh_limits(&self) -> anyhow::Result<()> {
+        let out = self.client.get_account().send().await.context("SES GetAccount failed")?;
+        if let Some(q) = out.send_quota() {
+            if q.max_send_rate() > 0.0 {
+                self.max_rate.store(q.max_send_rate().to_bits(), Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     async fn send(&self, email: &OutgoingEmail) -> anyhow::Result<String> {
+        use aws_sdk_sesv2::error::ProvideErrorMetadata;
         use aws_sdk_sesv2::primitives::Blob;
         use aws_sdk_sesv2::types::{Destination, EmailContent, RawMessage};
-        let raw = build_mime(email, None);
-        let mut req = self
-            .client
-            .send_email()
-            .from_email_address(format!("{} <{}>", encode_header(&email.from_name), email.from_email))
-            .destination(Destination::builder().to_addresses(email.to.clone()).build())
-            .content(
-                EmailContent::builder()
-                    .raw(RawMessage::builder().data(Blob::new(raw.into_bytes())).build()?)
-                    .build(),
-            );
-        if let Some(cs) = &self.configuration_set {
-            req = req.configuration_set_name(cs);
+        let raw = build_mime(email, None).into_bytes();
+        let mut backoff = SES_FIRST_BACKOFF;
+        let mut attempt = 0;
+        loop {
+            let mut req = self
+                .client
+                .send_email()
+                .from_email_address(format!("{} <{}>", encode_header(&email.from_name), email.from_email))
+                .destination(Destination::builder().to_addresses(email.to.clone()).build())
+                .content(EmailContent::builder().raw(RawMessage::builder().data(Blob::new(raw.clone())).build()?).build());
+            if let Some(cs) = &self.configuration_set {
+                req = req.configuration_set_name(cs);
+            }
+            let err = match req.send().await {
+                Ok(out) => return Ok(out.message_id().unwrap_or_default().to_string()),
+                Err(e) => e,
+            };
+            let (code, message) = (err.code().map(str::to_string), err.message().unwrap_or_default().to_string());
+            match classify_ses_error(code.as_deref(), &message) {
+                SesFailure::SlowDown if attempt < SES_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                SesFailure::SlowDown => {
+                    return Err(ProviderBusy { retry_after: Duration::from_secs(60), reason: format!("SES kept throttling: {message}") }.into());
+                }
+                SesFailure::Busy => {
+                    return Err(ProviderBusy { retry_after: SES_BUSY_WAIT, reason: format!("{}: {message}", code.unwrap_or_default()) }.into());
+                }
+                SesFailure::Fail => return Err(anyhow::Error::new(err).context("SES SendEmail failed")),
+            }
         }
-        let out = req.send().await.context("SES SendEmail failed")?;
-        Ok(out.message_id().unwrap_or_default().to_string())
     }
 
     async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState> {
@@ -256,5 +350,20 @@ impl EmailProvider for SesEmail {
             "pending"
         };
         Ok(DomainState { status: status.into(), records: Self::records_from(domain, &tokens, &dkim_status) })
+    }
+}
+
+#[cfg(test)]
+mod ses_error_tests {
+    use super::*;
+
+    #[test]
+    fn ses_errors_are_sorted_into_retry_wait_or_fail() {
+        assert_eq!(classify_ses_error(Some("TooManyRequestsException"), "Too many requests"), SesFailure::SlowDown);
+        assert_eq!(classify_ses_error(Some("LimitExceededException"), "Maximum sending rate exceeded."), SesFailure::SlowDown);
+        assert_eq!(classify_ses_error(Some("LimitExceededException"), "Daily message quota exceeded."), SesFailure::Busy);
+        assert_eq!(classify_ses_error(Some("SendingPausedException"), "Sending is paused for this account"), SesFailure::Busy);
+        assert_eq!(classify_ses_error(Some("MessageRejected"), "Email address is not verified."), SesFailure::Fail);
+        assert_eq!(classify_ses_error(None, "dispatch failure"), SesFailure::Fail);
     }
 }

@@ -185,6 +185,12 @@ async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, accou
         push_any(qb, &exc);
     }
     push_eligible(qb, channel);
+    if channel == "email" {
+        let sunset: bool = sqlx::query_scalar("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
+        if sunset {
+            crate::deliverability::push_not_unengaged(qb);
+        }
+    }
     Ok(())
 }
 

@@ -182,6 +182,12 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     if tick.is_multiple_of(45) {
         crate::phone::poll_verifications(state).await?;
     }
+    // Every ~10 minutes: the provider's sending rate can change (SES raises it as the account grows).
+    if tick.is_multiple_of(30) {
+        if let Err(e) = state.email.refresh_limits().await {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't refresh the email provider's sending limits");
+        }
+    }
     if tick.is_multiple_of(90) {
         crate::flows::date_triggers(state).await?;
     }

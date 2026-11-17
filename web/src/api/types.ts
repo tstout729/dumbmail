@@ -60,6 +60,8 @@ export type Account = {
   sending_paused_at: string | null;
   /** What tripped the pause, e.g. "hard bounce rate 12.0% (12 of 100 emails) …". */
   sending_paused_reason: string | null;
+  /** Campaign email skips people who got many emails over the last months and engaged with none. */
+  email_sunset_enabled: boolean;
 };
 
 export type AccountPatch = Partial<
@@ -75,6 +77,7 @@ export type AccountPatch = Partial<
     | "address"
     | "brand_color"
     | "logo_url"
+    | "email_sunset_enabled"
   >
 > & { onboarding?: Partial<Onboarding>; social_links?: Partial<Record<SocialNetwork, string>> };
 
@@ -593,6 +596,9 @@ export type Sending = {
   };
   sms: { provider: string; from_number: string | null; status: string };
   link_domain: { domain: string | null; status: LinkDomainStatus; dns_records: DnsRecord[]; url: string | null };
+  /** Hosted service only: the 24-hour email limit, which starts small and grows while bounces and complaints stay low. */
+  email_limit?: { limit: number; sent_last_24h: number; remaining: number; fixed: boolean; start: number };
+  unengaged_skip: { enabled: boolean; days: number; min_emails: number };
 };
 
 // ---- API keys ----

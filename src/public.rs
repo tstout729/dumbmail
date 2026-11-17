@@ -21,6 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/t/o/{token}", get(open_pixel))
         .route("/t/c/{token}", get(click))
         .route("/u/{token}", get(unsubscribe_page).post(unsubscribe_post))
+        .route("/c/{token}", get(confirm_page).post(confirm_post))
         .route("/onsite.js", get(onsite_js))
         .route("/client/dumbmail.js", get(onsite_js))
         .route("/client/postlark.js", get(onsite_js))
@@ -38,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/webhooks/stripe", post(stripe_webhook))
         .route("/admin/credit", post(admin_credit))
         .route("/admin/unpause", post(admin_unpause))
+        .route("/admin/sending-limit", post(admin_sending_limit))
         .route("/healthz", get(|| async { "ok" }))
 }
 
@@ -198,6 +200,47 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
     page("Unsubscribed", &format!("<h1>You're unsubscribed</h1><p>You won't get marketing messages from {} anymore.</p>", esc(&name)), &color).into_response()
+}
+
+/// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
+/// scanners that open every link in an email can't subscribe anyone.
+async fn confirm_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &token, false).await
+}
+
+async fn confirm_post(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &token, true).await
+}
+
+async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Response {
+    use crate::optin::Confirmed;
+    let Some(id) = crate::optin::id_from_token(state, token) else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
+    let res = if confirm { crate::optin::confirm(state, id).await } else { crate::optin::status(state, id).await };
+    let outcome = match res {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(error = %e.public_message(), "double opt-in confirmation failed");
+            return page("Something went wrong", "<h1>Something went wrong</h1><p>Please try the link again in a minute.</p>", "#1f6f5c").into_response();
+        }
+    };
+    let account_of = |a: Uuid| async move { crate::campaigns::load_account(&state.db, a).await.ok() };
+    let (account, body) = match outcome {
+        Confirmed::NotFound => return (StatusCode::NOT_FOUND, "link not found").into_response(),
+        Confirmed::Waiting(a) => {
+            let acct = account_of(a).await;
+            let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
+            let body = format!(r#"<h1>Confirm your subscription</h1><p>Start getting emails from {}?</p><form method="post"><button type="submit">Yes, subscribe me</button></form>"#, esc(&name));
+            (acct, body)
+        }
+        Confirmed::Joined(a) | Confirmed::Already(a) => {
+            let acct = account_of(a).await;
+            let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
+            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>", esc(&name)))
+        }
+        Confirmed::Expired(a) => (account_of(a).await, "<h1>This link has expired</h1><p>Sign up again and we'll send you a new one.</p>".to_string()),
+    };
+    let color = account.map(|a| a.brand_color).unwrap_or_else(|| "#1f6f5c".into());
+    page("Confirm your subscription", &body, &color).into_response()
 }
 
 // ---------- Browser tracking ----------
@@ -526,11 +569,16 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
     if let Some(p) = &phone {
         normalize_phone(p).ok_or_else(|| AppError::bad("enter a valid mobile number"))?;
     }
+    // A double opt-in list: the email address joins only after confirming by email.
+    let double_opt_in = match (form.list_id, &email) {
+        (Some(l), Some(_)) => sqlx::query_scalar::<_, bool>("SELECT double_opt_in FROM lists WHERE id = $1").bind(l).fetch_optional(&state.db).await?.unwrap_or(false),
+        _ => false,
+    };
     let input = ProfileInput {
         email: email.clone(),
         phone_number: phone.clone(),
         first_name: b.first_name.clone().filter(|n| !n.trim().is_empty()),
-        email_consent: email.as_ref().map(|_| "subscribed".to_string()),
+        email_consent: email.as_ref().filter(|_| !double_opt_in).map(|_| "subscribed".to_string()),
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
     };
@@ -539,6 +587,19 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody) -
     let mut props = json!({"form_id": form.id, "form": form.name, "list_id": form.list_id});
     if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
         props["form_version"] = json!(v);
+    }
+    // Already subscribed to email (they confirmed or opted in before): no need to ask again.
+    if let (true, Some(list_id), Some(addr)) = (double_opt_in && p.email_consent != "subscribed", form.list_id, p.email.as_deref()) {
+        match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone()).await? {
+            crate::optin::Started::Pending => {
+                let msg = form.config["confirm_message"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("Almost done! Check your inbox and tap the link to confirm.");
+                return Ok(json!({"ok": true, "confirm": true, "message": msg}));
+            }
+            crate::optin::Started::Unavailable(why) => {
+                tracing::warn!(account = %account.id, form = %form.id, reason = %why, "double opt-in unavailable; signing up directly");
+                sqlx::query("UPDATE profiles SET email_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(p.id).execute(&state.db).await?;
+            }
+        }
     }
     audience::record_event(
         &state.db,
@@ -879,6 +940,29 @@ async fn admin_unpause(State(state): State<AppState>, headers: HeaderMap, Json(b
     let was_paused = crate::deliverability::unpause(&state.db, id).await?;
     tracing::warn!(account = %id, was_paused, "admin lifted email sending pause");
     Ok(Json(json!({"account": name, "was_paused": was_paused, "sending_paused": false})))
+}
+
+/// Operator: give an account a fixed 24-hour email limit (`daily_limit`, a number) in place of the automatic
+/// warm-up, or return it to the warm-up (`daily_limit: null`). By account id or the owner's email.
+async fn admin_sending_limit(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
+    check_admin(&state, &headers)?;
+    let (id, name) = match b["account_id"].as_str() {
+        Some(raw) => {
+            let id: Uuid = raw.trim().parse().map_err(|_| AppError::bad("account_id must be a UUID"))?;
+            let name: Option<String> = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
+            (id, name.ok_or_else(|| AppError::not_found("account"))?)
+        }
+        None => account_by_owner_email(&state, &b).await?,
+    };
+    let fixed: Option<i32> = match &b["daily_limit"] {
+        Value::Null => None,
+        v => Some(v.as_i64().filter(|n| (0..=10_000_000).contains(n)).ok_or_else(|| AppError::bad("daily_limit must be a whole number from 0 to 10,000,000, or null for the automatic warm-up"))? as i32),
+    };
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = $2 WHERE id = $1").bind(id).bind(fixed).execute(&state.db).await?;
+    crate::deliverability::forget_daily_limit(&state, id);
+    let l = crate::deliverability::daily_limit(&state, id).await?;
+    tracing::warn!(account = %id, daily_limit = ?fixed, "admin set the email sending limit");
+    Ok(Json(json!({"account": name, "daily_limit": l.limit, "fixed": l.fixed, "sent_last_24h": l.sent_24h})))
 }
 
 #[cfg(test)]
