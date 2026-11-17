@@ -162,7 +162,7 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
         "html" => format!(r#"<tr><td style="{pad}">{}</td></tr>"#, s(b, "html")),
         // A saved block that wasn't filled in before rendering shows the copy stored with it.
         "saved" => b.get("blocks").and_then(|v| v.as_array()).map(|bs| bs.iter().filter(|x| s(x, "type") != "saved").map(|x| block_html(x, brand, font, depth)).collect()).unwrap_or_default(),
-        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" | "if_open" | "if_close" => crate::features::content::blocks::html(b, brand, font),
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" => crate::features::content::blocks::html(b, brand, font),
         _ => String::new(),
     }
 }
@@ -279,7 +279,7 @@ fn block_text(b: &Value, out: &mut String) {
                 block_text(x, out);
             }
         }
-        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" | "if_open" | "if_close" => crate::features::content::blocks::text(b, out),
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" => crate::features::content::blocks::text(b, out),
         _ => {}
     }
 }

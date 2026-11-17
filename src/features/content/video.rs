@@ -2,7 +2,12 @@
 //! with a play button drawn on it, stored as one of the account's images. Email apps can't play
 //! video or lay a button over an image reliably, so the button is part of the picture.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+
+use once_cell::sync::Lazy;
+use tokio::sync::Semaphore;
 
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 use reqwest::Method;
@@ -14,6 +19,34 @@ use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 const MAX_SOURCE: usize = 5 * 1024 * 1024;
+/// The most pixels a source image may have (checked from its header, before decoding it).
+pub const MAX_PIXELS: u64 = 24_000_000;
+/// The largest thumbnail, in either direction.
+pub const MAX_OUTPUT: u32 = 1200;
+/// Thumbnails being made at once across the server (one at a time per account).
+pub const GLOBAL_CONVERSIONS: usize = 2;
+
+static CONVERTING: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBAL_CONVERSIONS)));
+static ACCOUNTS: Lazy<std::sync::Mutex<HashSet<Uuid>>> = Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// The account's one-thumbnail-at-a-time slot; released when dropped.
+struct Slot(Uuid);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut a) = ACCOUNTS.lock() {
+            a.remove(&self.0);
+        }
+    }
+}
+
+fn take_slot(account_id: Uuid) -> AppResult<Slot> {
+    let mut a = ACCOUNTS.lock().map_err(|_| AppError::Busy("try again in a few seconds".into()))?;
+    if !a.insert(account_id) {
+        return Err(AppError::Busy("a video thumbnail is already being made for this account; try again in a few seconds".into()));
+    }
+    Ok(Slot(account_id))
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Video {
@@ -96,6 +129,11 @@ fn decode(bytes: &[u8]) -> AppResult<DynamicImage> {
         Some("image/webp") => ImageFormat::WebP,
         _ => return Err(AppError::bad("that isn't a PNG, JPEG, GIF or WebP image")),
     };
+    // Read the size from the header first: a small file can hold a huge picture.
+    let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt).into_dimensions().map_err(|_| AppError::bad("that image couldn't be read"))?;
+    if w > 8000 || h > 8000 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(AppError::bad("that image is too big (at most 24 megapixels and 8000 px on a side)"));
+    }
     let mut r = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8000);
@@ -105,10 +143,11 @@ fn decode(bytes: &[u8]) -> AppResult<DynamicImage> {
     r.decode().map_err(|_| AppError::bad("that image couldn't be read"))
 }
 
-/// The image at most 1200 px wide with a round play button in the middle, as a JPEG.
+/// The image at most [`MAX_OUTPUT`] px wide and tall with a round play button in the middle, as a JPEG.
 pub fn with_play_button(bytes: &[u8]) -> AppResult<Vec<u8>> {
     let img = decode(bytes)?;
-    let img = if img.width() > 1200 { img.resize(1200, 1200 * img.height() / img.width().max(1), image::imageops::FilterType::Triangle) } else { img };
+    // `resize` keeps the proportions and fits inside both bounds.
+    let img = if img.width() > MAX_OUTPUT || img.height() > MAX_OUTPUT { img.resize(MAX_OUTPUT, MAX_OUTPUT, image::imageops::FilterType::Triangle) } else { img };
     let (w, h) = img.dimensions();
     if w < 40 || h < 40 {
         return Err(AppError::bad("that image is too small for a video thumbnail"));
@@ -175,6 +214,8 @@ async fn own_image(state: &AppState, account_id: Uuid, url: &str) -> AppResult<O
 /// Make a video thumbnail: from `image_url` when given (an uploaded image, or any public image),
 /// otherwise from the YouTube or Vimeo video at `video_url`.
 pub async fn thumbnail(state: &AppState, account_id: Uuid, video_url: Option<&str>, image_url: Option<&str>) -> AppResult<Value> {
+    // One at a time per account, taken before fetching anything.
+    let _slot = take_slot(account_id)?;
     let image_url = image_url.map(str::trim).filter(|u| !u.is_empty());
     let video_url = video_url.map(str::trim).filter(|u| !u.is_empty());
     let (source, provider) = match (image_url, video_url) {
@@ -201,7 +242,16 @@ pub async fn thumbnail(state: &AppState, account_id: Uuid, video_url: Option<&st
         }
         (None, None) => return Err(AppError::bad("give video_url (YouTube or Vimeo) or image_url")),
     };
-    let jpeg = tokio::task::spawn_blocking(move || with_play_button(&source)).await.map_err(|e| AppError::Internal(e.into()))??;
+    let permit = tokio::time::timeout(Duration::from_secs(10), CONVERTING.clone().acquire_owned())
+        .await
+        .map_err(|_| AppError::Busy("the server is busy making other thumbnails; try again in a minute".into()))?
+        .map_err(|e| AppError::Internal(e.into()))?;
+    let jpeg = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        with_play_button(&source)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.into()))??;
     let stored = crate::api::images::store(state, account_id, &jpeg).await?;
     Ok(json!({"thumbnail_url": stored["url"], "image": stored, "source": provider}))
 }
@@ -220,6 +270,38 @@ mod tests {
         assert_eq!(parse("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ"), None);
         assert_eq!(parse("https://www.youtube.com/watch?v=../../x"), None);
         assert_eq!(parse("javascript:alert(1)"), None);
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for b in data {
+            c ^= u32::from(*b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+
+    fn png_of(w: u32, h: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        DynamicImage::ImageRgba8(RgbaImage::new(w, h)).write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png).unwrap();
+        png
+    }
+
+    #[test]
+    fn huge_pictures_are_refused_before_decoding_and_tall_ones_are_bounded() {
+        // A tiny file that claims 7000 x 7000 pixels: refused from its header.
+        let mut png = png_of(1, 1);
+        png[16..20].copy_from_slice(&7000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&7000u32.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let e = with_play_button(&png).unwrap_err();
+        assert!(e.public_message().contains("too big"), "{}", e.public_message());
+        let out = with_play_button(&png_of(300, 3000)).unwrap();
+        let back = image::load_from_memory(&out).unwrap();
+        assert!(back.height() <= MAX_OUTPUT && back.width() <= MAX_OUTPUT, "{}x{}", back.width(), back.height());
     }
 
     #[test]

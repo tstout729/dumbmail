@@ -194,8 +194,15 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
-    // Saved blocks, display rules and hosted images are worked out per recipient (see features::content).
-    let prepared = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await?;
+    // Saved blocks, display rules and the content module's blocks are worked out per recipient (see
+    // features::content); email that uses none of them goes on untouched. When every block is hidden
+    // for this person they get nothing (a test send says why).
+    let Some(prepared) = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await? else {
+        if spec.is_test {
+            return Err(AppError::bad("Nothing to show for this person: every block is hidden by a display rule, so they'd be skipped."));
+        }
+        return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
+    };
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);

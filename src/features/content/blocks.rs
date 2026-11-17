@@ -1,15 +1,18 @@
 //! HTML and plain text for the content module's email blocks: social links, video, countdown
-//! timer, table, quote, header, menu bar, footer and image beside text, plus the internal
-//! `if_open` / `if_close` markers that conditional display turns into.
+//! timer, table, quote, header, menu bar, footer and image beside text.
 //!
 //! `render.rs` calls [`html`] and [`text`] for these block types. Everything here is table HTML with
 //! inline styles and `role="presentation"`, widths set on tables and cells, and VML for Outlook's
 //! buttons. Text fields go through the template engine like the core blocks (so `{{ first_name }}`
-//! works); values that come from outside the account (thumbnails, icons) are computed by
-//! [`super::prepare`] into `_`-prefixed fields that content can't set.
+//! works). Links and image addresses are personalized and checked per recipient by
+//! [`super::prepare`] before they get here; here only an already-allowed address (see
+//! [`super::prepare::clean_url`]) is used, and a block whose link isn't allowed shows without it.
+//! Values that come from outside the account (icons, countdown images) are computed by `prepare`
+//! into `_`-prefixed fields that content can't set.
 
 use serde_json::Value;
 
+use super::prepare::clean_url;
 use crate::render::safe_color;
 
 pub const NETWORKS: [&str; 10] = ["instagram", "facebook", "tiktok", "x", "youtube", "pinterest", "linkedin", "threads", "website", "email"];
@@ -51,23 +54,23 @@ fn align(b: &Value) -> &'static str {
     }
 }
 
-/// A link target: web, mail and phone links, an anchor, or a personalized link (`{{ ... }}`).
-/// Anything else (javascript:, data:) becomes "#".
-pub fn safe_href(raw: &str) -> String {
-    let t = raw.trim();
-    let lower = t.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") || lower.starts_with("tel:") || t.starts_with('#') || t.starts_with("{{") {
-        esc(t)
-    } else {
-        "#".into()
-    }
+/// A link target, escaped for an attribute: `http(s)`, `mailto:` or `tel:` only. Anything else
+/// (javascript:, data:, a template tag that wasn't personalized first) is None: no link.
+pub fn safe_href(raw: &str) -> Option<String> {
+    clean_url(raw, false).map(|u| esc(&u))
 }
 
-/// An image source: only web addresses (or a personalized one).
+/// An image source, escaped for an attribute: `http(s)` only.
 pub fn safe_src(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    let lower = t.to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://") || t.starts_with("{{")).then(|| esc(t))
+    clean_url(raw, true).map(|u| esc(&u))
+}
+
+/// `inner` linked to `href` when the link is allowed, else `inner` alone.
+fn linked(href: &str, style: &str, inner: String) -> String {
+    match safe_href(href) {
+        Some(h) => format!(r#"<a href="{h}" style="{style}">{inner}</a>"#),
+        None => inner,
+    }
 }
 
 /// Text that came from outside the account: escaped, and unable to open a template tag.
@@ -82,10 +85,11 @@ fn links(b: &Value) -> Vec<(&str, &str)> {
         .unwrap_or_default()
 }
 
-/// A button that keeps its shape in Outlook (VML) and everywhere else (a padded link).
+/// A button that keeps its shape in Outlook (VML) and everywhere else (a padded link). Nothing
+/// when its link isn't allowed: a button that goes nowhere isn't shown.
 pub fn button(text: &str, href: &str, color: &str, font: &str, align: &str) -> String {
     let width = (text.chars().count() as u64 * 9 + 56).clamp(120, 520);
-    let href = safe_href(href);
+    let Some(href) = safe_href(href) else { return String::new() };
     let text = esc(text);
     format!(
         r#"<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="{align}" style="margin:0;"><tr><td align="center" bgcolor="{color}" style="border-radius:6px;background:{color};"><!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="{href}" style="height:44px;v-text-anchor:middle;width:{width}px;" arcsize="14%" stroke="f" fillcolor="{color}"><w:anchorlock/><center style="color:#ffffff;font-family:Arial,sans-serif;font-size:16px;font-weight:bold;">{text}</center></v:roundrect><![endif]--><!--[if !mso]><!-- --><a href="{href}" style="display:inline-block;padding:12px 24px;font-family:{font};font-size:16px;font-weight:600;line-height:20px;color:#ffffff;text-decoration:none;border-radius:6px;background:{color};">{text}</a><!--<![endif]--></td></tr></table>"#
@@ -104,20 +108,15 @@ pub fn html(b: &Value, brand: &str, font: &str) -> String {
         "nav" => nav_html(b, brand, font),
         "footer" => footer_html(b, font),
         "image_text" => image_text_html(b, brand, font),
-        "if_open" => match super::prepare::checked_expr(s(b, "expr")) {
-            Some(e) => format!("{{% if {e} %}}"),
-            None => "{% if false %}".into(),
-        },
-        "if_close" => "{% endif %}".into(),
         _ => String::new(),
     }
 }
 
-/// The icons [`super::prepare`] worked out: (link, image URL, label).
-fn icons(b: &Value) -> Vec<(&str, &str, &str)> {
+/// The icons [`super::prepare`] worked out whose link and image are allowed: (link, image, label), escaped.
+fn icons(b: &Value) -> Vec<(String, String, &str)> {
     b.get("_icons")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().map(|i| (s(i, "href"), s(i, "src"), s(i, "label"))).filter(|(h, src, _)| !h.is_empty() && !src.is_empty()).collect())
+        .map(|a| a.iter().filter_map(|i| Some((safe_href(s(i, "href"))?, safe_src(s(i, "src"))?, s(i, "label")))).collect())
         .unwrap_or_default()
 }
 
@@ -133,8 +132,6 @@ fn icon_row(b: &Value) -> String {
         .map(|(href, src, label)| {
             format!(
                 r#"<td style="padding:0 {gap}px;"><a href="{href}" style="display:inline-block;text-decoration:none;"><img src="{src}" width="{size}" height="{size}" alt="{label}" style="display:block;width:{size}px;height:{size}px;border:0;"></a></td>"#,
-                href = safe_href(href),
-                src = esc(src),
                 label = esc(label),
             )
         })
@@ -154,18 +151,24 @@ fn social_html(b: &Value, _font: &str) -> String {
 }
 
 fn video_html(b: &Value, font: &str) -> String {
-    let href = safe_href(s(b, "url"));
+    let href = s(b, "url");
     let alt = if s(b, "alt").trim().is_empty() { "Play video".to_string() } else { esc(s(b, "alt")) };
     let w = num(b, "width", 552, 100, 552);
     let r = num(b, "radius", 6, 0, 40);
     let media = match safe_src(s(b, "thumbnail")) {
-        Some(src) => format!(
-            r#"<a href="{href}" style="display:block;text-decoration:none;"><img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:{r}px;"></a>"#
+        Some(src) => linked(
+            href,
+            "display:block;text-decoration:none;",
+            format!(r#"<img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:{r}px;">"#),
         ),
         // No thumbnail yet: a dark panel with a play link still works everywhere.
-        None => format!(
-            r##"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#111827" style="background:#111827;border-radius:{r}px;padding:64px 16px;"><a href="{href}" style="font-family:{font};font-size:18px;font-weight:700;color:#ffffff;text-decoration:none;">&#9654;&nbsp; {alt}</a></td></tr></table>"##
-        ),
+        None => {
+            let label = format!(r#"<span style="font-family:{font};font-size:18px;font-weight:700;color:#ffffff;text-decoration:none;">&#9654;&nbsp; {alt}</span>"#);
+            format!(
+                r##"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#111827" style="background:#111827;border-radius:{r}px;padding:64px 16px;">{}</td></tr></table>"##,
+                linked(href, "text-decoration:none;", label)
+            )
+        }
     };
     let caption = if s(b, "caption").trim().is_empty() {
         String::new()
@@ -290,7 +293,13 @@ fn link_row(b: &Value, color: &str, font: &str, size: u32) -> String {
     let sep = if b.get("separator").and_then(|v| v.as_bool()).unwrap_or(false) { "&nbsp;&nbsp;|&nbsp;&nbsp;" } else { "&nbsp;&nbsp;&nbsp;&nbsp;" };
     links(b)
         .iter()
-        .map(|(t, h)| format!(r#"<a href="{}" style="font-family:{font};font-size:{size}px;font-weight:600;color:{color};text-decoration:none;white-space:nowrap;">{}</a>"#, safe_href(h), esc(t)))
+        .map(|(t, h)| {
+            let style = format!("font-family:{font};font-size:{size}px;font-weight:600;color:{color};text-decoration:none;white-space:nowrap;");
+            match safe_href(h) {
+                Some(h) => format!(r#"<a href="{h}" style="{style}">{}</a>"#, esc(t)),
+                None => format!(r#"<span style="{style}">{}</span>"#, esc(t)),
+            }
+        })
         .collect::<Vec<_>>()
         .join(&format!(r#"<span style="color:{color};">{sep}</span>"#))
 }
@@ -302,10 +311,7 @@ fn header_html(b: &Value, brand: &str, font: &str) -> String {
     let logo_w = num(b, "logo_width", 140, 40, 300);
     let logo = safe_src(s(b, "logo")).map(|src| {
         let img = format!(r#"<img src="{src}" alt="{}" width="{logo_w}" style="display:block;width:{logo_w}px;max-width:100%;height:auto;border:0;">"#, esc(s(b, "logo_alt")));
-        match s(b, "logo_href") {
-            "" => img,
-            h => format!(r#"<a href="{}" style="text-decoration:none;">{img}</a>"#, safe_href(h)),
-        }
+        linked(s(b, "logo_href"), "text-decoration:none;", img)
     });
     let _ = brand;
     let inner = match logo {
@@ -358,10 +364,7 @@ fn image_text_html(b: &Value, brand: &str, font: &str) -> String {
     let img = match safe_src(s(b, "src")) {
         Some(src) => {
             let img = format!(r#"<img src="{src}" alt="{}" width="260" style="display:block;width:100%;max-width:260px;height:auto;border:0;border-radius:{r}px;">"#, esc(s(b, "alt")));
-            match s(b, "href") {
-                "" => img,
-                h => format!(r#"<a href="{}" style="text-decoration:none;">{img}</a>"#, safe_href(h)),
-            }
+            linked(s(b, "href"), "text-decoration:none;", img)
         }
         None => String::new(),
     };
@@ -371,10 +374,10 @@ fn image_text_html(b: &Value, brand: &str, font: &str) -> String {
         format!(r#"<h3 style="margin:0 0 8px;font-family:{font};font-size:20px;line-height:1.3;color:#111827;font-weight:700;">{}</h3>"#, esc(s(b, "heading")))
     };
     let body = if s(b, "html").trim().is_empty() { String::new() } else { format!(r#"<div style="font-family:{font};font-size:16px;line-height:1.6;color:#374151;">{}</div>"#, s(b, "html")) };
-    let btn = if s(b, "button_text").trim().is_empty() {
-        String::new()
-    } else {
-        format!(r#"<div style="padding-top:12px;">{}</div>"#, button(s(b, "button_text"), s(b, "button_href"), &safe_color(s(b, "button_color"), brand), font, "left"))
+    let btn = match button(s(b, "button_text"), s(b, "button_href"), &safe_color(s(b, "button_color"), brand), font, "left") {
+        _ if s(b, "button_text").trim().is_empty() => String::new(),
+        b if b.is_empty() => b,
+        b => format!(r#"<div style="padding-top:12px;">{b}</div>"#),
     };
     let (img_pad, text_pad) = if right { ("padding:0 0 12px 12px;", "padding:0 12px 12px 0;") } else { ("padding:0 12px 12px 0;", "padding:0 0 12px 12px;") };
     // With the image on the right, `dir="rtl"` swaps the cells on wide screens while the image
@@ -392,15 +395,25 @@ fn strip_tags(html: &str) -> String {
     TAGS.replace_all(&t, "").replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").trim().to_string()
 }
 
+/// A link for the plain-text part: only an allowed address, else None.
+fn text_url(raw: &str) -> Option<String> {
+    clean_url(raw, false)
+}
+
 fn text_links(b: &Value, out: &mut String) {
     for (t, h) in links(b) {
-        out.push_str(&format!("{t}: {h}\n"));
+        match text_url(h) {
+            Some(u) => out.push_str(&format!("{t}: {u}\n")),
+            None => out.push_str(&format!("{t}\n")),
+        }
     }
 }
 
 fn text_icons(b: &Value, out: &mut String) {
-    for (href, _, label) in icons(b) {
-        out.push_str(&format!("{label}: {}\n", href.trim_start_matches("mailto:")));
+    for i in b.get("_icons").and_then(|v| v.as_array()).into_iter().flatten() {
+        if let Some(u) = text_url(s(i, "href")) {
+            out.push_str(&format!("{}: {}\n", s(i, "label"), u.trim_start_matches("mailto:")));
+        }
     }
 }
 
@@ -413,7 +426,10 @@ pub fn text(b: &Value, out: &mut String) {
         }
         "video" => {
             let label = if s(b, "alt").trim().is_empty() { "Watch the video" } else { s(b, "alt") };
-            out.push_str(&format!("{label}: {}\n\n", s(b, "url")));
+            match text_url(s(b, "url")) {
+                Some(u) => out.push_str(&format!("{label}: {u}\n\n")),
+                None => out.push_str(&format!("{label}\n\n")),
+            }
         }
         "countdown" => {
             if !s(b, "_alt").is_empty() {
@@ -469,17 +485,12 @@ pub fn text(b: &Value, out: &mut String) {
             if !t.is_empty() {
                 out.push_str(&format!("{t}\n\n"));
             }
-            if !s(b, "button_text").trim().is_empty() {
-                out.push_str(&format!("{}: {}\n\n", s(b, "button_text"), s(b, "button_href")));
-            } else if !s(b, "href").is_empty() {
-                out.push_str(&format!("{}\n\n", s(b, "href")));
+            match (s(b, "button_text").trim(), text_url(s(b, "button_href")), text_url(s(b, "href"))) {
+                (t, Some(u), _) if !t.is_empty() => out.push_str(&format!("{t}: {u}\n\n")),
+                (_, _, Some(u)) => out.push_str(&format!("{u}\n\n")),
+                _ => {}
             }
         }
-        "if_open" => match super::prepare::checked_expr(s(b, "expr")) {
-            Some(e) => out.push_str(&format!("{{% if {e} %}}")),
-            None => out.push_str("{% if false %}"),
-        },
-        "if_close" => out.push_str("{% endif %}"),
         _ => {}
     }
 }
@@ -491,14 +502,28 @@ mod tests {
 
     #[test]
     fn hrefs_and_sources_are_limited_to_safe_schemes() {
-        assert_eq!(safe_href("javascript:alert(1)"), "#");
-        assert_eq!(safe_href(" JavaScript:alert(1)"), "#");
-        assert_eq!(safe_href("data:text/html,x"), "#");
-        assert_eq!(safe_href("https://a.test/?x=\"1\""), "https://a.test/?x=&quot;1&quot;");
-        assert_eq!(safe_href("{{ event.properties.url }}"), "{{ event.properties.url }}");
-        assert_eq!(safe_href("mailto:hi@a.test"), "mailto:hi@a.test");
+        assert_eq!(safe_href("javascript:alert(1)"), None);
+        assert_eq!(safe_href(" JavaScript:alert(1)"), None);
+        assert_eq!(safe_href("data:text/html,x"), None);
+        assert_eq!(safe_href("https://a.test/?x=\"1\"").as_deref(), Some("https://a.test/?x=&quot;1&quot;"));
+        assert_eq!(safe_href("{{ event.properties.url }}"), None, "personalized links are worked out (and checked) before rendering");
+        assert_eq!(safe_href("#top"), None);
+        assert_eq!(safe_href("mailto:hi@a.test").as_deref(), Some("mailto:hi@a.test"));
         assert!(safe_src("javascript:x").is_none());
+        assert!(safe_src("mailto:x@a.test").is_none());
         assert!(safe_src("https://a.test/x.png").is_some());
+    }
+
+    #[test]
+    fn a_block_whose_link_is_not_allowed_shows_without_it() {
+        let html = super::html(&json!({"type": "image_text", "src": "https://a.test/i.png", "href": "javascript:x", "heading": "Hi", "button_text": "Go", "button_href": "data:x"}), "#111111", "Arial");
+        assert!(html.contains("https://a.test/i.png") && html.contains("Hi"));
+        assert!(!html.contains("<a ") && !html.contains("javascript") && !html.contains("data:"), "{html}");
+        let nav = super::html(&json!({"type": "nav", "links": [{"text": "Shop", "href": "vbscript:x"}, {"text": "New", "href": "https://a.test/new"}]}), "#111111", "Arial");
+        assert!(nav.contains("<span") && nav.contains("Shop") && nav.contains(r#"href="https://a.test/new""#));
+        let mut text = String::new();
+        super::text(&json!({"type": "video", "url": "javascript:x", "alt": "Watch"}), &mut text);
+        assert_eq!(text, "Watch\n\n");
     }
 
     #[test]

@@ -145,7 +145,8 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
-    let prepared = crate::features::content::prepare::prepare(state, &account, &b.content, &ctx).await?;
+    // Saved blocks and display rules (see features::content); email without them goes on untouched.
+    let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
     if b.channel == "email" {
         let content: render::EmailContent = serde_json::from_value(content)?;
@@ -539,7 +540,8 @@ async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None, ab_test: c.ab_test, send_options: c.send_options }).await?;
+    // The copy is a new, unsent email: its saved blocks show their current content again.
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(crate::features::content::prepare::relink(&c.content)), send_at: None, ab_test: crate::features::content::prepare::relink_ab(&c.ab_test), send_options: c.send_options }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 

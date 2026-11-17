@@ -117,6 +117,9 @@ fn check_template_content(content: &Value) -> AppResult<()> {
     if !content.is_object() || serde_json::to_string(content)?.len() > 600 * 1024 {
         return Err(AppError::bad("content must be an email content object (at most 600 KB)"));
     }
+    if let Some(p) = crate::features::content::prepare::transactional_problem(content) {
+        return Err(AppError::bad(p));
+    }
     let r = review::review(content);
     if r.blocked {
         return Err(AppError::bad(review::blocked_message(&r)));

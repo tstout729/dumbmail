@@ -78,8 +78,15 @@ async fn create_saved_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     Ok((StatusCode::CREATED, Json(saved::create(&state, ctx.account_id, ctx.user_id, b).await?)))
 }
 
-async fn get_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(saved::get(&state, ctx.account_id, id).await?))
+#[derive(Deserialize, Default)]
+struct SavedQuery {
+    /// Also a deleted saved block (emails that still use one show its last content).
+    #[serde(default)]
+    include_deleted: bool,
+}
+
+async fn get_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<SavedQuery>) -> AppResult<Json<Value>> {
+    Ok(Json(saved::get_with(&state, ctx.account_id, id, q.include_deleted).await?))
 }
 
 async fn patch_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<saved::Input>) -> AppResult<Json<Value>> {
@@ -219,11 +226,11 @@ impl Feature for Module {
         vec![
             tool("list_saved_blocks", "List saved blocks", "Saved blocks (reusable groups of email blocks) with their content and how many unsent emails use each. Put one in an email as {\"type\": \"saved\", \"saved_block_id\": \"...\"}; it shows the saved block's current content until the email is sent.", obj(json!({}), &[]), true, false),
             tool("save_block", "Save a block", "Save one or more email blocks under a name so they can be reused in any email (a header, a footer, a sign-off). Names are unique per account; up to 200 saved blocks.", obj(json!({"name": {"type": "string", "maxLength": 100}, "blocks": blocks}), &["name", "blocks"]), false, false),
-            tool("update_saved_block", "Update a saved block", "Rename a saved block or replace its blocks. Every template, draft or scheduled campaign and flow email that uses it shows the new content; campaigns already sending or sent keep what they sent. Returns where it's used.", obj(json!({"id": {"type": "string"}, "name": {"type": "string", "maxLength": 100}, "blocks": blocks}), &["id"]), false, false),
+            tool("update_saved_block", "Update a saved block", "Rename a saved block or replace its blocks. Every template, draft or scheduled campaign and flow email that uses it shows the new content; campaigns already sending or sent keep what they sent. Refused (naming them) when the new content would stop a scheduled campaign or live flow that uses it from sending. Returns where it's used.", obj(json!({"id": {"type": "string"}, "name": {"type": "string", "maxLength": 100}, "blocks": blocks}), &["id"]), false, false),
             tool("delete_saved_block", "Delete a saved block", "Remove a saved block from the list. Emails that use it keep showing its last content. Without confirm=true it only says where it's used.", obj(json!({"id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
             tool("list_starter_templates", "List starter templates", "Ready-made email designs (welcome, newsletter, product launch, sale, abandoned cart, order confirmation, shipping, review request, win-back, birthday, back in stock, personal note, booking confirmation, pre-arrival info) in the account's brand. Give key to get one's full content, to use in a campaign, flow email or template.", obj(json!({"key": {"type": "string"}}), &[]), true, false),
             tool("create_template_from_starter", "Create a template from a starter", "Create an email template from a starter template (keys from list_starter_templates), filled in with the account's brand.", obj(json!({"key": {"type": "string"}, "name": {"type": "string", "maxLength": 200}}), &["key"]), false, false),
-            tool("check_email", "Check an email before sending", "Check an email for problems: broken links and images, missing alt text, subject and preview text, images that are too heavy, Gmail clipping (over 102 KB), personalization that comes out empty for some recipients (with counts), an empty or unsubscribed audience, spam signals and the sending domain. Give content, or campaign_id (optionally with an unsaved audience), or flow_id with node_id. Findings marked blocks_sending stop a send; the rest are advice. Requests the email's links unless skip_links is true.",
+            tool("check_email", "Check an email before sending", "Check an email for problems: broken links and images, missing alt text, subject and preview text, images that are too heavy, Gmail clipping (over 102 KB), personalization that comes out empty for some recipients (with counts), an empty or unsubscribed audience, spam signals and the sending domain. Give content, or campaign_id (optionally with an unsaved audience), or flow_id with node_id. Findings marked blocks_sending stop a send; the rest are advice. Also counts how many people display rules would hide every block for. Requests the email's links unless skip_links is true (DumbMail's own tracking and unsubscribe links are never requested).",
                 obj(json!({"content": {"type": "object"}, "campaign_id": {"type": "string"}, "audience": {"type": "object"}, "flow_id": {"type": "string"}, "node_id": {"type": "string"}, "skip_links": {"type": "boolean"}}), &[]), true, false),
             tool("make_video_thumbnail", "Make a video thumbnail", "Make a thumbnail with a play button for a video block: from a YouTube or Vimeo link (video_url), or from an image (image_url). Stores it as one of the account's images and returns thumbnail_url.", obj(json!({"video_url": {"type": "string", "format": "uri"}, "image_url": {"type": "string", "format": "uri"}}), &[]), false, false),
         ]

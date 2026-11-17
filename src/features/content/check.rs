@@ -2,10 +2,17 @@
 //! product already refuses to send with (from `campaigns::readiness`, an empty audience, content
 //! that doesn't render) are marked `blocks_sending`; everything else is advice.
 //!
+//! One check runs at a time per account, and everything a check does against the database (counting
+//! the audience, trying display rules on it) runs behind that, at most [`GLOBAL_DB_CHECKS`] across
+//! the server and within [`AUDIENCE_DEADLINE`].
+//!
 //! Link and image checks request addresses found in the email through [`super::net`]: public
 //! addresses only, no redirects followed, at most [`MAX_URLS`] addresses, [`PARALLEL`] at a time per
-//! check and [`GLOBAL_PARALLEL`] across the server, one check at a time per account, a deadline on
-//! the whole check, and results cached for [`CACHE_SECS`] seconds.
+//! check and [`GLOBAL_PARALLEL`] across the server, a deadline on the whole check, and results cached
+//! for [`CACHE_SECS`] seconds. Addresses on DumbMail's own hosts (the app, the marketing site, the
+//! shared link host, retired hosts and every account's branded link domain) are never requested: a
+//! copied tracking link or open pixel would count as a real click or open. A tracked link is checked
+//! as the address it leads to.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,6 +37,10 @@ pub const MAX_URLS: usize = 40;
 pub const PARALLEL: usize = 6;
 pub const GLOBAL_PARALLEL: usize = 24;
 pub const CACHE_SECS: u64 = 600;
+pub const GLOBAL_DB_CHECKS: usize = 4;
+/// The most people display rules are tried on.
+pub const RULE_SAMPLE: i64 = 5_000;
+pub const AUDIENCE_DEADLINE: Duration = Duration::from_secs(15);
 const DEADLINE: Duration = Duration::from_secs(20);
 const PER_URL: Duration = Duration::from_secs(6);
 pub const GMAIL_CLIP_BYTES: usize = 102 * 1024;
@@ -358,7 +369,7 @@ pub struct Probe {
 pub fn judge(status: u16) -> (Option<bool>, &'static str) {
     match status {
         200..=299 => (Some(true), "works"),
-        300..=399 => (Some(true), "redirects"),
+        300..=399 => (None, "redirects elsewhere (not followed, so not checked)"),
         401 | 403 | 429 => (None, "refused our check (it may still work in a browser)"),
         404 | 410 => (Some(false), "page not found"),
         400..=499 => (Some(false), "the site refused the request"),
@@ -369,22 +380,32 @@ pub fn judge(status: u16) -> (Option<bool>, &'static str) {
 static CACHE: Lazy<Mutex<HashMap<(Uuid, String), (Instant, Probe)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GLOBAL: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBAL_PARALLEL)));
 static RUNNING: Lazy<Mutex<HashSet<Uuid>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static DB_CHECKS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBAL_DB_CHECKS)));
+
+/// What an answer means: a redirect isn't verified (it isn't followed), and an image address that
+/// answers with a web page (a login wall, an error page) shows a broken image.
+pub fn assess(r: &net::Response, image: bool) -> Probe {
+    let (ok, note) = judge(r.status);
+    let success = (200..300).contains(&r.status);
+    let bytes = r.content_length.or_else(|| (image && success).then_some(r.body.len() as u64));
+    let is_image = r.content_type.starts_with("image/") || (r.content_type.is_empty() && crate::api::images::sniff(&r.body).is_some());
+    if image && success && !is_image {
+        return Probe { ok: Some(false), status: Some(r.status), note: "isn't an image (the address answers with a web page or another kind of file)".into(), bytes };
+    }
+    Probe { ok, status: Some(r.status), note: note.to_string(), bytes }
+}
 
 async fn probe(url: &str, image: bool) -> Probe {
     let failed = |e: NetError| Probe { ok: if matches!(e, NetError::NotPublic | NetError::Invalid | NetError::NoSuchDomain) { Some(false) } else { None }, status: None, note: e.describe().to_string(), bytes: None };
     let head = net::request(Method::HEAD, url, 0, PER_URL).await;
     let res = match head {
-        Ok(r) if !matches!(r.status, 400 | 403 | 405 | 501) && (!image || r.content_length.is_some() || !(200..300).contains(&r.status)) => Ok(r),
+        Ok(r) if !matches!(r.status, 400 | 403 | 405 | 501) && (!image || !(200..300).contains(&r.status) || (r.content_length.is_some() && !r.content_type.is_empty())) => Ok(r),
         Err(e @ (NetError::NotPublic | NetError::Invalid | NetError::NoSuchDomain)) => Err(e),
         // Some servers don't answer HEAD properly; ask again with GET.
         _ => net::request(Method::GET, url, if image { 2 * 1024 * 1024 + 1 } else { 16 * 1024 }, PER_URL).await,
     };
     match res {
-        Ok(r) => {
-            let (ok, note) = judge(r.status);
-            let bytes = r.content_length.or_else(|| (image && (200..300).contains(&r.status)).then_some(r.body.len() as u64));
-            Probe { ok, status: Some(r.status), note: note.to_string(), bytes }
-        }
+        Ok(r) => assess(&r, image),
         Err(e) => failed(e),
     }
 }
@@ -471,6 +492,59 @@ async fn take_slot(account_id: Uuid) -> AppResult<Slot> {
     Ok(Slot(account_id))
 }
 
+/// Where an address found in the email points.
+#[derive(Debug, PartialEq)]
+pub enum Target {
+    /// Somewhere else: check it.
+    External(String),
+    /// One of the account's images on a DumbMail host.
+    OwnImage(Uuid),
+    /// A DumbMail address (tracking, unsubscribe, forms, hosted images): not requested.
+    Own,
+}
+
+fn exact_host(u: &str) -> Option<String> {
+    url::Url::parse(u).ok().and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
+}
+
+/// What `url` is, given DumbMail's own hosts. A click-tracking link is judged by where it leads.
+pub fn classify(url: &str, own: &HashSet<String>) -> Target {
+    let Some(host) = exact_host(url) else { return Target::External(url.to_string()) };
+    if !own.contains(&host) {
+        return Target::External(url.to_string());
+    }
+    let Ok(parsed) = url::Url::parse(url) else { return Target::Own };
+    let path = parsed.path();
+    if path.starts_with("/t/c/") {
+        if let Some((_, dest)) = parsed.query_pairs().find(|(k, _)| k == "u") {
+            if exact_host(&dest).is_some_and(|h| !own.contains(&h)) && (dest.starts_with("https://") || dest.starts_with("http://")) {
+                return Target::External(dest.into_owned());
+            }
+        }
+        return Target::Own;
+    }
+    match path.strip_prefix("/i/").and_then(|r| r.parse::<Uuid>().ok()) {
+        Some(id) => Target::OwnImage(id),
+        None => Target::Own,
+    }
+}
+
+/// DumbMail's own hostnames among `hosts`: the configured ones, and any account's link domain.
+async fn own_hosts(state: &AppState, hosts: &HashSet<String>) -> AppResult<HashSet<String>> {
+    let cfg = &state.cfg;
+    let mut own: HashSet<String> = [cfg.public_host(), cfg.site_host(), cfg.shared_link_host(), exact_host(cfg.link_url())].into_iter().flatten().collect();
+    own.extend(cfg.redirect_hosts.iter().map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase()).filter(|h| !h.is_empty()));
+    if let Some(site) = cfg.site_host() {
+        own.insert(format!("www.{site}"));
+    }
+    let unknown: Vec<String> = hosts.iter().filter(|h| !own.contains(*h)).cloned().collect();
+    if !unknown.is_empty() {
+        let found: Vec<String> = sqlx::query_scalar("SELECT DISTINCT lower(link_domain) FROM accounts WHERE lower(link_domain) = ANY($1)").bind(&unknown).fetch_all(&state.db).await?;
+        own.extend(found);
+    }
+    Ok(own)
+}
+
 fn host_of(u: &str) -> Option<String> {
     url::Url::parse(u).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
 }
@@ -495,16 +569,48 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 // ---------- The check ----------
 
-fn sample_ctx(account: &Account, event: Option<&Value>) -> Value {
-    let mut ctx = crate::render::context(account, None, event, "#unsubscribe");
-    ctx["first_name"] = json!("Alex");
-    ctx["last_name"] = json!("Rivera");
-    ctx["email"] = json!("alex@example.com");
-    ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
-    ctx
+use super::prepare::sample_ctx;
+
+/// Display rules tried on (up to [`RULE_SAMPLE`] of) the audience: (people tried, people every
+/// block is hidden for, people a rule couldn't be decided for).
+async fn rule_counts(state: &AppState, account: &Account, audience: Option<&Audience>, content: &Value, saved: &super::prepare::SavedMap) -> AppResult<(i64, i64, i64)> {
+    let mut qb = QueryBuilder::<Postgres>::new(format!("SELECT {}", crate::models::PROFILE_COLS));
+    match audience {
+        Some(a) => campaigns::append_audience(&mut qb, &state.db, account.id, "email", a).await?,
+        None => {
+            qb.push(" FROM profiles p WHERE p.account_id = ").push_bind(account.id);
+            campaigns::push_eligible(&mut qb, "email");
+        }
+    }
+    qb.push(" LIMIT ").push_bind(RULE_SAMPLE);
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '10s'").execute(&mut *tx).await?;
+    let people: Vec<crate::models::Profile> = qb.build_query_as().fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    let (state, account, content, saved) = (state.clone(), account.clone(), content.clone(), saved.clone());
+    let started = Instant::now();
+    let counts = tokio::task::spawn_blocking(move || {
+        let (mut tried, mut hidden, mut errors) = (0i64, 0i64, 0i64);
+        for p in &people {
+            if started.elapsed() > AUDIENCE_DEADLINE {
+                break;
+            }
+            let ctx = crate::render::context(&account, Some(p), None, "#unsubscribe");
+            let (shows, errs) = super::prepare::shows_for(&state, &account, &content, &ctx, &saved);
+            tried += 1;
+            hidden += i64::from(!shows);
+            errors += i64::from(errs > 0);
+        }
+        (tried, hidden, errors)
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+    Ok(counts)
 }
 
 pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<Value> {
+    // One check at a time per account, before any of its work (audience counts included).
+    let _slot = take_slot(account_id).await?;
     let account = campaigns::load_account(&state.db, account_id).await?;
     let ses = state.email.name() == "ses";
     let mut findings: Vec<Finding> = Vec::new();
@@ -583,7 +689,10 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
     // Render it the way a recipient would get it (tracked links included, for the size).
     let event = is_flow.then(|| json!({"properties": {}}));
     let mut ctx = sample_ctx(&account, event.as_ref());
-    let prepared = super::prepare::prepare_with(state, &account, &content, &ctx, true).await;
+    if let Err(e) = super::prepare::check_rules(&content) {
+        findings.push(blocking("render_error", "This email can't be rendered", e));
+    }
+    let prepared = super::prepare::prepare_all(state, &account, &content, &ctx).await;
     let mut size = None;
     let mut prepared_content = content.clone();
     match prepared {
@@ -668,16 +777,60 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
 
     // Who gets it, and personalization that would come out empty for some of them.
     let vars = bare_vars(&sc.strings);
+    let saved = super::prepare::load_saved_for(state, &account, &content).await?;
+    let rules = super::prepare::rules_text(&content, &saved);
+    // Rules about the event can't be tried without one (flows): only rules about the person are.
+    let try_rules = !rules.is_empty() && !(is_flow && rules.contains("event"));
+    let mut rule_result = None;
     let (people, never, missing) = match &audience {
         Some(a) if a.include.is_empty() => (None, 0, Vec::new()),
-        a => match counts(state, account_id, a.as_ref(), &vars).await {
-            Ok((t, n, m)) => (Some(t), n, m),
-            Err(e) => {
-                findings.push(finding("count_failed", "info", "Couldn't count recipients", e.public_message()));
-                (None, 0, Vec::new())
+        a => {
+            let work = async {
+                let _db = tokio::time::timeout(Duration::from_secs(5), DB_CHECKS.clone().acquire_owned())
+                    .await
+                    .map_err(|_| AppError::Busy("the server is busy checking other emails; try again in a minute".into()))?
+                    .map_err(|e| AppError::Internal(e.into()))?;
+                let c = counts(state, account_id, a.as_ref(), &vars).await?;
+                let r = if try_rules { Some(rule_counts(state, &account, a.as_ref(), &content, &saved).await?) } else { None };
+                Ok::<_, AppError>((c, r))
+            };
+            match tokio::time::timeout(AUDIENCE_DEADLINE + Duration::from_secs(5), work).await {
+                Ok(Ok(((t, n, m), r))) => {
+                    rule_result = r;
+                    (Some(t), n, m)
+                }
+                Ok(Err(e)) => {
+                    findings.push(finding("count_failed", "info", "Couldn't count recipients", e.public_message()));
+                    (None, 0, Vec::new())
+                }
+                Err(_) => {
+                    findings.push(finding("count_failed", "info", "Couldn't count recipients", "Counting took too long; try again later."));
+                    (None, 0, Vec::new())
+                }
             }
-        },
+        }
     };
+    if let Some((tried, hidden, errors)) = rule_result {
+        let of = |n: i64| if tried >= RULE_SAMPLE { format!("{} of the first {tried} people checked", n) } else { plural(n as usize, "person", "people") };
+        if hidden > 0 {
+            findings.push(finding(
+                "rules_hide_everything",
+                "warning",
+                format!("Display rules hide every block for {}", of(hidden)),
+                "They'll be skipped (\"nothing to show for this person\") instead of getting an empty email. Add a block everyone sees, or loosen a rule, if they should get it.",
+            ));
+        }
+        if errors > 0 {
+            findings.push(finding(
+                "rule_errors",
+                "warning",
+                format!("An advanced display rule can't be worked out for {}", of(errors)),
+                "Its block is hidden for them. Guard values that may be missing with `is defined`, or use a simple rule.",
+            ));
+        }
+    } else if !rules.is_empty() && is_flow {
+        findings.push(finding("rules_event", "info", "Display rules depend on the event", "Check the email with \"Preview as\" and a sample event: rules about the event can't be tried on your audience ahead of time."));
+    }
     if let (Some(0), Some(_)) = (people, &audience) {
         findings.push(blocking("audience_empty", "Nobody in this audience can get this email", "Everyone in it has unsubscribed, bounced, has no email address or hasn't confirmed. Pick another list or segment."));
     }
@@ -713,19 +866,26 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
     // Links and images, over the network.
     let mut links_out = Vec::new();
     if !input.skip_links {
-        let own = state.cfg.public_url().to_string();
+        let web = |u: &str| (u.starts_with("https://") || u.starts_with("http://")) && !u.contains("{{") && !u.contains("{%");
+        let found: Vec<(String, bool)> = sc.links.iter().map(|(u, _)| (u.clone(), false)).chain(sc.images.iter().map(|(u, _, _)| (u.clone(), true))).filter(|(u, _)| web(u)).collect();
+        let hosts: HashSet<String> = found.iter().filter_map(|(u, _)| exact_host(u)).collect();
+        let own = own_hosts(state, &hosts).await?;
         let mut urls: Vec<(String, bool)> = Vec::new();
         let mut own_images: Vec<Uuid> = Vec::new();
-        for (u, _) in &sc.links {
-            if (u.starts_with("https://") || u.starts_with("http://")) && !u.contains("{{") && !u.contains("{%") && !u.starts_with(&own) && !urls.iter().any(|(x, _)| x == u) {
-                urls.push((u.clone(), false));
-            }
-        }
-        for (src, _, _) in &sc.images {
-            if let Some(id) = src.strip_prefix(&format!("{own}/i/")).and_then(|r| r.parse::<Uuid>().ok()) {
-                own_images.push(id);
-            } else if (src.starts_with("https://") || src.starts_with("http://")) && !src.contains("{{") && !src.starts_with(&own) && !urls.iter().any(|(x, _)| x == src) {
-                urls.push((src.clone(), true));
+        let mut not_checked: Vec<(String, bool)> = Vec::new();
+        for (u, img) in found {
+            match classify(&u, &own) {
+                Target::External(dest) => {
+                    if !urls.iter().any(|(x, i)| *x == dest && *i == img) {
+                        urls.push((dest, img));
+                    }
+                }
+                Target::OwnImage(id) if img => own_images.push(id),
+                Target::OwnImage(_) | Target::Own => {
+                    if !not_checked.iter().any(|(x, _)| *x == u) {
+                        not_checked.push((u, img));
+                    }
+                }
             }
         }
         let skipped = urls.len().saturating_sub(MAX_URLS);
@@ -733,9 +893,8 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
         let heavy_own: Vec<(Uuid, i32)> = if own_images.is_empty() {
             Vec::new()
         } else {
-            sqlx::query_as("SELECT id, size FROM images WHERE id = ANY($1) AND size > $2").bind(&own_images).bind(HEAVY_IMAGE_BYTES as i32).fetch_all(&state.db).await?
+            sqlx::query_as("SELECT id, size FROM images WHERE id = ANY($1) AND account_id = $2 AND size > $3").bind(&own_images).bind(account_id).bind(HEAVY_IMAGE_BYTES as i32).fetch_all(&state.db).await?
         };
-        let _slot = take_slot(account_id).await?;
         let results = probe_all(account_id, urls).await;
         let broken: Vec<&(String, bool, Probe)> = results.iter().filter(|(_, _, p)| p.ok == Some(false)).collect();
         let unsure = results.iter().filter(|(_, _, p)| p.ok.is_none()).count();
@@ -759,6 +918,7 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
         links_out = results
             .iter()
             .map(|(u, img, p)| json!({"url": u, "kind": if *img { "image" } else { "link" }, "ok": p.ok, "status": p.status, "note": p.note, "bytes": p.bytes}))
+            .chain(not_checked.iter().map(|(u, img)| json!({"url": u, "kind": if *img { "image" } else { "link" }, "ok": null, "status": null, "note": "DumbMail link, not checked", "bytes": null})))
             .collect();
     }
 
@@ -822,9 +982,36 @@ mod tests {
     }
 
     #[test]
+    fn dumbmail_links_are_never_requested() {
+        let own: HashSet<String> = ["pl.test", "links.acme.test"].into_iter().map(String::from).collect();
+        assert_eq!(classify("https://links.acme.test/t/o/abc", &own), Target::Own, "a copied open pixel");
+        assert_eq!(classify("https://LINKS.acme.test/u/abc", &own), Target::Own);
+        assert_eq!(classify("https://links.acme.test/t/c/abc?u=https%3A%2F%2Fshop.test%2Fx&s=1", &own), Target::External("https://shop.test/x".into()), "a tracked link is checked as where it leads");
+        assert_eq!(classify("https://links.acme.test/t/c/abc?u=https%3A%2F%2Fpl.test%2Fu%2Fx&s=1", &own), Target::Own);
+        assert_eq!(classify("https://links.acme.test/t/c/abc?u=javascript%3Ax&s=1", &own), Target::Own);
+        let id = Uuid::now_v7();
+        assert_eq!(classify(&format!("https://pl.test/i/{id}"), &own), Target::OwnImage(id));
+        assert_eq!(classify("https://shop.test/a", &own), Target::External("https://shop.test/a".into()));
+        assert_eq!(classify("https://links.acme.test.evil.test/t/o/x", &own), Target::External("https://links.acme.test.evil.test/t/o/x".into()));
+    }
+
+    #[test]
+    fn images_must_be_images_and_redirects_are_unverified() {
+        let r = |status: u16, ct: &str, body: &[u8]| net::Response { status, content_type: ct.into(), content_length: None, location: None, body: body.to_vec() };
+        assert_eq!(assess(&r(200, "text/html; charset=utf-8", b"<html>"), true).ok, Some(false));
+        assert_eq!(assess(&r(200, "", b"<html>"), true).ok, Some(false));
+        assert_eq!(assess(&r(200, "", b"\x89PNG\r\n\x1a\nrest"), true).ok, Some(true));
+        assert_eq!(assess(&r(200, "image/jpeg", b""), true).ok, Some(true));
+        assert_eq!(assess(&r(200, "text/html", b"<html>"), false).ok, Some(true), "a page is fine for a link");
+        let moved = assess(&r(302, "", b""), false);
+        assert_eq!(moved.ok, None);
+        assert!(moved.note.contains("not followed"));
+    }
+
+    #[test]
     fn judges_answers() {
         assert_eq!(judge(200).0, Some(true));
-        assert_eq!(judge(301).0, Some(true));
+        assert_eq!(judge(301).0, None, "a redirect isn't followed, so it isn't verified");
         assert_eq!(judge(404).0, Some(false));
         assert_eq!(judge(403).0, None);
         assert_eq!(judge(503).0, Some(false));

@@ -69,7 +69,7 @@ pub fn check_blocks(v: &Value) -> AppResult<Value> {
                 _ => {}
             }
             if let Some(r) = b.get("show_if").filter(|r| !r.is_null()) {
-                super::prepare::parse_rule(r).map_err(AppError::bad)?;
+                super::prepare::parse_rules(r).map_err(AppError::bad)?;
             }
         }
         Ok(())
@@ -143,13 +143,25 @@ pub async fn usage(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Va
 }
 
 pub async fn get(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
-    let row: Option<SavedBlock> = sqlx::query_as("SELECT id, name, blocks, created_at, updated_at FROM saved_blocks WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL")
-        .bind(id)
-        .bind(account_id)
-        .fetch_optional(&state.db)
-        .await?;
-    let row = row.ok_or_else(|| AppError::not_found("saved block"))?;
-    let mut v = serde_json::to_value(&row)?;
+    get_with(state, account_id, id, false).await
+}
+
+/// A saved block; with `include_deleted`, also one that was deleted (emails that still point at it
+/// keep showing its last content, so detaching one copies that).
+pub async fn get_with(state: &AppState, account_id: Uuid, id: Uuid, include_deleted: bool) -> AppResult<Value> {
+    let row: Option<(Uuid, String, Value, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
+        "SELECT id, name, blocks, created_at, updated_at, deleted_at IS NOT NULL FROM saved_blocks WHERE id = $1 AND account_id = $2 AND (deleted_at IS NULL OR $3)",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(include_deleted)
+    .fetch_optional(&state.db)
+    .await?;
+    let (id, name, blocks, created_at, updated_at, deleted) = row.ok_or_else(|| AppError::not_found("saved block"))?;
+    let mut v = serde_json::to_value(SavedBlock { id, name, blocks, created_at, updated_at })?;
+    if deleted {
+        v["deleted"] = json!(true);
+    }
     v["used_in"] = usage(state, account_id, id).await?["data"].clone();
     Ok(v)
 }
@@ -184,9 +196,79 @@ pub async fn create(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, b
     Ok(serde_json::to_value(row)?)
 }
 
+/// Emails that use saved block `id` and can send without anyone looking at them again (scheduled
+/// or starting campaigns and their A/B versions, live flows), each checked with `blocks` standing
+/// in for the saved block's content. Returns the ones that couldn't be sent then, with why.
+pub async fn check_live_uses(state: &AppState, account_id: Uuid, id: Uuid, blocks: &Value) -> AppResult<Vec<String>> {
+    let path = r#"$.** ? (@.type == "saved" && @.saved_block_id == $id)"#;
+    let campaigns: Vec<(String, Value, Option<Value>)> = sqlx::query_as(
+        "SELECT name, content, ab_test FROM campaigns WHERE account_id = $1 AND channel = 'email' AND status IN ('scheduled', 'sending')
+           AND (jsonb_path_exists(content, $2::jsonpath, jsonb_build_object('id', $3::text)) OR jsonb_path_exists(COALESCE(ab_test, 'null'), $2::jsonpath, jsonb_build_object('id', $3::text)))
+         LIMIT 200",
+    )
+    .bind(account_id)
+    .bind(path)
+    .bind(id.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    let flows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT name, definition FROM flows WHERE account_id = $1 AND status = 'live' AND jsonb_path_exists(definition, $2::jsonpath, jsonb_build_object('id', $3::text)) LIMIT 200",
+    )
+    .bind(account_id)
+    .bind(path)
+    .bind(id.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    if campaigns.is_empty() && flows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut uses: Vec<(String, Value)> = Vec::new();
+    for (name, content, ab) in campaigns {
+        uses.push((format!("campaign {name:?}"), content));
+        for v in ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).into_iter().flatten() {
+            uses.push((format!("campaign {name:?} version {}", v["id"].as_str().unwrap_or("").to_uppercase()), v["content"].clone()));
+        }
+    }
+    for (name, def) in flows {
+        let Ok(def) = crate::flows::parse_definition(&def) else { continue };
+        for n in def.nodes.iter().filter(|n| n.kind == "email") {
+            if let Some(c) = n.data.get("content") {
+                uses.push((format!("flow {name:?}"), c.clone()));
+            }
+        }
+    }
+    let account = crate::campaigns::load_account(&state.db, account_id).await?;
+    let mut problems = Vec::new();
+    for (label, content) in uses {
+        if !super::prepare::content_refs(&content).contains(&id) {
+            continue;
+        }
+        let mut saved = super::prepare::load_saved_for(state, &account, &content).await?;
+        saved.insert(id, (String::new(), blocks.clone()));
+        if let Err(e) = super::prepare::check_sendable(state, &account, &content, &saved) {
+            let p = format!("{label}: {e}");
+            if !problems.contains(&p) {
+                problems.push(p);
+            }
+        }
+    }
+    Ok(problems)
+}
+
 pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, b: Input) -> AppResult<Value> {
     let name = b.name.as_deref().map(check_name).transpose()?;
     let blocks = b.blocks.as_ref().map(check_blocks).transpose()?;
+    if let Some(blocks) = &blocks {
+        // Emails set to send pick the change up with nobody looking again: it mustn't break any of them.
+        let problems = check_live_uses(state, account_id, id, blocks).await?;
+        if !problems.is_empty() {
+            return Err(AppError::Conflict(format!(
+                "This change would stop {} from sending: {}. Fix the saved block, or detach it in those emails first.",
+                if problems.len() == 1 { "an email that's set to go out".to_string() } else { format!("{} emails that are set to go out", problems.len()) },
+                problems.join("; ")
+            )));
+        }
+    }
     let row: Option<SavedBlock> = sqlx::query_as(
         "UPDATE saved_blocks SET name = COALESCE($3, name), blocks = COALESCE($4, blocks), updated_at = now()
          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL RETURNING id, name, blocks, created_at, updated_at",

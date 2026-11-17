@@ -65,11 +65,35 @@ pub const STARTERS: &[Starter] = &[
     Starter { key: "back_in_stock", name: "Back in stock", description: "Let people know the item they wanted is available again.", kind: "flow", trigger: Some("Back in Stock") },
     Starter { key: "personal_note", name: "Personal note", description: "A plain, text-only note that reads like it came from a person.", kind: "campaign", trigger: None },
     Starter { key: "booking_confirmation", name: "Event or booking confirmation", description: "Confirm a booking or event with the details in a table.", kind: "flow", trigger: Some("Booked") },
-    Starter { key: "pre_arrival", name: "Pre-arrival info", description: "Arrival details for a stay. Send it only from a flow that runs for fully paid bookings.", kind: "flow", trigger: Some("Booked") },
+    Starter {
+        key: "pre_arrival",
+        name: "Pre-arrival info",
+        description: "Arrival details for a stay. Start the flow from a booking event your booking system sends through the API or an integration (never a website event), and have it set paid_in_full: the address and arrival details show only when paid_in_full is true.",
+        kind: "flow",
+        trigger: Some("Booking Paid in Full"),
+    },
 ];
 
 pub fn find(key: &str) -> Option<&'static Starter> {
     STARTERS.iter().find(|s| s.key == key)
+}
+
+/// A link from the triggering event (`event.properties.<var>`), falling back to a page on the
+/// account's website. The website is read as data when the email renders, never written into the
+/// template, so nothing in its address (like an apostrophe) can change the template.
+fn event_link(var: &str, path: &str) -> String {
+    let site = "(organization.website or 'https://example.com')";
+    if path.is_empty() {
+        format!("{{{{ event.properties.{var}|default({site}) }}}}")
+    } else {
+        format!("{{{{ event.properties.{var}|default({site}|trim('/') ~ '/{path}') }}}}")
+    }
+}
+
+/// Shown only when the event that started the flow says the booking is paid in full.
+fn when_paid(mut b: Value) -> Value {
+    b["show_if"] = json!({"field": "event.properties.paid_in_full", "op": "eq", "value": "true"});
+    b
 }
 
 fn heading(text: &str, level: u8, align: &str) -> Value {
@@ -184,7 +208,7 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                 heading("Still thinking it over?", 1, "center"),
                 text("<p>Hi {{ first_name|default('there') }}, you left these in your cart. They're still there when you're ready.</p>", "center"),
                 items_table(),
-                button("Finish checking out", &format!("{{{{ event.properties.checkout_url|default('{}') }}}}", b.page("cart"))),
+                button("Finish checking out", &event_link("checkout_url", "cart")),
                 text("<p>Questions about sizing or shipping? Just reply.</p>", "center"),
                 footer(b),
             ],
@@ -211,7 +235,7 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                 text("<p>Hi {{ first_name|default('there') }}, your order <strong>#{{ event.properties.order_id }}</strong> has shipped.</p>", "center"),
                 json!({"type": "table", "columns": [{"label": ""}, {"label": "", "align": "right"}],
                     "rows": [["Carrier", "{{ event.properties.carrier|default('See tracking') }}"], ["Tracking number", "{{ event.properties.tracking_number|default('See tracking') }}"]]}),
-                button("Track your package", &format!("{{{{ event.properties.tracking_url|default('{}') }}}}", b.page("account"))),
+                button("Track your package", &event_link("tracking_url", "account")),
                 footer(b),
             ],
         ),
@@ -256,7 +280,7 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                 text("<p>Hi {{ first_name|default('there') }}, the item you asked about is available again. It sold out fast last time, so don't wait too long.</p>", "center"),
                 // The product from the triggering event, with its photo and price from the catalog.
                 json!({"type": "products", "source": "event_items", "count": 1, "columns": 1, "button_text": "Get it now"}),
-                button("Shop now", &format!("{{{{ event.properties.url|default('{}') }}}}", b.website)),
+                button("Shop now", &event_link("url", "")),
                 footer(b),
             ],
         ),
@@ -276,7 +300,7 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
                 text("<p>Hi {{ first_name|default('there') }}, thanks for booking with us. Here are your details.</p>", "left"),
                 json!({"type": "table", "columns": [{"label": ""}, {"label": "", "align": "right"}],
                     "rows": [["What", "{{ event.properties.name|default('Your booking') }}"], ["Starts", "{{ event.properties.start_date }}"], ["Ends", "{{ event.properties.end_date }}"], ["Confirmation", "{{ event.properties.confirmation_code }}"]]}),
-                button("View your booking", &format!("{{{{ event.properties.url|default('{}') }}}}", b.website)),
+                button("View your booking", &event_link("url", "")),
                 footer(b),
             ],
         ),
@@ -286,10 +310,13 @@ pub fn content(key: &str, b: &Brand) -> Option<Value> {
             vec![
                 image(&b.hero(), "Your stay", ""),
                 heading("See you soon, {{ first_name|default('there') }}", 1, "left"),
-                text("<p>Your stay starts soon. Here's what you need for arrival day. Save this email so it's handy when you get there.</p>", "left"),
-                json!({"type": "table", "columns": [{"label": ""}, {"label": "", "align": "right"}],
-                    "rows": [["Check-in", "{{ event.properties.check_in|default('From 4:00 PM') }}"], ["Check-out", "{{ event.properties.check_out|default('By 10:00 AM') }}"], ["Address", "{{ event.properties.address }}"], ["Parking", "{{ event.properties.parking|default('Ask us') }}"]]}),
-                button("Get directions", "{{ event.properties.directions_url|default('https://maps.google.com') }}"),
+                // Arrival details only for a booking the event says is paid in full.
+                when_paid(text("<p>Your stay starts soon. Here's what you need for arrival day. Save this email so it's handy when you get there.</p>", "left")),
+                when_paid(json!({"type": "table", "columns": [{"label": ""}, {"label": "", "align": "right"}],
+                    "rows": [["Check-in", "{{ event.properties.check_in|default('From 4:00 PM') }}"], ["Check-out", "{{ event.properties.check_out|default('By 10:00 AM') }}"], ["Address", "{{ event.properties.address }}"], ["Parking", "{{ event.properties.parking|default('Ask us') }}"]]})),
+                when_paid(button("Get directions", "{{ event.properties.directions_url|default('https://maps.google.com') }}")),
+                json!({"type": "text", "align": "left", "html": "<p>Your stay starts soon. We'll send the address and arrival details once your booking is paid in full.</p>",
+                    "show_if": {"field": "event.properties.paid_in_full", "op": "neq", "value": "true"}}),
                 text("<p>Anything you need before you arrive? Just reply to this email.</p>", "left"),
                 footer(b),
             ],
@@ -312,7 +339,7 @@ pub fn sample_event(key: &str) -> Option<Value> {
         "shipping" => Some(json!({"properties": {"order_id": "1042", "carrier": "UPS", "tracking_number": "1Z999AA10123456784"}})),
         "back_in_stock" => Some(json!({"properties": {"product_name": "Everyday tote", "product_id": "TOTE-1"}})),
         "booking_confirmation" => Some(json!({"properties": {"name": "Sunset kayak tour", "start_date": "Sat, Jun 6 at 6:00 PM", "end_date": "Sat, Jun 6 at 8:00 PM", "confirmation_code": "K7Q2P"}})),
-        "pre_arrival" => Some(json!({"properties": {"address": "123 Ocean View Rd"}})),
+        "pre_arrival" => Some(json!({"properties": {"address": "123 Ocean View Rd", "paid_in_full": true}})),
         _ => None,
     }
 }
@@ -333,5 +360,35 @@ mod tests {
             assert!(!c.to_string().contains("\"html\":\"<html"), "{}", s.key);
         }
         assert!(content("nope", &b).is_none());
+    }
+
+    #[test]
+    fn pre_arrival_shows_arrival_details_only_for_a_paid_booking_and_has_no_access_codes() {
+        let b = Brand { color: "#aa3366".into(), name: "Acme".into(), website: "https://acme.test".into(), assets: "https://pl.test/e/assets".into() };
+        let c = content("pre_arrival", &b).unwrap();
+        let text = c.to_string().to_lowercase();
+        for word in ["door", "access", "lockbox", "entry code", "gate code", "keypad", "wifi", "password"] {
+            assert!(!text.contains(word), "{word}: {text}");
+        }
+        for blk in c["blocks"].as_array().unwrap() {
+            let shown = blk.to_string();
+            if shown.contains("event.properties.address") || shown.contains("directions_url") || shown.contains("check_in") || shown.contains("arrival day") {
+                assert_eq!(blk["show_if"]["field"], "event.properties.paid_in_full", "{blk}");
+                assert_eq!(blk["show_if"]["op"], "eq", "{blk}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_website_is_data_not_template_source() {
+        let b = Brand { color: "#aa3366".into(), name: "Acme".into(), website: "https://acme.test/o'brien".into(), assets: "https://pl.test/e/assets".into() };
+        for s in STARTERS {
+            let c = content(s.key, &b).unwrap();
+            for blk in c["blocks"].as_array().unwrap() {
+                if blk["href"].as_str().is_some_and(|h| h.contains("{{")) {
+                    assert!(!blk["href"].as_str().unwrap().contains("o'brien"), "{}: {blk}", s.key);
+                }
+            }
+        }
     }
 }

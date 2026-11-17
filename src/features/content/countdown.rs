@@ -4,11 +4,14 @@
 //!
 //! The image address carries the end time and colors, signed with the server's secret, so nobody
 //! can make DumbMail draw arbitrary images. Cost is bounded: a fixed size and frame count, one
-//! drawing per timer per second (cached; every open in that second shares it), at most
-//! [`MAX_DRAWING`] drawings at once per server process, and at most [`ACCOUNT_PER_MINUTE`] new
-//! drawings a minute for one account (past that, opens get the last drawing).
+//! drawing per timer per second (every open in that second waits for and shares the same one), at
+//! most [`MAX_DRAWING`] drawings at once per server process (each holds its slot until it's done,
+//! even if the open that started it goes away), at most [`MAX_QUEUED`] waiting or drawing, and at
+//! most [`ACCOUNT_PER_MINUTE`] new drawings a minute for one account (past these limits, opens get
+//! the timer's last drawing).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
@@ -19,7 +22,7 @@ use base64::Engine;
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
 
 use super::prepare::{parse_time, Prep};
@@ -255,14 +258,20 @@ pub fn draw(t: &Timer, now: i64) -> Vec<u8> {
 
 // ---------- Serving ----------
 
-struct Cached {
-    second: i64,
-    gif: Arc<Vec<u8>>,
+/// The most drawings waiting for or holding a drawing slot at once, across the server. Past this,
+/// opens get the timer's last drawing (or a 503 when there is none yet).
+pub const MAX_QUEUED: usize = 16;
+
+/// A timer's latest drawing, or the one being drawn now (shared by every open in that second).
+enum Entry {
+    Ready { second: i64, gif: Arc<Vec<u8>> },
+    Drawing { second: i64, rx: watch::Receiver<Option<Arc<Vec<u8>>>>, last: Option<Arc<Vec<u8>>> },
 }
 
-static CACHE: Lazy<Mutex<HashMap<String, Cached>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static CACHE: Lazy<Mutex<HashMap<String, Entry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static BUDGET: Lazy<Mutex<HashMap<Uuid, (i64, u32)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static DRAWING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_DRAWING));
+static DRAWING: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(MAX_DRAWING)));
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
 
 /// Count one drawing against the account's per-minute budget; false when it's used up.
 async fn take_budget(account: Uuid, now: i64) -> bool {
@@ -294,34 +303,103 @@ fn gif_response(bytes: Arc<Vec<u8>>) -> Response {
         .into_response()
 }
 
-/// The image for `token` at `now`, drawing it if no open in this second already did.
+/// Frees a queue place when the drawing finishes or fails, and forgets a drawing that failed.
+struct Queued {
+    token: String,
+    second: i64,
+    done: bool,
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        QUEUED.fetch_sub(1, Ordering::SeqCst);
+        if !self.done {
+            let (token, second) = (std::mem::take(&mut self.token), self.second);
+            tokio::spawn(async move {
+                let mut cache = CACHE.lock().await;
+                if matches!(cache.get(&token), Some(Entry::Drawing { second: s, .. }) if *s == second) {
+                    cache.remove(&token);
+                }
+            });
+        }
+    }
+}
+
+/// Draw `t` at `now` in the background: the task holds a drawing slot until the drawing is done,
+/// whether or not anyone is still waiting for it, then stores it and hands it to every waiter.
+fn spawn_draw(token: String, t: Timer, now: i64, tx: watch::Sender<Option<Arc<Vec<u8>>>>) {
+    tokio::spawn(async move {
+        let mut q = Queued { token: token.clone(), second: now, done: false };
+        let Ok(permit) = DRAWING.clone().acquire_owned().await else { return };
+        let Ok(gif) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            draw(&t, now)
+        })
+        .await
+        else {
+            return;
+        };
+        let gif = Arc::new(gif);
+        {
+            let mut cache = CACHE.lock().await;
+            if cache.len() > 2_000 {
+                cache.retain(|_, e| matches!(e, Entry::Drawing { .. }) || matches!(e, Entry::Ready { second, .. } if *second >= now - 60));
+                if cache.len() > 2_000 {
+                    cache.retain(|_, e| matches!(e, Entry::Drawing { .. }));
+                }
+            }
+            // A newer drawing may have started meanwhile; it replaces this one when it's done.
+            let newer = matches!(cache.get(&token), Some(Entry::Drawing { second, .. } | Entry::Ready { second, .. }) if *second > now);
+            if !newer {
+                cache.insert(token, Entry::Ready { second: now, gif: gif.clone() });
+            }
+        }
+        q.done = true;
+        let _ = tx.send(Some(gif));
+    });
+}
+
+async fn wait(mut rx: watch::Receiver<Option<Arc<Vec<u8>>>>) -> Result<Arc<Vec<u8>>, StatusCode> {
+    let got = rx.wait_for(|v| v.is_some()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    got.clone().ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// The image for `token` at `now`. Every open of a timer in the same second shares one drawing.
 pub async fn image(secret: &str, token: &str, now: i64) -> Result<Arc<Vec<u8>>, StatusCode> {
     let t = Timer::from_token(secret, token).ok_or(StatusCode::NOT_FOUND)?;
     let ended = t.ends_at <= now;
-    {
-        let cache = CACHE.lock().await;
-        if let Some(c) = cache.get(token) {
-            // An ended timer never changes again.
-            if c.second == now || (ended && c.second >= t.ends_at) {
-                return Ok(c.gif.clone());
-            }
-        }
-    }
-    if !take_budget(t.account_id, now).await {
-        let cache = CACHE.lock().await;
-        return cache.get(token).map(|c| c.gif.clone()).ok_or(StatusCode::TOO_MANY_REQUESTS);
-    }
-    let _permit = DRAWING.acquire().await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let gif = Arc::new(tokio::task::spawn_blocking(move || draw(&t, now)).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    // An ended timer never changes again, so any drawing made after the end is current.
+    let current = |second: i64| second == now || (ended && second >= t.ends_at);
     let mut cache = CACHE.lock().await;
-    if cache.len() > 2_000 {
-        cache.retain(|_, c| c.second >= now - 60);
-        if cache.len() > 2_000 {
-            cache.clear();
-        }
+    let (rx, last) = match cache.get(token) {
+        Some(Entry::Ready { second, gif }) if current(*second) => return Ok(gif.clone()),
+        Some(Entry::Drawing { second, rx, .. }) if current(*second) => (Some(rx.clone()), None),
+        Some(Entry::Ready { gif, .. }) => (None, Some(gif.clone())),
+        Some(Entry::Drawing { last, .. }) => (None, last.clone()),
+        None => (None, None),
+    };
+    if let Some(rx) = rx {
+        drop(cache);
+        return wait(rx).await;
     }
-    cache.insert(token.to_string(), Cached { second: now, gif: gif.clone() });
-    Ok(gif)
+    let refused = |code| last.clone().ok_or(code);
+    if !take_budget(t.account_id, now).await {
+        return refused(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if QUEUED.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED {
+        QUEUED.fetch_sub(1, Ordering::SeqCst);
+        return refused(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (tx, rx) = watch::channel(None);
+    cache.insert(token.to_string(), Entry::Drawing { second: now, rx: rx.clone(), last });
+    drop(cache);
+    spawn_draw(token.to_string(), t, now, tx);
+    wait(rx).await
+}
+
+/// How many drawings are waiting for or holding a slot (for tests).
+pub fn queued() -> usize {
+    QUEUED.load(Ordering::SeqCst)
 }
 
 pub async fn image_h(State(state): State<AppState>, Path(file): Path<String>) -> Response {
@@ -376,6 +454,34 @@ mod tests {
         let mut r = gif::DecodeOptions::new().read_info(ended.as_slice()).unwrap();
         assert!(r.read_next_frame().unwrap().is_some());
         assert!(r.read_next_frame().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn opens_in_one_second_share_one_drawing_that_finishes_without_them() {
+        let t = Timer { account_id: Uuid::now_v7(), ends_at: 2_000_000_000, ..timer() };
+        let tok = t.token("s");
+        let now = 1_999_990_000;
+        // The open that starts the drawing goes away at once; the drawing still finishes.
+        let first = tokio::spawn({
+            let tok = tok.clone();
+            async move { image("s", &tok, now).await }
+        });
+        tokio::task::yield_now().await;
+        first.abort();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let tok = tok.clone();
+            set.spawn(async move { image("s", &tok, now).await });
+        }
+        let mut got = Vec::new();
+        while let Some(r) = set.join_next().await {
+            got.push(r.unwrap().unwrap());
+        }
+        assert!(got.iter().all(|g| Arc::ptr_eq(g, &got[0])), "one drawing shared by every open in that second");
+        assert_eq!(BUDGET.lock().await.get(&t.account_id).map(|e| e.1), Some(1), "the account paid for one drawing");
+        // The next second gets a drawing of its own.
+        let next = image("s", &tok, now + 1).await.unwrap();
+        assert!(!Arc::ptr_eq(&next, &got[0]));
     }
 
     #[test]

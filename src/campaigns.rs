@@ -317,8 +317,15 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     if c.audience != pre_audience || c.channel != channel {
         anyhow::bail!("the campaign changed while its send was being prepared; retrying");
     }
-    // Copy in the saved blocks it uses, so editing one later doesn't change what this campaign sends.
-    crate::features::content::prepare::freeze_campaign(&mut tx, &c).await?;
+    // Copy in the saved blocks it uses, in the same transaction that fixes the audience, so every
+    // recipient (also those held for their local or best time) gets this copy and editing a saved
+    // block later doesn't change what this campaign sends. A copy that can't be sent fails the
+    // campaign here, before anyone gets it.
+    if let Some(problem) = crate::features::content::prepare::freeze_campaign(state, &mut tx, &c).await? {
+        sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
             tx.commit().await?;
