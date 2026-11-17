@@ -282,12 +282,27 @@ async fn redact_customer(db: &PgPool, account_id: Uuid, shop: &str, p: &Value) -
     for o in &orders {
         mark(db, account_id, shop, "order", o.parse().unwrap_or(0)).await?;
     }
-    let ids = match cid {
+    let mut ids = match cid {
         Some(c) => customer_profiles(db, account_id, shop, c).await?,
         None => Vec::new(),
     };
     let metrics = metric_ids(db, account_id).await?;
     let cid_s = cid.map(|c| c.to_string());
+    // The profiles the erased orders were recorded on (a guest order's contact) are cleaned too.
+    let order_profiles: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT profile_id FROM events WHERE account_id = $1 AND metric_id = ANY($2) AND properties->>'shopify_shop' = $3 AND (properties->>'order_id') = ANY($4) LIMIT 1000",
+    )
+    .bind(account_id)
+    .bind(&metrics)
+    .bind(shop)
+    .bind(&orders)
+    .fetch_all(db)
+    .await?;
+    for p in order_profiles {
+        if !ids.contains(&p) {
+            ids.push(p);
+        }
+    }
     let mut tx = db.begin().await?;
     sqlx::query(
         "DELETE FROM events WHERE account_id = $1 AND metric_id = ANY($2) AND properties->>'shopify_shop' = $3

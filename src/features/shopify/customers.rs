@@ -24,7 +24,7 @@
 //!
 //! Unsubscribes made in DumbMail are written back to Shopify ([`write_back`]).
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::{json, Map, Value};
@@ -605,12 +605,12 @@ pub async fn writeback_due(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
 
 /// Write-backs waiting, and those Shopify refused at least once (for status).
 pub async fn writeback_counts(db: &PgPool, account_id: Uuid, shop: &str) -> sqlx::Result<(i64, i64)> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(
         "SELECT count(*) FILTER (WHERE TRUE), count(*) FILTER (WHERE c.email_wb_attempts > 0 OR c.sms_wb_attempts > 0)
          FROM shopify_customers c WHERE c.account_id = $1 AND c.shop_domain = $2 AND c.deleted_at IS NULL AND (
            (c.email IS NOT NULL AND c.email_state IN ('SUBSCRIBED', 'PENDING') AND EXISTS (SELECT 1 FROM profiles p WHERE p.account_id = c.account_id AND p.email = c.email AND p.email_consent = 'unsubscribed'))
            OR (c.phone IS NOT NULL AND c.sms_state IN ('SUBSCRIBED', 'PENDING') AND EXISTS (SELECT 1 FROM profiles p WHERE p.account_id = c.account_id AND p.phone_number = c.phone AND p.sms_consent = 'unsubscribed')))"
-    ))
+    )
     .bind(account_id)
     .bind(shop)
     .fetch_one(db)
@@ -619,9 +619,4 @@ pub async fn writeback_counts(db: &PgPool, account_id: Uuid, shop: &str) -> sqlx
 
 pub fn parse_time(s: Option<&str>) -> Option<DateTime<Utc>> {
     s.and_then(|x| DateTime::parse_from_rfc3339(x).ok()).map(|d| d.with_timezone(&Utc))
-}
-
-/// Backoff helper used by the worker for whole steps.
-pub fn backoff(attempts: i32) -> Duration {
-    Duration::minutes(2i64.saturating_pow(attempts.clamp(0, 10) as u32)).min(Duration::days(1))
 }

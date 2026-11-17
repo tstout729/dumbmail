@@ -598,7 +598,8 @@ pub async fn disconnect(state: &AppState, account_id: Uuid) -> AppResult<Value> 
             }
         }
     }
-    unfinished.dedup();
+    let mut seen = std::collections::HashSet::new();
+    unfinished.retain(|u| seen.insert(*u));
     forget(&state.db, account_id, "disconnected", Some(s.generation)).await?;
     let cleanup = (!unfinished.is_empty()).then(|| format!("Shopify didn't confirm removing {}. Uninstall the DumbMail app in Shopify to remove them; anything that still arrives is ignored.", unfinished.join(", ")));
     sqlx::query("UPDATE shopify_shops SET cleanup_error = $2 WHERE account_id = $1").bind(account_id).bind(&cleanup).execute(&state.db).await?;

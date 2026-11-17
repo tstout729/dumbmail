@@ -127,7 +127,7 @@ struct ConfirmBody {
 async fn disconnect(state: &AppState, ctx: &Ctx, confirm: bool) -> AppResult<Value> {
     if !confirm {
         let s = shop::connected(&state.db, ctx.account_id).await?;
-        return Ok(json!({"dry_run": true, "note": format!("Nothing changed. Disconnecting {} removes DumbMail's webhooks and pixel from the store and forgets its access. Profiles, events and products already brought in stay. Call again with confirm=true once the user approves.", s.shop_domain)}));
+        return Ok(json!({"dry_run": true, "note": format!("Nothing changed. Disconnecting {} removes DumbMail's webhooks, pixel and theme embed settings from the store and forgets its access. Profiles, events and products already brought in stay. Call again with confirm=true once the user approves.", s.shop_domain)}));
     }
     oauth::disconnect(state, ctx.account_id).await
 }
