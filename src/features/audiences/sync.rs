@@ -148,6 +148,7 @@ async fn end_run(state: &AppState, sync: &SyncRow, run: &RunRow, status: &str, m
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM ad_audience_desired WHERE sync_id = $1").bind(sync.id).execute(&mut *tx).await?;
+    prune_runs(&mut tx, sync.id).await?;
     tx.commit().await?;
     if status == "failed" {
         tracing::info!(sync = %sync.id, platform = %sync.platform, error = msg.unwrap_or_default(), "audience sync run failed");
@@ -324,11 +325,11 @@ struct PendingRow {
 /// Make sure the platform audience exists before adding (Meta and Google; TikTok creates it with the
 /// first upload). Looks for one this sync already made before creating another.
 async fn ensure_audience(state: &AppState, sync: &SyncRow, t: &Target<'_>) -> anyhow::Result<Result<Option<String>, PErr>> {
-    if let Some(id) = &sync.external_audience_id {
-        return Ok(Ok(Some(id.clone())));
+    if sync.external_audience_id.is_some() || sync.platform() == Platform::Tiktok {
+        return Ok(Ok(sync.external_audience_id.clone()));
     }
     let marker = platforms::marker(sync.id);
-    let found = match platforms::find_audience(state, t, &sync.name, &marker).await {
+    let found = match platforms::find_audience(state, t, &marker).await {
         Ok(f) => f,
         Err(e) => return Ok(Err(e)),
     };
@@ -510,12 +511,17 @@ async fn finish(state: &AppState, sync: &SyncRow, run: &RunRow, t: &Target<'_>) 
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM ad_audience_desired WHERE sync_id = $1").bind(sync.id).execute(&mut *tx).await?;
-    // Keep the last 30 runs of history.
-    sqlx::query("DELETE FROM ad_audience_runs WHERE sync_id = $1 AND id NOT IN (SELECT id FROM ad_audience_runs WHERE sync_id = $1 ORDER BY started_at DESC LIMIT 30)")
-        .bind(sync.id)
-        .execute(&mut *tx)
-        .await?;
+    prune_runs(&mut tx, sync.id).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Keep the last 30 runs of history.
+async fn prune_runs(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, sync_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM ad_audience_runs WHERE sync_id = $1 AND id NOT IN (SELECT id FROM ad_audience_runs WHERE sync_id = $1 ORDER BY started_at DESC LIMIT 30)")
+        .bind(sync_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

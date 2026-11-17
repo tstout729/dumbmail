@@ -616,7 +616,7 @@ pub fn marker(sync_id: uuid::Uuid) -> String {
 }
 
 /// Find an audience DumbMail already created for this sync.
-pub async fn find_audience(state: &AppState, t: &Target<'_>, name: &str, marker: &str) -> PResult<Option<String>> {
+pub async fn find_audience(state: &AppState, t: &Target<'_>, marker: &str) -> PResult<Option<String>> {
     let h = hosts(&state.cfg);
     match t.platform {
         Platform::Meta => {
@@ -657,27 +657,10 @@ pub async fn find_audience(state: &AppState, t: &Target<'_>, name: &str, marker:
             }
             Ok(None)
         }
-        Platform::Tiktok => {
-            for page in 1..=5 {
-                let res = state
-                    .http
-                    .get(format!("{}/dmp/custom_audience/list/", h.tiktok))
-                    .header("Access-Token", t.token)
-                    .query(&[("advertiser_id", t.ad_account_id), ("page", &page.to_string()), ("page_size", "100")])
-                    .send()
-                    .await
-                    .map_err(|e| network(t.platform, e))?;
-                let (status, v) = body(t.platform, res).await?;
-                let data = tiktok_ok(status, &v)?;
-                if let Some(a) = data["list"].as_array().into_iter().flatten().find(|a| a["name"].as_str() == Some(name)) {
-                    return Ok(a["audience_id"].as_str().map(String::from).or_else(|| a["audience_id"].as_i64().map(|n| n.to_string())));
-                }
-                if page >= data["page_info"]["total_page"].as_i64().unwrap_or(1) {
-                    break;
-                }
-            }
-            Ok(None)
-        }
+        // TikTok audiences have no description to carry the marker, and a name can match an
+        // audience the customer made by hand, so DumbMail never looks one up by name. Its id is
+        // saved straight after the create call instead.
+        Platform::Tiktok => Ok(None),
     }
 }
 

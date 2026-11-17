@@ -544,6 +544,7 @@ async fn tiktok_customer_files() {
     let sig = &body[sig_start..sig_start + 32];
     use md5::Digest as _;
     assert_eq!(sig, hex::encode(md5::Md5::digest(file.as_bytes())), "file_signature is the file's MD5");
+    assert!(m.calls("/custom_audience/list/").is_empty(), "never matched by name to an audience the customer made");
     let create = m.calls("/custom_audience/create/")[0].json();
     assert_eq!(create["calculate_type"], "EMAIL_SHA256");
     assert_eq!(create["advertiser_id"], "777");
