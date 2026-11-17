@@ -107,7 +107,7 @@ pub async fn start(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, ki
         }
         Err(e) => return Err(e.into()),
     };
-    super::shop::kick(&mut *tx, account_id).await?;
+    super::shop::kick(&mut tx, account_id).await?;
     tx.commit().await?;
     Ok(row)
 }
@@ -434,7 +434,7 @@ pub async fn queue_reconciles(db: &sqlx::PgPool) -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await?;
         if r.rows_affected() == 1 {
-            super::shop::kick(&mut *tx, account_id).await?;
+            super::shop::kick(&mut tx, account_id).await?;
         }
         tx.commit().await?;
     }

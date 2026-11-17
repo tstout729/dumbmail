@@ -1,0 +1,16 @@
+{%- comment -%}
+  DumbMail's website snippet on every page. DumbMail saves the script's address (with the store's
+  public key) in this app's settings when the store connects; nothing to type here.
+{%- endcomment -%}
+{%- assign dumbmail_src = app.metafields.dumbmail.script_url.value -%}
+{%- if dumbmail_src != blank -%}
+  <script async src="{{ dumbmail_src | escape }}"></script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "DumbMail",
+  "target": "head",
+  "settings": []
+}
+{% endschema %}

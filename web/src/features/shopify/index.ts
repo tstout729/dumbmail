@@ -1,4 +1,6 @@
 import type { DashboardFeature } from "../types";
 
-// Not built yet. This feature's pages, API hooks and types live in this folder.
-export const feature: DashboardFeature = {};
+export const feature: DashboardFeature = {
+  settingsRoutes: [{ path: "shopify", lazy: () => import("./ShopifyPage").then((m) => ({ Component: m.ShopifyPage })) }],
+  settingsTabs: [{ label: "Shopify", title: "Shopify store", to: "/settings/shopify" }],
+};

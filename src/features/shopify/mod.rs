@@ -83,13 +83,15 @@ pub struct Module;
 /// write back, then the import.
 async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
     let Some(lease) = shop::acquire(state, account_id).await? else { return Ok(()) };
-    let r = work_inner(state, account_id, &lease).await;
-    let (more, delay) = match &r {
-        Ok(x) => *x,
-        Err(_) => (true, Some(chrono::Duration::seconds(30))),
+    let (more, delay) = match work_inner(state, account_id, &lease).await {
+        Ok(x) => x,
+        Err(e) => {
+            // Queued again below; failing the job too would schedule it twice.
+            tracing::warn!(account = %account_id, error = %format!("{e:#}"), "Shopify work failed; trying again shortly");
+            (true, Some(chrono::Duration::seconds(30)))
+        }
     };
-    shop::release(state, &lease, more, delay).await?;
-    r.map(|_| ())
+    shop::release(state, &lease, more, delay).await
 }
 
 async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> anyhow::Result<(bool, Option<chrono::Duration>)> {

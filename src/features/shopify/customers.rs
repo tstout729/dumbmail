@@ -7,6 +7,7 @@
 //! - `UNSUBSCRIBED` unsubscribes it;
 //! - anything else (`NOT_SUBSCRIBED`, `PENDING`, `INVALID`, `REDACTED`) changes nothing; new profiles
 //!   start as never subscribed and Shopify's state is kept in the `shopify_email_marketing` property.
+//!
 //! SMS works the same from the SMS consent of that phone number. Orders and checkouts never change
 //! consent. When a customer's address changes in Shopify, the new address is a different profile (or
 //! gets its own consent), and the old one keeps its own: nothing carries over.

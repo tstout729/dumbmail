@@ -113,7 +113,7 @@ async fn store(state: &AppState, topic: &str, domain: &str, webhook_id: &str, bo
                 // A store that's gone has no worker; privacy work runs as its own job.
                 crate::jobs::enqueue(&mut *tx, "shopify_privacy", json!({"account_id": account_id}), None).await?;
             } else {
-                shop::kick(&mut *tx, account_id).await?;
+                shop::kick(&mut tx, account_id).await?;
             }
         }
         tx.commit().await?;
