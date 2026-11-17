@@ -419,7 +419,7 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone.
-    if refreshed_at.is_none() {
+    if refreshed_at.is_none() || crate::features::klaviyo_import::absorb_segment_entries(&state.db, account_id, refreshed_at).await? {
         return Ok(());
     }
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $2 AND status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")
@@ -570,6 +570,9 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "email" | "sms" => {
+                if crate::features::klaviyo_import::flow_send_held(state, run.id, flow.account_id, &node_id, &context).await? {
+                    return Ok(());
+                }
                 // Smart sending: skip if this person got any message in the last N hours (0 = off).
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 let recent: bool = hours > 0

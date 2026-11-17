@@ -223,6 +223,7 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         problems.push("Pick at least one list or segment".to_string());
     }
     problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
+    problems.extend(crate::features::klaviyo_import::review_problems(&c.content));
     if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
         match parse_ab_test(&c.channel, v) {
             Ok(t) => {
@@ -279,6 +280,9 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
 /// With an A/B test and no winner yet, only the test slice gets rows (each with its version);
 /// once a winner is picked this runs again and adds everyone else.
 pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result<()> {
+    if !crate::features::klaviyo_import::campaign_may_start(state, campaign_id).await? {
+        return Ok(());
+    }
     // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
     let mut tx = state.db.begin().await?;
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;

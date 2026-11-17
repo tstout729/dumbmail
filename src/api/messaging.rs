@@ -654,6 +654,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
     }
     let f = load_flow(state, account_id, id).await?;
     if status == "live" {
+        crate::features::klaviyo_import::check_flow_live(&state.db, id, &f.definition).await?;
         let def = flows::parse_definition(&f.definition)?;
         if def.entry.is_none() {
             return Err(AppError::bad("add at least one step before turning the flow on"));

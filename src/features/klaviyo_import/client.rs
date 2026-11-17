@@ -6,7 +6,7 @@
 //! called: `links.next` URLs from responses are followed only when they point back at it.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -40,8 +40,9 @@ pub enum KlaviyoError {
     /// Klaviyo asked us to wait this long before the next request.
     #[error("Klaviyo asked us to slow down; continuing in {0} seconds")]
     RateLimited(u64),
-    #[error("Klaviyo returned {status}: {detail}")]
-    Status { status: u16, detail: String },
+    /// Only Klaviyo's status and error code are kept: its detail text is never stored, logged or shown.
+    #[error("Klaviyo returned {status} ({code})")]
+    Status { status: u16, code: String },
     #[error("couldn't reach Klaviyo: {0}")]
     Network(String),
     #[error("Klaviyo sent a response we couldn't read: {0}")]
@@ -75,11 +76,22 @@ fn steady_per_minute(path: &str) -> u32 {
     }
 }
 
+/// When each endpoint family was last called, per Klaviyo key, shared by every job in this process (a
+/// survey and an import, or two jobs for one account, pace together).
+static PACE: OnceLock<Mutex<HashMap<(u64, String), Instant>>> = OnceLock::new();
+
+fn key_id(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 pub struct Client {
     http: reqwest::Client,
     key: String,
+    key_id: u64,
     base: String,
-    last: HashMap<String, Instant>,
     /// Longest a 429 may be waited out inside one call before giving the job back.
     pub max_inline_wait: Duration,
     pub calls: u64,
@@ -87,7 +99,8 @@ pub struct Client {
 
 impl Client {
     pub fn new(http: reqwest::Client, key: &str) -> Self {
-        Client { http, key: key.trim().to_string(), base: api_base().to_string(), last: HashMap::new(), max_inline_wait: Duration::from_secs(20), calls: 0 }
+        let key = key.trim().to_string();
+        Client { http, key_id: key_id(&key), key, base: api_base().to_string(), max_inline_wait: Duration::from_secs(20), calls: 0 }
     }
 
     fn url(&self, path_or_url: &str) -> KResult<String> {
@@ -106,13 +119,23 @@ impl Client {
         let family = path.trim_start_matches(&self.base).trim_start_matches("/api/").split(['/', '?']).next().unwrap_or("").to_string();
         let per_min = per_minute_override.unwrap_or_else(|| steady_per_minute(&format!("/api/{family}")));
         let gap = Duration::from_millis(60_000 / per_min.max(1) as u64);
-        if let Some(t) = self.last.get(&family) {
-            let since = t.elapsed();
-            if since < gap {
-                tokio::time::sleep(gap - since).await;
+        // Reserve the next slot for this key and family, then wait for it outside the lock.
+        let wait = {
+            let mut m = PACE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let slot = match m.get(&(self.key_id, family.clone())) {
+                Some(last) if *last + gap > now => *last + gap,
+                _ => now,
+            };
+            m.insert((self.key_id, family), slot);
+            if m.len() > 10_000 {
+                m.retain(|_, t| t.elapsed() < Duration::from_secs(600));
             }
+            slot.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
         }
-        self.last.insert(family, Instant::now());
     }
 
     pub async fn get(&mut self, path_or_url: &str) -> KResult<Value> {
@@ -209,13 +232,14 @@ async fn read_capped(mut res: reqwest::Response) -> KResult<Vec<u8>> {
 fn error_for(status: u16, body: &[u8]) -> KlaviyoError {
     let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let first = &v["errors"][0];
-    let code = first["code"].as_str().unwrap_or("");
-    let detail: String = first["detail"].as_str().or(first["title"].as_str()).unwrap_or("").chars().take(300).collect();
+    // The detail text is read only to tell a bad key or a missing scope; it's never kept.
+    let code: String = first["code"].as_str().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(60).collect();
+    let detail = first["detail"].as_str().or(first["title"].as_str()).unwrap_or("").to_lowercase();
     match status {
         401 => KlaviyoError::BadKey,
-        400 if code.contains("authenticat") || detail.to_lowercase().contains("api key") => KlaviyoError::BadKey,
+        400 if code.contains("authenticat") || detail.contains("api key") => KlaviyoError::BadKey,
         403 => KlaviyoError::MissingScope(scope_hint(&detail)),
-        _ => KlaviyoError::Status { status, detail: if detail.is_empty() { "no detail".into() } else { detail } },
+        _ => KlaviyoError::Status { status, code: if code.is_empty() { "no code".into() } else { code } },
     }
 }
 
@@ -274,6 +298,8 @@ mod tests {
         let e = error_for(403, br#"{"errors":[{"code":"permission_denied","detail":"Missing scope: flows:read"}]}"#);
         assert_eq!(e.to_string(), "The Klaviyo key can't read flows. Give it read access to flows and try again.");
         assert!(error_for(503, b"").is_transient());
+        let e = error_for(400, br#"{"errors":[{"code":"invalid","detail":"Bad filter for pk_secret123 at profile ann@example.com"}]}"#);
+        assert_eq!(e.to_string(), "Klaviyo returned 400 (invalid)", "Klaviyo's detail text is never kept");
     }
 
     #[test]

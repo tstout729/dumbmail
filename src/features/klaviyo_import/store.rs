@@ -17,7 +17,13 @@ pub const JOB_SURVEY: &str = "klaviyo_import_survey";
 pub const STEPS: &[&str] = &[
     "metrics", "profiles", "lists", "list_members", "segments", "segment_members", "templates", "campaigns", "campaign_stats", "flows", "forms", "events", "compare",
 ];
-pub const SYNC_STEPS: &[&str] = &["sync_profiles", "sync_list_members", "sync_events"];
+/// The ongoing sync. Everything up to `sync_consent_events` is about consent; when those finish the
+/// import's `consent_synced_at` moves forward (the send gate reads it). Then list changes and new events.
+pub const SYNC_STEPS: &[&str] = &[
+    "sync_profiles", "sync_suppressions", "sync_list_suppressions", "sync_consent_events", "sync_list_members", "sync_list_sweep", "sync_events",
+];
+/// The last consent step of a sync.
+pub const SYNC_CONSENT_DONE: &str = "sync_consent_events";
 /// What a customer can choose to leave out (profiles and consent always come across).
 pub const CHOOSABLE: &[&str] = &["lists", "segments", "templates", "campaigns", "flows", "forms", "events"];
 
@@ -50,6 +56,19 @@ pub struct Import {
     pub compared_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub consent_synced_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub lease_owner: Option<Uuid>,
+    #[serde(skip)]
+    pub lease_until: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub history_started_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub history_done_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub report_cache: Option<Value>,
+    #[serde(skip)]
+    pub report_cached_at: Option<DateTime<Utc>>,
 }
 
 impl Import {
@@ -60,10 +79,16 @@ impl Import {
         }
     }
 
-    /// Earliest event to import; None = all of it.
+    /// Earliest event to import; None = all of it. The chosen day starts at midnight in the account's
+    /// time zone (resolved when the import starts, kept as `events_since`).
     pub fn events_since(&self) -> Option<DateTime<Utc>> {
+        if self.options["events_from"] == "all" {
+            return None;
+        }
+        if let Some(t) = self.options["events_since"].as_str().and_then(|t| DateTime::parse_from_rfc3339(t).ok()) {
+            return Some(t.with_timezone(&Utc));
+        }
         match self.options["events_from"].as_str() {
-            Some("all") => None,
             Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc()),
             None => Some(self.created_at - chrono::Duration::days(730)),
         }
@@ -104,7 +129,7 @@ pub async fn enqueue(db: &PgPool, kind: &str, import_id: Uuid, run_at: Option<Da
 }
 
 /// Add to a step's done/total counters.
-pub async fn bump(db: &PgPool, id: Uuid, step: &str, done: i64, skipped: i64) -> sqlx::Result<()> {
+pub async fn bump<'e>(db: impl sqlx::PgExecutor<'e>, id: Uuid, step: &str, done: i64, skipped: i64) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE klaviyo_imports SET progress = jsonb_set(progress, ARRAY[$2],
             jsonb_build_object('done', COALESCE((progress->$2->>'done')::bigint, 0) + $3,
@@ -121,7 +146,7 @@ pub async fn bump(db: &PgPool, id: Uuid, step: &str, done: i64, skipped: i64) ->
     Ok(())
 }
 
-pub async fn finish_step(db: &PgPool, id: Uuid, step: &str) -> sqlx::Result<()> {
+pub async fn finish_step<'e>(db: impl sqlx::PgExecutor<'e>, id: Uuid, step: &str) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE klaviyo_imports SET progress = jsonb_set(progress, ARRAY[$2],
             COALESCE(progress->$2, '{\"done\":0,\"skipped\":0}'::jsonb) || '{\"finished\":true}'::jsonb, true), updated_at = now() WHERE id = $1",
@@ -173,7 +198,7 @@ pub async fn ref_local(db: &PgPool, account_id: Uuid, kind: &str, klaviyo_id: &s
         .await
 }
 
-pub async fn set_ref(db: &PgPool, account_id: Uuid, kind: &str, klaviyo_id: &str, local_id: Option<Uuid>, name: &str, detail: &Value) -> sqlx::Result<()> {
+pub async fn set_ref<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid, kind: &str, klaviyo_id: &str, local_id: Option<Uuid>, name: &str, detail: &Value) -> sqlx::Result<()> {
     let name: String = name.chars().take(300).collect();
     sqlx::query(
         "INSERT INTO klaviyo_refs (account_id, kind, klaviyo_id, local_id, name, detail) VALUES ($1, $2, $3, $4, $5, $6)
@@ -186,6 +211,39 @@ pub async fn set_ref(db: &PgPool, account_id: Uuid, kind: &str, klaviyo_id: &str
     .bind(local_id)
     .bind(name)
     .bind(detail)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Many references of one kind in one statement (a page of profiles).
+pub async fn set_refs(db: &PgPool, account_id: Uuid, kind: &str, rows: &[(String, Option<Uuid>, String, Value)]) -> sqlx::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // A page can mention the same Klaviyo id twice; keep the last.
+    let mut seen = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        seen.insert(r.0.as_str(), i);
+    }
+    let mut keep: Vec<usize> = seen.into_values().collect();
+    keep.sort_unstable();
+    let kid: Vec<&str> = keep.iter().map(|i| rows[*i].0.as_str()).collect();
+    let local: Vec<Option<Uuid>> = keep.iter().map(|i| rows[*i].1).collect();
+    let name: Vec<String> = keep.iter().map(|i| rows[*i].2.chars().take(300).collect()).collect();
+    let detail: Vec<&Value> = keep.iter().map(|i| &rows[*i].3).collect();
+    sqlx::query(
+        "INSERT INTO klaviyo_refs (account_id, kind, klaviyo_id, local_id, name, detail)
+         SELECT $1, $2, x.k, x.l, x.n, x.d FROM unnest($3::text[], $4::uuid[], $5::text[], $6::jsonb[]) AS x(k, l, n, d)
+         ON CONFLICT (account_id, kind, klaviyo_id) DO UPDATE SET local_id = COALESCE(EXCLUDED.local_id, klaviyo_refs.local_id),
+             name = EXCLUDED.name, detail = klaviyo_refs.detail || EXCLUDED.detail, updated_at = now()",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(&kid)
+    .bind(&local)
+    .bind(&name)
+    .bind(&detail)
     .execute(db)
     .await?;
     Ok(())
@@ -205,7 +263,10 @@ pub async fn ref_map(db: &PgPool, account_id: Uuid, kind: &str) -> sqlx::Result<
 pub async fn close(db: &PgPool, id: Uuid, status: &str, error: Option<&str>) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE klaviyo_imports SET status = $2, error = COALESCE($3, error), api_key_enc = NULL, sync_enabled = false,
-            finished_at = COALESCE(finished_at, now()), updated_at = now() WHERE id = $1",
+            finished_at = COALESCE(finished_at, now()), lease_owner = NULL, lease_until = NULL,
+            -- History writing that stopped part-way still counts as done now: segment flows absorb once more, then run normally.
+            history_done_at = CASE WHEN history_started_at > COALESCE(history_done_at, '-infinity') THEN now() ELSE history_done_at END,
+            updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .bind(status)

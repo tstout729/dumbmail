@@ -6,7 +6,10 @@
 pub mod client;
 pub mod consent;
 pub mod flows;
+pub mod gate;
+pub mod profiles;
 pub mod report;
+pub mod review;
 pub mod runner;
 pub mod segments;
 pub mod store;
@@ -34,6 +37,9 @@ use client::{Client, KlaviyoError, SCOPES};
 use store::{Import, CHOOSABLE, JOB_RUN, JOB_SURVEY, STEPS};
 
 pub use client::set_api_base;
+// Hooks the shared send paths call (one call each): see gate.rs and review.rs.
+pub use gate::{absorb_segment_entries, campaign_may_start, flow_send_held};
+pub use review::{check_flow_live, problems as review_problems};
 
 const DOC: &str = include_str!("../../../docs/MOVING_FROM_KLAVIYO.md");
 
@@ -53,8 +59,12 @@ pub async fn status_json(state: &AppState, account_id: Uuid) -> AppResult<Value>
         None => Vec::new(),
     };
     let checklist = report::checklist(state, imp.as_ref(), account_id).await?;
-    let worst_case = "Up to an hour, plus the time a sync takes. Before a scheduled campaign, a sync also runs within 30 minutes of its send time. Use Sync now right before sending anything by hand.";
+    let worst_case = "Campaigns wait until a sync has brought Klaviyo's opt-outs in within the last 15 minutes (starting one runs a sync if needed; after 2 hours without a successful sync it goes back to draft instead of sending). Flows send on opt-outs up to 2 hours old: the sync runs every hour, and past 2 hours flow emails and texts wait for the next successful sync.";
+    let reviews = review::list(&state.db, account_id).await?;
+    let waiting = gate::waiting(&state.db, account_id).await?;
     Ok(json!({
+        "reviews": reviews,
+        "waiting_campaigns": waiting,
         "import": imp.as_ref().map(|i| {
             let mut v = serde_json::to_value(i).unwrap_or(json!({}));
             v["key_stored"] = json!(i.api_key_enc.is_some());
@@ -97,17 +107,53 @@ pub async fn connect(state: &AppState, account_id: Uuid, api_key: &str) -> AppRe
         "timezone": a["attributes"]["timezone"], "currency": a["attributes"]["preferred_currency"],
         "website": a["attributes"]["contact_information"]["website_url"], "test_account": a["attributes"]["test_account"],
     });
+    // Imported records are matched by Klaviyo's ids, which are only unique within one Klaviyo account.
+    let other: Option<String> = sqlx::query_scalar(
+        "SELECT klaviyo_account->>'name' FROM klaviyo_imports WHERE account_id = $1 AND klaviyo_account->>'id' IS DISTINCT FROM $2 AND started_at IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(info["id"].as_str())
+    .fetch_optional(&state.db)
+    .await?
+    .flatten();
+    let other_any: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM klaviyo_imports WHERE account_id = $1 AND klaviyo_account->>'id' IS DISTINCT FROM $2 AND started_at IS NOT NULL)")
+        .bind(account_id)
+        .bind(info["id"].as_str())
+        .fetch_one(&state.db)
+        .await?;
+    if other_any {
+        return Err(AppError::Conflict(format!(
+            "This DumbMail account already holds an import from another Klaviyo account{}. Importing a second Klaviyo account into the same DumbMail account isn't supported.",
+            other.map(|n| format!(" ({n})")).unwrap_or_default()
+        )));
+    }
     let enc = crate::crypto::encrypt(&state.cfg.secret_key, key)?;
     let id = Uuid::now_v7();
+    // One connection per account: the previous import's sync stops and its key is deleted in the same
+    // transaction that adds the new one.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    let busy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM klaviyo_imports WHERE account_id = $1 AND status IN ('surveying', 'ready', 'importing', 'paused', 'syncing'))")
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if busy {
+        return Err(AppError::Conflict("A Klaviyo import is already set up. Cancel it before connecting another key.".into()));
+    }
+    sqlx::query("UPDATE klaviyo_imports SET sync_enabled = false, api_key_enc = NULL, updated_at = now() WHERE account_id = $1 AND (sync_enabled OR api_key_enc IS NOT NULL)")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("INSERT INTO klaviyo_imports (id, account_id, status, api_key_enc, key_hint, klaviyo_account) VALUES ($1, $2, 'surveying', $3, $4, $5)")
         .bind(id)
         .bind(account_id)
         .bind(enc)
         .bind(hint(key))
         .bind(&info)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    store::enqueue(&state.db, JOB_SURVEY, id, None).await?;
+    crate::jobs::enqueue(&mut *tx, JOB_SURVEY, json!({"import_id": id}), None).await?;
+    tx.commit().await?;
     status_json(state, account_id).await
 }
 
@@ -129,9 +175,13 @@ pub struct StartBody {
     /// Keep pulling changes from Klaviyo every hour after the import.
     #[serde(default)]
     pub sync: Option<bool>,
+    /// People who never subscribed in Klaviyo: "send" keeps them emailable, as in Klaviyo (default);
+    /// "hold" holds them back from marketing until they opt in.
+    #[serde(default)]
+    pub never_subscribed: Option<String>,
 }
 
-fn options(imp: &Import, b: &StartBody) -> AppResult<Value> {
+fn options(imp: &Import, b: &StartBody, tz: &str) -> AppResult<Value> {
     let what = match &b.what {
         Some(w) => {
             if w.len() > 20 {
@@ -163,7 +213,22 @@ fn options(imp: &Import, b: &StartBody) -> AppResult<Value> {
         Some(m) => json!(m),
         None => Value::Null,
     };
-    Ok(json!({"what": what, "events_from": events_from, "metrics": metrics}))
+    let never = match b.never_subscribed.as_deref() {
+        None | Some("send") => "send",
+        Some("hold") => "hold",
+        Some(_) => return Err(AppError::bad("never_subscribed must be \"send\" or \"hold\"")),
+    };
+    // The chosen day starts at midnight in the account's time zone.
+    let events_since = match events_from.as_str() {
+        "all" => Value::Null,
+        d => {
+            let tzv: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
+            let day = chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| AppError::bad("events_from must be YYYY-MM-DD or \"all\""))?;
+            let local = day.and_hms_opt(0, 0, 0).and_then(|t| t.and_local_timezone(tzv).earliest());
+            json!(local.map(|t| t.with_timezone(&Utc).to_rfc3339()))
+        }
+    };
+    Ok(json!({"what": what, "events_from": events_from, "events_since": events_since, "metrics": metrics, "never_subscribed": never}))
 }
 
 pub async fn start(state: &AppState, account_id: Uuid, b: StartBody) -> AppResult<Value> {
@@ -177,14 +242,15 @@ pub async fn start(state: &AppState, account_id: Uuid, b: StartBody) -> AppResul
     if missing.iter().any(|m| m == "profiles:read") {
         return Err(AppError::bad("The key can't read profiles. Give it read access to Profiles and connect again."));
     }
-    let opts = options(&imp, &b)?;
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    let opts = options(&imp, &b, &tz)?;
     if !b.confirm {
         return Ok(json!({
             "dry_run": true,
             "options": opts,
             "survey": imp.survey,
             "missing_scopes": missing,
-            "message": "Nothing has been imported yet. Profiles, consent and suppressions always come across; nobody is emailed or texted, no flow starts and imported flows stay drafts. Call again with confirm=true to start.",
+            "message": "Nothing has been imported yet. Profiles, consent and suppressions always come across; nobody is emailed or texted, no flow starts and imported flows stay drafts. While event history is imported, segment-triggered flows don't start for people who enter their segment. Choose never_subscribed: \"send\" (default, as in Klaviyo) or \"hold\" (held back from marketing until they opt in). Call again with confirm=true to start.",
         }));
     }
     sqlx::query(
@@ -245,6 +311,11 @@ pub async fn set_sync(state: &AppState, account_id: Uuid, enabled: bool) -> AppR
     status_json(state, account_id).await
 }
 
+pub async fn clear_review(state: &AppState, account_id: Uuid, kind: &str, id: Uuid) -> AppResult<Value> {
+    review::clear(&state.db, account_id, kind, id).await?;
+    status_json(state, account_id).await
+}
+
 pub async fn sync_now(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     let imp = store::current(&state.db, account_id).await?;
     match imp.status.as_str() {
@@ -259,7 +330,7 @@ pub async fn sync_now(state: &AppState, account_id: Uuid) -> AppResult<Value> {
 
 pub async fn comparison(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     let imp = store::current(&state.db, account_id).await?;
-    report::build(state, &imp).await
+    report::cached(state, &imp, chrono::Duration::minutes(2)).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,7 +426,12 @@ async fn run_survey(state: &AppState, id: Uuid) -> anyhow::Result<()> {
     };
     let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(imp.account_id).fetch_one(&state.db).await?;
     let mut k = Client::new(state.http.clone(), &key);
-    match survey::survey(&mut k, imp.events_since(), &tz).await {
+    let mut partial = imp.step_state["survey_partial"].as_object().cloned().unwrap_or_default();
+    let res = survey::survey(&mut k, imp.events_since(), &tz, &mut partial).await;
+    if res.is_err() {
+        sqlx::query("UPDATE klaviyo_imports SET step_state = jsonb_set(step_state, '{survey_partial}', $2) WHERE id = $1").bind(id).bind(Value::Object(partial)).execute(&state.db).await?;
+    }
+    match res {
         Ok(s) => {
             sqlx::query("UPDATE klaviyo_imports SET survey = $2, status = 'ready', error = NULL, updated_at = now() WHERE id = $1 AND status = 'surveying'").bind(id).bind(s).execute(&state.db).await?;
         }
@@ -364,7 +440,7 @@ async fn run_survey(state: &AppState, id: Uuid) -> anyhow::Result<()> {
         Err(e) => {
             let n = imp.step_state["retries"].as_u64().unwrap_or(0) + 1;
             if n > 4 || !e.is_transient() {
-                store::close(&state.db, id, "failed", Some(&format!("Couldn't read your Klaviyo account: {e}"))).await?;
+                store::close(&state.db, id, "failed", Some(&format!("Couldn't read your Klaviyo account: {e}."))).await?;
             } else {
                 sqlx::query("UPDATE klaviyo_imports SET step_state = jsonb_set(step_state, '{retries}', to_jsonb($2::bigint)) WHERE id = $1").bind(id).bind(n as i64).execute(&state.db).await?;
                 store::enqueue(&state.db, JOB_SURVEY, id, Some(Utc::now() + chrono::Duration::seconds(30 * n as i64))).await?;
@@ -380,6 +456,8 @@ async fn start_due_syncs(state: &AppState) -> anyhow::Result<()> {
     let due: Vec<Uuid> = sqlx::query_scalar(
         "SELECT i.id FROM klaviyo_imports i
          WHERE i.sync_enabled AND i.status = 'done' AND i.api_key_enc IS NOT NULL
+           -- A sync that just failed waits ten minutes before the next try.
+           AND (i.error IS NULL OR i.updated_at < now() - interval '10 minutes')
            AND (i.last_sync_at IS NULL OR i.last_sync_at < now() - interval '55 minutes'
                 OR (i.last_sync_at < now() - interval '15 minutes' AND EXISTS (
                     SELECT 1 FROM campaigns c WHERE c.account_id = i.account_id AND c.status = 'scheduled' AND c.send_at < now() + interval '30 minutes')))
@@ -390,6 +468,7 @@ async fn start_due_syncs(state: &AppState) -> anyhow::Result<()> {
     for id in due {
         runner::start_sync(&state.db, id).await?;
     }
+    runner::restart_stalled(&state.db).await?;
     Ok(())
 }
 
@@ -403,6 +482,12 @@ struct ConnectBody {
 #[derive(Deserialize)]
 struct SyncBody {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ReviewBody {
+    kind: String,
+    id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +537,9 @@ async fn campaigns_h(State(s): State<AppState>, ctx: Ctx, Query(q): Query<IssueQ
 async fn mark_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<MarkBody>) -> AppResult<Json<Value>> {
     Ok(Json(mark(&s, ctx.account_id, &b.item, b.done).await?))
 }
+async fn review_h(State(s): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ReviewBody>) -> AppResult<Json<Value>> {
+    Ok(Json(clear_review(&s, ctx.account_id, &b.kind, b.id).await?))
+}
 async fn check_site_h(State(s): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     Ok(Json(check_site(&s, ctx.account_id).await?))
 }
@@ -484,6 +572,7 @@ impl Feature for Module {
             .route("/api/klaviyo/campaigns", get(campaigns_h))
             .route("/api/klaviyo/checklist", post(mark_h))
             .route("/api/klaviyo/checklist/check-site", post(check_site_h))
+            .route("/api/klaviyo/review", post(review_h))
     }
 
     fn mcp_tools(&self) -> Vec<Value> {
@@ -496,7 +585,8 @@ impl Feature for Module {
                 "Import from Klaviyo in the background: profiles with their exact email/SMS consent and suppressions, then lists, segments (as rules where they translate, otherwise as a snapshot list), templates, campaigns (history and drafts), flows (always as drafts), forms (name and list) and event history. Nobody is messaged and no flow starts. Without confirm=true returns a dry run. Track it with klaviyo_import_status.",
                 obj(json!({"confirm": {"type": "boolean"}, "what": what, "events_from": {"type": "string", "description": "First day of events to import, YYYY-MM-DD, or \"all\". Default two years ago."},
                     "metrics": {"type": "array", "maxItems": 200, "items": {"type": "string", "maxLength": 128}, "description": "Klaviyo metric names or ids to import events for. Default: orders, checkouts, product views, carts and email/SMS engagement."},
-                    "sync": {"type": "boolean", "description": "Keep syncing changes from Klaviyo every hour after the import (keeps the key stored until turned off)."}}), &[]), false, false),
+                    "sync": {"type": "boolean", "description": "Keep syncing changes from Klaviyo every hour after the import (keeps the key stored until turned off)."},
+                    "never_subscribed": {"enum": ["send", "hold"], "description": "People who never subscribed in Klaviyo: send = keep them emailable, as in Klaviyo (default); hold = hold them back from marketing until they opt in. Anyone whose Klaviyo consent is unknown is always held."}}), &[]), false, false),
             tool("klaviyo_import_status", "Klaviyo import status", "Status, current step, progress per step, issue counts, the ongoing sync and the switch-over checklist.", obj(json!({}), &[]), true, false),
             tool("klaviyo_pause_import", "Pause or resume the Klaviyo import", "Pause a running import, or resume a paused one (resume=true). It picks up where it stopped.", obj(json!({"resume": {"type": "boolean"}}), &[]), false, false),
             tool("klaviyo_cancel_import", "Cancel the Klaviyo import", "Stop the import (or the ongoing sync) and delete the stored Klaviyo key. What was already imported stays.", obj(json!({}), &[]), false, false),
@@ -509,6 +599,9 @@ impl Feature for Module {
                 "While on, new profiles, consent changes (unsubscribes first), list joins and events are pulled from Klaviyo every hour, and before a scheduled campaign. Turning it off after the import deletes the stored key.",
                 obj(json!({"enabled": {"type": "boolean"}}), &["enabled"]), false, false),
             tool("klaviyo_sync_now", "Sync from Klaviyo now", "Pull changes from Klaviyo right away, e.g. just before sending a campaign so recent Klaviyo unsubscribes are honored. Needs the ongoing sync on.", obj(json!({}), &[]), false, false),
+            tool("klaviyo_clear_review", "Mark an imported Klaviyo item reviewed",
+                "Imported campaigns, flows and templates the importer couldn't translate with certainty are marked as needing review (listed under reviews in klaviyo_import_status): a campaign can't send and a flow can't go live until this is called. Fix what the notes say first.",
+                obj(json!({"kind": {"enum": review::KINDS}, "id": {"type": "string", "format": "uuid"}}), &["kind", "id"]), false, false),
             tool("klaviyo_checklist", "Switch-over checklist",
                 "The steps to finish moving from Klaviyo, most checked from live data. item+done ticks one of the hand-checked items (klaviyo_removed, flows_reviewed, warmup); check_site=true looks for Klaviyo's script on the account's website.",
                 obj(json!({"item": {"enum": report::MANUAL_ITEMS}, "done": {"type": "boolean"}, "check_site": {"type": "boolean"}}), &[]), false, false),
@@ -539,6 +632,10 @@ impl Feature for Module {
                 None => Err(AppError::bad("enabled is required")),
             },
             "klaviyo_sync_now" => sync_now(state, acct).await,
+            "klaviyo_clear_review" => match (a["kind"].as_str(), a["id"].as_str().and_then(|i| i.parse::<Uuid>().ok())) {
+                (Some(k), Some(id)) => clear_review(state, acct, k, id).await,
+                _ => Err(AppError::bad("kind and id are required")),
+            },
             "klaviyo_checklist" => {
                 if a["check_site"].as_bool() == Some(true) {
                     check_site(state, acct).await
@@ -585,7 +682,7 @@ mod tests {
     fn tools_are_well_formed() {
         use super::Feature;
         let t = super::Module.mcp_tools();
-        assert_eq!(t.len(), 10);
+        assert_eq!(t.len(), 11);
         for x in &t {
             assert_eq!(x["inputSchema"]["type"], "object");
             assert!(x["name"].as_str().unwrap().starts_with("klaviyo_"));

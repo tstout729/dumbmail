@@ -135,6 +135,18 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
             if let Some((_, t)) = filter_time(&filter, "updated") {
                 items.retain(|p| time_of(&p["attributes"]["updated"]) > t);
             }
+            // Klaviyo documents greater-than on these two timestamps.
+            if let Some((_, t)) = filter_time(&filter, "subscriptions.email.marketing.suppression.timestamp") {
+                items.retain(|p| p["attributes"]["subscriptions"]["email"]["marketing"]["suppression"].as_array().is_some_and(|s| s.iter().any(|x| time_of(&x["timestamp"]) > t)));
+            }
+            if let Some((_, t)) = filter_time(&filter, "subscriptions.email.marketing.list_suppressions.timestamp") {
+                items.retain(|p| p["attributes"]["subscriptions"]["email"]["marketing"]["list_suppressions"].as_array().is_some_and(|s| s.iter().any(|x| time_of(&x["timestamp"]) > t)));
+            }
+            let mut items = items;
+            if let Some(list) = filter.strip_prefix("any(id,[").and_then(|r| r.strip_suffix("])")) {
+                let ids: Vec<String> = list.split(',').map(|x| x.trim_matches(['"', '\'']).to_string()).collect();
+                items = arr("profiles").into_iter().chain(arr("hidden_profiles")).filter(|p| ids.iter().any(|i| p["id"] == i.as_str())).collect();
+            }
             let items = items.into_iter().map(|p| profile_res(&ds, p["id"].as_str().unwrap(), subs).unwrap()).collect();
             page_of(&base, &path, &q, items, 3)
         }
@@ -150,6 +162,11 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
                 l["attributes"]["profile_count"] = ds["counts"][*id].clone();
             }
             json!({"data": l})
+        }
+        ("GET", [kind @ ("lists" | "segments"), id, "relationships", "profiles"]) => {
+            let _ = kind;
+            let items: Vec<Value> = ds["members"][*id].as_array().cloned().unwrap_or_default().iter().map(|m| json!({"type": "profile", "id": m[0]})).collect();
+            page_of(&base, &path, &q, items, 100)
         }
         ("GET", [kind @ ("lists" | "segments"), id, "profiles"]) => {
             let members = ds["members"][*id].as_array().cloned().unwrap_or_default();
@@ -170,6 +187,10 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
         ("GET", ["metrics"]) => page_of(&base, &path, &q, arr("metrics"), 200),
         ("GET", ["events"]) => {
             let mut items = arr("events");
+            if let Some(m) = filter.split("equals(metric_id,").nth(1).and_then(|r| r.split(')').next()) {
+                let m = m.trim_matches(['"', '\'']);
+                items.retain(|e| e["relationships"]["metric"]["data"]["id"] == m);
+            }
             if let Some((inclusive, t)) = filter_time(&filter, "datetime") {
                 items.retain(|e| {
                     let d = time_of(&e["attributes"]["datetime"]);
@@ -191,6 +212,14 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
                 m
             }).chain(arr("audiences")).collect::<Vec<_>>());
             pg
+        }
+        ("GET", ["campaign-messages", id, "campaign-audience"]) => {
+            let Some(msg) = arr("campaign_messages").into_iter().find(|m| m["id"] == *id) else { return err(404, "not_found", "") };
+            let aid = msg["relationships"]["campaign-audience"]["data"]["id"].clone();
+            match arr("audiences").into_iter().find(|a| a["id"] == aid) {
+                Some(a) => json!({"data": a}),
+                None => return err(404, "not_found", ""),
+            }
         }
         ("GET", ["campaign-messages", id]) => {
             let Some(mut msg) = arr("campaign_messages").into_iter().find(|m| m["id"] == *id) else { return err(404, "not_found", "") };
@@ -375,7 +404,9 @@ fn dataset() -> Value {
             {"type": "flow", "id": "F2", "attributes": {"name": "Price drop", "status": "live", "archived": false, "trigger_type": "Price Drop", "definition": {"triggers": [{"type": "price-drop"}], "actions": []}}}
         ],
         "forms": [{"type": "form", "id": "FORM1", "attributes": {"name": "Footer signup", "status": "live", "ab_test": false,
-            "definition": {"versions": [{"steps": [{"components": [{"type": "button", "action": {"type": "next_step", "properties": {"list_id": "L1", "submit": true}}}]}]}]}}}]
+            "definition": {"versions": [{"status": "live", "steps": [{"columns": [{"rows": [{"components": [
+                {"type": "button", "action": {"type": "next_step", "submit": true, "properties": {"list_id": "L1"}}},
+                {"type": "button", "action": {"type": "close", "submit": false, "properties": {"list_id": "L2"}}}]}]}]}]}]}}}]
     })
 }
 
@@ -497,7 +528,7 @@ async fn imports_everything_and_proves_it() {
     assert_eq!(consent("pre@example.com").await.0, "unsubscribed");
     assert_eq!(consent("zed@example.com").await.0, "never_subscribed");
     let hal: (String, Option<String>) = sqlx::query_as("SELECT sms_consent, email FROM profiles WHERE phone_number = '+15035550108'").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(hal, ("unsubscribed".into(), None), "subscribed in Klaviyo but not textable there");
+    assert_eq!(hal, ("never_subscribed".into(), None), "subscribed in Klaviyo but not textable there: never textable here");
     // Properties, location, Klaviyo id and consent record; original sign-up date.
     let ann: (Value, chrono::DateTime<Utc>, Option<String>) = sqlx::query_as("SELECT properties, created_at, phone_number FROM profiles WHERE email = 'ann@example.com'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(ann.0["Favorite Color"], "blue");
@@ -568,14 +599,19 @@ async fn imports_everything_and_proves_it() {
     let form: (String, String, bool) = sqlx::query_as("SELECT f.name, f.status, f.list_id = (SELECT id FROM lists WHERE name = 'Newsletter') FROM forms f").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(form, ("Footer signup".into(), "draft".into(), true));
 
-    // The comparison report: every line green, with the numbers.
+    // The comparison report: every line matches, with the numbers.
     let r = h.ok("GET", "/api/klaviyo/report", None).await;
     assert_eq!(r["all_ok"], true, "{}", serde_json::to_string_pretty(&r["lines"]).unwrap());
-    assert_eq!(line(&r, "Profiles", "Profiles")["klaviyo"], 12);
-    assert_eq!(line(&r, "Email", "Subscribed")["klaviyo"], 7);
-    assert_eq!(line(&r, "Email", "Subscribed")["dumbmail"], 5);
+    assert_eq!(line(&r, "Profiles", "Profiles")["klaviyo"], 11, "Klaviyo's own total from the full scan");
+    assert_eq!(line(&r, "Profiles", "Profiles")["state"], "match");
+    assert_eq!(line(&r, "Email", "Subscribed in Klaviyo")["klaviyo"], 3);
+    assert_eq!(line(&r, "Email", "Subscribed in Klaviyo")["dumbmail"], 2, "one unsubscribed in DumbMail first, and that wins");
+    assert_eq!(line(&r, "Email", "Unsubscribed in Klaviyo")["klaviyo"], 2);
+    assert_eq!(line(&r, "Email", "Suppressed in Klaviyo (bounced, complained, invalid, by hand, or not emailable)")["dumbmail"], 3);
     assert_eq!(line(&r, "Email", "More reachable here than in Klaviyo")["dumbmail"], 0);
-    assert_eq!(line(&r, "SMS", "More reachable here than in Klaviyo")["dumbmail"], 0);
+    assert_eq!(line(&r, "SMS", "More textable here than in Klaviyo")["dumbmail"], 0);
+    assert_eq!(line(&r, "List opt-outs", "Unsubscribed from a list in Klaviyo")["klaviyo"], 1);
+    assert_eq!(line(&r, "List opt-outs", "Unsubscribed from a list in Klaviyo")["state"], "match");
     assert_eq!(line(&r, "Lists", "Newsletter")["klaviyo"], 3);
     assert_eq!(line(&r, "Lists", "Newsletter")["dumbmail"], 2);
     assert_eq!(line(&r, "Segments", "VIPs")["dumbmail"], 2);
@@ -585,7 +621,7 @@ async fn imports_everything_and_proves_it() {
     let (s, hd, csv) = h.raw("GET", "/api/klaviyo/report.csv", &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
     assert_eq!(s, 200);
     assert!(hd["content-type"].to_str().unwrap().starts_with("text/csv"));
-    assert!(csv.starts_with("Section,What,Klaviyo,DumbMail,Result,Note") && csv.contains("Newsletter,3,2,OK"), "{csv}");
+    assert!(csv.starts_with("Section,What,Klaviyo,DumbMail,Result,Note") && csv.contains("Newsletter,3,2,MATCH"), "{csv}");
     let issues = h.ok("GET", "/api/klaviyo/issues", None).await;
     assert!(issues["total"].as_i64().unwrap() >= 4, "{issues}");
 

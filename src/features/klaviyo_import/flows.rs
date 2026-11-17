@@ -2,8 +2,10 @@
 //!
 //! The trigger, delays, emails, texts, conditional splits, profile updates, list updates and webhooks
 //! are recreated. A step with no DumbMail equivalent is skipped (its path continues to the next step)
-//! and listed; a split whose rules don't translate sends everyone down "Yes" until someone fixes it.
-//! Any of those makes the flow "partial", and its name says so. Imported flows are always drafts.
+//! and listed, which makes the flow "partial" (its name says so). A step the importer can't be sure of
+//! (a split whose rules don't translate, a list step that may add or remove, a message that was off in
+//! Klaviyo, an email whose conversion had to guess) is a review note: the flow can't go live until a
+//! person clears it. Imported flows are always drafts.
 
 use std::collections::HashMap;
 
@@ -27,6 +29,8 @@ pub struct Translated {
     pub trigger: Value,
     pub definition: Value,
     pub issues: Vec<String>,
+    /// What a person must check and clear before the flow can go live.
+    pub review: Vec<String>,
 }
 
 impl Translated {
@@ -159,6 +163,7 @@ fn email_content(ctx: &Ctx, m: &Value, issues: &mut Vec<String>, step: &str) -> 
 
 pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
     let mut issues = Vec::new();
+    let mut review: Vec<String> = Vec::new();
     let trigger = trigger(ctx, def, &mut issues)?;
     let actions = def["actions"].as_array().cloned().unwrap_or_default();
     if actions.len() > 200 {
@@ -178,13 +183,14 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
         let step = format!("Step \"{}\"", data["name"].as_str().or(data["message"]["name"].as_str()).unwrap_or(kind));
         let mut n = Map::new();
         n.insert("id".into(), json!(id));
-        let mut add_message = |n: &mut Map<String, Value>, k: &str, d: &Value, issues: &mut Vec<String>| -> bool {
+        let mut add_message = |n: &mut Map<String, Value>, k: &str, d: &Value, issues: &mut Vec<String>, review: &mut Vec<String>| -> bool {
             let m = &d["message"];
             if m["smart_sending_enabled"].as_bool() == Some(true) {
                 smart = true;
             }
-            if matches!(d["status"].as_str(), Some("disabled") | Some("manual")) {
-                issues.push(format!("{step} was {} in Klaviyo.", d["status"].as_str().unwrap_or("")));
+            // Klaviyo action status: disabled | draft | live | manual. Only a live step sent by itself.
+            if let Some(st) = d["status"].as_str().filter(|st| *st != "live") {
+                review.push(format!("{step} was {st} in Klaviyo (it didn't send by itself there). Remove it, or keep it if it should send here."));
             }
             match k {
                 "send-email" => {
@@ -192,7 +198,9 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
                     if let Some(name) = m["name"].as_str() {
                         n.insert("name".into(), json!(name));
                     }
-                    n.insert("content".into(), email_content(ctx, m, issues, &step));
+                    let content = email_content(ctx, m, issues, &step);
+                    review.extend(super::templates::review_notes(&content).into_iter().map(|r| format!("{step}: {r}")));
+                    n.insert("content".into(), content);
                     true
                 }
                 "send-sms" => {
@@ -201,6 +209,7 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
                     if !conv.removed.is_empty() {
                         issues.push(format!("{step}: removed {} from the text.", conv.removed.join(", ")));
                     }
+                    review.extend(conv.review.iter().map(|r| format!("{step}: {r}")));
                     n.insert("content".into(), json!({"body": conv.text}));
                     true
                 }
@@ -219,11 +228,11 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
                 }
                 true
             }
-            "send-email" | "send-sms" => add_message(&mut n, kind, data, &mut issues),
+            "send-email" | "send-sms" => add_message(&mut n, kind, data, &mut issues, &mut review),
             "ab-test" => {
                 let main = &data["main_action"];
                 let k = main["type"].as_str().unwrap_or("");
-                let ok = add_message(&mut n, k, &main["data"], &mut issues);
+                let ok = add_message(&mut n, k, &main["data"], &mut issues, &mut review);
                 if ok {
                     issues.push(format!("{step} was an A/B test; only its main version was imported."));
                 }
@@ -233,7 +242,7 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
                 n.insert("type".into(), json!("condition"));
                 let rules = if kind == "conditional-split" { seg::translate(&ctx.seg, &data["profile_filter"]) } else { Err(vec!["splits on the triggering event's details".into()]) };
                 let cond = rules.unwrap_or_else(|why| {
-                    issues.push(format!("{step}: its rules couldn't be translated ({}). Everyone goes down \"Yes\" until you set the rules.", why.join("; ")));
+                    review.push(format!("{step}: its rules couldn't be translated ({}). Set the rules before turning the flow on.", why.join("; ")));
                     json!({"match": "all", "conditions": []})
                 });
                 n.insert("condition".into(), cond);
@@ -258,9 +267,15 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
             }
             "list-update" => match data["list_id"].as_str().and_then(|l| ctx.seg.lists.get(l)) {
                 Some(list) => {
-                    let add = data["on_execution"].as_bool().unwrap_or(true) || data["on_execution"] == "add";
+                    // Klaviyo's schema has `on_execution` as a nullable boolean and doesn't say which value
+                    // adds and which removes, so every list step is checked by a person.
+                    let add = data["on_execution"].as_bool().unwrap_or(true);
                     n.insert("type".into(), json!(if add { "add_to_list" } else { "remove_from_list" }));
                     n.insert("list_id".into(), json!(list));
+                    review.push(match data["on_execution"].as_bool() {
+                        Some(_) => format!("{step}: check it should {} the list (Klaviyo doesn't say which way its setting goes).", if add { "add people to" } else { "remove people from" }),
+                        None => format!("{step}: Klaviyo didn't say whether it adds people to the list or removes them. It's set to add; change it if not."),
+                    });
                     true
                 }
                 None => {
@@ -359,7 +374,8 @@ pub fn translate(ctx: &Ctx, def: &Value) -> Result<Translated, String> {
     if let Err(e) = crate::flows::parse_definition(&definition) {
         return Err(format!("its steps couldn't be put back together ({})", e.public_message()));
     }
-    Ok(Translated { trigger, definition, issues })
+    review.dedup();
+    Ok(Translated { trigger, definition, issues, review })
 }
 
 #[cfg(test)]
@@ -399,6 +415,27 @@ mod tests {
         assert_eq!(t.definition["settings"]["smart_sending_hours"], 16);
         assert!(t.partial());
         assert_eq!(t.issues.len(), 2, "{:?}", t.issues);
+        assert_eq!(t.review.len(), 1, "the text lost a tag: {:?}", t.review);
+    }
+
+    #[test]
+    fn ambiguous_steps_need_review() {
+        let m: HashMap<String, String> = HashMap::new();
+        let lid = Uuid::now_v7();
+        let lists: HashMap<String, Uuid> = [("L1".to_string(), lid)].into();
+        let s = HashMap::new();
+        let tp = HashMap::new();
+        let ctx = Ctx { metric_names: &m, seg: seg::Ctx { metrics: &m, all_metrics: &m, lists: &lists, events_since: None, now: chrono::Utc::now() }, segments: &s, templates: &tp };
+        let def = json!({"triggers": [{"type": "list", "id": "L1"}], "entry_action_id": "1", "actions": [
+            {"id": "1", "type": "list-update", "links": {"next": "2"}, "data": {"name": "Tag", "list_id": "L1", "on_execution": null}},
+            {"id": "2", "type": "send-sms", "links": {"next": "3"}, "data": {"status": "manual", "message": {"body": "Hi"}}},
+            {"id": "3", "type": "conditional-split", "links": {"next_if_true": null, "next_if_false": null}, "data": {"profile_filter": {"condition_groups": [{"conditions": [{"type": "profile-predictive-analytics"}]}]}}}
+        ]});
+        let t = translate(&ctx, &def).unwrap();
+        assert_eq!(t.review.len(), 3, "{:?}", t.review);
+        assert!(t.review[0].contains("didn't say whether"));
+        assert!(t.review[1].contains("manual"));
+        assert!(t.review[2].contains("rules"));
     }
 
     #[test]

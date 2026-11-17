@@ -269,7 +269,8 @@ pub struct HistoryEvent {
 }
 
 /// Record past events quietly: no flows start and nothing is sent or billed. Profiles' `last_event_at`
-/// moves only as far as the events' own times. Returns how many were new.
+/// moves only as far as the events' own times. Returns how many were new. One statement, so replaying a
+/// batch after a crash (its events already there) still brings `last_event_at` up to date.
 pub async fn record_history(db: &PgPool, account_id: Uuid, events: &[HistoryEvent]) -> AppResult<u64> {
     if events.is_empty() {
         return Ok(0);
@@ -285,15 +286,22 @@ pub async fn record_history(db: &PgPool, account_id: Uuid, events: &[HistoryEven
         times.push(e.occurred_at);
         uniques.push(e.unique_id.clone());
     }
-    let inserted: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
-        "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id)
-         SELECT x.id, $1, x.profile_id, x.metric_id, x.properties, x.value, x.occurred_at, x.unique_id
-         FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::jsonb[], $6::float8[], $7::timestamptz[], $8::text[])
-              AS x(id, profile_id, metric_id, properties, value, occurred_at, unique_id)
-         JOIN profiles p ON p.id = x.profile_id AND p.account_id = $1
-         JOIN metrics m ON m.id = x.metric_id AND m.account_id = $1
-         ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
-         RETURNING profile_id, occurred_at",
+    let inserted: i64 = sqlx::query_scalar(
+        "WITH x AS (SELECT * FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::jsonb[], $6::float8[], $7::timestamptz[], $8::text[])
+                    AS x(id, profile_id, metric_id, properties, value, occurred_at, unique_id)),
+         ins AS (
+            INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id)
+            SELECT x.id, $1, x.profile_id, x.metric_id, x.properties, x.value, x.occurred_at, x.unique_id FROM x
+            JOIN profiles p ON p.id = x.profile_id AND p.account_id = $1
+            JOIN metrics m ON m.id = x.metric_id AND m.account_id = $1
+            ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+            RETURNING 1),
+         latest AS (
+            UPDATE profiles p SET last_event_at = GREATEST(COALESCE(p.last_event_at, 'epoch'), l.t)
+            FROM (SELECT profile_id, max(occurred_at) AS t FROM x GROUP BY 1) l
+            WHERE p.id = l.profile_id AND p.account_id = $1 AND (p.last_event_at IS NULL OR p.last_event_at < l.t)
+            RETURNING 1)
+         SELECT (SELECT count(*) FROM ins) + 0 * (SELECT count(*) FROM latest)",
     )
     .bind(account_id)
     .bind(&ids)
@@ -303,25 +311,9 @@ pub async fn record_history(db: &PgPool, account_id: Uuid, events: &[HistoryEven
     .bind(&values)
     .bind(&times)
     .bind(&uniques)
-    .fetch_all(db)
+    .fetch_one(db)
     .await?;
-    let mut latest: std::collections::HashMap<Uuid, DateTime<Utc>> = std::collections::HashMap::new();
-    for (p, t) in &inserted {
-        let e = latest.entry(*p).or_insert(*t);
-        if t > e {
-            *e = *t;
-        }
-    }
-    let (lp, lt): (Vec<Uuid>, Vec<DateTime<Utc>>) = latest.into_iter().unzip();
-    sqlx::query(
-        "UPDATE profiles p SET last_event_at = GREATEST(COALESCE(p.last_event_at, 'epoch'), x.t)
-         FROM unnest($1::uuid[], $2::timestamptz[]) AS x(id, t) WHERE p.id = x.id",
-    )
-    .bind(&lp)
-    .bind(&lt)
-    .execute(db)
-    .await?;
-    Ok(inserted.len() as u64)
+    Ok(inserted as u64)
 }
 
 /// Add profiles to a list and wake list-triggered flows for newly added members.
