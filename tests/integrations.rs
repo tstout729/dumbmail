@@ -433,6 +433,12 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     let (s, v) = h.req("POST", &format!("/api/integrations/{id}/pull"), None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("client_id"));
+    // A scheduled pull waits for the credentials without logging errors.
+    sqlx::query("UPDATE integrations SET pull_next_at = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
+    dumbmail::features::integrations::engine::schedule_pulls(&h.state).await.unwrap();
+    h.drain().await;
+    assert!(h.ok("GET", &format!("/api/integrations/{id}"), None).await["last_error"].is_null());
+    assert_eq!(mock.tokens.load(Ordering::SeqCst), 0);
 
     // Point the recipe's pull at the stand-in Guesty.
     let mut pull = integ["pull"].clone();

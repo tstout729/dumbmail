@@ -253,10 +253,9 @@ pub async fn test(state: &AppState, integ: &Integration, script: Option<&str>, s
             let settings = integ.settings_map();
             let now = Utc::now();
             let vars = Vars { secrets: &creds, state: &st, settings: &settings, now, since: now - chrono::Duration::days(1), redact: false };
-            let shown = Vars { redact: true, ..vars };
-            let req = pull::build(&cfg, &NextRequest::default(), &Vars { redact: false, ..shown }).map_err(AppError::BadRequest)?;
-            let logged = pull::build(&cfg, &NextRequest::default(), &Vars { secrets: &creds, state: &st, settings: &settings, now, since: now - chrono::Duration::days(1), redact: true }).map_err(AppError::BadRequest)?;
-            let vars = Vars { secrets: &creds, state: &st, settings: &settings, now, since: now - chrono::Duration::days(1), redact: false };
+            let shown = Vars { secrets: &creds, state: &st, settings: &settings, now, since: now - chrono::Duration::days(1), redact: true };
+            let req = pull::build(&cfg, &NextRequest::default(), &vars).map_err(AppError::BadRequest)?;
+            let logged = pull::build(&cfg, &NextRequest::default(), &shown).map_err(AppError::BadRequest)?;
             let token = pull::oauth_token(state, integ.id, &cfg.auth, &vars).await?;
             let resp = pull::send(&req, token.as_deref()).await?;
             let mut extra = Map::new();
@@ -432,6 +431,10 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
             return Ok(()); // cancelled or replaced
         }
         let Some(cfg) = integ.pull_config() else { return Ok(()) };
+        // Scheduled pulls wait quietly until the credentials are saved (the page asks for them).
+        if !backfill && pages == 0 && !integ.missing_credentials().is_empty() {
+            return Ok(());
+        }
         let limit = if backfill { BACKFILL_MAX_PAGES } else { cfg.max_pages.unwrap_or(10) };
         let creds = integ.credentials(state).map_err(|e| anyhow::anyhow!(e.public_message()))?;
         let settings = integ.settings_map();

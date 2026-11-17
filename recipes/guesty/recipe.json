@@ -42,12 +42,12 @@
     "max_pages": 10
   },
   "setup": [
-    "Create the integration from this recipe. Copy its inbound URL.",
+    "Create the integration from this recipe and copy its webhook URL.",
     "In Guesty, create an Open API key (Integrations → API & Webhooks) and save its client ID and secret as the credentials client_id and client_secret. DumbMail asks Guesty for an access token at most 4 times a day (Guesty allows 5) and reuses it until it expires.",
-    "Subscribe the inbound URL to reservation webhooks: POST https://open-api.guesty.com/v1/webhooks with {\"url\": \"<inbound URL>\", \"events\": [\"reservation.new\", \"reservation.updated\"]}. These events include the guest's details. Guesty retires them on 1 March 2027; after that, subscribe to reservation.created.v2 and reservation.updated.v2 and the 15-minute pull fills in the guest details.",
+    "Subscribe the webhook URL to reservation webhooks: POST https://open-api.guesty.com/v1/webhooks with {\"url\": \"<webhook URL>\", \"events\": [\"reservation.new\", \"reservation.updated\"]}. These events include the guest's details. Guesty retires them on 1 March 2027; after that, subscribe to reservation.created.v2 and reservation.updated.v2 and the 15-minute pull fills in the guest details.",
     "Save the webhook signing secret (GET https://open-api.guesty.com/v1/webhooks-v2/secret, starts with whsec_) as the integration's signing secret.",
-    "Run test_integration with pull: true to see the first page of reservations and what would be written.",
-    "Import history with run_integration_pull and backfill_since (for example a year ago). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
+    "Test the pull (Pull tab → Test pull, or test_integration with pull: true) to see the first page of reservations and exactly what would be written.",
+    "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
     "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on."
   ],
   "flows": [

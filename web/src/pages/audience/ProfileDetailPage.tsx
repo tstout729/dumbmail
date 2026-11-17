@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router";
 import { Activity, ListChecks, Mail, MessageSquare, MousePointerClick, MailOpen, Pencil, PieChart, Plus, Trash2, X } from "lucide-react";
 import type { Consent, Profile, ProfileDetail } from "../../api";
 import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../../api";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Notice, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
 import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
 
@@ -32,6 +32,13 @@ export function ProfileDetailPage() {
   }
   return <ProfileView key={detail.data.profile.id} detail={detail.data} />;
 }
+
+const suppressionReasons: Record<string, string> = {
+  hard_bounce: "Email to this address bounced, so DumbMail won't send to it again.",
+  complaint: "This person marked an email as spam, so DumbMail won't email them again.",
+  booking_relay: "This is a booking-site relay address (Airbnb, Booking.com, Vrbo and the like). Those sites forbid marketing to it, so it never gets marketing email.",
+  no_marketing: "An integration marked this address as not for marketing, so it never gets marketing email.",
+};
 
 function ProfileView({ detail }: { detail: ProfileDetail }) {
   const { account } = useSession();
@@ -80,6 +87,28 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
           </>
         }
       />
+      {detail.email_suppressed_reason ? (
+        <div className="mb-4">
+          <Notice tone="amber" icon={<Mail />} title="No marketing email">
+            {suppressionReasons[detail.email_suppressed_reason] ?? `Email is suppressed (${detail.email_suppressed_reason}).`}
+          </Notice>
+        </div>
+      ) : null}
+      {detail.source?.kind === "integration" ? (
+        <p className="-mt-2 mb-4 text-xs text-zinc-500">
+          {detail.source.id && detail.source.name ? (
+            <>
+              Created by the{" "}
+              <Link to={`/integrations/${detail.source.id}`} className="font-medium text-accent-700 hover:underline">
+                {detail.source.name}
+              </Link>{" "}
+              integration.
+            </>
+          ) : (
+            "Created by an integration that has since been deleted."
+          )}
+        </p>
+      ) : null}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[360px_minmax(0,1fr)]">
         <div className="space-y-4">
           {editing ? <ProfileEditForm profile={profile} onDone={() => setEditing(false)} /> : <PropertiesCard profile={profile} tz={tz} />}

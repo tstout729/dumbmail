@@ -17,9 +17,9 @@
   "settings": {},
   "pull": null,
   "setup": [
-    "Create the integration from this recipe. Copy its inbound URL.",
+    "Create the integration from this recipe and copy its webhook URL.",
     "Pick a long random signing key and save it as the integration's signing secret.",
-    "Create a webhook subscription with Calendly's API (a Standard plan or higher is needed): POST https://api.calendly.com/webhook_subscriptions with your personal access token and {\"url\": \"<inbound URL>\", \"events\": [\"invitee.created\", \"invitee.canceled\"], \"organization\": \"<your organization URI>\", \"scope\": \"organization\", \"signing_key\": \"<the same key>\"}. GET https://api.calendly.com/users/me shows your organization URI.",
+    "Create a webhook subscription with Calendly's API (a Standard plan or higher is needed): POST https://api.calendly.com/webhook_subscriptions with your personal access token and {\"url\": \"<webhook URL>\", \"events\": [\"invitee.created\", \"invitee.canceled\"], \"organization\": \"<your organization URI>\", \"scope\": \"organization\", \"signing_key\": \"<the same key>\"}. GET https://api.calendly.com/users/me shows your organization URI.",
     "Book a test meeting and check the delivery log.",
     "Review the draft reminder and follow-up flows and turn them on."
   ],

@@ -334,11 +334,15 @@ export type CampaignReport = {
 
 // ---- Flows ----
 
+/** With `cancelled_by`, people leave the flow when a later event of those metrics has the same `key` property value. */
+type CancelledBy = { key?: string; cancelled_by?: string[] };
+
 export type FlowTrigger =
-  | { type: "metric"; metric: string; filters?: FieldFilter[] }
+  | ({ type: "metric"; metric: string; filters?: FieldFilter[] } & CancelledBy)
   | { type: "list"; list_id: string }
   | { type: "segment"; segment_id: string }
-  | { type: "date_property"; field: string; offset_days?: number };
+  | { type: "date_property"; field: string; offset_days?: number }
+  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy);
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
@@ -474,6 +478,10 @@ export type ProfileDetail = {
   segments: Segment[];
   events: EventRow[];
   messages: ProfileMessage[];
+  /** Why email to this profile is suppressed: hard_bounce, complaint, booking_relay or no_marketing. */
+  email_suppressed_reason?: string | null;
+  /** Set when an integration created the profile. */
+  source?: { kind: string; id: string | null; name: string | null } | null;
 };
 
 export type ProfileInput = Partial<
