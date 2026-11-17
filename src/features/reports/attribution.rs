@@ -21,6 +21,7 @@ use crate::state::AppState;
 /// the one touched earliest. Two messages touched at the same moment: the newer message wins, which
 /// is the order the database read a person's messages in before these settings existed (newest
 /// first, by `messages_profile_idx`), so default settings credit exactly what they always did.
+/// Transactional email (receipts, password resets) never takes the credit: it isn't marketing.
 macro_rules! touch_lateral {
     () => {
         "
@@ -35,7 +36,7 @@ macro_rules! touch_lateral {
                    END AS touches
         ) tt
         CROSS JOIN LATERAL (SELECT GREATEST(tt.touches[1], tt.touches[2]) AS last_at, LEAST(tt.touches[1], tt.touches[2]) AS first_at) t
-        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND t.last_at IS NOT NULL
+        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND NOT m.transactional AND t.last_at IS NOT NULL
         ORDER BY CASE WHEN cfg.first_touch THEN t.first_at END ASC, t.last_at DESC, m.created_at DESC, m.id
         LIMIT 1
     ) att ON true"
