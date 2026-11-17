@@ -33,6 +33,28 @@ pub enum Trigger {
         #[serde(default)]
         offset_days: i64,
     },
+    /// N days before or after a date inside each event, e.g. 2 days before `check_in` on
+    /// "Reservation Confirmed". Each event starts the flow at most once.
+    EventDate {
+        metric: String,
+        /// The event property holding the date (dots reach nested keys).
+        field: String,
+        /// Days after the date (negative: before).
+        #[serde(default)]
+        offset_days: i64,
+        /// Hour of the day to start, in the account's time zone. Default 9.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hour: Option<u32>,
+        #[serde(default)]
+        filters: Vec<Filter>,
+        /// The event property that identifies the thing (e.g. `reservation_id`). A newer event of the
+        /// same metric with the same value replaces the older one, and `cancelled_by` matches on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Metrics that cancel it when they happen later with the same `key` value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cancelled_by: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +104,75 @@ impl FlowDef {
 }
 
 pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
-    serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))
+    let t: Trigger = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))?;
+    if let Trigger::EventDate { metric, field, offset_days, hour, filters, key, cancelled_by } = &t {
+        let name_ok = |s: &str| !s.trim().is_empty() && s.len() <= 128;
+        if !name_ok(metric) || !name_ok(field) {
+            return Err(AppError::bad("an event date trigger needs a metric and the event property holding the date"));
+        }
+        if !(-365..=365).contains(offset_days) {
+            return Err(AppError::bad("offset_days must be -365 to 365"));
+        }
+        if hour.is_some_and(|h| h > 23) {
+            return Err(AppError::bad("hour must be 0-23"));
+        }
+        if filters.len() > 20 || cancelled_by.len() > 5 || !cancelled_by.iter().all(|m| name_ok(m)) {
+            return Err(AppError::bad("at most 20 filters and 5 cancelling metrics"));
+        }
+        if key.as_deref().is_some_and(|k| !name_ok(k)) {
+            return Err(AppError::bad("key must be an event property name"));
+        }
+        if !cancelled_by.is_empty() && key.is_none() {
+            return Err(AppError::bad("cancelled_by needs a key (the property both events share, e.g. reservation_id)"));
+        }
+    }
+    Ok(t)
+}
+
+fn json_path(field: &str) -> Vec<String> {
+    field.split('.').map(str::to_string).collect()
+}
+
+/// Whether an event-date trigger's event no longer stands: a newer event of the same metric with
+/// the same key replaced it, or a cancelling event with the same key came after it.
+async fn event_date_stale(db: &PgPool, account_id: Uuid, event_id: Uuid, key: Option<&str>, cancelled_by: &[String]) -> sqlx::Result<Option<&'static str>> {
+    let row: Option<(Uuid, Option<String>, chrono::DateTime<Utc>)> = sqlx::query_as("SELECT metric_id, properties #>> $3, occurred_at FROM events WHERE id = $1 AND account_id = $2")
+        .bind(event_id)
+        .bind(account_id)
+        .bind(json_path(key.unwrap_or("")))
+        .fetch_optional(db)
+        .await?;
+    let Some((metric_id, value, at)) = row else { return Ok(Some("event deleted")) };
+    let (Some(key), Some(value)) = (key, value) else { return Ok(None) };
+    let superseded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events n WHERE n.account_id = $1 AND n.metric_id = $2 AND n.properties #>> $3 = $4 AND (n.occurred_at, n.id) > ($5, $6))",
+    )
+    .bind(account_id)
+    .bind(metric_id)
+    .bind(json_path(key))
+    .bind(&value)
+    .bind(at)
+    .bind(event_id)
+    .fetch_one(db)
+    .await?;
+    if superseded {
+        return Ok(Some("superseded"));
+    }
+    if cancelled_by.is_empty() {
+        return Ok(None);
+    }
+    let cancelled: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events c JOIN metrics m ON m.id = c.metric_id
+          WHERE c.account_id = $1 AND m.account_id = $1 AND m.name = ANY($2) AND c.properties #>> $3 = $4 AND c.occurred_at >= $5)",
+    )
+    .bind(account_id)
+    .bind(cancelled_by)
+    .bind(json_path(key))
+    .bind(&value)
+    .bind(at)
+    .fetch_one(db)
+    .await?;
+    Ok(cancelled.then_some("cancelled"))
 }
 
 /// A random split's share of people sent down path A (`yes`); the rest take path B (`no`).
@@ -308,7 +398,9 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
     let def = parse_definition(&flow.definition)?;
     let Some(entry) = def.entry.clone() else { return Ok(None) };
     let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
-    let blocked: bool = match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
+    // Event-date flows start once per event (a guest with two bookings gets both), so re-entry doesn't apply.
+    let per_event = matches!(parse_trigger(&flow.trigger), Ok(Trigger::EventDate { .. }));
+    let blocked: bool = !per_event && match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
         (Value::String(s), _) if s == "always" => {
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')")
                 .bind(flow.id)
@@ -466,6 +558,73 @@ pub async fn date_triggers(state: &AppState) -> anyhow::Result<()> {
             start(state, &f, pid, json!({"date_field": field})).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
         }
     }
+    event_date_triggers(state).await
+}
+
+/// Start event-date flows for events whose date (plus the offset) is today in the account's time
+/// zone, once the set hour has passed. Each event is considered once per flow.
+async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date'").fetch_all(&state.db).await?;
+    for f in flows {
+        let Ok(Trigger::EventDate { metric, field, offset_days, hour, filters, key, cancelled_by }) = parse_trigger(&f.trigger) else { continue };
+        let account = crate::campaigns::load_account(&state.db, f.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let tz = sending::account_tz(&account);
+        let local = Utc::now().with_timezone(&tz);
+        if local.hour() < hour.unwrap_or(9) {
+            continue;
+        }
+        // The date that fires today is today minus the offset. Plain dates (2026-11-20) are taken as
+        // they are; date-times are read in the account's time zone.
+        let target = local.date_naive() - Duration::days(offset_days);
+        let rows: Vec<(Uuid, Uuid, Value, Option<f64>, chrono::DateTime<Utc>)> = sqlx::query_as(
+            "SELECT e.id, e.profile_id, e.properties, e.value, e.occurred_at FROM events e JOIN metrics m ON m.id = e.metric_id
+             WHERE e.account_id = $1 AND m.account_id = $1 AND m.name = $2 AND e.occurred_at > now() - interval '800 days'
+               AND (CASE WHEN (e.properties #>> $3) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN pl_ts(e.properties #>> $3)::date
+                         ELSE (pl_ts(e.properties #>> $3) AT TIME ZONE $4)::date END) = $5
+               AND NOT EXISTS (SELECT 1 FROM flow_event_date_fires x WHERE x.flow_id = $6 AND x.event_id = e.id)
+             ORDER BY e.occurred_at LIMIT 2000",
+        )
+        .bind(f.account_id)
+        .bind(&metric)
+        .bind(json_path(&field))
+        .bind(tz.name())
+        .bind(target)
+        .bind(f.id)
+        .fetch_all(&state.db)
+        .await?;
+        for (event_id, profile_id, props, value, at) in rows {
+            let mut obj = props.clone();
+            if let (Some(v), Some(o)) = (value, obj.as_object_mut()) {
+                o.entry("value").or_insert(json!(v));
+            }
+            let outcome = if !filters.iter().all(|flt| segments::json_filter_matches(&obj, flt)) {
+                Some("filtered")
+            } else {
+                event_date_stale(&state.db, f.account_id, event_id, key.as_deref(), &cancelled_by).await?
+            };
+            let claimed: Option<Uuid> = sqlx::query_scalar("INSERT INTO flow_event_date_fires (flow_id, event_id, outcome) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING event_id")
+                .bind(f.id)
+                .bind(event_id)
+                .bind(outcome.unwrap_or("started"))
+                .fetch_optional(&state.db)
+                .await?;
+            if claimed.is_none() || outcome.is_some() {
+                continue;
+            }
+            let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at}, "event_date": {"field": field, "date": target}});
+            match start(state, &f, profile_id, ctx).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    sqlx::query("UPDATE flow_event_date_fires SET outcome = 'not_started' WHERE flow_id = $1 AND event_id = $2").bind(f.id).bind(event_id).execute(&state.db).await?;
+                }
+                Err(e) => {
+                    // Try again on the next pass.
+                    sqlx::query("DELETE FROM flow_event_date_fires WHERE flow_id = $1 AND event_id = $2").bind(f.id).bind(event_id).execute(&state.db).await?;
+                    return Err(anyhow::anyhow!(e.public_message()));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -521,6 +680,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     };
     let mut context = run.context.clone();
     let mut current = run.current_node.clone();
+    // Event-date flows: stop when the booking was cancelled or its date changed.
+    let event_date = match parse_trigger(&flow.trigger) {
+        Ok(Trigger::EventDate { key, cancelled_by, .. }) => context["event"]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).map(|id| (id, key, cancelled_by)),
+        _ => None,
+    };
 
     for _ in 0..100 {
         let Some(node_id) = current.clone() else {
@@ -532,6 +696,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
         };
         if let Some(exit) = &exit {
             if segments::profile_matches(&state.db, run.profile_id, exit).await.map_err(|e| anyhow::anyhow!(e.public_message()))? {
+                return finish(&state.db, run.id, "exited").await;
+            }
+        }
+        if let Some((event_id, key, cancelled_by)) = &event_date {
+            if event_date_stale(&state.db, flow.account_id, *event_id, key.as_deref(), cancelled_by).await?.is_some() {
                 return finish(&state.db, run.id, "exited").await;
             }
         }
