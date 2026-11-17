@@ -36,6 +36,26 @@ pub use settings::{sms_hours, SmsHours};
 
 pub struct Module;
 
+use crate::features::team::access::{rule, Access, Perm, RouteRule, ToolRule};
+
+/// Previews and progress read like campaigns; the quiet-hours settings follow the other sending
+/// settings; a profile's time zone is personal data.
+static ROUTE_RULES: &[RouteRule] = &[
+    rule("POST", "/api/sendtime/preview", Perm::MessagingRead),
+    rule("GET", "/api/sendtime/settings", Perm::AccountRead),
+    rule("PATCH", "/api/sendtime/settings", Perm::SettingsWrite),
+    rule("GET", "/api/campaigns/{id}/send-progress", Perm::MessagingRead),
+    rule("GET", "/api/profiles/{id}/timezone", Perm::ProfilesRead),
+];
+
+static TOOL_RULES: &[ToolRule] = &[
+    ToolRule { name: "preview_send_plan", perm: Perm::MessagingRead },
+    ToolRule { name: "get_send_progress", perm: Perm::MessagingRead },
+    ToolRule { name: "get_send_settings", perm: Perm::AccountRead },
+    ToolRule { name: "update_send_settings", perm: Perm::SettingsWrite },
+    ToolRule { name: "get_profile_timezone", perm: Perm::ProfilesRead },
+];
+
 const DOC: &str = include_str!("../../../docs/SENDTIME.md");
 
 /// JSON Schema for a campaign's `send_options`, shared by the campaign tools.
@@ -147,6 +167,10 @@ fn uuid_arg(a: &Value, k: &str) -> AppResult<Uuid> {
 impl Feature for Module {
     fn name(&self) -> &'static str {
         "sendtime"
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTE_RULES, tools: TOOL_RULES }
     }
 
     fn routes(&self) -> Router<AppState> {

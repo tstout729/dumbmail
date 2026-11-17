@@ -1,6 +1,6 @@
 import { createBrowserRouter } from "react-router";
 import { AppShell, RedirectIfAuthed, RequireAuth } from "./components/shell/AppShell";
-import { featureRoutes, featureSettingsRoutes } from "./features/registry";
+import { featurePublicRoutes, featureRoutes, featureSettingsRoutes } from "./features/registry";
 import { RootLayout } from "./RootLayout";
 
 // Each page is its own chunk; navigation keeps the current page visible until the next one loads.
@@ -9,6 +9,7 @@ export const router = createBrowserRouter([
     Component: RootLayout,
     HydrateFallback: () => null,
     children: [
+      ...featurePublicRoutes,
       {
         Component: RedirectIfAuthed,
         children: [

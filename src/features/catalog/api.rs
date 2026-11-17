@@ -102,12 +102,25 @@ async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<I
     Ok(Json(import_csv(&state, ctx.account_id, &b.csv).await?))
 }
 
+/// A product's detail. Who's waiting for a restock (people's emails) only for callers who may
+/// read profiles; others get the counts.
+pub async fn product_detail(state: &AppState, ctx: &Ctx, key: &str) -> AppResult<Value> {
+    let mut v = store::detail(&state.db, ctx.account_id, key).await?;
+    if !ctx.can(crate::features::team::Perm::ProfilesRead) {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("waiting");
+        }
+    }
+    Ok(v)
+}
+
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path<String>) -> AppResult<Json<Value>> {
-    Ok(Json(store::detail(&state.db, ctx.account_id, &key).await?))
+    Ok(Json(product_detail(&state, &ctx, &key).await?))
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path<String>) -> AppResult<Json<Value>> {
     let p = store::delete(&state.db, ctx.account_id, &key).await?;
+    crate::features::team::audit(&state, &ctx, "product.delete", Some(&p.id.to_string()), json!({"title": p.title})).await;
     Ok(Json(json!({"ok": true, "deleted": p.id})))
 }
 
@@ -121,7 +134,16 @@ pub struct RecsQuery {
     pub limit: Option<i64>,
 }
 
-/// Picks for a person, or products bought and viewed together with a product.
+/// Picks for a person (what they viewed and bought shows through, so it needs profiles.read), or
+/// products bought and viewed together with a product.
+pub async fn recommendations_for(state: &AppState, ctx: &Ctx, q: &RecsQuery) -> AppResult<Value> {
+    if q.profile_id.is_some() {
+        ctx.require(crate::features::team::Perm::ProfilesRead)?;
+    }
+    recommendations(state, ctx.account_id, q).await
+}
+
+/// [`recommendations_for`] without the permission check, for code acting for the account itself.
 pub async fn recommendations(state: &AppState, account_id: Uuid, q: &RecsQuery) -> AppResult<Value> {
     let limit = q.limit.unwrap_or(8).clamp(1, 24);
     match (q.profile_id, q.product_id.as_deref()) {
@@ -143,7 +165,7 @@ pub async fn recommendations(state: &AppState, account_id: Uuid, q: &RecsQuery) 
 }
 
 async fn recs_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<RecsQuery>) -> AppResult<Json<Value>> {
-    Ok(Json(recommendations(&state, ctx.account_id, &q).await?))
+    Ok(Json(recommendations_for(&state, &ctx, &q).await?))
 }
 
 async fn feeds_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -151,7 +173,15 @@ async fn feeds_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Valu
 }
 
 async fn create_feed_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<feeds::FeedInput>) -> AppResult<Json<Value>> {
-    Ok(Json(json!(feeds::create(&state.db, ctx.account_id, b).await?)))
+    let f = feeds::create(&state.db, ctx.account_id, b).await?;
+    feed_changed(&state, &ctx, "product_feed.create", &f).await;
+    Ok(Json(json!(f)))
+}
+
+/// A feed was added or changed: its id, name, format and schedule (never its URL, which may hold
+/// a token).
+pub async fn feed_changed(state: &AppState, ctx: &Ctx, action: &str, f: &feeds::Feed) {
+    crate::features::team::audit(state, ctx, action, Some(&f.id.to_string()), json!({"name": f.name, "format": f.format, "interval_hours": f.interval_hours, "enabled": f.enabled})).await;
 }
 
 async fn get_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -159,11 +189,14 @@ async fn get_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
 }
 
 async fn update_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<feeds::FeedInput>) -> AppResult<Json<Value>> {
-    Ok(Json(json!(feeds::update(&state.db, ctx.account_id, id, b).await?)))
+    let f = feeds::update(&state.db, ctx.account_id, id, b).await?;
+    feed_changed(&state, &ctx, "product_feed.update", &f).await;
+    Ok(Json(json!(f)))
 }
 
 async fn delete_feed_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     feeds::delete(&state.db, ctx.account_id, id).await?;
+    crate::features::team::audit(&state, &ctx, "product_feed.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -192,5 +225,6 @@ async fn settings_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<V
 
 async fn update_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<alerts::SettingsPatch>) -> AppResult<Json<Value>> {
     alerts::update_settings(&state.db, ctx.account_id, b).await?;
+    crate::features::team::audit(&state, &ctx, "catalog.settings_change", None, json!({})).await;
     Ok(Json(settings_json(&state, ctx.account_id).await?))
 }

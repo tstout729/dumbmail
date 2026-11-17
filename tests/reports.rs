@@ -381,7 +381,10 @@ async fn custom_reports_group_filter_compare_save_and_schedule() {
     // CSV export of a report.
     let (st, headers, body) = {
         let cookie = h.cookie.clone().unwrap();
-        h.raw("POST", "/api/reports/run.csv", &[("cookie", &cookie), ("content-type", "application/json")], &json!({"source": "campaigns", "group_by": ["campaign"], "measures": ["sent", "open_rate", "revenue"]}).to_string()).await
+        // As the dashboard's download sends it: from the app, naming the open account.
+        let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM sessions ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+        let account = account.to_string();
+        h.raw("POST", "/api/reports/run.csv", &[("cookie", &cookie), ("content-type", "application/json"), ("origin", "https://pl.test"), ("x-dumbmail-account", &account)], &json!({"source": "campaigns", "group_by": ["campaign"], "measures": ["sent", "open_rate", "revenue"]}).to_string()).await
     };
     assert_eq!(st, StatusCode::OK);
     assert!(headers["content-type"].to_str().unwrap().starts_with("text/csv"));

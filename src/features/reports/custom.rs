@@ -92,6 +92,27 @@ pub struct Spec {
     pub limit: Option<i64>,
 }
 
+impl Spec {
+    /// The grouping that would show people's own values (a raw event or profile property), if any.
+    pub fn people_values(&self) -> Option<&'static str> {
+        if self.group_by.iter().any(|g| g == "property") {
+            Some("an event property")
+        } else if self.group_by.iter().any(|g| g == "country") {
+            Some("a profile property (country)")
+        } else {
+            None
+        }
+    }
+}
+
+/// Refuse a spec whose groups show people's own values unless `ctx` may read profiles.
+pub fn check_access(ctx: &crate::auth::Ctx, spec: &Spec) -> AppResult<()> {
+    match spec.people_values() {
+        Some(what) => crate::features::team::access::require_people_values(ctx, what),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Source {
     Campaigns,
@@ -920,7 +941,9 @@ fn growth_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
 fn metric_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
     let (s, e) = (q.bind(Arg::Ts(w.start)), q.bind(Arg::Ts(w.end)));
     let metric = q.bind(Arg::Text(c.spec.metric.clone().unwrap_or_default()));
-    let prop = c.spec.property.clone().map(|p| q.bind(Arg::Text(p)));
+    // Bound only when this query groups by it: the totals query (no groups) mustn't carry an
+    // unused parameter, which Postgres refuses.
+    let prop = c.spec.property.clone().filter(|_| groups.iter().any(|g| g == "property")).map(|p| q.bind(Arg::Text(p)));
     let (k, by) = keys_simple(groups, |g| {
         time_key(g, "e.occurred_at", &c.tz).unwrap_or_else(|| match g {
             "country" => "p.properties->>'country'".into(),
