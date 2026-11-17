@@ -469,7 +469,7 @@ fn features_section(c: &Config, shot_of: &dyn Fn(&str, &str, bool) -> String) ->
 <div class="feature">
 <div><h3>Flows that follow up for you</h3>
 <p>Start from a blueprint and edit it, or build your own from triggers, delays, emails, texts and conditional splits.</p>
-<ul><li>Welcome series, abandoned checkout, browse abandonment, post-purchase, winback and birthday blueprints</li><li>Triggers on events, list joins, segment entry or dates</li><li>Exit conditions, re-entry rules and smart sending</li></ul></div>
+<ul><li>Welcome series, abandoned checkout, browse abandonment, post-purchase, winback, back in stock, price drop and birthday blueprints</li><li>Triggers on events, list joins, segment entry or dates</li><li>Exit conditions, re-entry rules and smart sending</li></ul></div>
 {flow}
 </div>
 

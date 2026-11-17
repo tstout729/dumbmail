@@ -22,7 +22,8 @@ function AddBlockMenu({ onAdd, nested, label }: { onAdd: (t: EmailBlockType) => 
         </button>
       )}
       items={blockOrder
-        .filter((t) => !nested || t !== "columns")
+        // Columns and catalog product grids only go at the top level.
+        .filter((t) => !nested || (t !== "columns" && t !== "products"))
         .map((t) => {
           const Icon = blockMeta[t].icon;
           return { label: blockMeta[t].label, icon: <Icon className="size-3.5 text-zinc-400" />, onSelect: () => onAdd(t) };

@@ -17,6 +17,9 @@ pub enum AppError {
     Conflict(String),
     #[error("{0}")]
     LimitReached(String),
+    /// Too much running at once; try again shortly (429).
+    #[error("{0}")]
+    Busy(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -38,6 +41,7 @@ impl AppError {
             AppError::Forbidden(_) => "forbidden",
             AppError::Conflict(_) => "conflict",
             AppError::LimitReached(_) => "limit_reached",
+            AppError::Busy(_) => "busy",
             AppError::Internal(_) => "internal",
         }
     }
@@ -49,6 +53,7 @@ impl AppError {
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::LimitReached(_) => StatusCode::PAYMENT_REQUIRED,
+            AppError::Busy(_) => StatusCode::TOO_MANY_REQUESTS,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
