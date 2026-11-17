@@ -33,6 +33,7 @@ import {
 import { formatCurrency, formatDate, formatNumber, formatPercent } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
 import { toast } from "../../lib/toast";
+import { useCan } from "../team/api";
 import { exportUrl, useAddCodes, useCoupon, useCouponCodes, useCouponReport, useDeleteCoupon, useGenerateCodes, useUpdateCoupon } from "./api";
 import { CouponSettings, draftFrom, draftProblem, expiryText, inputFrom, StockBadge } from "./parts";
 import type { AddCodesResult, Coupon, CouponCode, CouponCodeStatus } from "./types";
@@ -65,6 +66,11 @@ function CouponView({ c }: { c: Coupon }) {
   const remove = useDeleteCoupon();
   const [adding, setAdding] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Codes are money and the holder list is people's data: managers and up, with profile access.
+  const canManage = useCan("catalog.write");
+  const canReadProfiles = useCan("profiles.read");
+  const canSeeCodes = canManage && canReadProfiles;
+  const canDelete = useCan("catalog.delete");
   const r = report.data;
 
   return (
@@ -80,6 +86,7 @@ function CouponView({ c }: { c: Coupon }) {
         description={[c.description, expiryText(c, account.timezone)].filter(Boolean).join(" · ")}
         actions={
           <>
+            {canSeeCodes ? (
             <Menu
               trigger={(p) => (
                 <button type="button" className={buttonClass("secondary")} {...p}>
@@ -93,12 +100,17 @@ function CouponView({ c }: { c: Coupon }) {
                 { label: "Every code, with who has it, for spreadsheets (.csv)", onSelect: () => window.location.assign(exportUrl(c.id, "all", "csv")) },
               ]}
             />
-            <IconButton label="Delete coupon" onClick={() => setDeleting(true)}>
-              <Trash2 className="size-4" />
-            </IconButton>
-            <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
-              Add codes
-            </Button>
+            ) : null}
+            {canDelete ? (
+              <IconButton label="Delete coupon" onClick={() => setDeleting(true)}>
+                <Trash2 className="size-4" />
+              </IconButton>
+            ) : null}
+            {canManage ? (
+              <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setAdding(true)}>
+                Add codes
+              </Button>
+            ) : null}
           </>
         }
       />
@@ -116,11 +128,17 @@ function CouponView({ c }: { c: Coupon }) {
       </div>
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-5">
         <div className="space-y-5 lg:col-span-3">
-          <CodesCard c={c} timeZone={account.timezone} />
+          {canSeeCodes ? (
+            <CodesCard c={c} timeZone={account.timezone} />
+          ) : (
+            <Card title="Codes">
+              <p className="text-sm text-zinc-600">Only people who manage coupons and can see profiles see the codes and who has them.</p>
+            </Card>
+          )}
         </div>
         <div className="space-y-5 lg:col-span-2">
           <UsageCard c={c} />
-          <SettingsCard c={c} />
+          {canManage ? <SettingsCard c={c} /> : null}
         </div>
       </div>
       {r?.note ? <p className="mt-4 text-xs text-zinc-500">{r.note}</p> : null}

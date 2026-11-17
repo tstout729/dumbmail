@@ -20,6 +20,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::team::access::{require, rule, Access, Perm, RouteRule, ToolRule};
+use super::team::audit;
 use super::{Feature, McpDoc};
 use crate::api::{ApiJson, Page};
 use crate::auth::Ctx;
@@ -30,6 +32,43 @@ use crate::state::AppState;
 pub use assign::{give_code, CreateInStore, Given, Prepared, SendCoupons, StoreCodeFuture, Via};
 
 pub struct Module;
+
+// Who may do what (docs/COUPONS.md, "Permissions"). Reading coupons, stock and reports: anyone who
+// reads content. Raw codes, who holds them and exports: people who manage coupons (catalog.write,
+// Managers and up), who must also be able to read profiles (checked in [`raw_codes_allowed`]).
+// Creating, editing, adding and generating: catalog.write. Deleting: catalog.delete (Admins and
+// the Owner), with confirm=true. Sign-up form codes are handed out by the public form routes.
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/coupons", Perm::ContentRead),
+    rule("POST", "/api/coupons", Perm::CatalogWrite),
+    rule("GET", "/api/coupons/report", Perm::ContentRead),
+    rule("GET", "/api/coupons/campaign-check/{campaign_id}", Perm::MessagingRead),
+    rule("GET", "/api/coupons/{id}", Perm::ContentRead),
+    rule("PATCH", "/api/coupons/{id}", Perm::CatalogWrite),
+    rule("DELETE", "/api/coupons/{id}", Perm::CatalogDelete),
+    rule("GET", "/api/coupons/{id}/codes", Perm::CatalogWrite),
+    rule("POST", "/api/coupons/{id}/codes", Perm::CatalogWrite),
+    rule("POST", "/api/coupons/{id}/generate", Perm::CatalogWrite),
+    rule("GET", "/api/coupons/{id}/export", Perm::CatalogWrite),
+    rule("GET", "/api/coupons/{id}/report", Perm::ContentRead),
+];
+
+static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_coupons", perm: Perm::ContentRead },
+    ToolRule { name: "coupon_report", perm: Perm::ContentRead },
+    ToolRule { name: "get_coupon", perm: Perm::CatalogWrite },
+    ToolRule { name: "export_coupon_codes", perm: Perm::CatalogWrite },
+    ToolRule { name: "create_coupon", perm: Perm::CatalogWrite },
+    ToolRule { name: "update_coupon", perm: Perm::CatalogWrite },
+    ToolRule { name: "add_coupon_codes", perm: Perm::CatalogWrite },
+    ToolRule { name: "generate_coupon_codes", perm: Perm::CatalogWrite },
+    ToolRule { name: "delete_coupon", perm: Perm::CatalogDelete },
+];
+
+/// Raw codes come with who holds them (people's emails): also needs profile access.
+fn raw_codes_allowed(ctx: &Ctx) -> AppResult<()> {
+    require(ctx, Perm::ProfilesRead)
+}
 
 /// Largest JSON body for adding codes (bigger uploads send the file itself, streamed).
 const MAX_JSON_UPLOAD: usize = 2 * 1024 * 1024;
@@ -45,6 +84,7 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx, Query(p): Query<Page>) 
 
 async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<store::Input>) -> AppResult<(StatusCode, Json<Value>)> {
     let c = store::create(&state.db, ctx.account_id, b).await?;
+    audit(&state, &ctx, "coupon.create", Some(&c.id.to_string()), json!({"name": c.name})).await;
     Ok((StatusCode::CREATED, Json(store::to_json(&state.db, &c).await?)))
 }
 
@@ -55,12 +95,13 @@ async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) ->
 
 async fn patch_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<store::Input>) -> AppResult<Json<Value>> {
     let c = store::update(&state.db, ctx.account_id, id, b).await?;
+    audit(&state, &ctx, "coupon.update", Some(&c.id.to_string()), json!({"name": c.name})).await;
     Ok(Json(store::to_json(&state.db, &c).await?))
 }
 
 /// What deleting would do; refused while anything uses the coupon.
-async fn delete_coupon(state: &AppState, account_id: Uuid, id: Uuid, confirm: bool) -> AppResult<Value> {
-    let c = store::load(&state.db, account_id, id).await?;
+async fn delete_coupon(state: &AppState, ctx: &Ctx, id: Uuid, confirm: bool) -> AppResult<Value> {
+    let c = store::load(&state.db, ctx.account_id, id).await?;
     let users = store::users(&state.db, &c).await?;
     if !users.is_empty() {
         return Err(AppError::Conflict(format!("coupon {:?} is used by {}; change those first", c.name, users.join(", "))));
@@ -72,7 +113,9 @@ async fn delete_coupon(state: &AppState, account_id: Uuid, id: Uuid, confirm: bo
             c.name, stock["total"], stock["assigned"], stock["redeemed"]
         )}));
     }
+    let codes = c.codes_total;
     store::delete(&state.db, &c).await?;
+    audit(state, ctx, "coupon.delete", Some(&c.id.to_string()), json!({"name": c.name, "codes": codes})).await;
     Ok(json!({"deleted": true}))
 }
 
@@ -82,7 +125,7 @@ struct ConfirmQuery {
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<ConfirmQuery>) -> AppResult<Response> {
-    let v = delete_coupon(&state, ctx.account_id, id, q.confirm == Some(true)).await?;
+    let v = delete_coupon(&state, &ctx, id, q.confirm == Some(true)).await?;
     if v["dry_run"] == true {
         return Err(AppError::bad(format!("{} (REST: DELETE /api/coupons/{id}?confirm=true)", v["note"].as_str().unwrap_or(""))));
     }
@@ -90,6 +133,7 @@ async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>,
 }
 
 async fn codes_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<store::CodeQuery>) -> AppResult<Json<Value>> {
+    raw_codes_allowed(&ctx)?;
     let c = store::load(&state.db, ctx.account_id, id).await?;
     Ok(Json(store::codes(&state.db, &c, &q).await?))
 }
@@ -112,7 +156,8 @@ fn add_response(r: &store::UploadResult, coupon: Value) -> AppResult<Value> {
     Ok(v)
 }
 
-async fn add_codes(state: &AppState, account_id: Uuid, id: Uuid, b: AddBody) -> AppResult<Value> {
+async fn add_codes(state: &AppState, ctx: &Ctx, id: Uuid, b: AddBody) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let c = store::load(&state.db, account_id, id).await?;
     let Some(lease) = store::Lease::take(&state.db, account_id).await? else { return Err(store::busy()) };
     let res = match (b.codes, b.text) {
@@ -122,8 +167,14 @@ async fn add_codes(state: &AppState, account_id: Uuid, id: Uuid, b: AddBody) -> 
     };
     lease.release(&state.db).await;
     let r = res?;
+    audit_added(state, ctx, &c, &r).await;
     let c = store::load(&state.db, account_id, id).await?;
     add_response(&r, store::to_json(&state.db, &c).await?)
+}
+
+/// Counts only, never codes.
+async fn audit_added(state: &AppState, ctx: &Ctx, c: &store::Coupon, r: &store::UploadResult) {
+    audit(state, ctx, "coupon.codes_add", Some(&c.id.to_string()), json!({"name": c.name, "added": r.added, "duplicates": r.duplicates, "refused": r.refused})).await;
 }
 
 /// Add codes: JSON (`codes` or `text`, up to 2 MB), or the file itself (`text/csv` or `text/plain`,
@@ -133,7 +184,7 @@ async fn add_codes_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uui
     if kind.starts_with("application/json") {
         let bytes = axum::body::to_bytes(body, MAX_JSON_UPLOAD).await.map_err(|_| AppError::bad("JSON uploads are limited to 2 MB; send the file itself as text/csv"))?;
         let b: AddBody = serde_json::from_slice(&bytes).map_err(|e| AppError::bad(format!("invalid body: {e}")))?;
-        return Ok(Json(add_codes(&state, ctx.account_id, id, b).await?));
+        return Ok(Json(add_codes(&state, &ctx, id, b).await?));
     }
     if !(kind.starts_with("text/csv") || kind.starts_with("text/plain")) {
         return Err(AppError::bad("send JSON, or the codes as text/csv or text/plain"));
@@ -158,6 +209,7 @@ async fn add_codes_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uui
     .await;
     lease.release(&state.db).await;
     let r = res?;
+    audit_added(&state, &ctx, &c, &r).await;
     let c = store::load(&state.db, ctx.account_id, id).await?;
     Ok(Json(add_response(&r, store::to_json(&state.db, &c).await?)?))
 }
@@ -169,15 +221,17 @@ struct GenerateBody {
     pattern: Option<store::Pattern>,
 }
 
-async fn generate(state: &AppState, account_id: Uuid, id: Uuid, b: GenerateBody) -> AppResult<Value> {
+async fn generate(state: &AppState, ctx: &Ctx, id: Uuid, b: GenerateBody) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let c = store::load(&state.db, account_id, id).await?;
     let (added, queued) = store::generate(&state.db, &c, b.count, b.pattern).await?;
+    audit(state, ctx, "coupon.codes_generate", Some(&c.id.to_string()), json!({"name": c.name, "added": added, "queued": queued})).await;
     let c = store::load(&state.db, account_id, id).await?;
     Ok(json!({"added": added, "queued": queued, "coupon": store::to_json(&state.db, &c).await?}))
 }
 
 async fn generate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<GenerateBody>) -> AppResult<Json<Value>> {
-    Ok(Json(generate(&state, ctx.account_id, id, b).await?))
+    Ok(Json(generate(&state, &ctx, id, b).await?))
 }
 
 #[derive(Deserialize)]
@@ -189,11 +243,13 @@ struct ExportQuery {
 /// A coupon's codes, streamed a chunk at a time (a pool can hold 2 million): `format=csv` (default)
 /// for spreadsheets, `format=codes` for one code per line exactly as stored.
 async fn export_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<ExportQuery>) -> AppResult<Response> {
+    raw_codes_allowed(&ctx)?;
     let c = store::load(&state.db, ctx.account_id, id).await?;
     let status = q.status.filter(|s| !s.is_empty() && s != "all");
     let format = store::Format::parse(q.format.as_deref())?;
     // Fail fast on a bad status rather than mid-stream.
     store::export_chunk(&state.db, &c, status.as_deref(), format, i64::MAX, false, 1).await?;
+    audit(&state, &ctx, "coupon.export", Some(&c.id.to_string()), json!({"name": c.name, "status": status.as_deref().unwrap_or("all"), "format": q.format.as_deref().unwrap_or("csv")})).await;
     let (ext, mime) = if format == store::Format::Csv { ("csv", "text/csv; charset=utf-8") } else { ("txt", "text/plain; charset=utf-8") };
     let filename = format!("coupon-{}-{}.{ext}", c.name.replace(|ch: char| !ch.is_ascii_alphanumeric(), "-"), status.as_deref().unwrap_or("all"));
     let stream = futures_util::stream::unfold(Some((0i64, true)), move |cursor| {
@@ -316,6 +372,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
             Ok(json!({"data": rows, "total": total}))
         }
         "get_coupon" => {
+            raw_codes_allowed(ctx)?;
             let c = store::find(&state.db, acct, &key()?).await?;
             let q = store::CodeQuery { q: a["search"].as_str().map(str::to_string), status: a["status"].as_str().map(str::to_string), limit: a["limit"].as_i64(), cursor: a["cursor"].as_i64() };
             let mut v = store::to_json(&state.db, &c).await?;
@@ -324,6 +381,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
         }
         "create_coupon" => {
             let c = store::create(&state.db, acct, from(a.clone())?).await?;
+            audit(state, ctx, "coupon.create", Some(&c.id.to_string()), json!({"name": c.name})).await;
             store::to_json(&state.db, &c).await
         }
         "update_coupon" => {
@@ -333,30 +391,33 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
                 o.remove("id");
             }
             let c = store::update(&state.db, acct, c.id, from(body)?).await?;
+            audit(state, ctx, "coupon.update", Some(&c.id.to_string()), json!({"name": c.name})).await;
             store::to_json(&state.db, &c).await
         }
         "add_coupon_codes" => {
             let c = store::find(&state.db, acct, &key()?).await?;
             let body = AddBody { codes: from(a["codes"].clone())?, text: a["text"].as_str().map(str::to_string) };
-            add_codes(state, acct, c.id, body).await
+            add_codes(state, ctx, c.id, body).await
         }
         "generate_coupon_codes" => {
             let c = store::find(&state.db, acct, &key()?).await?;
             let count = a["count"].as_u64().ok_or_else(|| AppError::bad("count is required"))? as usize;
             let pattern = if a["pattern"].is_null() { None } else { Some(from(a["pattern"].clone())?) };
-            generate(state, acct, c.id, GenerateBody { count, pattern }).await
+            generate(state, ctx, c.id, GenerateBody { count, pattern }).await
         }
         "export_coupon_codes" => {
+            raw_codes_allowed(ctx)?;
             let c = store::find(&state.db, acct, &key()?).await?;
             let format = store::Format::parse(a["format"].as_str())?;
             let after = a["after"].as_i64().unwrap_or(0).max(0);
             let limit = a["limit"].as_i64().unwrap_or(1000).clamp(1, MCP_EXPORT_MAX);
             let (text, last, n) = store::export_chunk(&state.db, &c, a["status"].as_str(), format, after, after == 0, limit).await?;
+            audit(state, ctx, "coupon.export", Some(&c.id.to_string()), json!({"name": c.name, "codes": n, "after": after})).await;
             Ok(json!({"text": text, "count": n, "next_after": if n as i64 == limit { Some(last) } else { None }}))
         }
         "delete_coupon" => {
             let c = store::find(&state.db, acct, &key()?).await?;
-            delete_coupon(state, acct, c.id, a["confirm"].as_bool() == Some(true)).await
+            delete_coupon(state, ctx, c.id, a["confirm"].as_bool() == Some(true)).await
         }
         "coupon_report" => match a["id"].as_str() {
             Some(k) => {
@@ -385,6 +446,10 @@ impl Feature for Module {
             .route("/api/coupons/{id}/generate", post(generate_h))
             .route("/api/coupons/{id}/export", get(export_h))
             .route("/api/coupons/{id}/report", get(report_h))
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOLS }
     }
 
     fn mcp_tools(&self) -> Vec<Value> {

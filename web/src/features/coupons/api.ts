@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, api, withQuery } from "../../api/client";
+import { ApiError, api, reloadIfAccountChanged, withQuery, writeHeaders } from "../../api/client";
 import type { ListResponse } from "../../api/types";
 import type { AddCodesResult, Coupon, CouponCampaignCheck, CouponCodePage, CouponCodeQuery, CouponInput, CouponPattern, CouponReport, ExportFormat, GenerateResult } from "./types";
 
@@ -19,7 +19,7 @@ async function uploadFile(id: string, file: File): Promise<AddCodesResult> {
     res = await fetch(`/api/coupons/${encodeURIComponent(id)}/codes`, {
       method: "POST",
       credentials: "include",
-      headers: { "Content-Type": file.name.toLowerCase().endsWith(".txt") ? "text/plain" : "text/csv", Accept: "application/json" },
+      headers: { "Content-Type": file.name.toLowerCase().endsWith(".txt") ? "text/plain" : "text/csv", Accept: "application/json", ...writeHeaders() },
       body: file,
     });
   } catch {
@@ -27,8 +27,9 @@ async function uploadFile(id: string, file: File): Promise<AddCodesResult> {
   }
   const json: unknown = await res.json().catch(() => null);
   if (!res.ok) {
-    const err = (json as { error?: { message?: string } } | null)?.error;
-    throw new ApiError(res.status, res.status === 409 ? "conflict" : "bad_request", err?.message ?? `Upload failed (${res.status})`);
+    const err = (json as { error?: { code?: string; message?: string } } | null)?.error;
+    reloadIfAccountChanged(res.status, err?.code);
+    throw new ApiError(res.status, res.status === 409 ? "conflict" : res.status === 403 ? "forbidden" : "bad_request", err?.message ?? `Upload failed (${res.status})`);
   }
   return json as AddCodesResult;
 }
@@ -57,8 +58,8 @@ export function useCoupon(id: string) {
   return useQuery({ queryKey: couponKeys.coupon(id), queryFn: () => couponsApi.get(id), enabled: id !== "", refetchInterval: (q) => ((q.state.data?.stock.generating ?? 0) > 0 ? 3000 : false) });
 }
 
-export function useCouponCodes(id: string, q: CouponCodeQuery) {
-  return useQuery({ queryKey: couponKeys.codes(id, q), queryFn: () => couponsApi.codes(id, q), placeholderData: keepPreviousData });
+export function useCouponCodes(id: string, q: CouponCodeQuery, enabled = true) {
+  return useQuery({ queryKey: couponKeys.codes(id, q), queryFn: () => couponsApi.codes(id, q), placeholderData: keepPreviousData, enabled });
 }
 
 export function useCouponCampaignCheck(campaignId: string) {

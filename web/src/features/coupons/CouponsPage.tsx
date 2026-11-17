@@ -4,6 +4,7 @@ import { Plus, TicketPercent } from "lucide-react";
 import { useSession } from "../../api";
 import { Button, EmptyRow, EmptyState, InlineError, Modal, Notice, Page, PageHeader, RowLink, SkeletonRows, Table, Td, Th } from "../../components/ui";
 import { formatNumber, pluralize } from "../../lib/format";
+import { useCan } from "../team/api";
 import { useCoupons, useCreateCoupon } from "./api";
 import { CouponSettings, draftFrom, draftProblem, expiryText, inputFrom, StockBadge } from "./parts";
 import type { Coupon } from "./types";
@@ -12,6 +13,7 @@ export function CouponsPage() {
   const { account } = useSession();
   const coupons = useCoupons();
   const [creating, setCreating] = useState(false);
+  const canManage = useCan("catalog.write");
   const rows = coupons.data?.data ?? [];
   const empty = rows.filter((c) => c.alerts.out_of_codes);
   const low = rows.filter((c) => !c.alerts.out_of_codes && c.alerts.low_stock);
@@ -23,9 +25,11 @@ export function CouponsPage() {
         title="Coupons"
         description="Pools of single-use codes. Everyone gets their own code in emails, texts and sign-up forms."
         actions={
-          <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setCreating(true)}>
-            New coupon
-          </Button>
+          canManage ? (
+            <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setCreating(true)}>
+              New coupon
+            </Button>
+          ) : null
         }
       />
       {empty.length ? (
@@ -67,9 +71,11 @@ export function CouponsPage() {
                 title="No coupons yet"
                 description="A coupon gives each person their own single-use code, so codes can't be shared and every use is tied to someone."
                 action={
-                  <Button variant="primary" onClick={() => setCreating(true)}>
-                    New coupon
-                  </Button>
+                  canManage ? (
+                    <Button variant="primary" onClick={() => setCreating(true)}>
+                      New coupon
+                    </Button>
+                  ) : undefined
                 }
               />
             </EmptyRow>

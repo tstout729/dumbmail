@@ -95,14 +95,15 @@ When a person is deleted, their codes stay used (they never go back to the pool)
 
 ## Permissions
 
-| What | Who should be able to | Routes and MCP tools |
+| What | Permission (roles) | Routes and MCP tools |
 | --- | --- | --- |
-| See coupons, stock, alerts and reports | Anyone who can see content | `GET /api/coupons`, `GET /api/coupons/{id}`, `GET /api/coupons/report`, `GET /api/coupons/{id}/report`, `GET /api/coupons/campaign-check/{id}`; `list_coupons`, `coupon_report` |
-| See raw codes and who holds them, and export | People who can manage coupons | `GET /api/coupons/{id}/codes`, `GET /api/coupons/{id}/export`; `get_coupon`, `export_coupon_codes` |
-| Create and edit coupons, add and generate codes | People who can manage coupons | `POST /api/coupons`, `PATCH /api/coupons/{id}`, `POST /api/coupons/{id}/codes`, `POST /api/coupons/{id}/generate`; `create_coupon`, `update_coupon`, `add_coupon_codes`, `generate_coupon_codes` |
-| Delete a coupon | Admins, with explicit confirmation | `DELETE /api/coupons/{id}?confirm=true`; `delete_coupon` with `confirm: true` |
+| See coupons, stock, alerts and reports | `content.read` (every role) | `GET /api/coupons`, `GET /api/coupons/{id}`, `GET /api/coupons/report`, `GET /api/coupons/{id}/report`; `list_coupons`, `coupon_report` |
+| A campaign's coupon check | `messaging.read` (every role) | `GET /api/coupons/campaign-check/{campaign_id}` |
+| See raw codes and who holds them, and export | `catalog.write` and `profiles.read` (Managers, Admins, the Owner) | `GET /api/coupons/{id}/codes`, `GET /api/coupons/{id}/export`; `get_coupon`, `export_coupon_codes` |
+| Create and edit coupons, add and generate codes | `catalog.write` (Managers, Admins, the Owner) | `POST /api/coupons`, `PATCH /api/coupons/{id}`, `POST /api/coupons/{id}/codes`, `POST /api/coupons/{id}/generate`; `create_coupon`, `update_coupon`, `add_coupon_codes`, `generate_coupon_codes` |
+| Delete a coupon | `catalog.delete` (Admins, the Owner), with `confirm=true` | `DELETE /api/coupons/{id}?confirm=true`; `delete_coupon` with `confirm: true` |
 
-Today every signed-in member of an account and every API key can do all of these; the team and roles layer will enforce this table.
+API keys follow the same rules through their scopes (`content` for writes, `content:read` for reads, plus `audience:read` for raw codes). Creating, changing, adding or generating codes, exporting and deleting are recorded in the audit log with counts, never codes. Sign-up form codes are handed out by the public form routes.
 
 ## For store integrations
 

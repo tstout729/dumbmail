@@ -859,7 +859,21 @@ async fn mcp_tools_cover_coupons_and_delete_needs_confirm() {
     let mut h = harness!();
     h.signup().await;
     let acct = account_id(&h).await;
-    let ctx = dumbmail::auth::Ctx { account_id: acct, user_id: None, via_api_key: true };
+    let ctx = dumbmail::auth::Ctx {
+        account_id: acct,
+        user_id: None,
+        via_api_key: true,
+        role: dumbmail::features::team::Role::Owner,
+        api_key_id: None,
+        scopes: Some(vec!["full".into()]),
+        session_id: None,
+        sso_session: false,
+        restriction: None,
+        reauth_at: None,
+        google_sign_in_at: None,
+        ip: None,
+        user_agent: None,
+    };
     let names: Vec<String> = dumbmail::features::mcp_tools().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
     for n in ["list_coupons", "get_coupon", "create_coupon", "update_coupon", "add_coupon_codes", "generate_coupon_codes", "export_coupon_codes", "delete_coupon", "coupon_report"] {
         assert!(names.iter().any(|x| x == n), "{n}");
@@ -887,5 +901,55 @@ async fn mcp_tools_cover_coupons_and_delete_needs_confirm() {
     assert_eq!(call("coupon_report", json!({})).await.unwrap()["data"][0]["name"], "MCP");
     call("delete_coupon", json!({"id": "MCP", "confirm": true})).await.unwrap();
     assert_eq!(call("list_coupons", json!({})).await.unwrap()["total"], 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn roles_decide_who_sees_codes_changes_coupons_or_deletes_them_and_the_log_keeps_counts_only() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let id = coupon(&mut h, "ROLES", &["ROLE-0001", "ROLE-0002"]).await;
+    let as_role = |db: sqlx::PgPool, role: &'static str| async move {
+        sqlx::query("UPDATE memberships SET role = $2 WHERE account_id = $1").bind(acct).bind(role).execute(&db).await.unwrap();
+    };
+    let read = format!("/api/coupons/{id}");
+    let codes = format!("/api/coupons/{id}/codes");
+    let export = format!("/api/coupons/{id}/export");
+    let report = format!("/api/coupons/{id}/report");
+    // (role, can read coupons and reports, can see raw codes, can add codes, can delete)
+    for (role, reads, raw, writes, deletes) in [
+        ("content", true, false, false, false),
+        ("analyst", true, false, false, false),
+        ("manager", true, true, true, false),
+        ("admin", true, true, true, true),
+    ] {
+        as_role(h.state.db.clone(), role).await;
+        for p in [&read, &report, &"/api/coupons".to_string()] {
+            assert_eq!(h.req("GET", p, None).await.0.is_success(), reads, "{role} GET {p}");
+        }
+        assert_eq!(h.req("GET", &codes, None).await.0.is_success(), raw, "{role} codes");
+        assert_eq!(h.bytes("GET", &export, "text/plain", vec![]).await.0.is_success(), raw, "{role} export");
+        let (s, _) = h.req("POST", &codes, Some(json!({"codes": [format!("{}-ADD1", role.to_uppercase())]}))).await;
+        assert_eq!(s.is_success(), writes, "{role} add codes: {s}");
+        let (s, _) = h.req("POST", "/api/coupons", Some(json!({"name": format!("NEW {role}")}))).await;
+        assert_eq!(s.is_success(), writes, "{role} create: {s}");
+        // Without confirm=true a delete only explains itself (400); a role that can't delete is refused (403).
+        let (s, _) = h.req("DELETE", &read, None).await;
+        assert_eq!(s, if deletes { StatusCode::BAD_REQUEST } else { StatusCode::FORBIDDEN }, "{role} delete");
+    }
+    as_role(h.state.db.clone(), "owner").await;
+    let (s, _) = h.req("DELETE", &format!("{read}?confirm=true"), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // The audit log records who did what, with counts, never the codes.
+    let rows: Vec<(String, Value)> = sqlx::query_as("SELECT action, details FROM audit_log WHERE account_id = $1 AND action LIKE 'coupon.%' ORDER BY created_at").bind(acct).fetch_all(&h.state.db).await.unwrap();
+    let actions: Vec<&str> = rows.iter().map(|(a, _)| a.as_str()).collect();
+    for want in ["coupon.create", "coupon.codes_add", "coupon.export", "coupon.delete"] {
+        assert!(actions.contains(&want), "{want} in {actions:?}");
+    }
+    for (_, d) in &rows {
+        assert!(!d.to_string().contains("ROLE-0") && !d.to_string().contains("-ADD1"), "no codes in the log: {d}");
+    }
     h.cleanup().await;
 }
