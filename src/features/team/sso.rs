@@ -6,9 +6,20 @@
 //! - only owners set it up;
 //! - each email domain an account's SSO covers must be one of its verified sending domains
 //!   (exactly), and only one account can claim a domain;
-//! - it links to an existing login only when that login is already a member of the account;
-//!   anyone else with a login is invited first. So an identity provider can't take over a login
-//!   it doesn't already share an account with, or one squatted before the company set it up;
+//! - it links to an existing login only when that login is already a member of the account and
+//!   the ID token says the email is verified (`email_verified: true`; a missing claim counts as
+//!   unverified unless the owner said this provider only issues verified emails). Anyone else with
+//!   a login is invited first. So an identity provider can't take over a login it doesn't already
+//!   share an account with, or one squatted before the company set it up;
+//! - a login linked to one identity at a provider is never moved to another by an email match;
+//!   an owner resets the link first (`DELETE /api/team/members/{user_id}/sso`);
+//! - someone removed from the account isn't added back by just-in-time joining until an owner
+//!   or admin invites them again (`team_removals`);
+//! - when the account requires two-factor login, a sign-in counts only if the ID token's `amr`
+//!   claim shows a second factor, or the owner said the provider enforces one; otherwise the
+//!   person also enters their DumbMail code;
+//! - turning single sign-on off, removing it, or pointing it at another provider (issuer or
+//!   client) ends every session it started;
 //! - an identity provider can only sign people in with emails on those domains;
 //! - a single sign-on session opens only that account. It can't open the person's other accounts
 //!   or change their password, two-factor or sessions (see `access::allows`).
@@ -141,10 +152,15 @@ struct Config {
     enforce: bool,
     auto_join: bool,
     default_role: String,
+    verified_emails_only: bool,
+    idp_enforces_mfa: bool,
 }
 
 async fn load(state: &AppState, account_id: Uuid) -> AppResult<Option<Config>> {
-    Ok(sqlx::query_as("SELECT account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role FROM account_sso WHERE account_id = $1")
+    Ok(sqlx::query_as(
+        "SELECT account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role, verified_emails_only, idp_enforces_mfa
+         FROM account_sso WHERE account_id = $1",
+    )
         .bind(account_id)
         .fetch_optional(&state.db)
         .await?)
@@ -156,6 +172,7 @@ pub async fn summary(state: &AppState, account_id: Uuid) -> AppResult<Value> {
         Some(c) => json!({
             "enabled": c.enabled, "issuer": c.issuer, "client_id": c.client_id, "client_secret_hint": c.secret_hint, "domains": c.domains,
             "enforce": c.enforce, "auto_join": c.auto_join, "default_role": c.default_role,
+            "verified_emails_only": c.verified_emails_only, "idp_enforces_mfa": c.idp_enforces_mfa,
             "redirect_uri": redirect_uri(state), "login_url": format!("{}/api/auth/sso?account={}", state.cfg.public_url(), c.account_id),
         }),
         None => Value::Null,
@@ -181,6 +198,12 @@ pub struct SsoBody {
     pub default_role: String,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// This provider only issues verified emails (for providers that never send `email_verified`).
+    #[serde(default)]
+    pub verified_emails_only: bool,
+    /// This provider makes everyone use two-step verification.
+    #[serde(default)]
+    pub idp_enforces_mfa: bool,
 }
 
 fn yes() -> bool {
@@ -245,11 +268,14 @@ pub async fn put_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<
     if meta.token_endpoint().is_none() {
         return Err(AppError::bad("that identity provider doesn't list a token endpoint"));
     }
+    // Off, or another provider: sessions the old settings started end in the same transaction.
+    let replaced = existing.as_ref().is_some_and(|c| c.issuer != issuer || c.client_id != client_id || (c.enabled && !b.enabled));
+    let mut tx = state.db.begin().await?;
     sqlx::query(
-        "INSERT INTO account_sso (account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "INSERT INTO account_sso (account_id, enabled, issuer, client_id, client_secret_enc, secret_hint, domains, enforce, auto_join, default_role, verified_emails_only, idp_enforces_mfa)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (account_id) DO UPDATE SET enabled = $2, issuer = $3, client_id = $4, client_secret_enc = $5, secret_hint = $6, domains = $7,
-            enforce = $8, auto_join = $9, default_role = $10, updated_at = now()",
+            enforce = $8, auto_join = $9, default_role = $10, verified_emails_only = $11, idp_enforces_mfa = $12, updated_at = now()",
     )
     .bind(ctx.account_id)
     .bind(b.enabled)
@@ -261,18 +287,38 @@ pub async fn put_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<
     .bind(b.enforce)
     .bind(b.auto_join)
     .bind(role.as_str())
-    .execute(&state.db)
+    .bind(b.verified_emails_only)
+    .bind(b.idp_enforces_mfa)
+    .execute(&mut *tx)
     .await?;
-    audit(&state, &ctx, if existing.is_some() { "sso.update" } else { "sso.configure" }, Some(&issuer), json!({"domains": domains, "enforce": b.enforce, "auto_join": b.auto_join, "default_role": role.as_str(), "enabled": b.enabled})).await;
+    let ended = if replaced { end_sso_sessions(&mut tx, ctx.account_id).await? } else { 0 };
+    tx.commit().await?;
+    audit(
+        &state,
+        &ctx,
+        if existing.is_some() { "sso.update" } else { "sso.configure" },
+        Some(&issuer),
+        json!({"domains": domains, "enforce": b.enforce, "auto_join": b.auto_join, "default_role": role.as_str(), "enabled": b.enabled,
+               "verified_emails_only": b.verified_emails_only, "idp_enforces_mfa": b.idp_enforces_mfa, "sessions_ended": ended}),
+    )
+    .await;
     Ok(Json(json!({"sso": summary(&state, ctx.account_id).await?, "redirect_uri": redirect_uri(&state)})))
 }
 
+/// End every session this account's single sign-on started.
+async fn end_sso_sessions(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<u64> {
+    Ok(sqlx::query("DELETE FROM sessions WHERE sso_account_id = $1").bind(account_id).execute(&mut *tx).await?.rows_affected())
+}
+
 pub async fn delete_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let n = sqlx::query("DELETE FROM account_sso WHERE account_id = $1").bind(ctx.account_id).execute(&state.db).await?.rows_affected();
+    let mut tx = state.db.begin().await?;
+    let n = sqlx::query("DELETE FROM account_sso WHERE account_id = $1").bind(ctx.account_id).execute(&mut *tx).await?.rows_affected();
     if n == 0 {
         return Err(AppError::not_found("single sign-on settings"));
     }
-    audit(&state, &ctx, "sso.remove", None, json!({})).await;
+    let ended = end_sso_sessions(&mut tx, ctx.account_id).await?;
+    tx.commit().await?;
+    audit(&state, &ctx, "sso.remove", None, json!({"sessions_ended": ended})).await;
     Ok(Json(json!({"sso": null, "redirect_uri": redirect_uri(&state)})))
 }
 
@@ -360,9 +406,9 @@ pub async fn callback_h(State(state): State<AppState>, headers: HeaderMap, jar: 
         return (jar, login_error(&state, "sso_busy"));
     }
     match finish(&state, cookie, q, &meta).await {
-        Ok((user_id, account_id, next)) => match login::start_session(&state, user_id, account_id, "sso", Some(account_id), &meta).await {
+        Ok(Done { user_id, account_id, next, mfa }) => match login::start_session_with(&state, user_id, account_id, "sso", Some(account_id), &meta, login::SessionStart { mfa_ok: mfa, ..Default::default() }).await {
             Ok(token) => {
-                record(&state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "sso"})).await;
+                record(&state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "sso", "second_factor": mfa})).await;
                 (jar.add(session_cookie(&state, token)), Redirect::to(&format!("{}{next}", state.cfg.public_url())))
             }
             Err(_) => (jar, login_error(&state, "sso_failed")),
@@ -378,7 +424,22 @@ pub async fn callback_h(State(state): State<AppState>, headers: HeaderMap, jar: 
 
 type Fail = (&'static str, Option<Uuid>);
 
-async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _meta: &ReqMeta) -> Result<(Uuid, Uuid, String), Fail> {
+struct Done {
+    user_id: Uuid,
+    account_id: Uuid,
+    next: String,
+    /// The sign-in had a second factor (by the `amr` claim, or the owner's word for the provider).
+    mfa: bool,
+}
+
+/// `amr` values (RFC 8176) that mean more than a password was used.
+const SECOND_FACTOR_AMR: [&str; 14] = ["mfa", "mca", "otp", "hwk", "swk", "sc", "pop", "sms", "tel", "fpt", "face", "iris", "retina", "vbm"];
+
+pub fn amr_shows_second_factor<'a>(amr: impl IntoIterator<Item = &'a str>) -> bool {
+    amr.into_iter().any(|v| SECOND_FACTOR_AMR.contains(&v.trim().to_ascii_lowercase().as_str()))
+}
+
+async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _meta: &ReqMeta) -> Result<Done, Fail> {
     let payload = cookie.and_then(|c| auth::verify(&state.cfg.secret_key, &c)).ok_or(("sso_expired", None))?;
     let parts: Vec<&str> = payload.split('|').collect();
     let [account, csrf, nonce, verifier, next] = parts.as_slice() else { return Err(("sso_expired", None)) };
@@ -425,6 +486,10 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     if claims.email_verified() == Some(false) {
         return Err(fail("sso_unverified"));
     }
+    // A missing claim counts as unverified, unless the owner said this provider only issues
+    // verified emails.
+    let verified = claims.email_verified() == Some(true) || cfg.verified_emails_only;
+    let mfa = cfg.idp_enforces_mfa || claims.auth_method_refs().is_some_and(|amr| amr_shows_second_factor(amr.iter().map(|r| r.as_str())));
     let email = claims.email().and_then(|e| normalize_email(e.as_str())).ok_or(fail("sso_unverified"))?;
     let domain = email.rsplit('@').next().unwrap_or("");
     if !cfg.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)) {
@@ -432,56 +497,155 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
     }
     let subject = claims.subject().as_str().to_string();
     let name = claims.name().and_then(|n| n.get(None)).map(|n| mail::plain(n.as_str(), 100)).filter(|n| !n.is_empty());
-    let user_id = match link_user(state, &cfg, &subject, &email, name).await {
-        Ok(Some(uid)) => uid,
-        Ok(None) => return Err(fail("sso_not_member")),
-        Err(_) => return Err(fail("sso_failed")),
-    };
-    let member: Option<String> = sqlx::query_scalar("SELECT role FROM memberships WHERE user_id = $1 AND account_id = $2").bind(user_id).bind(account_id).fetch_optional(&state.db).await.map_err(|_| fail("sso_failed"))?;
-    if member.is_none() {
-        if !cfg.auto_join {
-            return Err(fail("sso_not_member"));
+    match sign_in(state, &cfg, &subject, &email, verified, name).await {
+        Ok(Ok(user_id)) => Ok(Done { user_id, account_id, next, mfa }),
+        Ok(Err(code)) => Err(fail(code)),
+        Err(e) => {
+            tracing::warn!(account = %account_id, error = %e, "SSO sign-in failed");
+            Err(fail("sso_failed"))
         }
-        sqlx::query("INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-            .bind(user_id)
-            .bind(account_id)
-            .bind(&cfg.default_role)
-            .execute(&state.db)
-            .await
-            .map_err(|_| fail("sso_failed"))?;
-        record(state, account_id, &super::audit::Actor { user_id: Some(user_id), ..Default::default() }, "team.join", Some(&email), json!({"role": cfg.default_role, "via": "sso"})).await;
     }
-    Ok((user_id, account_id, next))
 }
 
-/// The login for this identity: one already linked to it; else the login with this email, but only
-/// when it's already a member of this account; else a new login (with auto-join). `None`: there's a
-/// login for this email outside the account (they need an invite first), or auto-join is off.
-async fn link_user(state: &AppState, cfg: &Config, subject: &str, email: &str, name: Option<String>) -> AppResult<Option<Uuid>> {
-    if let Some(uid) = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM sso_identities WHERE issuer = $1 AND subject = $2").bind(&cfg.issuer).bind(subject).fetch_optional(&state.db).await? {
-        return Ok(Some(uid));
-    }
-    let uid = match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1").bind(email).fetch_optional(&state.db).await? {
-        Some(uid) => {
-            let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(uid).bind(cfg.account_id).fetch_one(&state.db).await?;
-            if !member {
-                return Ok(None);
-            }
-            uid
-        }
-        None if cfg.auto_join => {
-            let uid = Uuid::now_v7();
-            sqlx::query("INSERT INTO users (id, email, name) VALUES ($1, $2, $3)").bind(uid).bind(email).bind(name).execute(&state.db).await?;
-            uid
-        }
-        None => return Ok(None),
+/// Find or link the login for this identity and make sure it's a member, all in one transaction.
+/// The login is the one already linked to this subject; else the login with this (verified)
+/// email, only when it's already a member and isn't linked to another subject at this provider;
+/// else a new login (with auto-join). Just-in-time joining refuses anyone removed from the
+/// account until they're invited again. `Ok(Err(code))` is a refusal for the login page.
+async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, verified: bool, name: Option<String>) -> AppResult<Result<Uuid, &'static str>> {
+    let mut tx = state.db.begin().await?;
+    // One sign-in per email at a time, and never alongside a removal of the same person.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("team-member:{}:{email}", cfg.account_id)).execute(&mut *tx).await?;
+    let linked: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sso_identities WHERE issuer = $1 AND subject = $2").bind(&cfg.issuer).bind(subject).fetch_optional(&mut *tx).await?;
+    // An open invite for this verified email counts as being let in (even after a removal).
+    // Owner invites are accepted through their link only.
+    let invite: Option<(Uuid, String)> = if verified {
+        sqlx::query_as(
+            "SELECT id, role FROM team_invites WHERE account_id = $1 AND email = $2 AND role <> 'owner'
+               AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now() FOR UPDATE",
+        )
+        .bind(cfg.account_id)
+        .bind(email)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        None
     };
-    sqlx::query("INSERT INTO sso_identities (issuer, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING").bind(&cfg.issuer).bind(subject).bind(uid).execute(&state.db).await?;
-    Ok(Some(uid))
+    let (uid, new_login) = match linked {
+        Some(uid) => (uid, false),
+        None => {
+            if !verified {
+                return Ok(Err("sso_unverified"));
+            }
+            match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1 FOR UPDATE").bind(email).fetch_optional(&mut *tx).await? {
+                Some(uid) => {
+                    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(uid).bind(cfg.account_id).fetch_one(&mut *tx).await?;
+                    // Never link a login outside the account, even with an invite: whoever made that
+                    // login may not be the person the provider vouches for. They accept the invite
+                    // signed in to their own login instead.
+                    if !member {
+                        return Ok(Err("sso_not_member"));
+                    }
+                    let other: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sso_identities WHERE issuer = $1 AND user_id = $2)").bind(&cfg.issuer).bind(uid).fetch_one(&mut *tx).await?;
+                    if other {
+                        return Ok(Err("sso_relink"));
+                    }
+                    (uid, false)
+                }
+                None if cfg.auto_join || invite.is_some() => {
+                    if invite.is_none() && removed(&mut tx, cfg, subject, email).await? {
+                        return Ok(Err("sso_removed"));
+                    }
+                    let uid: Option<Uuid> = sqlx::query_scalar("INSERT INTO users (id, email, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id")
+                        .bind(Uuid::now_v7())
+                        .bind(email)
+                        .bind(name)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                    let Some(uid) = uid else { return Ok(Err("sso_failed")) };
+                    (uid, true)
+                }
+                None => return Ok(Err("sso_not_member")),
+            }
+        }
+    };
+    if linked.is_none() {
+        // The primary key (issuer, subject) and the unique (issuer, user_id) settle a race: whoever
+        // loses inserts nothing and is refused.
+        let n = sqlx::query("INSERT INTO sso_identities (issuer, subject, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(&cfg.issuer)
+            .bind(subject)
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n != 1 {
+            return Ok(Err("sso_relink"));
+        }
+    }
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(uid).bind(cfg.account_id).fetch_one(&mut *tx).await?;
+    let mut joined_as = None;
+    if !member {
+        let role = match &invite {
+            Some((invite_id, role)) => {
+                sqlx::query("UPDATE team_invites SET accepted_at = now(), accepted_by = $2 WHERE id = $1").bind(invite_id).bind(uid).execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM team_removals WHERE account_id = $1 AND (email = $2 OR (issuer = $3 AND subject = $4))")
+                    .bind(cfg.account_id)
+                    .bind(email)
+                    .bind(&cfg.issuer)
+                    .bind(subject)
+                    .execute(&mut *tx)
+                    .await?;
+                role.clone()
+            }
+            None => {
+                if !cfg.auto_join {
+                    return Ok(Err("sso_not_member"));
+                }
+                if removed(&mut tx, cfg, subject, email).await? {
+                    return Ok(Err("sso_removed"));
+                }
+                cfg.default_role.clone()
+            }
+        };
+        sqlx::query("INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(uid)
+            .bind(cfg.account_id)
+            .bind(&role)
+            .execute(&mut *tx)
+            .await?;
+        joined_as = Some((role, invite.is_some()));
+    }
+    tx.commit().await?;
+    if let Some((role, invited)) = joined_as {
+        record(state, cfg.account_id, &super::audit::Actor { user_id: Some(uid), ..Default::default() }, "team.join", Some(email), json!({"role": role, "via": "sso", "new_login": new_login, "invited": invited})).await;
+    }
+    Ok(Ok(uid))
+}
+
+/// Whether this person was taken off the account and hasn't been invited back.
+async fn removed(tx: &mut sqlx::PgConnection, cfg: &Config, subject: &str, email: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM team_removals WHERE account_id = $1 AND (email = $2 OR (issuer = $3 AND subject = $4)))")
+        .bind(cfg.account_id)
+        .bind(email)
+        .bind(&cfg.issuer)
+        .bind(subject)
+        .fetch_one(&mut *tx)
+        .await?)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn second_factor_from_amr() {
+        assert!(super::amr_shows_second_factor(["pwd", "mfa"]));
+        assert!(super::amr_shows_second_factor(["pwd", "OTP"]));
+        assert!(super::amr_shows_second_factor(["hwk"]));
+        assert!(!super::amr_shows_second_factor(["pwd"]));
+        assert!(!super::amr_shows_second_factor(["pwd", "kba", "pin"]));
+        assert!(!super::amr_shows_second_factor(Vec::<&str>::new()));
+    }
+
     #[test]
     fn domains() {
         assert_eq!(super::clean_domain(" @Acme.com. ").as_deref(), Some("acme.com"));

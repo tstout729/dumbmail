@@ -36,6 +36,17 @@ pub async fn refund(state: &AppState, bucket: &str, window_secs: i64) -> AppResu
     Ok(())
 }
 
+/// How many attempts `bucket` has in the current window, without counting one.
+pub async fn count(state: &AppState, bucket: &str, window_secs: i64) -> AppResult<i32> {
+    let key = sha256_hex(&format!("{bucket}|{window_secs}"));
+    Ok(sqlx::query_scalar("SELECT hits FROM rate_limits WHERE bucket = $1 AND window_start = to_timestamp(floor(extract(epoch FROM now()) / $2) * $2)")
+        .bind(key)
+        .bind(window_secs as f64)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(0))
+}
+
 /// Limit by the caller's address, when the proxy told us one.
 pub async fn hit_ip(state: &AppState, what: &str, ip: Option<&str>, limit: i32, window_secs: i64) -> AppResult<()> {
     match ip {

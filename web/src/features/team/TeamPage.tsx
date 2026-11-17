@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { MailPlus, MoreHorizontal, RefreshCw, ShieldCheck, Trash2, UserMinus, Users } from "lucide-react";
+import { KeyRound, MailPlus, MoreHorizontal, RefreshCw, ShieldCheck, Trash2, UserMinus, Users } from "lucide-react";
 import { errorMessage, useSession } from "../../api";
 import {
   Badge,
@@ -28,12 +28,17 @@ import {
   useLeaveAccount,
   useRemoveMember,
   useResendInvite,
+  useResetSsoLink,
   useRevokeInvite,
   useTeam,
   useTeamSession,
   useTransferOwnership,
 } from "./api";
-import { roleDescriptions, roleLabels, roles, type InviteResult, type Member, type Role } from "./types";
+import { ConfirmIdentityModal } from "./ConfirmIdentity";
+import { roleDescriptions, roleLabels, roles, type Invite, type InviteResult, type Member, type Role } from "./types";
+
+/** A role change that makes or demotes an owner, waiting for the password or code. */
+type OwnerChange = { member: Member; role: Role };
 
 export function TeamPage() {
   const { user, account } = useSession();
@@ -48,9 +53,13 @@ export function TeamPage() {
   const [transferring, setTransferring] = useState<Member | null>(null);
   const [leaving, setLeaving] = useState(false);
   const [resent, setResent] = useState<InviteResult | null>(null);
+  const [ownerChange, setOwnerChange] = useState<OwnerChange | null>(null);
+  const [resendingOwner, setResendingOwner] = useState<Invite | null>(null);
+  const [resettingSso, setResettingSso] = useState<Member | null>(null);
   const remove = useRemoveMember();
   const transfer = useTransferOwnership();
   const leave = useLeaveAccount();
+  const resetSso = useResetSsoLink();
   const tz = account.timezone;
   const members = team.data?.members ?? [];
   const invites = team.data?.invites ?? [];
@@ -102,7 +111,12 @@ export function TeamPage() {
                           className="w-28"
                           value={m.role}
                           disabled={changeRole.isPending}
-                          onChange={(e) => changeRole.mutate({ userId: m.user_id, role: e.target.value as Role })}
+                          onChange={(e) => {
+                            const role = e.target.value as Role;
+                            // Making or demoting an owner asks for the password or a code first.
+                            if (role === "owner" || m.role === "owner") setOwnerChange({ member: m, role });
+                            else changeRole.mutate({ userId: m.user_id, role });
+                          }}
                         >
                           {assignable.map((r) => (
                             <option key={r} value={r}>
@@ -121,8 +135,10 @@ export function TeamPage() {
                         member={m}
                         canRemove={canEdit(m)}
                         canTransfer={myRole === "owner" && m.user_id !== user.id}
+                        canResetSso={myRole === "owner" && m.sso_linked}
                         onRemove={() => setRemoving(m)}
                         onTransfer={() => setTransferring(m)}
+                        onResetSso={() => setResettingSso(m)}
                       />
                     </Td>
                   </tr>
@@ -159,7 +175,10 @@ export function TeamPage() {
                     {canManage ? (
                       <Td>
                         <div className="flex justify-end gap-1">
-                          <IconButton label={`Resend invite to ${i.email}`} onClick={() => resend.mutate(i.id, { onSuccess: setResent })}>
+                          <IconButton
+                            label={`Resend invite to ${i.email}`}
+                            onClick={() => (i.role === "owner" ? setResendingOwner(i) : resend.mutate(i.id, { onSuccess: setResent }))}
+                          >
                             <RefreshCw className="size-3.5" />
                           </IconButton>
                           <IconButton label={`Revoke invite to ${i.email}`} className="hover:text-red-600" onClick={() => revoke.mutate(i.id)}>
@@ -199,7 +218,16 @@ export function TeamPage() {
 
       {inviting ? <InviteModal assignable={assignable} onClose={() => setInviting(false)} /> : null}
       {resent ? <InviteSentModal result={resent} onClose={() => setResent(null)} /> : null}
-      {removing ? (
+      {removing?.role === "owner" ? (
+        <ConfirmIdentityModal
+          title={`Remove ${removing.name || removing.email}?`}
+          body="They lose access to this account right away, and the API keys they made here stop working. Removing an owner needs your password or a code."
+          confirmLabel="Remove"
+          danger
+          onConfirmed={() => remove.mutateAsync(removing.user_id)}
+          onClose={() => setRemoving(null)}
+        />
+      ) : removing ? (
         <ConfirmDialog
           title={`Remove ${removing.name || removing.email}?`}
           body="They lose access to this account right away, and the API keys they made here stop working."
@@ -211,17 +239,53 @@ export function TeamPage() {
         />
       ) : null}
       {transferring ? (
-        <ConfirmDialog
+        <ConfirmIdentityModal
           title={`Make ${transferring.name || transferring.email} the owner?`}
           body="They become the owner, and you become an admin. Only an owner can undo this."
           confirmLabel="Transfer ownership"
           danger
-          loading={transfer.isPending}
-          onConfirm={() => transfer.mutate(transferring.user_id, { onSettled: () => setTransferring(null) })}
+          onConfirmed={() => transfer.mutateAsync(transferring.user_id)}
           onClose={() => setTransferring(null)}
         />
       ) : null}
-      {leaving ? (
+      {ownerChange ? (
+        <ConfirmIdentityModal
+          title={ownerChange.role === "owner" ? `Make ${ownerChange.member.name || ownerChange.member.email} an owner?` : `Change ${ownerChange.member.name || ownerChange.member.email} to ${roleLabels[ownerChange.role]}?`}
+          body={ownerChange.role === "owner" ? "Owners can do everything, including billing, ownership and deleting the account." : "They stop being an owner."}
+          confirmLabel="Change role"
+          onConfirmed={() => changeRole.mutateAsync({ userId: ownerChange.member.user_id, role: ownerChange.role })}
+          onClose={() => setOwnerChange(null)}
+        />
+      ) : null}
+      {resendingOwner ? (
+        <ConfirmIdentityModal
+          title={`Resend the owner invite to ${resendingOwner.email}?`}
+          body="They get a new link; the old one stops working."
+          confirmLabel="Resend invite"
+          onConfirmed={() => resend.mutateAsync(resendingOwner.id).then(setResent)}
+          onClose={() => setResendingOwner(null)}
+        />
+      ) : null}
+      {resettingSso ? (
+        <ConfirmDialog
+          title={`Reset ${resettingSso.name || resettingSso.email}'s single sign-on link?`}
+          body="Their single sign-on sessions here end. The next time they sign in with SSO, their login is linked again by their verified email. Use this when your identity provider gave them a new account."
+          confirmLabel="Reset link"
+          loading={resetSso.isPending}
+          onConfirm={() => resetSso.mutate(resettingSso.user_id, { onSettled: () => setResettingSso(null) })}
+          onClose={() => setResettingSso(null)}
+        />
+      ) : null}
+      {leaving && myRole === "owner" ? (
+        <ConfirmIdentityModal
+          title={`Leave ${account.name}?`}
+          body="Someone will have to invite you again to get back in. Leaving as an owner needs your password or a code."
+          confirmLabel="Leave account"
+          danger
+          onConfirmed={() => leave.mutateAsync(undefined)}
+          onClose={() => setLeaving(false)}
+        />
+      ) : leaving ? (
         <ConfirmDialog
           title={`Leave ${account.name}?`}
           body="Someone will have to invite you again to get back in."
@@ -236,9 +300,20 @@ export function TeamPage() {
   );
 }
 
-function MemberMenu({ member, canRemove, canTransfer, onRemove, onTransfer }: { member: Member; canRemove: boolean; canTransfer: boolean; onRemove: () => void; onTransfer: () => void }) {
+type MemberMenuProps = {
+  member: Member;
+  canRemove: boolean;
+  canTransfer: boolean;
+  canResetSso: boolean;
+  onRemove: () => void;
+  onTransfer: () => void;
+  onResetSso: () => void;
+};
+
+function MemberMenu({ member, canRemove, canTransfer, canResetSso, onRemove, onTransfer, onResetSso }: MemberMenuProps) {
   const items = [
     ...(canTransfer ? [{ label: "Make owner (transfer)", icon: <ShieldCheck className="size-3.5" />, onSelect: onTransfer }] : []),
+    ...(canResetSso ? [{ label: "Reset single sign-on link", icon: <KeyRound className="size-3.5" />, onSelect: onResetSso }] : []),
     ...(canRemove ? [{ label: "Remove from account", icon: <Trash2 className="size-3.5" />, onSelect: onRemove, danger: true }] : []),
   ];
   if (items.length === 0) return null;
@@ -258,14 +333,27 @@ function InviteModal({ assignable, onClose }: { assignable: Role[]; onClose: () 
   const invite = useInvite();
   const [role, setRole] = useState<Role>("manager");
   const [result, setResult] = useState<InviteResult | null>(null);
+  const [ownerEmail, setOwnerEmail] = useState<string | null>(null);
 
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const email = String(new FormData(e.currentTarget).get("email")).trim();
-    invite.mutate({ email, role }, { onSuccess: setResult });
+    // Inviting an owner asks for the password or a code first.
+    if (role === "owner") setOwnerEmail(email);
+    else invite.mutate({ email, role }, { onSuccess: setResult });
   };
 
   if (result) return <InviteSentModal result={result} onClose={onClose} />;
+  if (ownerEmail)
+    return (
+      <ConfirmIdentityModal
+        title={`Invite ${ownerEmail} as an owner?`}
+        body="Owners can do everything, including billing, ownership and deleting the account."
+        confirmLabel="Send invite"
+        onConfirmed={() => invite.mutateAsync({ email: ownerEmail, role: "owner" }).then(setResult)}
+        onClose={() => setOwnerEmail(null)}
+      />
+    );
   return (
     <Modal title="Invite a teammate" onClose={onClose} size="sm">
       <form onSubmit={onSubmit} className="space-y-4">

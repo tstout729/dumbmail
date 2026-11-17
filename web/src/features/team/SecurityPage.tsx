@@ -355,6 +355,8 @@ function SsoSummary({ sso }: { sso: SsoSettings }) {
         <dd className="flex flex-wrap gap-1.5">
           {sso.enabled ? <Badge tone="green">On</Badge> : <Badge>Off</Badge>}
           {sso.enforce ? <Badge tone="blue">Required for these domains</Badge> : null}
+          {sso.verified_emails_only ? <Badge>Trusts its emails as verified</Badge> : null}
+          {sso.idp_enforces_mfa ? <Badge>Counts as two-factor</Badge> : null}
         </dd>
       </div>
       <div className="sm:col-span-2">
@@ -383,6 +385,8 @@ function SsoForm({ current, redirectUri, onDone }: { current: SsoSettings | null
         auto_join: d.get("auto_join") === "on",
         enforce: d.get("enforce") === "on",
         enabled: d.get("enabled") === "on",
+        verified_emails_only: d.get("verified_emails_only") === "on",
+        idp_enforces_mfa: d.get("idp_enforces_mfa") === "on",
       },
       { onSuccess: onDone },
     );
@@ -419,7 +423,19 @@ function SsoForm({ current, redirectUri, onDone }: { current: SsoSettings | null
       <div className="space-y-2">
         <Checkbox name="auto_join" defaultChecked={current?.auto_join ?? true} label="Add new people from these domains when they first sign in" />
         <Checkbox name="enforce" defaultChecked={current?.enforce ?? false} label="Require single sign-on for these domains" description="Owners can still use their password, so a broken provider can't lock everyone out." />
-        <Checkbox name="enabled" defaultChecked={current?.enabled ?? true} label="Turned on" />
+        <Checkbox
+          name="verified_emails_only"
+          defaultChecked={current?.verified_emails_only ?? false}
+          label="This provider only issues verified emails"
+          description="Tick only if your provider never sends email_verified. Otherwise people are linked to an existing login only when the provider says their email is verified."
+        />
+        <Checkbox
+          name="idp_enforces_mfa"
+          defaultChecked={current?.idp_enforces_mfa ?? false}
+          label="Our identity provider enforces two-step verification"
+          description="When this account requires two-factor login, sign-ins through the provider count as two-factor. Otherwise they count only when the provider says a second factor was used, and people also enter their DumbMail code."
+        />
+        <Checkbox name="enabled" defaultChecked={current?.enabled ?? true} label="Turned on" description="Turning it off, or changing the provider, signs out everyone who signed in through it." />
       </div>
       <InlineError message={save.error ? errorMessage(save.error) : null} />
       <div className="flex justify-end gap-2">

@@ -96,14 +96,23 @@ async fn link_domain_guard(
 }
 
 pub fn app(state: AppState) -> Router {
+    app_with(state, Router::new())
+}
+
+/// The app with `extra` routes merged in like a feature's, behind the same permission check.
+/// Tests use it to prove a route without a permission rule is refused.
+#[doc(hidden)]
+pub fn app_with(state: AppState, extra: Router<AppState>) -> Router {
     Router::new()
         .merge(api::router())
         .merge(public::routes())
         .merge(mcp::routes())
         .merge(features::routes())
         .merge(site::routes())
-        // Records successful changes in the audit log (rules in features::team::access).
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), features::team::audit::layer))
+        .merge(extra)
+        // Every matched route is checked against its permission rule before its handler runs
+        // (features::team::access); routes without a rule are refused.
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), features::team::guard::layer))
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), site::host_split))
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))

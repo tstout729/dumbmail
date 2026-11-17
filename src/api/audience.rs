@@ -205,6 +205,7 @@ async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
     if n == 0 {
         return Err(AppError::not_found("profile"));
     }
+    crate::features::team::audit(&state, &ctx, "profile.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -255,7 +256,9 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
 }
 
 async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(import(&state, ctx.account_id, b).await?))
+    let v = import(&state, ctx.account_id, b).await?;
+    crate::features::team::audit(&state, &ctx, "profiles.import", None, json!({"created": v["created"], "updated": v["updated"], "skipped": v["skipped"]})).await;
+    Ok(Json(v))
 }
 
 // ---------- Lists ----------
@@ -342,6 +345,7 @@ async fn delete_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
     if n == 0 {
         return Err(AppError::not_found("list"));
     }
+    crate::features::team::audit(&state, &ctx, "list.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -370,6 +374,7 @@ async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
     core::list_belongs(&state.db, ctx.account_id, id).await?;
     let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(id).bind(&b.profile_ids).execute(&state.db).await?.rows_affected();
+    crate::features::team::audit(&state, &ctx, "list.members_remove", Some(&id.to_string()), json!({"removed": n})).await;
     Ok(Json(json!({"removed": n})))
 }
 
@@ -478,6 +483,7 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
     if n == 0 {
         return Err(AppError::not_found("segment"));
     }
+    crate::features::team::audit(&state, &ctx, "segment.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 

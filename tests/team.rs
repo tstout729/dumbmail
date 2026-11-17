@@ -4,11 +4,11 @@
 #[macro_use]
 mod common;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use common::*;
 use dumbmail::features::team::access;
 use http_body_util::BodyExt;
@@ -20,11 +20,13 @@ use uuid::Uuid;
 struct S {
     cookie: Option<String>,
     ip: String,
+    /// The account this "page" was loaded for; sent on writes like the dashboard does.
+    account: Option<String>,
 }
 
 impl S {
     fn new(ip: &str) -> Self {
-        S { cookie: None, ip: ip.into() }
+        S { cookie: None, ip: ip.into(), account: None }
     }
 }
 
@@ -32,6 +34,9 @@ async fn send(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Val
     let mut b = Request::builder().method(method).uri(path).header("x-real-ip", &s.ip).header(header::USER_AGENT, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Firefox/130.0");
     if let Some(c) = &s.cookie {
         b = b.header(header::COOKIE, c);
+    }
+    if let Some(a) = s.account.as_deref().filter(|_| method != "GET") {
+        b = b.header("x-dumbmail-account", a);
     }
     let req = match body {
         Some(v) => b.header(header::CONTENT_TYPE, "application/json").body(Body::from(v.to_string())).unwrap(),
@@ -47,7 +52,10 @@ async fn send(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Val
     let status = res.status();
     let headers = res.headers().clone();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let v = serde_json::from_slice(&bytes).unwrap_or(json!({"_raw": String::from_utf8_lossy(&bytes)}));
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!({"_raw": String::from_utf8_lossy(&bytes)}));
+    if let (true, Some(a)) = (v["permissions"].is_array(), v["account"]["id"].as_str()) {
+        s.account = Some(a.to_string());
+    }
     (status, v, headers)
 }
 
@@ -119,99 +127,111 @@ fn draft_body() -> Value {
     json!({"channel": "email", "name": "Draft", "content": {"subject": "Hello", "blocks": [{"type": "text", "html": "<p>x</p>"}]}})
 }
 
-// ---- Every route and tool has a permission rule ----
+// ---- Every route and tool has a permission rule, checked on the real router ----
 
-/// Every `.route("path", get(..).post(..))` in the server's source.
-fn routes_in_source() -> BTreeSet<(String, String)> {
-    let method_re = regex::Regex::new(r"(?:^|[^A-Za-z0-9_])(get|post|put|patch|delete|options|head)\(").unwrap();
-    let mut out = BTreeSet::new();
-    let mut stack = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&p).unwrap();
-            let bytes = src.as_bytes();
-            let mut from = 0;
-            while let Some(i) = src[from..].find(".route(\"") {
-                let start = from + i + ".route(".len();
-                // The path literal, then everything up to the matching close paren.
-                let path_end = src[start + 1..].find('"').unwrap() + start + 1;
-                let path = src[start + 1..path_end].to_string();
-                let (mut depth, mut j, mut in_str) = (1i32, path_end + 1, false);
-                while j < bytes.len() && depth > 0 {
-                    match bytes[j] {
-                        b'"' if bytes[j - 1] != b'\\' => in_str = !in_str,
-                        b'(' if !in_str => depth += 1,
-                        b')' if !in_str => depth -= 1,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                let args = &src[path_end + 1..j];
-                for c in method_re.captures_iter(args) {
-                    out.insert((c[1].to_uppercase(), path.clone()));
-                }
-                from = j;
-            }
-        }
-    }
-    out
+/// A request to `rule`'s route with made-up ids and an empty body.
+fn probe(r: &access::RouteRule) -> (String, Body, bool) {
+    let param = regex::Regex::new(r"\{[a-z_]+\}").unwrap();
+    let path = param.replace_all(r.path, "0190a000-0000-7000-8000-000000000000").to_string();
+    let has_body = matches!(r.method, "POST" | "PATCH" | "PUT");
+    (path, if has_body { Body::from("{}") } else { Body::empty() }, has_body)
 }
+
+async fn probe_status(h: &Harness, r: &access::RouteRule, auth: Option<(&str, String)>) -> StatusCode {
+    let (path, body, has_body) = probe(r);
+    let mut b = Request::builder().method(r.method).uri(&path).header("x-real-ip", "198.51.100.200");
+    if has_body {
+        b = b.header(header::CONTENT_TYPE, "application/json");
+    }
+    if let Some((name, value)) = auth {
+        b = b.header(name, value);
+    }
+    h.router.clone().oneshot(b.body(body).unwrap()).await.unwrap().status()
+}
+
+/// Routes the matrix only checks for refusals: calling them for real would end the test's own
+/// sessions or memberships.
+const SELF_ENDING: [(&str, &str); 2] = [("POST", "/api/team/leave"), ("POST", "/api/me/sessions/revoke-others")];
 
 #[tokio::test]
 async fn every_route_and_tool_has_a_permission_rule() {
     let h = harness!();
-    let in_source = routes_in_source();
-    assert!(in_source.len() > 150, "found only {} routes; is the parser broken?", in_source.len());
-    let rules: BTreeSet<(String, String)> = access::all_route_rules().iter().map(|r| (r.method.to_string(), r.path.to_string())).collect();
-    let missing: Vec<_> = in_source.difference(&rules).collect();
-    assert!(missing.is_empty(), "routes without a permission rule (add them to features::team::access::CORE_ROUTES or the feature's access()): {missing:?}");
-    let stale: Vec<_> = rules.difference(&in_source).collect();
-    assert!(stale.is_empty(), "permission rules for routes that don't exist: {stale:?}");
+    let rules = access::all_route_rules();
+    assert!(rules.len() > 150, "found only {} rules", rules.len());
 
-    // Every protected rule matches a real route that refuses anonymous callers.
+    // Every protected route refuses anonymous callers, on the router the app serves.
     let mut wrong = Vec::new();
-    let param = regex::Regex::new(r"\{[a-z_]+\}").unwrap();
-    for r in access::all_route_rules() {
-        if matches!(r.perm, access::Perm::Public) {
-            continue;
-        }
-        let path = param.replace_all(r.path, "0190a000-0000-7000-8000-000000000000").to_string();
-        let mut b = Request::builder().method(r.method).uri(&path);
-        if matches!(r.method, "POST" | "PATCH" | "PUT") {
-            b = b.header(header::CONTENT_TYPE, "application/json");
-        }
-        let body = if matches!(r.method, "POST" | "PATCH" | "PUT") { Body::from("{}") } else { Body::empty() };
-        let res = h.router.clone().oneshot(b.body(body).unwrap()).await.unwrap();
-        if res.status() != StatusCode::UNAUTHORIZED {
-            wrong.push(format!("{} {} -> {}", r.method, r.path, res.status()));
+    for r in rules.iter().filter(|r| r.perm != access::Perm::Public) {
+        let st = probe_status(&h, r, None).await;
+        if st != StatusCode::UNAUTHORIZED {
+            wrong.push(format!("{} {} -> {st}", r.method, r.path));
         }
     }
     assert!(wrong.is_empty(), "protected routes that didn't ask for sign-in: {wrong:?}");
 
-    // Anything unmapped is refused, even for an owner.
-    let ctx = dumbmail::auth::Ctx::system(Uuid::now_v7());
-    let r = access::authorize_route(&h.state, &ctx, &Method::GET, Some("/api/not-mapped"), None).await;
-    assert!(matches!(r, Err(dumbmail::error::AppError::Forbidden(_))));
-    let r = access::authorize_route(&h.state, &ctx, &Method::GET, None, None).await;
-    assert!(matches!(r, Err(dumbmail::error::AppError::Forbidden(_))));
+    // The role matrix: each role gets exactly the routes its permissions allow.
+    let mut owner = S::new("198.51.100.1");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let mut people = vec![(access::Role::Owner, owner.cookie.clone().unwrap())];
+    for role in [access::Role::Admin, access::Role::Manager, access::Role::Analyst, access::Role::Content] {
+        let (s, _) = join(&h, &mut owner, &format!("{}@acme.test", role.as_str()), role.as_str()).await;
+        people.push((role, s.cookie.unwrap()));
+    }
+    let mut wrong = Vec::new();
+    for r in rules.iter().filter(|r| !matches!(r.perm, access::Perm::Public | access::Perm::Mcp)) {
+        for (role, cookie) in &people {
+            let allowed = role.has(r.perm);
+            if allowed && SELF_ENDING.contains(&(r.method, r.path)) {
+                continue;
+            }
+            let st = probe_status(&h, r, Some(("cookie", cookie.clone()))).await;
+            if allowed == (st == StatusCode::FORBIDDEN) || st == StatusCode::UNAUTHORIZED {
+                wrong.push(format!("{} {} as {}: {st} (allowed: {allowed})", r.method, r.path, role.as_str()));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "role matrix mismatches: {wrong:#?}");
 
-    // Every MCP tool has a rule.
-    let mut s = S::new("198.51.100.1");
-    signup(&h, &mut s, "owner@acme.test", "Acme").await;
-    let key = ok(&h, &mut s, "POST", "/api/api-keys", Some(json!({"name": "all"}))).await;
-    let (_, v) = bearer(&h, key["key"].as_str().unwrap(), "POST", "/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))).await;
+    // API keys: a read-only key is refused every route that writes, and every browser-only one.
+    let read = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "ro", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let mut wrong = Vec::new();
+    for r in rules.iter().filter(|r| !matches!(r.perm, access::Perm::Public | access::Perm::Mcp | access::Perm::Me)) {
+        if access::scopes_allow(&["read".to_string()], r.perm) {
+            continue;
+        }
+        let st = probe_status(&h, r, Some(("authorization", format!("Bearer {read}")))).await;
+        if st != StatusCode::FORBIDDEN {
+            wrong.push(format!("{} {} -> {st}", r.method, r.path));
+        }
+    }
+    assert!(wrong.is_empty(), "a read-only key reached: {wrong:?}");
+
+    // A route registered without a rule (as a feature might) is refused, even for an owner, and
+    // the message says what to add where.
+    let extra = axum::Router::new().route("/api/no-rule-here", axum::routing::get(|| async { "secret" }).post(|| async { "changed" }));
+    let app = dumbmail::app_with(h.state.clone(), extra);
+    for m in ["GET", "POST"] {
+        let req = Request::builder().method(m).uri("/api/no-rule-here").header(header::COOKIE, people[0].1.clone()).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{m}");
+        let body = String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("/api/no-rule-here") && body.contains("access()") && body.contains("src/features/team/access.rs"), "{body}");
+    }
+    let req = Request::builder().uri("/api/no-rule-here").body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN, "no rule means refused before sign-in is even looked at");
+    // Paths that match no route reach only the dashboard's static files.
+    let (st, v) = call(&h, &mut S { cookie: Some(people[0].1.clone()), ip: "198.51.100.1".into(), account: None }, "POST", "/api/not-a-route", Some(json!({}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+
+    // Every MCP tool has a rule, and a tool without one is refused naming the fix.
+    let full = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "all"}))).await["key"].as_str().unwrap().to_string();
+    let (_, v) = bearer(&h, &full, "POST", "/mcp", Some(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     assert!(tools.len() > 60);
     let unmapped: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).filter(|n| access::tool_perm(n, &json!({})).is_none()).collect();
     assert!(unmapped.is_empty(), "MCP tools without a permission rule: {unmapped:?}");
+    let (is_err, text, _) = mcp(&h, &full, "made_up_tool", json!({})).await;
+    assert!(is_err && text.contains("no permission rule") && text.contains("core_tool_perm"), "{text}");
     h.cleanup().await;
 }
 
@@ -261,7 +281,9 @@ async fn roles_are_enforced_on_the_server() {
     let c1 = c1["id"].as_str().unwrap();
     sqlx::query("UPDATE campaigns SET status = 'scheduled', send_at = now() + interval '1 day' WHERE id = $1::uuid").bind(c1).execute(&h.state.db).await.unwrap();
     let (st, err) = call(&h, &mut content, "PATCH", &format!("/api/campaigns/{c1}"), Some(json!({"name": "Sneaky"}))).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+    assert_eq!(st, StatusCode::CONFLICT, "{err}");
+    let name: String = sqlx::query_scalar("SELECT name FROM campaigns WHERE id = $1::uuid").bind(c1).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(name, "Draft", "a content member's edit never reaches a scheduled campaign");
     ok(&h, &mut manager, "PATCH", &format!("/api/campaigns/{c1}"), Some(json!({"name": "Fine"}))).await;
     let me = ok(&h, &mut content, "GET", "/api/me", None).await;
     let perms: Vec<&str> = me["permissions"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
@@ -588,15 +610,28 @@ async fn sessions_passwords_and_resets() {
     assert_eq!(status(&h, &mut anon, "POST", "/api/auth/password/reset", Some(json!({"token": token, "password": "again password"}))).await, StatusCode::BAD_REQUEST);
     login(&h, &mut s1, "owner@acme.test", "reset password").await;
 
-    // Too many wrong passwords for one email are refused for a while, even the right one.
-    let mut last = StatusCode::OK;
+    // Strangers guessing from many addresses only slow sign-in down: the right password still works.
     for i in 0..11 {
-        last = status(&h, &mut S::new(&format!("192.0.2.{i}")), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "bad guess!"}))).await;
+        let st = status(&h, &mut S::new(&format!("192.0.2.{i}")), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "bad guess!"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+    let started = std::time::Instant::now();
+    login(&h, &mut S::new("192.0.2.99"), "owner@acme.test", "reset password").await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000), "lots of recent failures for an email slow the next check down");
+    // One address guessing one email is cut off, but that's only them.
+    let mut last = StatusCode::OK;
+    for _ in 0..11 {
+        last = status(&h, &mut S::new("192.0.2.50"), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "bad guess!"}))).await;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(status(&h, &mut S::new("192.0.2.99"), "POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "reset password"}))).await, StatusCode::TOO_MANY_REQUESTS);
+    login(&h, &mut S::new("192.0.2.51"), "owner@acme.test", "reset password").await;
     let audit = ok(&h, &mut s1, "GET", "/api/audit?action=login.failed", None).await;
     assert!(audit["total"].as_i64().unwrap() >= 10, "{audit}");
+
+    // Passwords sign-up used to accept (no upper limit) still sign in.
+    let long = "x".repeat(5000);
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE email = 'owner@acme.test'").bind(dumbmail::auth::hash_password(&long).unwrap()).execute(&h.state.db).await.unwrap();
+    login(&h, &mut S::new("192.0.2.60"), "owner@acme.test", &long).await;
     h.cleanup().await;
 }
 
@@ -698,22 +733,32 @@ async fn audit_log_records_filters_and_exports() {
     ok(&h, &mut owner, "PATCH", "/api/account", Some(json!({"name": "Acme Co"}))).await;
     let key = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "robot", "scopes": ["content", "audience"]}))).await;
     let k = key["key"].as_str().unwrap();
-    let (is_err, _, _) = mcp(&h, k, "create_template", json!({"name": "T", "channel": "email", "content": {"subject": "Private subject", "blocks": [{"type": "text", "html": "<p>secret body</p>"}]}})).await;
+    let (is_err, _, t) = mcp(&h, k, "create_template", json!({"name": "T", "channel": "email", "content": {"subject": "Private subject", "blocks": [{"type": "text", "html": "<p>secret body</p>"}]}})).await;
     assert!(!is_err);
-    let (is_err, _, _) = mcp(&h, k, "create_list", json!({"name": "From MCP"})).await;
+    let (is_err, _, _) = mcp(&h, k, "delete", json!({"type": "template", "id": t["id"]})).await;
     assert!(!is_err);
+    // Dry runs aren't actions.
+    let full = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "full"}))).await["key"].as_str().unwrap().to_string();
+    let (is_err, _, dry) = mcp(&h, &full, "remove_sending_domain", json!({"domain": "acme.test"})).await;
+    assert!(!is_err && dry["dry_run"] == true);
+    let (is_err, _, dry) = mcp(&h, &full, "remove_member", json!({"user_id": Uuid::now_v7()})).await;
+    assert!(is_err || dry["dry_run"] == true);
     let (_, mut analyst) = (0, join(&h, &mut owner, "analyst@acme.test", "analyst").await.0);
 
     let v = ok(&h, &mut owner, "GET", "/api/audit?action=list.delete", None).await;
     assert_eq!(v["total"], 1, "{v}");
     let e = &v["data"][0];
     assert_eq!((e["target"].as_str(), e["actor"]["label"].as_str(), e["actor"]["type"].as_str(), e["ip"].as_str()), (Some(list_id.as_str()), Some("owner@acme.test"), Some("user"), Some("198.51.100.50")));
-    for action in ["login.failed", "campaign.delete", "account.settings_change", "api_key.create", "team.invite", "team.join", "mcp.create_list", "account.signup"] {
+    for action in ["login.failed", "campaign.delete", "account.settings_change", "api_key.create", "team.invite", "team.join", "account.signup", "template.delete"] {
         let v = ok(&h, &mut owner, "GET", &format!("/api/audit?action={action}"), None).await;
         assert!(v["total"].as_i64().unwrap() >= 1, "{action} not recorded");
     }
-    let mcp_entry = ok(&h, &mut owner, "GET", "/api/audit?action=mcp.create_template", None).await;
+    let mcp_entry = ok(&h, &mut owner, "GET", "/api/audit?action=template.delete", None).await;
     assert_eq!(mcp_entry["data"][0]["actor"]["label"], format!("robot ({}…)", key["prefix"].as_str().unwrap()));
+    assert_eq!(mcp_entry["data"][0]["details"], json!({}), "fixed fields, never the tool's arguments");
+    for action in ["domain.remove", "team.member_remove"] {
+        assert_eq!(ok(&h, &mut owner, "GET", &format!("/api/audit?action={action}"), None).await["total"], 0, "{action} dry run was recorded");
+    }
     let all = ok(&h, &mut owner, "GET", "/api/audit?limit=200", None).await.to_string();
     assert!(!all.contains("secret body") && !all.contains("Private subject"), "message content never reaches the audit log");
     assert!(!all.contains(k), "keys never reach the audit log");
@@ -755,7 +800,7 @@ async fn audit_log_records_filters_and_exports() {
 mod oidc {
     use super::*;
     use openidconnect::core::{CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey};
-    use openidconnect::{AccessToken, Audience, EmptyAdditionalClaims, EndUserEmail, IssuerUrl, JsonWebKeyId, Nonce, PrivateSigningKey, StandardClaims, SubjectIdentifier};
+    use openidconnect::{AccessToken, Audience, AuthenticationMethodReference, EmptyAdditionalClaims, EndUserEmail, IssuerUrl, JsonWebKeyId, Nonce, PrivateSigningKey, StandardClaims, SubjectIdentifier};
     use rsa::pkcs1::EncodeRsaPrivateKey;
 
     /// What the next token request for a code should answer with.
@@ -767,6 +812,10 @@ mod oidc {
         pub challenge: String,
         pub audience: String,
         pub bad_key: bool,
+        /// The `email_verified` claim (None leaves it out).
+        pub verified: Option<bool>,
+        /// The `amr` claim (None leaves it out).
+        pub amr: Option<Vec<String>>,
     }
 
     #[derive(Clone, Default)]
@@ -836,10 +885,11 @@ mod oidc {
                         vec![Audience::new(g.audience.clone())],
                         chrono::Utc::now() + chrono::Duration::minutes(5),
                         chrono::Utc::now(),
-                        StandardClaims::new(SubjectIdentifier::new(g.sub.clone())).set_email(Some(EndUserEmail::new(g.email.clone()))).set_email_verified(Some(true)),
+                        StandardClaims::new(SubjectIdentifier::new(g.sub.clone())).set_email(Some(EndUserEmail::new(g.email.clone()))).set_email_verified(g.verified),
                         EmptyAdditionalClaims {},
                     )
-                    .set_nonce(Some(Nonce::new(g.nonce.clone())));
+                    .set_nonce(Some(Nonce::new(g.nonce.clone())))
+                    .set_auth_method_refs(g.amr.clone().map(|v| v.into_iter().map(AuthenticationMethodReference::new).collect()));
                     let id_token = CoreIdToken::new(claims, &key, CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256, Some(&at), None).unwrap();
                     (StatusCode::OK, axum::Json(json!({"access_token": "access-123", "token_type": "Bearer", "expires_in": 300, "id_token": id_token})))
                 }),
@@ -866,7 +916,7 @@ async fn sso_round(h: &Harness, idp: &oidc::Idp, email: &str, sub: &str, tweak: 
     assert_eq!(q["redirect_uri"], "https://pl.test/api/auth/sso/callback");
     assert!(q["scope"].contains("openid"));
     let sso_cookie = headers.get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string()).find(|c| c.starts_with("pl_sso=")).unwrap();
-    let mut g = oidc::Grant { email: email.into(), sub: sub.into(), nonce: q["nonce"].clone(), challenge: q["code_challenge"].clone(), audience: q["client_id"].clone(), bad_key: false };
+    let mut g = oidc::Grant { email: email.into(), sub: sub.into(), nonce: q["nonce"].clone(), challenge: q["code_challenge"].clone(), audience: q["client_id"].clone(), bad_key: false, verified: Some(true), amr: None };
     tweak(&mut g);
     let code = format!("code-{}", Uuid::now_v7().simple());
     idp.grants.lock().unwrap().insert(code.clone(), g);
@@ -933,7 +983,7 @@ async fn single_sign_on_with_openid_connect() {
     assert_eq!((me["user"]["email"].as_str(), me["role"].as_str(), me["sign_in_method"].as_str(), me["account"]["id"].as_str()), (Some("jo@acme.test"), Some("content"), Some("sso"), Some(account_id.as_str())));
     ok(&h, &mut jo, "GET", "/api/campaigns", None).await;
     // An SSO session is only good for this account: it can't change the login or open other accounts.
-    for (m, p) in [("POST", "/api/me/two-factor/setup"), ("POST", "/api/accounts"), ("GET", "/api/me/sessions"), ("POST", "/api/me/password"), ("POST", "/api/accounts/switch")] {
+    for (m, p) in [("POST", "/api/me/two-factor/disable"), ("POST", "/api/accounts"), ("GET", "/api/me/sessions"), ("POST", "/api/me/password"), ("POST", "/api/accounts/switch")] {
         assert_eq!(status(&h, &mut jo, m, p, Some(json!({"name": "x", "account_id": r["account"]["id"]}))).await, StatusCode::FORBIDDEN, "{m} {p}");
     }
     // Signing in again finds the same login by its identity.
@@ -972,5 +1022,405 @@ async fn single_sign_on_with_openid_connect() {
     assert!(ok(&h, &mut owner, "GET", "/api/audit?action=sso.configure", None).await["total"].as_i64().unwrap() == 1);
     ok(&h, &mut owner, "DELETE", "/api/team/sso", None).await;
     assert_eq!(sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.err().map(|e| e.ends_with("sso_unavailable")), Some(true));
+    h.cleanup().await;
+}
+
+// ---- Review findings: each one attacked directly ----
+
+/// Like `call`, with extra headers.
+async fn call_with(h: &Harness, s: &mut S, method: &str, path: &str, body: Option<Value>, extra: &[(&str, &str)]) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(path).header("x-real-ip", &s.ip);
+    if let Some(c) = &s.cookie {
+        b = b.header(header::COOKIE, c);
+    }
+    for (k, v) in extra {
+        b = b.header(*k, *v);
+    }
+    let req = match body {
+        Some(v) => b.header(header::CONTENT_TYPE, "application/json").body(Body::from(v.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    let res = h.router.clone().oneshot(req).await.unwrap();
+    let st = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (st, serde_json::from_slice(&bytes).unwrap_or(json!({"_raw": String::from_utf8_lossy(&bytes)})))
+}
+
+async fn profiles_with_email(h: &Harness, email: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM profiles WHERE email = $1").bind(email).fetch_one(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn content_members_send_test_emails_only_to_the_team() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.80");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (mut content, _) = join(&h, &mut owner, "writer@acme.test", "content").await;
+    let (mut manager, _) = join(&h, &mut owner, "boss@acme.test", "manager").await;
+    let c = ok(&h, &mut content, "POST", "/api/campaigns", Some(draft_body())).await;
+    let test = format!("/api/campaigns/{}/test", c["id"].as_str().unwrap());
+
+    // Someone outside the team: refused, and no profile appears for them.
+    let (st, err) = call(&h, &mut content, "POST", &test, Some(json!({"to": ["victim@elsewhere.test"]}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+    let (st, _) = call(&h, &mut content, "POST", &test, Some(json!({"to": ["writer@acme.test", "victim@elsewhere.test"]}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "one outsider refuses the whole send");
+    assert_eq!(profiles_with_email(&h, "victim@elsewhere.test").await, 0);
+    assert!(!h.state.email.sent().iter().any(|e| e.to == "victim@elsewhere.test"));
+    // A teammate without a profile yet: refused rather than creating one.
+    let (st, err) = call(&h, &mut content, "POST", &test, Some(json!({"to": ["writer@acme.test"]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(profiles_with_email(&h, "writer@acme.test").await, 0);
+
+    // Managers send tests anywhere, as before (making the profile).
+    ok(&h, &mut manager, "POST", &test, Some(json!({"to": ["writer@acme.test", "partner@elsewhere.test"]}))).await;
+    assert_eq!(profiles_with_email(&h, "writer@acme.test").await, 1);
+    // Now the content member can test to their teammate's address.
+    let sent = ok(&h, &mut content, "POST", &test, Some(json!({"to": ["Writer@Acme.test"]}))).await;
+    assert_eq!(sent["sent"], 1);
+
+    // No test texts for content members.
+    let sms = ok(&h, &mut owner, "POST", "/api/campaigns", Some(json!({"channel": "sms", "name": "Text", "content": {"body": "Hi"}}))).await;
+    let (st, err) = call(&h, &mut content, "POST", &format!("/api/campaigns/{}/test", sms["id"].as_str().unwrap()), Some(json!({"to": ["+15035550100"]}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+
+    // Keys need the messaging scope to send tests.
+    let ro = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "ro", "scopes": ["messaging:read"]}))).await["key"].as_str().unwrap().to_string();
+    let (is_err, text, _) = mcp(&h, &ro, "send_test", json!({"campaign_id": c["id"], "to": ["owner@acme.test"]})).await;
+    assert!(is_err && text.contains("messaging scope"), "{text}");
+    let audit = ok(&h, &mut owner, "GET", "/api/audit?action=campaign.test_send", None).await;
+    assert_eq!(audit["total"], 2, "{audit}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_key_never_outlives_or_outranks_the_key_that_made_it() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.81");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let parent = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "parent", "scopes": ["account", "audience"], "expires_in_days": 1}))).await;
+    let pk = parent["key"].as_str().unwrap().to_string();
+    let parent_expiry: chrono::DateTime<chrono::Utc> = parent["expires_at"].as_str().unwrap().parse().unwrap();
+
+    // Asking for no expiry (or a later one) still gets the parent's.
+    let (is_err, _, child) = mcp(&h, &pk, "create_api_key", json!({"name": "forever", "scopes": ["audience"]})).await;
+    assert!(!is_err, "{child}");
+    let child_expiry: chrono::DateTime<chrono::Utc> = child["expires_at"].as_str().expect("capped expiry").parse().unwrap();
+    assert!(child_expiry <= parent_expiry);
+    let (_, _, later) = mcp(&h, &pk, "create_api_key", json!({"name": "later", "scopes": ["audience"], "expires_in_days": 3650})).await;
+    assert!(later["expires_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().unwrap() <= parent_expiry);
+    let ck = child["key"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&h, &ck, "GET", "/api/lists", None).await.0, StatusCode::OK);
+
+    // The child stops when the parent expires, even with a later expiry of its own.
+    sqlx::query("UPDATE api_keys SET expires_at = now() + interval '100 days' WHERE name = 'forever'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE api_keys SET expires_at = now() - interval '1 second' WHERE name = 'parent'").execute(&h.state.db).await.unwrap();
+    assert_eq!(bearer(&h, &ck, "GET", "/api/lists", None).await.0, StatusCode::UNAUTHORIZED);
+    sqlx::query("UPDATE api_keys SET expires_at = now() + interval '1 day' WHERE name = 'parent'").execute(&h.state.db).await.unwrap();
+    assert_eq!(bearer(&h, &ck, "GET", "/api/lists", None).await.0, StatusCode::OK);
+    // A grandchild stops when the top key is revoked, and revoking takes the keys it made along.
+    let (_, _, grand) = mcp(&h, &ck, "create_api_key", json!({"name": "grand", "scopes": ["audience:read"]})).await;
+    assert!(grand["key"].is_null(), "an audience key can't manage keys: {grand}");
+    let revoked = ok(&h, &mut owner, "DELETE", &format!("/api/api-keys/{}", parent["id"].as_str().unwrap()), None).await;
+    assert_eq!(revoked["keys_it_made_revoked"], 2);
+    assert_eq!(bearer(&h, &ck, "GET", "/api/lists", None).await.0, StatusCode::UNAUTHORIZED);
+    // A revoked parent can't make keys either.
+    let (st, _) = bearer(&h, &pk, "POST", "/api/api-keys", Some(json!({"name": "after", "scopes": ["audience"]}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // A full owner key can't make or change owners, over REST or MCP.
+    let full = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "full"}))).await["key"].as_str().unwrap().to_string();
+    let (st, err) = bearer(&h, &full, "POST", "/api/team/invites", Some(json!({"email": "takeover@evil.test", "role": "owner"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+    let (_, admin_id) = join(&h, &mut owner, "admin@acme.test", "admin").await;
+    let (st, _) = bearer(&h, &full, "PATCH", &format!("/api/team/members/{admin_id}"), Some(json!({"role": "owner"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (is_err, _, _) = mcp(&h, &full, "invite_member", json!({"email": "takeover@evil.test", "role": "owner"})).await;
+    assert!(is_err, "not even a dry run");
+    let (is_err, _, _) = mcp(&h, &full, "change_member_role", json!({"user_id": admin_id, "role": "owner"})).await;
+    assert!(is_err);
+    // Other role changes still work by key.
+    let (st, _) = bearer(&h, &full, "PATCH", &format!("/api/team/members/{admin_id}"), Some(json!({"role": "manager"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn ownership_changes_need_a_fresh_password_or_code() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.82");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let (mut admin, admin_id) = join(&h, &mut owner, "admin@acme.test", "admin").await;
+    let stale = || sqlx::query("UPDATE sessions SET reauth_at = now() - interval '11 minutes'");
+    stale().execute(&h.state.db).await.unwrap();
+    let (st, err) = call(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": admin_id}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+    assert!(err["error"]["message"].as_str().unwrap().contains("confirm it's you"));
+    assert_eq!(status(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "co@acme.test", "role": "owner"}))).await, StatusCode::FORBIDDEN);
+    assert_eq!(status(&h, &mut owner, "PATCH", &format!("/api/team/members/{admin_id}"), Some(json!({"role": "owner"}))).await, StatusCode::FORBIDDEN);
+    // Ordinary changes don't need it.
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "m@acme.test", "role": "manager"}))).await;
+    // Wrong password: no; right one: yes, for a few minutes.
+    assert_eq!(status(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"password": "not it"}))).await, StatusCode::BAD_REQUEST);
+    ok(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"password": "correct horse"}))).await;
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "co@acme.test", "role": "owner"}))).await;
+    ok(&h, &mut owner, "POST", "/api/team/transfer", Some(json!({"user_id": admin_id}))).await;
+    assert_eq!(ok(&h, &mut admin, "GET", "/api/me", None).await["role"], "owner");
+    // An owner invite stops working if the owner who sent it isn't an owner anymore.
+    let token = invite_token(&h, "co@acme.test");
+    let (st, _) = call(&h, &mut S::new("198.51.100.83"), "POST", &format!("/api/invites/{token}/accept"), Some(json!({"password": "co password"}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "the inviter was demoted to admin by the transfer");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_stale_tab_cannot_write_to_the_other_account() {
+    let h = harness!();
+    let mut s = S::new("198.51.100.84");
+    let me = signup(&h, &mut s, "owner@acme.test", "Brand A").await;
+    let a = me["account"]["id"].as_str().unwrap().to_string();
+    // One account: older pages and scripts without the header still work.
+    ok(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "A list"}))).await;
+    let me = ok(&h, &mut s, "POST", "/api/accounts", Some(json!({"name": "Brand B"}))).await;
+    let b = me["account"]["id"].as_str().unwrap().to_string();
+
+    // A tab still showing Brand A tries to save while the session is on Brand B.
+    let (st, err) = call_with(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "Meant for A"})), &[("x-dumbmail-account", &a)]).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["error"]["code"], "account_changed");
+    let (st, _) = call_with(&h, &mut s, "PATCH", "/api/account", Some(json!({"name": "Renamed"})), &[("x-dumbmail-account", &a)]).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // With two accounts, a write that doesn't say which is refused too.
+    let mut no_header = S { cookie: s.cookie.clone(), ip: s.ip.clone(), account: None };
+    let (st, _) = call(&h, &mut no_header, "POST", "/api/lists", Some(json!({"name": "Unsure"}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM lists WHERE account_id = $1::uuid").bind(&b).fetch_all(&h.state.db).await.unwrap();
+    assert!(names.is_empty(), "nothing landed in Brand B: {names:?}");
+    let account_name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1::uuid").bind(&b).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(account_name, "Brand B");
+    // The right account goes through; reads and switching don't need it.
+    ok(&h, &mut s, "GET", "/api/lists", None).await;
+    let (st, _) = call_with(&h, &mut s, "POST", "/api/lists", Some(json!({"name": "For B"})), &[("x-dumbmail-account", &b)]).await;
+    assert_eq!(st, StatusCode::OK);
+    ok(&h, &mut s, "POST", "/api/accounts/switch", Some(json!({"account_id": a}))).await;
+    // API keys belong to one account and don't send it.
+    let key = {
+        let (st, k) = call_with(&h, &mut s, "POST", "/api/api-keys", Some(json!({"name": "k"})), &[("x-dumbmail-account", &a)]).await;
+        assert_eq!(st, StatusCode::OK);
+        k["key"].as_str().unwrap().to_string()
+    };
+    assert_eq!(bearer(&h, &key, "POST", "/api/lists", Some(json!({"name": "By key"}))).await.0, StatusCode::OK);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn changing_factors_ends_half_finished_sign_ins() {
+    let h = harness!();
+    let mut s1 = S::new("198.51.100.85");
+    signup(&h, &mut s1, "owner@acme.test", "Acme").await;
+    // A password session from before two-factor was on.
+    let mut before = S::new("198.51.100.86");
+    login(&h, &mut before, "owner@acme.test", "correct horse").await;
+    let setup = ok(&h, &mut s1, "POST", "/api/me/two-factor/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    let on = ok(&h, &mut s1, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(&secret, 0)}))).await;
+    assert_eq!(status(&h, &mut before, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED, "it never entered a code");
+    ok(&h, &mut s1, "GET", "/api/me", None).await;
+
+    // A sign-in waiting on its code ends when new recovery codes are made...
+    let mut pending = S::new("198.51.100.87");
+    assert_eq!(login(&h, &mut pending, "owner@acme.test", "correct horse").await["restriction"], "two_factor_code");
+    let recovery = on["recovery_codes"].as_array().unwrap();
+    ok(&h, &mut s1, "POST", "/api/me/two-factor/recovery-codes", Some(json!({"code": recovery[0]}))).await;
+    assert_eq!(status(&h, &mut pending, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    // ...and when two-factor is turned off, instead of becoming a full session.
+    let mut pending = S::new("198.51.100.88");
+    login(&h, &mut pending, "owner@acme.test", "correct horse").await;
+    ok(&h, &mut s1, "POST", "/api/me/two-factor/disable", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert_eq!(status(&h, &mut pending, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status(&h, &mut pending, "GET", "/api/campaigns", None).await, StatusCode::UNAUTHORIZED);
+    ok(&h, &mut s1, "GET", "/api/campaigns", None).await;
+
+    // A pending sign-in can't accept an invite into another account.
+    let mut other = S::new("198.51.100.89");
+    signup(&h, &mut other, "boss@other.test", "Other").await;
+    ok(&h, &mut other, "POST", "/api/team/invites", Some(json!({"email": "owner@acme.test", "role": "admin"}))).await;
+    let token = invite_token(&h, "owner@acme.test");
+    let setup = ok(&h, &mut s1, "POST", "/api/me/two-factor/setup", None).await;
+    ok(&h, &mut s1, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(setup["secret"].as_str().unwrap(), 0)}))).await;
+    let mut pending = S::new("198.51.100.90");
+    login(&h, &mut pending, "owner@acme.test", "correct horse").await;
+    let (st, err) = call(&h, &mut pending, "POST", &format!("/api/invites/{token}/accept"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{err}");
+    ok(&h, &mut s1, "POST", &format!("/api/invites/{token}/accept"), None).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_password_change_wins_over_a_sign_in_in_flight() {
+    let h = harness!();
+    let mut s = S::new("198.51.100.91");
+    let me = signup(&h, &mut s, "owner@acme.test", "Acme").await;
+    let uid: Uuid = me["user"]["id"].as_str().unwrap().parse().unwrap();
+    let acct: Uuid = me["account"]["id"].as_str().unwrap().parse().unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT credential_version FROM users WHERE id = $1").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    // A sign-in checked the old password; then the password changed before it made its session.
+    ok(&h, &mut s, "POST", "/api/me/password", Some(json!({"current_password": "correct horse", "new_password": "brand new pass"}))).await;
+    use dumbmail::features::team::login::{start_session_with, ReqMeta, SessionStart};
+    let late = start_session_with(&h.state, uid, acct, "password", None, &ReqMeta::default(), SessionStart { credential_version: Some(version), ..Default::default() }).await;
+    assert!(late.is_err(), "a session for the old password must not be made");
+    let now: i32 = sqlx::query_scalar("SELECT credential_version FROM users WHERE id = $1").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    assert!(start_session_with(&h.state, uid, acct, "password", None, &ReqMeta::default(), SessionStart { credential_version: Some(now), ..Default::default() }).await.is_ok());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn previews_and_team_reads_need_their_own_permissions() {
+    let h = harness!();
+    let mut owner = S::new("198.51.100.92");
+    signup(&h, &mut owner, "owner@acme.test", "Acme").await;
+    let p = ok(&h, &mut owner, "POST", "/api/profiles", Some(json!({"email": "zed@customer.test", "first_name": "Zedediah"}))).await;
+    let (mut content, _) = join(&h, &mut owner, "writer@acme.test", "content").await;
+    let body = json!({"channel": "email", "profile_id": p["id"], "content": {"subject": "Hi {{ first_name }} {{ email }}", "blocks": [{"type": "text", "html": "<p>x</p>"}]}});
+    let as_owner = ok(&h, &mut owner, "POST", "/api/render", Some(body.clone())).await;
+    assert!(as_owner["subject"].as_str().unwrap().contains("Zedediah"));
+    let as_content = ok(&h, &mut content, "POST", "/api/render", Some(body)).await;
+    let subject = as_content["subject"].as_str().unwrap();
+    assert!(!subject.contains("Zedediah") && !subject.contains("zed@customer.test") && subject.contains("Alex"), "{subject}");
+    // The same over MCP: a content key gets the sample person.
+    let ck = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "content", "scopes": ["content"]}))).await["key"].as_str().unwrap().to_string();
+    let (is_err, text, r) = mcp(&h, &ck, "render_preview", json!({"channel": "email", "profile_id": p["id"], "content": {"subject": "Hi {{ first_name }}", "blocks": [{"type": "text", "html": "<p>x</p>"}]}})).await;
+    assert!(!is_err && !r.to_string().contains("Zedediah") && r["subject"] == "Hi Alex", "{text}");
+
+    // `read` doesn't include the team or the audit log; the account scope does.
+    let read = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "read", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let acct = ok(&h, &mut owner, "POST", "/api/api-keys", Some(json!({"name": "acct", "scopes": ["account:read"]}))).await["key"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&h, &read, "GET", "/api/team", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&h, &read, "GET", "/api/audit", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(bearer(&h, &read, "GET", "/api/lists", None).await.0, StatusCode::OK);
+    for tool in ["list_team", "get_audit_log"] {
+        let (is_err, text, _) = mcp(&h, &read, tool, json!({})).await;
+        assert!(is_err && text.contains("account:read"), "{tool}: {text}");
+        let (is_err, _, _) = mcp(&h, &acct, tool, json!({})).await;
+        assert!(!is_err, "{tool}");
+    }
+    // Legacy full keys keep everything.
+    let account_id: Uuid = sqlx::query_scalar("SELECT id FROM accounts LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let legacy = dumbmail::api::account::new_api_key(&h.state, account_id, "old").await.unwrap()["key"].as_str().unwrap().to_string();
+    assert_eq!(bearer(&h, &legacy, "GET", "/api/team", None).await.0, StatusCode::OK);
+    h.cleanup().await;
+}
+
+/// An account with single sign-on on acme.test through `idp`, and its owner's browser.
+async fn sso_account(h: &Harness, idp: &oidc::Idp) -> (S, String, Value) {
+    dumbmail::features::team::sso::allow_private_hosts_for_tests();
+    let mut owner = S::new("198.51.100.93");
+    let me = signup(h, &mut owner, "owner@acme.test", "Acme").await;
+    let account_id = me["account"]["id"].as_str().unwrap().to_string();
+    sqlx::query("INSERT INTO sending_domains (id, account_id, domain, status) VALUES ($1, $2::uuid, 'acme.test', 'verified')").bind(Uuid::now_v7()).bind(&account_id).execute(&h.state.db).await.unwrap();
+    let cfg = json!({"issuer": idp.base, "client_id": "client-1", "client_secret": "shh-its-a-secret", "domains": ["acme.test"], "default_role": "content"});
+    ok(h, &mut owner, "PUT", "/api/team/sso", Some(cfg.clone())).await;
+    (owner, account_id, cfg)
+}
+
+fn with(cfg: &Value, extra: Value) -> Value {
+    let mut c = cfg.clone();
+    for (k, v) in extra.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    c
+}
+
+#[tokio::test]
+async fn sso_cannot_undo_a_removal_or_take_over_a_login() {
+    let h = harness!();
+    let idp = oidc::start().await;
+    let (mut owner, _, cfg) = sso_account(&h, &idp).await;
+
+    // Someone removed from the account doesn't come back through just-in-time joining.
+    let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.expect("joins");
+    let jo_id = ok(&h, &mut jo, "GET", "/api/me", None).await["user"]["id"].as_str().unwrap().to_string();
+    ok(&h, &mut owner, "DELETE", &format!("/api/team/members/{jo_id}"), None).await;
+    assert_eq!(status(&h, &mut jo, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.err().as_deref(), Some("sso_removed"));
+    // Not with another email at the provider either (same identity)...
+    assert_eq!(sso_round(&h, &idp, "joanna@acme.test", "idp-jo", |_| {}).await.err().as_deref(), Some("sso_removed"));
+    // ...until an owner or admin invites them again.
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "jo@acme.test", "role": "analyst"}))).await;
+    let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.expect("invited back");
+    assert_eq!(ok(&h, &mut jo, "GET", "/api/me", None).await["role"], "analyst");
+
+    // An unverified email never links to an existing login, least of all an owner's.
+    for verified in [None, Some(false)] {
+        assert_eq!(sso_round(&h, &idp, "owner@acme.test", "attacker", |g| g.verified = verified).await.err().as_deref(), Some("sso_unverified"));
+    }
+    assert_eq!(sso_round(&h, &idp, "new@acme.test", "idp-new", |g| g.verified = None).await.err().as_deref(), Some("sso_unverified"), "nor makes a new one");
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM sso_identities WHERE subject IN ('attacker', 'idp-new')").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, 0);
+
+    // A linked member is never moved to another identity by email; an owner resets the link.
+    let (_, pat_id) = join(&h, &mut owner, "pat@acme.test", "manager").await;
+    sso_round(&h, &idp, "pat@acme.test", "idp-pat", |_| {}).await.expect("links by verified email");
+    assert_eq!(sso_round(&h, &idp, "pat@acme.test", "idp-pat-2", |_| {}).await.err().as_deref(), Some("sso_relink"));
+    let mut pat_sso = sso_round(&h, &idp, "pat@acme.test", "idp-pat", |_| {}).await.unwrap();
+    ok(&h, &mut owner, "POST", "/api/me/reauth", Some(json!({"password": "correct horse"}))).await;
+    ok(&h, &mut owner, "DELETE", &format!("/api/team/members/{pat_id}/sso"), None).await;
+    assert_eq!(status(&h, &mut pat_sso, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED, "the reset ends their SSO sessions");
+    sso_round(&h, &idp, "pat@acme.test", "idp-pat-2", |_| {}).await.expect("links again after the reset");
+    // Owner's word that the provider only issues verified emails lets a missing claim through.
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "verified_emails_only": true})))).await;
+    sso_round(&h, &idp, "new@acme.test", "idp-new", |g| g.verified = None).await.expect("trusted provider");
+    assert_eq!(sso_round(&h, &idp, "other@acme.test", "idp-other", |g| g.verified = Some(false)).await.err().as_deref(), Some("sso_unverified"), "an explicit false still refuses");
+
+    // Turning it off or pointing it at another client ends the sessions it started.
+    let mut s1 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "client_id": "client-2"})))).await;
+    assert_eq!(status(&h, &mut s1, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null})))).await;
+    let mut s2 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "enabled": false})))).await;
+    assert_eq!(status(&h, &mut s2, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null})))).await;
+    let mut s3 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    ok(&h, &mut owner, "DELETE", "/api/team/sso", None).await;
+    assert_eq!(status(&h, &mut s3, "GET", "/api/me", None).await, StatusCode::UNAUTHORIZED);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn sso_counts_as_two_factor_only_with_proof_of_a_second_factor() {
+    let h = harness!();
+    let idp = oidc::start().await;
+    let (mut owner, _, cfg) = sso_account(&h, &idp).await;
+    let (_, _) = join(&h, &mut owner, "pat@acme.test", "manager").await;
+    let setup = ok(&h, &mut owner, "POST", "/api/me/two-factor/setup", None).await;
+    ok(&h, &mut owner, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(setup["secret"].as_str().unwrap(), 0)}))).await;
+    ok(&h, &mut owner, "PATCH", "/api/team/security", Some(json!({"require_two_factor": true}))).await;
+
+    // Password-only at the provider: our own code is still needed.
+    let mut jo = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |g| g.amr = Some(vec!["pwd".into()])).await.unwrap();
+    assert_eq!(ok(&h, &mut jo, "GET", "/api/me", None).await["restriction"], "two_factor_setup");
+    assert_eq!(status(&h, &mut jo, "GET", "/api/campaigns", None).await, StatusCode::FORBIDDEN);
+    // A login that only exists through SSO sets its code up right there...
+    let js = ok(&h, &mut jo, "POST", "/api/me/two-factor/setup", None).await;
+    ok(&h, &mut jo, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(js["secret"].as_str().unwrap(), 0)}))).await;
+    ok(&h, &mut jo, "GET", "/api/campaigns", None).await;
+    let mut jo2 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |_| {}).await.unwrap();
+    assert_eq!(ok(&h, &mut jo2, "GET", "/api/me", None).await["restriction"], "two_factor_code");
+    ok(&h, &mut jo2, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(js["secret"].as_str().unwrap(), 30)}))).await;
+    ok(&h, &mut jo2, "GET", "/api/campaigns", None).await;
+    // ...but one with a password sets it up after signing in with that password.
+    let mut pat = sso_round(&h, &idp, "pat@acme.test", "idp-pat", |_| {}).await.unwrap();
+    assert_eq!(status(&h, &mut pat, "POST", "/api/me/two-factor/setup", None).await, StatusCode::FORBIDDEN);
+
+    // A second factor at the provider (amr) counts.
+    let mut jo3 = sso_round(&h, &idp, "jo@acme.test", "idp-jo", |g| g.amr = Some(vec!["pwd".into(), "otp".into()])).await.unwrap();
+    assert!(ok(&h, &mut jo3, "GET", "/api/me", None).await["restriction"].is_null());
+    // So does the owner's word that the provider enforces it, and that's in the audit log.
+    ok(&h, &mut owner, "PUT", "/api/team/sso", Some(with(&cfg, json!({"client_secret": null, "idp_enforces_mfa": true})))).await;
+    let mut pat2 = sso_round(&h, &idp, "pat@acme.test", "idp-pat", |_| {}).await.unwrap();
+    assert!(ok(&h, &mut pat2, "GET", "/api/me", None).await["restriction"].is_null());
+    let log = ok(&h, &mut owner, "GET", "/api/audit?action=sso.update", None).await;
+    assert_eq!(log["data"][0]["details"]["idp_enforces_mfa"], true);
     h.cleanup().await;
 }

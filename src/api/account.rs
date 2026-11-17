@@ -84,9 +84,7 @@ pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uui
 /// Create an account and its owner. Shared by the signup route and the `create-account` command.
 pub async fn create_account(state: &AppState, email: &str, password: &str, name: Option<String>, company: &str) -> AppResult<(User, Account)> {
     let email = normalize_email(email).ok_or_else(|| AppError::bad("enter a valid email"))?;
-    if password.chars().count() < 8 || password.len() > 200 {
-        return Err(AppError::bad("use a password of 8 to 200 characters"));
-    }
+    team::login::check_new_password(password)?;
     let hash = auth::hash_password(password)?;
     insert_owner(state, &email, Some(hash), None, name, company, None).await
 }
@@ -137,7 +135,9 @@ async fn signup(State(state): State<AppState>, headers: HeaderMap, jar: CookieJa
     let meta = ReqMeta::from_headers(&headers);
     team::login::signup_guard(&state, &meta).await?;
     let (user, account) = create_account(&state, &b.email, &b.password, b.name, &b.company).await?;
-    let token = new_session(&state, user.id, account.id, "password", &meta).await?;
+    // They just typed their password.
+    let how = team::login::SessionStart { entered_password: true, ..Default::default() };
+    let token = team::login::start_session_with(&state, user.id, account.id, "password", None, &meta, how).await?;
     team::audit::record(&state, account.id, &meta.actor(Some(user.id)), "account.signup", None, json!({})).await;
     let me = team::login::me_for_token(&state, &token, &meta).await?;
     Ok((jar.add(session_cookie(&state, token)), Json(me)))
@@ -340,11 +340,17 @@ pub async fn import_brand(state: &AppState, account_id: Uuid, url: &str, apply: 
 }
 
 async fn brand_import(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<BrandImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(import_brand(&state, ctx.account_id, &b.url, b.apply).await?))
+    let v = import_brand(&state, ctx.account_id, &b.url, b.apply).await?;
+    if b.apply {
+        team::audit(&state, &ctx, "account.brand_import", None, json!({})).await;
+    }
+    Ok(Json(v))
 }
 
 async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AccountPatch>) -> AppResult<Json<Account>> {
-    Ok(Json(patch_account(&state, ctx.account_id, b).await?))
+    let a = patch_account(&state, ctx.account_id, b).await?;
+    team::audit(&state, &ctx, "account.settings_change", None, json!({})).await;
+    Ok(Json(a))
 }
 
 pub async fn sending_json(state: &AppState, a: &Account) -> AppResult<Value> {
@@ -388,7 +394,9 @@ pub async fn set_domain(state: &AppState, account_id: Uuid, domain: &str) -> App
 }
 
 async fn add_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
-    Ok(Json(set_domain(&state, ctx.account_id, &b.domain).await?))
+    let v = set_domain(&state, ctx.account_id, &b.domain).await?;
+    team::audit(&state, &ctx, "domain.add", Some(&b.domain), json!({})).await;
+    Ok(Json(v))
 }
 
 /// Re-checks every sending domain.
@@ -404,6 +412,7 @@ async fn verify_one_domain(State(state): State<AppState>, ctx: Ctx, Path(domain)
 
 async fn remove_domain(State(state): State<AppState>, ctx: Ctx, Path(domain): Path<String>) -> AppResult<Json<Value>> {
     crate::domains::remove_sending_domain(&state, ctx.account_id, &domain).await?;
+    team::audit(&state, &ctx, "domain.remove", Some(&domain), json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
@@ -412,7 +421,10 @@ async fn remove_only_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
     let domains: Vec<String> = sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1").bind(ctx.account_id).fetch_all(&state.db).await?;
     match domains.as_slice() {
         [] => {}
-        [only] => crate::domains::remove_sending_domain(&state, ctx.account_id, only).await?,
+        [only] => {
+            crate::domains::remove_sending_domain(&state, ctx.account_id, only).await?;
+            team::audit(&state, &ctx, "domain.remove", Some(only), json!({})).await;
+        }
         _ => return Err(AppError::bad("this account has several sending domains; use DELETE /api/account/domains/{domain}")),
     }
     sending_now(&state, ctx.account_id).await
@@ -420,6 +432,7 @@ async fn remove_only_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
 
 async fn add_link_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
     crate::domains::set_link_domain(&state, ctx.account_id, &b.domain).await?;
+    team::audit(&state, &ctx, "link_domain.set", Some(&b.domain), json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
@@ -430,6 +443,7 @@ async fn verify_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
 
 async fn remove_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     crate::domains::remove_link_domain(&state, ctx.account_id).await?;
+    team::audit(&state, &ctx, "link_domain.remove", None, json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
@@ -467,7 +481,9 @@ async fn checkout(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<C
     if ctx.via_api_key {
         return Err(AppError::Forbidden("add credit from the dashboard".into()));
     }
-    Ok(Json(json!({"url": crate::billing::checkout(&state, ctx.account_id, b.amount).await?})))
+    let url = crate::billing::checkout(&state, ctx.account_id, b.amount).await?;
+    team::audit(&state, &ctx, "billing.checkout", None, json!({"amount": b.amount})).await;
+    Ok(Json(json!({"url": url})))
 }
 
 #[derive(Deserialize)]
@@ -482,6 +498,7 @@ async fn auto_recharge(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
         return Err(AppError::Forbidden("change auto-recharge from the dashboard".into()));
     }
     crate::billing::set_auto_recharge(&state, ctx.account_id, b.enabled, b.threshold, b.amount).await?;
+    team::audit(&state, &ctx, "billing.auto_recharge_change", None, json!({"enabled": b.enabled, "threshold": b.threshold, "amount": b.amount})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -497,6 +514,7 @@ async fn choose_plan(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJso
         return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
     }
     let url = crate::subscription::choose(&state, ctx.account_id, b.tier).await?;
+    team::audit(&state, &ctx, "billing.plan_change", None, json!({"tier": b.tier})).await;
     Ok(Json(json!({"url": url, "billing": billing_json(&state, ctx.account_id).await?})))
 }
 
@@ -505,6 +523,7 @@ async fn cancel_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<
         return Err(AppError::Forbidden("cancel the email plan from the dashboard".into()));
     }
     crate::subscription::cancel(&state.db, ctx.account_id).await?;
+    team::audit(&state, &ctx, "billing.plan_cancel", None, json!({})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -513,6 +532,7 @@ async fn resume_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<
         return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
     }
     crate::subscription::resume(&state.db, ctx.account_id).await?;
+    team::audit(&state, &ctx, "billing.plan_resume", None, json!({})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -544,26 +564,31 @@ struct ClaimBody {
 
 async fn claim_number(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ClaimBody>) -> AppResult<Json<Value>> {
     let row = crate::phone::claim(&state, ctx.account_id, &b.phone_number).await?;
+    team::audit(&state, &ctx, "phone_number.claim", Some(&b.phone_number), json!({})).await;
     Ok(Json(crate::phone::row_json(&row)))
 }
 
 async fn release_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     crate::phone::release(&state, ctx.account_id, id).await?;
+    team::audit(&state, &ctx, "phone_number.release", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn verify_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<crate::phone::TollFreeVerification>) -> AppResult<Json<Value>> {
     let row = crate::phone::submit_verification(&state, ctx.account_id, id, b).await?;
+    team::audit(&state, &ctx, "phone_number.verification_submit", Some(&id.to_string()), json!({})).await;
     Ok(Json(crate::phone::row_json(&row)))
 }
 
 async fn connect_sms(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<crate::phone::ConnectBody>) -> AppResult<Json<Value>> {
     crate::phone::connect(&state, ctx.account_id, b).await?;
+    team::audit(&state, &ctx, "sms_provider.connect", None, json!({})).await;
     Ok(Json(numbers_json(&state, ctx.account_id).await?))
 }
 
 async fn disconnect_sms(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     crate::phone::disconnect(&state, ctx.account_id).await?;
+    team::audit(&state, &ctx, "sms_provider.disconnect", None, json!({})).await;
     Ok(Json(numbers_json(&state, ctx.account_id).await?))
 }
 

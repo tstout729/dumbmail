@@ -1,7 +1,7 @@
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
+use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::features::team::access::{Perm, Restriction, Role};
-use crate::features::team::audit::CtxSlot;
+use crate::features::team::guard::{Authorized, RouteAccess};
 use crate::features::team::login::ReqMeta;
 use crate::state::AppState;
 
@@ -44,9 +44,9 @@ pub fn sha256_hex(s: &str) -> String {
 
 /// The signed-in account (and user, for browser sessions).
 ///
-/// Extracting it also checks permissions: the route's rule in `features::team::access` must be
-/// allowed for this role, API key scopes and sign-in state, or the request is refused before the
-/// handler runs.
+/// Permissions are checked before any handler runs, by `features::team::guard::layer`, for every
+/// route. Extracting `Ctx` hands over the caller the guard already checked; on a public route it
+/// says who's signed in (if anyone) without granting anything.
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub account_id: Uuid,
@@ -62,6 +62,8 @@ pub struct Ctx {
     pub sso_session: bool,
     /// Set while the session still has to finish two-factor or single sign-on.
     pub restriction: Option<Restriction>,
+    /// When this browser session last re-entered its password or a two-factor code.
+    pub reauth_at: Option<chrono::DateTime<chrono::Utc>>,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
 }
@@ -89,6 +91,7 @@ impl Ctx {
             session_id: None,
             sso_session: false,
             restriction: None,
+            reauth_at: None,
             ip: None,
             user_agent: None,
         }
@@ -112,14 +115,15 @@ impl FromRequestParts<AppState> for Ctx {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let ctx = resolve(parts, state).await?;
-        let path = parts.extensions.get::<MatchedPath>().map(|m| m.as_str().to_string());
-        let first_param = RawPathParams::from_request_parts(parts, state).await.ok().and_then(|p| p.iter().next().map(|(_, v)| v.to_string()));
-        crate::features::team::access::authorize_route(state, &ctx, &parts.method, path.as_deref(), first_param.as_deref()).await?;
-        if let Some(slot) = parts.extensions.get::<CtxSlot>() {
-            slot.set(ctx.clone());
+        if let Some(Authorized(ctx)) = parts.extensions.get::<Authorized>() {
+            return Ok(ctx.clone());
         }
-        Ok(ctx)
+        // Only a public route runs without the guard checking a caller; there the caller is
+        // looked up but given nothing extra. Anything else that got here unchecked is refused.
+        match parts.extensions.get::<RouteAccess>() {
+            Some(RouteAccess(rule)) if rule.perm == Perm::Public => resolve(parts, state).await,
+            _ => Err(AppError::Unauthorized),
+        }
     }
 }
 

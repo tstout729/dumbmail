@@ -99,6 +99,8 @@ export type SsoSettings = {
   enforce: boolean;
   auto_join: boolean;
   default_role: Role;
+  verified_emails_only: boolean;
+  idp_enforces_mfa: boolean;
   redirect_uri: string;
   login_url: string;
 };
@@ -112,6 +114,8 @@ export type SsoInput = {
   auto_join: boolean;
   default_role: Role;
   enabled: boolean;
+  verified_emails_only: boolean;
+  idp_enforces_mfa: boolean;
 };
 
 export type AccountSecurity = { require_two_factor: boolean; members_without_two_factor: number; sso: SsoSettings | null };

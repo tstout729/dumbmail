@@ -5,11 +5,13 @@
 
 pub mod access;
 pub mod audit;
+pub mod guard;
 pub mod keys;
 pub mod login;
 pub mod mail;
 pub mod members;
 pub mod ratelimit;
+pub mod sends;
 pub mod sso;
 
 use async_trait::async_trait;
@@ -21,7 +23,7 @@ use uuid::Uuid;
 pub use access::{Perm, Role};
 pub use audit::audit;
 
-use self::access::{rule, Access, RouteRule, ToolRule};
+use self::access::{public, rule, Access, RouteRule, ToolRule};
 use super::{Feature, McpDoc};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
@@ -33,43 +35,45 @@ pub struct Module;
 use Perm::*;
 
 static ROUTE_RULES: &[RouteRule] = &[
-    rule("GET", "/api/team", TeamRead, None),
-    rule("POST", "/api/team/invites", TeamManage, None),
-    rule("POST", "/api/team/invites/{id}/resend", TeamManage, None),
-    rule("DELETE", "/api/team/invites/{id}", TeamManage, None),
-    rule("PATCH", "/api/team/members/{user_id}", TeamManage, None),
-    rule("DELETE", "/api/team/members/{user_id}", TeamManage, None),
-    rule("POST", "/api/team/leave", OwnLogin, None),
-    rule("POST", "/api/team/transfer", Ownership, None),
-    rule("GET", "/api/team/security", TeamRead, None),
-    rule("PATCH", "/api/team/security", Security, None),
-    rule("GET", "/api/team/sso", Ownership, None),
-    rule("PUT", "/api/team/sso", Ownership, None),
-    rule("DELETE", "/api/team/sso", Ownership, None),
-    rule("GET", "/api/invites/{token}", Public, None),
-    rule("POST", "/api/invites/{token}/accept", Public, None),
-    rule("GET", "/api/accounts", TwoFactorStep, None),
-    rule("POST", "/api/accounts", OwnLogin, None),
-    rule("POST", "/api/accounts/switch", TwoFactorStep, None),
-    rule("POST", "/api/auth/two-factor", TwoFactorStep, None),
-    rule("GET", "/api/me/two-factor", TwoFactorStep, None),
-    rule("POST", "/api/me/two-factor/setup", TwoFactorStep, None),
-    rule("POST", "/api/me/two-factor/enable", TwoFactorStep, None),
-    rule("POST", "/api/me/two-factor/disable", OwnLogin, None),
-    rule("POST", "/api/me/two-factor/recovery-codes", OwnLogin, None),
-    rule("GET", "/api/me/sessions", OwnLogin, None),
-    rule("DELETE", "/api/me/sessions/{id}", OwnLogin, None),
-    rule("POST", "/api/me/sessions/revoke-others", OwnLogin, None),
-    rule("POST", "/api/me/password", OwnLogin, None),
-    rule("POST", "/api/auth/password/forgot", Public, None),
-    rule("POST", "/api/auth/password/reset", Public, None),
-    rule("GET", "/api/auth/sso", Public, None),
-    rule("GET", "/api/auth/sso/callback", Public, None),
-    rule("GET", "/api/api-keys", ApiKeys, None),
-    rule("POST", "/api/api-keys", ApiKeys, None),
-    rule("DELETE", "/api/api-keys/{id}", ApiKeys, None),
-    rule("GET", "/api/audit", AuditRead, None),
-    rule("GET", "/api/audit/export", AuditRead, None),
+    rule("GET", "/api/team", TeamRead),
+    rule("POST", "/api/team/invites", TeamManage),
+    rule("POST", "/api/team/invites/{id}/resend", TeamManage),
+    rule("DELETE", "/api/team/invites/{id}", TeamManage),
+    rule("PATCH", "/api/team/members/{user_id}", TeamManage),
+    rule("DELETE", "/api/team/members/{user_id}", TeamManage),
+    rule("DELETE", "/api/team/members/{user_id}/sso", Ownership),
+    rule("POST", "/api/team/leave", OwnLogin),
+    rule("POST", "/api/team/transfer", Ownership),
+    rule("GET", "/api/team/security", TeamRead),
+    rule("PATCH", "/api/team/security", Security),
+    rule("GET", "/api/team/sso", Ownership),
+    rule("PUT", "/api/team/sso", Ownership),
+    rule("DELETE", "/api/team/sso", Ownership),
+    public("GET", "/api/invites/{token}"),
+    public("POST", "/api/invites/{token}/accept"),
+    rule("GET", "/api/accounts", SwitchAccount),
+    rule("POST", "/api/accounts", OwnLogin),
+    rule("POST", "/api/accounts/switch", SwitchAccount),
+    rule("POST", "/api/auth/two-factor", TwoFactorStep),
+    rule("GET", "/api/me/two-factor", TwoFactorStep),
+    rule("POST", "/api/me/two-factor/setup", TwoFactorStep),
+    rule("POST", "/api/me/two-factor/enable", TwoFactorStep),
+    rule("POST", "/api/me/two-factor/disable", OwnLogin),
+    rule("POST", "/api/me/two-factor/recovery-codes", OwnLogin),
+    rule("GET", "/api/me/sessions", OwnLogin),
+    rule("DELETE", "/api/me/sessions/{id}", OwnLogin),
+    rule("POST", "/api/me/sessions/revoke-others", OwnLogin),
+    rule("POST", "/api/me/password", OwnLogin),
+    rule("POST", "/api/me/reauth", ConfirmIdentity),
+    public("POST", "/api/auth/password/forgot"),
+    public("POST", "/api/auth/password/reset"),
+    public("GET", "/api/auth/sso"),
+    public("GET", "/api/auth/sso/callback"),
+    rule("GET", "/api/api-keys", ApiKeys),
+    rule("POST", "/api/api-keys", ApiKeys),
+    rule("DELETE", "/api/api-keys/{id}", ApiKeys),
+    rule("GET", "/api/audit", AuditRead),
+    rule("GET", "/api/audit/export", AuditRead),
 ];
 
 pub(crate) static TOOL_RULES: &[ToolRule] = &[
@@ -106,6 +110,7 @@ impl Feature for Module {
             .route("/api/team/invites/{id}/resend", post(members::resend_h))
             .route("/api/team/invites/{id}", delete(members::revoke_invite_h))
             .route("/api/team/members/{user_id}", patch(members::change_role_h).delete(members::remove_h))
+            .route("/api/team/members/{user_id}/sso", delete(members::reset_sso_h))
             .route("/api/team/leave", post(members::leave_h))
             .route("/api/team/transfer", post(members::transfer_h))
             .route("/api/team/security", get(members::security_h).patch(members::update_security_h))
@@ -124,6 +129,7 @@ impl Feature for Module {
             .route("/api/me/sessions/{id}", delete(login::revoke_session_h))
             .route("/api/me/sessions/revoke-others", post(login::revoke_others_h))
             .route("/api/me/password", post(login::change_password_h))
+            .route("/api/me/reauth", post(login::reauth_h))
             .route("/api/auth/password/forgot", post(login::forgot_h))
             .route("/api/auth/password/reset", post(login::reset_h))
             .route("/api/auth/sso", get(sso::start_h))
@@ -140,15 +146,15 @@ impl Feature for Module {
 
     fn mcp_tools(&self) -> Vec<Value> {
         let roles = json!({"enum": ["owner", "admin", "manager", "analyst", "content"], "description": "owner: everything; admin: everything but ownership; manager: campaigns, flows, forms, audience and content; analyst: read-only plus exports; content: templates and campaign drafts, no sending."});
-        let scopes = json!({"type": "array", "maxItems": 20, "items": {"enum": access::valid_scopes()}, "description": "full (default), read (everything read-only), an area (audience, messaging, content, analytics, account) for read and write, or <area>:read."});
+        let scopes = json!({"type": "array", "maxItems": 20, "items": {"enum": access::valid_scopes()}, "description": "full (default), read (everything read-only except the team and audit log), an area (audience, messaging, content, analytics, account) for read and write, <area>:read, or transactional.send."});
         vec![
             tool("list_team", "List team members", "Members of this account with their roles, two-factor status and last activity, plus open invites.", obj(json!({}), &[]), true, false),
-            tool("invite_member", "Invite a team member", "Email someone an invite to join this account with a role. Without confirm=true it only checks the invite and describes it. Only owners can invite owners.",
+            tool("invite_member", "Invite a team member", "Email someone an invite to join this account with a role. Without confirm=true it only checks the invite and describes it. Owner invites can only be sent from the dashboard by an owner who just confirmed their password or code, never through MCP.",
                 obj(json!({"email": {"type": "string", "maxLength": 254}, "role": roles.clone(), "confirm": {"type": "boolean"}}), &["email", "role"]), false, true),
             tool("resend_invite", "Resend an invite", "Send an open invite again with a new link (the old link stops working) and another 7 days. Requires confirm=true.",
                 obj(json!({"invite_id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["invite_id"]), false, true),
             tool("revoke_invite", "Revoke an invite", "Cancel an open invite so its link stops working.", obj(json!({"invite_id": {"type": "string"}}), &["invite_id"]), false, true),
-            tool("change_member_role", "Change a member's role", "Give a member another role. Only owners can make or change owners; the last owner can't be demoted.",
+            tool("change_member_role", "Change a member's role", "Give a member another role. Making, demoting or removing owners only works in the dashboard (an owner who just confirmed their password or code), never through MCP; the last owner can't be demoted.",
                 obj(json!({"user_id": {"type": "string"}, "role": roles}), &["user_id", "role"]), false, false),
             tool("remove_member", "Remove a team member", "Take someone off this account and revoke the API keys they made here. The last owner can't be removed. Without confirm=true it only describes what would happen.",
                 obj(json!({"user_id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["user_id"]), false, true),

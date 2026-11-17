@@ -36,6 +36,8 @@ const googleErrors: Record<string, string> = {
   sso_not_member: "You're not a member of this account yet. Ask an admin to invite you.",
   sso_unverified: "Your identity provider didn't confirm your email address.",
   sso_busy: "Too many sign-in attempts. Wait a few minutes and try again.",
+  sso_removed: "You were removed from this account. Ask an owner or admin to invite you again.",
+  sso_relink: "Your login is linked to a different identity at your company's provider. Ask the account owner to reset your single sign-on link.",
 };
 
 export function LoginPage() {

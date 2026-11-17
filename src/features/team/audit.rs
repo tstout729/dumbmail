@@ -1,15 +1,13 @@
 //! The audit log: who did what and when.
 //!
-//! Other modules record with [`audit`]. Route changes listed with an action in the permission map
-//! are recorded by [`layer`] after they succeed, and MCP write tools by [`after_tool`], so most of
-//! the app is covered without each handler doing it. Details never hold secrets or message bodies:
-//! [`scrub`] drops anything that looks like one.
+//! It records what happened, not what was asked: each change is recorded by the code that makes
+//! it, right after it's committed (a send started, a member removed), with a small fixed set of
+//! fields for that action. REST handlers and MCP tools record the same actions. Request bodies and
+//! MCP arguments are never copied in, dry runs aren't recorded, and [`scrub`] drops anything that
+//! looks like a secret or message content anyway.
 
-use std::sync::{Arc, Mutex};
-
-use axum::extract::{FromRequestParts, MatchedPath, Query, RawPathParams, Request, State};
+use axum::extract::{Query, State};
 use axum::http::header;
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -17,7 +15,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::access;
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -110,64 +107,16 @@ pub fn scrub(v: Value) -> Value {
     }
 }
 
-// ---- Recording route changes ----
+// ---- Typed entries for campaigns and flows ----
 
-/// Filled by the `Ctx` extractor so [`layer`] knows who made the request.
-#[derive(Clone, Default)]
-pub struct CtxSlot(Arc<Mutex<Option<Ctx>>>);
-
-impl CtxSlot {
-    pub fn set(&self, ctx: Ctx) {
-        if let Ok(mut g) = self.0.lock() {
-            *g = Some(ctx);
-        }
-    }
-    fn take(&self) -> Option<Ctx> {
-        self.0.lock().ok().and_then(|mut g| g.take())
-    }
+/// A campaign change: its id as the target, and its name, channel, status and send time.
+pub async fn campaign(state: &AppState, ctx: &Ctx, action: &str, c: &crate::models::CampaignRow) {
+    audit(state, ctx, action, Some(&c.id.to_string()), json!({"name": c.name, "channel": c.channel, "status": c.status, "send_at": c.send_at})).await;
 }
 
-/// Route middleware: after a successful call to a route whose rule names an audit action, record it
-/// with the route's first path parameter as the target.
-pub async fn layer(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let rule = req.extensions().get::<MatchedPath>().and_then(|m| access::route_rule(req.method(), m.as_str()));
-    let Some(action) = rule.and_then(|r| r.audit) else {
-        return next.run(req).await;
-    };
-    let (mut parts, body) = req.into_parts();
-    let target = RawPathParams::from_request_parts(&mut parts, &state).await.ok().and_then(|p| p.iter().next().map(|(_, v)| v.to_string()));
-    let slot = CtxSlot::default();
-    parts.extensions.insert(slot.clone());
-    let res = next.run(Request::from_parts(parts, body)).await;
-    if res.status().is_success() {
-        if let Some(ctx) = slot.take() {
-            audit(&state, &ctx, action, target.as_deref(), json!({"via": "api"})).await;
-        }
-    }
-    res
-}
-
-/// Argument names worth keeping from an MCP call: ids and short settings, never content.
-const TOOL_ARGS: [&str; 9] = ["id", "campaign_id", "list_id", "type", "status", "domain", "send_at", "version", "phone_number"];
-
-/// Record a successful MCP tool call that changed something. The team tools record their own.
-pub async fn after_tool(state: &AppState, ctx: &Ctx, name: &str, args: &Value) {
-    if super::TOOL_RULES.iter().any(|t| t.name == name) {
-        return;
-    }
-    let Some(perm) = access::tool_perm(name, args) else { return };
-    if !perm.writes() {
-        return;
-    }
-    let mut details = Map::new();
-    details.insert("via".into(), json!("mcp"));
-    for k in TOOL_ARGS {
-        if let Some(v) = args.get(k).filter(|v| v.is_string() || v.is_number() || v.is_boolean()) {
-            details.insert(k.into(), v.clone());
-        }
-    }
-    let target = ["id", "campaign_id", "list_id", "domain", "phone_number"].iter().find_map(|k| args[*k].as_str()).map(str::to_string);
-    audit(state, ctx, &format!("mcp.{name}"), target.as_deref(), Value::Object(details)).await;
+/// A flow change: its id as the target, and its name and status.
+pub async fn flow(state: &AppState, ctx: &Ctx, action: &str, f: &crate::models::FlowRow) {
+    audit(state, ctx, action, Some(&f.id.to_string()), json!({"name": f.name, "status": f.status})).await;
 }
 
 // ---- Reading ----
@@ -194,6 +143,12 @@ fn day_start(tz: chrono_tz::Tz, day: &str) -> AppResult<DateTime<Utc>> {
     let d = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d").map_err(|_| AppError::bad("dates look like 2026-11-17"))?;
     let local = d.and_hms_opt(0, 0, 0).expect("midnight");
     Ok(tz.from_local_datetime(&local).earliest().unwrap_or_else(|| tz.from_utc_datetime(&local)).with_timezone(&Utc))
+}
+
+fn next_day_start(tz: chrono_tz::Tz, day: &str) -> AppResult<DateTime<Utc>> {
+    let d = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d").map_err(|_| AppError::bad("dates look like 2026-11-17"))?;
+    let next = d.succ_opt().ok_or_else(|| AppError::bad("that date is out of range"))?;
+    day_start(tz, &next.format("%Y-%m-%d").to_string())
 }
 
 async fn account_tz(state: &AppState, account_id: Uuid) -> AppResult<chrono_tz::Tz> {
@@ -227,7 +182,8 @@ fn row_json(r: &Row, tz: chrono_tz::Tz) -> Value {
 async fn query_rows(state: &AppState, account_id: Uuid, q: &AuditQuery, limit: i64, offset: i64) -> AppResult<(Vec<Row>, i64, chrono_tz::Tz)> {
     let tz = account_tz(state, account_id).await?;
     let from = q.from.as_deref().filter(|s| !s.trim().is_empty()).map(|d| day_start(tz, d)).transpose()?;
-    let to = q.to.as_deref().filter(|s| !s.trim().is_empty()).map(|d| day_start(tz, d).map(|t| t + chrono::Duration::days(1))).transpose()?;
+    // The end is the next local midnight, not 24 hours later (days are 23 or 25 hours at DST changes).
+    let to = q.to.as_deref().filter(|s| !s.trim().is_empty()).map(|d| next_day_start(tz, d)).transpose()?;
     let mut c = sqlx::QueryBuilder::new("SELECT count(*) FROM audit_log WHERE account_id = ");
     c.push_bind(account_id);
     push_filters(&mut c, q, from, to);
@@ -332,6 +288,17 @@ pub async fn prune(state: &AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_ends_follow_dst() {
+        let la = chrono_tz::America::Los_Angeles;
+        // 2026-11-01 is 25 hours long in Los Angeles; 2026-03-08 is 23.
+        let (a, b) = (day_start(la, "2026-11-01").unwrap(), next_day_start(la, "2026-11-01").unwrap());
+        assert_eq!((b - a).num_hours(), 25);
+        let (a, b) = (day_start(la, "2026-03-08").unwrap(), next_day_start(la, "2026-03-08").unwrap());
+        assert_eq!((b - a).num_hours(), 23);
+        assert_eq!(next_day_start(la, "2026-11-17").unwrap().to_rfc3339(), "2026-11-18T08:00:00+00:00");
+    }
 
     #[test]
     fn scrub_drops_secrets() {

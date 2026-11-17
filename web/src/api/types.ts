@@ -13,6 +13,7 @@ export type ApiErrorCode =
   | "conflict"
   | "limit_reached"
   | "rate_limited"
+  | "account_changed"
   | "internal";
 
 export type Profile = {

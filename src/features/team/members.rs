@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::access::Role;
+use super::access::{require_fresh_sign_in, Role};
 use super::audit::{audit, record};
 use super::login::{self, ReqMeta};
 use super::{mail, ratelimit};
@@ -81,11 +81,26 @@ fn parse_role(s: &str) -> AppResult<Role> {
     Role::parse(s).ok_or_else(|| AppError::bad("role must be owner, admin, manager, analyst or content"))
 }
 
+/// Making an owner (an owner invite, or resending one) takes an owner who re-entered their
+/// password or a code in the last few minutes, in the dashboard.
 fn may_assign(ctx: &Ctx, role: Role) -> AppResult<()> {
-    if role == Role::Owner && ctx.role != Role::Owner {
-        return Err(AppError::Forbidden("only owners can make someone an owner".into()));
+    if role == Role::Owner {
+        if ctx.role != Role::Owner {
+            return Err(AppError::Forbidden("only owners can make someone an owner".into()));
+        }
+        require_fresh_sign_in(ctx)?;
     }
     Ok(())
+}
+
+/// Inside an ownership change's transaction: lock the account's owners and check the person making
+/// the change is still one of them (their role may have changed since the request started).
+async fn owner_acting(tx: &mut sqlx::PgConnection, ctx: &Ctx) -> AppResult<i64> {
+    let ids = owners(tx, ctx.account_id).await?;
+    if !ctx.user_id.is_some_and(|me| ids.contains(&me)) {
+        return Err(AppError::Forbidden("only owners can make, remove or demote owners".into()));
+    }
+    Ok(ids.len() as i64)
 }
 
 async fn inviter_name(state: &AppState, ctx: &Ctx) -> AppResult<String> {
@@ -158,6 +173,10 @@ pub async fn invite(state: &AppState, ctx: &Ctx, b: InviteBody, dry_run: bool) -
     ratelimit::hit(state, &format!("invite:account:{}", ctx.account_id), 30, 3600).await?;
     let token = auth::random_token(32);
     let id = Uuid::now_v7();
+    let mut tx = state.db.begin().await?;
+    if role == Role::Owner {
+        owner_acting(&mut tx, ctx).await?;
+    }
     let expires: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO team_invites (id, account_id, email, role, token_hash, invited_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(days => $7)) RETURNING expires_at",
     )
@@ -168,8 +187,9 @@ pub async fn invite(state: &AppState, ctx: &Ctx, b: InviteBody, dry_run: bool) -
     .bind(auth::sha256_hex(&token))
     .bind(ctx.user_id)
     .bind(INVITE_DAYS as i32)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     let sent = send_invite(state, ctx, &email, role, &token).await?;
     audit(state, ctx, "team.invite", Some(&email), json!({"role": role.as_str(), "email_sent": sent})).await;
     Ok(invite_result(state, id, &email, role, expires, sent, &token))
@@ -191,15 +211,22 @@ pub async fn resend(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
     let role = parse_role(&role)?;
     may_assign(ctx, role)?;
     let token = auth::random_token(32);
-    let expires: DateTime<Utc> = sqlx::query_scalar(
-        "UPDATE team_invites SET token_hash = $3, sent_at = now(), expires_at = now() + make_interval(days => $4) WHERE id = $1 AND account_id = $2 RETURNING expires_at",
+    let mut tx = state.db.begin().await?;
+    if role == Role::Owner {
+        owner_acting(&mut tx, ctx).await?;
+    }
+    let expires: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "UPDATE team_invites SET token_hash = $3, sent_at = now(), expires_at = now() + make_interval(days => $4)
+         WHERE id = $1 AND account_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL RETURNING expires_at",
     )
     .bind(id)
     .bind(ctx.account_id)
     .bind(auth::sha256_hex(&token))
     .bind(INVITE_DAYS as i32)
-    .fetch_one(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
+    let expires = expires.ok_or_else(|| AppError::not_found("invite"))?;
+    tx.commit().await?;
     let sent = send_invite(state, ctx, &email, role, &token).await?;
     audit(state, ctx, "team.invite_resend", Some(&email), json!({"role": role.as_str(), "email_sent": sent})).await;
     Ok(invite_result(state, id, &email, role, expires, sent, &token))
@@ -227,6 +254,8 @@ pub async fn revoke_invite_h(State(state): State<AppState>, ctx: Ctx, Path(id): 
 #[derive(sqlx::FromRow)]
 struct OpenInvite {
     id: Uuid,
+    token_hash: String,
+    invited_by_id: Option<Uuid>,
     account_id: Uuid,
     email: String,
     role: String,
@@ -241,7 +270,7 @@ async fn open_invite(state: &AppState, token: &str) -> AppResult<OpenInvite> {
         return Err(gone());
     }
     sqlx::query_as(
-        "SELECT i.id, i.account_id, i.email, i.role, i.expires_at, a.name AS account_name, COALESCE(u.name, u.email) AS invited_by
+        "SELECT i.id, i.token_hash, i.invited_by AS invited_by_id, i.account_id, i.email, i.role, i.expires_at, a.name AS account_name, COALESCE(u.name, u.email) AS invited_by
          FROM team_invites i JOIN accounts a ON a.id = i.account_id LEFT JOIN users u ON u.id = i.invited_by
          WHERE i.token_hash = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > now()",
     )
@@ -276,17 +305,37 @@ pub struct AcceptBody {
     pub password: Option<String>,
 }
 
-/// Join the account in one transaction; false when the invite was used or revoked meanwhile.
+/// Join the account in one transaction; false when the invite was used, revoked or resent (a new
+/// link) meanwhile, or when an owner invite's inviter isn't an owner anymore.
 async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bool> {
     let mut tx = state.db.begin().await?;
-    let n = sqlx::query("UPDATE team_invites SET accepted_at = now(), accepted_by = $2 WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()")
-        .bind(inv.id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let n = sqlx::query(
+        "UPDATE team_invites SET accepted_at = now(), accepted_by = $2
+         WHERE id = $1 AND token_hash = $3 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(inv.id)
+    .bind(user_id)
+    .bind(&inv.token_hash)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if n != 1 {
         return Ok(false);
+    }
+    if inv.role == Role::Owner.as_str() {
+        let inviter_still_owner = match inv.invited_by_id {
+            Some(by) => sqlx::query_scalar::<_, String>("SELECT role FROM memberships WHERE account_id = $1 AND user_id = $2 FOR SHARE")
+                .bind(inv.account_id)
+                .bind(by)
+                .fetch_optional(&mut *tx)
+                .await?
+                .as_deref()
+                == Some("owner"),
+            None => false,
+        };
+        if !inviter_still_owner {
+            return Ok(false);
+        }
     }
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships WHERE user_id = $1").bind(user_id).fetch_one(&mut *tx).await?;
     if count >= MAX_ACCOUNTS_PER_LOGIN {
@@ -298,6 +347,16 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
         .bind(&inv.role)
         .execute(&mut *tx)
         .await?;
+    // Invited back: single sign-on may let them in again.
+    sqlx::query(
+        "DELETE FROM team_removals WHERE account_id = $1
+           AND (email = $2 OR (issuer, subject) IN (SELECT issuer, subject FROM sso_identities WHERE user_id = $3))",
+    )
+    .bind(inv.account_id)
+    .bind(&inv.email)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -320,6 +379,14 @@ pub async fn accept_h(
     let gone = || AppError::NotFound("this invite link is no longer valid; ask for a new one".into());
     if let Some(c) = session_user(&ctx) {
         let uid = c.user_id.expect("session user");
+        // Only a finished sign-in can join another account: not one still waiting on a code, and
+        // not a single sign-on session (trusted for its own account only).
+        if c.restriction.is_some() {
+            return Err(AppError::Forbidden("finish signing in first, then open the invite link again".into()));
+        }
+        if c.sso_session {
+            return Err(AppError::Forbidden("sign in with your password or Google to accept an invite to another account".into()));
+        }
         let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
         if !login::same(&email, &inv.email) {
             return Err(AppError::Forbidden(format!("this invite was sent to {}; sign in with that email to accept it", mask_email(&inv.email))));
@@ -328,14 +395,12 @@ pub async fn accept_h(
             return Err(gone());
         }
         record(&state, inv.account_id, &meta.actor(Some(uid)), "team.join", Some(&inv.email), json!({"role": inv.role})).await;
-        // Open the new account, unless this is a single sign-on session (trusted for its own account only).
-        if !c.sso_session {
-            if let Some(sid) = c.session_id {
-                sqlx::query("UPDATE sessions SET account_id = $2 WHERE id = $1").bind(sid).bind(inv.account_id).execute(&state.db).await?;
-                sqlx::query("UPDATE users SET last_account_id = $2 WHERE id = $1").bind(uid).bind(inv.account_id).execute(&state.db).await?;
-                let fresh = login::ctx_for_session_id(&state, sid, &meta).await?;
-                return Ok((jar, Json(login::me_json(&state, &fresh).await?)));
-            }
+        // Open the new account.
+        if let Some(sid) = c.session_id {
+            sqlx::query("UPDATE sessions SET account_id = $2 WHERE id = $1").bind(sid).bind(inv.account_id).execute(&state.db).await?;
+            sqlx::query("UPDATE users SET last_account_id = $2 WHERE id = $1").bind(uid).bind(inv.account_id).execute(&state.db).await?;
+            let fresh = login::ctx_for_session_id(&state, sid, &meta).await?;
+            return Ok((jar, Json(login::me_json(&state, &fresh).await?)));
         }
         return Ok((jar, Json(login::me_json(&state, c).await?)));
     }
@@ -344,9 +409,7 @@ pub async fn accept_h(
         return Err(AppError::Conflict(format!("{} already has a DumbMail login; sign in with it to accept", inv.email)));
     }
     let password = b.password.unwrap_or_default();
-    if password.chars().count() < 8 || password.len() > 200 {
-        return Err(AppError::bad("use a password of at least 8 characters"));
-    }
+    login::check_new_password(&password)?;
     let uid = Uuid::now_v7();
     let name = b.name.map(|n| mail::plain(&n, 100)).filter(|n| !n.is_empty());
     sqlx::query("INSERT INTO users (id, email, name, password_hash) VALUES ($1, $2, $3, $4)")
@@ -361,7 +424,8 @@ pub async fn accept_h(
         return Err(gone());
     }
     record(&state, inv.account_id, &meta.actor(Some(uid)), "team.join", Some(&inv.email), json!({"role": inv.role, "new_login": true})).await;
-    let token = login::start_session(&state, uid, inv.account_id, "password", None, &meta).await?;
+    let how = login::SessionStart { entered_password: true, ..Default::default() };
+    let token = login::start_session_with(&state, uid, inv.account_id, "password", None, &meta, how).await?;
     let me = login::me_for_token(&state, &token, &meta).await?;
     Ok((jar.add(crate::api::account::session_cookie(&state, token)), Json(me)))
 }
@@ -401,19 +465,22 @@ async fn member_row(tx: &mut sqlx::PgConnection, account_id: Uuid, user_id: Uuid
     Ok((email, Role::parse(&role).unwrap_or(Role::Analyst)))
 }
 
-/// Lock the account's owners and count them, so two changes can't both remove "the other" owner.
-async fn owners(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<i64> {
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT user_id FROM memberships WHERE account_id = $1 AND role = 'owner' FOR UPDATE").bind(account_id).fetch_all(&mut *tx).await?;
-    Ok(ids.len() as i64)
+/// Lock the account's owners, so two changes can't both remove "the other" owner.
+async fn owners(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<Vec<Uuid>> {
+    Ok(sqlx::query_scalar("SELECT user_id FROM memberships WHERE account_id = $1 AND role = 'owner' FOR UPDATE").bind(account_id).fetch_all(&mut *tx).await?)
 }
 
 pub async fn change_role(state: &AppState, ctx: &Ctx, user_id: Uuid, role: &str) -> AppResult<Value> {
     let new = parse_role(role)?;
     let mut tx = state.db.begin().await?;
-    let owner_count = owners(&mut tx, ctx.account_id).await?;
+    let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, old) = member_row(&mut tx, ctx.account_id, user_id).await?;
-    if (old == Role::Owner || new == Role::Owner) && ctx.role != Role::Owner {
-        return Err(AppError::Forbidden("only owners can make or change owners".into()));
+    if (old == Role::Owner || new == Role::Owner) && old != new {
+        if ctx.role != Role::Owner {
+            return Err(AppError::Forbidden("only owners can make or change owners".into()));
+        }
+        require_fresh_sign_in(ctx)?;
+        owner_acting(&mut tx, ctx).await?;
     }
     if old == Role::Owner && new != Role::Owner && owner_count <= 1 {
         return Err(AppError::Conflict("the last owner can't be demoted; make someone else an owner first, or transfer ownership".into()));
@@ -434,7 +501,7 @@ pub async fn change_role_h(State(state): State<AppState>, ctx: Ctx, Path(user_id
 /// sessions on it (moved to another account of theirs when they have one).
 pub async fn remove(state: &AppState, ctx: &Ctx, user_id: Uuid, dry_run: bool) -> AppResult<Value> {
     let mut tx = state.db.begin().await?;
-    let owner_count = owners(&mut tx, ctx.account_id).await?;
+    let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, role) = member_row(&mut tx, ctx.account_id, user_id).await?;
     let leaving = Some(user_id) == ctx.user_id;
     if role == Role::Owner && ctx.role != Role::Owner && !leaving {
@@ -443,10 +510,30 @@ pub async fn remove(state: &AppState, ctx: &Ctx, user_id: Uuid, dry_run: bool) -
     if role == Role::Owner && owner_count <= 1 {
         return Err(AppError::Conflict("the last owner can't be removed; transfer ownership first".into()));
     }
+    if role == Role::Owner {
+        require_fresh_sign_in(ctx)?;
+        if !leaving {
+            owner_acting(&mut tx, ctx).await?;
+        }
+    }
     if dry_run {
         return Ok(json!({"dry_run": true, "would_remove": {"user_id": user_id, "email": email, "role": role.as_str()}, "message": "Removes their access to this account and revokes the API keys they made here. Call again with confirm=true."}));
     }
+    // Never alongside a single sign-on join of the same person (see `sso::sign_in`).
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("team-member:{}:{email}", ctx.account_id)).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM memberships WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(user_id).execute(&mut *tx).await?;
+    // Remember the removal so single sign-on doesn't add them straight back (see `sso`).
+    sqlx::query(
+        "INSERT INTO team_removals (id, account_id, email, issuer, subject, removed_by)
+         SELECT gen_random_uuid(), $1, $2, NULL, NULL, $3
+         UNION ALL SELECT gen_random_uuid(), $1, $2, i.issuer, i.subject, $3 FROM sso_identities i WHERE i.user_id = $4",
+    )
+    .bind(ctx.account_id)
+    .bind(&email)
+    .bind(ctx.user_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     let keys = sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE account_id = $1 AND created_by = $2 AND revoked_at IS NULL").bind(ctx.account_id).bind(user_id).execute(&mut *tx).await?.rows_affected();
     sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND (sso_account_id = $2 OR (account_id = $2 AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1)))")
         .bind(user_id)
@@ -484,13 +571,32 @@ pub async fn transfer_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     if b.user_id == me {
         return Err(AppError::bad("pick another member to transfer ownership to"));
     }
+    require_fresh_sign_in(&ctx)?;
     let mut tx = state.db.begin().await?;
-    owners(&mut tx, ctx.account_id).await?;
+    owner_acting(&mut tx, &ctx).await?;
     let (email, _) = member_row(&mut tx, ctx.account_id, b.user_id).await?;
     sqlx::query("UPDATE memberships SET role = 'owner' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(b.user_id).execute(&mut *tx).await?;
     sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(me).execute(&mut *tx).await?;
     tx.commit().await?;
     audit(&state, &ctx, "team.ownership_transfer", Some(&email), json!({"previous_owner_now": "admin"})).await;
+    Ok(Json(team_json(&state, ctx.account_id).await?))
+}
+
+/// `DELETE /api/team/members/{user_id}/sso`: unlink a member from this account's identity
+/// provider (owners only), so their next single sign-on links by email again, for example after
+/// the provider gave them a new identity. Their single sign-on sessions here end.
+pub async fn reset_sso_h(State(state): State<AppState>, ctx: Ctx, Path(user_id): Path<Uuid>) -> AppResult<Json<Value>> {
+    let mut tx = state.db.begin().await?;
+    let (email, _) = member_row(&mut tx, ctx.account_id, user_id).await?;
+    let issuer: Option<String> = sqlx::query_scalar("SELECT issuer FROM account_sso WHERE account_id = $1").bind(ctx.account_id).fetch_optional(&mut *tx).await?;
+    let issuer = issuer.ok_or_else(|| AppError::not_found("single sign-on settings"))?;
+    let n = sqlx::query("DELETE FROM sso_identities WHERE user_id = $1 AND issuer = $2").bind(user_id).bind(&issuer).execute(&mut *tx).await?.rows_affected();
+    let ended = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND sso_account_id = $2").bind(user_id).bind(ctx.account_id).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    if n == 0 {
+        return Err(AppError::NotFound(format!("{email} isn't linked to the identity provider")));
+    }
+    audit(&state, &ctx, "team.sso_link_reset", Some(&email), json!({"sessions_ended": ended})).await;
     Ok(Json(team_json(&state, ctx.account_id).await?))
 }
 

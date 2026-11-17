@@ -48,19 +48,21 @@ pub struct KeyBody {
     pub expires_in_days: Option<i64>,
 }
 
-/// Make a key. A key can only make keys with scopes it has itself; the new key acts with the role
-/// of the member behind the request.
+/// Make a key. The new key acts with the role of the member behind the request. A key made by a
+/// key can't have scopes its parent lacks, never expires after its parent, and stops working when
+/// its parent is revoked or expires.
 pub async fn create(state: &AppState, ctx: &Ctx, b: KeyBody) -> AppResult<Value> {
     let name = b.name.as_deref().map(|n| super::mail::plain(n, 100)).filter(|n| !n.is_empty()).unwrap_or_else(|| "API key".into());
     let scopes = normalize_scopes(&b.scopes.unwrap_or_else(|| vec!["full".into()]))?;
-    let created_by = if ctx.via_api_key {
+    let (created_by, parent) = if ctx.via_api_key {
         let caller = ctx.scopes.clone().unwrap_or_default();
         if !scopes_within(&scopes, &caller) {
             return Err(AppError::Forbidden("an API key can only make keys with scopes it has itself".into()));
         }
-        sqlx::query_scalar::<_, Option<Uuid>>("SELECT created_by FROM api_keys WHERE id = $1").bind(ctx.api_key_id).fetch_one(&state.db).await?
+        let by = sqlx::query_scalar::<_, Option<Uuid>>("SELECT created_by FROM api_keys WHERE id = $1").bind(ctx.api_key_id).fetch_one(&state.db).await?;
+        (by, ctx.api_key_id)
     } else {
-        ctx.user_id
+        (ctx.user_id, None)
     };
     if let Some(d) = b.expires_in_days {
         if !(1..=3650).contains(&d) {
@@ -74,9 +76,15 @@ pub async fn create(state: &AppState, ctx: &Ctx, b: KeyBody) -> AppResult<Value>
     let key = format!("{API_KEY_PREFIX}{}", auth::random_token(24));
     let prefix: String = key.chars().take(12).collect();
     let id = Uuid::now_v7();
-    let expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "INSERT INTO api_keys (id, account_id, name, prefix, key_hash, scopes, expires_at, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7::bigint IS NULL THEN NULL ELSE now() + make_interval(days => $7::int) END, $8) RETURNING expires_at",
+    // The parent's expiry caps the new key's (LEAST skips NULLs, so "no expiry" takes the parent's).
+    // The parent must still be live as this commits; a parent revoked a moment ago leaves no row.
+    let expires_at: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+        "INSERT INTO api_keys (id, account_id, name, prefix, key_hash, scopes, expires_at, created_by, parent_key_id)
+         SELECT $1, $2, $3, $4, $5, $6,
+                LEAST(CASE WHEN $7::bigint IS NULL THEN NULL ELSE now() + make_interval(days => $7::int) END, p.expires_at), $8, $9
+         FROM (SELECT 1) one LEFT JOIN api_keys p ON p.id = $9 AND p.account_id = $2
+         WHERE $9::uuid IS NULL OR (p.id IS NOT NULL AND p.revoked_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > now()))
+         RETURNING expires_at",
     )
     .bind(id)
     .bind(ctx.account_id)
@@ -86,9 +94,11 @@ pub async fn create(state: &AppState, ctx: &Ctx, b: KeyBody) -> AppResult<Value>
     .bind(&scopes)
     .bind(b.expires_in_days)
     .bind(created_by)
-    .fetch_one(&state.db)
+    .bind(parent)
+    .fetch_optional(&state.db)
     .await?;
-    audit(state, ctx, "api_key.create", Some(&name), json!({"key_id": id, "key_prefix": prefix, "scopes": scopes, "expires_at": expires_at})).await;
+    let expires_at = expires_at.ok_or(AppError::Unauthorized)?;
+    audit(state, ctx, "api_key.create", Some(&name), json!({"key_id": id, "key_prefix": prefix, "scopes": scopes, "expires_at": expires_at, "parent_key_id": parent})).await;
     Ok(json!({"id": id, "name": name, "prefix": prefix, "scopes": scopes, "expires_at": expires_at, "key": key}))
 }
 
@@ -97,14 +107,33 @@ pub async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJs
 }
 
 pub async fn revoke(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let mut tx = state.db.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL RETURNING name, prefix")
         .bind(id)
         .bind(ctx.account_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await?;
     let (name, prefix) = row.ok_or_else(|| AppError::not_found("API key"))?;
-    audit(state, ctx, "api_key.revoke", Some(&name), json!({"key_id": id, "key_prefix": prefix})).await;
-    Ok(json!({"ok": true}))
+    let children = revoke_descendants(&mut tx, id).await?;
+    tx.commit().await?;
+    audit(state, ctx, "api_key.revoke", Some(&name), json!({"key_id": id, "key_prefix": prefix, "keys_it_made_revoked": children})).await;
+    Ok(json!({"ok": true, "keys_it_made_revoked": children}))
+}
+
+/// Revoke every key made (directly or further down) by key `id`. Keys check their parents on
+/// every call too; this just makes the dashboard show them as gone.
+pub async fn revoke_descendants(tx: &mut sqlx::PgConnection, id: Uuid) -> AppResult<u64> {
+    Ok(sqlx::query(
+        "WITH RECURSIVE down(id, depth) AS (
+           SELECT k.id, 1 FROM api_keys k WHERE k.parent_key_id = $1
+           UNION ALL SELECT k.id, down.depth + 1 FROM api_keys k JOIN down ON k.parent_key_id = down.id WHERE down.depth < 50
+         )
+         UPDATE api_keys SET revoked_at = now() WHERE id IN (SELECT id FROM down) AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected())
 }
 
 pub async fn revoke_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

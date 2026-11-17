@@ -7,7 +7,11 @@
 //! - when an account requires two-factor for everyone, password and Google sign-ins need it too
 //!   (people without it set it up first). Google's own sign-in doesn't count: we can't tell whether
 //!   the Google account has two-step verification, so we ask for our own code;
-//! - single sign-on sessions are exempt, because the identity provider handles it.
+//! - a single sign-on sign-in counts only when the ID token's `amr` claim shows a second factor,
+//!   or the owner said the identity provider enforces one (see `sso`); otherwise it needs our code.
+//!
+//! Changing someone's factors (turning two-factor on or off, new recovery codes) signs out their
+//! sessions that are still waiting on a code, so a half-finished sign-in can't become a full one.
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -43,12 +47,10 @@ impl ReqMeta {
     }
 }
 
-/// The caller's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For
-/// entry (the one the proxy added). Only a valid IP counts.
+/// The caller's address, worked out the same way as for the public endpoints' limits
+/// (`public::client_ip`).
 pub fn client_ip(headers: &HeaderMap) -> Option<String> {
-    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
-    let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
-    get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))
+    crate::public::client_ip(headers)
 }
 
 /// Constant-time string comparison.
@@ -58,14 +60,34 @@ pub fn same(a: &str, b: &str) -> bool {
 
 // ---- Sessions ----
 
+/// How a new session was signed in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionStart {
+    /// The login's `credential_version` the password was checked against. The session is only
+    /// made if it's still current (a password change or reset in the meantime wins).
+    pub credential_version: Option<i32>,
+    /// A second factor is already done (an identity provider that reported one).
+    pub mfa_ok: bool,
+    /// The person just typed their password, which counts as confirming it's them.
+    pub entered_password: bool,
+}
+
 /// Start a browser session. `method` is password, google or sso (`sso_account` is the account
 /// whose identity provider signed them in).
 pub async fn start_session(state: &AppState, user_id: Uuid, account_id: Uuid, method: &str, sso_account: Option<Uuid>, meta: &ReqMeta) -> AppResult<String> {
+    start_session_with(state, user_id, account_id, method, sso_account, meta, SessionStart::default()).await
+}
+
+pub async fn start_session_with(state: &AppState, user_id: Uuid, account_id: Uuid, method: &str, sso_account: Option<Uuid>, meta: &ReqMeta, how: SessionStart) -> AppResult<String> {
     let token = auth::random_token(32);
-    sqlx::query(
-        "INSERT INTO sessions (token_hash, user_id, account_id, expires_at, auth_method, sso_account_id, ip, user_agent)
-         VALUES ($1, $2, $3, now() + interval '30 days', $4, $5, $6, $7)",
+    // One statement, holding the login's row: a reset that changed the password after it was
+    // checked (or is changing it right now) leaves no row to insert from.
+    let n = sqlx::query(
+        "INSERT INTO sessions (id, token_hash, user_id, account_id, expires_at, auth_method, sso_account_id, ip, user_agent, mfa_ok, reauth_at)
+         SELECT $1, $2, u.id, $4, now() + interval '30 days', $5, $6, $7, $8, $9, CASE WHEN $10 THEN now() END
+         FROM users u WHERE u.id = $3 AND ($11::int IS NULL OR u.credential_version = $11) FOR SHARE",
     )
+    .bind(Uuid::now_v7())
     .bind(auth::sha256_hex(&token))
     .bind(user_id)
     .bind(account_id)
@@ -73,10 +95,31 @@ pub async fn start_session(state: &AppState, user_id: Uuid, account_id: Uuid, me
     .bind(sso_account)
     .bind(&meta.ip)
     .bind(&meta.user_agent)
+    .bind(how.mfa_ok)
+    .bind(how.entered_password)
+    .bind(how.credential_version)
     .execute(&state.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if n != 1 {
+        return Err(AppError::BadRequest("your password just changed; sign in again with the new one".into()));
+    }
     sqlx::query("UPDATE users SET last_account_id = $2 WHERE id = $1").bind(user_id).bind(account_id).execute(&state.db).await?;
     Ok(token)
+}
+
+/// Sign out a login's sessions that are still waiting on a two-factor code (or would be after a
+/// change to their factors), except `keep`. Called whenever someone's factors change.
+pub async fn revoke_unverified_sessions(state: &AppState, user_id: Uuid, keep: Option<Uuid>) -> AppResult<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM sessions s USING accounts a WHERE s.user_id = $1 AND a.id = s.account_id AND NOT s.mfa_ok AND s.id IS DISTINCT FROM $2
+           AND (s.auth_method = 'password' OR a.require_two_factor)",
+    )
+    .bind(user_id)
+    .bind(keep)
+    .execute(&state.db)
+    .await?
+    .rows_affected())
 }
 
 /// The account a login opens: the one used last, else the first it joined.
@@ -92,13 +135,15 @@ pub async fn pick_account(state: &AppState, user_id: Uuid) -> AppResult<Option<U
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
-    id: Uuid,
+    id: Option<Uuid>,
+    token_hash: String,
     user_id: Uuid,
     account_id: Uuid,
     auth_method: String,
     mfa_ok: bool,
     sso_account_id: Option<Uuid>,
     last_seen_at: DateTime<Utc>,
+    reauth_at: Option<DateTime<Utc>>,
     role: Option<String>,
     require_two_factor: bool,
     totp_on: bool,
@@ -123,7 +168,7 @@ pub async fn ctx_for_session_id(state: &AppState, sid: Uuid, meta: &ReqMeta) -> 
 
 async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<Uuid>, meta: &ReqMeta) -> AppResult<Ctx> {
     let row: Option<SessionRow> = sqlx::query_as(
-        "SELECT s.id, s.user_id, s.account_id, s.auth_method, s.mfa_ok, s.sso_account_id, s.last_seen_at,
+        "SELECT s.id, s.token_hash, s.user_id, s.account_id, s.auth_method, s.mfa_ok, s.sso_account_id, s.last_seen_at, s.reauth_at,
                 m.role, a.require_two_factor, (u.totp_enabled_at IS NOT NULL) AS totp_on, u.email,
                 COALESCE(sso.enabled AND sso.enforce, false) AS sso_enforced, COALESCE(sso.domains, '{}') AS sso_domains
          FROM sessions s
@@ -143,9 +188,14 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
     if sso_session && r.sso_account_id != Some(r.account_id) {
         return Err(AppError::Unauthorized);
     }
+    // Sessions from before session ids existed get one the first time they're used.
+    let id = match r.id {
+        Some(id) => id,
+        None => sqlx::query_scalar("UPDATE sessions SET id = COALESCE(id, $2) WHERE token_hash = $1 RETURNING id").bind(&r.token_hash).bind(Uuid::now_v7()).fetch_one(&state.db).await?,
+    };
     let restriction = if r.auth_method == "password" && r.totp_on && !r.mfa_ok {
         Some(Restriction::TwoFactorCode)
-    } else if r.require_two_factor && !sso_session && !r.mfa_ok {
+    } else if r.require_two_factor && !r.mfa_ok {
         Some(if r.totp_on { Restriction::TwoFactorCode } else { Restriction::TwoFactorSetup })
     } else if r.sso_enforced && !sso_session && role != Role::Owner && r.sso_domains.iter().any(|d| d.eq_ignore_ascii_case(email_domain(&r.email))) {
         // Owners keep their other sign-in so a broken identity provider can't lock everyone out.
@@ -155,7 +205,7 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
     };
     if r.last_seen_at < Utc::now() - chrono::Duration::minutes(5) {
         sqlx::query("UPDATE sessions SET last_seen_at = now(), ip = COALESCE($2, ip), user_agent = COALESCE($3, user_agent) WHERE id = $1")
-            .bind(r.id)
+            .bind(id)
             .bind(&meta.ip)
             .bind(&meta.user_agent)
             .execute(&state.db)
@@ -168,9 +218,10 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
         role,
         api_key_id: None,
         scopes: None,
-        session_id: Some(r.id),
+        session_id: Some(id),
         sso_session,
         restriction,
+        reauth_at: r.reauth_at,
         ip: meta.ip.clone(),
         user_agent: meta.user_agent.clone(),
     })
@@ -182,9 +233,18 @@ pub async fn key_ctx(state: &AppState, key: &str, meta: &ReqMeta) -> AppResult<C
     if !key.starts_with(auth::API_KEY_PREFIX) {
         return Err(AppError::Unauthorized);
     }
+    // A key made by another key works only while every key above it still does.
     let row: Option<(Uuid, Uuid, Vec<String>, Option<Uuid>)> = sqlx::query_as(
-        "UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
-         RETURNING id, account_id, scopes, created_by",
+        "UPDATE api_keys k SET last_used_at = now() WHERE k.key_hash = $1 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > now())
+           AND NOT EXISTS (
+             WITH RECURSIVE up(id, parent, revoked_at, expires_at, depth) AS (
+               SELECT p.id, p.parent_key_id, p.revoked_at, p.expires_at, 1 FROM api_keys p WHERE p.id = k.parent_key_id
+               UNION ALL
+               SELECT p.id, p.parent_key_id, p.revoked_at, p.expires_at, up.depth + 1 FROM api_keys p JOIN up ON p.id = up.parent WHERE up.depth < 50
+             )
+             SELECT 1 FROM up WHERE up.revoked_at IS NOT NULL OR (up.expires_at IS NOT NULL AND up.expires_at <= now())
+           )
+         RETURNING k.id, k.account_id, k.scopes, k.created_by",
     )
     .bind(auth::sha256_hex(key))
     .fetch_optional(&state.db)
@@ -207,6 +267,7 @@ pub async fn key_ctx(state: &AppState, key: &str, meta: &ReqMeta) -> AppResult<C
         session_id: None,
         sso_session: false,
         restriction: None,
+        reauth_at: None,
         ip: meta.ip.clone(),
         user_agent: meta.user_agent.clone(),
     })
@@ -265,7 +326,9 @@ pub async fn me_json(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
 
 // ---- Password sign-in ----
 
-const MAX_PASSWORD: usize = 1024;
+/// Longest password a new or changed password may be. Signing in checks a password of any length,
+/// because sign-up never had a limit.
+const MAX_NEW_PASSWORD: usize = 1024;
 
 /// A fixed hash to check against when the email is unknown, so both answers take as long.
 fn dummy_hash() -> &'static str {
@@ -273,32 +336,57 @@ fn dummy_hash() -> &'static str {
     H.get_or_init(|| auth::hash_password("dumbmail-not-a-real-password").unwrap_or_default())
 }
 
+/// Window for counting failed sign-ins.
+const LOGIN_WINDOW: i64 = 900;
+
+/// The wait before checking a password for an email that's had `failures` wrong guesses from
+/// anywhere lately: nothing for the first few, then a little more each time, up to 3 seconds. A
+/// wait, not a lockout, so strangers guessing can't keep the real person out.
+pub fn login_delay(failures: i32) -> std::time::Duration {
+    std::time::Duration::from_millis((failures.saturating_sub(5).max(0) as u64 * 200).min(3000))
+}
+
 /// Check an email and password and start a session. The answer is the same for an unknown email,
 /// a wrong password and a login that only uses Google.
+///
+/// Throttling only ever counts failures: per address (30 in 15 minutes) and per email from one
+/// address (10 in 15 minutes) they're refused; per email from everywhere they only slow the next
+/// check down ([`login_delay`]). The right password is never refused because of other people's
+/// wrong guesses.
 pub async fn password_login(state: &AppState, email: &str, password: &str, meta: &ReqMeta) -> AppResult<String> {
     let email = email.trim().to_lowercase();
-    // Per address every attempt counts; per email only failures, so signing in often is fine.
-    ratelimit::hit_ip(state, "login", meta.ip.as_deref(), 30, 900).await?;
+    let ip = meta.ip.as_deref().unwrap_or("unknown");
+    // Counted up front and given back on success, so parallel guesses can't slip past.
+    let ip_bucket = format!("login:ip:{ip}");
+    let pair_bucket = format!("login:email-ip:{email}|{ip}");
     let email_bucket = format!("login:email:{email}");
-    ratelimit::hit(state, &email_bucket, 10, 900).await?;
-    let bad = || AppError::BadRequest("that email and password don't match (if you signed up with Google, use Continue with Google)".into());
-    if password.len() > MAX_PASSWORD {
-        return Err(bad());
+    let ip_limit = if meta.ip.is_some() { 30 } else { 600 };
+    ratelimit::hit(state, &ip_bucket, ip_limit, LOGIN_WINDOW).await?;
+    if let Err(e) = ratelimit::hit(state, &pair_bucket, 10, LOGIN_WINDOW).await {
+        ratelimit::refund(state, &ip_bucket, LOGIN_WINDOW).await?;
+        return Err(e);
     }
-    let row: Option<(Uuid, Option<String>)> = sqlx::query_as("SELECT id, password_hash FROM users WHERE email = $1").bind(&email).fetch_optional(&state.db).await?;
+    let failures = ratelimit::count(state, &email_bucket, LOGIN_WINDOW).await?;
+    tokio::time::sleep(login_delay(failures)).await;
+    let bad = || AppError::BadRequest("that email and password don't match (if you signed up with Google, use Continue with Google)".into());
+    let row: Option<(Uuid, Option<String>, i32)> = sqlx::query_as("SELECT id, password_hash, credential_version FROM users WHERE email = $1").bind(&email).fetch_optional(&state.db).await?;
     let ok = match &row {
-        Some((_, Some(hash))) => auth::verify_password(password, hash),
+        Some((_, Some(hash), _)) => auth::verify_password(password, hash),
         _ => {
             auth::verify_password(password, dummy_hash());
             false
         }
     };
-    let user_id = match row {
-        Some((uid, _)) if ok => {
-            ratelimit::refund(state, &email_bucket, 900).await?;
-            uid
+    if !ok {
+        ratelimit::hit(state, &email_bucket, i32::MAX, LOGIN_WINDOW).await?;
+    }
+    let (user_id, version) = match row {
+        Some((uid, _, version)) if ok => {
+            ratelimit::refund(state, &ip_bucket, LOGIN_WINDOW).await?;
+            ratelimit::refund(state, &pair_bucket, LOGIN_WINDOW).await?;
+            (uid, version)
         }
-        Some((uid, _)) => {
+        Some((uid, _, _)) => {
             for account_id in user_accounts(state, uid).await? {
                 record(state, account_id, &meta.actor(Some(uid)), "login.failed", Some(&email), json!({"method": "password"})).await;
             }
@@ -307,7 +395,8 @@ pub async fn password_login(state: &AppState, email: &str, password: &str, meta:
         None => return Err(bad()),
     };
     let account_id = pick_account(state, user_id).await?.ok_or_else(|| AppError::Forbidden("this login isn't part of any account anymore; ask a teammate to invite you again".into()))?;
-    let token = start_session(state, user_id, account_id, "password", None, meta).await?;
+    let how = SessionStart { credential_version: Some(version), mfa_ok: false, entered_password: true };
+    let token = start_session_with(state, user_id, account_id, "password", None, meta, how).await?;
     record(state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "password"})).await;
     Ok(token)
 }
@@ -467,7 +556,7 @@ pub async fn verify_session_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b
         return Err(AppError::bad("that code didn't work; check the time on your phone or use a recovery code"));
     }
     code_ok(&state, uid).await?;
-    sqlx::query("UPDATE sessions SET mfa_ok = true WHERE id = $1").bind(sid).execute(&state.db).await?;
+    sqlx::query("UPDATE sessions SET mfa_ok = true, reauth_at = now() WHERE id = $1").bind(sid).execute(&state.db).await?;
     audit(&state, &ctx, "login.two_factor", None, json!({})).await;
     let fresh = reload(&state, &ctx).await?;
     Ok(Json(me_json(&state, &fresh).await?))
@@ -493,9 +582,24 @@ pub async fn status_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json
     Ok(Json(json!({"enabled": enabled_at.is_some(), "enabled_at": enabled_at, "setup_started": pending, "recovery_codes_left": left, "required_by": required_by})))
 }
 
+/// A single sign-on session is trusted for its own account only, so it may add a factor only to a
+/// login that has no other way in (no password, no Google): otherwise it could lock the person
+/// out of their other accounts.
+async fn may_change_factors(state: &AppState, ctx: &Ctx, uid: Uuid) -> AppResult<()> {
+    if !ctx.sso_session {
+        return Ok(());
+    }
+    let other_way_in: bool = sqlx::query_scalar("SELECT password_hash IS NOT NULL OR google_sub IS NOT NULL FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
+    if other_way_in {
+        return Err(AppError::Forbidden("set up two-factor login after signing in with your password or Google, then come back through single sign-on".into()));
+    }
+    Ok(())
+}
+
 /// `POST /api/me/two-factor/setup`: a new secret to scan. Nothing changes until it's confirmed.
 pub async fn setup_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     let uid = need_user(&ctx)?;
+    may_change_factors(&state, &ctx, uid).await?;
     let (email, on): (String, bool) = sqlx::query_as("SELECT email, totp_enabled_at IS NOT NULL FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
     if on {
         return Err(AppError::Conflict("two-factor login is already on; turn it off first to move it to a new device".into()));
@@ -514,6 +618,7 @@ pub async fn setup_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<
 /// `POST /api/me/two-factor/enable`: confirm the new secret with a code. Returns recovery codes once.
 pub async fn enable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<CodeBody>) -> AppResult<Json<Value>> {
     let uid = need_user(&ctx)?;
+    may_change_factors(&state, &ctx, uid).await?;
     code_attempt(&state, &ctx, uid).await?;
     let (pending, email, on): (Option<String>, String, bool) =
         sqlx::query_as("SELECT totp_pending_enc, email, totp_enabled_at IS NOT NULL FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
@@ -542,9 +647,11 @@ pub async fn enable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJs
     code_ok(&state, uid).await?;
     let codes = new_recovery_codes(&state, uid).await?;
     if let Some(sid) = ctx.session_id {
-        sqlx::query("UPDATE sessions SET mfa_ok = true WHERE id = $1").bind(sid).execute(&state.db).await?;
+        sqlx::query("UPDATE sessions SET mfa_ok = true, reauth_at = now() WHERE id = $1").bind(sid).execute(&state.db).await?;
     }
-    audit(&state, &ctx, "two_factor.enable", None, json!({})).await;
+    // Password sessions elsewhere haven't entered a code; they sign in again with one.
+    let signed_out = revoke_unverified_sessions(&state, uid, ctx.session_id).await?;
+    audit(&state, &ctx, "two_factor.enable", None, json!({"sessions_signed_out": signed_out})).await;
     Ok(Json(json!({"enabled": true, "recovery_codes": codes})))
 }
 
@@ -563,9 +670,21 @@ pub async fn disable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
         return Err(AppError::bad("that code didn't work"));
     }
     code_ok(&state, uid).await?;
-    sqlx::query("UPDATE users SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1").bind(uid).execute(&state.db).await?;
-    sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1").bind(uid).execute(&state.db).await?;
-    audit(&state, &ctx, "two_factor.disable", None, json!({})).await;
+    // Sign out half-finished sign-ins first: with the factor gone they'd have nothing left to do.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE users SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+    let signed_out = sqlx::query(
+        "DELETE FROM sessions s USING accounts a WHERE s.user_id = $1 AND a.id = s.account_id AND NOT s.mfa_ok AND s.id IS DISTINCT FROM $2
+           AND (s.auth_method = 'password' OR a.require_two_factor)",
+    )
+    .bind(uid)
+    .bind(ctx.session_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    audit(&state, &ctx, "two_factor.disable", None, json!({"sessions_signed_out": signed_out})).await;
     Ok(Json(json!({"enabled": false})))
 }
 
@@ -578,8 +697,44 @@ pub async fn recovery_codes_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b
     }
     code_ok(&state, uid).await?;
     let codes = new_recovery_codes(&state, uid).await?;
-    audit(&state, &ctx, "two_factor.recovery_codes_reset", None, json!({})).await;
+    let signed_out = revoke_unverified_sessions(&state, uid, ctx.session_id).await?;
+    audit(&state, &ctx, "two_factor.recovery_codes_reset", None, json!({"sessions_signed_out": signed_out})).await;
     Ok(Json(json!({"recovery_codes": codes})))
+}
+
+// ---- Confirming it's you ----
+
+#[derive(Deserialize)]
+pub struct ReauthBody {
+    pub password: Option<String>,
+    pub code: Option<String>,
+}
+
+/// `POST /api/me/reauth`: re-enter your password or a two-factor code. For the next
+/// `access::FRESH_SIGN_IN_MINUTES` minutes this session may make, remove or demote owners.
+pub async fn reauth_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ReauthBody>) -> AppResult<Json<Value>> {
+    let uid = need_user(&ctx)?;
+    let sid = ctx.session_id.ok_or(AppError::Unauthorized)?;
+    code_attempt(&state, &ctx, uid).await?;
+    let ok = match (b.password.as_deref().filter(|p| !p.is_empty()), b.code.as_deref().filter(|c| !c.trim().is_empty())) {
+        (Some(pw), _) => {
+            let hash: Option<String> = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1").bind(uid).fetch_one(&state.db).await?;
+            match hash {
+                Some(h) => auth::verify_password(pw, &h),
+                None => return Err(AppError::bad("your login has no password; enter a two-factor code instead")),
+            }
+        }
+        (_, Some(code)) => check_code(&state, uid, code).await?,
+        _ => return Err(AppError::bad("enter your password or a code from your authenticator app")),
+    };
+    if !ok {
+        audit(&state, &ctx, "login.reauth_failed", None, json!({})).await;
+        return Err(AppError::bad("that didn't match; try again"));
+    }
+    code_ok(&state, uid).await?;
+    sqlx::query("UPDATE sessions SET reauth_at = now() WHERE id = $1").bind(sid).execute(&state.db).await?;
+    audit(&state, &ctx, "login.reauth", None, json!({})).await;
+    Ok(Json(json!({"ok": true, "valid_minutes": access::FRESH_SIGN_IN_MINUTES})))
 }
 
 // ---- Sessions ----
@@ -623,6 +778,8 @@ pub fn device(ua: Option<&str>) -> String {
 /// `GET /api/me/sessions`
 pub async fn sessions_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     let uid = need_user(&ctx)?;
+    // Older sessions get their id here, so each one can be signed out.
+    sqlx::query("UPDATE sessions SET id = gen_random_uuid() WHERE user_id = $1 AND id IS NULL").bind(uid).execute(&state.db).await?;
     let rows: Vec<(Uuid, DateTime<Utc>, DateTime<Utc>, Option<String>, Option<String>, String, String)> = sqlx::query_as(
         "SELECT s.id, s.created_at, s.last_seen_at, s.ip, s.user_agent, s.auth_method, a.name FROM sessions s JOIN accounts a ON a.id = s.account_id
          WHERE s.user_id = $1 AND s.expires_at > now() ORDER BY s.last_seen_at DESC LIMIT 100",
@@ -660,12 +817,13 @@ pub async fn revoke_others_h(State(state): State<AppState>, ctx: Ctx) -> AppResu
 
 // ---- Passwords ----
 
-fn check_new_password(p: &str) -> AppResult<()> {
-    if p.chars().count() < 8 {
+/// The rule for a new password: 8 or more characters (as sign-up has always counted them).
+pub fn check_new_password(p: &str) -> AppResult<()> {
+    if p.len() < 8 {
         return Err(AppError::bad("use a password of at least 8 characters"));
     }
-    if p.len() > 200 {
-        return Err(AppError::bad("use a password of at most 200 characters"));
+    if p.len() > MAX_NEW_PASSWORD {
+        return Err(AppError::bad("use a shorter password"));
     }
     Ok(())
 }
@@ -685,13 +843,17 @@ pub async fn change_password_h(State(state): State<AppState>, ctx: Ctx, ApiJson(
     let Some(hash) = hash else {
         return Err(AppError::bad("your login uses Google and has no password; use Forgot password on the sign-in page to add one"));
     };
-    if b.current_password.len() > MAX_PASSWORD || !auth::verify_password(&b.current_password, &hash) {
+    if !auth::verify_password(&b.current_password, &hash) {
         audit(&state, &ctx, "password.change_failed", None, json!({})).await;
         return Err(AppError::bad("your current password isn't right"));
     }
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1").bind(uid).bind(auth::hash_password(&b.new_password)?).execute(&state.db).await?;
-    let n = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND id IS DISTINCT FROM $2").bind(uid).bind(ctx.session_id).execute(&state.db).await?.rows_affected();
-    sqlx::query("DELETE FROM password_resets WHERE user_id = $1").bind(uid).execute(&state.db).await?;
+    let new_hash = auth::hash_password(&b.new_password)?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE users SET password_hash = $2, credential_version = credential_version + 1 WHERE id = $1").bind(uid).bind(new_hash).execute(&mut *tx).await?;
+    let n = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND id IS DISTINCT FROM $2").bind(uid).bind(ctx.session_id).execute(&mut *tx).await?.rows_affected();
+    sqlx::query("DELETE FROM password_resets WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
+    sqlx::query("UPDATE sessions SET reauth_at = now() WHERE id = $1").bind(ctx.session_id).execute(&mut *tx).await?;
+    tx.commit().await?;
     audit(&state, &ctx, "password.change", None, json!({"other_sessions_revoked": n})).await;
     Ok(Json(json!({"ok": true, "other_sessions_revoked": n})))
 }
@@ -759,7 +921,9 @@ pub async fn reset_h(State(state): State<AppState>, headers: HeaderMap, ApiJson(
         .fetch_optional(&mut *tx)
         .await?;
     let uid = uid.ok_or_else(invalid)?;
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1").bind(uid).bind(auth::hash_password(&b.password)?).execute(&mut *tx).await?;
+    // The new version makes any sign-in that checked the old password before this commits fail
+    // to get a session (see `start_session_with`).
+    sqlx::query("UPDATE users SET password_hash = $2, credential_version = credential_version + 1 WHERE id = $1").bind(uid).bind(auth::hash_password(&b.password)?).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM password_resets WHERE user_id = $1 AND used_at IS NULL").bind(uid).execute(&mut *tx).await?;
     tx.commit().await?;

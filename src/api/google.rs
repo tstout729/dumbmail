@@ -242,7 +242,7 @@ pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<(Uuid,
         // keys they could have made (keys this login made, and keys from before teams on accounts
         // it owns; teammates' keys on shared accounts stay). The owner makes new keys if needed.
         let mut tx = state.db.begin().await?;
-        sqlx::query("UPDATE users SET google_sub = $2, password_hash = NULL, totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1")
+        sqlx::query("UPDATE users SET google_sub = $2, password_hash = NULL, credential_version = credential_version + 1, totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1")
             .bind(uid)
             .bind(&c.sub)
             .execute(&mut *tx)

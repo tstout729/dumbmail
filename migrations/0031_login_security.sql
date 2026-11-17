@@ -1,11 +1,18 @@
 -- Sessions: an id to list and revoke them, how they signed in, two-factor state and the device.
-ALTER TABLE sessions ADD COLUMN id uuid NOT NULL DEFAULT gen_random_uuid();
+-- No volatile defaults and no rewrites: `id` is filled for new sessions on insert and for older
+-- ones the first time they're used (see features::team::login).
+ALTER TABLE sessions ADD COLUMN id uuid;
 ALTER TABLE sessions ADD COLUMN auth_method text NOT NULL DEFAULT 'password';
 ALTER TABLE sessions ADD COLUMN mfa_ok boolean NOT NULL DEFAULT false;
-ALTER TABLE sessions ADD COLUMN sso_account_id uuid REFERENCES accounts(id) ON DELETE CASCADE;
+ALTER TABLE sessions ADD COLUMN sso_account_id uuid;
+ALTER TABLE sessions ADD CONSTRAINT sessions_sso_account_fk FOREIGN KEY (sso_account_id) REFERENCES accounts(id) ON DELETE CASCADE NOT VALID;
 ALTER TABLE sessions ADD COLUMN last_seen_at timestamptz NOT NULL DEFAULT now();
 ALTER TABLE sessions ADD COLUMN ip text;
 ALTER TABLE sessions ADD COLUMN user_agent text;
+-- When this session last re-entered its password or a two-factor code (ownership changes need it
+-- within 10 minutes).
+ALTER TABLE sessions ADD COLUMN reauth_at timestamptz;
+-- A small table; building this index blocks session writes only for a moment.
 CREATE UNIQUE INDEX sessions_id_idx ON sessions (id);
 
 -- Two-factor login (TOTP). Secrets are encrypted with SECRET_KEY.
@@ -14,6 +21,9 @@ ALTER TABLE users ADD COLUMN totp_pending_enc text;
 ALTER TABLE users ADD COLUMN totp_enabled_at timestamptz;
 -- The last 30-second step a code was accepted for, so a code can't be used twice.
 ALTER TABLE users ADD COLUMN totp_last_step bigint;
+-- Goes up whenever the password changes, is reset or removed; a sign-in only gets a session if
+-- the version it checked the password against is still current.
+ALTER TABLE users ADD COLUMN credential_version integer NOT NULL DEFAULT 0;
 
 CREATE TABLE recovery_codes (
     id         uuid PRIMARY KEY,

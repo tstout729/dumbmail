@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, withQuery } from "../../api/client";
+import { announceAccountSwitch, api, withQuery } from "../../api/client";
 import { keys } from "../../api/keys";
 import { useSession } from "../../api";
 import type { Session } from "../../api/types";
@@ -40,6 +40,8 @@ export const teamApi = {
   revokeInvite: (id: string) => api<{ ok: true }>("DELETE", `/api/team/invites/${id}`),
   changeRole: (input: { userId: string; role: Role }) => api<{ role: Role }>("PATCH", `/api/team/members/${input.userId}`, { role: input.role }),
   removeMember: (userId: string) => api<{ ok: true }>("DELETE", `/api/team/members/${userId}`),
+  resetSsoLink: (userId: string) => api<Team>("DELETE", `/api/team/members/${userId}/sso`),
+  reauth: (input: { password?: string; code?: string }) => api<{ ok: true; valid_minutes: number }>("POST", "/api/me/reauth", input),
   leave: () => api<{ ok: true }>("POST", "/api/team/leave"),
   transfer: (userId: string) => api<Team>("POST", "/api/team/transfer", { user_id: userId }),
   switchAccount: (accountId: string) => api<TeamSession>("POST", "/api/accounts/switch", { account_id: accountId }),
@@ -91,6 +93,7 @@ export function useCan(permission: string): boolean {
 
 /** A full reload after switching accounts drops every cached query from the old one. */
 function reloadHome() {
+  announceAccountSwitch();
   window.location.assign("/");
 }
 
@@ -108,6 +111,12 @@ export const useResendInvite = () => useTeamMutation(teamApi.resendInvite);
 export const useRevokeInvite = () => useTeamMutation(teamApi.revokeInvite);
 export const useChangeRole = () => useTeamMutation(teamApi.changeRole);
 export const useRemoveMember = () => useTeamMutation(teamApi.removeMember);
+export const useResetSsoLink = () => useTeamMutation(teamApi.resetSsoLink);
+
+/** Re-enter the password or a code; ownership changes need it in the last few minutes. */
+export function useReauth() {
+  return useMutation({ mutationFn: teamApi.reauth, meta: { silentError: true } });
+}
 
 export function useTransferOwnership() {
   return useMutation({ mutationFn: teamApi.transfer, onSuccess: reloadHome });
@@ -122,7 +131,14 @@ export function useSwitchAccount() {
 }
 
 export function useCreateAccount() {
-  return useMutation({ mutationFn: teamApi.createAccount, meta: { silentError: true }, onSuccess: () => window.location.assign("/onboarding") });
+  return useMutation({
+    mutationFn: teamApi.createAccount,
+    meta: { silentError: true },
+    onSuccess: () => {
+      announceAccountSwitch();
+      window.location.assign("/onboarding");
+    },
+  });
 }
 
 export function useVerifyCode() {
