@@ -274,16 +274,18 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     match result {
         Ok(provider_id) => {
             let cost = crate::billing::charge_message(state, spec.account.id, spec.channel, segments, is_mms, own_provider).await?;
-            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4 WHERE id = $1")
+            let from_domain = match &rendered {
+                Rendered::Email(e) => crate::features::reports::delivery::sender_domain(&e.from_email),
+                Rendered::Sms(..) => None,
+            };
+            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4, from_domain = $5 WHERE id = $1")
                 .bind(message_id)
                 .bind(&provider_id)
                 .bind(segments as i32)
                 .bind(cost)
+                .bind(from_domain)
                 .execute(&state.db)
                 .await?;
-            if let Rendered::Email(e) = &rendered {
-                crate::features::reports::delivery::note_sender(&state.db, message_id, &e.from_email).await?;
-            }
             if limited {
                 crate::deliverability::record_send(&state.db, message_id, &provider_id, spec.account.id, spec.campaign_id).await?;
                 crate::deliverability::complete_daily_slot(state, spec.account.id);

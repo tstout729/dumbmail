@@ -56,6 +56,8 @@ export type SavedReport = {
   spec: ReportSpec;
   schedule: Schedule | null;
   recipients: string[];
+  /** Each recipient, and whether they've confirmed their address for report emails. */
+  recipient_status: RecipientStatus[];
   next_run_at: string | null;
   last_sent_at: string | null;
   last_error: string | null;
@@ -73,7 +75,12 @@ export type ReportInput = {
   recipients?: string[];
 };
 
-export type Member = { id: string; email: string; name: string | null; role: string };
+/** confirmed: gets report emails. waiting: a confirmation link was emailed. not_asked: neither yet. */
+export type ReportEmailStatus = "confirmed" | "waiting" | "not_asked";
+
+export type RecipientStatus = { id: string; email: string; name: string | null; status: ReportEmailStatus };
+
+export type Member = { id: string; email: string; name: string | null; role: string; report_emails: ReportEmailStatus };
 
 export type AttributionSettings = {
   email_open_window_hours: number;

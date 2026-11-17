@@ -1,23 +1,29 @@
 //! Custom reports: a whitelisted JSON spec compiled to parameterized SQL.
 //!
 //! Nothing in a spec becomes SQL text except names picked from the fixed lists below; every value
-//! (dates, ids, metric names, property keys and filter values) is bound. Each run has a statement
-//! time limit and a row cap. `docs/REPORTS.md` documents the format.
+//! (dates, ids, metric names, property keys and filter values) is bound. Each run has one deadline
+//! for all its statements, a row cap applied after sorting, a cap on group values' length and on the
+//! result's size, and computes only what its measures need. `docs/REPORTS.md` documents the format.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::attribution::ATTRIBUTION_SQL;
-use super::query::{self, Arg, Sql, Window};
+use super::attribution::{ATTRIBUTION_SQL, CONVERSIONS_SQL, CREDITED};
+use super::query::{self, Arg, Mode, Run, Sql, Window};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// Most groups one query may return before the result is cut (the caller's `limit` is lower).
+/// Most groups one query may return before the result is cut (the caller's `limit` is lower). The
+/// query sorts before it cuts, so the top groups are always in.
 const SQL_ROW_CAP: usize = 5000;
+/// Longest group value or label kept, in characters.
+const MAX_VALUE_CHARS: usize = 200;
+/// Largest result, roughly, in bytes; rows past it are cut.
+const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_LIMIT: i64 = 1000;
 const MAX_FILTERS: usize = 10;
 const MAX_FILTER_VALUES: usize = 100;
@@ -526,6 +532,53 @@ struct Ctx<'a> {
     src: &'static SourceInfo,
     tz: String,
     metrics: Vec<String>,
+    /// The raw values the spec's measures need. Anything else isn't computed.
+    need: HashSet<&'static str>,
+}
+
+impl Ctx<'_> {
+    fn needs(&self, raw: &str) -> bool {
+        self.need.contains(raw)
+    }
+
+    /// `expr AS name`, or a zero when no measure needs it.
+    fn agg(&self, name: &str, expr: &str) -> String {
+        if self.needs(name) { format!("{expr} AS {name}") } else { format!("0::float8 AS {name}") }
+    }
+}
+
+/// The raw values behind a set of measures.
+fn needed_raw(src: &SourceInfo, measures: &[String]) -> HashSet<&'static str> {
+    let mut need = HashSet::new();
+    for m in measures {
+        let Some(def) = src.measures.iter().find(|x| x.key == m) else { continue };
+        match def.formula {
+            Raw(k) | Share(k) => {
+                need.insert(k);
+            }
+            Ratio(n, d) => {
+                need.insert(n);
+                need.insert(d);
+            }
+            Net => need.extend(["joined", "unsubscribed", "bounced"]),
+        }
+    }
+    need
+}
+
+/// SQL for a measure's value from a row `r` of raw values, for sorting before the row cap.
+fn measure_sql(src: &SourceInfo, key: &str) -> String {
+    match src.measures.iter().find(|x| x.key == key).map(|x| x.formula) {
+        Some(Raw(k)) | Some(Share(k)) => format!("r.{k}"),
+        Some(Ratio(n, d)) => format!("CASE WHEN r.{d} > 0 THEN r.{n} / r.{d} ELSE 0 END"),
+        Some(Net) => "(r.joined - r.unsubscribed - r.bounced)".into(),
+        None => "0".into(),
+    }
+}
+
+/// A group key, never longer than [`MAX_VALUE_CHARS`].
+fn bounded(expr: &str) -> String {
+    format!("left(COALESCE({expr}, ''), {MAX_VALUE_CHARS})")
 }
 
 fn time_key(group: &str, col: &str, tz: &str) -> Option<String> {
@@ -614,7 +667,8 @@ fn message_key(group: &str, side: Side, tz: &str) -> String {
         "message" => format!("COALESCE({a}.flow_id::text || '/' || {a}.flow_node_id, {a}.campaign_id::text)"),
         "source" => format!("CASE WHEN {a}.campaign_id IS NOT NULL THEN 'campaign' WHEN {a}.flow_id IS NOT NULL THEN 'flow' ELSE 'other' END"),
         "country" => "p.properties->>'country'".into(),
-        "list" | "segment" => "aud.ref".into(),
+        "list" => "aud_list.ref".into(),
+        "segment" => "aud_segment.ref".into(),
         _ => "''".into(),
     }
 }
@@ -638,15 +692,16 @@ fn message_filter(q: &mut Sql, f: &Filter, side: Side) -> String {
     }
 }
 
-/// Messages sent in the window, and conversions in the window credited to them.
-fn messages_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) -> Vec<String> {
+/// Messages sent in the window, and conversions in the window credited to them. Each side runs only
+/// when a measure needs it: a sends-only report never works out attribution.
+fn messages_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
     let (s, e) = (q.bind(Arg::Ts(w.start)), q.bind(Arg::Ts(w.end)));
     let n = groups.len().max(1);
     let keys = |side: Side| -> String {
         if groups.is_empty() {
             return "''::text AS g0".into();
         }
-        groups.iter().enumerate().map(|(i, g)| format!("COALESCE({}, '') AS g{i}", message_key(g, side, &c.tz))).collect::<Vec<_>>().join(", ")
+        groups.iter().enumerate().map(|(i, g)| format!("{} AS g{i}", bounded(&message_key(g, side, &c.tz)))).collect::<Vec<_>>().join(", ")
     };
     let by = (1..=n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     let (scope_m, scope_x) = match c.src.source {
@@ -656,9 +711,14 @@ fn messages_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) -> Vec<Strin
     };
     let need_campaign = uses(c.spec, &["list", "segment"]);
     let need_profile = uses(c.spec, &["country"]);
-    let aud = groups.iter().find(|g| *g == "list" || *g == "segment").map(|g| {
-        format!(" CROSS JOIN LATERAL (SELECT r->>'id' AS ref FROM jsonb_array_elements(COALESCE(c.audience->'include', '[]'::jsonb)) r WHERE r->>'type' = '{g}') aud")
-    });
+    // One row per list (or segment) the campaign was sent to; messages with none group as "(none)".
+    let auds: Vec<String> = groups
+        .iter()
+        .filter(|g| *g == "list" || *g == "segment")
+        .map(|g| {
+            format!(" LEFT JOIN LATERAL (SELECT r->>'id' AS ref FROM jsonb_array_elements(COALESCE(c.audience->'include', '[]'::jsonb)) r WHERE r->>'type' = '{g}') aud_{g} ON true")
+        })
+        .collect();
     let joins = |side: Side| {
         let a = if side == Side::Msg { "m" } else { "x" };
         let mut j = String::new();
@@ -668,112 +728,122 @@ fn messages_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) -> Vec<Strin
         if need_profile {
             j.push_str(&format!(" LEFT JOIN profiles p ON p.id = {a}.profile_id"));
         }
-        if let Some(a) = &aud {
+        for a in &auds {
             j.push_str(a);
         }
         j
     };
+    const REV: &[&str] = &["conversions", "revenue"];
+    let need_rev = REV.iter().any(|r| c.needs(r));
+    let need_msg = MESSAGE_RAW.iter().any(|r| !REV.contains(r) && c.needs(r));
     let mut fm = String::new();
     let mut fx = String::new();
     for f in &c.spec.filters {
-        fm.push_str(&message_filter(q, f, Side::Msg));
-        fx.push_str(&message_filter(q, f, Side::Rev));
+        if need_msg {
+            fm.push_str(&message_filter(q, f, Side::Msg));
+        }
+        if need_rev {
+            fx.push_str(&message_filter(q, f, Side::Rev));
+        }
     }
     let sent = "m.status NOT IN ('queued','sending','failed','skipped')";
-    let delivered = "(m.status IN ('sent','delivered') OR m.opened_at IS NOT NULL)";
+    let delivered = DELIVERED;
     let gcols = (0..n).map(|i| format!("g{i}")).collect::<Vec<_>>().join(", ");
-    let sql = format!(
-        "WITH msg AS (
+    let mut ctes = Vec::new();
+    if need_msg {
+        ctes.push(format!(
+            "msg AS (
             SELECT {km},
-                   count(*) FILTER (WHERE {sent}) AS sent,
-                   count(*) FILTER (WHERE m.channel = 'email' AND {sent}) AS email_sent,
-                   count(*) FILTER (WHERE {delivered}) AS delivered,
-                   count(*) FILTER (WHERE m.channel = 'email' AND {delivered}) AS email_delivered,
-                   count(DISTINCT m.profile_id) FILTER (WHERE {sent}) AS recipients,
-                   count(m.opened_at) AS opens,
-                   count(m.clicked_at) AS clicks,
-                   count(m.clicked_at) FILTER (WHERE m.channel = 'email') AS email_clicks,
-                   count(m.unsubscribed_at) AS unsubscribes,
-                   count(*) FILTER (WHERE m.status = 'bounced') AS bounces,
-                   count(*) FILTER (WHERE m.status = 'bounced' AND m.bounce_type = 'Permanent') AS hard_bounces,
-                   count(*) FILTER (WHERE m.status = 'complained') AS complaints
+                   {sent_c}, {email_sent}, {deliv}, {email_deliv}, {recipients}, {opens}, {clicks}, {email_clicks}, {unsubs}, {bounces}, {hard}, {complaints}
             FROM messages m{jm}
             WHERE m.account_id = $1 AND NOT m.is_test AND m.status <> 'skipped' AND m.created_at >= {s} AND m.created_at < {e}{scope_m}{fm}
-            GROUP BY {by}),
-         rev AS (
-            SELECT {kx}, count(*) AS conversions, COALESCE(sum(x.value), 0) AS revenue
+            GROUP BY {by})",
+            km = keys(Side::Msg),
+            jm = joins(Side::Msg),
+            sent_c = c.agg("sent", &format!("count(*) FILTER (WHERE {sent})::float8")),
+            email_sent = c.agg("email_sent", &format!("count(*) FILTER (WHERE m.channel = 'email' AND {sent})::float8")),
+            deliv = c.agg("delivered", &format!("count(*) FILTER (WHERE {delivered})::float8")),
+            email_deliv = c.agg("email_delivered", &format!("count(*) FILTER (WHERE m.channel = 'email' AND {delivered})::float8")),
+            recipients = c.agg("recipients", &format!("count(DISTINCT m.profile_id) FILTER (WHERE {sent})::float8")),
+            opens = c.agg("opens", "count(m.opened_at) FILTER (WHERE m.channel = 'email')::float8"),
+            clicks = c.agg("clicks", "count(m.clicked_at)::float8"),
+            email_clicks = c.agg("email_clicks", "count(m.clicked_at) FILTER (WHERE m.channel = 'email')::float8"),
+            unsubs = c.agg("unsubscribes", "count(m.unsubscribed_at)::float8"),
+            bounces = c.agg("bounces", "count(*) FILTER (WHERE m.status = 'bounced')::float8"),
+            hard = c.agg("hard_bounces", "count(*) FILTER (WHERE m.status = 'bounced' AND m.bounce_type = 'Permanent')::float8"),
+            complaints = c.agg("complaints", "count(*) FILTER (WHERE m.status = 'complained')::float8"),
+        ));
+    }
+    if need_rev {
+        ctes.push(format!(
+            "rev AS (
+            SELECT {kx}, count(*)::float8 AS conversions, COALESCE(sum(x.value), 0)::float8 AS revenue
             FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {s} AND e.occurred_at < {e}) x{jx}
-            WHERE x.message_id IS NOT NULL{scope_x}{fx}
-            GROUP BY {by})
-         SELECT {gcols}, {labels},
-                COALESCE(msg.sent, 0)::float8 AS sent, COALESCE(msg.email_sent, 0)::float8 AS email_sent,
-                COALESCE(msg.delivered, 0)::float8 AS delivered, COALESCE(msg.email_delivered, 0)::float8 AS email_delivered,
-                COALESCE(msg.recipients, 0)::float8 AS recipients, COALESCE(msg.opens, 0)::float8 AS opens,
-                COALESCE(msg.clicks, 0)::float8 AS clicks, COALESCE(msg.email_clicks, 0)::float8 AS email_clicks,
-                COALESCE(msg.unsubscribes, 0)::float8 AS unsubscribes, COALESCE(msg.bounces, 0)::float8 AS bounces,
-                COALESCE(msg.hard_bounces, 0)::float8 AS hard_bounces, COALESCE(msg.complaints, 0)::float8 AS complaints,
-                COALESCE(rev.conversions, 0)::float8 AS conversions, COALESCE(rev.revenue, 0)::float8 AS revenue
-         FROM msg FULL JOIN rev USING ({gcols})",
-        km = keys(Side::Msg),
-        kx = keys(Side::Rev),
-        jm = joins(Side::Msg),
-        jx = joins(Side::Rev),
-        labels = labels(groups),
-    );
-    q.push(&sql);
-    MESSAGE_RAW.iter().map(|s| s.to_string()).collect()
+            WHERE {CREDITED}{scope_x}{fx}
+            GROUP BY {by})",
+            kx = keys(Side::Rev),
+            jx = joins(Side::Rev),
+        ));
+    }
+    let cols = MESSAGE_RAW
+        .iter()
+        .map(|r| {
+            let side = if REV.contains(r) { "rev" } else { "msg" };
+            if (side == "rev" && need_rev) || (side == "msg" && need_msg) { format!("COALESCE({side}.{r}, 0)::float8 AS {r}") } else { format!("0::float8 AS {r}") }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let from = match (need_msg, need_rev) {
+        (true, true) => format!("msg FULL JOIN rev USING ({gcols})"),
+        (true, false) => "msg".to_string(),
+        _ => "rev".to_string(),
+    };
+    q.push(&format!("WITH {} SELECT {gcols}, {cols} FROM {from}", ctes.join(",\n")));
 }
 
-fn labels(groups: &[String]) -> String {
-    if groups.is_empty() {
-        return "NULL::text AS l0".into();
-    }
-    groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| format!("{} AS l{i}", label_sql(g, &format!("g{i}")).unwrap_or_else(|| "NULL::text".into())))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+/// A message that reached the inbox: sent or delivered, or opened even if it later bounced or was
+/// marked as spam. The overview, campaign and flow reports count it the same way.
+pub const DELIVERED: &str = "(m.status IN ('sent','delivered') OR m.opened_at IS NOT NULL)";
 
 fn keys_simple(groups: &[String], key: impl Fn(&str) -> String) -> (String, String) {
     if groups.is_empty() {
         return ("''::text AS g0".into(), "1".into());
     }
-    let k = groups.iter().enumerate().map(|(i, g)| format!("COALESCE({}, '') AS g{i}", key(g))).collect::<Vec<_>>().join(", ");
+    let k = groups.iter().enumerate().map(|(i, g)| format!("{} AS g{i}", bounded(&key(g)))).collect::<Vec<_>>().join(", ");
     let by = (1..=groups.len()).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     (k, by)
 }
 
-/// Every conversion in the window, attributed or not.
+/// Every conversion in the window, attributed or not. Which message gets the credit is only worked
+/// out when a measure, group or filter needs it.
 fn revenue_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
     let (s, e) = (q.bind(Arg::Ts(w.start)), q.bind(Arg::Ts(w.end)));
-    let (k, by) = keys_simple(groups, |g| {
-        if g == "source" {
-            "CASE WHEN x.campaign_id IS NOT NULL THEN 'campaign' WHEN x.flow_id IS NOT NULL THEN 'flow' WHEN x.message_id IS NOT NULL THEN 'other' ELSE 'none' END".into()
-        } else {
-            message_key(g, Side::Rev, &c.tz)
-        }
-    });
+    let source_expr = "CASE WHEN x.campaign_id IS NOT NULL THEN 'campaign' WHEN x.flow_id IS NOT NULL THEN 'flow' WHEN x.message_id IS NOT NULL THEN 'other' ELSE 'none' END";
+    let (k, by) = keys_simple(groups, |g| if g == "source" { source_expr.into() } else { message_key(g, Side::Rev, &c.tz) });
     let join = if uses(c.spec, &["country"]) { " LEFT JOIN profiles p ON p.id = x.profile_id" } else { "" };
     let mut fx = String::new();
     for f in &c.spec.filters {
         if f.field == "source" {
             let ph = arr(q, f);
+            // `none` here means not credited to a campaign or flow, matching the attributed measures.
             let expr = "CASE WHEN x.campaign_id IS NOT NULL THEN 'campaign' WHEN x.flow_id IS NOT NULL THEN 'flow' ELSE 'none' END";
             fx.push_str(&cond(f, expr, &ph));
         } else {
             fx.push_str(&message_filter(q, f, Side::Rev));
         }
     }
+    let need_att = c.needs("attributed_conversions") || c.needs("attributed_revenue") || uses(c.spec, &["channel", "source", "campaign", "flow", "message"]);
+    let base = if need_att { ATTRIBUTION_SQL } else { CONVERSIONS_SQL };
     let sql = format!(
-        "SELECT {k}, count(*)::float8 AS conversions, COALESCE(sum(x.value), 0)::float8 AS revenue,
-                count(*) FILTER (WHERE x.message_id IS NOT NULL)::float8 AS attributed_conversions,
-                COALESCE(sum(x.value) FILTER (WHERE x.message_id IS NOT NULL), 0)::float8 AS attributed_revenue,
-                count(DISTINCT x.profile_id)::float8 AS customers
-         FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {s} AND e.occurred_at < {e}) x{join}
+        "SELECT {k}, {conv}, {rev}, {aconv}, {arev}, {cust}
+         FROM ({base} AND e.occurred_at >= {s} AND e.occurred_at < {e}) x{join}
          WHERE true{fx}
-         GROUP BY {by}"
+         GROUP BY {by}",
+        conv = c.agg("conversions", "count(*)::float8"),
+        rev = c.agg("revenue", "COALESCE(sum(x.value), 0)::float8"),
+        aconv = c.agg("attributed_conversions", &format!("count(*) FILTER (WHERE {CREDITED})::float8")),
+        arev = c.agg("attributed_revenue", &format!("COALESCE(sum(x.value) FILTER (WHERE {CREDITED}), 0)::float8")),
+        cust = c.agg("customers", "count(DISTINCT x.profile_id)::float8"),
     );
     q.push(&sql);
 }
@@ -802,7 +872,9 @@ fn growth_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
         Some((true, ph)) => format!(" AND NOT ({col} = ANY({ph}))"),
         None => String::new(),
     };
-    let new_profiles = if per_list {
+    let need_events = ["unsubscribed", "bounced", "complaints"].iter().any(|r| c.needs(r));
+    let need_joined = c.needs("joined");
+    let new_profiles = if per_list || !c.needs("new_profiles") {
         String::new()
     } else {
         format!("SELECT p.created_at AS at, NULL::uuid AS list_id, p.id AS profile_id, 'new' AS kind FROM profiles p WHERE p.account_id = $1 AND p.created_at >= {s} AND p.created_at < {e} UNION ALL ")
@@ -829,16 +901,19 @@ fn growth_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
          FROM ({new_profiles}
                SELECT lm.added_at AS at, lm.list_id, lm.profile_id, 'joined' AS kind
                FROM list_members lm JOIN lists l ON l.id = lm.list_id
-               WHERE l.account_id = $1 AND lm.added_at >= {s} AND lm.added_at < {e}{lc1}
+               WHERE {joined_on} AND l.account_id = $1 AND lm.added_at >= {s} AND lm.added_at < {e}{lc1}
                UNION ALL
                SELECT e.occurred_at, {list_expr}, e.profile_id,
                       CASE mt.name WHEN 'Bounced Email' THEN 'bounced' WHEN 'Marked Email as Spam' THEN 'complained' ELSE 'unsubscribed' END
                FROM events e JOIN metrics mt ON mt.id = e.metric_id{list_join}
-               WHERE e.account_id = $1 AND mt.account_id = $1 AND mt.name = ANY({metrics}) AND e.occurred_at >= {s} AND e.occurred_at < {e}
+               WHERE {events_on} AND e.account_id = $1 AND mt.account_id = $1 AND mt.name = ANY({metrics}) AND e.occurred_at >= {s} AND e.occurred_at < {e}
                  AND (mt.name <> 'Bounced Email' OR e.properties->>'bounce_type' = 'Permanent'){lc2}) s
          GROUP BY {by}",
         lc1 = list_cond("lm.list_id"),
         lc2 = if per_list { list_cond("lx.list_id") } else { String::new() },
+        // A constant false lets Postgres skip a branch no measure needs without reading it.
+        joined_on = need_joined,
+        events_on = need_events,
     ));
 }
 
@@ -875,11 +950,12 @@ fn metric_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
         }
     }
     q.push(&format!(
-        "SELECT {k}, count(*)::float8 AS events, count(DISTINCT e.profile_id)::float8 AS people, COALESCE(sum(e.value), 0)::float8 AS value
+        "SELECT {k}, count(*)::float8 AS events, {people}, COALESCE(sum(e.value), 0)::float8 AS value
          FROM events e{joins}
          WHERE e.account_id = $1 AND e.metric_id = (SELECT id FROM metrics WHERE account_id = $1 AND name = {metric})
            AND e.occurred_at >= {s} AND e.occurred_at < {e}{fs}
-         GROUP BY {by}"
+         GROUP BY {by}",
+        people = c.agg("people", "count(DISTINCT e.profile_id)::float8"),
     ));
 }
 
@@ -899,13 +975,16 @@ fn customers_sql(q: &mut Sql, c: &Ctx, groups: &[String], w: Window) {
     q.push(&format!(
         "WITH mids AS (SELECT array_agg(id) AS ids FROM metrics WHERE account_id = $1 AND name = ANY({metrics}))
          SELECT {k},
-                count(DISTINCT e.profile_id)::float8 AS customers,
-                count(DISTINCT e.profile_id) FILTER (WHERE EXISTS (
-                    SELECT 1 FROM events b WHERE b.profile_id = e.profile_id AND b.metric_id = ANY(mids.ids) AND b.occurred_at < e.occurred_at))::float8 AS returning_customers,
+                count(DISTINCT e.profile_id)::float8 AS customers, {returning},
                 count(*)::float8 AS orders, COALESCE(sum(e.value), 0)::float8 AS revenue
          FROM mids, events e{joins}
          WHERE e.account_id = $1 AND e.metric_id = ANY(mids.ids) AND e.occurred_at >= {s} AND e.occurred_at < {e}{fs}
-         GROUP BY {by}"
+         GROUP BY {by}",
+        returning = c.agg(
+            "returning_customers",
+            "count(DISTINCT e.profile_id) FILTER (WHERE EXISTS (
+                    SELECT 1 FROM events b WHERE b.profile_id = e.profile_id AND b.metric_id = ANY(mids.ids) AND b.occurred_at < e.occurred_at))::float8"
+        ),
     ));
 }
 
@@ -936,14 +1015,14 @@ fn engagement_sql(q: &mut Sql, c: &Ctx) {
     ));
 }
 
-async fn fetch(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, c: &Ctx<'_>, account_id: Uuid, groups: &[String], w: Window) -> AppResult<Vec<RawRow>> {
+/// Run one query: groups sorted the way the result shows them, then cut at [`SQL_ROW_CAP`], so the
+/// top groups are never the ones cut.
+async fn fetch(tx: &mut query::Tx, c: &Ctx<'_>, account_id: Uuid, groups: &[String], w: Window, sort: &Sort) -> AppResult<Vec<RawRow>> {
     let mut q = Sql::new(account_id);
     let tz_ph = q.bind(Arg::Text(c.tz.clone()));
-    let c = Ctx { spec: c.spec, src: c.src, tz: tz_ph, metrics: c.metrics.clone() };
+    let c = Ctx { spec: c.spec, src: c.src, tz: tz_ph, metrics: c.metrics.clone(), need: c.need.clone() };
     match c.src.source {
-        Source::Campaigns | Source::Flows | Source::FlowMessages | Source::Messages => {
-            messages_sql(&mut q, &c, groups, w);
-        }
+        Source::Campaigns | Source::Flows | Source::FlowMessages | Source::Messages => messages_sql(&mut q, &c, groups, w),
         Source::Revenue => revenue_sql(&mut q, &c, groups, w),
         Source::Forms => forms_sql(&mut q, &c, groups, w),
         Source::Growth => growth_sql(&mut q, &c, groups, w),
@@ -951,23 +1030,41 @@ async fn fetch(tx: &mut sqlx::Transaction<'static, sqlx::Postgres>, c: &Ctx<'_>,
         Source::Customers => customers_sql(&mut q, &c, groups, w),
         Source::Engagement => engagement_sql(&mut q, &c),
     }
-    // Labels for sources whose SELECT groups directly are looked up after the cap.
-    let wrapped = if matches!(c.src.source, Source::Campaigns | Source::Flows | Source::FlowMessages | Source::Messages) {
-        format!("{} LIMIT {}", q.text, SQL_ROW_CAP + 1)
-    } else {
-        let n = groups.len().max(1);
-        let cols = (0..n).map(|i| format!("r.g{i}")).collect::<Vec<_>>().join(", ");
-        let labs = (0..n)
-            .map(|i| groups.get(i).and_then(|g| label_sql(g, &format!("r.g{i}"))).map(|l| format!("{l} AS l{i}")).unwrap_or_else(|| format!("NULL::text AS l{i}")))
+    let n = groups.len().max(1);
+    let labs = (0..n)
+        .map(|i| {
+            groups
+                .get(i)
+                .and_then(|g| label_sql(g, &format!("r.g{i}")))
+                .map(|l| format!("left({l}, {MAX_VALUE_CHARS}) AS l{i}"))
+                .unwrap_or_else(|| format!("NULL::text AS l{i}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys_order = (0..n).map(|i| format!("r.g{i}")).collect::<Vec<_>>().join(", ");
+    let cap = SQL_ROW_CAP + 1;
+    let by_label = sort.by == "group" && groups.iter().any(|g| label_sql(g, "x").is_some());
+    q.text = if by_label {
+        // Sorted by name: look the names up first.
+        let dir = if sort.desc { "DESC" } else { "ASC" };
+        let ord = groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| if label_sql(g, "x").is_some() { format!("lower(COALESCE(r.l{i}, r.g{i})) {dir}") } else { format!("r.g{i} {dir}") })
             .collect::<Vec<_>>()
             .join(", ");
-        let raws = c.src.raw.iter().map(|r| format!("r.{r}")).collect::<Vec<_>>().join(", ");
-        format!("SELECT {cols}, {labs}, {raws} FROM ({} LIMIT {}) r", q.text, SQL_ROW_CAP + 1)
+        format!("SELECT * FROM (SELECT r.*, {labs} FROM ({}) r) r ORDER BY {ord} LIMIT {cap}", q.text)
+    } else {
+        let dir = if sort.desc { "DESC" } else { "ASC" };
+        let ord = if sort.by == "group" {
+            (0..n).map(|i| format!("r.g{i} {dir}")).collect::<Vec<_>>().join(", ")
+        } else {
+            format!("{} {dir}, {keys_order}", measure_sql(c.src, &sort.by))
+        };
+        format!("SELECT r.*, {labs} FROM (SELECT * FROM ({}) r ORDER BY {ord} LIMIT {cap}) r", q.text)
     };
-    q.text = wrapped;
-    let rows = q.fetch_all(tx).await?;
+    let rows = tx.fetch_all(&q).await?;
     use sqlx::Row;
-    let n = groups.len().max(1);
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let mut keys = Vec::with_capacity(n);
@@ -1048,30 +1145,48 @@ fn time_buckets(group: &str, w: Window, tz: chrono_tz::Tz) -> Option<Vec<String>
     }
 }
 
-/// Run a validated spec. `limit` statements stop at the given time limit.
-pub async fn run(state: &AppState, account_id: Uuid, spec: Spec, timeout: &'static str) -> AppResult<Value> {
+/// The order rows come back in when the spec doesn't say: time and tiers in order, otherwise the
+/// first measure, biggest first.
+fn default_sort(spec: &Spec) -> Sort {
+    let first_group_is_time = spec.group_by.first().is_some_and(|g| TIME_GROUPS.contains(&g.as_str()) || g == "tier");
+    spec.sort.clone().unwrap_or_else(|| {
+        if spec.group_by.is_empty() || first_group_is_time {
+            Sort { by: "group".into(), desc: false }
+        } else {
+            Sort { by: spec.measures[0].clone(), desc: true }
+        }
+    })
+}
+
+/// Run a spec. In a request it has 20 seconds in all and is refused while another report runs for
+/// the account; in a job, 2 minutes.
+pub async fn run(state: &AppState, account_id: Uuid, spec: Spec, mode: Mode) -> AppResult<Value> {
     let spec = validate(spec)?;
     let src = info(&spec.source)?;
+    let run = Run::start(account_id, mode).await?;
     let (tz_name, tz) = query::account_tz(state, account_id).await?;
     let settings = super::attribution::load(&state.db, account_id).await?;
     let window = query::resolve_range(tz, spec.range.days, spec.range.start, spec.range.end)?;
-    let c = Ctx { spec: &spec, src, tz: tz_name.clone(), metrics: settings.conversion_metrics.clone() };
+    let c = Ctx { spec: &spec, src, tz: tz_name.clone(), metrics: settings.conversion_metrics.clone(), need: needed_raw(src, &spec.measures) };
+    let sort = default_sort(&spec);
+    let by_group = Sort { by: "group".into(), desc: false };
 
-    let mut tx = query::timed_for(state, timeout).await?;
-    let mut rows = fetch(&mut tx, &c, account_id, &spec.group_by, window).await?;
+    let mut tx = run.tx(state).await?;
+    let mut rows = fetch(&mut tx, &c, account_id, &spec.group_by, window, &sort).await?;
     let totals_raw = if spec.group_by.is_empty() || src.source == Source::Engagement {
         sum_rows(&rows, src)
     } else {
-        let t = fetch(&mut tx, &c, account_id, &[], window).await?;
+        let t = fetch(&mut tx, &c, account_id, &[], window, &by_group).await?;
         t.into_iter().next().map(|r| r.raw).unwrap_or_else(|| sum_rows(&[], src))
     };
     let previous_raw = if spec.compare {
-        let t = fetch(&mut tx, &c, account_id, &[], window.previous()).await?;
+        let t = fetch(&mut tx, &c, account_id, &[], window.previous(), &by_group).await?;
         Some(t.into_iter().next().map(|r| r.raw).unwrap_or_else(|| sum_rows(&[], src)))
     } else {
         None
     };
     tx.commit().await?;
+    drop(run);
 
     let truncated_sql = rows.len() > SQL_ROW_CAP;
     rows.truncate(SQL_ROW_CAP);
@@ -1092,14 +1207,6 @@ pub async fn run(state: &AppState, account_id: Uuid, spec: Spec, timeout: &'stat
     }
 
     let is_time = |g: &str| TIME_GROUPS.contains(&g);
-    let first_group_is_time = spec.group_by.first().is_some_and(|g| is_time(g) || g == "tier");
-    let sort = spec.sort.clone().unwrap_or_else(|| {
-        if spec.group_by.is_empty() || first_group_is_time {
-            Sort { by: "group".into(), desc: false }
-        } else {
-            Sort { by: spec.measures[0].clone(), desc: true }
-        }
-    });
     let mut out_rows: Vec<(Vec<String>, Vec<String>, Map<String, Value>)> = rows
         .into_iter()
         .map(|r| {
@@ -1147,8 +1254,20 @@ pub async fn run(state: &AppState, account_id: Uuid, spec: Spec, timeout: &'stat
     }
     let default_limit = if spec.group_by.iter().any(|g| is_time(g)) { MAX_LIMIT } else { 100 };
     let limit = spec.limit.unwrap_or(default_limit) as usize;
-    let truncated = truncated_sql || out_rows.len() > limit;
+    let mut truncated = truncated_sql || out_rows.len() > limit;
     out_rows.truncate(limit);
+    // Keep the whole answer to a bounded size, whatever the groups hold.
+    let mut bytes = 0usize;
+    let mut keep = 0usize;
+    for r in &out_rows {
+        bytes += r.0.iter().chain(r.1.iter()).map(|x| x.len() + 8).sum::<usize>() + r.2.len() * 32;
+        if bytes > MAX_RESULT_BYTES {
+            truncated = true;
+            break;
+        }
+        keep += 1;
+    }
+    out_rows.truncate(keep);
 
     let mut columns: Vec<Value> = spec.group_by.iter().map(|g| json!({"key": g, "label": group_label(g), "kind": "group"})).collect();
     columns.extend(spec.measures.iter().filter_map(|name| src.measures.iter().find(|x| x.key == name)).map(|x| json!({"key": x.key, "label": x.label, "kind": x.kind})));

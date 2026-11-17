@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::query::{Mode, Run};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -17,7 +18,9 @@ use crate::state::AppState;
 /// flow_id, flow_node_id, variant` (all NULL when nothing gets the credit). A message counts when
 /// the person opened it (if opens count) within the open window, or clicked it within the click
 /// window, before that moment. Last touch credits the message touched most recently; first touch
-/// the one touched earliest.
+/// the one touched earliest. Two messages touched at the same moment: the newer message wins, which
+/// is the order the database read a person's messages in before these settings existed (newest
+/// first, by `messages_profile_idx`), so default settings credit exactly what they always did.
 macro_rules! touch_lateral {
     () => {
         "
@@ -32,8 +35,8 @@ macro_rules! touch_lateral {
                    END AS touches
         ) tt
         CROSS JOIN LATERAL (SELECT GREATEST(tt.touches[1], tt.touches[2]) AS last_at, LEAST(tt.touches[1], tt.touches[2]) AS first_at) t
-        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND m.created_at <= e.occurred_at AND t.last_at IS NOT NULL
-        ORDER BY CASE WHEN cfg.first_touch THEN t.first_at END ASC, t.last_at DESC, m.id
+        WHERE m.profile_id = e.profile_id AND NOT m.is_test AND t.last_at IS NOT NULL
+        ORDER BY CASE WHEN cfg.first_touch THEN t.first_at END ASC, t.last_at DESC, m.created_at DESC, m.id
         LIMIT 1
     ) att ON true"
     };
@@ -77,6 +80,24 @@ macro_rules! attribution_sql {
 
 /// Every revenue number uses this, with the account's saved settings.
 pub const ATTRIBUTION_SQL: &str = attribution_sql!(saved_cfg!());
+
+/// The same conversions as [`ATTRIBUTION_SQL`] with the same columns, without working out which
+/// message gets the credit (all NULL). For reports that only count orders and revenue.
+pub const CONVERSIONS_SQL: &str = concat!(
+    "
+    SELECT e.id AS event_id, COALESCE(e.value, 0) AS value, e.occurred_at, e.profile_id,
+           NULL::uuid AS message_id, NULL::text AS channel, NULL::uuid AS campaign_id, NULL::uuid AS flow_id, NULL::text AS flow_node_id, NULL::text AS variant
+    FROM events e
+    CROSS JOIN ",
+    saved_cfg!(),
+    " cfg
+    JOIN metrics mt ON mt.id = e.metric_id AND mt.name = ANY(cfg.metrics)
+    WHERE e.account_id = $1"
+);
+
+/// Credit that counts as revenue from DumbMail: a campaign's or a flow's message. Other messages
+/// (double opt-in confirmations) can take the credit but it isn't counted, as on the overview.
+pub const CREDITED: &str = "(x.campaign_id IS NOT NULL OR x.flow_id IS NOT NULL)";
 
 /// The saved settings relation, for queries that credit other events (funnels): select from it
 /// `AS cfg` and join [`TOUCH_LATERAL`] with `e.profile_id` and `e.occurred_at` in scope.
@@ -269,15 +290,15 @@ pub fn to_json(s: &Settings) -> Value {
 }
 
 /// Attributed totals for `[since, now)` under the given settings.
-async fn totals(state: &AppState, account_id: Uuid, s: &Settings, since: chrono::DateTime<chrono::Utc>) -> AppResult<Value> {
+async fn totals(state: &AppState, run: &Run, account_id: Uuid, s: &Settings, since: chrono::DateTime<chrono::Utc>) -> AppResult<Value> {
     let sql = format!(
         "SELECT count(*), COALESCE(sum(value), 0)::float8,
-                count(*) FILTER (WHERE message_id IS NOT NULL), COALESCE(sum(value) FILTER (WHERE message_id IS NOT NULL), 0)::float8,
+                count(*) FILTER (WHERE {CREDITED}), COALESCE(sum(value) FILTER (WHERE {CREDITED}), 0)::float8,
                 COALESCE(sum(value) FILTER (WHERE campaign_id IS NOT NULL), 0)::float8, COALESCE(sum(value) FILTER (WHERE flow_id IS NOT NULL), 0)::float8,
-                COALESCE(sum(value) FILTER (WHERE channel = 'email'), 0)::float8, COALESCE(sum(value) FILTER (WHERE channel = 'sms'), 0)::float8
+                COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'email'), 0)::float8, COALESCE(sum(value) FILTER (WHERE {CREDITED} AND channel = 'sms'), 0)::float8
          FROM ({PREVIEW_SQL} AND e.occurred_at >= $8) x"
     );
-    let mut tx = super::query::timed(state).await?;
+    let mut tx = run.tx(state).await?;
     let (orders, revenue, att_orders, att_rev, camp, flow, email, sms): (i64, f64, i64, f64, f64, f64, f64, f64) = sqlx::query_as(&sql)
         .bind(account_id)
         .bind(&s.conversion_metrics)
@@ -287,7 +308,7 @@ async fn totals(state: &AppState, account_id: Uuid, s: &Settings, since: chrono:
         .bind(s.sms_click_window_hours)
         .bind(s.model == "first_touch")
         .bind(since)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx.arm().await?)
         .await
         .map_err(super::query::db_err)?;
     tx.commit().await?;
@@ -301,10 +322,11 @@ async fn totals(state: &AppState, account_id: Uuid, s: &Settings, since: chrono:
 /// settings. Nothing is saved.
 pub async fn preview(state: &AppState, account_id: Uuid, proposed: &Settings, days: i64) -> AppResult<Value> {
     let days = days.clamp(1, 365);
+    let run = Run::start(account_id, Mode::Request).await?;
     let current = load(&state.db, account_id).await?;
     let since = chrono::Utc::now() - chrono::Duration::days(days);
-    let now = totals(state, account_id, &current, since).await?;
-    let next = totals(state, account_id, proposed, since).await?;
+    let now = totals(state, &run, account_id, &current, since).await?;
+    let next = totals(state, &run, account_id, proposed, since).await?;
     Ok(json!({
         "days": days,
         "current": {"settings": to_json(&current), "totals": now},

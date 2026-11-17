@@ -6,7 +6,9 @@ pub mod cohorts;
 pub mod custom;
 pub mod delivery;
 pub mod exports;
+pub mod indexes;
 pub mod query;
+pub mod recipients;
 pub mod saved;
 
 use async_trait::async_trait;
@@ -110,19 +112,19 @@ async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Str
 }
 
 async fn run_h(State(state): State<AppState>, ctx: Ctx, ApiJson(spec): ApiJson<custom::Spec>) -> AppResult<Json<Value>> {
-    Ok(Json(custom::run(&state, ctx.account_id, spec, query::REQUEST_TIMEOUT).await?))
+    Ok(Json(custom::run(&state, ctx.account_id, spec, query::Mode::Request).await?))
 }
 
 async fn run_csv_h(State(state): State<AppState>, ctx: Ctx, ApiJson(spec): ApiJson<custom::Spec>) -> AppResult<Response> {
     let name = format!("report-{}.csv", spec.source);
-    let result = custom::run(&state, ctx.account_id, spec, query::REQUEST_TIMEOUT).await?;
+    let result = custom::run(&state, ctx.account_id, spec, query::Mode::Request).await?;
     Ok(csv_response(&name, saved::result_csv(&result)))
 }
 
 async fn run_saved(state: &AppState, account_id: Uuid, id: &str) -> AppResult<Value> {
     let report = saved::get(state, account_id, id).await?;
     let spec: custom::Spec = serde_json::from_value(report["spec"].clone())?;
-    let result = custom::run(state, account_id, spec, query::REQUEST_TIMEOUT).await?;
+    let result = custom::run(state, account_id, spec, query::Mode::Request).await?;
     Ok(json!({"report": report, "result": result}))
 }
 
@@ -268,12 +270,12 @@ fn tools() -> Vec<Value> {
         tool("run_report", "Run a report", "Run an ad-hoc report spec and get rows, totals and (with compare) the previous period. Read the dumbmail://docs/reports resource for the spec format.", obj(json!({"spec": spec_schema()}), &["spec"]), true, false),
         tool("list_reports", "List reports", "Ready-made reports (ids builtin:<key>) and the account's saved reports with their email schedules.", obj(json!({}), &[]), true, false),
         tool("get_report", "Get and run a report", "A saved or ready-made report's definition and its current results.", obj(json!({"id": id}), &["id"]), true, false),
-        tool("save_report", "Save a report", "Create a saved report, or update one by id. A schedule (weekly on Mondays or monthly on the 1st, 8 a.m. account time) emails a summary and a CSV link to the chosen members (user ids from list_report_recipients); setting or changing a schedule requires confirm=true and the user's approval.",
+        tool("save_report", "Save a report", "Create a saved report, or update one by id. A schedule (weekly on Mondays or monthly on the 1st, 8 a.m. account time) emails a summary and a CSV link to the chosen members (user ids from list_report_recipients). Each member gets the emails only after confirming their address from a link we email them (members who sign in with Google count as confirmed); recipient_status shows who is still waiting. Setting or changing a schedule requires confirm=true and the user's approval.",
             obj(json!({"id": {"type": "string"}, "name": {"type": "string", "maxLength": 120}, "description": {"type": "string", "maxLength": 500}, "spec": spec_schema(),
                        "schedule": {"enum": ["weekly", "monthly", null]}, "recipients": {"type": "array", "items": {"type": "string"}, "maxItems": 10}, "confirm": {"type": "boolean"}}), &[]), false, false),
         tool("duplicate_report", "Duplicate a report", "Copy a saved or ready-made report into a new saved report you can change.", obj(json!({"id": id, "name": {"type": "string"}}), &["id"]), false, false),
         tool("delete_report", "Delete a report", "Delete a saved report and its schedule. Without confirm=true it only describes what would happen.", obj(json!({"id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
-        tool("list_report_recipients", "Members for report emails", "Members of the account who can get scheduled report emails.", obj(json!({}), &[]), true, false),
+        tool("list_report_recipients", "Members for report emails", "Members of the account who can get scheduled report emails, each with report_emails: confirmed, waiting (a confirmation link was sent) or not_asked.", obj(json!({}), &[]), true, false),
         tool("cohort_report", "Cohort retention", "Group people by first purchase month (or sign-up month) and show, for each month since, the share who bought (again) and cumulative revenue per person.",
             obj(json!({"by": {"enum": ["first_purchase", "signup"]}, "months": {"type": "integer", "minimum": 1, "maximum": 24}}), &[]), true, false),
         tool("funnel_report", "Funnel", "Ordered steps from any metrics (e.g. Viewed Product, Added to Cart, Started Checkout, Placed Order) within a window from the first step, with conversion and drop-off per step, optionally split by an event or profile property or by whether the first step came from a campaign or flow.",
@@ -303,7 +305,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
     let str_arg = |k: &str| a[k].as_str().map(str::to_string);
     match name {
         "get_report_catalog" => Ok(custom::catalog()),
-        "run_report" => custom::run(state, acct, from(a["spec"].clone())?, query::REQUEST_TIMEOUT).await,
+        "run_report" => custom::run(state, acct, from(a["spec"].clone())?, query::Mode::Request).await,
         "list_reports" => saved::list(state, acct).await,
         "get_report" => run_saved(state, acct, &str_arg("id").unwrap_or_default()).await,
         "save_report" => {
@@ -318,7 +320,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
             let schedule_set = matches!(&input.schedule, Some(Some(_))) || input.recipients.is_some();
             if schedule_set && !confirmed {
                 return Ok(json!({"dry_run": true, "note": format!(
-                    "Nothing saved. This would email the report {} to {} member(s). Call again with confirm=true once the user approves.",
+                    "Nothing saved. This would email the report {} to {} member(s), once each confirms their address from the link we email them. Call again with confirm=true once the user approves.",
                     input.schedule.clone().flatten().unwrap_or_else(|| "on its current schedule".into()),
                     input.recipients.as_ref().map_or(0, Vec::len))}));
             }
@@ -377,7 +379,7 @@ impl Feature for Module {
     }
 
     fn routes(&self) -> Router<AppState> {
-        Router::new()
+        recipients::routes()
             .route("/api/reports", get(list_h).post(create_h))
             .route("/api/reports/catalog", get(catalog_h))
             .route("/api/reports/members", get(members_h))
@@ -424,16 +426,24 @@ impl Feature for Module {
                 Ok(i) => exports::run_batch(state, i).await,
                 Err(e) => Err(e),
             }),
-            "reports_scheduled_send" => Some(match id("report_id") {
-                Ok(i) => saved::send_scheduled(state, i).await,
-                Err(e) => Err(e),
-            }),
+            "reports_scheduled_send" => {
+                let occurrence = payload["occurrence"].as_str().and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+                Some(match (id("report_id"), occurrence) {
+                    (Ok(i), Some(o)) => saved::send_scheduled(state, i, o).await,
+                    (Err(e), _) => Err(e),
+                    (_, None) => Err(anyhow::anyhow!("job payload missing occurrence")),
+                })
+            }
             "reports_mx_lookup" => Some(match id("account_id") {
                 Ok(i) => delivery::mx_lookup(state, i).await,
                 Err(e) => Err(e),
             }),
             _ => None,
         }
+    }
+
+    async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
+        indexes::ensure(state).await
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {

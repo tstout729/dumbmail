@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::attribution::{SAVED_CFG, TOUCH_LATERAL};
 use super::custom::Range;
-use super::query::{self, Arg, Sql};
+use super::query::{self, Arg, Mode, Run, Sql};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -36,6 +36,7 @@ pub async fn cohorts(state: &AppState, account_id: Uuid, q: CohortQuery) -> AppR
     if !(1..=24).contains(&months) {
         return Err(AppError::bad("months must be 1-24"));
     }
+    let run = Run::start(account_id, Mode::Request).await?;
     let (tz_name, tz) = query::account_tz(state, account_id).await?;
     let settings = super::attribution::load(&state.db, account_id).await?;
     let today = Utc::now().with_timezone(&tz).date_naive();
@@ -75,9 +76,10 @@ pub async fn cohorts(state: &AppState, account_id: Uuid, q: CohortQuery) -> AppR
          FROM sizes s LEFT JOIN act a ON a.cm = s.cm AND a.am >= s.cm
          ORDER BY 1, 3"
     ));
-    let mut tx = query::timed(state).await?;
-    let rows = s.fetch_all(&mut tx).await?;
+    let mut tx = run.tx(state).await?;
+    let rows = tx.fetch_all(&s).await?;
     tx.commit().await?;
+    drop(run);
 
     let parse = |v: Option<String>| v.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
     let mut cohorts: Vec<(NaiveDate, i64, Vec<(i64, f64)>)> = Vec::new();
@@ -169,7 +171,10 @@ pub struct FunnelQuery {
     pub split_by: Option<Split>,
 }
 
+/// Splits shown; the rest are added up as "Other".
 const MAX_SPLITS: usize = 10;
+/// Longest split value kept, in characters.
+const MAX_SPLIT_CHARS: usize = 200;
 
 /// People who did step 1 in the range, and how many went on to each later step, in order, within
 /// the window from their first step 1. Each person counts once, from their first step 1 in the range.
@@ -182,6 +187,7 @@ pub async fn funnel(state: &AppState, account_id: Uuid, q: FunnelQuery) -> AppRe
     if !(1..=90).contains(&window_days) {
         return Err(AppError::bad("window_days must be 1-90"));
     }
+    let run = Run::start(account_id, Mode::Request).await?;
     let (tz_name, tz) = query::account_tz(state, account_id).await?;
     let w = query::resolve_range(tz, q.range.days, q.range.start, q.range.end)?;
     if (w.end - w.start).num_days() > 366 {
@@ -230,11 +236,11 @@ pub async fn funnel(state: &AppState, account_id: Uuid, q: FunnelQuery) -> AppRe
         None => ("''".to_string(), String::new()),
         Some((kind, key)) if kind == "event_property" => {
             let kp = s.bind(Arg::Text(key.clone()));
-            (format!("COALESCE(s0.properties->>{kp}, '')"), String::new())
+            (format!("left(COALESCE(s0.properties->>{kp}, ''), {MAX_SPLIT_CHARS})"), String::new())
         }
         Some((kind, key)) if kind == "profile_property" => {
             let kp = s.bind(Arg::Text(key.clone()));
-            (format!("COALESCE(p.properties->>{kp}, '')"), " LEFT JOIN profiles p ON p.id = s0.profile_id".to_string())
+            (format!("left(COALESCE(p.properties->>{kp}, ''), {MAX_SPLIT_CHARS})"), " LEFT JOIN profiles p ON p.id = s0.profile_id".to_string())
         }
         Some(_) => (
             "CASE WHEN att.campaign_id IS NOT NULL THEN 'campaign' WHEN att.flow_id IS NOT NULL THEN 'flow' ELSE 'none' END".to_string(),
@@ -242,31 +248,32 @@ pub async fn funnel(state: &AppState, account_id: Uuid, q: FunnelQuery) -> AppRe
         ),
     };
     let counts = (0..steps.len()).map(|i| format!("count(s{i}.profile_id)::int8 AS c{i}")).collect::<Vec<_>>().join(", ");
+    let sums = (0..steps.len()).map(|i| format!("sum(c{i})::int8 AS c{i}")).collect::<Vec<_>>().join(", ");
     let step_joins = (1..steps.len()).map(|i| format!(" LEFT JOIN s{i} ON s{i}.profile_id = s0.profile_id")).collect::<String>();
-    s.push(&format!("WITH {} SELECT {grp} AS grp, {counts} FROM s0{step_joins}{joins} GROUP BY 1 ORDER BY 2 DESC LIMIT 500", ctes.join(",\n")));
-    let mut tx = query::timed(state).await?;
-    let rows = s.fetch_all(&mut tx).await?;
+    // Every split is counted; past the biggest ones they're added up as "Other", so the total
+    // always covers everyone.
+    s.push(&format!(
+        "WITH {}, g AS (SELECT {grp} AS grp, {counts} FROM s0{step_joins}{joins} GROUP BY 1),
+         r AS (SELECT g.*, row_number() OVER (ORDER BY c0 DESC, grp) AS rn, count(*) OVER () AS groups FROM g)
+         SELECT (groups > {MAX_SPLITS} AND rn >= {MAX_SPLITS}) AS other, CASE WHEN groups > {MAX_SPLITS} AND rn >= {MAX_SPLITS} THEN NULL ELSE grp END AS grp,
+                {sums}, min(rn) AS rn
+         FROM r GROUP BY 1, 2 ORDER BY 1, min(rn)",
+        ctes.join(",\n")
+    ));
+    let mut tx = run.tx(state).await?;
+    let rows = tx.fetch_all(&s).await?;
     tx.commit().await?;
+    drop(run);
 
-    let mut groups: Vec<(String, Vec<i64>)> = rows
+    let groups: Vec<(String, Vec<i64>)> = rows
         .into_iter()
         .map(|r| {
+            let other: bool = r.try_get("other").unwrap_or(false);
             let g: Option<String> = r.try_get("grp").ok().flatten();
             let c: Vec<i64> = (0..steps.len()).map(|i| r.try_get::<i64, _>(format!("c{i}").as_str()).unwrap_or(0)).collect();
-            (g.unwrap_or_default(), c)
+            (if other { "\u{0}other".to_string() } else { g.unwrap_or_default() }, c)
         })
         .collect();
-    // Keep the biggest splits; fold the rest into "Other".
-    if groups.len() > MAX_SPLITS {
-        let rest = groups.split_off(MAX_SPLITS - 1);
-        let mut other = vec![0i64; steps.len()];
-        for (_, c) in rest {
-            for (i, v) in c.into_iter().enumerate() {
-                other[i] += v;
-            }
-        }
-        groups.push(("\u{0}other".into(), other));
-    }
     let shape = |counts: &[i64]| -> Vec<Value> {
         counts
             .iter()

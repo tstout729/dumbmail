@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::custom::{self, Spec};
-use super::query;
+use super::query::{self, Mode};
+use super::recipients;
 use crate::error::{AppError, AppResult};
 use crate::providers::email::OutgoingEmail;
 use crate::state::AppState;
@@ -85,15 +86,27 @@ pub fn builtin(key: &str) -> Option<&'static Builtin> {
 
 fn builtin_json(b: &Builtin) -> Value {
     json!({"id": format!("builtin:{}", b.key), "builtin": true, "name": b.name, "description": b.description, "spec": (b.spec)(),
-           "schedule": null, "recipients": [], "next_run_at": null, "last_sent_at": null, "last_error": null})
+           "schedule": null, "recipients": [], "recipient_status": [], "next_run_at": null, "last_sent_at": null, "last_error": null})
 }
 
 type Row = (Uuid, String, String, Value, Option<String>, Vec<Uuid>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, DateTime<Utc>, DateTime<Utc>);
 const COLS: &str = "id, name, description, spec, schedule, schedule_recipients, next_run_at, last_sent_at, last_error, created_at, updated_at";
 
-fn row_json(r: Row) -> Value {
-    json!({"id": r.0, "builtin": false, "name": r.1, "description": r.2, "spec": r.3, "schedule": r.4, "recipients": r.5,
+type Statuses = std::collections::HashMap<Uuid, (String, Option<String>, &'static str)>;
+
+/// `recipient_status` lists each recipient with `confirmed` or `waiting` (for their confirmation).
+fn row_json(r: Row, st: &Statuses) -> Value {
+    json!({"id": r.0, "builtin": false, "name": r.1, "description": r.2, "spec": r.3, "schedule": r.4,
+           "recipient_status": recipients::recipient_json(&r.5, st), "recipients": r.5,
            "next_run_at": r.6, "last_sent_at": r.7, "last_error": r.8, "created_at": r.9, "updated_at": r.10})
+}
+
+async fn rows_json(state: &AppState, account_id: Uuid, rows: Vec<Row>) -> AppResult<Vec<Value>> {
+    let mut ids: Vec<Uuid> = rows.iter().flat_map(|r| r.5.iter().copied()).collect();
+    ids.sort();
+    ids.dedup();
+    let st = recipients::statuses(state, account_id, &ids).await?;
+    Ok(rows.into_iter().map(|r| row_json(r, &st)).collect())
 }
 
 pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
@@ -101,7 +114,7 @@ pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
         .bind(account_id)
         .fetch_all(&state.db)
         .await?;
-    Ok(json!({"builtin": BUILTINS.iter().map(builtin_json).collect::<Vec<_>>(), "saved": rows.into_iter().map(row_json).collect::<Vec<_>>()}))
+    Ok(json!({"builtin": BUILTINS.iter().map(builtin_json).collect::<Vec<_>>(), "saved": rows_json(state, account_id, rows).await?}))
 }
 
 /// A saved report (`<uuid>`) or a ready-made one (`builtin:<key>`).
@@ -115,7 +128,8 @@ pub async fn get(state: &AppState, account_id: Uuid, id: &str) -> AppResult<Valu
         .bind(account_id)
         .fetch_optional(&state.db)
         .await?;
-    r.map(row_json).ok_or_else(|| AppError::not_found("report"))
+    let r = r.ok_or_else(|| AppError::not_found("report"))?;
+    Ok(rows_json(state, account_id, vec![r]).await?.remove(0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,7 +165,8 @@ fn clean_description(d: &str) -> AppResult<String> {
     Ok(d.to_string())
 }
 
-/// Members of the account (for schedule recipients).
+/// Members of the account (for schedule recipients), with `report_emails`: `confirmed`, `waiting`
+/// (a confirmation link was sent) or `not_asked`.
 pub async fn members(state: &AppState, account_id: Uuid) -> AppResult<Vec<Value>> {
     let rows: Vec<(Uuid, String, Option<String>, String)> = sqlx::query_as(
         "SELECT u.id, u.email, u.name, m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 500",
@@ -159,7 +174,15 @@ pub async fn members(state: &AppState, account_id: Uuid) -> AppResult<Vec<Value>
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
-    Ok(rows.into_iter().map(|(id, email, name, role)| json!({"id": id, "email": email, "name": name, "role": role})).collect())
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let st = recipients::statuses(state, account_id, &ids).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, email, name, role)| {
+            let status = st.get(&id).map_or("not_asked", |s| s.2);
+            json!({"id": id, "email": email, "name": name, "role": role, "report_emails": status})
+        })
+        .collect())
 }
 
 async fn check_recipients(state: &AppState, account_id: Uuid, ids: &[Uuid]) -> AppResult<Vec<Uuid>> {
@@ -240,6 +263,9 @@ pub async fn create(state: &AppState, account_id: Uuid, user_id: Option<Uuid>, b
     .bind(user_id)
     .execute(&state.db)
     .await?;
+    if schedule.is_some() {
+        recipients::ask(state, account_id, &recipients).await?;
+    }
     get(state, account_id, &id.to_string()).await
 }
 
@@ -282,6 +308,9 @@ pub async fn update(state: &AppState, account_id: Uuid, id: &str, b: Input) -> A
     .bind(next)
     .execute(&state.db)
     .await?;
+    if schedule.is_some() {
+        recipients::ask(state, account_id, &recipients).await?;
+    }
     get(state, account_id, &id.to_string()).await
 }
 
@@ -381,14 +410,17 @@ fn fmt(kind: &str, v: &Value) -> String {
     }
 }
 
-/// Run a saved report and email it to its recipients with a link to the CSV. Called by the job.
-pub async fn send_scheduled(state: &AppState, report_id: Uuid) -> anyhow::Result<()> {
+/// Run a saved report and email it, with a link to the CSV, to its recipients who confirmed their
+/// address. Called by the job for the send that was due at `occurrence`. Each recipient's delivery is
+/// written down before the email goes out, so if the job runs again (a worker restarted) nobody gets
+/// it twice.
+pub async fn send_scheduled(state: &AppState, report_id: Uuid, occurrence: DateTime<Utc>) -> anyhow::Result<()> {
     let row: Option<(Uuid, String, Value, Vec<Uuid>)> =
         sqlx::query_as("SELECT account_id, name, spec, schedule_recipients FROM saved_reports WHERE id = $1 AND schedule IS NOT NULL")
             .bind(report_id)
             .fetch_optional(&state.db)
             .await?;
-    let Some((account_id, name, spec, recipients)) = row else { return Ok(()) };
+    let Some((account_id, name, spec, recipient_ids)) = row else { return Ok(()) };
     let fail = |msg: String| async move {
         sqlx::query("UPDATE saved_reports SET last_error = $2 WHERE id = $1").bind(report_id).bind(&msg).execute(&state.db).await.map(|_| ())
     };
@@ -397,19 +429,17 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid) -> anyhow::Result
         fail("Scheduled emails need SUPPORT_EMAIL set on the server.".into()).await?;
         return Ok(());
     };
-    // Only people who are still members get it.
-    let to: Vec<String> = sqlx::query_scalar("SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 AND m.user_id = ANY($2)")
-        .bind(account_id)
-        .bind(&recipients)
-        .fetch_all(&state.db)
-        .await?;
+    // Only people who are still members and confirmed their address get it.
+    let to = recipients::confirmed(state, account_id, &recipient_ids).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     if to.is_empty() {
-        fail("None of the recipients are members of this account anymore.".into()).await?;
+        fail("No one gets this report yet: each recipient has to confirm their address from the email we sent them.".into()).await?;
         return Ok(());
     }
     let spec: Spec = serde_json::from_value(spec)?;
-    let result = match custom::run(state, account_id, spec, query::JOB_TIMEOUT).await {
+    let result = match custom::run(state, account_id, spec, Mode::Job).await {
         Ok(r) => r,
+        // Another report is running for the account, or the server is busy: try again shortly.
+        Err(e @ AppError::Busy(_)) => return Err(anyhow::anyhow!(e.public_message())),
         Err(e) => {
             fail(e.public_message()).await?;
             return Ok(());
@@ -419,7 +449,17 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid) -> anyhow::Result
     let (_, tz) = query::account_tz(state, account_id).await?;
     let today = Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string();
     let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
-    let export_id = super::exports::store_file(state, account_id, "report", json!({"report_id": report_id}), &format!("{}-{today}.csv", slug.trim_matches('-')), csv.as_bytes()).await?;
+    // One file per scheduled send, even if the job runs again.
+    let params = json!({"report_id": report_id, "occurrence": occurrence});
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM exports WHERE account_id = $1 AND kind = 'report' AND params = $2 LIMIT 1")
+        .bind(account_id)
+        .bind(&params)
+        .fetch_optional(&state.db)
+        .await?;
+    let export_id = match existing {
+        Some(id) => id,
+        None => super::exports::store_file(state, account_id, "report", params, &format!("{}-{today}.csv", slug.trim_matches('-')), csv.as_bytes()).await?,
+    };
 
     let account_name: String = sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
     let link = format!("{}/analytics/exports", state.cfg.public_url());
@@ -465,7 +505,19 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid) -> anyhow::Result
         esc(&link)
     ));
     let mut errors = Vec::new();
-    for addr in &to {
+    let mut sent = 0;
+    for (user_id, addr) in &to {
+        let claimed = sqlx::query("INSERT INTO report_deliveries (report_id, occurrence, user_id, email) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+            .bind(report_id)
+            .bind(occurrence)
+            .bind(user_id)
+            .bind(addr)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+        if claimed == 0 {
+            continue; // Already sent (or tried) for this occurrence.
+        }
         let email = OutgoingEmail {
             message_id: Uuid::now_v7(),
             to: addr.clone(),
@@ -477,33 +529,55 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid) -> anyhow::Result
             text: text.clone(),
             unsubscribe_url: None,
         };
-        if let Err(e) = state.email.send(&email).await {
-            tracing::error!(report = %report_id, error = %format!("{e:#}"), "couldn't email a scheduled report");
-            errors.push(addr.clone());
-        }
+        let (status, error) = match state.email.send(&email).await {
+            Ok(_) => {
+                sent += 1;
+                ("sent", None)
+            }
+            Err(e) => {
+                tracing::error!(report = %report_id, error = %format!("{e:#}"), "couldn't email a scheduled report");
+                errors.push(addr.clone());
+                ("failed", Some(format!("{e:#}").chars().take(500).collect::<String>()))
+            }
+        };
+        sqlx::query("UPDATE report_deliveries SET status = $4, error = $5 WHERE report_id = $1 AND occurrence = $2 AND user_id = $3")
+            .bind(report_id)
+            .bind(occurrence)
+            .bind(user_id)
+            .bind(status)
+            .bind(error)
+            .execute(&state.db)
+            .await?;
     }
     let err = (!errors.is_empty()).then(|| format!("Couldn't email {}.", errors.join(", ")));
     sqlx::query("UPDATE saved_reports SET last_sent_at = now(), last_error = $2 WHERE id = $1").bind(report_id).bind(err).execute(&state.db).await?;
-    tracing::info!(report = %report_id, export = %export_id, recipients = to.len(), "scheduled report sent");
+    tracing::info!(report = %report_id, export = %export_id, recipients = sent, "scheduled report sent");
     Ok(())
 }
 
 /// Queue the reports that are due, moving each one's next send time forward first so a slow run
 /// never sends twice.
 pub async fn enqueue_due(state: &AppState) -> anyhow::Result<()> {
-    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT r.id, r.schedule, a.timezone FROM saved_reports r JOIN accounts a ON a.id = r.account_id
+    let due: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT r.id, r.schedule, a.timezone, r.next_run_at FROM saved_reports r JOIN accounts a ON a.id = r.account_id
          WHERE r.schedule IS NOT NULL AND r.next_run_at <= now() ORDER BY r.next_run_at LIMIT 50",
     )
     .fetch_all(&state.db)
     .await?;
-    for (id, schedule, tz) in due {
+    for (id, schedule, tz, due_at) in due {
         let tz = tz.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::America::Los_Angeles);
         let next = next_run(&schedule, tz, Utc::now());
         let mut tx = state.db.begin().await?;
-        let claimed = sqlx::query("UPDATE saved_reports SET next_run_at = $2 WHERE id = $1 AND next_run_at <= now()").bind(id).bind(next).execute(&mut *tx).await?.rows_affected();
+        let claimed = sqlx::query("UPDATE saved_reports SET next_run_at = $2 WHERE id = $1 AND next_run_at = $3")
+            .bind(id)
+            .bind(next)
+            .bind(due_at)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if claimed == 1 {
-            crate::jobs::enqueue(&mut *tx, "reports_scheduled_send", json!({"report_id": id}), None).await?;
+            // The time it was due names this send, so a replayed job is recognised.
+            crate::jobs::enqueue(&mut *tx, "reports_scheduled_send", json!({"report_id": id, "occurrence": due_at}), None).await?;
         }
         tx.commit().await?;
     }

@@ -1,38 +1,163 @@
-//! Shared plumbing for report queries: a bind-parameter builder, a time limit on every statement,
-//! and the account's time zone and date ranges.
+//! Shared plumbing for report queries: limits on how much reporting runs at once and for how long,
+//! a bind-parameter builder, and the account's time zone and date ranges.
+//!
+//! Every report (custom, ready-made, cohorts, funnels, deliverability, benchmarks, attribution
+//! previews, scheduled emails) runs inside a [`Run`]: one at a time per account, at most
+//! [`max_concurrent`] across the server (so reporting can only ever use a few of the database
+//! connections live sending needs), and one deadline for all of its statements together. Exports and
+//! MX lookups take a slot of the same global limit.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{Postgres, Transaction};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// Longest any report statement may run in a request.
-pub const REQUEST_TIMEOUT: &str = "20s";
-/// Longest a statement may run in a background job (exports, scheduled reports).
-pub const JOB_TIMEOUT: &str = "120s";
+/// The whole of one report request, across all its statements.
+pub const REQUEST_BUDGET: Duration = Duration::from_secs(20);
+/// The whole of one background run (a scheduled report, one export batch, one MX lookup job).
+pub const JOB_BUDGET: Duration = Duration::from_secs(120);
+/// Default for `REPORTS_MAX_CONCURRENT`.
+const DEFAULT_CONCURRENT: usize = 4;
 
-/// A transaction whose statements stop after [`REQUEST_TIMEOUT`], so one heavy report can't hold
-/// the database.
-pub async fn timed(state: &AppState) -> AppResult<Transaction<'static, Postgres>> {
-    timed_for(state, REQUEST_TIMEOUT).await
+/// Where a report runs: in a request (20 seconds, a second report for the same account is refused)
+/// or in a background job (2 minutes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Request,
+    Job,
 }
 
-pub async fn timed_for(state: &AppState, limit: &'static str) -> AppResult<Transaction<'static, Postgres>> {
-    let mut tx = state.db.begin().await?;
-    sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
-    // `limit` is one of the constants above, never user input.
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{limit}'")).execute(&mut *tx).await?;
-    Ok(tx)
+impl Mode {
+    pub fn budget(self) -> Duration {
+        match self {
+            Mode::Request => REQUEST_BUDGET,
+            Mode::Job => JOB_BUDGET,
+        }
+    }
+}
+
+/// Most report, cohort, funnel, deliverability and export queries the server runs at once:
+/// `REPORTS_MAX_CONCURRENT` (1-16), default 4 of the 20 database connections.
+pub fn max_concurrent() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("REPORTS_MAX_CONCURRENT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_CONCURRENT).clamp(1, 16))
+}
+
+fn global() -> Arc<Semaphore> {
+    static S: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    S.get_or_init(|| Arc::new(Semaphore::new(max_concurrent()))).clone()
+}
+
+fn running() -> &'static Mutex<HashSet<Uuid>> {
+    static R: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Marks an account as running a report until dropped.
+struct AccountSlot(Uuid);
+
+impl Drop for AccountSlot {
+    fn drop(&mut self) {
+        running().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
+pub const BUSY_ACCOUNT: &str = "A report is already running for this account. Wait for it to finish, then try again.";
+const BUSY_SERVER: &str = "Reports are busy right now. Try again in a minute.";
+const TOO_LONG: &str = "This report took too long to run. Try a shorter date range or fewer groups.";
+
+/// One report's permission to run, and its deadline.
+pub struct Run {
+    deadline: Instant,
+    _slot: Option<AccountSlot>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Run {
+    /// Start a report for `account_id`. Refused (429) while another report runs for the account;
+    /// waits for a global slot until the deadline.
+    pub async fn start(account_id: Uuid, mode: Mode) -> AppResult<Run> {
+        let deadline = Instant::now() + mode.budget();
+        let slot = {
+            let mut set = running().lock().unwrap_or_else(|e| e.into_inner());
+            if !set.insert(account_id) {
+                return Err(AppError::Busy(BUSY_ACCOUNT.into()));
+            }
+            AccountSlot(account_id)
+        };
+        let permit = Self::permit(deadline).await?;
+        Ok(Run { deadline, _slot: Some(slot), _permit: permit })
+    }
+
+    /// A slot of the global limit only (exports and MX lookups, which have their own per-account rule).
+    pub async fn background(budget: Duration) -> AppResult<Run> {
+        let deadline = Instant::now() + budget;
+        let permit = Self::permit(deadline).await?;
+        Ok(Run { deadline, _slot: None, _permit: permit })
+    }
+
+    async fn permit(deadline: Instant) -> AppResult<OwnedSemaphorePermit> {
+        match tokio::time::timeout_at(deadline.into(), global().acquire_owned()).await {
+            Ok(Ok(p)) => Ok(p),
+            _ => Err(AppError::Busy(BUSY_SERVER.into())),
+        }
+    }
+
+    /// Time left before the deadline.
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// A read-only transaction whose statements together stop at the deadline.
+    pub async fn tx(&self, state: &AppState) -> AppResult<Tx> {
+        let mut tx = state.db.begin().await?;
+        sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+        Ok(Tx { tx, deadline: self.deadline })
+    }
+}
+
+/// A report transaction. Before each statement the time limit is set to what's left of the run's
+/// deadline, so several statements can't add up to more than one.
+pub struct Tx {
+    tx: Transaction<'static, Postgres>,
+    deadline: Instant,
+}
+
+impl Tx {
+    /// Set the time limit for the next statement and hand out the transaction to run it on.
+    pub async fn arm(&mut self) -> AppResult<&mut Transaction<'static, Postgres>> {
+        let left = self.deadline.saturating_duration_since(Instant::now()).as_millis();
+        if left < 50 {
+            return Err(AppError::bad(TOO_LONG));
+        }
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)").bind(format!("{left}ms")).execute(&mut *self.tx).await?;
+        Ok(&mut self.tx)
+    }
+
+    pub async fn fetch_all(&mut self, q: &Sql) -> AppResult<Vec<PgRow>> {
+        let tx = self.arm().await?;
+        q.query().fetch_all(&mut **tx).await.map_err(db_err)
+    }
+
+    pub async fn commit(self) -> AppResult<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Turn a timed-out statement into an answer people can act on.
 pub fn db_err(e: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(d) = &e {
         if d.code().as_deref() == Some("57014") {
-            return AppError::bad("This report took too long to run. Try a shorter date range or fewer groups.");
+            return AppError::bad(TOO_LONG);
         }
     }
     e.into()
@@ -72,7 +197,8 @@ impl Sql {
         self
     }
 
-    pub async fn fetch_all(&self, tx: &mut Transaction<'static, Postgres>) -> AppResult<Vec<PgRow>> {
+    /// The query with its values bound.
+    pub fn query(&self) -> sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments> {
         let mut q = sqlx::query(&self.text);
         for a in &self.args {
             q = match a {
@@ -84,7 +210,7 @@ impl Sql {
                 Arg::UuidArr(v) => q.bind(v.clone()),
             };
         }
-        q.fetch_all(&mut **tx).await.map_err(db_err)
+        q
     }
 }
 

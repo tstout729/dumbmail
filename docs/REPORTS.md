@@ -8,6 +8,21 @@ server (tools listed at the end).
 Dates and day boundaries use the account's time zone (Settings → Account, default
 `America/Los_Angeles`).
 
+## Limits
+
+Reports share the database with live sending, so they're kept small:
+
+- One report runs at a time per account. Another one while it runs (a report, cohort, funnel,
+  deliverability, benchmark or attribution preview, from the dashboard, the API or MCP) gets
+  `429` with "A report is already running for this account". A scheduled email that finds one
+  running tries again a little later.
+- The server runs at most 4 report and export queries at once (set `REPORTS_MAX_CONCURRENT`, 1-16).
+  A report that can't start within its time gets `429` "Reports are busy right now".
+- A report has 20 seconds in all, however many queries it needs (2 minutes for scheduled emails and
+  each export batch). Past that it stops with "This report took too long to run".
+- Only what a report's measures need is worked out: a report of sends never looks at attribution.
+- Group values and names are cut at 200 characters, and a result at about 2 MB.
+
 ## Attribution settings
 
 Revenue is credited to a message by one rule, used by every report: the analytics overview, campaign
@@ -24,6 +39,15 @@ past dates.
 | `conversion_metrics` | `["Placed Order"]` | Events of these metrics (1-5) are conversions. Their `value` is the revenue. |
 
 Windows are 1-720 hours (30 days). A message counts only for interactions before the conversion.
+Credit counts as revenue from DumbMail only when it goes to a campaign or flow message, as on the
+overview; a double opt-in confirmation email can take the credit, but that revenue counts as not
+attributed.
+
+**One change from before these settings.** The old rule looked at an email's latest interaction
+only, so an email opened before a purchase and clicked after it got no credit. Now each interaction
+is checked on its own: the open, inside its window before the purchase, earns the credit. Everything
+else about the default settings credits the same message as before, including ties (two messages
+touched at the same moment), which go to the newer message.
 One conversion metric is also saved as the account's `conversion_metric` (which `update_account`
 changes too); two or more are kept here and take precedence.
 
@@ -36,8 +60,8 @@ changes too); two or more are kept here and take precedence.
 ## Report spec
 
 A report is a JSON spec. Only the names listed below are accepted; every value is bound into the
-query, never written into it. Each run stops after 20 seconds (2 minutes for scheduled emails) and
-returns at most 1,000 rows.
+query, never written into it. Each run has the limits above and returns at most 1,000 rows. Rows are
+sorted before they're cut, so a report sorted by revenue always has the top earners.
 
 ```json
 {
@@ -87,7 +111,9 @@ Products aren't a source yet: DumbMail doesn't have a product catalog to report 
 - **Message sources** (`campaigns`, `flows`, `flow_messages`, `messages`): `sent`, `delivered`,
   `recipients` (different people), `opens` and `clicks` (unique, one per message), `unsubscribes`,
   `bounces`, `hard_bounces`, `complaints`, `conversions`, `revenue`, `open_rate` (opens ÷ delivered
-  emails), `click_rate` (clicks ÷ delivered), `click_to_open_rate`, `unsubscribe_rate` (÷ sent),
+  emails), `click_rate` (clicks ÷ delivered). A message is `delivered` when it was sent or delivered,
+  or opened even if it later bounced or was marked as spam, the same as on the overview and the
+  campaign and flow reports. `click_to_open_rate`, `unsubscribe_rate` (÷ sent),
   `bounce_rate` and `complaint_rate` (÷ emails sent), `conversion_rate` (conversions ÷ recipients),
   `revenue_per_recipient`, `average_order_value`. Messages count by when they were sent; revenue
   counts by when the conversion happened, so a report's totals match the overview for the same days.
@@ -108,7 +134,8 @@ Products aren't a source yet: DumbMail doesn't have a product catalog to report 
 `day`, `week` (starting Monday), `month`, `hour` (00-23) and `weekday` (1 = Monday) are in the
 account's time zone. `channel` is email or SMS. `source` is campaign, flow or (revenue only) none.
 `message` is a flow step (`<flow id>/<step id>`) or a campaign. `list` and `segment` on message
-sources are the campaign's audience, so a campaign sent to two lists shows under both. `country` is
+sources are the campaign's audience, so a campaign sent to two lists shows under both, and messages
+with none (flows, or a campaign sent to everyone) show as "(none)". `country` is
 the profile's `country` property. Engagement `tier`s: `active_30`, `active_90` (31-90 days ago),
 `active_180` (91-180), `at_risk` (last active 6-12 months ago), `unengaged` (emailed in the last
 year, never opened or clicked), `not_emailed` (no email in the last year).
@@ -164,7 +191,7 @@ Product views by a property, Canada only:
 | PATCH | `/api/reports/{id}` | Any of the create fields; `"schedule": null` stops emails | The saved report. Ready-made reports can't be changed. |
 | POST | `/api/reports/{id}/duplicate` | `{name?}` | A new saved copy (201). |
 | DELETE | `/api/reports/{id}` | | 204 |
-| GET | `/api/reports/members` | | Members who can get scheduled emails. |
+| GET | `/api/reports/members` | | Members who can get scheduled emails, each with `report_emails`: `confirmed`, `waiting` or `not_asked`. |
 
 ### Ready-made reports
 
@@ -179,6 +206,13 @@ to 1-10 `recipients` (user ids of the account's members). Each email has the tot
 and links to the full CSV, which is kept with the account's exports for 7 days and downloads only
 while signed in. Emails come from the server's `SUPPORT_EMAIL`; without it the report shows
 `last_error` instead. People who leave the account stop getting them.
+
+A member gets report emails only after confirming their address. Saving a schedule emails each new
+recipient a link (good for 7 days, sent again at most once a day when the schedule is saved again);
+the page it opens has a button, and only pressing it confirms. Members who sign in with Google count
+as confirmed. A saved report's `recipient_status` lists each recipient as `confirmed` or `waiting`.
+Each send is recorded per recipient before the email goes out, so a retried job never sends a
+report twice.
 
 ## Cohorts
 
@@ -202,7 +236,7 @@ in order, within `window_days` (1-90) of that first step. `split_by` is optional
 `{"type": "event_property", "key": "utm_source"}` (of the step 1 event),
 `{"type": "profile_property", "key": "plan"}`, or `{"type": "source"}` (whether step 1 came from a
 campaign or flow message, by the attribution settings). The 10 biggest splits are kept; the rest are
-"Other". Each step returns `people`, `conversion_from_previous`, `conversion_from_start` and
+"Other", and the total always counts everyone. Each step returns `people`, `conversion_from_previous`, `conversion_from_start` and
 `dropped`. A funnel's range can cover at most 365 days.
 
 ## Deliverability
@@ -213,7 +247,8 @@ and each sending domain: sent, delivered, opens, clicks, unsubscribes, bounces (
 complaints and their rates, a `health` score (0-100, `good` 85+, `fair` 65+, else `poor`) with
 plain-language `flags`, and a `series` over time. Providers come from the recipient's email domain;
 custom domains are matched by their public MX records (Google Workspace, Microsoft 365, Yahoo,
-iCloud), looked up in the background after you open the report and cached for 30 days. Sending
+iCloud), looked up in the background after you open the report (up to 50 domains at a time) and
+cached for 30 days. Sending
 domains are recorded from now on; earlier email shows as "not recorded". `authentication` lists each
 sending domain's DKIM, SPF and DMARC status from its last check in Settings → Domains.
 
@@ -254,8 +289,9 @@ Bodies:
 - `{"kind": "suppressions"}`: everyone unsubscribed from email or SMS, or suppressed after a hard
   bounce or complaint.
 
-Exports run in the background, 5,000 rows at a time. One runs per account at a time. Files are kept
-7 days and can be up to 100 MB. Times are in the account's time zone with their offset. Cells that
+Exports run in the background, up to 5,000 rows or 8 MB at a time. One runs per account at a time.
+Files are kept 7 days and can be up to 100 MB; an export that would pass that stops with a message
+saying so. Only the custom properties you pick are read. Times are in the account's time zone with their offset. Cells that
 start with `=`, `+`, `-` or `@` get a leading `'` so spreadsheets don't run them as formulas.
 
 ## MCP tools

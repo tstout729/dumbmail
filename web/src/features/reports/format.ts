@@ -31,6 +31,12 @@ export function formatBucket(group: string, key: string): string {
 
 export const TIME_GROUPS = ["day", "week", "month"];
 
+/** The calendar date `n` days before `date` ("2026-11-17"). */
+export function daysBefore(date: string, n: number): string {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d - n)).toISOString().slice(0, 10);
+}
+
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;

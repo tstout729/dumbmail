@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
-use super::query::{self, Arg, Sql, Window};
+use super::query::{self, Arg, Mode, Run, Sql, Window};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -181,6 +181,7 @@ pub async fn report(state: &AppState, account_id: Uuid, q: DeliverabilityQuery) 
         None if days <= 31 => "day",
         None => "week",
     };
+    let run = Run::start(account_id, Mode::Request).await?;
     let (tz_name, _) = query::account_tz(state, account_id).await?;
     let now = Utc::now();
     let w = Window { start: now - chrono::Duration::days(days), end: now };
@@ -193,13 +194,13 @@ pub async fn report(state: &AppState, account_id: Uuid, q: DeliverabilityQuery) 
              LEFT JOIN inbox_provider_cache ipc ON ipc.domain = m.dom"
         )
     };
-    let mut tx = query::timed(state).await?;
+    let mut tx = run.tx(state).await?;
 
     let mut by_provider = Sql::new(account_id);
     let from = base(&mut by_provider);
     let prov = provider_sql(&mut by_provider);
     by_provider.push(&format!("SELECT {prov} AS provider, {} {from} GROUP BY 1", aggregates()));
-    let rows = by_provider.fetch_all(&mut tx).await?;
+    let rows = tx.fetch_all(&by_provider).await?;
     let mut raw_by: HashMap<String, HashMap<&'static str, f64>> = rows.iter().map(|r| (r.try_get::<String, _>("provider").unwrap_or_default(), read_raw(r))).collect();
     let mut overall: HashMap<&'static str, f64> = RAW.iter().map(|k| (*k, 0.0)).collect();
     for raw in raw_by.values() {
@@ -227,8 +228,8 @@ pub async fn report(state: &AppState, account_id: Uuid, q: DeliverabilityQuery) 
         "SELECT to_char(date_trunc('{interval}', m.created_at AT TIME ZONE {tzp}), 'YYYY-MM-DD') AS bucket, {prov} AS provider, {} {from} GROUP BY 1, 2 ORDER BY 1",
         aggregates()
     ));
-    let series_rows: Vec<Value> = series
-        .fetch_all(&mut tx)
+    let series_rows: Vec<Value> = tx
+        .fetch_all(&series)
         .await?
         .iter()
         .map(|r| {
@@ -242,11 +243,12 @@ pub async fn report(state: &AppState, account_id: Uuid, q: DeliverabilityQuery) 
     let mut by_domain = Sql::new(account_id);
     let from = base(&mut by_domain);
     by_domain.push(&format!("SELECT COALESCE(m.from_domain, '') AS domain, {} {from} GROUP BY 1 ORDER BY 2 DESC LIMIT 50", aggregates()));
-    let domain_rows = by_domain.fetch_all(&mut tx).await?;
+    let domain_rows = tx.fetch_all(&by_domain).await?;
     tx.commit().await?;
 
     let auth: Vec<(String, String, Value, Option<chrono::DateTime<Utc>>)> =
-        sqlx::query_as("SELECT domain, status, records, verified_at FROM sending_domains WHERE account_id = $1 ORDER BY created_at").bind(account_id).fetch_all(&state.db).await?;
+        sqlx::query_as("SELECT domain, status, records, verified_at FROM sending_domains WHERE account_id = $1 ORDER BY created_at LIMIT 100").bind(account_id).fetch_all(&state.db).await?;
+    drop(run);
     let auth_for = |d: &str| auth.iter().find(|a| d == a.0 || d.ends_with(&format!(".{}", a.0)));
     let domains: Vec<Value> = domain_rows
         .iter()
@@ -285,14 +287,19 @@ pub async fn report(state: &AppState, account_id: Uuid, q: DeliverabilityQuery) 
     }))
 }
 
-async fn queue_mx_lookup(state: &AppState, account_id: Uuid) -> AppResult<()> {
+/// Queue one MX lookup job for the account unless one is already waiting. The check and the insert
+/// run under a per-account advisory lock, so two reports opened at once can't queue two.
+pub async fn queue_mx_lookup(state: &AppState, account_id: Uuid) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('reports_mx_lookup'), hashtext($1))").bind(account_id.to_string()).execute(&mut *tx).await?;
     let queued: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = 'reports_mx_lookup' AND payload->>'account_id' = $1 AND run_at <> 'infinity')")
         .bind(account_id.to_string())
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await?;
     if !queued {
-        crate::jobs::enqueue(&state.db, "reports_mx_lookup", json!({"account_id": account_id}), None).await?;
+        crate::jobs::enqueue(&mut *tx, "reports_mx_lookup", json!({"account_id": account_id}), None).await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -300,44 +307,64 @@ fn plausible_domain(d: &str) -> bool {
     d.contains('.') && d.len() < 254 && d.split('.').all(|l| !l.is_empty() && l.len() < 64 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// Job: classify up to 50 of the account's busiest custom recipient domains by MX record. Results
-/// are public DNS facts, cached for 30 days and shared by all accounts.
+/// Most custom domains one job looks up.
+const MX_PER_JOB: usize = 50;
+/// Lookups in flight at once.
+const MX_PARALLEL: usize = 8;
+/// Longest one lookup may take.
+const MX_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest the whole job may take, well inside the 15-minute job lease.
+const MX_JOB_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Job: classify up to [`MX_PER_JOB`] of the account's busiest custom recipient domains by MX record.
+/// Results are public DNS facts, cached for 30 days and shared by all accounts. The scan for
+/// candidates has a time limit; lookups run a few at a time, each with its own limit, and the job
+/// stops at [`MX_JOB_BUDGET`] (the rest wait for the next one).
 pub async fn mx_lookup(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
-    let domains: Vec<String> = sqlx::query_scalar(
-        "SELECT d FROM (SELECT lower(split_part(to_address, '@', 2)) AS d, count(*) AS n FROM messages
-                        WHERE account_id = $1 AND channel = 'email' AND NOT is_test AND created_at > now() - interval '30 days'
-                        GROUP BY 1 HAVING count(*) >= 3) x
-         WHERE NOT EXISTS (SELECT 1 FROM inbox_provider_cache c WHERE c.domain = x.d AND c.checked_at > now() - interval '30 days')
-         ORDER BY n DESC LIMIT 200",
-    )
-    .bind(account_id)
-    .fetch_all(&state.db)
-    .await?;
-    let mut done = 0;
-    for d in domains {
-        if done >= 50 {
+    use futures_util::StreamExt;
+    let started = std::time::Instant::now();
+    let candidates: Vec<String> = {
+        let run = Run::background(query::JOB_BUDGET).await?;
+        let mut tx = run.tx(state).await?;
+        let mut q = Sql::new(account_id);
+        q.push(
+            "SELECT d FROM (SELECT lower(split_part(to_address, '@', 2)) AS d, count(*) AS n FROM messages
+                            WHERE account_id = $1 AND channel = 'email' AND NOT is_test AND created_at > now() - interval '30 days'
+                            GROUP BY 1 HAVING count(*) >= 3) x
+             WHERE NOT EXISTS (SELECT 1 FROM inbox_provider_cache c WHERE c.domain = x.d AND c.checked_at > now() - interval '30 days')
+             ORDER BY n DESC LIMIT 200",
+        );
+        let rows = tx.fetch_all(&q).await?;
+        tx.commit().await?;
+        rows.iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect()
+    };
+    let domains: Vec<String> = candidates.into_iter().filter(|d| known_provider(d).is_none() && plausible_domain(d)).take(MX_PER_JOB).collect();
+    let mut lookups = futures_util::stream::iter(domains)
+        .map(|d| async move {
+            let mx = tokio::time::timeout(MX_LOOKUP_TIMEOUT, crate::domains::lookup(state, &d, "MX")).await;
+            (d, mx)
+        })
+        .buffer_unordered(MX_PARALLEL);
+    while let Some((d, mx)) = lookups.next().await {
+        // A lookup that timed out isn't cached, so it's tried again next time.
+        if let Ok(mx) = mx {
+            sqlx::query("INSERT INTO inbox_provider_cache (domain, provider, checked_at) VALUES ($1, $2, now()) ON CONFLICT (domain) DO UPDATE SET provider = $2, checked_at = now()")
+                .bind(&d)
+                .bind(provider_from_mx(&mx))
+                .execute(&state.db)
+                .await?;
+        }
+        if started.elapsed() > MX_JOB_BUDGET {
             break;
         }
-        if known_provider(&d).is_some() || !plausible_domain(&d) {
-            continue;
-        }
-        done += 1;
-        let mx = crate::domains::lookup(state, &d, "MX").await;
-        let provider = provider_from_mx(&mx);
-        sqlx::query("INSERT INTO inbox_provider_cache (domain, provider, checked_at) VALUES ($1, $2, now()) ON CONFLICT (domain) DO UPDATE SET provider = $2, checked_at = now()")
-            .bind(&d)
-            .bind(provider)
-            .execute(&state.db)
-            .await?;
     }
     Ok(())
 }
 
-/// Record the domain an email was sent from (for deliverability by sending domain).
-pub async fn note_sender(db: &sqlx::PgPool, message_id: Uuid, from_email: &str) -> sqlx::Result<()> {
-    let domain = from_email.rsplit_once('@').map(|(_, d)| d.trim().to_ascii_lowercase()).filter(|d| !d.is_empty() && d.len() < 254);
-    sqlx::query("UPDATE messages SET from_domain = $2 WHERE id = $1").bind(message_id).bind(domain).execute(db).await?;
-    Ok(())
+/// The domain an email is sent from, kept on the message for deliverability by sending domain.
+/// The send path writes it in the same update that marks the message sent.
+pub fn sender_domain(from_email: &str) -> Option<String> {
+    from_email.rsplit_once('@').map(|(_, d)| d.trim().to_ascii_lowercase()).filter(|d| !d.is_empty() && d.len() < 254)
 }
 
 pub const BENCHMARKS_JSON: &str = include_str!("benchmarks.json");
@@ -353,7 +380,8 @@ pub async fn benchmarks(state: &AppState, account_id: Uuid, industry: Option<&st
     let key = industry.unwrap_or("all");
     let chosen = industries.iter().find(|i| i["key"] == key).cloned().ok_or_else(|| AppError::bad("unknown industry"))?;
     let now = Utc::now();
-    let mut tx = query::timed(state).await?;
+    let run = Run::start(account_id, Mode::Request).await?;
+    let mut tx = run.tx(state).await?;
     let window = |days: i64| {
         let mut q = Sql::new(account_id);
         let since = q.bind(Arg::Ts(now - chrono::Duration::days(days)));
@@ -363,9 +391,10 @@ pub async fn benchmarks(state: &AppState, account_id: Uuid, industry: Option<&st
         ));
         q
     };
-    let recent = window(30).fetch_all(&mut tx).await?;
-    let trailing = window(90).fetch_all(&mut tx).await?;
+    let recent = tx.fetch_all(&window(30)).await?;
+    let trailing = tx.fetch_all(&window(90)).await?;
     tx.commit().await?;
+    drop(run);
     let recent = recent.first().map(read_raw).unwrap_or_default();
     let trailing = trailing.first().map(read_raw).unwrap_or_default();
     let (r, t) = (rates(&recent), rates(&trailing));

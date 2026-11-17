@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { CalendarClock, Copy, Download, MoreHorizontal, Plus, Save, Trash2, X } from "lucide-react";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments, errorMessage } from "../../api";
 import {
+  Badge,
   Button,
   Card,
   Checkbox,
@@ -25,9 +26,11 @@ import {
 } from "../../components/ui";
 import { useDebouncedValue } from "../../lib/hooks";
 import { formatDateTime } from "../../lib/format";
+import { utcToZoned } from "../../lib/tz";
 import { toast } from "../../lib/toast";
 import { useSession } from "../../api";
 import { downloadCsv, useCatalog, useCreateReport, useDeleteReport, useDuplicateReport, useMembers, useRunReport, useSavedReport, useUpdateReport } from "./api";
+import { daysBefore } from "./format";
 import { ResultView } from "./ResultView";
 import type { CatalogSource, ReportFilter, ReportSpec, SavedReport, Schedule } from "./types";
 
@@ -190,6 +193,16 @@ function Builder({ sources, report, initial }: { sources: CatalogSource[]; repor
           </>
         }
       />
+      {report?.schedule && report.recipient_status.some((r) => r.status !== "confirmed") ? (
+        <div className="mb-4">
+          <Notice tone="blue" title="Waiting for confirmation">
+            {`${report.recipient_status
+              .filter((r) => r.status !== "confirmed")
+              .map((r) => r.name || r.email)
+              .join(", ")} won't get this report until they confirm their address from the email we sent them.`}
+          </Notice>
+        </div>
+      ) : null}
       {report?.last_error ? (
         <div className="mb-4">
           <Notice tone="amber" title="The last scheduled email didn't go out">
@@ -218,9 +231,9 @@ function Builder({ sources, report, initial }: { sources: CatalogSource[]; repor
                     onChange={(e) => {
                       const v = e.target.value as RangeChoice;
                       if (v === "custom") {
-                        const today = new Date().toISOString().slice(0, 10);
-                        const start = new Date(Date.now() - 29 * 864e5).toISOString().slice(0, 10);
-                        set({ range: { start, end: today } });
+                        // Today in the account's time zone, not the browser's or UTC.
+                        const today = utcToZoned(new Date().toISOString(), account.timezone).date;
+                        set({ range: { start: daysBefore(today, 29), end: today } });
                       } else set({ range: { days: Number(v) } });
                     }}
                   >
@@ -528,10 +541,13 @@ function ScheduleDialog({ report, onClose }: { report: SavedReport; onClose: () 
           />
         </Field>
         {schedule !== "off" ? (
-          <Field label="Send to">
+          <Field label="Send to" hint="We email each person a link to confirm their address. Reports go only to people who confirmed.">
             <div className="space-y-1.5">
               {(members.data ?? []).map((m) => (
-                <Checkbox key={m.id} checked={recipients.includes(m.id)} onChange={() => toggle(m.id)} label={m.name || m.email} description={m.name ? m.email : undefined} />
+                <div key={m.id} className="flex items-start justify-between gap-2">
+                  <Checkbox checked={recipients.includes(m.id)} onChange={() => toggle(m.id)} label={m.name || m.email} description={m.name ? m.email : undefined} />
+                  {recipients.includes(m.id) && m.report_emails !== "confirmed" ? <Badge tone="amber">{m.report_emails === "waiting" ? "Waiting for confirmation" : "Will be asked to confirm"}</Badge> : null}
+                </div>
               ))}
             </div>
           </Field>
