@@ -46,13 +46,23 @@ pub fn id_from_token(state: &AppState, token: &str) -> Option<Uuid> {
     crate::auth::verify(&state.cfg.secret_key, token)?.strip_prefix('c')?.parse().ok()
 }
 
-/// The inbox an address reaches: lowercased, `+tag` removed, and for Gmail the dots too, so
-/// `v.ictim+1@gmail.com` and `victim@googlemail.com` count as the same person.
+/// Mailbox providers that deliver `name+anything@` to `name@`. Elsewhere a `+` may be part of a different
+/// address, so stripping it could let a made-up variant hold back the real person's confirmation.
+const PLUS_TAG_DOMAINS: &[&str] = &[
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me", "pm.me", "fastmail.com", "fastmail.fm",
+];
+
+/// The inbox an address reaches: lowercased; at providers that ignore them, `+tag` removed (and for Gmail
+/// the dots too), so `v.ictim+1@gmail.com` and `victim@googlemail.com` count as the same person.
 pub fn email_key(email: &str) -> String {
     let e = email.trim().to_lowercase();
     let Some((local, domain)) = e.rsplit_once('@') else { return e };
-    let local = local.split('+').next().unwrap_or(local);
     let domain = if domain == "googlemail.com" { "gmail.com" } else { domain };
+    if !PLUS_TAG_DOMAINS.contains(&domain) {
+        return format!("{local}@{domain}");
+    }
+    let local = local.split('+').next().unwrap_or(local);
     let local = if domain == "gmail.com" { local.replace('.', "") } else { local.to_string() };
     format!("{local}@{domain}")
 }
@@ -87,9 +97,13 @@ pub async fn start(
     let key = email_key(email);
     let ip_hash = ip.filter(|s| !s.is_empty()).map(crate::auth::sha256_hex);
 
-    // Checked and recorded under a lock on the inbox, so simultaneous sign-ups can't both send.
+    // Checked and recorded under locks on the account (its inbox and hourly checks) and the visitor, always
+    // taken in that order, so simultaneous sign-ups can't get past a check together.
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("optin:{}:{key}", account.id)).execute(&mut *tx).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("optin:{}", account.id)).execute(&mut *tx).await?;
+    if let Some(h) = &ip_hash {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("optin-ip:{h}")).execute(&mut *tx).await?;
+    }
     let waiting: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM optin_confirmations WHERE account_id = $1 AND email_key = $2 AND confirmed_at IS NULL AND created_at > now() - make_interval(hours => $3))",
     )
@@ -279,7 +293,8 @@ mod tests {
     fn one_inbox_one_key() {
         assert_eq!(email_key("V.ictim+1@Gmail.com"), "victim@gmail.com");
         assert_eq!(email_key("victim@googlemail.com"), "victim@gmail.com");
-        assert_eq!(email_key("jane.doe+news@shop.test"), "jane.doe@shop.test");
+        assert_eq!(email_key("jane+news@outlook.com"), "jane@outlook.com");
+        assert_eq!(email_key("jane.doe+news@shop.test"), "jane.doe+news@shop.test", "other providers may treat + as part of the address");
         assert_ne!(email_key("jane.doe@shop.test"), email_key("janedoe@shop.test"), "dots only matter outside Gmail");
     }
 
