@@ -1412,7 +1412,9 @@ pub fn form_destinations(def: &Value) -> Vec<String> {
 
 /// Steps where a missing scope only means that part is left out.
 fn optional_step(phase: &str) -> bool {
-    matches!(phase, "segments" | "segment_members" | "templates" | "campaigns" | "campaign_stats" | "flows" | "forms" | "compare" | "sync_consent_events" | "sync_events")
+    // Not the sync's consent steps: a sync that can't read one of its opt-out signals hasn't synced
+    // consent, so it fails (and sends keep waiting) rather than counting as fresh.
+    matches!(phase, "segments" | "segment_members" | "templates" | "campaigns" | "campaign_stats" | "flows" | "forms" | "compare" | "sync_events")
 }
 
 /// Claim the import for this run. Another live run keeps it.

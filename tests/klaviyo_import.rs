@@ -126,7 +126,7 @@ async fn handle(State(m): State<Shared>, method: Method, uri: Uri, headers: Head
     drop(g);
     let arr = |k: &str| ds[k].as_array().cloned().unwrap_or_default();
     let out: Value = match (method.as_str(), seg.as_slice()) {
-        ("GET", ["accounts"]) => json!({"data": [{"type": "account", "id": "ACCT1", "attributes": {"test_account": false, "contact_information": {"organization_name": "Acme Klaviyo", "website_url": "https://acme.test"}, "timezone": "US/Pacific", "preferred_currency": "USD"}}]}),
+        ("GET", ["accounts"]) => json!({"data": [{"type": "account", "id": ds["account_id"].as_str().unwrap_or("ACCT1"), "attributes": {"test_account": false, "contact_information": {"organization_name": "Acme Klaviyo", "website_url": "https://acme.test"}, "timezone": "US/Pacific", "preferred_currency": "USD"}}]}),
         ("GET", ["profiles"]) => {
             let mut items: Vec<Value> = arr("profiles");
             if let Some(reason) = filter.strip_prefix("equals(subscriptions.email.marketing.suppression.reason,'").and_then(|r| r.strip_suffix("')")) {
@@ -792,4 +792,610 @@ async fn pause_cancel_isolation_and_mcp() {
 /// A second session against the same app and database.
 fn harness_like(h: &Harness) -> Harness {
     Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: format!("{}_unused", h.dbname) }
+}
+
+// ---------- Consent, case by case, against the database ----------
+
+use dumbmail::features::klaviyo_import::{runner::Run, store};
+
+/// An import row to run profile writes against (no Klaviyo calls are made).
+async fn bare_import(h: &Harness, never: &str, status: &str) -> store::Import {
+    let acct: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    let id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO klaviyo_imports (id, account_id, status, options, klaviyo_account) VALUES ($1, $2, $3, $4, '{\"id\": \"ACCT1\"}')")
+        .bind(id)
+        .bind(acct)
+        .bind(status)
+        .bind(json!({"never_subscribed": never}))
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    store::load(&h.state.db, id).await.unwrap().unwrap()
+}
+
+fn kres(kid: &str, email: Option<&str>, phone: Option<&str>, ext: &str, email_m: Option<Value>, sms_m: Option<Value>) -> Value {
+    let mut subs = json!({});
+    if let Some(e) = email_m {
+        subs["email"] = json!({"marketing": e});
+    }
+    if let Some(s) = sms_m {
+        subs["sms"] = json!({"marketing": s});
+    }
+    json!({"type": "profile", "id": kid, "attributes": {"email": email, "phone_number": phone, "external_id": ext, "first_name": "T", "properties": {}, "location": {}, "subscriptions": subs}})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Dm {
+    None,
+    Never,
+    Subscribed,
+    Unsubscribed,
+    Pending,
+    /// Subscribed, with a hard bounce.
+    Suppressed,
+}
+
+const DMS: [Dm; 6] = [Dm::None, Dm::Never, Dm::Subscribed, Dm::Unsubscribed, Dm::Pending, Dm::Suppressed];
+
+fn dm_cols(d: Dm) -> (&'static str, Option<&'static str>) {
+    match d {
+        Dm::None | Dm::Never => ("never_subscribed", None),
+        Dm::Subscribed => ("subscribed", None),
+        Dm::Unsubscribed => ("unsubscribed", None),
+        Dm::Pending => ("pending", None),
+        Dm::Suppressed => ("subscribed", Some("hard_bounce")),
+    }
+}
+
+/// The ruling, written out independently of the importer: (email consent, suppressed, held).
+fn expect_email(state: &str, can: bool, sup: &str, dm: Dm, same: bool, hold_never: bool) -> (String, bool, bool) {
+    let opt_out = state == "UNSUBSCRIBED" || sup == "UNSUBSCRIBE" || sup == "SPAM_COMPLAINT";
+    let unknown = state.is_empty() || !matches!(state, "SUBSCRIBED" | "UNSUBSCRIBED" | "NEVER_SUBSCRIBED");
+    let opt_in = state == "SUBSCRIBED" && !opt_out;
+    // No consent record at all says nothing about suppression: such people are held instead.
+    let k_sup = matches!(sup, "HARD_BOUNCE" | "SPAM_COMPLAINT" | "INVALID_EMAIL" | "USER_SUPPRESSED") || (!state.is_empty() && !can && !opt_out);
+    let k_hold = !opt_out && (unknown || (state == "NEVER_SUBSCRIBED" && hold_never));
+    if dm == Dm::None {
+        let c = if opt_out { "unsubscribed" } else if opt_in { "subscribed" } else { "never_subscribed" };
+        return (c.into(), k_sup, k_hold);
+    }
+    let (dc, ds) = dm_cols(dm);
+    if !same {
+        return (dc.into(), ds.is_some(), false);
+    }
+    let c = if opt_out { "unsubscribed" } else if opt_in && dc == "never_subscribed" && ds.is_none() { "subscribed" } else { dc };
+    (c.into(), ds.is_some() || k_sup, k_hold && dc != "subscribed")
+}
+
+fn email_marketing(state: &str, can: bool, sup: &str) -> Option<Value> {
+    if state == "-" {
+        return None;
+    }
+    let sups: Vec<Value> = if sup.is_empty() { vec![] } else { vec![json!({"reason": sup, "timestamp": "2024-02-01T00:00:00+00:00"})] };
+    Some(json!({"consent": state, "can_receive_email_marketing": can, "consent_timestamp": "2023-01-01T00:00:00+00:00", "suppression": sups, "list_suppressions": []}))
+}
+
+#[tokio::test]
+async fn email_consent_every_combination() {
+    let mut h = harness!();
+    h.signup().await;
+    // Klaviyo email states ("-" = no consent record at all, "ODD" = a state DumbMail doesn't know).
+    let k_states: [(&str, bool); 7] = [("SUBSCRIBED", true), ("SUBSCRIBED", false), ("UNSUBSCRIBED", false), ("NEVER_SUBSCRIBED", true), ("NEVER_SUBSCRIBED", false), ("-", false), ("ODD", true)];
+    let sups = ["", "HARD_BOUNCE", "SPAM_COMPLAINT", "INVALID_EMAIL", "USER_SUPPRESSED", "UNSUBSCRIBE"];
+    let mut n = 0usize;
+    let mut checked = 0usize;
+    for mode in ["first", "rerun", "sync"] {
+        for hold_never in [false, true] {
+            let imp = bare_import(&h, if hold_never { "hold" } else { "send" }, if mode == "sync" { "syncing" } else { "importing" }).await;
+            let run = Run::new(&h.state, imp.clone(), "pk_unused");
+            let mut cases = Vec::new();
+            for (state, can) in k_states {
+                for sup in sups {
+                    if state == "-" && !sup.is_empty() {
+                        continue;
+                    }
+                    for dm in DMS {
+                        for same in [true, false] {
+                            if dm == Dm::None && !same {
+                                continue;
+                            }
+                            n += 1;
+                            cases.push((n, state, can, sup, dm, same));
+                        }
+                    }
+                }
+            }
+            let dm_email = |n: usize| format!("dm{n}@case.test");
+            let k_email = |n: usize, same: bool| if same { dm_email(n) } else { format!("k{n}@case.test") };
+            // Set up DumbMail's side.
+            if mode == "first" {
+                for (n, _, _, _, dm, _) in &cases {
+                    if *dm != Dm::None {
+                        let (c, s) = dm_cols(*dm);
+                        sqlx::query("INSERT INTO profiles (id, account_id, email, external_id, email_consent, email_suppressed_reason) VALUES ($1, $2, $3, $4, $5, $6)")
+                            .bind(uuid::Uuid::now_v7())
+                            .bind(imp.account_id)
+                            .bind(dm_email(*n))
+                            .bind(format!("X{n}"))
+                            .bind(c)
+                            .bind(s)
+                            .execute(&h.state.db)
+                            .await
+                            .unwrap();
+                    }
+                }
+            } else {
+                // An earlier import brought each person across (neutral consent); then DumbMail's state changed.
+                let first: Vec<Value> = cases.iter().map(|(n, ..)| kres(&format!("K{n}"), Some(&dm_email(*n)), None, &format!("X{n}"), email_marketing("NEVER_SUBSCRIBED", true, ""), None)).collect();
+                for page in first.chunks(100) {
+                    run.upsert_profiles(page).await.unwrap();
+                }
+                for (n, _, _, _, dm, _) in &cases {
+                    if *dm == Dm::None {
+                        sqlx::query("DELETE FROM profiles WHERE external_id = $1").bind(format!("X{n}")).execute(&h.state.db).await.unwrap();
+                    } else {
+                        let (c, s) = dm_cols(*dm);
+                        sqlx::query("UPDATE profiles SET email_consent = $2, email_suppressed_reason = $3, marketing_hold = false WHERE external_id = $1").bind(format!("X{n}")).bind(c).bind(s).execute(&h.state.db).await.unwrap();
+                    }
+                }
+            }
+            // Klaviyo's side, in pages of 100 like the import.
+            let pages: Vec<Value> = cases.iter().map(|(n, state, can, sup, _, same)| kres(&format!("K{n}"), Some(&k_email(*n, *same)), None, &format!("X{n}"), email_marketing(state, *can, sup), None)).collect();
+            for page in pages.chunks(100) {
+                run.upsert_profiles(page).await.unwrap();
+            }
+            for (n, state, can, sup, dm, same) in &cases {
+                let got: (Option<String>, String, Option<String>, bool) = sqlx::query_as("SELECT email, email_consent, email_suppressed_reason, marketing_hold FROM profiles WHERE external_id = $1")
+                    .bind(format!("X{n}"))
+                    .fetch_one(&h.state.db)
+                    .await
+                    .unwrap();
+                let want = expect_email(if *state == "-" { "" } else { state }, *can, sup, *dm, *same, hold_never);
+                let case = format!("mode={mode} hold_never={hold_never} klaviyo={state}/can={can}/sup={sup} dumbmail={dm:?} same_address={same}");
+                assert_eq!((got.1.clone(), got.2.is_some(), got.3), want, "{case}");
+                // The invariants, checked on their own: never easier to reach than both sides allowed...
+                let reach = |c: &str, s: bool, held: bool| !matches!(c, "unsubscribed" | "pending") && !s && !held;
+                let k_reach = *state != "-" && *can && !matches!(*sup, "HARD_BOUNCE" | "SPAM_COMPLAINT" | "INVALID_EMAIL" | "USER_SUPPRESSED" | "UNSUBSCRIBE") && *state != "UNSUBSCRIBED" && *state != "ODD";
+                let (dc, ds) = dm_cols(*dm);
+                let dm_reach = *dm != Dm::None && reach(dc, ds.is_some(), false) && dc == "subscribed";
+                if reach(&got.1, got.2.is_some(), got.3) {
+                    assert!(k_reach || (dm_reach && *same) || !*same, "{case}: more reachable than Klaviyo and DumbMail allowed");
+                }
+                // ...and a restriction already in DumbMail is never lifted.
+                if *dm != Dm::None {
+                    match dm {
+                        Dm::Unsubscribed => assert_eq!(got.1, "unsubscribed", "{case}"),
+                        Dm::Pending => assert!(matches!(got.1.as_str(), "pending" | "unsubscribed"), "{case}"),
+                        Dm::Suppressed => assert!(got.2.is_some(), "{case}"),
+                        _ => {}
+                    }
+                }
+                // A different address: DumbMail's is kept, Klaviyo's consent isn't applied, the clash is reported.
+                if !*same {
+                    assert_eq!(got.0.as_deref(), Some(dm_email(*n).as_str()), "{case}");
+                    let flagged: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM klaviyo_import_issues WHERE import_id = $1 AND kind = 'conflict' AND klaviyo_id = $2 AND message LIKE '%d***@case.test%')")
+                        .bind(imp.id)
+                        .bind(format!("K{n}"))
+                        .fetch_one(&h.state.db)
+                        .await
+                        .unwrap();
+                    assert!(flagged, "{case}: identity conflict recorded with masked values");
+                }
+                // Every Klaviyo suppression is kept on the profile with its time.
+                if !sup.is_empty() && *same {
+                    let p: Value = sqlx::query_scalar("SELECT properties FROM profiles WHERE external_id = $1").bind(format!("X{n}")).fetch_one(&h.state.db).await.unwrap();
+                    assert_eq!(p["klaviyo_consent"]["email"]["suppressions"][0], json!({"reason": sup, "at": "2024-02-01T00:00:00+00:00"}), "{case}");
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1400, "{checked}");
+    h.cleanup().await;
+}
+
+/// (SMS consent, held)
+fn expect_sms(state: &str, can: bool, dm: Option<&str>, same: bool) -> (String, bool) {
+    let opt_out = state == "UNSUBSCRIBED";
+    let opt_in = state == "SUBSCRIBED" && can;
+    let odd = !matches!(state, "SUBSCRIBED" | "UNSUBSCRIBED" | "NEVER_SUBSCRIBED" | "" | "-");
+    match dm {
+        None => ((if opt_out { "unsubscribed" } else if opt_in { "subscribed" } else { "never_subscribed" }).into(), odd),
+        Some(d) if !same => (d.into(), false),
+        Some(d) => ((if opt_out { "unsubscribed" } else if opt_in && d == "never_subscribed" { "subscribed" } else { d }).into(), odd && d != "subscribed"),
+    }
+}
+
+#[tokio::test]
+async fn sms_consent_every_combination() {
+    let mut h = harness!();
+    h.signup().await;
+    let k_states: [(&str, bool); 6] = [("SUBSCRIBED", true), ("SUBSCRIBED", false), ("UNSUBSCRIBED", false), ("NEVER_SUBSCRIBED", false), ("-", false), ("ODD", true)];
+    let dms: [Option<&str>; 5] = [None, Some("never_subscribed"), Some("subscribed"), Some("unsubscribed"), Some("pending")];
+    let mut n = 0usize;
+    for mode in ["first", "rerun", "sync"] {
+        let imp = bare_import(&h, "send", if mode == "sync" { "syncing" } else { "importing" }).await;
+        let run = Run::new(&h.state, imp.clone(), "pk_unused");
+        let mut cases = Vec::new();
+        for (state, can) in k_states {
+            for dm in dms {
+                for same in [true, false] {
+                    if dm.is_none() && !same {
+                        continue;
+                    }
+                    n += 1;
+                    cases.push((n, state, can, dm, same));
+                }
+            }
+        }
+        let dm_phone = |n: usize| format!("+1503{:07}", n);
+        let k_phone = |n: usize, same: bool| if same { dm_phone(n) } else { format!("+1971{:07}", n) };
+        let sms = |state: &str, can: bool| if state == "-" { None } else { Some(json!({"consent": state, "can_receive_sms_marketing": can, "method": "TEXT"})) };
+        if mode == "first" {
+            for (n, _, _, dm, _) in &cases {
+                if let Some(d) = dm {
+                    sqlx::query("INSERT INTO profiles (id, account_id, phone_number, external_id, sms_consent) VALUES ($1, $2, $3, $4, $5)")
+                        .bind(uuid::Uuid::now_v7())
+                        .bind(imp.account_id)
+                        .bind(dm_phone(*n))
+                        .bind(format!("S{n}"))
+                        .bind(d)
+                        .execute(&h.state.db)
+                        .await
+                        .unwrap();
+                }
+            }
+        } else {
+            let first: Vec<Value> = cases.iter().map(|(n, ..)| kres(&format!("KS{n}"), None, Some(&dm_phone(*n)), &format!("S{n}"), None, sms("NEVER_SUBSCRIBED", false))).collect();
+            for page in first.chunks(100) {
+                run.upsert_profiles(page).await.unwrap();
+            }
+            for (n, _, _, dm, _) in &cases {
+                match dm {
+                    None => sqlx::query("DELETE FROM profiles WHERE external_id = $1").bind(format!("S{n}")).execute(&h.state.db).await.unwrap(),
+                    Some(d) => sqlx::query("UPDATE profiles SET sms_consent = $2, marketing_hold = false WHERE external_id = $1").bind(format!("S{n}")).bind(d).execute(&h.state.db).await.unwrap(),
+                };
+            }
+        }
+        let pages: Vec<Value> = cases.iter().map(|(n, state, can, _, same)| kres(&format!("KS{n}"), None, Some(&k_phone(*n, *same)), &format!("S{n}"), None, sms(state, *can))).collect();
+        for page in pages.chunks(100) {
+            run.upsert_profiles(page).await.unwrap();
+        }
+        for (n, state, can, dm, same) in &cases {
+            let got: (Option<String>, String, bool) = sqlx::query_as("SELECT phone_number, sms_consent, marketing_hold FROM profiles WHERE external_id = $1").bind(format!("S{n}")).fetch_one(&h.state.db).await.unwrap();
+            let case = format!("mode={mode} klaviyo={state}/can={can} dumbmail={dm:?} same_number={same}");
+            assert_eq!((got.1.clone(), got.2), expect_sms(state, *can, *dm, *same), "{case}");
+            if got.1 == "subscribed" {
+                assert!((*state == "SUBSCRIBED" && *can && *same) || *dm == Some("subscribed"), "{case}: textable without a reachable Klaviyo opt-in or a DumbMail one");
+            }
+            if !*same {
+                assert_eq!(got.0.as_deref(), Some(dm_phone(*n).as_str()), "{case}: DumbMail's number kept");
+            }
+        }
+    }
+    h.cleanup().await;
+}
+
+/// A STOP or unsubscribe that lands after the importer read the profile and before it writes is kept.
+#[tokio::test]
+async fn an_opt_out_between_read_and_write_wins() {
+    let mut h = harness!();
+    h.signup().await;
+    let imp = bare_import(&h, "send", "syncing").await;
+    let pid = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, phone_number, email_consent, sms_consent) VALUES ($1, $2, 'race@x.test', '+15035550199', 'never_subscribed', 'never_subscribed')")
+        .bind(pid)
+        .bind(imp.account_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    // Klaviyo says: subscribed to both.
+    let k = kres("KR", Some("race@x.test"), Some("+15035550199"), "XR", email_marketing("SUBSCRIBED", true, ""), Some(json!({"consent": "SUBSCRIBED", "can_receive_sms_marketing": true})));
+    // The person replies STOP and unsubscribes: committed while the importer is between its read and write.
+    let mut stop = h.state.db.begin().await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed', sms_consent = 'unsubscribed' WHERE id = $1").bind(pid).execute(&mut *stop).await.unwrap();
+    let state = h.state.clone();
+    let task = tokio::spawn(async move {
+        let run = Run::new(&state, imp, "pk_unused");
+        run.upsert_profiles(&[k]).await.unwrap();
+    });
+    // Wait until the importer has read the row and is blocked writing it.
+    let dbname = h.dbname.clone();
+    let mut blocked = false;
+    for _ in 0..200 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE profiles p SET%'")
+            .bind(&dbname)
+            .fetch_one(&h.admin)
+            .await
+            .unwrap();
+        if n > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(blocked, "the importer should be waiting on the row");
+    stop.commit().await.unwrap();
+    task.await.unwrap();
+    let got: (String, String) = sqlx::query_as("SELECT email_consent, sms_consent FROM profiles WHERE id = $1").bind(pid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(got, ("unsubscribed".into(), "unsubscribed".into()), "the opt-out that landed meanwhile wins");
+    h.cleanup().await;
+}
+
+async fn import_with(h: &mut Harness, ds: Value, opts: Value) -> String {
+    let key = register(ds).await;
+    h.ok("POST", "/api/klaviyo/connect", Some(json!({"api_key": key}))).await;
+    settle(h).await;
+    let mut o = opts;
+    o["confirm"] = json!(true);
+    h.ok("POST", "/api/klaviyo/start", Some(o)).await;
+    settle(h).await;
+    key
+}
+
+fn quiet(mut ds: Value) -> Value {
+    ds["throttle_once"] = json!(false);
+    ds
+}
+
+async fn on_list(h: &Harness, list: &str, email: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_members m JOIN lists l ON l.id = m.list_id JOIN profiles p ON p.id = m.profile_id WHERE l.name LIKE $1 AND p.email = $2)")
+        .bind(list)
+        .bind(email)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn people_who_left_a_list_stay_off_it_and_snapshots_are_replaced() {
+    let mut h = harness!();
+    h.signup().await;
+    let key = import_with(&mut h, quiet(dataset()), json!({"what": ["lists", "segments"], "sync": true})).await;
+    assert!(on_list(&h, "Newsletter", "bob@example.com").await && on_list(&h, "VIP", "ann@example.com").await);
+    assert!(!on_list(&h, "Newsletter", "cat@example.com").await, "opted out of this list in Klaviyo");
+    assert!(on_list(&h, "Likely to churn%", "ann@example.com").await);
+    // In DumbMail, Bob is taken off the Newsletter list.
+    sqlx::query("DELETE FROM list_members m USING lists l, profiles p WHERE l.id = m.list_id AND p.id = m.profile_id AND l.name = 'Newsletter' AND p.email = 'bob@example.com'").execute(&h.state.db).await.unwrap();
+    // In Klaviyo: Ann is removed from VIP; Dan opts out of VIP only; the churn segment is now Bob and Dan.
+    {
+        let mut g = mock().1.lock().unwrap();
+        let d = g.sets.get_mut(&key).unwrap();
+        d["members"]["L2"] = json!([["P4", "2024-02-02T00:00:00+00:00"]]);
+        d["members"]["S2"] = json!([["P2", "2024-02-01T00:00:00+00:00"], ["P4", "2024-02-01T00:00:00+00:00"]]);
+        let dan = d["profiles"].as_array_mut().unwrap().iter_mut().find(|p| p["id"] == "P4").unwrap();
+        dan["attributes"]["subscriptions"]["email"]["marketing"]["list_suppressions"] = json!([{"list_id": "L2", "reason": "USER_SUPPRESSED", "timestamp": Utc::now().to_rfc3339()}]);
+    }
+    h.ok("POST", "/api/klaviyo/sync-now", None).await;
+    settle(&h).await;
+    assert_eq!(h.ok("GET", "/api/klaviyo", None).await["import"]["status"], "done");
+    assert!(!on_list(&h, "Newsletter", "bob@example.com").await, "left in DumbMail: the sync doesn't add him back");
+    assert!(!on_list(&h, "VIP", "ann@example.com").await, "removed in Klaviyo: the sync takes her off");
+    assert!(!on_list(&h, "VIP", "dan@example.com").await, "a list opt-out in Klaviyo: off that list");
+    assert!(on_list(&h, "Newsletter", "ann@example.com").await, "other lists untouched");
+    let dan: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'dan@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(dan, "subscribed", "a list opt-out stays scoped to the list");
+    // A re-run (connect again) retires the old sync and its key, adds nobody back, and replaces the snapshot.
+    let old_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM klaviyo_imports").fetch_one(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/klaviyo/connect", Some(json!({"api_key": key}))).await;
+    let old: (bool, bool) = sqlx::query_as("SELECT sync_enabled, api_key_enc IS NOT NULL FROM klaviyo_imports WHERE id = $1").bind(old_id).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(old, (false, false), "the old connection's sync stops and its key is deleted at once");
+    settle(&h).await;
+    h.ok("POST", "/api/klaviyo/start", Some(json!({"confirm": true, "what": ["lists", "segments"]}))).await;
+    settle(&h).await;
+    assert!(!on_list(&h, "Newsletter", "bob@example.com").await);
+    assert!(!on_list(&h, "VIP", "ann@example.com").await && !on_list(&h, "VIP", "dan@example.com").await);
+    assert!(!on_list(&h, "Likely to churn%", "ann@example.com").await, "no longer in the segment: off the snapshot");
+    assert!(on_list(&h, "Likely to churn%", "dan@example.com").await && on_list(&h, "Likely to churn%", "bob@example.com").await);
+    // Another Klaviyo account can't be imported into the same DumbMail account.
+    let mut other = quiet(dataset());
+    other["account_id"] = json!("ACCT2");
+    let key2 = register(other).await;
+    let (s, v) = h.req("POST", "/api/klaviyo/connect", Some(json!({"api_key": key2}))).await;
+    assert_eq!(s, 409, "{v}");
+    h.cleanup().await;
+}
+
+async fn sync_import(h: &mut Harness) -> uuid::Uuid {
+    import_with(h, quiet(dataset()), json!({"what": ["lists"], "sync": true})).await;
+    sqlx::query_scalar("SELECT id FROM klaviyo_imports").fetch_one(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn campaigns_and_flows_wait_for_klaviyo_opt_outs() {
+    let mut h = harness!();
+    h.signup().await;
+    let imp = sync_import(&mut h).await;
+    let list: uuid::Uuid = sqlx::query_scalar("SELECT id FROM lists WHERE name = 'Newsletter'").fetch_one(&h.state.db).await.unwrap();
+    let make = |name: &str| json!({"name": name, "channel": "email", "audience": {"include": [{"type": "list", "id": list}]}, "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}});
+    let pool = h.state.db.clone();
+    let messages = |id: uuid::Uuid| {
+        let db = pool.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE campaign_id = $1").bind(id).fetch_one(&db).await.unwrap() }
+    };
+    let c1: uuid::Uuid = h.ok("POST", "/api/campaigns", Some(make("Fresh"))).await["id"].as_str().unwrap().parse().unwrap();
+    // Fresh consent (the import just finished): it goes.
+    sqlx::query("UPDATE klaviyo_imports SET consent_synced_at = now() WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(c1).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, c1).await.unwrap();
+    assert!(messages(c1).await > 0);
+    // Stale by 20 minutes: it waits, says why, and a sync starts.
+    let c2: uuid::Uuid = h.ok("POST", "/api/campaigns", Some(make("Stale"))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE klaviyo_imports SET consent_synced_at = now() - interval '20 minutes' WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(c2).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, c2).await.unwrap();
+    assert_eq!(messages(c2).await, 0, "nothing goes out on stale consent");
+    let c: (String, Option<String>) = sqlx::query_as("SELECT status, error FROM campaigns WHERE id = $1").bind(c2).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c.0, "sending");
+    assert!(c.1.unwrap().starts_with("Waiting for Klaviyo opt-outs to sync"));
+    assert_eq!(h.ok("GET", "/api/klaviyo", None).await["import"]["status"], "syncing", "starting it ran a sync");
+    assert_eq!(h.ok("GET", "/api/klaviyo", None).await["waiting_campaigns"][0]["name"], "Stale");
+    // The sync finishes: the campaign goes.
+    settle(&h).await;
+    h.fast_forward().await;
+    assert!(messages(c2).await > 0, "sent once Klaviyo's opt-outs were in");
+    let err: Option<String> = sqlx::query_scalar("SELECT error FROM campaigns WHERE id = $1").bind(c2).fetch_one(&h.state.db).await.unwrap();
+    assert!(err.is_none());
+    // No successful sync for 2 hours: back to draft with the reason, nothing sent.
+    let c3: uuid::Uuid = h.ok("POST", "/api/campaigns", Some(make("Never synced"))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE klaviyo_imports SET consent_synced_at = now() - interval '3 hours', status = 'syncing' WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(c3).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO klaviyo_campaign_waits (campaign_id, account_id, since) SELECT $1, account_id, now() - interval '121 minutes' FROM campaigns WHERE id = $1").bind(c3).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, c3).await.unwrap();
+    let c: (String, Option<String>) = sqlx::query_as("SELECT status, error FROM campaigns WHERE id = $1").bind(c3).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c.0, "draft");
+    assert!(c.1.unwrap().contains("no sync from Klaviyo succeeded in 2 hours"));
+    assert_eq!(messages(c3).await, 0);
+
+    // Flows: consent up to 2 hours old is fine; older, the email waits at its step.
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"},
+        "definition": {"entry": "w", "nodes": [{"id": "w", "type": "update_profile", "properties": {"seen": true}, "next": "e"}, {"id": "e", "type": "email", "content": {"subject": "Thanks", "blocks": [{"type": "text", "html": "<p>Thanks</p>"}]}, "next": null}]}}))).await;
+    let fid: uuid::Uuid = flow["id"].as_str().unwrap().parse().unwrap();
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    let f: dumbmail::models::FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1").bind(fid).fetch_one(&h.state.db).await.unwrap();
+    let ann: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'ann@example.com'").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE klaviyo_imports SET status = 'done', consent_synced_at = now() - interval '3 hours' WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'klaviyo_import_run'").execute(&h.state.db).await.unwrap();
+    let run = dumbmail::flows::start(&h.state, &f, ann, json!({})).await.unwrap().unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    let flow_msgs = || {
+        let db = pool.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE flow_id = $1").bind(fid).fetch_one(&db).await.unwrap() }
+    };
+    assert_eq!(flow_msgs().await, 0, "held: consent is 3 hours old");
+    let at: (String, Value) = sqlx::query_as("SELECT current_node, context FROM flow_runs WHERE id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(at.0, "e", "waits at the email, not before the profile update");
+    assert_eq!(h.ok("GET", "/api/klaviyo", None).await["import"]["status"], "syncing", "the hold started a sync");
+    sqlx::query("UPDATE klaviyo_imports SET status = 'done', consent_synced_at = now() - interval '90 minutes' WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(flow_msgs().await, 1, "consent 90 minutes old is within the flow's limit");
+    let visits: Value = sqlx::query_scalar("SELECT visited FROM flow_runs WHERE id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(visits, json!(["w", "e"]), "the wait didn't repeat steps");
+    // With the sync off, nothing waits.
+    h.ok("POST", "/api/klaviyo/sync", Some(json!({"enabled": false}))).await;
+    let c4: uuid::Uuid = h.ok("POST", "/api/campaigns", Some(make("Sync off"))).await["id"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(c4).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, c4).await.unwrap();
+    assert!(messages(c4).await > 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn segment_flows_absorb_people_who_enter_during_history_import() {
+    let mut h = harness!();
+    h.signup().await;
+    let imp = sync_import(&mut h).await;
+    let seg = h.ok("POST", "/api/segments", Some(json!({"name": "Ordered", "definition": {"conditions": [{"type": "property", "field": "vip", "op": "eq", "value": true}]}}))).await;
+    let sid: uuid::Uuid = seg["id"].as_str().unwrap().parse().unwrap();
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "VIP welcome", "trigger": {"type": "segment", "segment_id": sid},
+        "definition": {"entry": "e", "nodes": [{"id": "e", "type": "email", "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}, "next": null}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    let pool = h.state.db.clone();
+    let runs = || {
+        let db = pool.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM flow_runs").fetch_one(&db).await.unwrap() }
+    };
+    let enter = |email: &'static str| {
+        let db = pool.clone();
+        async move {
+            sqlx::query("UPDATE profiles SET properties = properties || '{\"vip\": true}' WHERE email = $1").bind(email).execute(&db).await.unwrap();
+        }
+    };
+    // History is being written: people entering the segment are taken in quietly.
+    sqlx::query("UPDATE klaviyo_imports SET history_started_at = now(), history_done_at = NULL WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    enter("bob@example.com").await;
+    dumbmail::flows::refresh_segment(&h.state, sid).await.unwrap();
+    assert_eq!(runs().await, 0);
+    // It finished after this segment's last refresh: the first refresh after it is quiet too.
+    sqlx::query("UPDATE klaviyo_imports SET history_done_at = now() + interval '1 second' WHERE id = $1").bind(imp).execute(&h.state.db).await.unwrap();
+    enter("gus@example.com").await;
+    dumbmail::flows::refresh_segment(&h.state, sid).await.unwrap();
+    assert_eq!(runs().await, 0);
+    // After that, new members start the flow as usual.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    dumbmail::flows::refresh_segment(&h.state, sid).await.unwrap();
+    enter("fay@example.com").await;
+    dumbmail::flows::refresh_segment(&h.state, sid).await.unwrap();
+    assert_eq!(runs().await, 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn imported_items_that_need_review_cant_send_or_go_live() {
+    let mut ds = quiet(dataset());
+    // The draft text campaign excludes a list that isn't imported and went to half its audience.
+    ds["audiences"][1]["attributes"]["definition"]["excluded"] = json!(["LGONE"]);
+    ds["campaign_messages"][1]["attributes"]["definition"]["send_options"]["recipient_percentage"] = json!(50);
+    // The VIP list isn't on Klaviyo's count endpoint: that report line can't be verified.
+    ds["counts"].as_object_mut().unwrap().remove("L2");
+    let mut h = harness!();
+    h.signup().await;
+    import_with(&mut h, ds, json!({})).await;
+    let cid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM campaigns WHERE status = 'draft'").fetch_one(&h.state.db).await.unwrap();
+    let st = h.ok("GET", "/api/klaviyo", None).await;
+    let rev = st["reviews"].as_array().unwrap().iter().find(|r| r["kind"] == "campaign").unwrap().clone();
+    assert_eq!(rev["id"], json!(cid));
+    let notes = rev["notes"].to_string();
+    assert!(notes.contains("LGONE") && notes.contains("50%"), "{notes}");
+    // The audience isn't widened: the exclusion that couldn't be mapped keeps it unsendable.
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("needs review"), "{v}");
+    // Even if the content mirror were lost, the send path refuses.
+    sqlx::query("UPDATE campaigns SET content = content #- '{imported,review}', status = 'sending' WHERE id = $1").bind(cid).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
+    let c: (String, i64) = sqlx::query_as("SELECT status, (SELECT count(*) FROM messages WHERE campaign_id = $1) FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, ("draft".into(), 0));
+    h.ok("POST", "/api/klaviyo/review", Some(json!({"kind": "campaign", "id": cid}))).await;
+    let c = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert!(c["content"]["imported"]["review"].is_null(), "{c}");
+    // The imported flow has a split whose rules didn't translate: it can't go live until reviewed.
+    let fid: uuid::Uuid = sqlx::query_scalar("SELECT local_id FROM klaviyo_refs WHERE kind = 'flow' AND local_id IS NOT NULL").fetch_one(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    assert_eq!(s, 400);
+    assert!(v["error"]["message"].as_str().unwrap().contains("needs review"), "{v}");
+    let tpl: uuid::Uuid = sqlx::query_scalar("SELECT local_id FROM klaviyo_refs WHERE kind = 'template'").fetch_one(&h.state.db).await.unwrap();
+    h.ok("POST", "/api/klaviyo/review", Some(json!({"kind": "flow", "id": fid}))).await;
+    h.ok("POST", "/api/klaviyo/review", Some(json!({"kind": "template", "id": tpl}))).await;
+    let (_, v) = h.req("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    assert!(!v.to_string().contains("needs review"), "{v}");
+    // The report: a list Klaviyo wouldn't count is "not verified", so there's no "nothing was lost".
+    let r = h.ok("GET", "/api/klaviyo/report", None).await;
+    assert_eq!(line(&r, "Lists", "VIP")["state"], "not_verified");
+    assert_eq!(r["all_ok"], false);
+    assert!(r["not_verified"].as_u64().unwrap() >= 1);
+    let (_, _, csv) = h.raw("GET", "/api/klaviyo/report.csv", &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
+    assert!(csv.contains("VIP,,") && csv.contains("NOT VERIFIED"), "{csv}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn one_runner_per_import_and_dates_in_the_account_time_zone() {
+    let mut h = harness!();
+    h.signup().await;
+    let key = register(quiet(dataset())).await;
+    h.ok("POST", "/api/klaviyo/connect", Some(json!({"api_key": key}))).await;
+    settle(&h).await;
+    let dry = h.ok("POST", "/api/klaviyo/start", Some(json!({"events_from": "2025-01-01"}))).await;
+    // Midnight in Los Angeles, not in UTC.
+    assert_eq!(dry["options"]["events_since"], "2025-01-01T08:00:00+00:00", "{dry}");
+    assert_eq!(dry["options"]["never_subscribed"], "send");
+    let (s, _) = h.req("POST", "/api/klaviyo/start", Some(json!({"confirm": true, "never_subscribed": "maybe"}))).await;
+    assert_eq!(s, 400);
+    h.ok("POST", "/api/klaviyo/start", Some(json!({"confirm": true, "never_subscribed": "hold"}))).await;
+    // Another worker holds the import: this run leaves it alone and looks again later.
+    let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM klaviyo_imports").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE klaviyo_imports SET lease_owner = gen_random_uuid(), lease_until = now() + interval '5 minutes' WHERE id = $1").bind(id).execute(&h.state.db).await.unwrap();
+    sqlx::query("DELETE FROM jobs").execute(&h.state.db).await.unwrap();
+    dumbmail::features::klaviyo_import::runner::run(&h.state, id).await.unwrap();
+    let phase: Option<String> = sqlx::query_scalar("SELECT phase FROM klaviyo_imports WHERE id = $1").bind(id).fetch_one(&h.state.db).await.unwrap();
+    assert!(phase.is_none(), "nothing ran");
+    assert_eq!(count(&h, "SELECT count(*) FROM jobs WHERE kind = 'klaviyo_import_run'").await, 1);
+    sqlx::query("UPDATE klaviyo_imports SET lease_until = now() - interval '1 second' WHERE id = $1").bind(id).execute(&h.state.db).await.unwrap();
+    settle(&h).await;
+    assert_eq!(h.ok("GET", "/api/klaviyo", None).await["import"]["status"], "done");
+    // Hold-back chosen: Bob (never subscribed in Klaviyo) is held; Ann (subscribed) isn't.
+    let held: Vec<(String, bool)> = sqlx::query_as("SELECT email, marketing_hold FROM profiles WHERE email IN ('ann@example.com', 'bob@example.com') ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(held, vec![("ann@example.com".into(), false), ("bob@example.com".into(), true)]);
+    h.cleanup().await;
 }

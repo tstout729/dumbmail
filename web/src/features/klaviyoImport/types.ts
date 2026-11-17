@@ -17,6 +17,8 @@ export type KlaviyoSurvey = {
   events: { estimate: number; since: string | null; by_metric: { id: string; name: string; estimate: number }[] };
   all_metrics: { id: string; name: string; integration: string }[];
   estimate_minutes: number;
+  /** True when some counts were capped, so the time is "at least". */
+  estimate_is_lower_bound?: boolean;
   missing_scopes: string[];
 };
 
@@ -29,12 +31,14 @@ export type KlaviyoImport = {
   key_stored: boolean;
   klaviyo_account: { name?: string | null; id?: string; timezone?: string | null };
   survey: KlaviyoSurvey | null;
-  options: { what?: string[]; events_from?: string; metrics?: string[] | null };
+  options: { what?: string[]; events_from?: string; metrics?: string[] | null; never_subscribed?: NeverSubscribed };
   phase: string | null;
   progress: Record<string, StepProgress>;
   checklist: Record<string, { done?: boolean }>;
   sync_enabled: boolean;
   last_sync_at: string | null;
+  /** When Klaviyo's opt-outs were last fully in DumbMail. */
+  consent_synced_at: string | null;
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -44,8 +48,16 @@ export type KlaviyoImport = {
 
 export type ChecklistItem = { key: string; label: string; done: boolean; auto: boolean; detail: string; link?: string; checked_at?: string | null };
 
+export type ReviewKind = "campaign" | "flow" | "template";
+
+export type KlaviyoReview = { kind: ReviewKind; id: string; name: string | null; notes: string[] };
+
+export type WaitingCampaign = { id: string; name: string; since: string };
+
 export type KlaviyoState = {
   import: KlaviyoImport | null;
+  reviews: KlaviyoReview[];
+  waiting_campaigns: WaitingCampaign[];
   issues: Record<string, number>;
   checklist: { items: ChecklistItem[]; done: number; total: number };
   steps: string[];
@@ -54,11 +66,15 @@ export type KlaviyoState = {
   sync_worst_case_delay: string;
 };
 
-export type ReportLine = { section: string; label: string; klaviyo: number | null; dumbmail: number | null; ok: boolean; note: string };
+export type LineState = "match" | "mismatch" | "not_verified";
+
+export type ReportLine = { section: string; label: string; klaviyo: number | null; dumbmail: number | null; state: LineState; ok: boolean; note: string };
 
 export type KlaviyoReport = {
   compared_at: string | null;
   all_ok: boolean;
+  mismatches: number;
+  not_verified: number;
   lines_not_ok: number;
   lines: ReportLine[];
   issues_by_step: { step: string; kind: string; count: number }[];
@@ -77,4 +93,6 @@ export type KlaviyoCampaign = {
   stats: Partial<Record<"recipients" | "delivered" | "opens_unique" | "clicks_unique" | "unsubscribes" | "conversions" | "conversion_value", number>> | null;
 };
 
-export type StartOptions = { confirm: boolean; what: string[]; events_from: string; sync: boolean };
+export type NeverSubscribed = "send" | "hold";
+
+export type StartOptions = { confirm: boolean; what: string[]; events_from: string; sync: boolean; never_subscribed: NeverSubscribed };

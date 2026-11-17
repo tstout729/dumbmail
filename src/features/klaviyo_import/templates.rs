@@ -26,6 +26,7 @@ static FILTER_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\|\s*([a-z_]+)\s*:\s
 static LOOKUP: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\b(person|event)\s*\|\s*lookup\s*:\s*("[^"]*"|'[^']*')"#).unwrap());
 static EVENT_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bevent\.([A-Za-z_$][\w$]*)").unwrap());
 static PERSON_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bperson\.([A-Za-z_$][\w$ ]*?)\b").unwrap());
+static AUTHORED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\s*(organization(\.[A-Za-z_]\w*)+|'[^'{}]*'|"[^"{}]*")\s*(\|\s*[a-z_]+\s*(\(\s*('[^']*'|"[^"]*"|\d+)?\s*\))?\s*)*$"#).unwrap());
 static SAFE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\|\s*safe\b").unwrap());
 
 /// Shown in the email where Klaviyo content couldn't be converted, so it can't go out unnoticed.
@@ -123,8 +124,9 @@ fn strip_unsafe(e: &str) -> (String, bool) {
     if !SAFE.is_match(e) {
         return (e.to_string(), false);
     }
-    let root = e.trim_start();
-    let authored = root.starts_with('\'') || root.starts_with('"') || root.starts_with("organization.");
+    // The whole expression must be one literal or one organization field, then filters: anything that
+    // also mentions a person, an event or any other value loses `safe`.
+    let authored = AUTHORED.is_match(e);
     if authored {
         (e.to_string(), false)
     } else {
@@ -397,6 +399,8 @@ mod tests {
 
     #[test]
     fn safe_only_on_authored_content() {
+        let r = convert("{{ organization.name ~ person.first_name|safe }}");
+        assert!(!r.text.contains("safe"), "a mixed expression loses safe: {}", r.text);
         let r = convert("{{ person.bio|safe }} {{ event.html|safe }} {{ organization.name|safe }}");
         assert!(r.text.contains("{{ person.properties.bio }}") && r.text.contains("{{ event.properties.html }}"), "{}", r.text);
         assert!(r.text.contains("{{ organization.name|safe }}"));

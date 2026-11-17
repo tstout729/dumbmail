@@ -2,11 +2,12 @@ import { useState, type FormEvent } from "react";
 import { Link } from "react-router";
 import { AlertTriangle, CheckCircle2, CircleDashed, Download, KeyRound, Loader2, Pause, Play, RefreshCw, Search, XCircle } from "lucide-react";
 import { useSession } from "../../api";
-import { Badge, Button, Card, Checkbox, ConfirmDialog, Field, InlineError, Input, Notice, Select, Skeleton, StatusBadge, Table, Td, Th, Toggle, cx } from "../../components/ui";
+import { Badge, Button, Card, Checkbox, ConfirmDialog, Field, InlineError, Input, Notice, Select, Skeleton, StatusBadge, Table, Td, Th, Toggle, cx, type Tone } from "../../components/ui";
 import { formatCurrency, formatDate, formatDateTime, formatNumber, formatPercent, formatRelative } from "../../lib/format";
 import {
   useCancelKlaviyo,
   useCheckSiteKlaviyo,
+  useClearReviewKlaviyo,
   useConnectKlaviyo,
   useKlaviyo,
   useKlaviyoCampaigns,
@@ -18,7 +19,7 @@ import {
   usePauseKlaviyo,
   useStartKlaviyo,
 } from "./api";
-import type { ChecklistItem, KlaviyoImport, KlaviyoState, KlaviyoSurvey, ReportLine, SurveyCount } from "./types";
+import type { ChecklistItem, KlaviyoImport, KlaviyoReview, KlaviyoState, KlaviyoSurvey, LineState, NeverSubscribed, ReportLine, SurveyCount } from "./types";
 
 const stepLabels: Record<string, string> = {
   metrics: "Metrics",
@@ -35,9 +36,24 @@ const stepLabels: Record<string, string> = {
   events: "Events",
   compare: "Klaviyo's counts for the report",
   sync_profiles: "Changed profiles",
+  sync_suppressions: "New suppressions",
+  sync_list_suppressions: "New list opt-outs",
+  sync_consent_events: "Unsubscribes, complaints and bounces",
   sync_list_members: "New list members",
+  sync_list_sweep: "People taken off lists",
   sync_events: "New events",
 };
+
+const syncSteps = ["sync_profiles", "sync_suppressions", "sync_list_suppressions", "sync_consent_events", "sync_list_members", "sync_list_sweep", "sync_events"];
+
+const lineBadge: Record<LineState, { tone: Tone; label: string }> = {
+  match: { tone: "green", label: "Match" },
+  mismatch: { tone: "red", label: "Mismatch" },
+  not_verified: { tone: "amber", label: "Not verified" },
+};
+
+const reviewKindLabel: Record<KlaviyoReview["kind"], string> = { campaign: "Campaign", flow: "Flow", template: "Template" };
+const reviewLink = (r: KlaviyoReview) => (r.kind === "campaign" ? `/campaigns/${r.id}` : r.kind === "flow" ? `/flows/${r.id}` : `/content/templates/${r.id}`);
 
 const partLabels: Record<string, string> = {
   lists: "Lists and members",
@@ -93,6 +109,7 @@ export function KlaviyoImportPage() {
       {imp?.status === "ready" && imp.survey ? <SurveyCard imp={imp} survey={imp.survey} s={s} /> : null}
       {imp && ["importing", "paused", "syncing", "done"].includes(imp.status) ? <ProgressCard imp={imp} s={s} /> : null}
       {imp && (imp.status === "done" || imp.status === "syncing") && imp.compared_at ? <ReportCard imp={imp} /> : null}
+      {s.reviews.length > 0 ? <ReviewCard reviews={s.reviews} /> : null}
       {imp && ["importing", "paused", "syncing", "done"].includes(imp.status) ? <SyncCard imp={imp} s={s} /> : null}
       {imp && (imp.status === "done" || imp.status === "syncing") ? <CampaignsCard imp={imp} /> : null}
       <ChecklistCard s={s} />
@@ -165,6 +182,7 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
   const [what, setWhat] = useState<string[]>(s.choosable);
   const [range, setRange] = useState("2y");
   const [sync, setSync] = useState(false);
+  const [never, setNever] = useState<NeverSubscribed>("send");
   const [confirming, setConfirming] = useState(false);
   const eventsFrom = (() => {
     if (range === "all") return "all";
@@ -208,8 +226,8 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
           ))}
         </dl>
         <p className="text-sm text-zinc-600">
-          Estimated time: about {formatNumber(survey.estimate_minutes)} {survey.estimate_minutes === 1 ? "minute" : "minutes"}. You can leave this page
-          while it runs. Key {imp.key_hint}.
+          Estimated time: {survey.estimate_is_lower_bound ? "at least" : "about"} {formatNumber(survey.estimate_minutes)} {survey.estimate_minutes === 1 ? "minute" : "minutes"}
+          {survey.estimate_is_lower_bound ? " (some counts are larger than shown)" : ""}. You can leave this page while it runs. Key {imp.key_hint}.
         </p>
         {survey.missing_scopes.length > 0 ? (
           <Notice tone={noProfiles ? "red" : "amber"} icon={<AlertTriangle />} title="The key can't read everything">
@@ -232,11 +250,24 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
               <option value="all">Everything</option>
             </Select>
           </Field>
+          <Field
+            label="People who never subscribed in Klaviyo"
+            hint="Klaviyo can email people who never subscribed. Anyone whose Klaviyo consent is unknown is always held back."
+            className="max-w-md"
+          >
+            <Select value={never} onChange={(e) => setNever(e.target.value === "hold" ? "hold" : "send")}>
+              <option value="send">Keep them emailable, as in Klaviyo</option>
+              <option value="hold">Hold them back from marketing until they opt in</option>
+            </Select>
+          </Field>
           <div className="flex items-start gap-3">
             <Toggle checked={sync} onChange={setSync} label="Keep syncing from Klaviyo" />
             <div className="text-sm">
               <div className="font-medium text-zinc-800">Keep syncing from Klaviyo every hour</div>
-              <div className="text-xs text-zinc-500">For running both for a while. Keeps the key stored until you turn it off.</div>
+              <div className="text-xs text-zinc-500">
+                For running both for a while. Keeps the key stored until you turn it off. While it's on, campaigns wait for Klaviyo's latest opt-outs
+                before they send.
+              </div>
             </div>
           </div>
         </div>
@@ -249,11 +280,11 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
       {confirming ? (
         <ConfirmDialog
           title="Start the import?"
-          body="DumbMail reads your Klaviyo account and adds what it finds here. Nobody is emailed or texted, no flow starts, and imported flows stay drafts. You can pause or cancel at any time."
+          body="DumbMail reads your Klaviyo account and adds what it finds here. Nobody is emailed or texted, no flow starts, and imported flows stay drafts. While event history comes in, flows triggered by segments won't start for people who enter those segments. You can pause or cancel at any time."
           confirmLabel="Start import"
           loading={start.isPending}
           onClose={() => setConfirming(false)}
-          onConfirm={() => start.mutate({ confirm: true, what, events_from: eventsFrom, sync }, { onSuccess: () => setConfirming(false) })}
+          onConfirm={() => start.mutate({ confirm: true, what, events_from: eventsFrom, sync, never_subscribed: never }, { onSuccess: () => setConfirming(false) })}
         />
       ) : null}
     </Card>
@@ -266,7 +297,7 @@ function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const { account } = useSession();
   const syncing = imp.status === "syncing";
-  const steps = syncing ? ["sync_profiles", "sync_list_members", "sync_events"] : s.steps.filter((st) => imp.progress[st] || imp.phase === st);
+  const steps = syncing ? syncSteps : s.steps.filter((st) => imp.progress[st] || imp.phase === st);
   const running = imp.status === "importing" || syncing;
   return (
     <Card
@@ -322,7 +353,10 @@ function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
             );
           })}
         </ul>
-        {(s.issues.snapshot ?? 0) + (s.issues.partial ?? 0) + (s.issues.skipped ?? 0) + (s.issues.unmapped ?? 0) > 0 ? (
+        {imp.status !== "done" && (imp.options.what ?? []).includes("events") ? (
+          <p className="text-xs text-zinc-500">While event history comes in, flows triggered by segments don't start for people who enter those segments.</p>
+        ) : null}
+        {(s.issues.snapshot ?? 0) + (s.issues.partial ?? 0) + (s.issues.skipped ?? 0) + (s.issues.unmapped ?? 0) + (s.issues.conflict ?? 0) > 0 ? (
           <p className="text-xs text-zinc-500">Anything that didn't come across exactly is listed under the report.</p>
         ) : null}
       </div>
@@ -375,13 +409,17 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
       ) : r ? (
         <div className="space-y-4">
           {r.all_ok ? (
-            <Notice tone="green" icon={<CheckCircle2 />} title="Everything matches">
-              Every line agrees with Klaviyo, or differs only in the safe direction (someone less reachable here). Klaviyo's counts are from{" "}
-              {formatDateTime(r.compared_at, account.timezone)}.
+            <Notice tone="green" icon={<CheckCircle2 />} title="Nothing was lost">
+              Every line matches Klaviyo's own numbers. Klaviyo's counts are from {formatDateTime(r.compared_at, account.timezone)}.
+            </Notice>
+          ) : r.mismatches > 0 ? (
+            <Notice tone="red" icon={<AlertTriangle />} title={`${r.mismatches} ${r.mismatches === 1 ? "line doesn't" : "lines don't"} match`}>
+              Each one says what to do. Running the import again fills in anything missing.
+              {r.not_verified > 0 ? ` ${r.not_verified} more couldn't be checked against Klaviyo.` : ""}
             </Notice>
           ) : (
-            <Notice tone="red" icon={<AlertTriangle />} title={`${r.lines_not_ok} ${r.lines_not_ok === 1 ? "line needs" : "lines need"} a look`}>
-              Each red line says what to do. Running the import again fills in anything missing.
+            <Notice tone="amber" icon={<AlertTriangle />} title={`${r.not_verified} ${r.not_verified === 1 ? "line couldn't" : "lines couldn't"} be checked`}>
+              Nothing doesn't match, but Klaviyo didn't give a number to compare for these. Each one says why.
             </Notice>
           )}
           <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 text-sm sm:hidden">
@@ -393,7 +431,7 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
                 <li key={`${section}-${l.label}-${i}`} className="px-3 py-2">
                   <div className="flex items-start justify-between gap-2">
                     <span className="text-zinc-900">{l.label}</span>
-                    {l.ok ? <Badge tone="green">OK</Badge> : <Badge tone="red">Check</Badge>}
+                    <Badge tone={lineBadge[l.state].tone}>{lineBadge[l.state].label}</Badge>
                   </div>
                   <div className="mt-0.5 text-xs tabular-nums text-zinc-600">
                     Klaviyo {cell(l.klaviyo, section)} · DumbMail {cell(l.dumbmail, section)}
@@ -427,7 +465,9 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
                     </Td>
                     <Td className="text-right tabular-nums">{cell(l.klaviyo, section)}</Td>
                     <Td className="text-right tabular-nums">{cell(l.dumbmail, section)}</Td>
-                    <Td>{l.ok ? <Badge tone="green">OK</Badge> : <Badge tone="red">Check</Badge>}</Td>
+                    <Td>
+                      <Badge tone={lineBadge[l.state].tone}>{lineBadge[l.state].label}</Badge>
+                    </Td>
                   </tr>
                 )),
               ])}
@@ -442,7 +482,7 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
                 {(issues.data?.data ?? []).map((i) => (
                   <li key={i.id} className="px-3 py-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge tone={i.kind === "skipped" ? "red" : i.kind === "note" ? "gray" : "amber"}>{i.kind}</Badge>
+                      <Badge tone={i.kind === "skipped" ? "red" : i.kind === "note" ? "gray" : "amber"}>{i.kind === "conflict" ? "email or phone differs" : i.kind}</Badge>
                       <span className="text-xs text-zinc-500">{stepLabels[i.step] ?? i.step}</span>
                       <span className="font-medium text-zinc-900">{i.item}</span>
                     </div>
@@ -454,6 +494,57 @@ function ReportCard({ imp }: { imp: KlaviyoImport }) {
             ) : null}
           </div>
         </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function ReviewCard({ reviews }: { reviews: KlaviyoReview[] }) {
+  const clear = useClearReviewKlaviyo();
+  const [confirm, setConfirm] = useState<KlaviyoReview | null>(null);
+  return (
+    <Card title={`Needs review (${reviews.length})`}>
+      <p className="mb-3 text-sm text-zinc-600">
+        These came across from Klaviyo but needed some guessing. Until you mark one reviewed, a campaign can't be sent and a flow can't be turned
+        on. Open each one, fix what the notes say, then mark it reviewed.
+      </p>
+      <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 text-sm">
+        {reviews.map((r) => (
+          <li key={`${r.kind}-${r.id}`} className="flex flex-col gap-2 px-3 py-2.5 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone="amber">{reviewKindLabel[r.kind]}</Badge>
+                <Link to={reviewLink(r)} className="font-medium text-zinc-900 hover:underline">
+                  {r.name ?? "Untitled"}
+                </Link>
+              </div>
+              <ul className="mt-1 list-disc space-y-0.5 pl-5 text-zinc-600">
+                {r.notes.map((n, i) => (
+                  <li key={i}>{n}</li>
+                ))}
+              </ul>
+            </div>
+            <Button size="sm" className="shrink-0 self-start" onClick={() => setConfirm(r)}>
+              Mark reviewed
+            </Button>
+          </li>
+        ))}
+      </ul>
+      {confirm ? (
+        <ConfirmDialog
+          title={`Mark "${confirm.name ?? "this item"}" reviewed?`}
+          body={
+            confirm.kind === "campaign"
+              ? "Check its audience, exclusions and content first. Once reviewed it can be sent like any other campaign."
+              : confirm.kind === "flow"
+                ? "Check every step first. Once reviewed it can be turned on."
+                : "Check the content first. Campaigns and flows made from it afterwards won't carry the review."
+          }
+          confirmLabel="Mark reviewed"
+          loading={clear.isPending}
+          onClose={() => setConfirm(null)}
+          onConfirm={() => clear.mutate({ kind: confirm.kind, id: confirm.id }, { onSuccess: () => setConfirm(null) })}
+        />
       ) : null}
     </Card>
   );
@@ -479,10 +570,31 @@ function SyncCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
         {imp.sync_enabled ? (
           <>
             <p>
-              Last sync: {imp.last_sync_at ? formatRelative(imp.last_sync_at) : "not yet"}.
+              Last sync: {imp.last_sync_at ? formatRelative(imp.last_sync_at) : "not yet"}. Klaviyo's opt-outs are in as of{" "}
+              {imp.consent_synced_at ? formatRelative(imp.consent_synced_at) : "the import"}.
             </p>
+            {imp.error && imp.status === "done" ? (
+              <Notice tone="amber" icon={<AlertTriangle />} title="The last sync didn't finish">
+                {imp.error} Campaigns and flows wait for a successful sync; turn the sync off if you've finished with Klaviyo.
+              </Notice>
+            ) : null}
+            {s.waiting_campaigns.length > 0 ? (
+              <div>
+                <div className="font-medium text-zinc-800">Waiting for Klaviyo opt-outs to sync</div>
+                <ul className="mt-1 space-y-0.5">
+                  {s.waiting_campaigns.map((c) => (
+                    <li key={c.id}>
+                      <Link to={`/campaigns/${c.id}`} className="text-zinc-900 hover:underline">
+                        {c.name}
+                      </Link>{" "}
+                      <span className="text-xs text-zinc-500">since {formatRelative(c.since)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <p>
-              <span className="font-medium text-zinc-800">How fast a Klaviyo unsubscribe arrives: </span>
+              <span className="font-medium text-zinc-800">Before anything is sent: </span>
               {s.sync_worst_case_delay}
             </p>
             <p className="text-xs text-zinc-500">While both run, an order your site reports to both is counted here twice. Turn the sync off once DumbMail's snippet is on your site.</p>

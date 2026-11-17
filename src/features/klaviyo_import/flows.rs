@@ -146,13 +146,18 @@ fn email_content(ctx: &Ctx, m: &Value, issues: &mut Vec<String>, step: &str) -> 
         issues.push(format!("{step}: its email design wasn't found in Klaviyo, so the email is empty."));
         json!({"blocks": []})
     });
-    let conv = |s: &str| super::templates::convert(s).text;
-    if let Some(s) = m["subject_line"].as_str() {
-        content["subject"] = conv(s).into();
+    // Subject and preview text: converted, and anything the conversion had to guess goes on the
+    // content's review list with the body's.
+    let mut notes = super::templates::review_notes(&content);
+    for (src, dst, label) in [("subject_line", "subject", "Subject"), ("preview_text", "preheader", "Preview text")] {
+        if let Some(s) = m[src].as_str().filter(|s| !s.is_empty() || dst == "subject") {
+            let c = super::templates::convert(s);
+            notes.extend(c.review.iter().map(|r| format!("{label}: {r}")));
+            content[dst] = c.text.into();
+        }
     }
-    if let Some(s) = m["preview_text"].as_str().filter(|s| !s.is_empty()) {
-        content["preheader"] = conv(s).into();
-    }
+    notes.dedup();
+    super::review::mirror(&mut content, &notes);
     for (k, d) in [("from_label", "from_name"), ("from_email", "from_email"), ("reply_to_email", "reply_to")] {
         if let Some(v) = m[k].as_str().filter(|v| !v.is_empty()) {
             content[d] = v.into();
@@ -436,6 +441,19 @@ mod tests {
         assert!(t.review[0].contains("didn't say whether"));
         assert!(t.review[1].contains("manual"));
         assert!(t.review[2].contains("rules"));
+    }
+
+    #[test]
+    fn subject_warnings_reach_the_review() {
+        let m = HashMap::new();
+        let l = HashMap::new();
+        let sg = HashMap::new();
+        let tp: HashMap<String, Value> = [("T".to_string(), json!({"blocks": [{"type": "html", "html": "<p>x</p>"}]}))].into();
+        let ctx = Ctx { metric_names: &m, seg: seg::Ctx { metrics: &m, all_metrics: &m, lists: &l, events_since: None, now: chrono::Utc::now() }, segments: &sg, templates: &tp };
+        let def = json!({"triggers": [{"type": "date", "date_field_type": "profile-property", "date_profile_property": "birthday", "timedelta_unit_before_date": "days", "timedelta_value_before_date": 0}],
+            "entry_action_id": "1", "actions": [{"id": "1", "type": "send-email", "links": {"next": null}, "data": {"status": "live", "message": {"template_id": "T", "subject_line": "Code {% coupon_code 'X' %}"}}}]});
+        let t = translate(&ctx, &def).unwrap();
+        assert!(t.review.iter().any(|r| r.contains("Subject:")), "{:?}", t.review);
     }
 
     #[test]

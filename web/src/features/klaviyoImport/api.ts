@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "../../api/client";
-import type { KlaviyoCampaign, KlaviyoIssue, KlaviyoReport, KlaviyoState, StartOptions } from "./types";
+import type { KlaviyoCampaign, KlaviyoIssue, KlaviyoReport, KlaviyoState, ReviewKind, StartOptions } from "./types";
 
 const key = ["klaviyo-import"] as const;
 const busy = new Set(["surveying", "importing", "syncing"]);
@@ -46,4 +46,5 @@ export const useCancelKlaviyo = () => useAction(() => api<KlaviyoState>("POST", 
 export const useKlaviyoSync = () => useAction((enabled: boolean) => api<KlaviyoState>("POST", "/api/klaviyo/sync", { enabled }));
 export const useKlaviyoSyncNow = () => useAction(() => api<KlaviyoState>("POST", "/api/klaviyo/sync-now"));
 export const useMarkKlaviyo = () => useAction((v: { item: string; done: boolean }) => api<KlaviyoState>("POST", "/api/klaviyo/checklist", v));
+export const useClearReviewKlaviyo = () => useAction((v: { kind: ReviewKind; id: string }) => api<KlaviyoState>("POST", "/api/klaviyo/review", v));
 export const useCheckSiteKlaviyo = () => useAction(() => api<KlaviyoState>("POST", "/api/klaviyo/checklist/check-site"));

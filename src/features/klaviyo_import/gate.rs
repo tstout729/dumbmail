@@ -50,13 +50,14 @@ pub async fn campaign_may_start(state: &AppState, campaign_id: Uuid) -> anyhow::
         .bind(campaign_id)
         .fetch_optional(db)
         .await?;
-    // Not sending, or already past the start (a retry): nothing to hold.
     let Some((account_id, status, started)) = row else { return Ok(true) };
-    if status != "sending" || started {
+    if status != "sending" {
         return Ok(true);
     }
+    // `started`: recipients are already queued (a retry, or an A/B test's winner send). They're still held
+    // until consent is fresh, because each message re-checks consent when it's sent.
     // An imported campaign still waiting for review never goes out.
-    if let Some(notes) = super::review::pending(db, "campaign", campaign_id).await? {
+    if let Some(notes) = super::review::pending(db, "campaign", campaign_id).await?.filter(|_| !started) {
         let msg = format!("Not sent: it was imported from Klaviyo and needs review ({}). Mark it reviewed under Settings → Move from Klaviyo.", notes.first().map(String::as_str).unwrap_or("see the notes"));
         back_to_draft(db, campaign_id, &msg).await?;
         return Ok(false);
@@ -78,7 +79,12 @@ pub async fn campaign_may_start(state: &AppState, campaign_id: Uuid) -> anyhow::
     .fetch_one(db)
     .await?;
     if since < Utc::now() - Duration::hours(CAMPAIGN_MAX_WAIT_HOURS) {
-        back_to_draft(db, campaign_id, PAUSED_MESSAGE).await?;
+        if started {
+            // Part of it may have gone out (an A/B test slice): stop the rest, skipping what's queued.
+            crate::deliverability::stop_campaign(db, campaign_id, PAUSED_MESSAGE).await?;
+        } else {
+            back_to_draft(db, campaign_id, PAUSED_MESSAGE).await?;
+        }
         sqlx::query("DELETE FROM klaviyo_campaign_waits WHERE campaign_id = $1").bind(campaign_id).execute(db).await?;
         return Ok(false);
     }
