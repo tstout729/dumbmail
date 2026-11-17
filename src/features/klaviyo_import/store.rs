@@ -17,13 +17,6 @@ pub const JOB_SURVEY: &str = "klaviyo_import_survey";
 pub const STEPS: &[&str] = &[
     "metrics", "profiles", "lists", "list_members", "segments", "segment_members", "templates", "campaigns", "campaign_stats", "flows", "forms", "events", "compare",
 ];
-/// The ongoing sync. Everything up to `sync_consent_events` is about consent; when those finish the
-/// import's `consent_synced_at` moves forward (the send gate reads it). Then list changes and new events.
-pub const SYNC_STEPS: &[&str] = &[
-    "sync_profiles", "sync_suppressions", "sync_list_suppressions", "sync_consent_events", "sync_list_members", "sync_list_sweep", "sync_events",
-];
-/// The last consent step of a sync.
-pub const SYNC_CONSENT_DONE: &str = "sync_consent_events";
 /// What a customer can choose to leave out (profiles and consent always come across).
 pub const CHOOSABLE: &[&str] = &["lists", "segments", "templates", "campaigns", "flows", "forms", "events"];
 
@@ -48,15 +41,12 @@ pub struct Import {
     #[serde(skip)]
     pub source_counts: Value,
     pub checklist: Value,
-    pub sync_enabled: bool,
-    pub last_sync_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub compared_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub consent_synced_at: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub lease_owner: Option<Uuid>,
     #[serde(skip)]
@@ -95,7 +85,7 @@ impl Import {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.status.as_str(), "surveying" | "ready" | "importing" | "paused" | "syncing")
+        matches!(self.status.as_str(), "surveying" | "ready" | "importing" | "paused")
     }
 }
 
@@ -259,10 +249,10 @@ pub async fn ref_map(db: &PgPool, account_id: Uuid, kind: &str) -> sqlx::Result<
     Ok(rows.into_iter().collect())
 }
 
-/// Stop an import for good: the key is deleted and the ongoing sync turned off.
+/// Stop an import for good: the key is deleted.
 pub async fn close(db: &PgPool, id: Uuid, status: &str, error: Option<&str>) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE klaviyo_imports SET status = $2, error = COALESCE($3, error), api_key_enc = NULL, sync_enabled = false,
+        "UPDATE klaviyo_imports SET status = $2, error = COALESCE($3, error), api_key_enc = NULL,
             finished_at = COALESCE(finished_at, now()), lease_owner = NULL, lease_until = NULL,
             -- History writing that stopped part-way still counts as done now: segment flows absorb once more, then run normally.
             history_done_at = CASE WHEN history_started_at > COALESCE(history_done_at, '-infinity') THEN now() ELSE history_done_at END,

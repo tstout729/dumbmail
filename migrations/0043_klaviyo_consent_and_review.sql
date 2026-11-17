@@ -1,5 +1,4 @@
--- Klaviyo import, second pass: marketing holds, consent-sync freshness for the send gate, one runner per
--- import, history windows for segment-triggered flows, list memberships the import must never re-add, and
+-- Klaviyo import, second pass: marketing holds, one runner per import, history windows for segment-triggered flows, list memberships the import must never re-add, and
 -- imported items that need a person's review before they can send.
 
 -- Held people are left out of campaigns and get only service-message flows until they opt in. The custom
@@ -7,9 +6,6 @@
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS marketing_hold boolean NOT NULL DEFAULT false;
 
 ALTER TABLE klaviyo_imports
-    -- When the consent part of the last successful sync (or the import) started: everything Klaviyo knew
-    -- about opt-outs up to this moment is in DumbMail. Campaigns and flows check it before sending.
-    ADD COLUMN IF NOT EXISTS consent_synced_at timestamptz,
     -- The run that owns this import right now, so two workers never run it at once.
     ADD COLUMN IF NOT EXISTS lease_owner uuid,
     ADD COLUMN IF NOT EXISTS lease_until timestamptz,
@@ -22,7 +18,7 @@ ALTER TABLE klaviyo_imports
     ADD COLUMN IF NOT EXISTS report_cached_at timestamptz;
 
 -- One row per (list, profile) the import has dealt with. `left` rows are people who left the list, in
--- Klaviyo or in DumbMail (preference page, removed by hand): the import and the sync never add them back.
+-- Klaviyo or in DumbMail (preference page, removed by hand): the import never adds them back.
 -- `scan` is the full membership scan that last saw the person in Klaviyo, so removals can be reconciled
 -- once a scan completes; snapshot segments stage their new member set here before it's swapped in.
 CREATE TABLE IF NOT EXISTS klaviyo_memberships (
@@ -52,10 +48,3 @@ CREATE TABLE IF NOT EXISTS klaviyo_reviews (
     PRIMARY KEY (kind, local_id)
 );
 CREATE INDEX IF NOT EXISTS klaviyo_reviews_account_idx ON klaviyo_reviews (account_id) WHERE cleared_at IS NULL;
-
--- Campaigns held back because Klaviyo opt-outs haven't synced recently enough.
-CREATE TABLE IF NOT EXISTS klaviyo_campaign_waits (
-    campaign_id uuid PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE,
-    account_id  uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    since       timestamptz NOT NULL DEFAULT now()
-);

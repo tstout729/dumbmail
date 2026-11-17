@@ -280,9 +280,6 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
 /// With an A/B test and no winner yet, only the test slice gets rows (each with its version);
 /// once a winner is picked this runs again and adds everyone else.
 pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result<()> {
-    if !crate::features::klaviyo_import::campaign_may_start(state, campaign_id).await? {
-        return Ok(());
-    }
     // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
     let mut tx = state.db.begin().await?;
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;

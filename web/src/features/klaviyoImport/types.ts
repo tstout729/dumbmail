@@ -1,4 +1,4 @@
-export type KlaviyoStatus = "surveying" | "ready" | "importing" | "paused" | "syncing" | "done" | "cancelled" | "failed";
+export type KlaviyoStatus = "surveying" | "ready" | "importing" | "paused" | "done" | "cancelled" | "failed";
 
 export type SurveyCount = { count: number | null; exact: boolean; error?: string };
 
@@ -35,10 +35,6 @@ export type KlaviyoImport = {
   phase: string | null;
   progress: Record<string, StepProgress>;
   checklist: Record<string, { done?: boolean }>;
-  sync_enabled: boolean;
-  last_sync_at: string | null;
-  /** When Klaviyo's opt-outs were last fully in DumbMail. */
-  consent_synced_at: string | null;
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -52,18 +48,14 @@ export type ReviewKind = "campaign" | "flow" | "template";
 
 export type KlaviyoReview = { kind: ReviewKind; id: string; name: string | null; notes: string[] };
 
-export type WaitingCampaign = { id: string; name: string; since: string };
-
 export type KlaviyoState = {
   import: KlaviyoImport | null;
   reviews: KlaviyoReview[];
-  waiting_campaigns: WaitingCampaign[];
   issues: Record<string, number>;
   checklist: { items: ChecklistItem[]; done: number; total: number };
   steps: string[];
   choosable: string[];
   scopes: { label: string; scope: string }[];
-  sync_worst_case_delay: string;
 };
 
 export type LineState = "match" | "mismatch" | "not_verified";
@@ -95,4 +87,4 @@ export type KlaviyoCampaign = {
 
 export type NeverSubscribed = "send" | "hold";
 
-export type StartOptions = { confirm: boolean; what: string[]; events_from: string; sync: boolean; never_subscribed: NeverSubscribed };
+export type StartOptions = { confirm: boolean; what: string[]; events_from: string; never_subscribed: NeverSubscribed };

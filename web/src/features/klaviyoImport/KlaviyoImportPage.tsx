@@ -1,9 +1,9 @@
 import { useState, type FormEvent } from "react";
 import { Link } from "react-router";
-import { AlertTriangle, CheckCircle2, CircleDashed, Download, KeyRound, Loader2, Pause, Play, RefreshCw, Search, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, Download, KeyRound, Loader2, Pause, Play, Search, XCircle } from "lucide-react";
 import { useSession } from "../../api";
-import { Badge, Button, Card, Checkbox, ConfirmDialog, Field, InlineError, Input, Notice, Select, Skeleton, StatusBadge, Table, Td, Th, Toggle, cx, type Tone } from "../../components/ui";
-import { formatCurrency, formatDate, formatDateTime, formatNumber, formatPercent, formatRelative } from "../../lib/format";
+import { Badge, Button, Card, Checkbox, ConfirmDialog, Field, InlineError, Input, Notice, Select, Skeleton, StatusBadge, Table, Td, Th, cx, type Tone } from "../../components/ui";
+import { formatCurrency, formatDate, formatDateTime, formatNumber, formatPercent } from "../../lib/format";
 import {
   useCancelKlaviyo,
   useCheckSiteKlaviyo,
@@ -13,8 +13,6 @@ import {
   useKlaviyoCampaigns,
   useKlaviyoIssues,
   useKlaviyoReport,
-  useKlaviyoSync,
-  useKlaviyoSyncNow,
   useMarkKlaviyo,
   usePauseKlaviyo,
   useStartKlaviyo,
@@ -35,16 +33,7 @@ const stepLabels: Record<string, string> = {
   forms: "Forms",
   events: "Events",
   compare: "Klaviyo's counts for the report",
-  sync_profiles: "Changed profiles",
-  sync_suppressions: "New suppressions",
-  sync_list_suppressions: "New list opt-outs",
-  sync_consent_events: "Unsubscribes, complaints and bounces",
-  sync_list_members: "New list members",
-  sync_list_sweep: "People taken off lists",
-  sync_events: "New events",
 };
-
-const syncSteps = ["sync_profiles", "sync_suppressions", "sync_list_suppressions", "sync_consent_events", "sync_list_members", "sync_list_sweep", "sync_events"];
 
 const lineBadge: Record<LineState, { tone: Tone; label: string }> = {
   match: { tone: "green", label: "Match" },
@@ -70,7 +59,6 @@ const statusLabels: Record<string, string> = {
   ready: "Ready to import",
   importing: "Importing",
   paused: "Paused",
-  syncing: "Syncing",
   done: "Done",
   cancelled: "Cancelled",
   failed: "Stopped",
@@ -107,13 +95,12 @@ export function KlaviyoImportPage() {
       {fresh ? <ConnectCard s={s} again={!!imp} /> : null}
       {imp?.status === "surveying" ? <SurveyingCard imp={imp} /> : null}
       {imp?.status === "ready" && imp.survey ? <SurveyCard imp={imp} survey={imp.survey} s={s} /> : null}
-      {imp && ["importing", "paused", "syncing", "done"].includes(imp.status) ? <ProgressCard imp={imp} s={s} /> : null}
-      {imp && (imp.status === "done" || imp.status === "syncing") && imp.compared_at ? <ReportCard imp={imp} /> : null}
+      {imp && ["importing", "paused", "done"].includes(imp.status) ? <ProgressCard imp={imp} s={s} /> : null}
+      {imp?.status === "done" && imp.compared_at ? <ReportCard imp={imp} /> : null}
       {s.reviews.length > 0 ? <ReviewCard reviews={s.reviews} /> : null}
-      {imp && ["importing", "paused", "syncing", "done"].includes(imp.status) ? <SyncCard imp={imp} s={s} /> : null}
-      {imp && (imp.status === "done" || imp.status === "syncing") ? <CampaignsCard imp={imp} /> : null}
+      {imp?.status === "done" ? <CampaignsCard imp={imp} /> : null}
       <ChecklistCard s={s} />
-      {imp?.status === "done" && !imp.key_stored ? <ConnectCard s={s} again /> : null}
+      {imp?.status === "done" ? <ConnectCard s={s} again /> : null}
     </div>
   );
 }
@@ -126,10 +113,24 @@ function ConnectCard({ s, again }: { s: KlaviyoState; again: boolean }) {
     connect.mutate(key.trim(), { onSuccess: () => setKey("") });
   };
   return (
-    <Card title={again ? "Connect Klaviyo again" : "1. Connect your Klaviyo account"}>
+    <Card title={again ? "Run the import again" : "1. Connect your Klaviyo account"}>
       <div className="space-y-4 text-sm text-zinc-600">
         {again ? (
-          <p>Running the import again only adds what's new since last time: nothing is duplicated.</p>
+          <>
+            <p>
+              Running it again picks up everything that changed in Klaviyo since: new people, unsubscribes and suppressions, list joins and leaves, and
+              new events. Nothing is duplicated.
+            </p>
+            <div>
+              <div className="font-medium text-zinc-800">When you're ready to switch</div>
+              <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+                <li>Stop sending from Klaviyo. Don't send from both at once.</li>
+                <li>Run the import again, so the latest unsubscribes come across.</li>
+                <li>Check the comparison report.</li>
+                <li>Then send from DumbMail.</li>
+              </ol>
+            </div>
+          </>
         ) : (
           <ol className="list-decimal space-y-1 pl-5">
             <li>
@@ -150,10 +151,7 @@ function ConnectCard({ s, again }: { s: KlaviyoState; again: boolean }) {
             Connect
           </Button>
         </form>
-        <p className="text-xs text-zinc-500">
-          The key is stored encrypted only while the import runs (and while the ongoing sync is on). It's deleted when the import finishes, when you
-          cancel, or when you turn the sync off.
-        </p>
+        <p className="text-xs text-zinc-500">The key is stored encrypted only while the import runs. It's deleted when the import finishes or when you cancel.</p>
       </div>
     </Card>
   );
@@ -181,7 +179,6 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
   const cancel = useCancelKlaviyo();
   const [what, setWhat] = useState<string[]>(s.choosable);
   const [range, setRange] = useState("2y");
-  const [sync, setSync] = useState(false);
   const [never, setNever] = useState<NeverSubscribed>("send");
   const [confirming, setConfirming] = useState(false);
   const eventsFrom = (() => {
@@ -260,16 +257,6 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
               <option value="hold">Hold them back from marketing until they opt in</option>
             </Select>
           </Field>
-          <div className="flex items-start gap-3">
-            <Toggle checked={sync} onChange={setSync} label="Keep syncing from Klaviyo" />
-            <div className="text-sm">
-              <div className="font-medium text-zinc-800">Keep syncing from Klaviyo every hour</div>
-              <div className="text-xs text-zinc-500">
-                For running both for a while. Keeps the key stored until you turn it off. While it's on, campaigns wait for Klaviyo's latest opt-outs
-                before they send.
-              </div>
-            </div>
-          </div>
         </div>
         <div className="flex justify-end">
           <Button variant="primary" onClick={() => setConfirming(true)} disabled={noProfiles}>
@@ -284,7 +271,7 @@ function SurveyCard({ imp, survey, s }: { imp: KlaviyoImport; survey: KlaviyoSur
           confirmLabel="Start import"
           loading={start.isPending}
           onClose={() => setConfirming(false)}
-          onConfirm={() => start.mutate({ confirm: true, what, events_from: eventsFrom, sync, never_subscribed: never }, { onSuccess: () => setConfirming(false) })}
+          onConfirm={() => start.mutate({ confirm: true, what, events_from: eventsFrom, never_subscribed: never }, { onSuccess: () => setConfirming(false) })}
         />
       ) : null}
     </Card>
@@ -296,15 +283,14 @@ function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
   const cancel = useCancelKlaviyo();
   const [confirmCancel, setConfirmCancel] = useState(false);
   const { account } = useSession();
-  const syncing = imp.status === "syncing";
-  const steps = syncing ? syncSteps : s.steps.filter((st) => imp.progress[st] || imp.phase === st);
-  const running = imp.status === "importing" || syncing;
+  const steps = s.steps.filter((st) => imp.progress[st] || imp.phase === st);
+  const running = imp.status === "importing";
   return (
     <Card
-      title={syncing ? "Syncing from Klaviyo" : "3. Import"}
+      title="3. Import"
       actions={
         <div className="flex items-center gap-2">
-          <StatusBadge status={imp.status === "importing" || imp.status === "syncing" ? "sending" : imp.status === "done" ? "sent" : imp.status} label={statusLabels[imp.status]} />
+          <StatusBadge status={imp.status === "importing" ? "sending" : imp.status === "done" ? "sent" : imp.status} label={statusLabels[imp.status]} />
           {imp.status === "importing" ? (
             <Button size="sm" icon={<Pause className="size-3.5" />} onClick={() => pause.mutate(false)} loading={pause.isPending}>
               Pause
@@ -326,7 +312,7 @@ function ProgressCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
       <div className="space-y-3">
         {imp.status === "done" ? (
           <p className="text-sm text-zinc-600">
-            Finished {formatDateTime(imp.finished_at, account.timezone)}. {imp.key_stored ? "The Klaviyo key is kept for the ongoing sync." : "The Klaviyo key has been deleted."}
+            Finished {formatDateTime(imp.finished_at, account.timezone)}. The Klaviyo key has been deleted.
           </p>
         ) : null}
         <ul className="divide-y divide-zinc-100 text-sm">
@@ -381,7 +367,7 @@ function cell(v: number | null, section: string): string {
 }
 
 function ReportCard({ imp }: { imp: KlaviyoImport }) {
-  const version = `${imp.compared_at}-${imp.last_sync_at}`;
+  const version = `${imp.compared_at}-${imp.finished_at}`;
   const report = useKlaviyoReport(true, version);
   const issues = useKlaviyoIssues(true, version);
   const [showIssues, setShowIssues] = useState(false);
@@ -546,66 +532,6 @@ function ReviewCard({ reviews }: { reviews: KlaviyoReview[] }) {
           onConfirm={() => clear.mutate({ kind: confirm.kind, id: confirm.id }, { onSuccess: () => setConfirm(null) })}
         />
       ) : null}
-    </Card>
-  );
-}
-
-function SyncCard({ imp, s }: { imp: KlaviyoImport; s: KlaviyoState }) {
-  const sync = useKlaviyoSync();
-  const now = useKlaviyoSyncNow();
-  const canEnable = imp.key_stored;
-  return (
-    <Card title="Run both for a while">
-      <div className="space-y-3 text-sm text-zinc-600">
-        <div className="flex items-start gap-3">
-          <Toggle checked={imp.sync_enabled} onChange={(v) => sync.mutate(v)} disabled={sync.isPending || (!imp.sync_enabled && !canEnable)} label="Keep syncing from Klaviyo" />
-          <div>
-            <div className="font-medium text-zinc-800">Keep syncing from Klaviyo every hour</div>
-            <p className="text-xs text-zinc-500">
-              Every hour, pulls opt-outs and suppressions first, then changed profiles, list joins and removals, and new events, until you switch
-              over. Turning it off deletes the stored key.
-            </p>
-          </div>
-        </div>
-        {imp.sync_enabled ? (
-          <>
-            <p>
-              Last sync: {imp.last_sync_at ? formatRelative(imp.last_sync_at) : "not yet"}. Klaviyo's opt-outs are in as of{" "}
-              {imp.consent_synced_at ? formatRelative(imp.consent_synced_at) : "the import"}.
-            </p>
-            {imp.error && imp.status === "done" ? (
-              <Notice tone="amber" icon={<AlertTriangle />} title="The last sync didn't finish">
-                {imp.error} Campaigns and flows wait for a successful sync; turn the sync off if you've finished with Klaviyo.
-              </Notice>
-            ) : null}
-            {s.waiting_campaigns.length > 0 ? (
-              <div>
-                <div className="font-medium text-zinc-800">Waiting for Klaviyo opt-outs to sync</div>
-                <ul className="mt-1 space-y-0.5">
-                  {s.waiting_campaigns.map((c) => (
-                    <li key={c.id}>
-                      <Link to={`/campaigns/${c.id}`} className="text-zinc-900 hover:underline">
-                        {c.name}
-                      </Link>{" "}
-                      <span className="text-xs text-zinc-500">since {formatRelative(c.since)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-            <p>
-              <span className="font-medium text-zinc-800">Before anything is sent: </span>
-              {s.sync_worst_case_delay}
-            </p>
-            <p className="text-xs text-zinc-500">While both run, an order your site reports to both is counted here twice. Turn the sync off once DumbMail's snippet is on your site.</p>
-            <Button size="sm" icon={<RefreshCw className="size-3.5" />} onClick={() => now.mutate()} loading={now.isPending || imp.status === "syncing"} disabled={imp.status !== "done"}>
-              Sync now
-            </Button>
-          </>
-        ) : !canEnable && imp.status === "done" ? (
-          <p className="text-xs text-zinc-500">The key was deleted when the import finished. Connect it again to sync.</p>
-        ) : null}
-      </div>
     </Card>
   );
 }

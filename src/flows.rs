@@ -574,9 +574,6 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "email" | "sms" => {
-                if crate::features::klaviyo_import::flow_send_held(state, run.id, flow.account_id, &node_id, &context).await? {
-                    return Ok(());
-                }
                 // Smart sending: skip if this person got any message in the last N hours (0 = off).
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 let recent: bool = hours > 0

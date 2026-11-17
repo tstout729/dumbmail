@@ -1,11 +1,11 @@
--- Moving an account from Klaviyo: one row per import (connect, survey, import, optional ongoing sync).
+-- Moving an account from Klaviyo: one row per import (connect, survey, import).
 CREATE TABLE klaviyo_imports (
     id              uuid PRIMARY KEY,
     account_id      uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    -- surveying | ready | importing | paused | syncing | done | cancelled | failed
+    -- surveying | ready | importing | paused | done | cancelled | failed
     status          text NOT NULL DEFAULT 'surveying',
-    -- The customer's private Klaviyo key, AES-GCM encrypted. Cleared when the import finishes (unless the
-    -- ongoing sync is on), is cancelled or fails.
+    -- The customer's private Klaviyo key, AES-GCM encrypted. Cleared when the import finishes, is
+    -- cancelled or fails.
     api_key_enc     text,
     key_hint        text NOT NULL DEFAULT '',
     -- Klaviyo account name, id, time zone and currency, from GET /api/accounts.
@@ -23,8 +23,6 @@ CREATE TABLE klaviyo_imports (
     source_counts   jsonb NOT NULL DEFAULT '{}',
     -- Switch-over checklist items the customer ticked by hand.
     checklist       jsonb NOT NULL DEFAULT '{}',
-    sync_enabled    boolean NOT NULL DEFAULT false,
-    last_sync_at    timestamptz,
     error           text,
     started_at      timestamptz,
     finished_at     timestamptz,
@@ -33,4 +31,3 @@ CREATE TABLE klaviyo_imports (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX klaviyo_imports_account_idx ON klaviyo_imports (account_id, created_at DESC);
-CREATE INDEX klaviyo_imports_sync_idx ON klaviyo_imports (last_sync_at) WHERE sync_enabled;

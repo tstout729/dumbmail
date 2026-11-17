@@ -3,7 +3,7 @@ import { api, withQuery } from "../../api/client";
 import type { KlaviyoCampaign, KlaviyoIssue, KlaviyoReport, KlaviyoState, ReviewKind, StartOptions } from "./types";
 
 const key = ["klaviyo-import"] as const;
-const busy = new Set(["surveying", "importing", "syncing"]);
+const busy = new Set(["surveying", "importing"]);
 
 /** The import's state, refreshed every 3 seconds while something runs in the background. */
 export function useKlaviyo() {
@@ -43,8 +43,6 @@ export const useConnectKlaviyo = () => useAction((api_key: string) => api<Klaviy
 export const useStartKlaviyo = () => useAction((o: StartOptions) => api<KlaviyoState>("POST", "/api/klaviyo/start", o));
 export const usePauseKlaviyo = () => useAction((resume: boolean) => api<KlaviyoState>("POST", resume ? "/api/klaviyo/resume" : "/api/klaviyo/pause"));
 export const useCancelKlaviyo = () => useAction(() => api<KlaviyoState>("POST", "/api/klaviyo/cancel"));
-export const useKlaviyoSync = () => useAction((enabled: boolean) => api<KlaviyoState>("POST", "/api/klaviyo/sync", { enabled }));
-export const useKlaviyoSyncNow = () => useAction(() => api<KlaviyoState>("POST", "/api/klaviyo/sync-now"));
 export const useMarkKlaviyo = () => useAction((v: { item: string; done: boolean }) => api<KlaviyoState>("POST", "/api/klaviyo/checklist", v));
 export const useClearReviewKlaviyo = () => useAction((v: { kind: ReviewKind; id: string }) => api<KlaviyoState>("POST", "/api/klaviyo/review", v));
 export const useCheckSiteKlaviyo = () => useAction(() => api<KlaviyoState>("POST", "/api/klaviyo/checklist/check-site"));

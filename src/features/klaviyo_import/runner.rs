@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::client::{next_link, q, Client, KlaviyoError};
 use super::consent;
 use super::review;
-use super::store::{self, Import, JOB_RUN, STEPS, SYNC_CONSENT_DONE, SYNC_STEPS};
+use super::store::{self, Import, JOB_RUN, STEPS};
 use crate::state::AppState;
 
 /// How long one job run works before handing over to the next (jobs are unlocked after 15 minutes).
@@ -30,19 +30,12 @@ const EVENT_PAGE: u32 = 500;
 const MAX_EVENT_PROPS: usize = 64 * 1024;
 /// Most lists and segments whose Klaviyo size the report fetches (each costs one slow call).
 pub const MAX_COMPARED_GROUPS: usize = 500;
-/// The sync re-reads this much before the last sync, so late arrivals and ties aren't missed.
-const SYNC_OVERLAP_MINUTES: i64 = 30;
 
 /// Metrics imported when the customer doesn't choose: shopping activity and email/SMS engagement.
 pub const DEFAULT_METRICS: &[&str] = &[
     "Placed Order", "Ordered Product", "Started Checkout", "Checkout Started", "Viewed Product", "Added to Cart", "Active on Site",
     "Fulfilled Order", "Cancelled Order", "Refunded Order", "Received Email", "Opened Email", "Clicked Email", "Bounced Email",
     "Marked Email as Spam", "Unsubscribed", "Received SMS", "Clicked SMS", "Unsubscribed from SMS", "Subscribed to List",
-];
-/// Metrics that mean a person's consent changed; the sync re-reads those people before anything else.
-pub const CONSENT_METRICS: &[&str] = &[
-    "Unsubscribed", "Unsubscribed from SMS", "Marked Email as Spam", "Bounced Email", "Unsubscribed from List", "Subscribed to List",
-    "Subscribed to SMS Marketing", "Subscribed to Email Marketing", "Unsubscribed from Email Marketing", "Unsubscribed from SMS Marketing",
 ];
 /// Metrics whose values are revenue in the report.
 pub const ORDER_METRICS: &[&str] = &["Placed Order"];
@@ -151,16 +144,6 @@ impl<'a> Run<'a> {
     pub(super) async fn issue(&self, step: &str, kind: &str, item: &str, kid: Option<&str>, local: Option<Uuid>, msg: &str) -> anyhow::Result<()> {
         store::issue(&self.state.db, &self.imp, step, kind, item, kid, local, msg).await?;
         Ok(())
-    }
-
-    fn syncing(&self) -> bool {
-        self.imp.status == "syncing"
-    }
-
-    /// Where the sync starts reading: the last sync, less an overlap (everything it reads is deduplicated).
-    fn sync_since(&self) -> String {
-        let t = self.imp.last_sync_at.or(self.imp.started_at).unwrap_or(self.imp.created_at) - chrono::Duration::minutes(SYNC_OVERLAP_MINUTES);
-        fmt_ts(t)
     }
 
     // ---------- metrics ----------
@@ -280,32 +263,14 @@ impl<'a> Run<'a> {
     }
 
     async fn step_profiles(&mut self, step: &str) -> anyhow::Result<bool> {
-        let url = match self.imp.cursor.clone() {
-            Some(c) => c,
-            None => {
-                let mut u = format!("/api/profiles?additional-fields%5Bprofile%5D=subscriptions&page%5Bsize%5D={PROFILE_PAGE}&sort=id");
-                let field = match step {
-                    "sync_profiles" => Some("updated"),
-                    "sync_suppressions" => Some("subscriptions.email.marketing.suppression.timestamp"),
-                    "sync_list_suppressions" => Some("subscriptions.email.marketing.list_suppressions.timestamp"),
-                    _ => None,
-                };
-                if let Some(f) = field {
-                    u = u.replace("&sort=id", "");
-                    u.push_str(&format!("&filter={}", q(&format!("greater-than({f},{})", self.sync_since()))));
-                }
-                u
-            }
-        };
+        let url = self.imp.cursor.clone().unwrap_or_else(|| format!("/api/profiles?additional-fields%5Bprofile%5D=subscriptions&page%5Bsize%5D={PROFILE_PAGE}&sort=id"));
         let page = self.k.get(&url).await?;
         let data = page["data"].as_array().cloned().unwrap_or_default();
         let up = self.take_profiles(&data).await?;
         self.bump(step, up.done, up.skipped);
-        if step == "profiles" {
-            // Klaviyo's own total, counted while reading every page: the report's independent number.
-            let n = self.st("scan_profiles").as_i64().unwrap_or(0) + data.len() as i64;
-            self.set_st("scan_profiles", json!(n));
-        }
+        // Klaviyo's own total, counted while reading every page: the report's independent number.
+        let n = self.st("scan_profiles").as_i64().unwrap_or(0) + data.len() as i64;
+        self.set_st("scan_profiles", json!(n));
         self.imp.cursor = next_link(&page);
         Ok(self.imp.cursor.is_none())
     }
@@ -409,8 +374,6 @@ impl<'a> Run<'a> {
             self.set_st("group", json!(0));
             return Ok(true);
         };
-        let joins_only = step == "sync_list_members";
-        let ids_only = step == "sync_list_sweep";
         let url = match self.imp.cursor.clone() {
             Some(c) => c,
             None => {
@@ -419,15 +382,7 @@ impl<'a> Run<'a> {
                 self.set_st("scan_started", json!(fmt_ts(Utc::now())));
                 self.set_st("scan_seen", json!(0));
                 let base = if segments { "segments" } else { "lists" };
-                if ids_only {
-                    format!("/api/{base}/{kid}/relationships/profiles?page%5Bsize%5D={PROFILE_PAGE}")
-                } else {
-                    let mut u = format!("/api/{base}/{kid}/profiles?additional-fields%5Bprofile%5D=subscriptions&page%5Bsize%5D={PROFILE_PAGE}");
-                    if joins_only {
-                        u.push_str(&format!("&filter={}", q(&format!("greater-than(joined_group_at,{})", self.sync_since()))));
-                    }
-                    u
-                }
+                format!("/api/{base}/{kid}/profiles?additional-fields%5Bprofile%5D=subscriptions&page%5Bsize%5D={PROFILE_PAGE}")
             }
         };
         let scan = self.st("scan").as_i64().unwrap_or(0);
@@ -444,19 +399,7 @@ impl<'a> Run<'a> {
         let data = page["data"].as_array().cloned().unwrap_or_default();
         let seen_n = self.st("scan_seen").as_i64().unwrap_or(0) + data.len() as i64;
         self.set_st("scan_seen", json!(seen_n));
-        if ids_only {
-            let kids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
-            sqlx::query(
-                "UPDATE klaviyo_memberships m SET scan = $3 FROM klaviyo_refs r
-                 WHERE r.account_id = $4 AND r.kind = 'profile' AND r.klaviyo_id = ANY($2) AND m.list_id = $1 AND m.profile_id = r.local_id AND m.state = 'member'",
-            )
-            .bind(list_id)
-            .bind(&kids)
-            .bind(scan)
-            .bind(self.acct())
-            .execute(&self.state.db)
-            .await?;
-        } else {
+        {
             let ids = self.resolve_profiles(&data).await?;
             // List-level opt-outs on this page, for every list they name (this one included).
             let sups: Vec<(Uuid, String)> = data
@@ -485,13 +428,12 @@ impl<'a> Run<'a> {
             sqlx::query(
                 "INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, scan)
                  SELECT $1, $2, x.p, 'member', $4 FROM unnest($3::uuid[]) AS x(p) JOIN profiles pr ON pr.id = x.p AND pr.account_id = $1
-                 ON CONFLICT (list_id, profile_id) DO UPDATE SET scan = CASE WHEN $5 THEN klaviyo_memberships.scan ELSE EXCLUDED.scan END, updated_at = now()",
+                 ON CONFLICT (list_id, profile_id) DO UPDATE SET scan = EXCLUDED.scan, updated_at = now()",
             )
             .bind(self.acct())
             .bind(list_id)
             .bind(&pids)
-            .bind(if joins_only { 0 } else { scan })
-            .bind(joins_only)
+            .bind(scan)
             .execute(&mut *tx)
             .await?;
             let added = if segments {
@@ -516,9 +458,7 @@ impl<'a> Run<'a> {
         }
         self.imp.cursor = next_link(&page);
         if self.imp.cursor.is_none() {
-            if !joins_only {
-                self.complete_scan(list_id, segments, scan).await?;
-            }
+            self.complete_scan(list_id, segments, scan).await?;
             self.set_st("group", json!(i + 1));
         }
         Ok(false)
@@ -1079,8 +1019,7 @@ impl<'a> Run<'a> {
                 // History is about to be written: segment-triggered flows absorb new members until it's done.
                 self.mark_history(true).await?;
                 let mut u = format!("/api/events?sort=datetime&page%5Bsize%5D={EVENT_PAGE}");
-                let since = if self.syncing() { Some(self.sync_since()) } else { self.imp.events_since().map(fmt_ts) };
-                if let Some(since) = since {
+                if let Some(since) = self.imp.events_since().map(fmt_ts) {
                     u.push_str(&format!("&filter={}", q(&format!("greater-or-equal(datetime,{since})"))));
                 }
                 u
@@ -1159,36 +1098,6 @@ impl<'a> Run<'a> {
             self.mark_history(false).await?;
         }
         Ok(self.imp.cursor.is_none())
-    }
-
-    /// The sync's first look at consent changes carried by events: anyone who unsubscribed, complained,
-    /// bounced or subscribed since the last sync (with an overlap) is read again, all of them before the
-    /// cursor moves on.
-    async fn step_consent_events(&mut self) -> anyhow::Result<bool> {
-        let ids: Vec<String> = {
-            let m = self.metric_map().await?;
-            let mut v: Vec<String> = m.iter().filter(|(_, (n, _))| CONSENT_METRICS.iter().any(|c| c.eq_ignore_ascii_case(n))).map(|(k, _)| k.clone()).collect();
-            v.sort();
-            v
-        };
-        let i = self.st_i("group");
-        let Some(mid) = ids.get(i).cloned() else {
-            self.set_st("group", json!(0));
-            return Ok(true);
-        };
-        let url = self.imp.cursor.clone().unwrap_or_else(|| {
-            format!("/api/events?sort=datetime&page%5Bsize%5D={EVENT_PAGE}&filter={}", q(&format!("equals(metric_id,\"{}\"),greater-or-equal(datetime,{})", mid.replace('"', ""), self.sync_since())))
-        });
-        let page = self.k.get(&url).await?;
-        let kids: Vec<String> = page["data"].as_array().into_iter().flatten().filter_map(|e| rel_ids(e, "profile").first().cloned()).collect::<HashSet<_>>().into_iter().collect();
-        let n = kids.len() as i64;
-        self.fetch_profiles(&kids).await?;
-        self.bump("sync_consent_events", n, 0);
-        self.imp.cursor = next_link(&page);
-        if self.imp.cursor.is_none() {
-            self.set_st("group", json!(i + 1));
-        }
-        Ok(false)
     }
 
     // ---------- the Klaviyo side of the comparison report ----------
@@ -1316,10 +1225,9 @@ impl<'a> Run<'a> {
     async fn step(&mut self, phase: &str) -> anyhow::Result<bool> {
         match phase {
             "metrics" => self.step_metrics().await,
-            "profiles" | "sync_profiles" | "sync_suppressions" | "sync_list_suppressions" => self.step_profiles(phase).await,
-            "sync_consent_events" => self.step_consent_events().await,
+            "profiles" => self.step_profiles(phase).await,
             "lists" => self.step_lists().await,
-            "list_members" | "sync_list_members" | "sync_list_sweep" => self.step_members(phase, false).await,
+            "list_members" => self.step_members(phase, false).await,
             "segments" => self.step_segments().await,
             "segment_members" => self.step_members(phase, true).await,
             "templates" => self.step_templates().await,
@@ -1327,7 +1235,7 @@ impl<'a> Run<'a> {
             "campaign_stats" => self.step_campaign_stats().await,
             "flows" => self.step_flows().await,
             "forms" => self.step_forms().await,
-            "events" | "sync_events" => self.step_events(phase).await,
+            "events" => self.step_events(phase).await,
             "compare" => self.step_compare().await,
             _ => Ok(true),
         }
@@ -1335,28 +1243,27 @@ impl<'a> Run<'a> {
 
     fn wanted(&self, phase: &str) -> bool {
         match phase {
-            "lists" | "list_members" | "sync_list_members" | "sync_list_sweep" => self.imp.wants("lists"),
+            "lists" | "list_members" => self.imp.wants("lists"),
             "segments" | "segment_members" => self.imp.wants("segments"),
             "templates" => self.imp.wants("templates"),
             "campaigns" | "campaign_stats" => self.imp.wants("campaigns"),
             "flows" => self.imp.wants("flows"),
             "forms" => self.imp.wants("forms"),
-            "events" | "sync_events" => self.imp.wants("events"),
+            "events" => self.imp.wants("events"),
             // Consent steps always run.
             _ => true,
         }
     }
 
     fn next_phase(&self, current: Option<&str>) -> Option<&'static str> {
-        let steps = if self.syncing() { SYNC_STEPS } else { STEPS };
         let start = match current {
-            Some(c) => steps.iter().position(|s| *s == c).map(|p| p + 1).unwrap_or(0),
+            Some(c) => STEPS.iter().position(|s| *s == c).map(|p| p + 1).unwrap_or(0),
             None => 0,
         };
-        steps[start..].iter().copied().find(|p| self.wanted(p))
+        STEPS[start..].iter().copied().find(|p| self.wanted(p))
     }
 
-    /// A step is done: record it, and when the sync's consent part is complete, say so for the send gate.
+    /// A step is done: record it.
     async fn step_done(&mut self, phase: &str) -> anyhow::Result<()> {
         self.finished.push(phase.to_string());
         self.imp.cursor = None;
@@ -1368,10 +1275,6 @@ impl<'a> Run<'a> {
                 .bind(n)
                 .execute(&self.state.db)
                 .await?;
-        }
-        if phase == SYNC_CONSENT_DONE {
-            let started = ts(self.st("sync_started")).unwrap_or_else(Utc::now);
-            sqlx::query("UPDATE klaviyo_imports SET consent_synced_at = GREATEST(COALESCE(consent_synced_at, '-infinity'), $2) WHERE id = $1").bind(self.imp.id).bind(started).execute(&self.state.db).await?;
         }
         self.imp.phase = self.next_phase(Some(phase)).map(String::from);
         Ok(())
@@ -1412,9 +1315,7 @@ pub fn form_destinations(def: &Value) -> Vec<String> {
 
 /// Steps where a missing scope only means that part is left out.
 fn optional_step(phase: &str) -> bool {
-    // Not the sync's consent steps: a sync that can't read one of its opt-out signals hasn't synced
-    // consent, so it fails (and sends keep waiting) rather than counting as fresh.
-    matches!(phase, "segments" | "segment_members" | "templates" | "campaigns" | "campaign_stats" | "flows" | "forms" | "compare" | "sync_events")
+    matches!(phase, "segments" | "segment_members" | "templates" | "campaigns" | "campaign_stats" | "flows" | "forms" | "compare")
 }
 
 /// Claim the import for this run. Another live run keeps it.
@@ -1439,15 +1340,11 @@ async fn release(db: &sqlx::PgPool, id: Uuid, owner: Uuid) -> sqlx::Result<()> {
 
 pub async fn run(state: &AppState, import_id: Uuid) -> anyhow::Result<()> {
     let Some(imp) = store::load(&state.db, import_id).await? else { return Ok(()) };
-    if !matches!(imp.status.as_str(), "importing" | "syncing") {
+    if imp.status != "importing" {
         return Ok(());
     }
     let Some(key) = store::key(state, &imp) else {
-        if imp.status == "syncing" {
-            end_sync_failed(&state.db, imp.id, "The Klaviyo key is no longer stored. Connect it again, or turn the sync off.").await?;
-        } else {
-            store::close(&state.db, imp.id, "failed", Some("The Klaviyo key is no longer stored. Connect again to continue.")).await?;
-        }
+        store::close(&state.db, imp.id, "failed", Some("The Klaviyo key is no longer stored. Connect again to continue.")).await?;
         return Ok(());
     };
     let mut r = Run::new(state, imp, &key);
@@ -1498,7 +1395,7 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
                     Some(KlaviyoError::MissingScope(what)) if optional_step(&phase) => {
                         let msg = format!("{}. This part was left out.", KlaviyoError::MissingScope(what.clone()));
                         r.issue(&phase, "skipped", "Klaviyo access", None, None, &msg).await?;
-                        if phase == "events" || phase == "sync_events" {
+                        if phase == "events" {
                             r.mark_history(false).await?;
                         }
                         r.step_done(&phase).await?;
@@ -1507,13 +1404,7 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
                         }
                     }
                     Some(k @ (KlaviyoError::BadKey | KlaviyoError::MissingScope(_))) => {
-                        let msg = k.to_string();
-                        if r.syncing() {
-                            // The sync stays on (so sends keep waiting for it) until someone turns it off.
-                            end_sync_failed(&state.db, r.imp.id, &msg).await?;
-                        } else {
-                            store::close(&state.db, r.imp.id, "failed", Some(&msg)).await?;
-                        }
+                        store::close(&state.db, r.imp.id, "failed", Some(&k.to_string())).await?;
                         return Ok(());
                     }
                     _ => {
@@ -1525,12 +1416,8 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
                         };
                         tracing::warn!(import = %r.imp.id, phase = %phase, attempt = n, error = %msg, "klaviyo import step failed");
                         if n > 6 {
-                            let text = format!("Stopped at the {} step: {msg}.", phase.replace('_', " "));
-                            if r.syncing() {
-                                end_sync_failed(&state.db, r.imp.id, &format!("{text} The next sync tries again.")).await?;
-                            } else {
-                                store::close(&state.db, r.imp.id, "failed", Some(&format!("{text} Imported data is kept; connect again to pick up where it left off."))).await?;
-                            }
+                            let text = format!("Stopped at the {} step: {msg}. Imported data is kept; connect again to pick up where it left off.", phase.replace('_', " "));
+                            store::close(&state.db, r.imp.id, "failed", Some(&text)).await?;
                             return Ok(());
                         }
                         r.set_st("retries", json!(n));
@@ -1547,48 +1434,18 @@ async fn drive(r: &mut Run<'_>) -> anyhow::Result<()> {
             return Ok(());
         }
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM klaviyo_imports WHERE id = $1").bind(r.imp.id).fetch_optional(&state.db).await?;
-        if !matches!(status.as_deref(), Some("importing" | "syncing")) {
+        if status.as_deref() != Some("importing") {
             return Ok(());
         }
     }
 }
 
-/// A sync pass that couldn't finish: back to `done` with the reason, the sync still on, the last good
-/// sync time unchanged (so sends keep waiting). The scheduler tries again after a pause.
-async fn end_sync_failed(db: &sqlx::PgPool, id: Uuid, msg: &str) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE klaviyo_imports SET status = 'done', phase = NULL, cursor = NULL, error = $2, lease_owner = NULL, lease_until = NULL,
-            history_done_at = CASE WHEN history_started_at > COALESCE(history_done_at, '-infinity') THEN now() ELSE history_done_at END,
-            api_key_enc = CASE WHEN sync_enabled THEN api_key_enc ELSE NULL END, updated_at = now()
-         WHERE id = $1 AND status = 'syncing'",
-    )
-    .bind(id)
-    .bind(msg)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
 async fn finish(r: &mut Run<'_>) -> anyhow::Result<()> {
     let db = &r.state.db;
-    if r.syncing() {
-        let started = ts(r.st("sync_started")).unwrap_or_else(Utc::now);
-        // One statement: done, and the key goes if the sync was turned off while it ran.
-        sqlx::query(
-            "UPDATE klaviyo_imports SET status = 'done', phase = NULL, cursor = NULL, last_sync_at = $2, error = NULL, report_cached_at = NULL,
-                api_key_enc = CASE WHEN sync_enabled THEN api_key_enc ELSE NULL END, updated_at = now()
-             WHERE id = $1 AND status = 'syncing'",
-        )
-        .bind(r.imp.id)
-        .bind(started)
-        .execute(db)
-        .await?;
-        return Ok(());
-    }
+    // Done, and the key is deleted, in one statement.
     sqlx::query(
-        "UPDATE klaviyo_imports SET status = 'done', phase = NULL, cursor = NULL, finished_at = now(), last_sync_at = COALESCE(started_at, now()),
-            consent_synced_at = COALESCE(started_at, now()), report_cached_at = NULL,
-            api_key_enc = CASE WHEN sync_enabled THEN api_key_enc ELSE NULL END, updated_at = now()
+        "UPDATE klaviyo_imports SET status = 'done', phase = NULL, cursor = NULL, finished_at = now(), report_cached_at = NULL,
+            api_key_enc = NULL, lease_owner = NULL, lease_until = NULL, updated_at = now()
          WHERE id = $1 AND status = 'importing'",
     )
     .bind(r.imp.id)
@@ -1597,34 +1454,10 @@ async fn finish(r: &mut Run<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Begin a sync pass of an import that has finished (the key is still there because sync is on). The
-/// status change and its job are one transaction, so a crash can't leave a sync with nothing to run it.
-pub async fn start_sync(db: &sqlx::PgPool, import_id: Uuid) -> anyhow::Result<bool> {
-    let mut tx = db.begin().await?;
-    let started = sqlx::query(
-        "UPDATE klaviyo_imports SET status = 'syncing', phase = NULL, cursor = NULL,
-            step_state = jsonb_build_object('sync_started', $2::text),
-            progress = progress - 'sync_profiles' - 'sync_suppressions' - 'sync_list_suppressions' - 'sync_consent_events' - 'sync_list_members' - 'sync_list_sweep' - 'sync_events',
-            updated_at = now()
-         WHERE id = $1 AND status = 'done' AND sync_enabled AND api_key_enc IS NOT NULL",
-    )
-    .bind(import_id)
-    .bind(fmt_ts(Utc::now()))
-    .execute(&mut *tx)
-    .await?
-    .rows_affected()
-        > 0;
-    if started {
-        crate::jobs::enqueue(&mut *tx, JOB_RUN, json!({"import_id": import_id}), None).await?;
-    }
-    tx.commit().await?;
-    Ok(started)
-}
-
 /// Imports that should be running but have no job (a worker died between steps): queue them again.
 pub async fn restart_stalled(db: &sqlx::PgPool) -> anyhow::Result<()> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT i.id FROM klaviyo_imports i WHERE i.status IN ('importing', 'syncing') AND i.updated_at < now() - interval '20 minutes'
+        "SELECT i.id FROM klaviyo_imports i WHERE i.status = 'importing' AND i.updated_at < now() - interval '20 minutes'
            AND (i.lease_until IS NULL OR i.lease_until < now())
            AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = $1 AND j.payload->>'import_id' = i.id::text AND j.run_at <> 'infinity')
          LIMIT 100",

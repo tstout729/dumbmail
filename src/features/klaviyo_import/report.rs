@@ -479,7 +479,7 @@ pub async fn checklist(state: &AppState, imp: Option<&Import>, account_id: Uuid)
     let ticked = |k: &str| manual[k]["done"] == true;
     // From the report (cached: the status page polls), every email, SMS and list opt-out line must match.
     let suppressions = match imp {
-        Some(i) if (i.status == "done" || i.status == "syncing") && i.compared_at.is_some() => {
+        Some(i) if i.status == "done" && i.compared_at.is_some() => {
             let r = cached(state, i, Duration::minutes(10)).await?;
             r["lines"].as_array().into_iter().flatten().filter(|l| matches!(l["section"].as_str(), Some("Email" | "SMS" | "List opt-outs"))).all(|l| l["state"] == MATCH)
         }
