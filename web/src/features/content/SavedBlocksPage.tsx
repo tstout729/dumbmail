@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useBlocker, useNavigate, useParams } from "react-router";
 import { Bookmark, Plus, Trash2 } from "lucide-react";
 import type { EmailBlock } from "../../api/types";
+import { useSession } from "../../api";
 import { BlockList } from "../../components/email/BlockList";
 import { EmailPreview } from "../../components/email/EmailPreview";
 import { newBlock } from "../../components/email/blocks";
@@ -127,6 +128,7 @@ export function SavedBlockEditorPage() {
 type Draft = { name: string; blocks: EmailBlock[] };
 
 function Editor({ saved }: { saved: SavedBlockDetail }) {
+  const { account } = useSession();
   const update = useUpdateSavedBlock(saved.id);
   const remove = useDeleteSavedBlock();
   const navigate = useNavigate();
@@ -197,7 +199,7 @@ function Editor({ saved }: { saved: SavedBlockDetail }) {
         <div className="min-w-0">
           <BlockList blocks={current.blocks} savedBlocks={false} onChange={(blocks) => setDraft({ ...current, blocks })} />
         </div>
-        <EmailPreview content={{ subject: current.name, blocks: current.blocks }} className="min-h-[480px]" />
+        <EmailPreview content={{ subject: current.name, blocks: current.blocks }} fromName={account.name} className="min-h-[480px]" />
       </div>
       {confirmDelete ? (
         <ConfirmDialog

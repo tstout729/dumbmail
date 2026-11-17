@@ -13,8 +13,10 @@ use reqwest::Method;
 pub enum NetError {
     /// Not an http(s) address.
     Invalid,
-    /// Resolves to a private, local or reserved address (or doesn't resolve).
+    /// Resolves to a private, local or reserved address.
     NotPublic,
+    /// The domain doesn't exist.
+    NoSuchDomain,
     Timeout,
     /// Couldn't connect or the connection failed (a short class).
     Failed(&'static str),
@@ -25,6 +27,7 @@ impl NetError {
         match self {
             NetError::Invalid => "isn't a web address",
             NetError::NotPublic => "doesn't point to a public website",
+            NetError::NoSuchDomain => "points to a domain that doesn't exist",
             NetError::Timeout => "took too long to answer",
             NetError::Failed(c) => c,
         }
@@ -60,7 +63,7 @@ pub async fn request(method: Method, url: &str, max_bytes: usize, timeout: Durat
         return Err(NetError::Invalid);
     }
     let checked = tokio::time::timeout(timeout, crate::flows::check_webhook_url(url)).await.map_err(|_| NetError::Timeout)?;
-    let (host, addr) = checked.map_err(|_| NetError::NotPublic)?;
+    let (host, addr) = checked.map_err(|e| if e.public_message().contains("doesn't resolve") { NetError::NoSuchDomain } else { NetError::NotPublic })?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .resolve(&host, addr)

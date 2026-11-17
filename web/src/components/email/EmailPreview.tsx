@@ -4,10 +4,10 @@ import type { EmailContent } from "../../api";
 import { useEmailRender } from "../../api";
 import { useDebouncedValue } from "../../lib/hooks";
 import { PreviewAsPicker } from "../../features/catalog/PreviewAsPicker";
-import { Segmented, cx } from "../ui";
+import { IconButton, Modal, Segmented, cx } from "../ui";
 
 type Props = { content: EmailContent; fromName?: string; className?: string };
-type View = "desktop" | "mobile" | "dark" | "all" | "text";
+type View = "desktop" | "mobile" | "dark" | "text";
 
 /**
  * Dark mode as the Gmail and Outlook apps do it to emails without their own dark styles: colors
@@ -37,6 +37,7 @@ function Inbox({ from, subject, preheader, dark, children, className }: { from: 
 
 export function EmailPreview({ content, fromName, className }: Props) {
   const [view, setView] = useState<View>("desktop");
+  const [all, setAll] = useState(false);
   const [profileId, setProfileId] = useState<string | undefined>();
   const debounced = useDebouncedValue(content, 450);
   const render = useEmailRender(debounced, profileId);
@@ -46,7 +47,7 @@ export function EmailPreview({ content, fromName, className }: Props) {
   const subject = render.data?.subject || content.subject || "";
   const preheader = render.data?.preheader || content.preheader || "";
 
-  const body = (h: string, v: Exclude<View, "all" | "text">, height = "h-[640px]") => (
+  const body = (h: string, v: Exclude<View, "text">, height = "h-[640px]") => (
     <Inbox from={from} subject={subject} preheader={preheader} dark={v === "dark"}>
       <Frame html={v === "dark" ? darkened(h) : h} title={`Email preview (${v})`} className={height} />
     </Inbox>
@@ -67,10 +68,12 @@ export function EmailPreview({ content, fromName, className }: Props) {
             { value: "desktop", label: <><Monitor className="size-3.5" /> Desktop</> },
             { value: "mobile", label: <><Smartphone className="size-3.5" /> Phone</> },
             { value: "dark", label: <><Moon className="size-3.5" /> Dark</> },
-            { value: "all", label: <><Columns3 className="size-3.5" /> All</> },
             { value: "text", label: <><FileText className="size-3.5" /> Text</> },
           ]}
         />
+        <IconButton size="sm" label="Desktop, phone and dark side by side" disabled={!html} onClick={() => setAll(true)}>
+          <Columns3 className="size-3.5" />
+        </IconButton>
       </div>
       <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-zinc-200 bg-zinc-100 p-3">
         {render.error ? (
@@ -86,21 +89,6 @@ export function EmailPreview({ content, fromName, className }: Props) {
           <Inbox from={from} subject={subject} preheader={preheader} className="mx-auto max-w-[680px]">
             <pre className="whitespace-pre-wrap break-words px-4 py-4 font-mono text-xs leading-relaxed text-zinc-800">{render.data?.text}</pre>
           </Inbox>
-        ) : view === "all" ? (
-          <div className="flex gap-3 overflow-x-auto pb-1">
-            <div className="w-[600px] shrink-0">
-              <div className="pb-1 text-[11px] font-medium text-zinc-500">Desktop</div>
-              {body(html, "desktop")}
-            </div>
-            <div className="w-[375px] shrink-0">
-              <div className="pb-1 text-[11px] font-medium text-zinc-500">Phone</div>
-              {body(html, "mobile")}
-            </div>
-            <div className="w-[375px] shrink-0">
-              <div className="pb-1 text-[11px] font-medium text-zinc-500">Phone, dark mode</div>
-              {body(html, "dark")}
-            </div>
-          </div>
         ) : (
           <div className={cx("mx-auto transition-[width]", view === "desktop" ? "w-full max-w-[680px]" : "w-[375px] max-w-full")}>
             {body(html, view)}
@@ -108,6 +96,24 @@ export function EmailPreview({ content, fromName, className }: Props) {
           </div>
         )}
       </div>
+      {all && html ? (
+        <Modal title="Desktop, phone and dark mode" onClose={() => setAll(false)} size="full">
+          <div className="flex h-full gap-4 overflow-auto bg-zinc-100 p-4">
+            {(
+              [
+                ["Desktop", "desktop", "w-[640px]"],
+                ["Phone", "mobile", "w-[375px]"],
+                ["Phone, dark mode", "dark", "w-[375px]"],
+              ] as const
+            ).map(([label, v, w]) => (
+              <div key={v} className={cx("shrink-0", w)}>
+                <div className="pb-1 text-xs font-medium text-zinc-500">{label}</div>
+                {body(html, v, "h-[calc(100vh-12rem)] min-h-[480px]")}
+              </div>
+            ))}
+          </div>
+        </Modal>
+      ) : null}
     </div>
   );
 }

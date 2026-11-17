@@ -162,10 +162,8 @@ impl Canvas {
                     let i = (py as u32 * WIDTH + px as u32) as usize;
                     let cur = self.px[i];
                     let cur_level = if cur >= 16 { cur - 16 } else { cur };
-                    if level > cur_level || cur == 0 {
-                        if level > 0 {
-                            self.px[i] = base + level;
-                        }
+                    if level > 0 && level > cur_level {
+                        self.px[i] = base + level;
                     }
                 });
             }
@@ -179,9 +177,8 @@ fn palette(t: &Timer) -> Vec<u8> {
     let mut p = Vec::with_capacity(32 * 3);
     for target in [t.color, t.label_color] {
         for i in 0..16u32 {
-            for c in 0..3 {
-                let v = (t.background[c] as u32 * (15 - i) + target[c] as u32 * i) / 15;
-                p.push(v as u8);
+            for (bg, fg) in t.background.iter().zip(target) {
+                p.push(((*bg as u32 * (15 - i) + fg as u32 * i) / 15) as u8);
             }
         }
     }
@@ -248,13 +245,7 @@ pub fn draw(t: &Timer, now: i64) -> Vec<u8> {
                 let row = (y * WIDTH) as usize;
                 buf.extend_from_slice(&cur.px[row + x0 as usize..=row + x1 as usize]);
             }
-            let mut f = gif::Frame::default();
-            f.left = x0 as u16;
-            f.top = y0 as u16;
-            f.width = w as u16;
-            f.height = h as u16;
-            f.delay = 100;
-            f.buffer = std::borrow::Cow::Owned(buf);
+            let f = gif::Frame { left: x0 as u16, top: y0 as u16, width: w as u16, height: h as u16, delay: 100, buffer: std::borrow::Cow::Owned(buf), ..Default::default() };
             enc.write_frame(&f).expect("gif frame");
             prev = Some(cur);
         }

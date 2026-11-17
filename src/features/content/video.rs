@@ -43,7 +43,7 @@ pub fn parse(raw: &str) -> Option<Video> {
 }
 
 async fn get(url: &str, max: usize) -> AppResult<net::Response> {
-    let r = net::request(Method::GET, url, max + 1, Duration::from_secs(10)).await.map_err(|e| AppError::bad(format!("the thumbnail {}", e.describe())))?;
+    let r = net::request(Method::GET, url, max + 1, Duration::from_secs(10)).await.map_err(|e| AppError::bad(format!("that image address {}", e.describe())))?;
     if r.body.len() > max {
         return Err(AppError::bad("the thumbnail is bigger than 5 MB"));
     }

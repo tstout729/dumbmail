@@ -371,11 +371,11 @@ static GLOBAL: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBA
 static RUNNING: Lazy<Mutex<HashSet<Uuid>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 async fn probe(url: &str, image: bool) -> Probe {
-    let failed = |e: NetError| Probe { ok: if matches!(e, NetError::NotPublic | NetError::Invalid) { Some(false) } else { None }, status: None, note: e.describe().to_string(), bytes: None };
+    let failed = |e: NetError| Probe { ok: if matches!(e, NetError::NotPublic | NetError::Invalid | NetError::NoSuchDomain) { Some(false) } else { None }, status: None, note: e.describe().to_string(), bytes: None };
     let head = net::request(Method::HEAD, url, 0, PER_URL).await;
     let res = match head {
         Ok(r) if !matches!(r.status, 400 | 403 | 405 | 501) && (!image || r.content_length.is_some() || !(200..300).contains(&r.status)) => Ok(r),
-        Err(e @ (NetError::NotPublic | NetError::Invalid)) => Err(e),
+        Err(e @ (NetError::NotPublic | NetError::Invalid | NetError::NoSuchDomain)) => Err(e),
         // Some servers don't answer HEAD properly; ask again with GET.
         _ => net::request(Method::GET, url, if image { 2 * 1024 * 1024 + 1 } else { 16 * 1024 }, PER_URL).await,
     };
