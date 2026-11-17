@@ -681,7 +681,17 @@ export type UploadedImage = { id: string; url: string; content_type: string; siz
 
 // ---- Events and metrics ----
 
-export type MetricSummary = { id: string; name: string; count_30d: number; last_seen: string | null };
+export type MetricSummary = {
+  id: string;
+  name: string;
+  count_30d: number;
+  count_prev_30d: number;
+  last_seen: string | null;
+  /** Whether any event of this metric carries a value (e.g. an order total). */
+  has_value: boolean;
+  /** 30 daily counts, oldest first. */
+  trend: number[];
+};
 
 export type EventRow = {
   id: string;
@@ -690,6 +700,8 @@ export type EventRow = {
   properties: Record<string, unknown>;
   value: number | null;
   occurred_at: string;
+  /** Email, phone or name; only on the events list. */
+  profile_label?: string | null;
 };
 
 export type Measurement = "count" | "unique_profiles" | "sum_value";
@@ -708,29 +720,43 @@ export type MetricQueryResult = { series: { date: string; value: number; group?:
 
 // ---- Analytics ----
 
+export type OverviewTotals = {
+  revenue: number;
+  attributed_revenue: number;
+  campaign_revenue: number;
+  flow_revenue: number;
+  orders: number;
+  attributed_orders: number;
+  emails_sent: number;
+  sms_sent: number;
+  emails_delivered: number;
+  opens: number;
+  clicks: number;
+  email_clicks: number;
+  open_rate: number;
+  click_rate: number;
+  unsubscribe_rate: number;
+  bounce_rate: number;
+  complaint_rate: number;
+  new_profiles: number;
+};
+
 export type AnalyticsOverview = {
-  totals: {
+  days: number;
+  totals: OverviewTotals & { profiles: number };
+  /** The same totals for the `days` before this range. */
+  previous: OverviewTotals;
+  series: {
+    date: string;
     revenue: number;
     attributed_revenue: number;
     campaign_revenue: number;
     flow_revenue: number;
     emails_sent: number;
     sms_sent: number;
-    open_rate: number;
-    click_rate: number;
-    unsubscribe_rate: number;
-    bounce_rate: number;
-    profiles: number;
-    new_profiles: number;
-  };
-  series: {
-    date: string;
-    revenue: number;
-    attributed_revenue: number;
-    emails_sent: number;
-    sms_sent: number;
     opens: number;
     clicks: number;
+    new_profiles: number;
   }[];
   top_campaigns: {
     id: string;
@@ -739,9 +765,20 @@ export type AnalyticsOverview = {
     recipients: number;
     open_rate: number;
     click_rate: number;
+    orders: number;
     revenue: number;
   }[];
-  top_flows: { id: string; name: string; status: FlowStatus; recipients: number; revenue: number }[];
+  /** Flow numbers cover the selected range only. */
+  top_flows: {
+    id: string;
+    name: string;
+    status: FlowStatus;
+    recipients: number;
+    open_rate: number;
+    click_rate: number;
+    orders: number;
+    revenue: number;
+  }[];
 };
 
 // ---- Sending and domains ----

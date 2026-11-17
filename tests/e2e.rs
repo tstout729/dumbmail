@@ -266,6 +266,22 @@ async fn signup_import_segment_campaign_tracking_unsubscribe() {
     let ov = h.ok("GET", "/api/analytics/overview?days=30", None).await;
     assert_eq!(ov["totals"]["campaign_revenue"], 120.5);
     assert_eq!(ov["totals"]["emails_sent"], 1);
+    assert_eq!(ov["totals"]["attributed_orders"], 1);
+    assert_eq!(ov["totals"]["email_clicks"], 1);
+    assert_eq!(ov["top_campaigns"][0]["orders"], 1);
+    // Nothing happened in the 30 days before, so the comparison window is empty.
+    assert_eq!(ov["previous"]["emails_sent"], 0);
+    assert_eq!(ov["previous"]["attributed_revenue"], 0.0);
+    assert_eq!(ov["series"].as_array().unwrap().last().unwrap()["campaign_revenue"], 120.5);
+    let metrics = h.ok("GET", "/api/metrics", None).await;
+    let order = metrics["data"].as_array().unwrap().iter().find(|m| m["name"] == "Placed Order").unwrap().clone();
+    assert_eq!(order["has_value"], true);
+    assert_eq!(order["count_prev_30d"], 0);
+    let trend = order["trend"].as_array().unwrap();
+    assert_eq!(trend.len(), 30);
+    assert_eq!(trend[29], 1, "today's order lands in the last bucket");
+    let events = h.ok("GET", "/api/events?metric=Placed%20Order", None).await;
+    assert_eq!(events["data"][0]["profile_label"], "bob@x.test");
 
     // One-click unsubscribe (RFC 8058).
     let unsub = mail.unsubscribe_url.unwrap().replace("https://pl.test", "");

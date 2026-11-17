@@ -196,7 +196,7 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | --- | --- | --- | --- |
 | POST | `/api/events` | `{metric, profile: {email?, phone_number?, external_id?, id?, first_name?, ...}, properties?, value?, time?, unique_id?}` | `{id, profile_id}` |
 | GET | `/api/events` | `?metric=&profile_id=&limit=&offset=` | `{data: EventRow[], total}` |
-| GET | `/api/metrics` | – | `{data: MetricSummary[]}` |
+| GET | `/api/metrics` | – | `{data: {id, name, count_30d, count_prev_30d, last_seen, has_value, trend: number[30]}[]}` (`trend`: daily counts for the last 30 days, oldest first) |
 | POST | `/api/metrics/query` | `{metric, measurement: "count"\|"unique_profiles"\|"sum_value", interval: "day"\|"week"\|"month", start?, end?, group_by?: string}` | `{series: {date, value, group?}[], total}` |
 
 ## Messaging
@@ -237,7 +237,7 @@ Form `config` (content, fields, phone step, style, teaser, targeting and schedul
 
 | Method | Path | Query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/analytics/overview` | `?days=30` | `{totals: {revenue, attributed_revenue, campaign_revenue, flow_revenue, emails_sent, sms_sent, open_rate, click_rate, unsubscribe_rate, bounce_rate, profiles, new_profiles}, series: {date, revenue, attributed_revenue, emails_sent, sms_sent, opens, clicks}[], top_campaigns: {id, name, sent_at, recipients, open_rate, click_rate, revenue}[], top_flows: {id, name, status, recipients, revenue}[]}` |
+| GET | `/api/analytics/overview` | `?days=30` | `{days, totals: {revenue, attributed_revenue, campaign_revenue, flow_revenue, orders, attributed_orders, emails_sent, sms_sent, emails_delivered, opens, clicks, email_clicks, open_rate, click_rate, unsubscribe_rate, bounce_rate, complaint_rate, profiles, new_profiles}, previous: (the same totals for the `days` before, without `profiles`), series: {date, revenue, attributed_revenue, campaign_revenue, flow_revenue, emails_sent, sms_sent, opens, clicks, new_profiles}[], top_campaigns: {id, name, sent_at, recipients, open_rate, click_rate, orders, revenue}[], top_flows: {id, name, status, recipients, open_rate, click_rate, orders, revenue}[]}`. Flow numbers cover the range only. |
 
 Attribution: a conversion event (`Placed Order` by default) is credited to the newest email the person opened or clicked in the previous 5 days, or the newest SMS they clicked in the previous 24 hours.
 

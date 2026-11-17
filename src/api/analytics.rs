@@ -19,45 +19,70 @@ struct Days {
     days: Option<i64>,
 }
 
-/// Dashboard numbers for the last `days` days, bucketed by day in the account's time zone.
-pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResult<Value> {
-    let days = days.clamp(1, 365);
-    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
-    let since = format!("now() - interval '{days} days'");
+/// Window totals for `[now - from_days, now - to_days)`: sends, engagement, revenue and orders.
+async fn window_totals(state: &AppState, account_id: Uuid, from_days: i64, to_days: i64) -> AppResult<Value> {
+    let lo = format!("now() - interval '{from_days} days'");
+    let hi = format!("now() - interval '{to_days} days'");
 
-    let (sent_email, sent_sms, delivered, opens, clicks, unsubs, bounces): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
+    let (sent_email, sent_sms, delivered, opens, clicks, email_clicks, unsubs, bounces, complaints): (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
         "SELECT count(*) FILTER (WHERE channel = 'email' AND status NOT IN ('queued','sending','failed','skipped')),
                 count(*) FILTER (WHERE channel = 'sms' AND status NOT IN ('queued','sending','failed','skipped')),
                 count(*) FILTER (WHERE channel = 'email' AND status IN ('sent','delivered')),
                 count(opened_at) FILTER (WHERE channel = 'email'),
                 count(clicked_at),
+                count(clicked_at) FILTER (WHERE channel = 'email'),
                 count(unsubscribed_at),
-                count(*) FILTER (WHERE status = 'bounced')
-         FROM messages WHERE account_id = $1 AND NOT is_test AND created_at >= {since}"
+                count(*) FILTER (WHERE status = 'bounced'),
+                count(*) FILTER (WHERE status = 'complained')
+         FROM messages WHERE account_id = $1 AND NOT is_test AND created_at >= {lo} AND created_at < {hi}"
     ))
     .bind(account_id)
     .fetch_one(&state.db)
     .await?;
 
-    let (revenue, attributed, campaign_rev, flow_rev): (f64, f64, f64, f64) = sqlx::query_as(&format!(
+    let (revenue, attributed, campaign_rev, flow_rev, orders, attributed_orders): (f64, f64, f64, f64, i64, i64) = sqlx::query_as(&format!(
         "SELECT COALESCE(sum(value), 0)::float8,
                 COALESCE(sum(value) FILTER (WHERE campaign_id IS NOT NULL OR flow_id IS NOT NULL), 0)::float8,
                 COALESCE(sum(value) FILTER (WHERE campaign_id IS NOT NULL), 0)::float8,
-                COALESCE(sum(value) FILTER (WHERE flow_id IS NOT NULL), 0)::float8
-         FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {since}) x"
+                COALESCE(sum(value) FILTER (WHERE flow_id IS NOT NULL), 0)::float8,
+                count(*),
+                count(*) FILTER (WHERE campaign_id IS NOT NULL OR flow_id IS NOT NULL)
+         FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {lo} AND e.occurred_at < {hi}) x"
     ))
     .bind(account_id)
     .fetch_one(&state.db)
     .await?;
 
-    let (profiles, new_profiles): (i64, i64) = sqlx::query_as(&format!(
-        "SELECT count(*), count(*) FILTER (WHERE created_at >= {since}) FROM profiles WHERE account_id = $1"
-    ))
-    .bind(account_id)
-    .fetch_one(&state.db)
-    .await?;
+    let new_profiles: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM profiles WHERE account_id = $1 AND created_at >= {lo} AND created_at < {hi}"))
+        .bind(account_id)
+        .fetch_one(&state.db)
+        .await?;
 
-    let rows: Vec<(String, f64, f64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
+    let rate = |n: i64, d: i64| if d > 0 { n as f64 / d as f64 } else { 0.0 };
+    Ok(json!({
+        "revenue": revenue, "attributed_revenue": attributed, "campaign_revenue": campaign_rev, "flow_revenue": flow_rev,
+        "orders": orders, "attributed_orders": attributed_orders,
+        "emails_sent": sent_email, "sms_sent": sent_sms, "emails_delivered": delivered, "opens": opens, "clicks": clicks, "email_clicks": email_clicks,
+        "open_rate": rate(opens, delivered), "click_rate": rate(clicks, delivered + sent_sms),
+        "unsubscribe_rate": rate(unsubs, sent_email + sent_sms), "bounce_rate": rate(bounces, sent_email),
+        "complaint_rate": rate(complaints, sent_email),
+        "new_profiles": new_profiles,
+    }))
+}
+
+/// Dashboard numbers for the last `days` days, bucketed by day in the account's time zone, with the
+/// same totals for the `days` before that (`previous`) so the UI can show change.
+pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResult<Value> {
+    let days = days.clamp(1, 365);
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    let since = format!("now() - interval '{days} days'");
+
+    let mut totals = window_totals(state, account_id, days, 0).await?;
+    let previous = window_totals(state, account_id, days * 2, days).await?;
+    let profiles: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE account_id = $1").bind(account_id).fetch_one(&state.db).await?;
+    totals["profiles"] = json!(profiles);
+
+    let rows: Vec<(String, f64, f64, f64, f64, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
         "WITH d AS (
             SELECT to_char(g, 'YYYY-MM-DD') AS day FROM generate_series(
               date_trunc('day', ({since}) AT TIME ZONE $2), date_trunc('day', now() AT TIME ZONE $2), interval '1 day') g),
@@ -69,10 +94,13 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
          o AS (SELECT to_char(opened_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n FROM messages WHERE account_id = $1 AND NOT is_test AND opened_at >= {since} GROUP BY 1),
          c AS (SELECT to_char(clicked_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n FROM messages WHERE account_id = $1 AND NOT is_test AND clicked_at >= {since} GROUP BY 1),
          r AS (SELECT to_char(occurred_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, sum(value) AS rev,
-                      sum(value) FILTER (WHERE campaign_id IS NOT NULL OR flow_id IS NOT NULL) AS att
-               FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {since}) x GROUP BY 1)
-         SELECT d.day, COALESCE(r.rev, 0)::float8, COALESCE(r.att, 0)::float8, COALESCE(m.emails, 0), COALESCE(m.sms, 0), COALESCE(o.n, 0), COALESCE(c.n, 0)
-         FROM d LEFT JOIN m USING (day) LEFT JOIN o USING (day) LEFT JOIN c USING (day) LEFT JOIN r USING (day) ORDER BY d.day"
+                      sum(value) FILTER (WHERE campaign_id IS NOT NULL OR flow_id IS NOT NULL) AS att,
+                      sum(value) FILTER (WHERE campaign_id IS NOT NULL) AS camp, sum(value) FILTER (WHERE flow_id IS NOT NULL) AS flow
+               FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {since}) x GROUP BY 1),
+         p AS (SELECT to_char(created_at AT TIME ZONE $2, 'YYYY-MM-DD') AS day, count(*) AS n FROM profiles WHERE account_id = $1 AND created_at >= {since} GROUP BY 1)
+         SELECT d.day, COALESCE(r.rev, 0)::float8, COALESCE(r.att, 0)::float8, COALESCE(r.camp, 0)::float8, COALESCE(r.flow, 0)::float8,
+                COALESCE(m.emails, 0), COALESCE(m.sms, 0), COALESCE(o.n, 0), COALESCE(c.n, 0), COALESCE(p.n, 0)
+         FROM d LEFT JOIN m USING (day) LEFT JOIN o USING (day) LEFT JOIN c USING (day) LEFT JOIN r USING (day) LEFT JOIN p USING (day) ORDER BY d.day"
     ))
     .bind(account_id)
     .bind(&tz)
@@ -80,7 +108,10 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
     .await?;
     let series: Vec<Value> = rows
         .into_iter()
-        .map(|(date, rev, att, e, s, o, c)| json!({"date": date, "revenue": rev, "attributed_revenue": att, "emails_sent": e, "sms_sent": s, "opens": o, "clicks": c}))
+        .map(|(date, rev, att, camp, flow, e, s, o, c, p)| {
+            json!({"date": date, "revenue": rev, "attributed_revenue": att, "campaign_revenue": camp, "flow_revenue": flow,
+                   "emails_sent": e, "sms_sent": s, "opens": o, "clicks": c, "new_profiles": p})
+        })
         .collect();
 
     let top_campaigns: Vec<(Uuid, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(&format!(
@@ -92,31 +123,43 @@ pub async fn overview(state: &AppState, account_id: Uuid, days: i64) -> AppResul
     let mut tc = Vec::new();
     for (id, name, sent_at) in top_campaigns {
         let s = crate::campaigns::stats(&state.db, account_id, id).await?;
-        tc.push(json!({"id": id, "name": name, "sent_at": sent_at, "recipients": s.recipients, "open_rate": s.open_rate, "click_rate": s.click_rate, "revenue": s.revenue}));
+        tc.push(json!({"id": id, "name": name, "sent_at": sent_at, "recipients": s.recipients, "open_rate": s.open_rate, "click_rate": s.click_rate, "orders": s.orders, "revenue": s.revenue}));
     }
     tc.sort_by(|a, b| b["revenue"].as_f64().partial_cmp(&a["revenue"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
 
-    let flows: Vec<(Uuid, String, String)> = sqlx::query_as("SELECT id, name, status FROM flows WHERE account_id = $1 AND status <> 'draft' ORDER BY updated_at DESC LIMIT 20")
-        .bind(account_id)
-        .fetch_all(&state.db)
-        .await?;
+    // Flow numbers cover this window only, so they add up to the flow revenue in `totals`.
+    let flows: Vec<(Uuid, String, String, i64, i64, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT f.id, f.name, f.status,
+                count(m.id) FILTER (WHERE m.status NOT IN ('queued','sending','failed','skipped')),
+                count(m.id) FILTER (WHERE m.status IN ('sent','delivered') OR m.opened_at IS NOT NULL),
+                count(m.opened_at) FILTER (WHERE m.channel = 'email'),
+                count(m.clicked_at)
+         FROM flows f LEFT JOIN messages m ON m.flow_id = f.id AND NOT m.is_test AND m.created_at >= {since}
+         WHERE f.account_id = $1 AND f.status <> 'draft'
+         GROUP BY f.id ORDER BY max(f.updated_at) DESC LIMIT 20"
+    ))
+    .bind(account_id)
+    .fetch_all(&state.db)
+    .await?;
+    let flow_rev: Vec<(Uuid, i64, f64)> = sqlx::query_as(&format!(
+        "SELECT flow_id, count(*), COALESCE(sum(value), 0)::float8 FROM ({ATTRIBUTION_SQL} AND e.occurred_at >= {since}) x WHERE flow_id IS NOT NULL GROUP BY 1"
+    ))
+    .bind(account_id)
+    .fetch_all(&state.db)
+    .await?;
+    let rate = |n: i64, d: i64| if d > 0 { n as f64 / d as f64 } else { 0.0 };
     let mut tf = Vec::new();
-    for (id, name, status) in flows {
-        let (s, _, _) = crate::flows::stats(&state.db, account_id, id).await?;
-        tf.push(json!({"id": id, "name": name, "status": status, "recipients": s.recipients, "revenue": s.revenue, "open_rate": s.open_rate, "click_rate": s.click_rate}));
+    for (id, name, status, recipients, delivered, opens, clicks) in flows {
+        let (orders, revenue) = flow_rev.iter().find(|r| r.0 == id).map(|r| (r.1, r.2)).unwrap_or((0, 0.0));
+        tf.push(json!({"id": id, "name": name, "status": status, "recipients": recipients, "orders": orders, "revenue": revenue,
+                       "open_rate": rate(opens, delivered), "click_rate": rate(clicks, delivered)}));
     }
     tf.sort_by(|a, b| b["revenue"].as_f64().partial_cmp(&a["revenue"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
 
-    let rate = |n: i64, d: i64| if d > 0 { n as f64 / d as f64 } else { 0.0 };
     Ok(json!({
         "days": days,
-        "totals": {
-            "revenue": revenue, "attributed_revenue": attributed, "campaign_revenue": campaign_rev, "flow_revenue": flow_rev,
-            "emails_sent": sent_email, "sms_sent": sent_sms,
-            "open_rate": rate(opens, delivered), "click_rate": rate(clicks, delivered + sent_sms),
-            "unsubscribe_rate": rate(unsubs, sent_email + sent_sms), "bounce_rate": rate(bounces, sent_email),
-            "profiles": profiles, "new_profiles": new_profiles,
-        },
+        "totals": totals,
+        "previous": previous,
         "series": series,
         "top_campaigns": tc,
         "top_flows": tf,

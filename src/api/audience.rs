@@ -564,7 +564,9 @@ pub async fn events(state: &AppState, account_id: Uuid, q: &EventsQuery) -> AppR
     .fetch_one(&state.db)
     .await?;
     let rows: Vec<EventRow> = sqlx::query_as(
-        "SELECT e.id, m.name AS metric, e.profile_id, e.properties, e.value, e.occurred_at FROM events e JOIN metrics m ON m.id = e.metric_id
+        "SELECT e.id, m.name AS metric, e.profile_id, e.properties, e.value, e.occurred_at,
+                COALESCE(p.email, p.phone_number, NULLIF(concat_ws(' ', p.first_name, p.last_name), '')) AS profile_label
+         FROM events e JOIN metrics m ON m.id = e.metric_id LEFT JOIN profiles p ON p.id = e.profile_id
          WHERE e.account_id = $1 AND ($2::text IS NULL OR m.name = $2) AND ($3::uuid IS NULL OR e.profile_id = $3)
          ORDER BY e.occurred_at DESC LIMIT $4 OFFSET $5",
     )
@@ -584,16 +586,36 @@ async fn events_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Event
 }
 
 pub async fn metrics(state: &AppState, account_id: Uuid) -> AppResult<Value> {
-    let rows: Vec<(Uuid, String, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT m.id, m.name,
-            (SELECT count(*) FROM events e WHERE e.metric_id = m.id AND e.occurred_at > now() - interval '30 days'),
-            (SELECT max(occurred_at) FROM events e WHERE e.metric_id = m.id)
-         FROM metrics m WHERE m.account_id = $1 ORDER BY m.name",
+    // `trend` is 30 daily counts, oldest first, in rolling 24-hour buckets ending now (for sparklines).
+    // Only the last 60 days are scanned (index on account, metric, time); `has_value` looks at those too.
+    let rows: Vec<(Uuid, String, i64, i64, Option<DateTime<Utc>>, bool, Vec<i64>)> = sqlx::query_as(
+        "SELECT m.id, m.name, s.c30, s.cprev,
+                (SELECT max(e.occurred_at) FROM events e WHERE e.account_id = m.account_id AND e.metric_id = m.id),
+                s.has_value, t.trend
+         FROM metrics m
+         CROSS JOIN LATERAL (
+            SELECT count(*) FILTER (WHERE e.occurred_at > now() - interval '30 days') AS c30,
+                   count(*) FILTER (WHERE e.occurred_at <= now() - interval '30 days') AS cprev,
+                   COALESCE(bool_or(e.value IS NOT NULL), false) AS has_value
+            FROM events e WHERE e.account_id = m.account_id AND e.metric_id = m.id AND e.occurred_at > now() - interval '60 days') s
+         CROSS JOIN LATERAL (
+            SELECT array_agg(COALESCE(x.n, 0) ORDER BY d.i) AS trend
+            FROM generate_series(0, 29) d(i)
+            LEFT JOIN (
+                SELECT 29 - floor(extract(epoch FROM now() - e.occurred_at) / 86400)::int AS i, count(*) AS n
+                FROM events e WHERE e.account_id = m.account_id AND e.metric_id = m.id AND e.occurred_at > now() - interval '30 days'
+                GROUP BY 1) x ON x.i = d.i) t
+         WHERE m.account_id = $1 ORDER BY m.name",
     )
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
-    let data: Vec<Value> = rows.into_iter().map(|(id, name, c, last)| json!({"id": id, "name": name, "count_30d": c, "last_seen": last})).collect();
+    let data: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, name, c, prev, last, has_value, trend)| {
+            json!({"id": id, "name": name, "count_30d": c, "count_prev_30d": prev, "last_seen": last, "has_value": has_value, "trend": trend})
+        })
+        .collect();
     Ok(json!({"data": data}))
 }
 
