@@ -30,6 +30,8 @@ pnpm -C web typecheck && pnpm -C web lint && pnpm -C web build
 
 Run clippy and the web checks before you push. Leave the full test run to CI.
 
+The deploy image is built from only the paths the `Dockerfile` copies (`src`, `migrations`, `docs`, the built dashboard). If the server embeds a file from any other folder (`include_str!`, `include_bytes!`, rust-embed), add a `COPY` for that folder to the `Dockerfile` in the same PR. CI runs `scripts/check-docker-context.sh` to catch a miss; a missed folder took a deploy down on 2026-11-17.
+
 ## Release
 
 - Every change goes through a pull request into `main`, with auto-merge on.
