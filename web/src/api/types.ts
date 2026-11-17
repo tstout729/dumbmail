@@ -615,7 +615,8 @@ export type AutoRecharge = { enabled: boolean; threshold: number; amount: number
 
 export type LedgerEntry = { id: string; kind: string; description: string; amount: number; created_at: string };
 
-export type PlanStatus = "none" | "active" | "cancelling" | "renewal_failed";
+/** "renewing": the month ended and the renewal charge hasn't settled yet. */
+export type PlanStatus = "none" | "active" | "cancelling" | "renewing" | "renewal_failed";
 
 /** The monthly email plan. Fields past `status` are present whenever there is a plan (status ≠ "none"). */
 export type EmailPlan =

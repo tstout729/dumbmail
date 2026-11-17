@@ -173,11 +173,18 @@ function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
   const badge =
     plan.status === "renewal_failed" ? (
       <Badge tone="amber">Payment failed</Badge>
+    ) : plan.status === "renewing" ? (
+      <Badge tone="blue">Renewing</Badge>
     ) : plan.status === "cancelling" ? (
       <Badge tone="gray">Ends {end}</Badge>
     ) : (
       <Badge tone="green">Active</Badge>
     );
+  const cancelButton = (
+    <Button variant="ghost" onClick={() => setConfirmCancel(true)}>
+      Cancel plan
+    </Button>
+  );
   return (
     <Card title="Monthly email plan" actions={badge}>
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
@@ -187,16 +194,24 @@ function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
         <div className="text-sm tabular-nums text-zinc-700">{formatCurrency(plan.price)}/month</div>
       </div>
       {plan.status === "renewal_failed" ? (
-        <div className="mt-3">
+        <div className="mt-3 space-y-3">
           <Notice tone="amber" icon={<AlertTriangle />} title="We couldn't charge your card for this month">
             We'll try again tomorrow (try {plan.renewal_attempts} of {plan.max_renewal_attempts}). Until then, emails past your free allowance use prepaid
             credit. Paying with another card starts a new month right away.
-            <div className="mt-2">
-              <Button size="sm" variant="primary" loading={busy} onClick={() => change(plan.tier, "Plan saved")}>
-                Pay {formatCurrency(plan.price)} with another card
-              </Button>
-            </div>
           </Notice>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="primary" loading={busy} onClick={() => change(plan.tier, "Plan saved")}>
+              Pay {formatCurrency(plan.price)} with another card
+            </Button>
+            {cancelButton}
+          </div>
+        </div>
+      ) : plan.status === "renewing" ? (
+        <div className="mt-3 space-y-3">
+          <p className="text-sm text-zinc-700">
+            Your month ended on {end}. We're charging your card {formatCurrency(plan.price)} for the next one; this usually takes a minute.
+          </p>
+          <div className="flex flex-wrap gap-2">{cancelButton}</div>
         </div>
       ) : (
         <>
@@ -240,9 +255,7 @@ function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
                 <Button onClick={() => setChanging((v) => !v)} aria-expanded={changing}>
                   Change plan
                 </Button>
-                <Button variant="ghost" onClick={() => setConfirmCancel(true)}>
-                  Cancel plan
-                </Button>
+                {cancelButton}
               </>
             )}
           </div>
@@ -270,7 +283,11 @@ function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
       {confirmCancel ? (
         <ConfirmDialog
           title="Cancel your email plan?"
-          body={`It stays active until ${end} and won't renew. After that, emails past your free allowance use prepaid credit.`}
+          body={
+            plan.status === "active"
+              ? `It stays active until ${end} and won't renew. After that, emails past your free allowance use prepaid credit.`
+              : "It ends now and won't be charged again. Emails past your free allowance use prepaid credit."
+          }
           confirmLabel="Cancel plan"
           danger
           loading={cancel.isPending}
@@ -278,7 +295,7 @@ function CurrentPlan({ b, plan }: { b: Billing; plan: ActivePlan }) {
             cancel.mutate(undefined, {
               onSuccess: () => {
                 setConfirmCancel(false);
-                toast.success(`Plan cancelled. It stays active until ${end}.`);
+                toast.success(plan.status === "active" ? `Plan cancelled. It stays active until ${end}.` : "Plan cancelled.");
               },
             })
           }

@@ -1624,16 +1624,33 @@ async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
     h.cleanup().await;
 }
 
-/// A stand-in for the few Stripe endpoints billing uses. Records what was asked of it.
+/// A stand-in for the few Stripe endpoints billing uses. Like Stripe, it replays the first answer
+/// for an idempotency key and lists a customer's PaymentIntents with their metadata.
 #[derive(Default)]
 struct MockStripe {
     sessions: Vec<std::collections::HashMap<String, String>>,
-    intents: Vec<(Option<String>, std::collections::HashMap<String, String>)>,
-    /// "ok" (default), "decline" (402 card_declined) or "error" (500).
+    /// PaymentIntents created: (idempotency key, request form, id, status).
+    intents: Vec<MockIntent>,
+    /// First answer per idempotency key.
+    replies: std::collections::HashMap<String, (u16, Value)>,
+    /// POST /payment_intents behavior: "ok" (default); "decline" (402, PaymentIntent left failed);
+    /// "error" (500, nothing created); "lost" (charged, but the answer is a 500); "conflict" (409).
     mode: String,
+    /// Calls to POST /payment_intents, including ones that created nothing.
+    posts: usize,
 }
 
 type Mock = std::sync::Arc<std::sync::Mutex<MockStripe>>;
+type MockIntent = (Option<String>, std::collections::HashMap<String, String>, String, String);
+
+fn intent_json(form: &std::collections::HashMap<String, String>, id: &str, status: &str) -> Value {
+    let metadata: serde_json::Map<String, Value> = form
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix("metadata[").and_then(|k| k.strip_suffix(']')).map(|k| (k.to_string(), json!(v))))
+        .collect();
+    json!({"id": id, "status": status, "amount": form.get("amount").and_then(|a| a.parse::<i64>().ok()), "customer": form.get("customer"),
+           "metadata": metadata, "last_payment_error": if status == "succeeded" { Value::Null } else { json!({"message": "Your card was declined."}) }})
+}
 
 async fn mock_stripe() -> (Mock, String) {
     use axum::extract::{Form, Path, State};
@@ -1663,16 +1680,38 @@ async fn mock_stripe() -> (Mock, String) {
         .route("/payment_intents/{id}/cancel", post(|Path(id): Path<String>| async move { axum::Json(json!({"id": id, "status": "canceled"})) }))
         .route(
             "/payment_intents",
-            post(|State(m): State<Mock>, headers: axum::http::HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
+            get(|State(m): State<Mock>| async move {
+                let m = m.lock().unwrap();
+                axum::Json(json!({"object": "list", "data": m.intents.iter().rev().map(|(_, f, id, st)| intent_json(f, id, st)).collect::<Vec<_>>()}))
+            })
+            .post(|State(m): State<Mock>, headers: axum::http::HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
                 let mut m = m.lock().unwrap();
+                m.posts += 1;
                 let key = headers.get("idempotency-key").and_then(|v| v.to_str().ok()).map(String::from);
-                m.intents.push((key, f));
-                let n = m.intents.len();
-                match m.mode.as_str() {
-                    "decline" => (StatusCode::PAYMENT_REQUIRED, axum::Json(json!({"error": {"code": "card_declined", "message": "Your card was declined."}}))),
-                    "error" => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": {"message": "Stripe is having a bad day"}}))),
-                    _ => (StatusCode::OK, axum::Json(json!({"id": format!("pi_mock_{n}"), "status": "succeeded"}))),
+                if let Some((code, body)) = key.as_ref().and_then(|k| m.replies.get(k)).cloned() {
+                    return (StatusCode::from_u16(code).unwrap(), axum::Json(body));
                 }
+                let id = format!("pi_mock_{}", m.intents.len() + 1);
+                let (code, body) = match m.mode.as_str() {
+                    "conflict" => return (StatusCode::CONFLICT, axum::Json(json!({"error": {"type": "idempotency_error", "message": "request in progress"}}))),
+                    "error" => (500, json!({"error": {"type": "api_error", "message": "Stripe is having a bad day"}})),
+                    "decline" => {
+                        m.intents.push((key.clone(), f.clone(), id.clone(), "requires_payment_method".into()));
+                        (402, json!({"error": {"type": "card_error", "code": "card_declined", "message": "Your card was declined.", "payment_intent": intent_json(&f, &id, "requires_payment_method")}}))
+                    }
+                    "lost" => {
+                        m.intents.push((key.clone(), f.clone(), id.clone(), "succeeded".into()));
+                        (500, json!({"error": {"type": "api_error", "message": "connection reset"}}))
+                    }
+                    _ => {
+                        m.intents.push((key.clone(), f.clone(), id.clone(), "succeeded".into()));
+                        (200, intent_json(&f, &id, "succeeded"))
+                    }
+                };
+                if let Some(k) = key {
+                    m.replies.insert(k, (code, body.clone()));
+                }
+                (StatusCode::from_u16(code).unwrap(), axum::Json(body))
             }),
         )
         .with_state(mock.clone());
@@ -1805,21 +1844,73 @@ async fn monthly_email_plans() {
         assert!(m.intents[0].0.as_deref().unwrap().starts_with("plan-renewal-"));
     }
     assert_eq!(b["plan_payments"].as_array().unwrap().len(), 3);
+    let charges = |m: &Mock| m.lock().unwrap().intents.len();
+    // Let pending attempts be picked up again (the scheduler waits two minutes between checks).
+    let age = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move {
+            sqlx::query("UPDATE plan_renewals SET claimed_at = now() - interval '5 minutes' WHERE status = 'pending'").execute(&db).await.unwrap();
+        }
+    };
 
-    // Stripe unreachable: no attempt is counted, and the retry reuses the idempotency key.
-    mock.lock().unwrap().mode = "error".into();
+    // The charge goes through but the answer is lost: nothing is counted, and the next check finds the
+    // payment at Stripe instead of charging again.
+    mock.lock().unwrap().mode = "lost".into();
     past_due(&h).await;
     renew(&h).await;
     let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "renewing");
     assert_eq!(b["plan"]["renewal_attempts"], 0);
+    renew(&h).await; // too soon to look again
+    assert_eq!(charges(&mock), 2);
     mock.lock().unwrap().mode = "ok".into();
+    age(&h).await;
     renew(&h).await;
-    {
-        let m = mock.lock().unwrap();
-        assert_eq!(m.intents.len(), 3);
-        assert_eq!(m.intents[1].0, m.intents[2].0, "same key, so an unknown outcome can't charge twice");
+    assert_eq!(charges(&mock), 2, "found the lost payment; no second charge");
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "active", "{}", b["plan"]);
+    assert_eq!(b["plan_payments"].as_array().unwrap().len(), 4);
+
+    // Stripe busy (409) or down (500, which it replays for the same key): no attempt is counted.
+    for mode in ["conflict", "error"] {
+        mock.lock().unwrap().mode = mode.into();
+        past_due(&h).await;
+        renew(&h).await;
+        age(&h).await;
+        renew(&h).await;
+        let b = h.ok("GET", "/api/billing", None).await;
+        assert_eq!((b["plan"]["status"].as_str(), b["plan"]["renewal_attempts"].as_i64()), (Some("renewing"), Some(0)), "{mode}");
+        mock.lock().unwrap().mode = "ok".into();
+        // An attempt sent more than 10 minutes ago with nothing at Stripe gets a fresh key.
+        sqlx::query("UPDATE plan_renewals SET created_at = now() - interval '11 minutes' WHERE status = 'pending'").execute(&h.state.db).await.unwrap();
+        age(&h).await;
+        renew(&h).await;
+        assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "active", "{mode}");
     }
-    assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "active");
+    assert_eq!(charges(&mock), 4);
+
+    // Stripe's webhook can settle an attempt before the scheduler does.
+    mock.lock().unwrap().mode = "lost".into();
+    past_due(&h).await;
+    renew(&h).await;
+    let (pi, renewal) = {
+        let m = mock.lock().unwrap();
+        let (_, f, id, _) = m.intents.last().unwrap();
+        (id.clone(), f["metadata[renewal_id]"].clone())
+    };
+    let ev = json!({"type": "payment_intent.succeeded", "data": {"object": {"id": pi, "status": "succeeded",
+        "metadata": {"kind": "plan_renewal", "renewal_id": renewal, "account_id": acct}}}}).to_string();
+    for _ in 0..2 {
+        let (s, _, body) = h.raw("POST", "/webhooks/stripe", &[("stripe-signature", &stripe_sig(&ev)), ("content-type", "application/json")], &ev).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+    }
+    mock.lock().unwrap().mode = "ok".into();
+    age(&h).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!(b["plan"]["status"], "active");
+    assert_eq!(b["plan_payments"].as_array().unwrap().len(), 7, "the webhook and the scheduler record it once");
+    assert_eq!(charges(&mock), 5);
 
     // Declined three times (a day apart): plan emails stop at once, the plan ends after the third.
     mock.lock().unwrap().mode = "decline".into();
@@ -1843,7 +1934,7 @@ async fn monthly_email_plans() {
             assert_eq!(b["plan"]["ended_reason"], "renewal_failed");
         }
     }
-    let keys: std::collections::HashSet<_> = mock.lock().unwrap().intents[3..].iter().map(|(k, _)| k.clone()).collect();
+    let keys: std::collections::HashSet<_> = mock.lock().unwrap().intents[5..].iter().map(|(k, ..)| k.clone()).collect();
     assert_eq!(keys.len(), 3, "each declined attempt is a new charge attempt");
 
     // A late upgrade payment for a plan that has ended becomes credit instead of vanishing.
@@ -1853,19 +1944,56 @@ async fn monthly_email_plans() {
     assert_eq!(b["plan"]["status"], "none");
     assert!(b["plan_payments"][0]["description"].as_str().unwrap().contains("added as credit"));
 
+    // An old attempt that settles after the customer bought a new plan can't touch the new one:
+    // a decline is ignored, and a payment becomes credit.
+    mock.lock().unwrap().mode = "ok".into();
+    plan_paid(&h, &acct, "cs_new1", 0, 1, 1000).await;
+    for (mode, outcome) in [("decline", 0.0), ("ok", 20.0)] {
+        mock.lock().unwrap().mode = "error".into();
+        past_due(&h).await;
+        renew(&h).await; // in flight, outcome unknown
+        let session = format!("cs_after_{mode}");
+        plan_paid(&h, &acct, &session, 0, 2, 2000).await; // the customer pays for a fresh plan meanwhile
+        let before = h.ok("GET", "/api/billing", None).await;
+        assert_eq!(before["plan"]["status"], "active");
+        mock.lock().unwrap().mode = mode.into();
+        sqlx::query("UPDATE plan_renewals SET created_at = now() - interval '11 minutes' WHERE status = 'pending'").execute(&h.state.db).await.unwrap();
+        age(&h).await;
+        renew(&h).await;
+        let after = h.ok("GET", "/api/billing", None).await;
+        assert_eq!(after["plan"]["status"], "active", "{mode}: {}", after["plan"]);
+        assert_eq!(after["plan"]["period_end"], before["plan"]["period_end"], "{mode}");
+        assert_eq!(after["plan"]["renewal_attempts"], 0, "{mode}");
+        assert_eq!(after["balance"].as_f64().unwrap() - before["balance"].as_f64().unwrap(), outcome, "{mode}");
+    }
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM plan_renewals WHERE status = 'pending'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pending, 0);
+
     // Cancel at the end of the month: no charge, the plan just ends. Keeping it undoes that.
     mock.lock().unwrap().mode = "ok".into();
-    plan_paid(&h, &acct, "cs_again", 0, 1, 1000).await;
     assert_eq!(h.ok("POST", "/api/billing/plan/cancel", None).await["plan"]["status"], "cancelling");
     assert_eq!(h.ok("POST", "/api/billing/plan/resume", None).await["plan"]["status"], "active");
     h.ok("POST", "/api/billing/plan/cancel", None).await;
-    let charges_before = mock.lock().unwrap().intents.len();
+    let charges_before = charges(&mock);
     past_due(&h).await;
     renew(&h).await;
     let b = h.ok("GET", "/api/billing", None).await;
     assert_eq!(b["plan"]["status"], "none");
     assert_eq!(b["plan"]["ended_reason"], "cancelled");
-    assert_eq!(mock.lock().unwrap().intents.len(), charges_before);
+    assert_eq!(charges(&mock), charges_before);
+
+    // Cancelling while a declined renewal waits for its retry ends the plan without another charge.
+    plan_paid(&h, &acct, "cs_again", 0, 1, 1000).await;
+    mock.lock().unwrap().mode = "decline".into();
+    past_due(&h).await;
+    renew(&h).await;
+    assert_eq!(h.ok("GET", "/api/billing", None).await["plan"]["status"], "renewal_failed");
+    let posts = mock.lock().unwrap().posts;
+    h.ok("POST", "/api/billing/plan/cancel", None).await;
+    renew(&h).await;
+    let b = h.ok("GET", "/api/billing", None).await;
+    assert_eq!((b["plan"]["status"].as_str(), b["plan"]["ended_reason"].as_str()), (Some("none"), Some("cancelled")));
+    assert_eq!(mock.lock().unwrap().posts, posts);
 
     // Paid by bank debit: the plan starts, but that account isn't kept for automatic charges.
     plan_paid(&h, &acct, "cs_bank", 0, 1, 1000).await;

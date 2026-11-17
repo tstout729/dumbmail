@@ -271,19 +271,11 @@ fn stripe_key(state: &AppState) -> AppResult<&str> {
     state.cfg.stripe_secret_key.as_deref().ok_or_else(|| AppError::bad("card payments aren't configured on this server"))
 }
 
+/// POST to Stripe. 4xx answers come back as `BadRequest`, network and 5xx failures as `Internal`.
+/// For charges that must happen exactly once, use `stripe_charge`.
 pub(crate) async fn stripe_post(state: &AppState, path: &str, form: &[(String, String)]) -> AppResult<Value> {
-    stripe_post_idem(state, path, form, None).await
-}
-
-/// POST to Stripe. 4xx answers (a declined card, a bad request) come back as `BadRequest`;
-/// network and 5xx failures as `Internal`, so callers can tell a definite "no" from "unknown".
-/// With an idempotency key, retrying an unknown outcome can't charge twice.
-pub(crate) async fn stripe_post_idem(state: &AppState, path: &str, form: &[(String, String)], idempotency_key: Option<&str>) -> AppResult<Value> {
     let key = stripe_key(state)?;
-    let mut req = state.http.post(format!("{}/{path}", state.cfg.stripe_api_base)).basic_auth(key, Some("")).form(form);
-    if let Some(k) = idempotency_key {
-        req = req.header("Idempotency-Key", k);
-    }
+    let req = state.http.post(format!("{}/{path}", state.cfg.stripe_api_base)).basic_auth(key, Some("")).form(form);
     let res = req.send().await.map_err(|e| AppError::Internal(e.into()))?;
     let status = res.status();
     let v: Value = res.json().await.map_err(|e| AppError::Internal(e.into()))?;
@@ -292,6 +284,44 @@ pub(crate) async fn stripe_post_idem(state: &AppState, path: &str, form: &[(Stri
         return Err(if status.is_client_error() { AppError::BadRequest(msg) } else { AppError::Internal(anyhow::anyhow!(msg)) });
     }
     Ok(v)
+}
+
+/// What a Stripe call that moves money came back with.
+pub(crate) enum StripeOutcome {
+    Ok(Value),
+    /// A definite "no" (a declined card, an invalid request). Stripe's error body is included.
+    Refused(Value),
+    /// Unknown: network trouble, a 5xx, a 409 (the same idempotent request is still running) or a
+    /// 429 (rate limited). The money may or may not have moved.
+    Unknown(String),
+}
+
+/// POST with an idempotency key, sorting the answer into ok / refused / unknown.
+pub(crate) async fn stripe_charge(state: &AppState, path: &str, form: &[(String, String)], idempotency_key: &str) -> AppResult<StripeOutcome> {
+    let key = stripe_key(state)?;
+    let res = match state
+        .http
+        .post(format!("{}/{path}", state.cfg.stripe_api_base))
+        .basic_auth(key, Some(""))
+        .header("Idempotency-Key", idempotency_key)
+        .form(form)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(StripeOutcome::Unknown(e.to_string())),
+    };
+    let status = res.status();
+    let body: Value = match res.json().await {
+        Ok(v) => v,
+        Err(e) => return Ok(StripeOutcome::Unknown(format!("HTTP {status}: unreadable body: {e}"))),
+    };
+    Ok(match status.as_u16() {
+        200..=299 => StripeOutcome::Ok(body),
+        409 | 429 => StripeOutcome::Unknown(format!("HTTP {status}: {}", body["error"]["message"].as_str().unwrap_or(""))),
+        400..=499 => StripeOutcome::Refused(body),
+        _ => StripeOutcome::Unknown(format!("HTTP {status}: {}", body["error"]["message"].as_str().unwrap_or(""))),
+    })
 }
 
 pub(crate) async fn stripe_get(state: &AppState, path: &str) -> AppResult<Value> {
@@ -428,6 +458,12 @@ pub async fn handle_stripe_event(state: &AppState, ev: &Value) -> AppResult<()> 
                 _ => return Ok(()),
             }
             save_payment_method(state, account_id, obj).await?;
+        }
+        // Normally the scheduler records a renewal itself; this covers a response it never got.
+        "payment_intent.succeeded" if obj["metadata"]["kind"] == "plan_renewal" => {
+            if let (Some(renewal), Some(pi)) = (obj["metadata"]["renewal_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()), obj["id"].as_str()) {
+                crate::subscription::renewal_succeeded(&state.db, renewal, pi).await?;
+            }
         }
         "payment_intent.succeeded" if obj["metadata"]["kind"] == "auto_recharge" => {
             if let Some(account_id) = obj["metadata"]["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {

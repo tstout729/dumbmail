@@ -285,9 +285,13 @@ time (7 days out) and is released then unless the balance is topped up first.
 Optional, hosted only, dashboard only (API keys get 403). Tier N costs $10 × 2^(N-1) a month for
 30,000 × 2^(N-1) emails, about 17% below pay-as-you-go. Emails use the free allowance first, then the
 plan, then prepaid credit. An upgrade mid-month charges the price difference and adds the extra emails
-at once; a downgrade starts at the next renewal. Renewals charge the saved card (no Stripe Billing).
-A declined renewal is retried a day later, up to 3 tries, then the plan ends; while it's failing, plan
-emails aren't available. Unused plan emails don't carry over. A plan payment that no longer fits by
+at once; a downgrade starts at the next renewal. Renewals charge the saved card (no Stripe Billing),
+one month later on the Pacific calendar. Each charge attempt is recorded (`plan_renewals`) with its
+exact request before it's sent; an unknown outcome (network, 5xx, 409, 429) is settled by asking
+Stripe before anything is resent, and Stripe's `payment_intent.succeeded` webhook settles it too.
+A declined renewal is retried a day later, up to 3 tries, then the plan ends; while the renewal is
+pending or failing, plan emails aren't available. Cancelling while a renewal is failing ends the plan
+right away. Unused plan emails don't carry over. A plan payment that no longer fits by
 the time it lands (e.g. an upgrade paid after the plan ended) is added to prepaid credit.
 
 ```ts
@@ -304,7 +308,7 @@ type Billing = {
   ledger: { id: string; kind: string; description: string; amount: number; created_at: string }[];      // newest 50; credits positive
   limits: { profiles: number | null };
   plan: { status: "none"; ended_at: string | null; ended_reason: "cancelled" | "renewal_failed" | null }
-      | { status: "active" | "cancelling" | "renewal_failed"; tier: number; price: number; emails_included: number; emails_used: number;
+      | { status: "active" | "cancelling" | "renewing" | "renewal_failed"; tier: number; price: number; emails_included: number; emails_used: number;
           emails_remaining: number; period_start: string; period_end: string; next_tier: number | null; next_price: number | null;
           next_emails: number | null; renewal_attempts: number; renewal_failed_at: string | null; max_renewal_attempts: number };
   plan_options: { tier: number; price: number; emails: number; price_per_1000: number; pay_as_you_go_price: number }[];
