@@ -140,15 +140,16 @@ pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> App
     .bind(id)
     .fetch_all(&state.db)
     .await?;
-    let messages: Vec<(Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at FROM messages WHERE profile_id = $1 AND NOT is_test ORDER BY created_at DESC LIMIT 50",
+    #[allow(clippy::type_complexity)]
+    let messages: Vec<(Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
+        "SELECT id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at, send_note FROM messages WHERE profile_id = $1 AND NOT is_test ORDER BY created_at DESC LIMIT 50",
     )
     .bind(id)
     .fetch_all(&state.db)
     .await?;
     let messages: Vec<Value> = messages
         .into_iter()
-        .map(|m| json!({"id": m.0, "channel": m.1, "subject": m.2, "status": m.3, "campaign_id": m.4, "flow_id": m.5, "sent_at": m.6, "opened_at": m.7, "clicked_at": m.8}))
+        .map(|m| json!({"id": m.0, "channel": m.1, "subject": m.2, "status": m.3, "campaign_id": m.4, "flow_id": m.5, "sent_at": m.6, "opened_at": m.7, "clicked_at": m.8, "note": m.9}))
         .collect();
     Ok(json!({"profile": profile, "lists": lists, "segments": segs, "events": events, "messages": messages}))
 }

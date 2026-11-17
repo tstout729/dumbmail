@@ -343,20 +343,25 @@ impl Lookups {
         }
         let ms = ids("message");
         if !ms.is_empty() {
+            // Transactional sends are flagged, with their own status (which can be `unknown`: it may
+            // have gone out). Their variables and bodies aren't stored, so they're never sent.
             #[allow(clippy::type_complexity)]
-            let rows: Vec<(Uuid, Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
-                "SELECT id, profile_id, channel, subject, status, campaign_id, flow_id, flow_node_id, sent_at, delivered_at FROM messages
-                 WHERE account_id = $1 AND id = ANY($2) AND NOT is_test",
-            )
-            .bind(account_id)
-            .bind(&ms)
-            .fetch_all(&mut *tx)
-            .await?;
+            let rows: Vec<(Uuid, Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<String>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool, Option<Value>)> =
+                sqlx::query_as(
+                    "SELECT m.id, m.profile_id, m.channel, m.subject, m.status, m.campaign_id, m.flow_id, m.flow_node_id, m.sent_at, m.delivered_at, m.send_after, m.transactional,
+                            (SELECT jsonb_build_object('id', t.id, 'status', t.status) FROM transactional_sends t WHERE t.message_id = m.id AND t.account_id = $1 LIMIT 1)
+                     FROM messages m WHERE m.account_id = $1 AND m.id = ANY($2) AND NOT m.is_test",
+                )
+                .bind(account_id)
+                .bind(&ms)
+                .fetch_all(&mut *tx)
+                .await?;
             for r in rows {
                 people.insert(r.1);
                 l.messages.insert(
                     r.0,
-                    (r.1, json!({"id": r.0, "channel": r.2, "subject": r.3, "status": r.4, "campaign_id": r.5, "flow_id": r.6, "flow_node_id": r.7, "sent_at": r.8, "delivered_at": r.9})),
+                    (r.1, json!({"id": r.0, "channel": r.2, "subject": r.3, "status": r.4, "campaign_id": r.5, "flow_id": r.6, "flow_node_id": r.7, "sent_at": r.8,
+                        "delivered_at": r.9, "send_after": r.10, "transactional": r.11, "transactional_send": r.12})),
                 );
             }
         }

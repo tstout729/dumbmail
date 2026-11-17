@@ -126,6 +126,9 @@ pub struct CampaignRow {
     /// When the test slice's results are read and the winner goes to everyone else.
     pub ab_test_ends_at: Option<DateTime<Utc>>,
     pub ab_winner: Option<String>,
+    /// When each recipient's message goes out and smart sending; see `features::sendtime::SendOptions`.
+    #[sqlx(default)]
+    pub send_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

@@ -132,7 +132,7 @@ copies of a row, the one with the later `_updated_at` is the newer one.
 | --- | --- | --- | --- |
 | `profiles` | incremental | `id` | `id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent, email_suppressed_reason, created_at, updated_at, last_event_at` |
 | `events` | incremental | `id` | `id, profile_id, metric, properties, value, occurred_at, created_at, unique_id, message_id, from_browser` |
-| `messages` | incremental | `id` | `id, profile_id, channel, campaign_id, flow_id, flow_node_id, variant, to_address, subject, status, error, bounce_type, segments, cost_micros, sent_at, delivered_at, opened_at, clicked_at, unsubscribed_at, created_at` |
+| `messages` | incremental | `id` | `id, profile_id, channel, campaign_id, flow_id, flow_node_id, variant, to_address, subject, status, error, bounce_type, segments, cost_micros, sent_at, delivered_at, opened_at, clicked_at, unsubscribed_at, created_at, send_after, transactional, transactional_send_id, transactional_status` |
 | `lists` | snapshot | `id` | `id, name, double_opt_in, show_on_preferences, description, member_count, created_at` |
 | `list_members` | snapshot | `list_id, profile_id` | `list_id, list, profile_id, added_at` |
 | `segments` | snapshot | `id` | `id, name, definition, member_count, refreshed_at, created_at, updated_at` |
@@ -153,6 +153,12 @@ Notes:
   same outcomes are also in `events` (`Opened Email`, `Clicked Email`, `Bounced Email`,
   `Marked Email as Spam`, `Unsubscribed` ...) with the same `message_id`. `cost_micros` is the price
   in millionths of a dollar.
+- A message that wasn't sent has status `skipped` with the reason in `error` (`smart sending`,
+  `time zones disagree`, `campaign cancelled`, `sending paused` ...) or `failed`. `send_after` is
+  when a send that waits for the person's local or best time is due.
+- Transactional emails are in `messages` with `transactional` true, their send's id and its status
+  (`transactional_status` can be `unknown`: the provider may have accepted it). Their variables and
+  content aren't stored, so they're never exported.
 - `from_browser` on events is true for events a browser sent through the website snippet with the
   public site key. Anyone can send those with any values: don't count browser `Placed Order`
   events as revenue without checking them against your store.

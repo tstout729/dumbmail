@@ -63,7 +63,10 @@ macro_rules! message_json {
         "jsonb_build_object('id', x.id, 'profile_id', x.profile_id, 'channel', x.channel, 'campaign_id', x.campaign_id, 'flow_id', x.flow_id,
             'flow_node_id', x.flow_node_id, 'variant', x.variant, 'to_address', x.to_address, 'subject', x.subject, 'status', x.status, 'error', x.error,
             'bounce_type', x.bounce_type, 'segments', x.segments, 'cost_micros', x.cost_micros, 'sent_at', x.sent_at, 'delivered_at', x.delivered_at,
-            'opened_at', x.opened_at, 'clicked_at', x.clicked_at, 'unsubscribed_at', x.unsubscribed_at, 'created_at', x.created_at)"
+            'opened_at', x.opened_at, 'clicked_at', x.clicked_at, 'unsubscribed_at', x.unsubscribed_at, 'created_at', x.created_at,
+            'send_after', x.send_after, 'transactional', x.transactional,
+            'transactional_send_id', (SELECT t.id FROM transactional_sends t WHERE t.message_id = x.id AND t.account_id = x.account_id LIMIT 1),
+            'transactional_status', (SELECT t.status FROM transactional_sends t WHERE t.message_id = x.id AND t.account_id = x.account_id LIMIT 1))"
     };
 }
 
@@ -116,9 +119,9 @@ pub const DATASETS: &[Dataset] = &[
     Dataset {
         name: "messages",
         incremental: true,
-        description: "Every email and text sent, with its outcome (status, delivered, opened, clicked, unsubscribed, bounced). Incremental: messages sent since the last run, and earlier ones whose outcome changed since then.",
+        description: "Every email and text, campaign, flow and transactional, with its outcome (sent, delivered, opened, clicked, unsubscribed, bounced, skipped with the reason in error, failed). Incremental: messages created since the last run, and earlier ones whose outcome changed since then.",
         key: &["id"],
-        columns: &["id", "profile_id", "channel", "campaign_id", "flow_id", "flow_node_id", "variant", "to_address", "subject", "status", "error", "bounce_type", "segments", "cost_micros", "sent_at", "delivered_at", "opened_at", "clicked_at", "unsubscribed_at", "created_at"],
+        columns: &["id", "profile_id", "channel", "campaign_id", "flow_id", "flow_node_id", "variant", "to_address", "subject", "status", "error", "bounce_type", "segments", "cost_micros", "sent_at", "delivered_at", "opened_at", "clicked_at", "unsubscribed_at", "created_at", "send_after", "transactional", "transactional_send_id", "transactional_status"],
         sql: concat!(
             "SELECT ",
             message_json!(),

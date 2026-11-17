@@ -12,7 +12,6 @@ pub mod content;
 pub mod coupons;
 pub mod hub;
 pub mod inbox;
-pub mod indexes;
 pub mod integrations;
 pub mod klaviyo_import;
 pub mod objects;
@@ -170,6 +169,39 @@ pub async fn wants_event(db: &sqlx::PgPool, account_id: Uuid, metric: &str) -> b
         }
     }
     false
+}
+
+/// Messages that ended without being sent: `skipped` (with the reason in `error`: smart sending,
+/// time zones, a cancelled campaign ...) or `failed`. Call it right after the write, with the ids
+/// it changed. Lets webhooks and data exports report the outcome. Never fails or blocks the caller.
+pub async fn messages_unsent(db: &sqlx::PgPool, account_id: Uuid, ids: &[Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    webhooks::messages_unsent(db, account_id, ids).await;
+    let rows: Vec<(&str, Uuid)> = ids.iter().map(|id| ("messages", *id)).collect();
+    warehouse::changed_many(db, account_id, &rows).await;
+}
+
+/// [`messages_unsent`] for (account id, message id) pairs from more than one account.
+pub async fn messages_unsent_rows(db: &sqlx::PgPool, rows: &[(Uuid, Uuid)]) {
+    let mut by: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+    for (account, id) in rows {
+        by.entry(*account).or_default().push(*id);
+    }
+    for (account, ids) in by {
+        messages_unsent(db, account, &ids).await;
+    }
+}
+
+/// [`messages_unsent`] inside the caller's transaction (it goes out only if that commits; a failure
+/// here can't spoil it).
+pub async fn messages_unsent_in(conn: &mut sqlx::PgConnection, account_id: Uuid, ids: &[Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    webhooks::messages_unsent_in(conn, account_id, ids).await;
+    warehouse::changed_in(conn, account_id, "messages", ids).await;
 }
 
 /// Run every feature's [`Feature::after_start`] on its own task and return at once. Errors are logged.

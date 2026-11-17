@@ -416,6 +416,57 @@ pub async fn segment_changed_in(conn: &mut PgConnection, account_id: Uuid, segme
     }
 }
 
+/// Messages ended `skipped` or `failed`: `message.skipped` / `message.failed`, with the reason.
+/// One statement over the ids (reading what the write left), for any number of them.
+const UNSENT_INSERT: &str = "
+    WITH o AS (
+        INSERT INTO webhook_outbox (account_id, event_id, topic, source, data)
+        SELECT $1, md5('message.' || m.status || ':' || m.id::text)::uuid, 'message.' || m.status, 'system',
+               jsonb_build_object('$message', m.id, 'reason', left(m.error, 200))
+        FROM messages m
+        WHERE m.account_id = $1 AND m.id = ANY($2) AND m.status IN ('skipped', 'failed') AND NOT m.is_test
+          AND EXISTS (SELECT 1 FROM webhook_endpoints e WHERE e.account_id = $1 AND e.enabled AND ('message.' || m.status) = ANY(e.topics))
+        RETURNING account_id
+    ), mk AS (
+        INSERT INTO webhook_fanout_pending (account_id) SELECT $1 WHERE EXISTS (SELECT 1 FROM o)
+        ON CONFLICT DO NOTHING RETURNING account_id
+    )
+    INSERT INTO jobs (kind, payload, lane) SELECT 'webhooks_fanout', jsonb_build_object('account_id', mk.account_id), 'background' FROM mk";
+
+fn wants_unsent_cached(account_id: Uuid) -> bool {
+    may_want_cached(account_id, "message.skipped") || may_want_cached(account_id, "message.failed")
+}
+
+/// See [`crate::features::messages_unsent`].
+pub async fn messages_unsent(db: &PgPool, account_id: Uuid, ids: &[Uuid]) {
+    if !(may_want(db, account_id, "message.skipped", None, Source::System).await || may_want(db, account_id, "message.failed", None, Source::System).await) {
+        return;
+    }
+    for chunk in ids.chunks(10_000) {
+        if let Err(e) = sqlx::query(UNSENT_INSERT).bind(account_id).bind(chunk).execute(db).await {
+            tracing::error!(account = %account_id, error = %e, "couldn't queue webhook events");
+        }
+    }
+}
+
+/// [`messages_unsent`] in the caller's transaction, under a savepoint.
+pub async fn messages_unsent_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) {
+    if !wants_unsent_cached(account_id) {
+        return;
+    }
+    let res: sqlx::Result<()> = async {
+        let mut sp = sqlx::Connection::begin(&mut *conn).await?;
+        for chunk in ids.chunks(10_000) {
+            sqlx::query(UNSENT_INSERT).bind(account_id).bind(chunk).execute(&mut *sp).await?;
+        }
+        sp.commit().await
+    }
+    .await;
+    if let Err(e) = res {
+        tracing::error!(account = %account_id, error = %e, "couldn't queue webhook events");
+    }
+}
+
 /// The provider confirmed a message was delivered (called only the first time it does).
 pub async fn message_delivered(db: &PgPool, account_id: Uuid, message_id: Uuid) {
     let o = Out { event_id: stable_id(&["message.delivered", &message_id.to_string()]), ..Out::new("message.delivered", Source::System, json!({"$message": message_id})) };

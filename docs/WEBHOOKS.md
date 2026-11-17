@@ -25,6 +25,8 @@ addresses, and redirects aren't followed. Each endpoint gets only its own accoun
 | `segment.entered` | A profile enters a segment | `{segment: {id, name}, profile}` |
 | `segment.left` | A profile leaves a segment | `{segment: {id, name}, profile}` |
 | `message.sent` | DumbMail sends an email or text | `{message, profile}` |
+| `message.skipped` | A message isn't sent, and why (`smart sending`, `time zones disagree`, `campaign cancelled`, `sending paused`, an unsubscribe or suppression ...) | `{message, reason, profile}` |
+| `message.failed` | A message couldn't be sent, and why | `{message, reason, profile}` |
 | `message.delivered` | The provider confirms delivery | `{message, profile}` |
 | `message.opened` | An email is opened (first open) | `{message, profile}` |
 | `message.clicked` | A link in an email or text is clicked | `{message, url, profile}` |
@@ -39,7 +41,11 @@ addresses, and redirects aren't followed. Each endpoint gets only its own accoun
 `profile` in most topics is `{id, email, phone_number, external_id, first_name, last_name}`.
 `Profile` (in `profile.created` and `profile.updated`) adds `properties`, `email_consent`,
 `sms_consent`, `created_at`, `updated_at` and `last_event_at`. `message` is `{id, channel, subject,
-status, campaign_id, flow_id, flow_node_id, sent_at, delivered_at}`.
+status, campaign_id, flow_id, flow_node_id, sent_at, delivered_at, send_after, transactional,
+transactional_send}`. `send_after` is set when a send waits for the person's local or best time.
+Transactional emails (the transactional API) are messages too: `transactional` is true and
+`transactional_send` is `{id, status}`, where status can be `unknown` (the provider may have accepted
+it; it isn't sent again). Their variables and content are never stored, so they're never in a webhook.
 
 Consent topics come from the place consent is written, with the value before and after the change
 (`never_subscribed`, `pending`, `subscribed` or `unsubscribed`), and only when it really changed:

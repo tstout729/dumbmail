@@ -798,3 +798,39 @@ async fn a_failing_endpoint_is_turned_off_after_three_days_even_with_no_more_tra
     assert_eq!(count(&h, "SELECT count(*) FROM webhook_deliveries WHERE status = 'failed' AND error = 'expired'").await, 1);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn skipped_and_transactional_messages_reach_the_message_topics() {
+    let mut h = harness!();
+    let (rx, base) = receiver().await;
+    h.signup().await;
+    h.credit(10.0).await;
+    let list = email_list(&mut h, "skip", 3).await;
+    h.drain().await;
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("{base}/hook"), "batch_size": 1, "topics": ["message.sent", "message.skipped", "message.failed"]}))).await;
+
+    // A campaign cancelled after its messages were made: each queued one ends skipped, with why.
+    let cid = send_campaign(&mut h, &list).await;
+    assert!(dumbmail::jobs::run_one(&h.state).await.unwrap(), "prepare the send");
+    h.ok("POST", &format!("/api/campaigns/{cid}/cancel"), None).await;
+    h.drain().await;
+    let skipped: Vec<Value> = rx.envelopes().into_iter().filter(|e| e["topic"] == "message.skipped").collect();
+    assert_eq!(skipped.len(), 3, "{:?}", rx.topics());
+    assert!(skipped.iter().all(|e| e["data"]["reason"] == "campaign cancelled" && e["data"]["message"]["status"] == "skipped" && e["data"]["message"]["campaign_id"] == cid.as_str()));
+
+    // A transactional email is a message too, flagged as one, without its content.
+    h.ok("PATCH", "/api/transactional/settings", Some(json!({"enabled": true, "acknowledge": true}))).await;
+    let id = h.ok("GET", "/api/me", None).await["account"]["id"].as_str().unwrap().to_string();
+    let (s, _, body) = h
+        .raw("POST", "/admin/transactional/mode", &[("authorization", "Bearer test-admin-token-0123456789abcdef0123"), ("content-type", "application/json")], &json!({"account_id": id, "mode": "full"}).to_string())
+        .await;
+    assert_eq!(s, 200, "{body}");
+    let v = h.ok("POST", "/api/transactional/send", Some(json!({"to": "t@x.test", "content": {"subject": "Reset your password", "text": "secret-reset-link-123"}}))).await;
+    assert_eq!(v["status"], "sent", "{v}");
+    h.drain().await;
+    let sent = rx.envelopes().into_iter().find(|e| e["topic"] == "message.sent" && e["data"]["message"]["transactional"] == true).unwrap_or_else(|| panic!("{:?}", rx.topics()));
+    assert_eq!(sent["data"]["message"]["transactional_send"]["status"], "sent");
+    assert_eq!(sent["data"]["profile"]["email"], "t@x.test");
+    assert!(!sent.to_string().contains("secret-reset-link-123"), "no content or variables: {sent}");
+    h.cleanup().await;
+}

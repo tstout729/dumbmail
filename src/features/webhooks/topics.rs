@@ -21,6 +21,8 @@ pub const TOPICS: &[Topic] = &[
     Topic { name: "segment.entered", group: "Lists and segments", description: "A profile enters a segment (checked when segments refresh, about every 15 minutes)." },
     Topic { name: "segment.left", group: "Lists and segments", description: "A profile leaves a segment (checked when segments refresh)." },
     Topic { name: "message.sent", group: "Messages", description: "An email or text is sent." },
+    Topic { name: "message.skipped", group: "Messages", description: "A message isn't sent, with the reason (smart sending, quiet hours, a cancelled campaign, an unsubscribe ...)." },
+    Topic { name: "message.failed", group: "Messages", description: "A message couldn't be sent, with the reason." },
     Topic { name: "message.delivered", group: "Messages", description: "The provider confirms delivery." },
     Topic { name: "message.opened", group: "Messages", description: "An email is opened (first open only)." },
     Topic { name: "message.clicked", group: "Messages", description: "A link in an email or text is clicked." },
@@ -44,7 +46,7 @@ pub fn list_json() -> Value {
 /// The message topic one of DumbMail's own message events stands for (besides `event.tracked`).
 pub fn message_topic(metric: &str) -> Option<&'static str> {
     Some(match metric {
-        "Received Email" | "Received SMS" => "message.sent",
+        "Received Email" | "Received SMS" | crate::features::transactional::send::METRIC => "message.sent",
         "Opened Email" => "message.opened",
         "Clicked Email" | "Clicked SMS" => "message.clicked",
         "Bounced Email" => "message.bounced",
@@ -59,7 +61,8 @@ fn sample_profile() -> Value {
 
 fn sample_message() -> Value {
     json!({"id": "0193a5b4-7a10-7e55-8c11-2f3a4b5c6d70", "channel": "email", "subject": "New arrivals are here", "status": "sent",
-        "campaign_id": "0193a5b4-7b20-7f66-9d22-3a4b5c6d7e80", "flow_id": null, "flow_node_id": null, "sent_at": "2026-11-17T18:04:05Z"})
+        "campaign_id": "0193a5b4-7b20-7f66-9d22-3a4b5c6d7e80", "flow_id": null, "flow_node_id": null, "sent_at": "2026-11-17T18:04:05Z",
+        "delivered_at": null, "send_after": null, "transactional": false, "transactional_send": null})
 }
 
 /// Sample `data` for a topic, shaped exactly like the real thing.
@@ -90,6 +93,18 @@ pub fn sample_data(topic: &str, metric: Option<&str>) -> Value {
         "message.sent" | "message.delivered" | "message.opened" | "message.complained" => json!({"message": sample_message(), "profile": profile}),
         "message.clicked" => json!({"message": sample_message(), "url": "https://example.com/new", "profile": profile}),
         "message.bounced" => json!({"message": sample_message(), "bounce_type": "Permanent", "profile": profile}),
+        "message.skipped" => {
+            let mut m = sample_message();
+            m["status"] = json!("skipped");
+            m["sent_at"] = Value::Null;
+            json!({"message": m, "reason": "smart sending", "profile": profile})
+        }
+        "message.failed" => {
+            let mut m = sample_message();
+            m["status"] = json!("failed");
+            m["sent_at"] = Value::Null;
+            json!({"message": m, "reason": "not sent: email sending is paused for this account", "profile": profile})
+        }
         "form.submitted" => json!({"form": {"id": "0193a5b4-bf60-7daa-9b66-7e8f9a0b1c23", "name": "Welcome popup", "kind": "popup"}, "list_id": "0193a5b4-9d40-7b88-9f44-5c6d7e8f9a01",
             "variant": "a", "profile": profile}),
         "campaign.sent" | "campaign.finished" => json!({"campaign": {"id": "0193a5b4-7b20-7f66-9d22-3a4b5c6d7e80", "name": "November launch", "channel": "email",

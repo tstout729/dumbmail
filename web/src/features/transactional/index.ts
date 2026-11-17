@@ -1,4 +1,9 @@
+import { Receipt } from "lucide-react";
 import type { DashboardFeature } from "../types";
 
-// Not built yet. This feature's pages, API hooks and types live in this folder.
-export const feature: DashboardFeature = {};
+export const feature: DashboardFeature = {
+  routes: [{ path: "transactional", lazy: () => import("./TransactionalPage").then((m) => ({ Component: m.TransactionalPage })) }],
+  settingsRoutes: [{ path: "transactional", lazy: () => import("./TransactionalSettingsPage").then((m) => ({ Component: m.TransactionalSettingsPage })) }],
+  nav: [{ label: "Transactional", to: "/transactional", icon: Receipt }],
+  settingsTabs: [{ label: "Transactional", title: "Turn transactional email on or off", to: "/settings/transactional" }],
+};

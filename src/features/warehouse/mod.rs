@@ -96,7 +96,7 @@ impl Feature for Module {
     /// Incremental exports read profiles by `updated_at` and events by `created_at`. On big
     /// accounts that wants these indexes; exports work without them, slower.
     async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
-        crate::features::indexes::ensure(state, INDEX_LOCK_KEY, "data export indexes", INDEXES).await
+        crate::features::reports::indexes::build(state, INDEX_LOCK_KEY, "data export", INDEXES).await
     }
 }
 
@@ -164,6 +164,34 @@ pub async fn changed_many(db: &sqlx::PgPool, account_id: Uuid, rows: &[(&str, Uu
     .bind(&sets)
     .bind(&ids)
     .execute(db)
+    .await;
+    if let Err(e) = res {
+        tracing::error!(account = %account_id, error = %e, "couldn't note changed rows for data exports");
+    }
+}
+
+/// [`changed_many`] for rows of one dataset inside the caller's transaction, under a savepoint.
+pub async fn changed_in(conn: &mut sqlx::PgConnection, account_id: Uuid, dataset: &str, ids: &[Uuid]) {
+    if let Some((at, sets)) = EXPORTED.lock().ok().and_then(|m| m.get(&account_id).map(|(a, v)| (*a, v.clone()))) {
+        if at.elapsed() < CACHE_TTL && !sets.iter().any(|s| s == dataset) {
+            return;
+        }
+    }
+    let res: sqlx::Result<()> = async {
+        let mut sp = sqlx::Connection::begin(&mut *conn).await?;
+        sqlx::query(
+            "INSERT INTO warehouse_changes (account_id, dataset, row_id)
+             SELECT $1, $2, x FROM UNNEST($3::uuid[]) AS x
+             WHERE EXISTS (SELECT 1 FROM warehouse_destinations d WHERE d.account_id = $1 AND d.enabled AND $2 = ANY(d.datasets))
+             ON CONFLICT (account_id, dataset, row_id) DO UPDATE SET changed_at = now()",
+        )
+        .bind(account_id)
+        .bind(dataset)
+        .bind(ids)
+        .execute(&mut *sp)
+        .await?;
+        sp.commit().await
+    }
     .await;
     if let Err(e) = res {
         tracing::error!(account = %account_id, error = %e, "couldn't note changed rows for data exports");

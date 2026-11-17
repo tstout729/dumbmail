@@ -441,6 +441,8 @@ async fn a_message_exported_before_its_delivery_comes_back_with_its_final_status
     assert!(again[0]["delivered_at"].is_string());
     let (a, b): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) = (first[0]["_updated_at"].as_str().unwrap().parse().unwrap(), again[0]["_updated_at"].as_str().unwrap().parse().unwrap());
     assert!(b > a, "keep the copy with the latest _updated_at");
+    assert_eq!((again[0]["transactional"].as_bool(), again[0]["transactional_status"].is_null()), (Some(false), true));
+    assert!(again[0].get("send_after").is_some());
     h.cleanup().await;
 }
 
