@@ -99,18 +99,20 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
     let src = &imp.source_counts;
 
     // ----- Profiles -----
-    // Only references this run read: Klaviyo profiles deleted since an earlier run don't count.
-    let run_from = imp.started_at;
+    // Only profiles this run's full scan read: Klaviyo profiles deleted since an earlier run, and ones met
+    // only through an event or a list, don't count.
+    let run_from = imp.id.to_string();
     let scan = &src["profiles_scan"];
     let scan_done = scan["complete"] == true;
     let scan_total = scan["total"].as_i64();
-    let (seen, linked, skipped, gone, conflicts): (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let (seen, linked, skipped, skipped_addr, gone, conflicts): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*), count(DISTINCT p.id), count(*) FILTER (WHERE r.local_id IS NULL),
+                count(*) FILTER (WHERE r.local_id IS NULL AND (r.detail->>'has_email' = 'true' OR r.detail->>'has_phone' = 'true')),
                 count(*) FILTER (WHERE r.local_id IS NOT NULL AND p.id IS NULL), count(*) FILTER (WHERE p.id IS NOT NULL AND jsonb_typeof(r.detail->'conflict') = 'array')
-         FROM klaviyo_refs r LEFT JOIN profiles p ON p.id = r.local_id WHERE r.account_id = $1 AND r.kind = 'profile' AND r.updated_at >= COALESCE($2, '-infinity')",
+         FROM klaviyo_refs r LEFT JOIN profiles p ON p.id = r.local_id WHERE r.account_id = $1 AND r.kind = 'profile' AND r.detail->>'scan' = $2::text",
     )
     .bind(a)
-    .bind(run_from)
+    .bind(&run_from)
     .fetch_one(db)
     .await?;
     let merged = (seen - skipped - gone - linked).max(0);
@@ -163,7 +165,7 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
                    (p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold) AS ereach,
                    (p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND NOT p.marketing_hold) AS sreach
             FROM klaviyo_refs r JOIN profiles p ON p.id = r.local_id
-            WHERE r.account_id = $1 AND r.kind = 'profile' AND r.updated_at >= COALESCE($2, '-infinity'))
+            WHERE r.account_id = $1 AND r.kind = 'profile' AND r.detail->>'scan' = $2::text)
          SELECT
             count(*) FILTER (WHERE ae AND es = 'unsubscribed') AS e_unsub_k,
             count(*) FILTER (WHERE ae AND es = 'unsubscribed' AND ec = 'unsubscribed') AS e_unsub_d,
@@ -191,13 +193,14 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
          FROM x",
     )
     .bind(a)
-    .bind(run_from)
+    .bind(&run_from)
     .fetch_one(db)
     .await?;
     // Consent can be compared only for people placed on a profile with the same address: a profile scan
-    // that didn't finish, or people skipped or with a clashing address, leave it unverified.
+    // that didn't finish, or people with an address who were skipped or clash, leave it unverified.
+    // (Someone with no email or phone has no consent to compare.)
     let covered = scan_done && scan_total.is_some_and(|t| seen >= t);
-    let unresolved = skipped + conflicts;
+    let unresolved = skipped_addr + conflicts;
     let verdict = |ok: bool| if !covered || unresolved > 0 { NOT_VERIFIED } else if ok { MATCH } else { MISMATCH };
     let with = |base: String| {
         if !covered {
@@ -252,10 +255,10 @@ pub async fn build(state: &AppState, imp: &Import) -> AppResult<Value> {
          FROM klaviyo_refs pr CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.detail->'list_suppressions', '[]')) AS ls(kid)
          LEFT JOIN klaviyo_refs lr ON lr.account_id = pr.account_id AND lr.kind = 'list' AND lr.klaviyo_id = ls.kid AND lr.local_id IS NOT NULL
          LEFT JOIN klaviyo_memberships m ON m.list_id = lr.local_id AND m.profile_id = pr.local_id
-         WHERE pr.account_id = $1 AND pr.kind = 'profile' AND pr.local_id IS NOT NULL AND pr.updated_at >= COALESCE($2, '-infinity')",
+         WHERE pr.account_id = $1 AND pr.kind = 'profile' AND pr.local_id IS NOT NULL AND pr.detail->>'scan' = $2::text",
     )
     .bind(a)
-    .bind(run_from)
+    .bind(&run_from)
     .fetch_one(db)
     .await?;
     let lo_base = if lo_k == lo_d { "Each is off that list here and won't be added back; their other lists aren't touched.".to_string() } else { format!("{} are still on the list they left. Run the import again.", lo_k - lo_d) };

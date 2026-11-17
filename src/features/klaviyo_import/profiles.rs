@@ -492,7 +492,10 @@ impl Run<'_> {
             }
             match parse(r, hold_never, self.imp.id) {
                 Ok(k) => ks.push(k),
-                Err((kid, label, d)) => {
+                Err((kid, label, mut d)) => {
+                    if self.in_profile_scan {
+                        d["scan"] = json!(self.imp.id);
+                    }
                     let why = d["skipped"].as_str().unwrap_or("").to_string();
                     issues.push(("skipped".into(), Some(kid.clone()), None, mask_text(&label), why));
                     refs.push((kid, None, label, d));
@@ -544,6 +547,9 @@ impl Run<'_> {
             }
             let mut d = k.detail.clone();
             d["fp"] = json!(k.fp);
+            if self.in_profile_scan {
+                d["scan"] = json!(self.imp.id);
+            }
             let Some(w) = out.get(&i) else {
                 let why = "Its email, phone number or external id belongs to another profile that couldn't be merged with it. Klaviyo's opt-outs for its address and number were still applied.";
                 d["skipped"] = json!(why);

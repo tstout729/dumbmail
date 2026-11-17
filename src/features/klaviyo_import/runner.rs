@@ -64,6 +64,8 @@ pub struct Run<'a> {
     /// Progress for work done since the last save, written in the same transaction as the cursor.
     pending: Vec<(String, i64, i64)>,
     finished: Vec<String>,
+    /// Writing the full profile scan (its references are what the report compares with Klaviyo's total).
+    pub(super) in_profile_scan: bool,
 }
 
 fn s(v: &Value) -> Option<&str> {
@@ -92,7 +94,7 @@ pub fn fmt_ts(t: DateTime<Utc>) -> String {
 
 impl<'a> Run<'a> {
     pub fn new(state: &'a AppState, imp: Import, key: &str) -> Self {
-        Run { state, imp, k: Client::new(state.http.clone(), key), deadline: Instant::now() + RUN_BUDGET, metrics: None, owner: Uuid::now_v7(), pending: Vec::new(), finished: Vec::new() }
+        Run { state, imp, k: Client::new(state.http.clone(), key), deadline: Instant::now() + RUN_BUDGET, metrics: None, owner: Uuid::now_v7(), pending: Vec::new(), finished: Vec::new(), in_profile_scan: false }
     }
 
     fn out_of_time(&self) -> bool {
@@ -321,7 +323,10 @@ impl<'a> Run<'a> {
         let url = self.imp.cursor.clone().unwrap_or_else(|| format!("/api/profiles?additional-fields%5Bprofile%5D=subscriptions&page%5Bsize%5D={PROFILE_PAGE}&sort=id"));
         let page = self.k.get(&url).await?;
         let data = page["data"].as_array().cloned().unwrap_or_default();
-        let up = self.take_profiles(&data).await?;
+        self.in_profile_scan = true;
+        let up = self.take_profiles(&data).await;
+        self.in_profile_scan = false;
+        let up = up?;
         self.bump(step, up.done, up.skipped);
         // Klaviyo's own total, counted while reading every page: the report's independent number.
         let n = self.st("scan_profiles").as_i64().unwrap_or(0) + data.len() as i64;
