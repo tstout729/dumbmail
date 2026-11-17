@@ -1,6 +1,6 @@
 import { BarChart3 } from "lucide-react";
 import { useFlowAnalytics, type FlowTotals } from "../../api";
-import { DeltaBadge, Hint, change, type Change } from "../analytics/kit";
+import { DeltaBadge, Hint, MiniStat, change } from "../analytics/kit";
 import { BarSeriesChart } from "../charts/BarSeriesChart";
 import { RangePicker, type RangeDays } from "../charts/RangePicker";
 import { Card, Skeleton, cx } from "../ui";
@@ -76,7 +76,7 @@ export function FlowsSummary({ days, onDaysChange }: { days: RangeDays; onDaysCh
             </div>
           </div>
           <dl className="grid grid-cols-2 border-t border-zinc-100 sm:grid-cols-4 [&>div]:border-zinc-100 max-sm:[&>div:nth-child(-n+2)]:border-b sm:[&>div:not(:first-child)]:border-l max-sm:[&>div:nth-child(even)]:border-l">
-            <Stat
+            <MiniStat
               label="Messages sent"
               value={formatCompact(t?.messages_sent ?? 0)}
               title={formatNumber(t?.messages_sent ?? 0)}
@@ -86,7 +86,7 @@ export function FlowsSummary({ days, onDaysChange }: { days: RangeDays; onDaysCh
             />
             <RateStat label="Open rate" k="open_rate" t={t} p={ratesComparable ? p : undefined} vs={vs} loading={loading} hint="Emails opened, out of emails delivered." />
             <RateStat label="Click rate" k="click_rate" t={t} p={ratesComparable ? p : undefined} vs={vs} loading={loading} hint="Emails and texts clicked, out of those delivered." />
-            <Stat
+            <MiniStat
               label="Revenue per recipient"
               value={formatCurrency(t?.revenue_per_recipient, true)}
               delta={(p?.recipients ?? 0) > 0 ? change(t?.revenue_per_recipient ?? 0, p?.revenue_per_recipient ?? 0, "count") : null}
@@ -103,29 +103,6 @@ export function FlowsSummary({ days, onDaysChange }: { days: RangeDays; onDaysCh
 
 function RateStat({ label, k, t, p, vs, loading, hint }: { label: string; k: "open_rate" | "click_rate"; t?: FlowTotals; p?: FlowTotals; vs: string; loading: boolean; hint: string }) {
   return (
-    <Stat label={label} value={formatPercent(t?.[k] ?? 0, 1)} delta={p ? change(t?.[k] ?? 0, p[k], "rate") : null} vs={vs} loading={loading} hint={hint} />
-  );
-}
-
-function Stat({ label, value, title, delta, vs, loading, hint }: { label: string; value: string; title?: string; delta: Change | null; vs: string; loading: boolean; hint?: string }) {
-  return (
-    <div className="min-w-0 px-4 py-3">
-      <dt className="flex items-center gap-1 text-xs font-medium text-zinc-500">
-        {label}
-        {hint ? <Hint text={hint} /> : null}
-      </dt>
-      <dd className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-        {loading ? (
-          <Skeleton className="h-6 w-16" />
-        ) : (
-          <>
-            <span className="text-lg font-semibold tracking-tight text-zinc-950" title={title}>
-              {value}
-            </span>
-            <DeltaBadge value={delta} label={vs} />
-          </>
-        )}
-      </dd>
-    </div>
+    <MiniStat label={label} value={formatPercent(t?.[k] ?? 0, 1)} delta={p ? change(t?.[k] ?? 0, p[k], "rate") : null} vs={vs} loading={loading} hint={hint} />
   );
 }

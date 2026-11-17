@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/analytics/overview", get(overview_h))
         .route("/api/analytics/flows", get(flows_h))
+        .route("/api/analytics/forms", get(forms_h))
 }
 
 #[derive(Deserialize)]
@@ -248,4 +249,62 @@ pub async fn flows(state: &AppState, account_id: Uuid, days: i64) -> AppResult<V
 
 async fn flows_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Days>) -> AppResult<Json<Value>> {
     Ok(Json(flows(&state, ctx.account_id, q.days.unwrap_or(30)).await?))
+}
+
+/// Form views and sign-ups for `[now - from_days, now - to_days)`.
+async fn form_window(state: &AppState, account_id: Uuid, from_days: i64, to_days: i64) -> AppResult<Value> {
+    let now = chrono::Utc::now();
+    let (lo, hi) = (now - chrono::Duration::days(from_days), now - chrono::Duration::days(to_days));
+    let (views, submits): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(sum(views), 0)::int8, COALESCE(sum(submits), 0)::int8 FROM form_stats_hourly WHERE account_id = $1 AND hour >= $2 AND hour < $3",
+    )
+    .bind(account_id)
+    .bind(lo)
+    .bind(hi)
+    .fetch_one(&state.db)
+    .await?;
+    let rate = if views > 0 { submits as f64 / views as f64 } else { 0.0 };
+    Ok(json!({"views": views, "submits": submits, "submit_rate": rate}))
+}
+
+/// Sign-up form performance for the last `days` days, the `days` before that, sign-ups and views by
+/// day, and each form's numbers in the range.
+pub async fn forms(state: &AppState, account_id: Uuid, days: i64) -> AppResult<Value> {
+    let days = days.clamp(1, 365);
+    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(&state.db).await?;
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
+    let totals = form_window(state, account_id, days, 0).await?;
+    let previous = form_window(state, account_id, days * 2, days).await?;
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "WITH d AS (
+            SELECT to_char(g, 'YYYY-MM-DD') AS day FROM generate_series(
+              date_trunc('day', $3 AT TIME ZONE $2), date_trunc('day', now() AT TIME ZONE $2), interval '1 day') g),
+         s AS (SELECT to_char(hour AT TIME ZONE $2, 'YYYY-MM-DD') AS day, sum(views) AS views, sum(submits) AS submits
+               FROM form_stats_hourly WHERE account_id = $1 AND hour >= $3 GROUP BY 1)
+         SELECT d.day, COALESCE(s.views, 0)::int8, COALESCE(s.submits, 0)::int8 FROM d LEFT JOIN s USING (day) ORDER BY d.day",
+    )
+    .bind(account_id)
+    .bind(&tz)
+    .bind(since)
+    .fetch_all(&state.db)
+    .await?;
+    let series: Vec<Value> = rows.into_iter().map(|(date, v, s)| json!({"date": date, "views": v, "submits": s})).collect();
+    let per_form: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
+        "SELECT f.id, f.name, sum(h.views)::int8, sum(h.submits)::int8
+         FROM form_stats_hourly h JOIN forms f ON f.id = h.form_id
+         WHERE h.account_id = $1 AND h.hour >= $2 GROUP BY f.id ORDER BY 4 DESC, 3 DESC",
+    )
+    .bind(account_id)
+    .bind(since)
+    .fetch_all(&state.db)
+    .await?;
+    let forms: Vec<Value> = per_form
+        .into_iter()
+        .map(|(id, name, v, s)| json!({"id": id, "name": name, "views": v, "submits": s, "submit_rate": if v > 0 { s as f64 / v as f64 } else { 0.0 }}))
+        .collect();
+    Ok(json!({"days": days, "totals": totals, "previous": previous, "series": series, "forms": forms}))
+}
+
+async fn forms_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<Days>) -> AppResult<Json<Value>> {
+    Ok(Json(forms(&state, ctx.account_id, q.days.unwrap_or(30)).await?))
 }

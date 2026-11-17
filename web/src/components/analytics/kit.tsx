@@ -138,3 +138,27 @@ export function LegendDot({ color, children }: { color: string; children: ReactN
     </span>
   );
 }
+
+/** A compact number with its change, for a row of secondary stats under a headline. */
+export function MiniStat({ label, value, title, delta, vs, loading, hint }: { label: string; value: string; title?: string; delta: Change | null; vs: string; loading: boolean; hint?: string }) {
+  return (
+    <div className="min-w-0 px-4 py-3">
+      <dt className="flex items-center gap-1 text-xs font-medium text-zinc-500">
+        {label}
+        {hint ? <Hint text={hint} /> : null}
+      </dt>
+      <dd className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+        {loading ? (
+          <Skeleton className="h-6 w-16" />
+        ) : (
+          <>
+            <span className="text-lg font-semibold tracking-tight text-zinc-950" title={title}>
+              {value}
+            </span>
+            <DeltaBadge value={delta} label={vs} />
+          </>
+        )}
+      </dd>
+    </div>
+  );
+}

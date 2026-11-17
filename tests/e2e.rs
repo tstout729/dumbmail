@@ -520,6 +520,8 @@ async fn mcp_server() {
     assert_eq!(an["result"]["structuredContent"]["totals"]["emails_sent"], 1);
     let (_, fa) = call(&h, tool(16, "get_analytics", json!({"days": 7, "scope": "flows"}))).await;
     assert!(fa["result"]["structuredContent"]["totals"]["revenue_per_recipient"].is_number(), "{fa}");
+    let (_, fo) = call(&h, tool(16, "get_analytics", json!({"days": 7, "scope": "forms"}))).await;
+    assert!(fo["result"]["structuredContent"]["totals"]["submit_rate"].is_number(), "{fo}");
     let (_, res) = call(&h, rpc(17, "resources/read", json!({"uri": "postlark://docs/flows"}))).await;
     assert!(res["result"]["contents"][0]["text"].as_str().unwrap().contains("exit_condition"));
     h.cleanup().await;
@@ -1337,6 +1339,12 @@ async fn form_ab_test() {
 
     let f = h.ok("GET", &format!("/api/forms/{fid}"), None).await;
     assert_eq!(f["stats"], json!({"views": 5, "submits": 2}));
+    // The Forms page summary counts the same views and sign-ups, by day.
+    let fa = h.ok("GET", "/api/analytics/forms?days=7", None).await;
+    assert_eq!(fa["totals"], json!({"views": 5, "submits": 2, "submit_rate": 0.4}));
+    assert_eq!(fa["previous"]["views"], 0);
+    assert_eq!(fa["series"].as_array().unwrap().last().unwrap()["submits"], 2);
+    assert_eq!(fa["forms"][0]["id"], fid.as_str());
     assert_eq!(f["variant_stats"][0], json!({"id": "a", "views": 1, "submits": 0, "submit_rate": 0.0}));
     assert_eq!(f["variant_stats"][1], json!({"id": "b", "views": 2, "submits": 1, "submit_rate": 0.5}));
 

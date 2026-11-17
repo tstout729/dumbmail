@@ -36,4 +36,5 @@ export const keys = {
   images: ["images"] as const,
   overview: (days: number) => ["analytics-overview", days] as const,
   flowAnalytics: (days: number) => ["analytics-flows", days] as const,
+  formAnalytics: (days: number) => ["analytics-forms", days] as const,
 };

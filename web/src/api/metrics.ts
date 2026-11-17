@@ -1,7 +1,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, withQuery } from "./client";
 import { keys } from "./keys";
-import type { AnalyticsOverview, FlowAnalytics, EventRow, ListResponse, MetricQuery, MetricQueryResult, MetricSummary } from "./types";
+import type { AnalyticsOverview, FlowAnalytics, FormAnalytics, EventRow, ListResponse, MetricQuery, MetricQueryResult, MetricSummary } from "./types";
 
 export type EventQuery = { metric?: string; profile_id?: string; limit?: number; offset?: number };
 
@@ -11,6 +11,7 @@ export const metricsApi = {
   events: (params: EventQuery) => api<ListResponse<EventRow>>("GET", withQuery("/api/events", params)),
   overview: (days: number) => api<AnalyticsOverview>("GET", withQuery("/api/analytics/overview", { days })),
   flows: (days: number) => api<FlowAnalytics>("GET", withQuery("/api/analytics/flows", { days })),
+  forms: (days: number) => api<FormAnalytics>("GET", withQuery("/api/analytics/forms", { days })),
 };
 
 export function useMetrics() {
@@ -46,6 +47,14 @@ export function useFlowAnalytics(days: number) {
   return useQuery({
     queryKey: keys.flowAnalytics(days),
     queryFn: () => metricsApi.flows(days),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useFormAnalytics(days: number) {
+  return useQuery({
+    queryKey: keys.formAnalytics(days),
+    queryFn: () => metricsApi.forms(days),
     placeholderData: keepPreviousData,
   });
 }

@@ -804,6 +804,18 @@ export type FlowAnalytics = {
   series: { date: string; revenue: number; messages_sent: number }[];
 };
 
+export type FormWindow = { views: number; submits: number; submit_rate: number };
+
+export type FormAnalytics = {
+  days: number;
+  totals: FormWindow;
+  /** The same numbers for the `days` before this range. */
+  previous: FormWindow;
+  series: { date: string; views: number; submits: number }[];
+  /** Forms with views or sign-ups in the range, most sign-ups first. */
+  forms: ({ id: string; name: string } & FormWindow)[];
+};
+
 // ---- Sending and domains ----
 
 export type DnsStatus = "not_started" | "pending" | "verified" | "failed";
