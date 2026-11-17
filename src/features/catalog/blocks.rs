@@ -28,36 +28,6 @@ const SHARED_TTL: Duration = Duration::from_secs(60);
 /// Products the Jinja `catalog` lists hold.
 const LIST_SIZE: i64 = 8;
 
-/// Check a `products` block's settings (when content is saved through the catalog tools and in tests).
-pub fn check_block(b: &Value) -> Result<(), String> {
-    let source = b["source"].as_str().unwrap_or("");
-    if !SOURCES.contains(&source) {
-        return Err(format!("products block source must be one of {}", SOURCES.join(", ")));
-    }
-    if let Some(f) = b["fallback"].as_str().filter(|f| !f.is_empty()) {
-        if !SOURCES.contains(&f) {
-            return Err(format!("products block fallback must be one of {}", SOURCES.join(", ")));
-        }
-    }
-    if source == "handpicked" && b["product_ids"].as_array().is_none_or(|a| a.is_empty() || a.len() > MAX_COUNT as usize) {
-        return Err("hand-picked products need 1 to 12 product ids".into());
-    }
-    if source == "collection" && ["category", "tag", "brand"].iter().all(|k| b[*k].as_str().is_none_or(str::is_empty)) {
-        return Err("a collection needs a category, tag or brand".into());
-    }
-    if let Some(c) = b["count"].as_i64() {
-        if !(1..=MAX_COUNT).contains(&c) {
-            return Err("products block count must be 1 to 12".into());
-        }
-    }
-    if let Some(c) = b["columns"].as_i64() {
-        if !(1..=4).contains(&c) {
-            return Err("products block columns must be 1 to 4".into());
-        }
-    }
-    Ok(())
-}
-
 static SHARED: Lazy<Mutex<HashMap<String, (Instant, Vec<Value>)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn shared_get(key: &str) -> Option<Vec<Value>> {
