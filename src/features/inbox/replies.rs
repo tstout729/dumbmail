@@ -1,7 +1,7 @@
 //! Replying: who can be answered, replies typed in the dashboard (or sent over the API and MCP),
 //! and automatic texts (keyword answers and sign-up texts, the default and away replies, HELP), all
 //! sent through `sending::send_conversational` so billing, the provider and bookkeeping are the
-//! normal ones, and every one passes `store::claim_send` right before the provider call.
+//! normal ones, and every one passes the claim in `sending` right before the provider call.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};

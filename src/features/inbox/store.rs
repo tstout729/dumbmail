@@ -20,8 +20,9 @@ pub const MAX_BODY_CHARS: usize = 1600;
 pub const MAX_MEDIA: usize = 10;
 /// Someone not subscribed to marketing texts can be answered this long after their last text.
 pub const REPLY_WINDOW_HOURS: i64 = 24;
-/// Inbound kinds that don't open a reply window: an opt-out, and texts from opted-out numbers.
-const NO_WINDOW_KINDS: &str = "('stop', 'blocked')";
+/// Inbound kinds that don't open a reply window: an opt-out, texts from opted-out numbers, and
+/// HELP (answered on its own; it doesn't invite other replies).
+pub const NO_WINDOW_KINDS: &str = "('stop', 'blocked', 'help')";
 
 /// One inbound text as the provider described it.
 #[derive(Debug, Clone, Default)]
@@ -137,7 +138,7 @@ pub fn preview(text: &str, media: usize) -> String {
 
 /// Serializes everything that changes or checks one number's opt-out state in one account: an
 /// inbound text's consent effects and the final check before a text goes to the provider.
-async fn lock_number(conn: &mut PgConnection, account_id: Uuid, phone: &str) -> AppResult<()> {
+pub async fn lock_number(conn: &mut PgConnection, account_id: Uuid, phone: &str) -> AppResult<()> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 64))").bind(account_id).bind(phone).execute(conn).await?;
     Ok(())
 }
@@ -398,51 +399,29 @@ pub fn window_open(start: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     start.is_some_and(|at| now - at < chrono::Duration::hours(REPLY_WINDOW_HOURS))
 }
 
-/// The final check before a text goes to the provider, made under the same lock an inbound
-/// opt-out takes, so an opt-out that committed first always wins. Returns why not, if it can't go.
+/// The inbox's reply rules for a conversational text, from state read under the number's lock in
+/// the same transaction that claims the message (`sending::claim_text`; the carrier-level opt-out
+/// is checked there first). Returns why not, if it can't go.
 ///
-/// - Every text: the number hasn't opted out at the carrier level (HELP answers excepted: they're
-///   administrative, and the provider still enforces its own block).
-/// - Marketing: the person is still subscribed to texts (tests excepted).
-/// - Conversational texts: they go from one of the account's numbers, the person hasn't
-///   unsubscribed, and either the reply window from their last verified text is open or (for a
-///   reply typed by a person) they're subscribed on that number.
-pub async fn claim_send(db: &PgPool, account_id: Uuid, profile_id: Uuid, to: &str, from: &str, is_test: bool, conversational: Option<&Conversational>) -> AppResult<Result<(), &'static str>> {
-    let mut tx = db.begin().await?;
-    lock_number(&mut tx, account_id, to).await?;
-    let help = conversational.is_some_and(|c| c.kind == "help");
-    if !help && is_opted_out(&mut tx, account_id, to).await? {
-        return Ok(Err("opted out"));
+/// - It goes from one of the account's numbers.
+/// - HELP answers: always (they're administrative; the provider still enforces its own block).
+/// - Otherwise the person hasn't unsubscribed, and either the reply window from their last verified
+///   text to that number is open or (for a reply typed by a person) they're subscribed on that number.
+pub fn reply_allowed(c: &Conversational, consent: &str, phone: Option<&str>, from_ours: bool, window_start: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Result<(), &'static str> {
+    if !from_ours {
+        return Err("the number they texted is no longer this account's");
     }
-    let person: Option<(String, Option<String>)> = sqlx::query_as("SELECT sms_consent, phone_number FROM profiles WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
-    let Some((consent, phone)) = person else { return Ok(Err("profile deleted")) };
-    let Some(c) = conversational else {
-        if !is_test && consent != "subscribed" {
-            return Ok(Err("no sms consent"));
-        }
-        return Ok(Ok(()));
-    };
-    let ours: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1 AND sms_from = $2)
-             OR EXISTS (SELECT 1 FROM phone_numbers WHERE account_id = $1 AND phone_number = $2 AND status IN ('verified', 'active'))",
-    )
-    .bind(account_id)
-    .bind(from)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !ours {
-        return Ok(Err("the number they texted is no longer this account's"));
+    if c.kind == "help" {
+        return Ok(());
     }
-    if consent == "unsubscribed" && !help {
-        return Ok(Err("unsubscribed from texts"));
+    if consent == "unsubscribed" {
+        return Err("unsubscribed from texts");
     }
-    let open = window_open(window_start(&mut tx, account_id, to, from).await?, Utc::now());
-    let subscribed_here = c.kind == "reply" && consent == "subscribed" && phone.as_deref() == Some(to);
-    if !open && !subscribed_here {
-        return Ok(Err("reply window closed"));
+    let subscribed_here = c.kind == "reply" && consent == "subscribed" && phone == Some(c.to.as_str());
+    if !window_open(window_start, now) && !subscribed_here {
+        return Err("reply window closed");
     }
-    tx.commit().await?;
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// "Received SMS Reply": flows and segments use it (a flow trigger, "engaged with SMS").

@@ -589,16 +589,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
-                let recent: bool = hours > 0
-                    && sqlx::query_scalar(
-                        "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND sent_at > now() - make_interval(hours => $3)
-                             AND NOT EXISTS (SELECT 1 FROM sms_sent_texts t WHERE t.message_id = messages.id AND t.kind <> 'marketing'))",
-                    )
-                        .bind(run.profile_id)
-                        .bind(&node.kind)
-                        .bind(hours as i32)
-                        .fetch_one(&state.db)
-                        .await?;
+                let recent: bool = hours > 0 && crate::features::sendtime::recently_messaged(&state.db, run.profile_id, &node.kind, hours).await?;
                 if !recent {
                     let event = context.get("event").cloned();
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));

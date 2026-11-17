@@ -7,7 +7,8 @@
 //! stores the text and applies its effect on consent in one transaction ([`store::receive`]:
 //! opt-outs first and always), then runs what follows ([`process`]): events, HELP, double
 //! opt-in, keywords, automatic replies and waiting flows. Every text that goes out passes
-//! [`store::claim_send`] just before the provider call, so an opt-out that committed first wins.
+//! the claim in `sending::claim_text` just before the provider call (under the lock an inbound
+//! opt-out takes, with [`store::reply_allowed`] for replies), so an opt-out that committed first wins.
 
 mod api;
 pub mod conversations;
@@ -25,7 +26,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub use store::{claim_send, record_sent, replied_between, Inbound, Received};
+pub use store::{record_sent, replied_between, Inbound, Received};
 pub use verify::Proof;
 
 use super::{Feature, McpDoc};

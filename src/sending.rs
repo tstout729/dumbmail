@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::audience::{record_event, NewEvent};
 use crate::error::{AppError, AppResult};
-use crate::models::{Account, Profile};
+use crate::models::{normalize_phone, Account, Profile};
 use crate::providers::email::OutgoingEmail;
 use crate::providers::sms::OutgoingSms;
 use crate::render::{self, EmailContent, SmsContent, Tracking};
@@ -54,6 +54,56 @@ pub(crate) async fn throttle(channel: &'static str, per_sec: f64) {
     };
     if !wait.is_zero() {
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// How long a claimed text may wait on the provider before it counts as failed (not sent again).
+pub const SMS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Test hook: hold an account's texts right after their rate-limiter wait, so a test can land an
+/// opt-out exactly there. Never set outside tests.
+#[doc(hidden)]
+pub struct LimiterPause {
+    arrived: tokio::sync::Semaphore,
+    go: tokio::sync::Semaphore,
+}
+
+static LIMITER_PAUSES: Lazy<std::sync::Mutex<HashMap<Uuid, std::sync::Arc<LimiterPause>>>> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+impl LimiterPause {
+    /// Hold every text this account sends after its limiter wait until [`LimiterPause::release`].
+    #[doc(hidden)]
+    pub fn hold(account_id: Uuid) -> std::sync::Arc<Self> {
+        let p = std::sync::Arc::new(Self { arrived: tokio::sync::Semaphore::new(0), go: tokio::sync::Semaphore::new(0) });
+        if let Ok(mut m) = LIMITER_PAUSES.lock() {
+            m.insert(account_id, p.clone());
+        }
+        p
+    }
+
+    /// Wait until a text is being held.
+    pub async fn arrived(&self) {
+        if let Ok(permit) = self.arrived.acquire().await {
+            permit.forget();
+        }
+    }
+
+    /// Let held texts go, and stop holding this account's texts.
+    pub fn release(&self, account_id: Uuid) {
+        if let Ok(mut m) = LIMITER_PAUSES.lock() {
+            m.remove(&account_id);
+        }
+        self.go.add_permits(1000);
+    }
+}
+
+async fn limiter_pause(account_id: Uuid) {
+    let pause = LIMITER_PAUSES.lock().ok().and_then(|m| m.get(&account_id).cloned());
+    if let Some(p) = pause {
+        p.arrived.add_permits(1);
+        if let Ok(permit) = p.go.acquire().await {
+            permit.forget();
+        }
     }
 }
 
@@ -122,6 +172,8 @@ pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversat
 
 async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
     let p = spec.profile;
+    // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
+    let mut send_note: Option<String> = None;
     let to = match spec.channel {
         "email" => {
             // `pending`: a double opt-in sign-up that hasn't confirmed gets nothing until it does.
@@ -144,18 +196,55 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             if p.sms_consent == "unsubscribed" && c.kind != "help" {
                 return Ok(Outcome::Skipped("texted STOP"));
             }
-            Some(c.to.clone())
+            normalize_phone(&c.to)
         }
         "sms" => {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
+            // Quiet hours in the recipient's own time zone: their phone number's (the account's when we can't tell).
             if !spec.is_test {
-                if let Some(until) = sms_quiet_until(spec.account, Utc::now()) {
+                let hours = crate::features::sendtime::sms_hours(&state.db, spec.account, p, Utc::now()).await?;
+                if hours.skip {
+                    let why = "time zones disagree";
+                    match spec.message_id {
+                        Some(mid) => {
+                            sqlx::query("UPDATE messages SET send_note = $2 WHERE id = $1").bind(mid).bind(&hours.note).execute(&state.db).await?;
+                        }
+                        None => {
+                            sqlx::query(
+                                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error, send_note)
+                                 VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, 'skipped', $8, $9)",
+                            )
+                            .bind(Uuid::now_v7())
+                            .bind(spec.account.id)
+                            .bind(p.id)
+                            .bind(spec.campaign_id)
+                            .bind(spec.flow_id)
+                            .bind(spec.flow_node_id)
+                            .bind(p.phone_number.as_deref().unwrap_or_default())
+                            .bind(why)
+                            .bind(&hours.note)
+                            .execute(&state.db)
+                            .await?;
+                        }
+                    }
+                    return Ok(Outcome::Skipped(why));
+                }
+                if let Some(until) = hours.wait {
                     return Ok(Outcome::Deferred(until));
                 }
+                send_note = hours.note;
             }
-            spec.to_override.clone().or_else(|| p.phone_number.clone())
+            // One form of the number for the opt-out check, the lock and the provider alike.
+            match spec.to_override.as_deref().or(p.phone_number.as_deref()) {
+                Some(raw) => match normalize_phone(raw) {
+                    Some(n) => Some(n),
+                    None if spec.is_test => return Err(AppError::bad(format!("{raw:?} isn't a phone number (use +15035550100)"))),
+                    None => return Ok(Outcome::Skipped("not a phone number")),
+                },
+                None => None,
+            }
         }
         _ => return Err(AppError::bad("channel must be email or sms")),
     };
@@ -272,8 +361,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
 
     if spec.message_id.is_none() {
         sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -285,38 +374,73 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&to)
         .bind(&subject)
         .bind(spec.is_test)
+        .bind(&send_note)
         .execute(&state.db)
         .await?;
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3 WHERE id = $1")
+        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note) WHERE id = $1")
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
+            .bind(&send_note)
             .execute(&state.db)
             .await?;
     }
 
-    // The last check before the provider, under the same lock an inbound STOP takes: an opt-out
-    // that committed first always wins, on every path (campaigns, flows, replies, automatic texts).
-    if let Rendered::Sms(s, _, _) = &rendered {
-        if let Err(why) = crate::features::inbox::claim_send(&state.db, spec.account.id, p.id, &s.to, &s.from, spec.is_test, conversational).await? {
-            sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1").bind(message_id).bind(why).execute(&state.db).await?;
-            return Ok(Outcome::Skipped(why));
+    match &rendered {
+        Rendered::Email(_) => throttle_email(state).await,
+        Rendered::Sms(..) => {
+            throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
+            limiter_pause(spec.account.id).await;
         }
+    }
+    // An opt-out, a cancel, a pause or (texts) the closing of the window can land while waiting for a
+    // slot: check again right before the hand-off. A text is checked and claimed in one short
+    // transaction under the same lock an inbound STOP takes (tests too: a test can't reach a number
+    // that opted out), so an opt-out that committed first always wins and nothing can mark it
+    // skipped after it's handed over.
+    let stop = match &rendered {
+        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id).await?,
+        Rendered::Email(_) => None,
+    };
+    if let Some(stop) = stop {
+        if limited {
+            crate::deliverability::return_daily_slot(state, spec.account.id);
+        }
+        return match stop {
+            Stop::Defer(until) => {
+                if spec.message_id.is_none() {
+                    // A flow re-runs this step then and creates a new message.
+                    sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id).execute(&state.db).await?;
+                }
+                Ok(Outcome::Deferred(until))
+            }
+            Stop::Skip(why, note) => {
+                // A text's claim already recorded why (without overwriting a STOP's mark).
+                if spec.channel == "email" {
+                    sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1")
+                        .bind(message_id)
+                        .bind(why)
+                        .bind(note)
+                        .execute(&state.db)
+                        .await?;
+                }
+                Ok(Outcome::Skipped(why))
+            }
+        };
     }
     // Keep the text as sent, so the SMS inbox can show campaign, flow and reply texts in each thread.
     if let (Rendered::Sms(s, _, _), false) = (&rendered, spec.is_test) {
         crate::features::inbox::record_sent(&state.db, spec.account.id, p.id, message_id, &s.body, s.media_url.as_deref(), conversational).await?;
     }
     let result = match &rendered {
-        Rendered::Email(e) => {
-            throttle_email(state).await;
-            state.email.send(e).await
-        }
-        Rendered::Sms(s, provider, _) => {
-            throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
-            provider.send(s).await
-        }
+        Rendered::Email(e) => state.email.send(e).await,
+        // Bounded, so a claimed text never waits on the provider indefinitely.
+        Rendered::Sms(s, provider, _) => match tokio::time::timeout(SMS_PROVIDER_TIMEOUT, provider.send(s)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("the texting provider didn't answer within {} seconds; not sent again", SMS_PROVIDER_TIMEOUT.as_secs())),
+        },
     };
     match result {
         Ok(provider_id) => {
@@ -325,14 +449,18 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 Rendered::Email(e) => crate::features::reports::delivery::sender_domain(&e.from_email),
                 Rendered::Sms(..) => None,
             };
-            sqlx::query("UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4, from_domain = $5 WHERE id = $1")
-                .bind(message_id)
-                .bind(&provider_id)
-                .bind(segments as i32)
-                .bind(cost)
-                .bind(from_domain)
-                .execute(&state.db)
-                .await?;
+            // A text's result is written only over its own claim ('sending'), never over another mark.
+            sqlx::query(
+                "UPDATE messages SET status = 'sent', provider_message_id = $2, sent_at = now(), error = NULL, segments = $3, cost_micros = $4, from_domain = $5
+                 WHERE id = $1 AND (channel <> 'sms' OR status = 'sending')",
+            )
+            .bind(message_id)
+            .bind(&provider_id)
+            .bind(segments as i32)
+            .bind(cost)
+            .bind(from_domain)
+            .execute(&state.db)
+            .await?;
             if limited {
                 crate::deliverability::record_send(&state.db, message_id, &provider_id, spec.account.id, spec.campaign_id).await?;
                 crate::deliverability::complete_daily_slot(state, spec.account.id);
@@ -345,7 +473,10 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                         account_id: spec.account.id,
                         profile_id: p.id,
                         metric,
-                        properties: json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        properties: match &send_note {
+                            Some(note) => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id, "time_zone_note": note}),
+                            None => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        },
                         value: None,
                         occurred_at: None,
                         unique_id: Some(message_id.to_string()),
@@ -376,7 +507,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             }
             let msg = format!("{e:#}");
             tracing::warn!(message = %message_id, error = %msg, "send failed");
-            sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1")
+            sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1 AND (channel <> 'sms' OR status = 'sending')")
                 .bind(message_id)
                 .bind(&msg)
                 .execute(&state.db)
@@ -384,6 +515,138 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             Ok(Outcome::Failed(msg))
         }
     }
+}
+
+/// Why a message stops at the last check: skipped (with a note for the message), or deferred.
+enum Stop {
+    Skip(&'static str, Option<String>),
+    Defer(DateTime<Utc>),
+}
+
+/// The last check before the provider call, in one query against the current state: the person's
+/// consent and suppression for the channel, the account's email pause, the campaign's status, and for
+/// texts the whole quiet-hours decision. None: send it.
+async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
+                CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
+                (SELECT c.status FROM campaigns c WHERE c.id = $2),
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict
+         FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
+         WHERE p.id = $1",
+    )
+    .bind(profile_id)
+    .bind(campaign_id)
+    .bind(channel)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict)) = row else {
+        return Ok(Some(Stop::Skip("profile deleted", None)));
+    };
+    match campaign.as_deref() {
+        _ if campaign_id.is_none() => {}
+        Some("sending") => {}
+        Some("cancelled") | None => return Ok(Some(Stop::Skip("campaign cancelled", None))),
+        Some(_) => return Ok(Some(Stop::Skip("campaign stopped", None))),
+    }
+    if channel == "email" {
+        if email.is_none() || email_consent == "unsubscribed" || email_consent == "pending" {
+            return Ok(Some(Stop::Skip("not emailable", None)));
+        }
+        if suppressed {
+            return Ok(Some(Stop::Skip("suppressed", None)));
+        }
+        if paused {
+            return Ok(Some(Stop::Skip("sending paused", None)));
+        }
+        return Ok(None);
+    }
+    Ok(marketing_text_stop(account, &sms_consent, phone.as_deref(), props.as_ref(), start, end, conflict.as_deref()))
+}
+
+/// A marketing text's consent and the whole quiet-hours decision, from the current row.
+fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>, props: Option<&Value>, start: Option<i32>, end: Option<i32>, conflict: Option<&str>) -> Option<Stop> {
+    if sms_consent != "subscribed" || phone.is_none() {
+        return Some(Stop::Skip("no sms consent", None));
+    }
+    let ((s, e), skip_conflicts) = crate::features::sendtime::settings::window_from(start.zip(end), conflict);
+    let zones = crate::features::sendtime::settings::sms_zones(props.unwrap_or(&Value::Null), phone, account_tz(account));
+    let hours = crate::features::sendtime::settings::decide(&zones, Utc::now(), s, e, skip_conflicts);
+    if hours.skip {
+        return Some(Stop::Skip("time zones disagree", hours.note));
+    }
+    hours.wait.map(Stop::Defer)
+}
+
+/// The last check before a text goes to the provider, and its claim, in one short transaction under
+/// the lock an inbound opt-out takes for this number (see `features::inbox`): the number hasn't
+/// opted out, the campaign is still sending, and then either the marketing rules (consent, quiet
+/// hours; not for tests) or the inbox's reply rules. If it may go, the message is claimed
+/// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
+/// settled it. None: claimed, send it.
+async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>) -> AppResult<Option<Stop>> {
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>);
+    let account = spec.account;
+    let mut tx = state.db.begin().await?;
+    crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
+    let ours = conversational.map(|_| from);
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start): Row = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
+                p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
+                $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
+                (SELECT max(i.provider_received_at) FROM sms_inbound i
+                  WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {})
+         FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
+         WHERE a.id = $1",
+        crate::features::inbox::store::NO_WINDOW_KINDS
+    ))
+    .bind(account.id)
+    .bind(spec.profile.id)
+    .bind(to)
+    .bind(spec.campaign_id)
+    .bind(ours)
+    .fetch_one(&mut *tx)
+    .await?;
+    let help = conversational.is_some_and(|c| c.kind == "help");
+    let stop = if opted_out && !help {
+        Some(Stop::Skip("opted out", None))
+    } else if consent.is_none() {
+        Some(Stop::Skip("profile deleted", None))
+    } else if spec.campaign_id.is_some() && campaign.as_deref() != Some("sending") {
+        Some(Stop::Skip(if matches!(campaign.as_deref(), Some("cancelled") | None) { "campaign cancelled" } else { "campaign stopped" }, None))
+    } else if let Some(c) = conversational {
+        crate::features::inbox::store::reply_allowed(c, consent.as_deref().unwrap_or_default(), phone.as_deref(), from_ours, window_start, Utc::now()).err().map(|why| Stop::Skip(why, None))
+    } else if spec.is_test {
+        None
+    } else {
+        marketing_text_stop(account, consent.as_deref().unwrap_or_default(), phone.as_deref(), props.as_ref(), start, end, conflict.as_deref())
+    };
+    match &stop {
+        Some(Stop::Skip(why, note)) => {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1 AND status IN ('queued', 'sending')")
+                .bind(message_id)
+                .bind(why)
+                .bind(note)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Some(Stop::Defer(_)) => {}
+        None => {
+            let claimed: Option<Uuid> =
+                sqlx::query_scalar("UPDATE messages SET status = 'sending', claimed_at = COALESCE(claimed_at, now()) WHERE id = $1 AND status IN ('queued', 'sending') RETURNING id")
+                    .bind(message_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if claimed.is_none() {
+                tx.commit().await?;
+                return Ok(Some(Stop::Skip("no longer queued", None)));
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(stop)
 }
 
 #[cfg(test)]
