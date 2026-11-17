@@ -1,8 +1,9 @@
+import { useCan } from "../team/api";
 import { useUnread } from "./api";
 
 /** The sidebar's unread count: conversations with texts nobody has read yet. */
 export function UnreadBadge() {
-  const unread = useUnread();
+  const unread = useUnread(useCan("profiles.read"));
   const n = unread.data?.conversations ?? 0;
   if (n === 0) return null;
   return (

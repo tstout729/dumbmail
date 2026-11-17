@@ -5,6 +5,7 @@ import { errorMessage, useProfile, useSession } from "../../api";
 import { Badge, Button, InlineError, Notice, Select, Skeleton, StatusBadge, Textarea, cx, type Tone } from "../../components/ui";
 import { formatDateTime, formatPhone, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { useCan } from "../team/api";
 import { useConversation, usePreviewReply, useSavedReplies, useSendReply, useSetConversationStatus } from "./api";
 import { personLabel } from "./InboxPage";
 import type { ConversationDetail, ThreadMessage } from "./types";
@@ -48,6 +49,7 @@ type ThreadViewProps = { id: string; detail: ConversationDetail; onShowOlder: ((
 function ThreadView({ id, detail, onShowOlder, loadingOlder }: ThreadViewProps) {
   const { conversation, reply, messages } = detail;
   const setStatus = useSetConversationStatus();
+  const canSend = useCan("campaigns.send");
   const p = conversation.profile;
   const closed = conversation.status === "closed";
   // Newest first from the API; the column is reversed so it opens scrolled to the newest text.
@@ -68,15 +70,17 @@ function ThreadView({ id, detail, onShowOlder, loadingOlder }: ThreadViewProps) 
             <Link to={`/audience/profiles/${p.id}`} className="inline-flex items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 xl:hidden">
               <User className="size-3.5" /> Profile
             </Link>
-            <Button
-              size="sm"
-              variant={closed ? "secondary" : "primary"}
-              icon={closed ? <RotateCcw className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
-              loading={setStatus.isPending}
-              onClick={() => setStatus.mutate({ id, status: closed ? "open" : "closed" }, { onSuccess: () => toast.success(closed ? "Reopened" : "Closed") })}
-            >
-              {closed ? "Reopen" : "Close"}
-            </Button>
+            {canSend ? (
+              <Button
+                size="sm"
+                variant={closed ? "secondary" : "primary"}
+                icon={closed ? <RotateCcw className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
+                loading={setStatus.isPending}
+                onClick={() => setStatus.mutate({ id, status: closed ? "open" : "closed" }, { onSuccess: () => toast.success(closed ? "Reopened" : "Closed") })}
+              >
+                {closed ? "Reopen" : "Close"}
+              </Button>
+            ) : null}
           </div>
         </header>
         <div className="flex min-h-0 flex-1 flex-col-reverse gap-3 overflow-y-auto px-4 py-4" aria-label="Messages" role="log">
@@ -181,6 +185,19 @@ function Bubble({ m }: { m: ThreadMessage }) {
 }
 
 function ReplyBox({ id, reply }: { id: string; reply: ConversationDetail["reply"] }) {
+  if (!useCan("campaigns.send")) {
+    return (
+      <div className="border-t border-zinc-100 p-3">
+        <Notice tone="gray" title="Your role can't reply to texts">
+          Owners, admins and managers can reply. You can still read the conversation.
+        </Notice>
+      </div>
+    );
+  }
+  return <ReplyComposer id={id} reply={reply} />;
+}
+
+function ReplyComposer({ id, reply }: { id: string; reply: ConversationDetail["reply"] }) {
   const { account } = useSession();
   const [body, setBody] = useState("");
   const saved = useSavedReplies();

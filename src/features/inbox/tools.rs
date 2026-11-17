@@ -100,7 +100,10 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
         .await,
         "send_sms_reply" => async {
             let body = a["body"].as_str().unwrap_or_default();
-            replies::send_reply(state, acct, uuid_arg(a, "conversation_id")?, body, ctx.user_id, a["confirm"].as_bool() == Some(true)).await
+            let id = uuid_arg(a, "conversation_id")?;
+            let out = replies::send_reply(state, acct, id, body, ctx.user_id, a["confirm"].as_bool() == Some(true)).await?;
+            super::audit::reply(state, ctx, id, &out).await;
+            Ok(out)
         }
         .await,
         "close_conversation" => async {
@@ -121,7 +124,9 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
                 Some(_) => Some(uuid_arg(a, "id")?),
                 None => None,
             };
-            Ok(json!(keywords::upsert(&state.db, &account, id, &without(a, &["id"])).await?))
+            let k = keywords::upsert(&state.db, &account, id, &without(a, &["id"])).await?;
+            super::audit::keyword(state, ctx, if id.is_some() { "sms_keyword.update" } else { "sms_keyword.create" }, &k).await;
+            Ok(json!(k))
         }
         .await,
         "delete_sms_keyword" => async {
@@ -130,6 +135,7 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
                 return Ok(json!({"dry_run": true, "note": "Nothing deleted. Texts with this word will become ordinary messages. Call again with confirm=true once the user approves."}));
             }
             keywords::delete(&state.db, acct, id).await?;
+            super::audit::keyword_deleted(state, ctx, id).await;
             Ok(json!({"ok": true}))
         }
         .await,
@@ -152,11 +158,12 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<
             Ok(json!({"ok": true}))
         }
         .await,
-        "get_sms_inbox_settings" => settings::settings_json(state, acct).await,
+        "get_sms_inbox_settings" => settings::settings_json(state, ctx).await,
         "update_sms_inbox_settings" => async {
             let account = crate::campaigns::load_account(&state.db, acct).await?;
-            settings::update_all(state, &account, a).await?;
-            settings::settings_json(state, acct).await
+            settings::update_all(state, ctx, &account, a).await?;
+            super::audit::settings(state, ctx, a).await;
+            settings::settings_json(state, ctx).await
         }
         .await,
         _ => return None,

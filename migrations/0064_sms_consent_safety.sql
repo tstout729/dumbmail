@@ -109,3 +109,12 @@ CREATE TABLE sms_consents (
 
 CREATE INDEX sms_consents_profile ON sms_consents (profile_id, created_at DESC);
 CREATE UNIQUE INDEX sms_consents_confirmation ON sms_consents (confirmation_message_id);
+
+-- Operator alerts for an opt-out that couldn't be recorded because several accounts claim the
+-- number it was sent to: at most one per number per day (Pacific), enforced by this key.
+CREATE TABLE sms_claim_conflict_alerts (
+    our_number text NOT NULL,
+    day date NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (our_number, day)
+);

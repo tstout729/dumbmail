@@ -78,7 +78,9 @@ struct ReplyBody {
 }
 
 async fn reply_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ReplyBody>) -> AppResult<Json<Value>> {
-    Ok(Json(replies::send_reply(&state, ctx.account_id, id, &b.body, ctx.user_id, b.confirm).await?))
+    let out = replies::send_reply(&state, ctx.account_id, id, &b.body, ctx.user_id, b.confirm).await?;
+    super::audit::reply(&state, &ctx, id, &out).await;
+    Ok(Json(out))
 }
 
 async fn keywords_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -89,16 +91,21 @@ async fn keywords_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<V
 
 async fn create_keyword_h(State(state): State<AppState>, ctx: Ctx, ApiJson(v): ApiJson<Value>) -> AppResult<Json<Value>> {
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    Ok(Json(json!(keywords::upsert(&state.db, &account, None, &v).await?)))
+    let k = keywords::upsert(&state.db, &account, None, &v).await?;
+    super::audit::keyword(&state, &ctx, "sms_keyword.create", &k).await;
+    Ok(Json(json!(k)))
 }
 
 async fn update_keyword_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(v): ApiJson<Value>) -> AppResult<Json<Value>> {
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    Ok(Json(json!(keywords::upsert(&state.db, &account, Some(id), &v).await?)))
+    let k = keywords::upsert(&state.db, &account, Some(id), &v).await?;
+    super::audit::keyword(&state, &ctx, "sms_keyword.update", &k).await;
+    Ok(Json(json!(k)))
 }
 
 async fn delete_keyword_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     keywords::delete(&state.db, ctx.account_id, id).await?;
+    super::audit::keyword_deleted(&state, &ctx, id).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -124,13 +131,14 @@ async fn delete_saved_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
 }
 
 async fn settings_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(settings::settings_json(&state, ctx.account_id).await?))
+    Ok(Json(settings::settings_json(&state, &ctx).await?))
 }
 
 async fn update_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(v): ApiJson<Value>) -> AppResult<Json<Value>> {
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    settings::update_all(&state, &account, &v).await?;
-    Ok(Json(settings::settings_json(&state, ctx.account_id).await?))
+    settings::update_all(&state, &ctx, &account, &v).await?;
+    super::audit::settings(&state, &ctx, &v).await;
+    Ok(Json(settings::settings_json(&state, &ctx).await?))
 }
 
 /// An image someone texted in. Only signed-in members of the account can see it.

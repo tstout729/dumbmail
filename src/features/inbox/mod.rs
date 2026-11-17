@@ -31,6 +31,7 @@ pub use verify::Proof;
 
 use super::{Feature, McpDoc};
 use crate::auth::Ctx;
+use crate::features::team::access::{rule, Access, Perm, RouteRule, ToolRule};
 use crate::audience::{self, NewEvent};
 use crate::error::AppResult;
 use crate::models::normalize_phone;
@@ -72,6 +73,10 @@ pub async fn inbound(state: &AppState, scope: Option<Uuid>, msg: &Inbound, proof
         }
         many => {
             tracing::error!(provider = msg.provider, message, to = %to, accounts = many.len(), "inbound text for a number several accounts claim; nothing stored in any");
+            if stop {
+                let ids: Vec<Uuid> = many.iter().map(|(id, _, _)| *id).collect();
+                claim_conflict_alert(state, &to, &ids).await;
+            }
             return Ok(());
         }
     };
@@ -106,6 +111,50 @@ pub async fn inbound(state: &AppState, scope: Option<Uuid>, msg: &Inbound, proof
         return Ok(());
     }
     process(state, &rx).await
+}
+
+/// An opt-out was dropped because several accounts claim the number it was sent to: tell the
+/// operator, at most once per number per day. The claim and the job that emails are written
+/// together; anything that goes wrong is only logged, so the webhook still answers 200.
+async fn claim_conflict_alert(state: &AppState, our_number: &str, accounts: &[Uuid]) {
+    let run = async {
+        let mut tx = state.db.begin().await?;
+        let fresh = sqlx::query(
+            "INSERT INTO sms_claim_conflict_alerts (our_number, day) VALUES ($1, (now() AT TIME ZONE 'America/Los_Angeles')::date) ON CONFLICT DO NOTHING",
+        )
+        .bind(our_number)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if fresh {
+            let ids: Vec<Uuid> = accounts.iter().take(20).copied().collect();
+            crate::jobs::enqueue(&mut *tx, "inbox_claim_conflict_alert", json!({"our_number": our_number, "accounts": ids, "count": accounts.len()}), None).await?;
+        }
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    };
+    if let Err(e) = run.await {
+        tracing::error!(to = %our_number, error = %e, "couldn't queue the operator alert for a number several accounts claim");
+    }
+}
+
+/// The job behind [`claim_conflict_alert`]: the number and the account ids, nothing else.
+async fn send_claim_conflict_alert(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let number = payload["our_number"].as_str().unwrap_or_default();
+    let ids: Vec<Uuid> = payload["accounts"].as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse().ok()).collect();
+    let count = payload["count"].as_u64().unwrap_or(ids.len() as u64);
+    let list = ids.iter().map(|id| format!("  {id}")).collect::<Vec<_>>().join("\n");
+    let more = if count > ids.len() as u64 { format!("\n  … and {} more", count - ids.len() as u64) } else { String::new() };
+    let text = format!(
+        "Someone texted STOP (or another opt-out) to {number}, but {count} accounts claim that number, so the opt-out wasn't recorded in any of them.\n\
+         They may still get texts from this number until it belongs to one account. Release it from the accounts that shouldn't have it (their phone numbers, or the number set as their SMS sender).\n\n\
+         Number: {number}\nAccounts:\n{list}{more}\n\n\
+         This alert is sent at most once a day for each number."
+    );
+    let first = ids.first().copied().unwrap_or_default();
+    crate::deliverability::email_operator(state, first, &format!("Opt-out not recorded: {number} is claimed by several accounts"), text).await;
+    Ok(())
 }
 
 /// Everything after a text is stored. Each step is idempotent, so a provider retry of a text that
@@ -173,10 +222,90 @@ async fn consent_event(state: &AppState, rx: &Received, metric: &str, properties
     Ok(())
 }
 
+// Reading conversations and inbound texts is reading people's data. Replying (and closing a
+// conversation, which is part of answering it) needs the send permission; saved replies are the
+// replier's, so changing them does too. Keywords and inbox settings (automatic replies, HELP,
+// budgets) are Managers and up; the Telnyx signing key in the settings also needs the SMS
+// connection's permission (checked in `settings::update_all`).
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/inbox/conversations", Perm::ProfilesRead),
+    rule("GET", "/api/inbox/unread", Perm::ProfilesRead),
+    rule("GET", "/api/inbox/conversations/{id}", Perm::ProfilesRead),
+    rule("POST", "/api/inbox/conversations/{id}/read", Perm::ProfilesRead),
+    rule("POST", "/api/inbox/conversations/{id}/status", Perm::CampaignSend),
+    rule("POST", "/api/inbox/conversations/{id}/reply", Perm::CampaignSend),
+    rule("GET", "/api/inbox/profiles/{profile_id}", Perm::ProfilesRead),
+    rule("GET", "/api/inbox/media/{id}", Perm::ProfilesRead),
+    rule("GET", "/api/inbox/keywords", Perm::AccountRead),
+    rule("POST", "/api/inbox/keywords", Perm::SettingsWrite),
+    rule("PATCH", "/api/inbox/keywords/{id}", Perm::SettingsWrite),
+    rule("DELETE", "/api/inbox/keywords/{id}", Perm::SettingsWrite),
+    rule("GET", "/api/inbox/saved-replies", Perm::MessagingRead),
+    rule("POST", "/api/inbox/saved-replies", Perm::CampaignSend),
+    rule("PATCH", "/api/inbox/saved-replies/{id}", Perm::CampaignSend),
+    rule("DELETE", "/api/inbox/saved-replies/{id}", Perm::CampaignManage),
+    rule("GET", "/api/inbox/settings", Perm::AccountRead),
+    rule("PATCH", "/api/inbox/settings", Perm::SettingsWrite),
+];
+
+static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_conversations", perm: Perm::ProfilesRead },
+    ToolRule { name: "get_conversation", perm: Perm::ProfilesRead },
+    ToolRule { name: "mark_conversation_read", perm: Perm::ProfilesRead },
+    ToolRule { name: "send_sms_reply", perm: Perm::CampaignSend },
+    ToolRule { name: "close_conversation", perm: Perm::CampaignSend },
+    ToolRule { name: "list_sms_keywords", perm: Perm::AccountRead },
+    ToolRule { name: "upsert_sms_keyword", perm: Perm::SettingsWrite },
+    ToolRule { name: "delete_sms_keyword", perm: Perm::SettingsWrite },
+    ToolRule { name: "list_saved_replies", perm: Perm::MessagingRead },
+    ToolRule { name: "upsert_saved_reply", perm: Perm::CampaignSend },
+    ToolRule { name: "delete_saved_reply", perm: Perm::CampaignManage },
+    ToolRule { name: "get_sms_inbox_settings", perm: Perm::AccountRead },
+    ToolRule { name: "update_sms_inbox_settings", perm: Perm::SettingsWrite },
+];
+
+/// Audit entries, shared by the REST routes and the MCP tools. Fixed fields only: never the text
+/// of a message or a reply.
+pub(crate) mod audit {
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    use super::keywords::Keyword;
+    use crate::auth::Ctx;
+    use crate::features::team;
+    use crate::state::AppState;
+
+    /// Which settings changed (their names, already checked against the known list).
+    pub async fn settings(state: &AppState, ctx: &Ctx, patch: &Value) {
+        let mut fields: Vec<&str> = patch.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        fields.sort_unstable();
+        team::audit(state, ctx, "sms_inbox.settings_change", None, json!({"fields": fields})).await;
+    }
+
+    pub async fn keyword(state: &AppState, ctx: &Ctx, action: &str, k: &Keyword) {
+        team::audit(state, ctx, action, Some(&k.id.to_string()), json!({"word": k.keyword, "enabled": k.enabled, "subscribe": k.subscribe})).await;
+    }
+
+    pub async fn keyword_deleted(state: &AppState, ctx: &Ctx, id: Uuid) {
+        team::audit(state, ctx, "sms_keyword.delete", Some(&id.to_string()), json!({})).await;
+    }
+
+    /// A reply that went out (not dry runs).
+    pub async fn reply(state: &AppState, ctx: &Ctx, conversation_id: Uuid, out: &Value) {
+        if out["sent"] == true {
+            team::audit(state, ctx, "sms_reply.send", Some(&conversation_id.to_string()), json!({"message_id": out["message_id"]})).await;
+        }
+    }
+}
+
 #[async_trait]
 impl Feature for Module {
     fn name(&self) -> &'static str {
         "inbox"
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOLS }
     }
 
     fn routes(&self) -> Router<AppState> {
@@ -205,6 +334,7 @@ impl Feature for Module {
             "inbox_media" => Some(notify::copy_media(state, payload).await),
             "inbox_auto_send" => Some(replies::run_auto_send(state, payload).await),
             "inbox_digest" => Some(notify::send_digest(state, payload).await),
+            "inbox_claim_conflict_alert" => Some(send_claim_conflict_alert(state, payload).await),
             _ => None,
         }
     }
@@ -215,6 +345,7 @@ impl Feature for Module {
         }
         if tick.is_multiple_of(60) {
             sqlx::query("DELETE FROM sms_auto_budget WHERE hour < now() - interval '2 days'").execute(&state.db).await?;
+            sqlx::query("DELETE FROM sms_claim_conflict_alerts WHERE created_at < now() - interval '7 days'").execute(&state.db).await?;
         }
         Ok(())
     }

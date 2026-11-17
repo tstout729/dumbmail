@@ -3,6 +3,7 @@ import { Pencil, Plus, Trash2 } from "lucide-react";
 import { errorMessage, useSession } from "../../api";
 import { Button, Card, Checkbox, ConfirmDialog, EmptyState, Field, IconButton, InlineError, Input, Modal, Notice, Segmented, Select, Skeleton, Textarea, Toggle } from "../../components/ui";
 import { toast } from "../../lib/toast";
+import { useCan } from "../team/api";
 import { useDeleteSavedReply, useInboxSettings, useSaveInboxSettings, useSavedReplies, useSaveSavedReply } from "./api";
 import type { HelpReplies, InboxSettings, InboxSettingsPatch, SavedReply } from "./types";
 
@@ -31,6 +32,9 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
   const save = useSaveInboxSettings();
   const [s, setS] = useState(initial);
   const [telnyxKey, setTelnyxKey] = useState("");
+  const canEdit = useCan("settings.write");
+  // The signing key is part of the SMS connection, so it follows that permission.
+  const canSetKey = useCan("domains.manage");
   const set = (patch: Partial<InboxSettings>) => setS((v) => ({ ...v, ...patch }));
   const submit = () => {
     const patch: InboxSettingsPatch = {
@@ -57,7 +61,12 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
 
   const v = s.verification;
   return (
-    <>
+    <fieldset disabled={!canEdit} className="min-w-0 space-y-4">
+      {!canEdit ? (
+        <Notice tone="gray" title="Only owners, admins and managers can change these settings">
+          You can see how the inbox is set up.
+        </Notice>
+      ) : null}
       <Card title="Checking texts come from your provider">
         {v.configured ? (
           <Notice tone="green" title="Inbound texts are verified">
@@ -69,7 +78,7 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
             automatic reply, open the 24-hour reply window or start a flow, because anyone who learned your webhook address could fake one. {v.how}
           </Notice>
         )}
-        {v.provider === "telnyx" && (s.telnyx_public_key_hint !== null || !v.configured) ? (
+        {canSetKey && v.provider === "telnyx" && (s.telnyx_public_key_hint !== null || !v.configured) ? (
           <div className="mt-3">
             <Field
               label="Telnyx public key (your own Telnyx account only)"
@@ -208,12 +217,14 @@ function SettingsForm({ initial }: { initial: InboxSettings }) {
         </div>
       </Card>
       <InlineError message={save.error ? errorMessage(save.error) : null} />
-      <div className="flex justify-end">
-        <Button variant="primary" loading={save.isPending} onClick={submit}>
-          Save
-        </Button>
-      </div>
-    </>
+      {canEdit ? (
+        <div className="flex justify-end">
+          <Button variant="primary" loading={save.isPending} onClick={submit}>
+            Save
+          </Button>
+        </div>
+      ) : null}
+    </fieldset>
   );
 }
 
@@ -247,13 +258,17 @@ function SavedReplies() {
   const [editing, setEditing] = useState<SavedReply | "new" | null>(null);
   const [deleting, setDeleting] = useState<SavedReply | null>(null);
   const remove = useDeleteSavedReply();
+  const canEdit = useCan("campaigns.send");
+  const canDelete = useCan("campaigns.manage");
   return (
     <Card
       title="Saved replies"
       actions={
-        <Button size="sm" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
-          New saved reply
-        </Button>
+        canEdit ? (
+          <Button size="sm" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
+            New saved reply
+          </Button>
+        ) : null
       }
       padded={false}
     >
@@ -273,12 +288,16 @@ function SavedReplies() {
                 <div className="text-sm font-medium text-zinc-900">{r.name}</div>
                 <p className="line-clamp-2 text-xs text-zinc-500">{r.body}</p>
               </div>
-              <IconButton label={`Edit ${r.name}`} onClick={() => setEditing(r)}>
-                <Pencil className="size-3.5" />
-              </IconButton>
-              <IconButton label={`Delete ${r.name}`} onClick={() => setDeleting(r)}>
-                <Trash2 className="size-3.5" />
-              </IconButton>
+              {canEdit ? (
+                <IconButton label={`Edit ${r.name}`} onClick={() => setEditing(r)}>
+                  <Pencil className="size-3.5" />
+                </IconButton>
+              ) : null}
+              {canDelete ? (
+                <IconButton label={`Delete ${r.name}`} onClick={() => setDeleting(r)}>
+                  <Trash2 className="size-3.5" />
+                </IconButton>
+              ) : null}
             </li>
           ))}
         </ul>

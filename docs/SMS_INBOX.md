@@ -23,7 +23,9 @@ Everything here works in the dashboard (Inbox), the REST API (`/api/inbox/...`) 
    recorded when the number belongs to exactly one account and the address used is the platform's
    or that account's, even without a message id, a signing key or a matching connection. An
    opt-out is never written into several accounts: a number that several accounts claim is a setup
-   mistake to fix, and nothing is stored until it is.
+   mistake to fix, and nothing is stored until it is. When an opt-out is dropped that way, the
+   operator (`OPERATOR_ALERT_EMAIL`, or the support address) gets an email naming the number and
+   the account ids, at most once a day per number.
 3. **Opt-out is decided first**, before anything else looks at the text, and it errs toward opting
    out (see [Opting out](#opting-out)). The text is stored, and its effect on consent (an opt-out, or
    START lifting one) is written in the same transaction. A provider retry of the same text is
@@ -89,6 +91,8 @@ People who are not opted out and already have a profile can still text **START**
 subscribe, as before the inbox. **YES** and **Y** count only as the answer to a double opt-in prompt
 (see [Keywords](#keywords)); otherwise they're ordinary texts. **SUBSCRIBE** no longer subscribes
 anyone on its own: nobody is subscribed by a word that didn't answer a disclosed sign-up.
+A text of SUBSCRIBE is treated as an ordinary message and doesn't change anyone's consent; to let
+people sign up by text, make a keyword such as JOIN with `subscribe: true`.
 
 People who texted STOP before the inbox existed are protected as they were then: their profile's
 SMS consent is `unsubscribed`, so no marketing text reaches them. The carrier-level opt-out list
@@ -258,6 +262,22 @@ out as, so it can go at most once even if its job runs twice.
 
 **Email digests**: members in `notify_user_ids` get one email listing who texted, at most every 30
 minutes, not one email per text. The settings response lists the account's `members`.
+
+## Who can do what
+
+| What | Needs | Roles |
+| --- | --- | --- |
+| Read conversations, threads, attachments and the unread count; mark read | `profiles.read` | Owner, Admin, Manager, Analyst |
+| Reply, close or reopen a conversation, change saved replies | `campaigns.send` | Owner, Admin, Manager |
+| Delete a saved reply | `campaigns.manage` | Owner, Admin, Manager |
+| List saved replies | `messaging.read` | everyone |
+| Read keywords and inbox settings | `account.read` | everyone (the members list only for those who can see the team) |
+| Change or delete keywords, change inbox settings | `settings.write` | Owner, Admin, Manager |
+| Set or remove `telnyx_public_key` | `domains.manage` too, as for connecting a provider | Owner, Admin |
+
+API keys follow their scopes in the same way (for example, replying needs the `messaging` scope).
+Replies sent, keyword changes and settings changes are recorded in the audit log, without any
+message text.
 
 ## Flows
 

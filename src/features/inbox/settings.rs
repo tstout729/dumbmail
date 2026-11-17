@@ -6,7 +6,9 @@ use serde_json::{json, Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{self, Perm};
 use crate::models::Account;
 use crate::phone::ByoCredentials;
 use crate::state::AppState;
@@ -261,7 +263,12 @@ pub async fn update(db: &PgPool, account: &Account, patch: &Value) -> AppResult<
 
 /// Apply a settings change, including `telnyx_public_key` (saved with the account's own Telnyx
 /// connection, encrypted, and never shown again in full).
-pub async fn update_all(state: &AppState, account: &Account, patch: &Value) -> AppResult<Settings> {
+/// Change the settings `patch` names. The Telnyx signing key is part of the SMS connection, so
+/// changing it needs the permission that connecting a provider needs.
+pub async fn update_all(state: &AppState, ctx: &Ctx, account: &Account, patch: &Value) -> AppResult<Settings> {
+    if patch.get("telnyx_public_key").is_some() {
+        access::require(ctx, Perm::Domains)?;
+    }
     let mut patch = patch.clone();
     if let Some(key) = patch.as_object_mut().and_then(|o| o.remove("telnyx_public_key")) {
         let key = match key {
@@ -304,16 +311,21 @@ async fn telnyx_key_hint(state: &AppState, account_id: Uuid) -> AppResult<Option
     Ok(key.filter(|_| own).map(|k| format!("{}…", k.chars().take(6).collect::<String>())))
 }
 
-/// Settings plus the account's members (for choosing who gets digests) and whether inbound texts
-/// can be verified (keywords, automatic replies and reply windows need that).
-pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
+/// Settings plus the account's members (for choosing who gets digests; only for callers who may
+/// see the team) and whether inbound texts can be verified (keywords, automatic replies and reply
+/// windows need that).
+pub async fn settings_json(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
     let db = &state.db;
+    let account_id = ctx.account_id;
     let s = load(db, account_id).await?;
-    let members: Vec<(Uuid, String, Option<String>)> =
+    let members: Vec<(Uuid, String, Option<String>)> = if access::allows(ctx, Perm::TeamRead) {
         sqlx::query_as("SELECT u.id, u.email, u.name FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 100")
             .bind(account_id)
             .fetch_all(db)
-            .await?;
+            .await?
+    } else {
+        Vec::new()
+    };
     let mut v = serde_json::to_value(&s).unwrap_or_default();
     v["members"] = json!(members.iter().map(|(id, email, name)| json!({"id": id, "email": email, "name": name})).collect::<Vec<_>>());
     v["disclosure_ready"] = json!(!s.program_name.is_empty() && !s.message_frequency.is_empty());

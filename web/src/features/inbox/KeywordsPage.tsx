@@ -28,6 +28,7 @@ import {
   Th,
 } from "../../components/ui";
 import { toast } from "../../lib/toast";
+import { useCan } from "../team/api";
 import { useDeleteKeyword, useInboxSettings, useKeywords, useSaveKeyword } from "./api";
 import type { KeywordMatch, SmsKeyword } from "./types";
 
@@ -37,6 +38,7 @@ export function KeywordsPage() {
   const [editing, setEditing] = useState<SmsKeyword | "new" | null>(null);
   const [deleting, setDeleting] = useState<SmsKeyword | null>(null);
   const remove = useDeleteKeyword();
+  const canEdit = useCan("settings.write");
   const listName = (id: string | null) => (id ? (lists.data?.find((l) => l.id === id)?.name ?? "a list") : null);
 
   return (
@@ -46,9 +48,11 @@ export function KeywordsPage() {
         description="Words people can text you, like JOIN, and what each one does."
         breadcrumbs={[{ label: "Inbox", to: "/inbox" }]}
         actions={
-          <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
-            New keyword
-          </Button>
+          canEdit ? (
+            <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
+              New keyword
+            </Button>
+          ) : null
         }
       />
       <Table>
@@ -74,9 +78,11 @@ export function KeywordsPage() {
                 title="No keywords yet"
                 description="Add one like JOIN so people can sign up for texts, or HOURS to send your opening times."
                 action={
-                  <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
-                    New keyword
-                  </Button>
+                  canEdit ? (
+                    <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={() => setEditing("new")}>
+                      New keyword
+                    </Button>
+                  ) : null
                 }
               />
             </EmptyRow>
@@ -100,14 +106,16 @@ export function KeywordsPage() {
                   <StatusBadge status={k.enabled ? "active" : "paused"} label={k.enabled ? "On" : "Off"} />
                 </Td>
                 <Td className="text-right">
-                  <div className="flex justify-end gap-1">
-                    <IconButton label={`Edit ${k.keyword}`} onClick={() => setEditing(k)}>
-                      <Pencil className="size-3.5" />
-                    </IconButton>
-                    <IconButton label={`Delete ${k.keyword}`} onClick={() => setDeleting(k)}>
-                      <Trash2 className="size-3.5" />
-                    </IconButton>
-                  </div>
+                  {canEdit ? (
+                    <div className="flex justify-end gap-1">
+                      <IconButton label={`Edit ${k.keyword}`} onClick={() => setEditing(k)}>
+                        <Pencil className="size-3.5" />
+                      </IconButton>
+                      <IconButton label={`Delete ${k.keyword}`} onClick={() => setDeleting(k)}>
+                        <Trash2 className="size-3.5" />
+                      </IconButton>
+                    </div>
+                  ) : null}
                 </Td>
               </tr>
             ))

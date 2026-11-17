@@ -55,8 +55,8 @@ export function useConversation(id: string) {
   });
 }
 
-export function useUnread() {
-  return useQuery({ queryKey: inboxKeys.unread, queryFn: () => api<Unread>("GET", "/api/inbox/unread"), refetchInterval: 30_000 });
+export function useUnread(enabled = true) {
+  return useQuery({ queryKey: inboxKeys.unread, queryFn: () => api<Unread>("GET", "/api/inbox/unread"), refetchInterval: 30_000, enabled });
 }
 
 function refreshInbox(qc: QueryClient) {

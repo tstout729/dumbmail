@@ -4,6 +4,7 @@ import { Inbox, KeyRound, MessageSquare, Search, Settings2 } from "lucide-react"
 import { Button, ButtonLink, Checkbox, EmptyState, Input, Notice, Page, PageHeader, Segmented, Skeleton, cx } from "../../components/ui";
 import { useDebouncedValue } from "../../lib/hooks";
 import { formatPhone, formatRelative, fullName } from "../../lib/format";
+import { useCan } from "../team/api";
 import { useConversations, useInboxSettings, useMarkRead, type ConversationFilter } from "./api";
 import { Thread } from "./Thread";
 import type { Conversation, ConversationStatus } from "./types";
@@ -19,6 +20,7 @@ export function InboxPage() {
   const [search, setSearch] = useState("");
   const q = useDebouncedValue(search.trim(), 300);
   const filter: ConversationFilter = { status, unread, q };
+  const canRead = useCan("profiles.read");
 
   return (
     <Page wide>
@@ -36,40 +38,46 @@ export function InboxPage() {
           </>
         }
       />
-      <AutoPausedNotice />
-      <div className="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-9.5rem)] lg:min-h-[520px] lg:grid-cols-[340px_minmax(0,1fr)]">
-        <section className={cx("min-h-0 flex-col rounded-lg border border-zinc-200 bg-white shadow-xs", id ? "hidden lg:flex" : "flex")}>
-          <div className="space-y-2.5 border-b border-zinc-100 p-3">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-zinc-400" />
-              <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search names, numbers, texts" className="pl-8" aria-label="Search conversations" />
+      {canRead ? <AutoPausedNotice /> : null}
+      {!canRead ? (
+        <Notice tone="gray" title="Your role can't see texts">
+          Texts are people's own messages, so only roles that can see profiles can open the inbox. Ask an owner or admin if you need it.
+        </Notice>
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-9.5rem)] lg:min-h-[520px] lg:grid-cols-[340px_minmax(0,1fr)]">
+          <section className={cx("min-h-0 flex-col rounded-lg border border-zinc-200 bg-white shadow-xs", id ? "hidden lg:flex" : "flex")}>
+            <div className="space-y-2.5 border-b border-zinc-100 p-3">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-zinc-400" />
+                <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search names, numbers, texts" className="pl-8" aria-label="Search conversations" />
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Segmented
+                  size="sm"
+                  value={status}
+                  onChange={setStatus}
+                  options={[
+                    { value: "open", label: "Open" },
+                    { value: "closed", label: "Closed" },
+                    { value: "all", label: "All" },
+                  ]}
+                />
+                <Checkbox label="Unread only" checked={unread} onChange={(e) => setUnread(e.target.checked)} />
+              </div>
             </div>
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Segmented
-                size="sm"
-                value={status}
-                onChange={setStatus}
-                options={[
-                  { value: "open", label: "Open" },
-                  { value: "closed", label: "Closed" },
-                  { value: "all", label: "All" },
-                ]}
-              />
-              <Checkbox label="Unread only" checked={unread} onChange={(e) => setUnread(e.target.checked)} />
-            </div>
-          </div>
-          <ConversationList filter={filter} selected={id} />
-        </section>
-        <section className={cx("min-h-0", id ? "block" : "hidden lg:block")}>
-          {id ? (
-            <Thread key={id} id={id} />
-          ) : (
-            <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-white">
-              <EmptyState icon={<MessageSquare className="size-5" />} title="Pick a conversation" description="Choose someone on the left to read their texts and reply." />
-            </div>
-          )}
-        </section>
-      </div>
+            <ConversationList filter={filter} selected={id} />
+          </section>
+          <section className={cx("min-h-0", id ? "block" : "hidden lg:block")}>
+            {id ? (
+              <Thread key={id} id={id} />
+            ) : (
+              <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-zinc-200 bg-white">
+                <EmptyState icon={<MessageSquare className="size-5" />} title="Pick a conversation" description="Choose someone on the left to read their texts and reply." />
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </Page>
   );
 }

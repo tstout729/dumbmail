@@ -711,6 +711,14 @@ async fn unverified_texts_can_opt_out_but_nothing_else() {
     assert_eq!(telnyx_post(&h, &no_id_stop.replace(b, c2), false).await.0, StatusCode::OK);
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sms_opt_outs WHERE phone_number = $1").bind(c2).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(n, 0, "never written into several accounts");
+    // The operator hears about the dropped opt-out once that day, by number and account ids only.
+    h.drain().await;
+    let alerts: Vec<_> = h.state.email.sent().into_iter().filter(|m| m.to == "ops@pl.test" && m.subject.contains("Opt-out not recorded")).collect();
+    assert_eq!(alerts.len(), 1, "two opt-outs, one alert");
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE sms_from = $1").bind(&ours).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(alerts[0].subject.contains(&ours) && ids.iter().all(|id| alerts[0].text.contains(&id.to_string())), "{}", alerts[0].text);
+    assert!(!alerts[0].text.contains(c2) && !alerts[0].text.contains("Acme") && !alerts[0].text.contains("Else"), "{}", alerts[0].text);
     h.cleanup().await;
 }
 
@@ -1615,5 +1623,85 @@ async fn an_inbox_reply_doesnt_hold_the_next_campaign_text_but_quiet_hours_and_s
     assert_eq!(to_stopped, 0, "the STOP left them out");
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND to_address = $2 AND status = 'queued'").bind(&cid).bind(&night).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(held, 1, "held for their morning, not dropped");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn roles_decide_who_reads_replies_and_changes_settings() {
+    let mut h = signed!();
+    let ours = setup(&mut h).await;
+    let them = "+15035550931";
+    telnyx(&h, "perm-1", them, &ours, "Do you ship to Canada?").await;
+    let cid = h.ok("GET", "/api/inbox/conversations", None).await["data"][0]["id"].as_str().unwrap().to_string();
+    let acct: Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'Acme Goods'").fetch_one(&h.state.db).await.unwrap();
+    let reply = format!("/api/inbox/conversations/{cid}/reply");
+    let send = json!({"body": "Yes, we do.", "confirm": true});
+    async fn role(h: &Harness, account: Uuid, role: &str) {
+        sqlx::query("UPDATE memberships SET role = $2 WHERE account_id = $1").bind(account).bind(role).execute(&h.state.db).await.unwrap();
+    }
+
+    // Content: no texts (people's data), no replies, no settings changes; settings can be read.
+    role(&h, acct, "content").await;
+    for (m, p, b) in [
+        ("GET", "/api/inbox/conversations".to_string(), None),
+        ("GET", format!("/api/inbox/conversations/{cid}"), None),
+        ("GET", "/api/inbox/unread".to_string(), None),
+        ("POST", reply.clone(), Some(send.clone())),
+        ("POST", format!("/api/inbox/conversations/{cid}/status"), Some(json!({"status": "closed"}))),
+        ("POST", "/api/inbox/saved-replies".to_string(), Some(json!({"name": "Hours", "body": "9-5"}))),
+        ("POST", "/api/inbox/keywords".to_string(), Some(json!({"keyword": "HOURS", "reply": "9-5"}))),
+        ("PATCH", "/api/inbox/settings".to_string(), Some(json!({"default_reply_enabled": false}))),
+    ] {
+        let (s, v) = h.req(m, &p, b).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "content {m} {p}: {v}");
+    }
+    h.ok("GET", "/api/inbox/settings", None).await;
+    h.ok("GET", "/api/inbox/keywords", None).await;
+
+    // Analyst: reads texts and marks them read, but can't reply.
+    role(&h, acct, "analyst").await;
+    h.ok("GET", &format!("/api/inbox/conversations/{cid}"), None).await;
+    h.ok("POST", &format!("/api/inbox/conversations/{cid}/read"), Some(json!({}))).await;
+    assert_eq!(h.req("POST", &reply, Some(send.clone())).await.0, StatusCode::FORBIDDEN);
+    assert!(h.state.sms.sent().is_empty());
+
+    // Manager: replies and changes inbox settings, but not the provider's signing key.
+    role(&h, acct, "manager").await;
+    h.ok("PATCH", "/api/inbox/settings", Some(json!({"support_contact": "help@acme.test", "default_reply_enabled": false}))).await;
+    let (s, v) = h.req("PATCH", "/api/inbox/settings", Some(json!({"telnyx_public_key": null}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    let k = h.ok("POST", "/api/inbox/keywords", Some(json!({"keyword": "HOURS", "reply": "Open 9-5"}))).await;
+    h.ok("DELETE", &format!("/api/inbox/keywords/{}", k["id"].as_str().unwrap()), None).await;
+    assert_eq!(h.ok("POST", &reply, Some(send.clone())).await["sent"], true);
+    // A dry run isn't a send, so it isn't in the audit log.
+    h.ok("POST", &reply, Some(json!({"body": "Preview only"}))).await;
+    role(&h, acct, "owner").await;
+
+    // The audit log names what happened, never the text.
+    let log: Vec<(String, Option<String>, Value)> = sqlx::query_as("SELECT action, target, details FROM audit_log WHERE account_id = $1 AND action LIKE 'sms_%' ORDER BY created_at")
+        .bind(acct)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    let actions: Vec<&str> = log.iter().map(|(a, _, _)| a.as_str()).collect();
+    assert_eq!(actions, ["sms_inbox.settings_change", "sms_keyword.create", "sms_keyword.delete", "sms_reply.send"], "{log:?}");
+    assert_eq!(log[0].2["fields"], json!(["default_reply_enabled", "support_contact"]));
+    assert_eq!(log[1].2["word"], "hours");
+    assert_eq!(log[3].1.as_deref(), Some(cid.as_str()));
+    assert!(log[3].2["message_id"].is_string(), "{:?}", log[3]);
+    let all = format!("{log:?}");
+    assert!(!all.contains("Yes, we do") && !all.contains("Open 9-5") && !all.contains("help@acme.test"), "{all}");
+
+    // A read-only API key reads the settings but not who's on the team, and can't reply.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "ro", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let auth = format!("Bearer {key}");
+    let (s, _, body) = h.raw("GET", "/api/inbox/settings", &[("authorization", &auth)], "").await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["members"], json!([]), "{v}");
+    assert!(!body.contains("owner@acme.test"));
+    let (s, _, _) = h.raw("POST", &reply, &[("authorization", &auth), ("content-type", "application/json")], &send.to_string()).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(h.state.sms.sent().len(), 1);
     h.cleanup().await;
 }
