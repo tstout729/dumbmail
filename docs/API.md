@@ -279,8 +279,8 @@ These protect the shared SES account's reputation along with the automatic pause
   A confirmation email (from the account's sender, not billed, no unsubscribe header) links to `/c/:token`.
   Confirming sets `email_consent: "subscribed"`, records "Subscribed to List" (with
   `double_opt_in: true`) and adds them to the list, which starts list-triggered flows. People already
-  subscribed to email join straight away. An inbox waiting to confirm gets no second email for 24 hours (`+tags` and Gmail dots
-  don't make an address new), one visitor (IP address) triggers at most 5 an hour, and an account sends at
+  subscribed to email join straight away. An address waiting to confirm gets no second email for 24 hours, one inbox gets at most
+  3 a day however it's spelled (`+tags` and Gmail dots ignored), one visitor (IP address) triggers at most 5 an hour, and an account sends at
   most 200 an hour (past that, sign-ups get 409 "try again later"). Addresses that bounced or complained before get
   none. If the account can't send email (no verified sender, or sending paused), the sign-up is refused
   with 409 ("try again later") rather than let through unconfirmed. Confirmation emails count toward bounce

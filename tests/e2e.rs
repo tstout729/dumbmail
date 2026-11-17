@@ -2157,13 +2157,18 @@ async fn double_opt_in_never_lets_anyone_in_unconfirmed() {
     let (counted, total): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE counts_toward_limit), count(*) FROM email_sends").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((counted, total), (0, 1));
 
-    // One inbox, however it's spelled, gets one confirmation a day.
-    for e in ["Victim+1@gmail.com", "v.ictim+2@gmail.com", "victim@googlemail.com"] {
+    // One inbox, however it's spelled, gets at most 3 confirmations a day.
+    for e in ["Victim+1@gmail.com", "v.ictim+2@gmail.com", "victim@googlemail.com", "victim+4@gmail.com", "victim@gmail.com"] {
         let (s, _, body) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe(e)).await;
         assert_eq!(s, StatusCode::OK, "{body}");
     }
     let to_victim = h.state.email.sent().into_iter().filter(|m| m.to.contains("ictim")).count();
-    assert_eq!(to_victim, 1);
+    assert_eq!(to_victim, 3);
+    // A made-up variant doesn't hold back the real address's confirmation.
+    for e in ["ann+x@shop.test", "ann@shop.test"] {
+        h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &subscribe(e)).await;
+    }
+    assert_eq!(h.state.email.sent().into_iter().filter(|m| m.to == "ann@shop.test").count(), 1);
 
     // One visitor can trigger at most 5 confirmations an hour.
     for i in 0..7 {
