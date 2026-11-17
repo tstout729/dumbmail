@@ -89,10 +89,11 @@ fn off_message() -> String {
     "Transactional email is off for this account. The account owner can turn it on in Settings → Transactional.".into()
 }
 
-/// The one place that decides whether this caller may send transactional email, and how. Today that's
-/// any signed-in member or API key of an account that turned it on; when API keys get scopes, the
-/// send permission is checked here.
+/// The one place that decides whether this caller may send transactional email, and how: the caller
+/// needs `Perm::TransactionalSend` (managers and up; API keys need the `transactional.send` scope or
+/// `full`), and the account must have turned it on.
 pub async fn may_send_transactional(state: &AppState, ctx: &Ctx) -> AppResult<Access> {
+    ctx.require(crate::features::team::Perm::TransactionalSend)?;
     access(state, ctx.account_id).await
 }
 

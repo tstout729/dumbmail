@@ -1,7 +1,7 @@
-import { NavLink, useLocation, useNavigate } from "react-router";
-import { ChevronsUpDown, LogOut, Search, Settings, X } from "lucide-react";
-import { useLogout, useSession } from "../../api";
-import { Kbd, Menu, cx } from "../ui";
+import { NavLink, useLocation } from "react-router";
+import { Search, X } from "lucide-react";
+import { AccountMenu } from "../../features/team/AccountMenu";
+import { Kbd, cx } from "../ui";
 import { Logo } from "./Logo";
 import { bottomNav, mainNav, type NavItem } from "./nav";
 
@@ -39,9 +39,6 @@ function NavEntry({ item, onNavigate }: { item: NavItem; onNavigate: () => void 
 type SidebarProps = { open: boolean; onClose: () => void; onOpenPalette: () => void };
 
 export function Sidebar({ open, onClose, onOpenPalette }: SidebarProps) {
-  const { user, account } = useSession();
-  const logout = useLogout();
-  const navigate = useNavigate();
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
 
   return (
@@ -91,38 +88,7 @@ export function Sidebar({ open, onClose, onOpenPalette }: SidebarProps) {
           ))}
         </div>
         <div className="border-t border-zinc-200 p-2">
-          <Menu
-            align="left"
-            up
-            className="relative block w-full"
-            trigger={(props) => (
-              <button
-                type="button"
-                {...props}
-                className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-zinc-200/60"
-              >
-                <span
-                  className="flex size-7 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-white"
-                  style={{ background: account.brand_color || "#115f42" }}
-                >
-                  {account.name.slice(0, 1).toUpperCase()}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-medium text-zinc-900">{account.name}</span>
-                  <span className="block truncate text-[11px] text-zinc-500">{user.email}</span>
-                </span>
-                <ChevronsUpDown className="size-3.5 text-zinc-400" />
-              </button>
-            )}
-            items={[
-              { label: "Account settings", icon: <Settings className="size-3.5" />, onSelect: () => navigate("/settings") },
-              {
-                label: "Log out",
-                icon: <LogOut className="size-3.5" />,
-                onSelect: () => logout.mutate(),
-              },
-            ]}
-          />
+          <AccountMenu />
         </div>
       </aside>
     </>

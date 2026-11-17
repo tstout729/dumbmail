@@ -14,6 +14,8 @@ export type ApiErrorCode =
   | "forbidden"
   | "conflict"
   | "limit_reached"
+  | "busy"
+  | "account_changed"
   | "internal";
 
 export type Profile = {

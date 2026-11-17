@@ -1267,7 +1267,7 @@ async fn a_stop_that_lands_while_a_text_waits_for_its_turn_stops_it() {
     let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
     let pause = LimiterPause::hold(acct);
     let st = h.state.clone();
-    let test_send = tokio::spawn(async move { dumbmail::campaigns::send_test(&st, &account, &draft, &["(503) 555-2002".to_string()], None).await });
+    let test_send = tokio::spawn(async move { dumbmail::campaigns::send_test(&st, &account, &draft, &["(503) 555-2002".to_string()], None, true).await });
     pause.arrived().await;
     telnyx(&h, "rl-5", tester, &ours, "STOP").await;
     pause.release(acct);

@@ -391,8 +391,8 @@ async fn security_guards() {
     let (s, _) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["nope@x.test"]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // API keys can't mint more keys; revoked keys stop working.
-    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await;
+    // Only keys with the account scope can mint more keys (tests/team.rs covers scopes); revoked keys stop working.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k", "scopes": ["audience", "messaging"]}))).await;
     let k = key["key"].as_str().unwrap();
     let (s, _, _) = h.raw("POST", "/api/api-keys", &[("authorization", &format!("Bearer {k}")), ("content-type", "application/json")], "{}").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -845,16 +845,21 @@ async fn site_host_and_app_host_split() {
     assert_eq!(headers["location"], "https://app.pl.test/login?error=expired");
 
     // Session cookies cover both hosts, and logging out clears that same cookie.
-    let (s, headers, _) = h
+    let (s, headers, body) = h
         .raw("POST", "/api/auth/signup", &[("host", "app.pl.test"), ("content-type", "application/json")], r#"{"email":"split@acme.test","password":"correct horse","company":"Split"}"#)
         .await;
     assert_eq!(s, StatusCode::OK);
+    let account = serde_json::from_str::<Value>(&body).unwrap()["account"]["id"].as_str().unwrap().to_string();
     let set = headers[header::SET_COOKIE].to_str().unwrap().to_string();
     assert!(set.starts_with("pl_session=") && set.contains("Domain=pl.test"), "{set}");
     let session = set.split(';').next().unwrap().to_string();
     let (s, _, _) = h.raw("GET", "/api/me", &[("host", "pl.test"), ("cookie", &session)], "").await;
     assert_eq!(s, StatusCode::OK, "the session works on the site host's API too");
-    let (s, headers, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session)], "").await;
+    // Signing out is a write with the session cookie: the dashboard sends it from the app host,
+    // naming its account. From the marketing site it's refused.
+    let (s, _, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session), ("origin", "https://pl.test"), ("x-dumbmail-account", &account)], "").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, headers, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session), ("origin", "https://app.pl.test"), ("x-dumbmail-account", &account)], "").await;
     assert_eq!(s, StatusCode::OK);
     let cleared = headers[header::SET_COOKIE].to_str().unwrap();
     assert!(cleared.starts_with("pl_session=;") && cleared.contains("Domain=pl.test") && cleared.contains("Max-Age=0"), "{cleared}");

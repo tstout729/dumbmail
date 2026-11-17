@@ -13,6 +13,8 @@ export type FeatureSettingsTab = { label: string; title: string; to: string; end
 export type DashboardFeature = {
   /** Pages inside the app shell (paths relative to "/"). */
   routes?: RouteObject[];
+  /** Pages anyone can open, signed in or not, outside the app shell (paths relative to "/"). */
+  publicRoutes?: RouteObject[];
   /** Pages under /settings (paths relative to "/settings"). */
   settingsRoutes?: RouteObject[];
   nav?: FeatureNavItem[];
