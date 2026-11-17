@@ -1964,7 +1964,7 @@ async fn import_requires_permission_and_skips_risky_addresses() {
     assert_eq!(imp["skipped"], 3);
     let errors = imp["errors"].to_string();
     assert!(errors.contains("Skipped 2 shared inbox addresses"), "{errors}");
-    assert!(errors.contains("Skipped 1 throwaway addresses"), "{errors}");
+    assert!(errors.contains("Skipped 1 throwaway address "), "{errors}");
 
     // A suppression file needs no confirmation and keeps every address, so they're never emailed.
     let imp = h.ok("POST", "/api/profiles/import", Some(json!({"csv": csv, "email_consent": "unsubscribed"}))).await;

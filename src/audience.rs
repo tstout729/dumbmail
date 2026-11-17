@@ -379,10 +379,12 @@ pub async fn import_csv(
         }
     }
     if roles_skipped > 0 {
-        out.errors.insert(0, format!("Skipped {roles_skipped} shared inbox addresses like info@ or sales@. Nobody in particular signed up with them, and they bounce and report spam more often."));
+        let what = if roles_skipped == 1 { "shared inbox address" } else { "shared inbox addresses" };
+        out.errors.insert(0, format!("Skipped {roles_skipped} {what} like info@ or sales@. Nobody in particular signed up with them, and they bounce and report spam more often."));
     }
     if disposable_skipped > 0 {
-        out.errors.insert(0, format!("Skipped {disposable_skipped} throwaway addresses (like mailinator.com). They stop working within hours and bounce."));
+        let what = if disposable_skipped == 1 { "throwaway address" } else { "throwaway addresses" };
+        out.errors.insert(0, format!("Skipped {disposable_skipped} {what} (like mailinator.com). They stop working within hours and bounce."));
     }
     if let Some(list_id) = list_id {
         for chunk in ids.chunks(5000) {
