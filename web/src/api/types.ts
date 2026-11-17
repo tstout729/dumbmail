@@ -466,6 +466,8 @@ export type ProfileMessage = {
   sent_at: string | null;
   opened_at: string | null;
   clicked_at: string | null;
+  /** How it was sent, when worth telling (SMS: the phone's and the profile's time zones disagreed). */
+  note: string | null;
 };
 
 export type ProfileDetail = {

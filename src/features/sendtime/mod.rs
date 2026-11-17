@@ -32,7 +32,7 @@ use crate::state::AppState;
 
 pub use options::SendOptions;
 pub use plan::recently_messaged;
-pub use settings::sms_quiet_until;
+pub use settings::{sms_hours, sms_quiet_until, SmsHours};
 
 pub struct Module;
 
@@ -42,7 +42,7 @@ const DOC: &str = include_str!("../../../docs/SENDTIME.md");
 pub fn send_options_schema() -> Value {
     json!({
         "type": ["object", "null"],
-        "description": "How the campaign goes out. timing: all_at_once (default) | local_time (at local_time, HH:MM, in each person's time zone on the send day; late: next_day (default) or immediately for people whose time already passed when sending starts) | best_time (each person's best hour from their own past opens and clicks, between window_start and window_end their time, within within_hours of the send time; people without enough history get the account's best hour, then 10:00) | gradual (spread over spread_hours, one equal batch an hour). smart_sending: true skips people who got a message on this channel in the last smart_sending_hours (default 16). null clears all options. See dumbmail://docs/sendtime.",
+        "description": "How the campaign goes out. timing: all_at_once (default) | local_time (at local_time, HH:MM, in each person's time zone on the send day; late: next_day (default) or immediately for people whose time had already passed more than 15 minutes before the send was asked for; anyone whose time passed less than 15 minutes before gets it right away) | best_time (each person's best hour from their own past opens and clicks, between window_start and window_end their time, within within_hours of the send time; people without enough history get the account's best hour, then 10:00; anyone whose window doesn't open within within_hours gets it when it next opens, after that) | gradual (spread over spread_hours, one equal batch an hour). smart_sending: true skips people who got a message on this channel in the last smart_sending_hours (default 16). null clears all options. See dumbmail://docs/sendtime.",
         "properties": {
             "timing": {"enum": ["all_at_once", "local_time", "best_time", "gradual"]},
             "local_time": {"type": "string", "pattern": "^\\d{1,2}:\\d{2}$"},
@@ -164,9 +164,9 @@ impl Feature for Module {
                 obj(json!({"campaign_id": {"type": "string"}, "send_options": send_options_schema(), "send_at": {"type": "string", "format": "date-time", "description": "When sending starts (for local_time: the day). Defaults to the campaign's schedule, or now."}, "channel": {"enum": ["email", "sms"]}, "audience": audience}), &[]), true, false),
             tool("get_send_progress", "Campaign send progress by time zone", "For a campaign that is sending or sent: messages per release time (with their time zones) waiting, sent, skipped by smart sending, skipped for other reasons and failed, plus the next release and skip reasons.",
                 obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), true, false),
-            tool("get_send_settings", "Get SMS quiet hours", "The hours texts may go out in each recipient's own time zone (default 09:00-20:00; never wider than 08:00-21:00). Texts outside the window wait for it to open.", obj(json!({}), &[]), true, false),
-            tool("update_send_settings", "Set SMS quiet hours", "Narrow the hours texts may go out in each recipient's time zone. Must stay within 08:00-21:00 and be at least an hour long.",
-                obj(json!({"sms_window_start": {"type": "string", "pattern": "^\\d{1,2}:\\d{2}$"}, "sms_window_end": {"type": "string", "pattern": "^\\d{1,2}:\\d{2}$"}}), &[]), false, false),
+            tool("get_send_settings", "Get SMS quiet hours", "The hours texts may go out in each recipient's own time zone (default 09:00-20:00; never wider than 08:00-21:00), using their phone number's zone (a profile time zone can only narrow it). Texts outside the window wait for it to open. sms_zone_conflict: what happens when the phone's and profile's zones never share texting hours.", obj(json!({}), &[]), true, false),
+            tool("update_send_settings", "Set SMS quiet hours", "Narrow the hours texts may go out in each recipient's time zone (must stay within 08:00-21:00 and be at least an hour long), and choose what happens when someone's profile time zone and phone number never share texting hours: phone (default) uses the phone number's hours, skip doesn't text them. Either way the message notes it.",
+                obj(json!({"sms_window_start": {"type": "string", "pattern": "^\\d{1,2}:\\d{2}$"}, "sms_window_end": {"type": "string", "pattern": "^\\d{1,2}:\\d{2}$"}, "sms_zone_conflict": {"enum": ["phone", "skip"]}}), &[]), false, false),
             tool("get_profile_timezone", "Get a person's time zone", "The time zone DumbMail uses for a profile and where it came from: profile (their timezone property), region, zip, country, phone (country or area code) or account (no other clue).",
                 obj(json!({"profile_id": {"type": "string"}}), &["profile_id"]), true, false),
         ]

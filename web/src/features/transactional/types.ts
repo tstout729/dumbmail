@@ -1,4 +1,4 @@
-export type SendStatus = "queued" | "sent" | "delivered" | "opened" | "clicked" | "bounced" | "complained" | "skipped" | "failed";
+export type SendStatus = "queued" | "sending" | "sent" | "delivered" | "opened" | "clicked" | "bounced" | "complained" | "skipped" | "failed" | "unknown";
 
 export type TransactionalSend = {
   id: string;
@@ -13,17 +13,13 @@ export type TransactionalSend = {
   metadata: Record<string, unknown>;
   track_clicks: boolean;
   via: string;
+  attempts: number;
   created_at: string;
   sent_at: string | null;
   delivered_at: string | null;
   opened_at: string | null;
   clicked_at: string | null;
   bounce_type: string | null;
-};
-
-export type TransactionalSendDetail = TransactionalSend & {
-  request: { variables?: Record<string, unknown>; template_id?: string; content?: unknown };
-  resent_from: string | null;
 };
 
 export type TransactionalTemplate = {
@@ -35,7 +31,15 @@ export type TransactionalTemplate = {
   review: { flags: string[]; blocked: boolean };
 };
 
+export type TransactionalMode = "off" | "restricted" | "full";
+
 export type TransactionalSettings = {
+  enabled: boolean;
+  enabled_at: string | null;
+  mode: TransactionalMode;
+  hosted: boolean;
+  full_mode_granted: boolean;
+  support_email: string | null;
   per_minute_limit: number;
   daily_limit: number;
   sent_last_minute: number;

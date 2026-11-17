@@ -1,7 +1,11 @@
 //! Planning a campaign send: each queued message gets the instant it's released (`send_after`) and
 //! the time zone that was planned in (`send_tz`). Batches are then queued per release time, so a
-//! zone's recipients go out when their clock reaches the hour. Planning only touches messages
-//! without a release time, so a retried or restarted send never moves anyone or plans them twice.
+//! zone's recipients go out when their clock reaches the hour.
+//!
+//! Planning is in two steps so a restart gives everyone exactly the same time. First, one statement
+//! stamps every new message with when this part of the send was asked for (`planned_from`: the send,
+//! or the A/B winner pick) and, for a gradual send, its position. Then each message's release time is
+//! computed from that stamp alone. Messages already planned are never touched again.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -32,6 +36,9 @@ const DEFAULT_HOUR: u32 = 10;
 /// Engagement older than this doesn't count; newer engagement counts more (half-life in days).
 const HISTORY_DAYS: i32 = 180;
 const HALF_LIFE_DAYS: f64 = 30.0;
+/// local_time: a zone whose hour passed less than this long before the send was asked for still gets
+/// it right away, rather than at that hour the next day (sending always starts a little after the click).
+pub const GRACE_MINUTES: i64 = 15;
 
 /// Opens and clicks by hour of the week (Monday 00:00 = 0), weighted toward recent ones.
 #[derive(Debug, Clone)]
@@ -95,6 +102,7 @@ impl Histogram {
 /// Everything about one send that's the same for every recipient.
 pub struct Plan {
     pub opts: SendOptions,
+    /// When this part of the send was asked for: release times are computed from it.
     pub start: DateTime<Utc>,
     pub account_tz: Tz,
     /// local_time: the day it goes out.
@@ -105,29 +113,35 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// When this recipient's message is released. `index`/`total` place them in a gradual send;
-    /// `sms_zones` are the zones a text must respect (see `settings::sms_zones`).
+    /// When this recipient's message is released. `index`/`total` place them in a gradual send.
     pub fn release(&self, tz: Tz, index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
-        self.release_with(tz, &[tz], index, total, personal)
+        self.adjust(&[tz], self.slot(tz, index, total, personal))
     }
 
-    pub fn release_with(&self, tz: Tz, sms_zones: &[Tz], index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
-        let at = match self.opts.timing {
+    /// The release time before quiet hours.
+    pub fn slot(&self, tz: Tz, index: i64, total: i64, personal: Option<&Histogram>) -> DateTime<Utc> {
+        match self.opts.timing {
             Timing::AllAtOnce => self.start,
             Timing::LocalTime => {
                 let minute = self.opts.local_minute();
-                match self.opts.late {
-                    Late::NextDay => next_local(tz, self.start, Some(self.local_date), minute),
-                    Late::Immediately => local_instant(tz, self.local_date, minute).max(self.start),
+                let at = local_instant(tz, self.local_date, minute);
+                if at + Duration::minutes(GRACE_MINUTES) >= self.start {
+                    // Not yet, or only just passed when the send was asked for: at the hour, or right away.
+                    at.max(self.start)
+                } else {
+                    match self.opts.late {
+                        Late::NextDay => next_local(tz, self.start, Some(self.local_date), minute),
+                        Late::Immediately => self.start,
+                    }
                 }
             }
-            Timing::Gradual => {
-                let hours = self.opts.spread_hours().max(1);
-                self.start + Duration::hours(index.max(0) * hours / total.max(1))
-            }
+            Timing::Gradual => gradual_slot(self.start, self.opts.spread_hours(), index, total),
             Timing::BestTime => self.best(tz, personal),
-        };
-        // Texts never go out during the recipient's quiet hours.
+        }
+    }
+
+    /// Texts never go out during the recipient's quiet hours (`sms_zones`: see `settings::sms_zones`).
+    pub fn adjust(&self, sms_zones: &[Tz], at: DateTime<Utc>) -> DateTime<Utc> {
         match self.sms_window {
             Some((s, e)) => super::settings::sms_wait(sms_zones, at, s, e).unwrap_or(at),
             None => at,
@@ -169,10 +183,17 @@ impl Plan {
         }
         match best {
             Some((_, at)) => at,
-            // The window doesn't open before the look-ahead ends: its next opening.
+            // None of the window's hours falls inside the look-ahead (a short within_hours): the window's
+            // next opening, which is after it. Documented as such (see `options::describe`).
             None => next_local(tz, self.start, None, ws),
         }
     }
+}
+
+/// Position `index` of `total` in a gradual send over `hours`: one equal batch an hour. The same
+/// arithmetic as the SQL in [`plan_campaign`].
+pub fn gradual_slot(start: DateTime<Utc>, hours: i64, index: i64, total: i64) -> DateTime<Utc> {
+    start + Duration::hours(index.max(0) * hours.max(1) / total.max(1))
 }
 
 /// The account's opens and clicks by hour of the week in its own zone, used as each person's local
@@ -237,22 +258,36 @@ async fn build_plan(state: &AppState, account: &Account, channel: &str, opts: Se
 }
 
 /// Job step: give every queued, unplanned message of the campaign its release time. Returns the
-/// number planned. Safe to run again: planned messages are left alone.
+/// number planned. Safe to run again, and after a crash part way: planned messages are left alone and
+/// the rest get the same times they would have got.
 pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<u64> {
     let Some(opts) = options::of(c.send_options.as_ref()).filter(SendOptions::plans) else { return Ok(0) };
     let account = crate::campaigns::load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let plan = build_plan(state, &account, &c.channel, opts, Utc::now()).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1 AND status = 'queued' AND send_after IS NULL AND NOT is_test")
-        .bind(c.id)
-        .fetch_one(&state.db)
-        .await?;
-    let mut index = 0i64;
+    let now = Utc::now();
+    // When this part was asked for: the A/B winner pick (now), or the send itself (its send time).
+    let asked = if c.ab_winner.is_some() { now } else { c.send_at.map_or(now, |t| t.min(now)) };
+    let spread = if opts.timing == Timing::Gradual { opts.spread_hours().max(1) } else { 0 };
+    // Step one, a single statement: stamp the new messages and fix gradual positions.
+    sqlx::query(
+        "WITH r AS (SELECT id, row_number() OVER (ORDER BY id) - 1 AS rn, count(*) OVER () AS total FROM messages
+                    WHERE campaign_id = $1 AND status = 'queued' AND send_after IS NULL AND planned_from IS NULL AND NOT is_test)
+         UPDATE messages m SET planned_from = $2,
+                send_after = CASE WHEN $3 > 0 THEN $2 + make_interval(hours => (r.rn * $3 / GREATEST(r.total, 1))::int) END
+         FROM r WHERE m.id = r.id",
+    )
+    .bind(c.id)
+    .bind(asked)
+    .bind(spread)
+    .execute(&state.db)
+    .await?;
+    // Step two: each stamped message's release time and zone, from its stamp.
+    let mut plans: HashMap<DateTime<Utc>, Plan> = HashMap::new();
     let mut last = Uuid::nil();
     let mut planned = 0u64;
     loop {
-        let rows: Vec<(Uuid, Uuid, Value, Option<String>)> = sqlx::query_as(
-            "SELECT m.id, m.profile_id, p.properties, p.phone_number FROM messages m JOIN profiles p ON p.id = m.profile_id
-             WHERE m.campaign_id = $1 AND m.status = 'queued' AND m.send_after IS NULL AND NOT m.is_test AND m.id > $2
+        let rows: Vec<(Uuid, Uuid, Value, Option<String>, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT m.id, m.profile_id, p.properties, p.phone_number, m.planned_from, m.send_after FROM messages m JOIN profiles p ON p.id = m.profile_id
+             WHERE m.campaign_id = $1 AND m.status = 'queued' AND m.planned_from IS NOT NULL AND m.send_tz IS NULL AND NOT m.is_test AND m.id > $2
              ORDER BY m.id LIMIT $3",
         )
         .bind(c.id)
@@ -262,19 +297,31 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
         .await?;
         let Some(tail) = rows.last() else { break };
         last = tail.0;
-        let zones: Vec<(Uuid, Tz)> = rows.iter().map(|(_, pid, props, phone)| (*pid, zone::resolve_parts(props, phone.as_deref(), plan.account_tz).0)).collect();
-        let hists = if plan.opts.timing == Timing::BestTime { personal_histograms(&state.db, &zones, plan.start).await? } else { HashMap::new() };
+        for (_, _, _, _, from, _) in &rows {
+            if !plans.contains_key(from) {
+                let p = build_plan(state, &account, &c.channel, opts.clone(), *from).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                plans.insert(*from, p);
+            }
+        }
+        let account_tz = crate::sending::account_tz(&account);
+        let zones: Vec<(Uuid, Tz)> = rows.iter().map(|(_, pid, props, phone, _, _)| (*pid, zone::resolve_parts(props, phone.as_deref(), account_tz).0)).collect();
+        // Decay counted from when this part was asked for, so a re-run weighs history the same way.
+        let hists = if opts.timing == Timing::BestTime { personal_histograms(&state.db, &zones, rows[0].4).await? } else { HashMap::new() };
         let (mut ids, mut ats, mut tzs) = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()));
-        for ((mid, _, props, phone), (pid, tz)) in rows.iter().zip(&zones) {
+        for ((mid, _, props, phone, from, gradual_at), (pid, tz)) in rows.iter().zip(&zones) {
+            let plan = &plans[from];
+            let base = match (opts.timing, gradual_at) {
+                (Timing::Gradual, Some(at)) => *at,
+                _ => plan.slot(*tz, 0, 1, hists.get(pid)),
+            };
+            let sms_zones = super::settings::sms_zones(props, phone.as_deref(), account_tz);
             ids.push(*mid);
-            let sms_zones = super::settings::sms_zones(props, phone.as_deref(), plan.account_tz);
-            ats.push(plan.release_with(*tz, &sms_zones, index, total, hists.get(pid)));
+            ats.push(plan.adjust(&sms_zones, base));
             tzs.push(tz.name().to_string());
-            index += 1;
         }
         planned += sqlx::query(
             "UPDATE messages m SET send_after = x.at, send_tz = x.tz FROM unnest($1::uuid[], $2::timestamptz[], $3::text[]) AS x(id, at, tz)
-             WHERE m.id = x.id AND m.send_after IS NULL AND m.status = 'queued'",
+             WHERE m.id = x.id AND m.send_tz IS NULL AND m.status = 'queued'",
         )
         .bind(&ids)
         .bind(&ats)

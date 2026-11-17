@@ -191,16 +191,20 @@ pub async fn pause(state: &AppState, account_id: Uuid, reason: &str) -> anyhow::
 }
 
 /// Fail a campaign because sending is paused; its queued messages are skipped (never silently dropped).
+/// The campaign is stopped first, in the same transaction, so a batch claiming or re-queuing a message
+/// at the same moment (see `campaigns::claim`) can't leave one queued behind it.
 pub async fn stop_campaign(db: &sqlx::PgPool, campaign_id: Uuid, msg: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test")
-        .bind(campaign_id)
-        .execute(db)
-        .await?;
+    let mut tx = db.begin().await?;
     sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1 AND status IN ('sending','scheduled','testing')")
         .bind(campaign_id)
         .bind(msg)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test")
+        .bind(campaign_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 

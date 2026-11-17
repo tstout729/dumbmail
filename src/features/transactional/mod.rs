@@ -1,7 +1,8 @@
 //! Transactional email API: receipts, password resets, shipping notices and other mail a person
 //! triggered. It skips marketing consent but never hard-bounced or complaining addresses, has no
 //! unsubscribe footer, isn't held by the warm-up limit, is billed like any email, and is kept
-//! honest by content rules, caps and an automatic pause (see `review` and `guard`).
+//! honest by being off until the owner turns it on, a restricted mode on the hosted service, content
+//! rules, caps and an automatic pause (see `review` and `guard`).
 
 pub mod guard;
 pub mod review;
@@ -29,7 +30,7 @@ pub const RETRY_JOB: &str = "transactional_retry";
 const DOC: &str = include_str!("../../../docs/TRANSACTIONAL.md");
 
 async fn send_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<send::SendBody>) -> AppResult<Json<Value>> {
-    let (mut v, replayed) = send::send(&state, ctx.account_id, b, if ctx.via_api_key { "api" } else { "dashboard" }, None).await?;
+    let (mut v, replayed) = send::send(&state, &ctx, b, if ctx.via_api_key { "api" } else { "dashboard" }).await?;
     v["replayed"] = json!(replayed);
     Ok(Json(v))
 }
@@ -42,7 +43,7 @@ struct ListQuery {
     offset: Option<i64>,
 }
 
-const STATUSES: &[&str] = &["queued", "sent", "delivered", "opened", "clicked", "bounced", "complained", "skipped", "failed"];
+const STATUSES: &[&str] = &["queued", "sending", "sent", "delivered", "opened", "clicked", "bounced", "complained", "skipped", "failed", "unknown"];
 
 async fn list(state: &AppState, account_id: Uuid, q: ListQuery) -> AppResult<Value> {
     if let Some(s) = q.status.as_deref().filter(|s| !STATUSES.contains(s)) {
@@ -61,10 +62,6 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ListQue
 
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     Ok(Json(send::get(&state.db, ctx.account_id, id).await?))
-}
-
-async fn resend_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(send::resend(&state, ctx.account_id, id).await?))
 }
 
 #[derive(Deserialize)]
@@ -132,7 +129,20 @@ async fn review_h(_ctx: Ctx, ApiJson(b): ApiJson<ReviewBody>) -> AppResult<Json<
 }
 
 async fn settings_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(guard::settings_json(&state.db, ctx.account_id).await?))
+    Ok(Json(guard::settings_json(&state, ctx.account_id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnableBody {
+    enabled: bool,
+    #[serde(default)]
+    acknowledge: bool,
+}
+
+/// Owner: turn transactional email on (accepting what it's for) or off.
+async fn update_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<EnableBody>) -> AppResult<Json<Value>> {
+    Ok(Json(guard::set_enabled(&state, &ctx, b.enabled, b.acknowledge).await?))
 }
 
 async fn admin_account(state: &AppState, b: &Value) -> AppResult<Uuid> {
@@ -162,7 +172,22 @@ async fn admin_limits_h(State(state): State<AppState>, headers: HeaderMap, Json(
     };
     guard::set_caps(&state.db, id, num("per_minute_limit", 100_000)?, num("daily_limit", 10_000_000)?).await?;
     tracing::warn!(account = %id, "admin set transactional caps");
-    Ok(Json(guard::settings_json(&state.db, id).await?))
+    Ok(Json(guard::settings_json(&state, id).await?))
+}
+
+/// Operator: grant full mode (inline content and the normal caps) or put an account back in
+/// restricted mode. Bearer ADMIN_TOKEN.
+async fn admin_mode_h(State(state): State<AppState>, headers: HeaderMap, Json(b): Json<Value>) -> AppResult<Json<Value>> {
+    crate::public::check_admin(&state, &headers)?;
+    let id = admin_account(&state, &b).await?;
+    let full = match b["mode"].as_str() {
+        Some("full") => true,
+        Some("restricted") => false,
+        _ => return Err(AppError::bad("mode must be full or restricted")),
+    };
+    guard::set_full_mode(&state.db, id, full).await?;
+    tracing::warn!(account = %id, full, "admin set transactional mode");
+    Ok(Json(guard::settings_json(&state, id).await?))
 }
 
 fn body_from(a: &Value) -> AppResult<send::SendBody> {
@@ -189,12 +214,12 @@ impl Feature for Module {
             .route("/api/transactional/send", post(send_h).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)))
             .route("/api/transactional/sends", get(list_h))
             .route("/api/transactional/sends/{id}", get(get_h))
-            .route("/api/transactional/sends/{id}/resend", post(resend_h))
             .route("/api/transactional/templates", get(templates_h).post(create_template_h).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)))
             .route("/api/transactional/review", post(review_h).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)))
-            .route("/api/transactional/settings", get(settings_h))
+            .route("/api/transactional/settings", get(settings_h).patch(update_settings_h))
             .route("/admin/transactional/unpause", post(admin_unpause_h))
             .route("/admin/transactional/limits", post(admin_limits_h))
+            .route("/admin/transactional/mode", post(admin_mode_h))
     }
 
     fn mcp_tools(&self) -> Vec<Value> {
@@ -213,18 +238,16 @@ impl Feature for Module {
             "confirm": {"type": "boolean"}
         });
         vec![
-            tool("send_transactional_email", "Send a transactional email", "Send one email a person triggered (receipt, password reset, shipping notice) to one recipient. It skips marketing consent, so it must not promote anything: content that reads like marketing is refused. Hard-bounced and complaining addresses are never sent to (the result has status skipped). Without confirm=true it renders the email and reports whether it would send, without sending. With confirm=true it sends to a real person; get the user's go-ahead first.",
+            tool("send_transactional_email", "Send a transactional email", "Send one email a person triggered (receipt, password reset, shipping notice) to one recipient. It skips marketing consent, so it must not promote anything: content that reads like marketing is refused. Transactional email is off until the account owner turns it on in Settings; on the hosted service it starts in restricted mode (saved transactional templates only, 200 a day) until full mode is granted. Hard-bounced and complaining addresses are never sent to (the result has status skipped). Without confirm=true it renders the email and reports whether it would send, without sending. With confirm=true it sends to a real person; get the user's go-ahead first. To send again, make a new call with fresh variables.",
                 obj(send_props, &["to"]), false, true),
-            tool("list_transactional_sends", "List transactional sends", "Recent transactional emails, newest first, with status (queued, sent, delivered, opened, clicked, bounced, complained, skipped, failed). q searches recipient and subject.",
+            tool("list_transactional_sends", "List transactional sends", "Recent transactional emails, newest first, with status (queued, sending, sent, delivered, opened, clicked, bounced, complained, skipped, failed, or unknown: cut off mid-send, may have gone out, never sent again). q searches recipient and subject. Variables and email bodies are never stored, so they aren't shown.",
                 obj(json!({"q": {"type": "string"}, "status": {"enum": STATUSES}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}, "offset": {"type": "integer", "minimum": 0}}), &[]), true, false),
-            tool("get_transactional_send", "Get a transactional send", "One transactional send with its status, delivery and engagement times, metadata and the original request.",
+            tool("get_transactional_send", "Get a transactional send", "One transactional send: recipient, subject, template, status, attempts, delivery and engagement times and metadata (never its variables or body).",
                 obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
-            tool("resend_transactional_email", "Resend a transactional email", "Send a transactional email again to the same person, as a new send checked like any other. Reaches a real person: requires confirm=true and the user's go-ahead.",
-                obj(json!({"id": {"type": "string"}, "confirm": {"type": "boolean"}}), &["id"]), false, true),
-            tool("create_transactional_template", "Create a transactional template", "Save an email template the transactional API can send by template_id. Content that reads like marketing (discount calls to action, shop now, limited time) is refused.",
+            tool("create_transactional_template", "Create a transactional template", "Save an email template the transactional API can send by template_id. Content that reads like marketing is refused: discount or offer language (20% off, $10 off, promo code, limited time, sale), shop now / buy now calls to action, links to 3 or more product pages, or an unsubscribe link.",
                 obj(json!({"name": {"type": "string"}, "content": content}), &["name", "content"]), false, false),
             tool("list_transactional_templates", "List transactional templates", "Templates the transactional API can send, with any review warnings.", obj(json!({}), &[]), true, false),
-            tool("get_transactional_settings", "Transactional limits and status", "The account's transactional caps (per minute and per 24 hours), how much of each is used, and whether transactional sending is paused.", obj(json!({}), &[]), true, false),
+            tool("get_transactional_settings", "Transactional status and limits", "Whether transactional email is on and its mode (off, restricted: saved templates only and a low daily cap, or full), the caps per minute and per 24 hours, how much of each is used, and whether it's paused. Only the account owner can turn it on, in the dashboard.", obj(json!({}), &[]), true, false),
         ]
     }
 
@@ -234,27 +257,18 @@ impl Feature for Module {
             "send_transactional_email" => async {
                 let b = body_from(a)?;
                 if a["confirm"].as_bool() != Some(true) {
-                    return send::dry_run(state, acct, b, a["include_html"].as_bool().unwrap_or(false)).await;
+                    return send::dry_run(state, ctx, b, a["include_html"].as_bool().unwrap_or(false)).await;
                 }
-                let (mut v, replayed) = send::send(state, acct, b, "mcp", None).await?;
+                let (mut v, replayed) = send::send(state, ctx, b, "mcp").await?;
                 v["replayed"] = json!(replayed);
                 Ok(v)
             }
             .await,
             "list_transactional_sends" => list(state, acct, ListQuery { q: a["q"].as_str().map(String::from), status: a["status"].as_str().map(String::from), limit: a["limit"].as_i64(), offset: a["offset"].as_i64() }).await,
             "get_transactional_send" => async { send::get(&state.db, acct, uuid_arg(a, "id")?).await }.await,
-            "resend_transactional_email" => async {
-                let id = uuid_arg(a, "id")?;
-                if a["confirm"].as_bool() != Some(true) {
-                    let prior = send::get(&state.db, acct, id).await?;
-                    return Ok(json!({"dry_run": true, "to": prior["to"], "subject": prior["subject"], "note": "Nothing sent. Call again with confirm=true to send this email again to the same person."}));
-                }
-                send::resend(state, acct, id).await
-            }
-            .await,
             "create_transactional_template" => async { create_template(state, acct, crate::mcp::from(a.clone())?).await }.await,
             "list_transactional_templates" => list_templates(state, acct).await,
-            "get_transactional_settings" => guard::settings_json(&state.db, acct).await,
+            "get_transactional_settings" => guard::settings_json(state, acct).await,
             _ => return None,
         };
         Some(r)
@@ -276,6 +290,7 @@ impl Feature for Module {
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
+        send::sweep(&state.db).await?;
         if tick.is_multiple_of(3) {
             guard::check_recent(state).await?;
         }

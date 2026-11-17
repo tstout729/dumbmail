@@ -1,6 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "../../api/client";
-import type { SendStatus, TransactionalSend, TransactionalSendDetail, TransactionalSettings, TransactionalTemplate } from "./types";
+import { toast } from "../../lib/toast";
+import type { SendStatus, TransactionalSend, TransactionalSettings, TransactionalTemplate } from "./types";
 
 export const pageSize = 50;
 
@@ -24,16 +25,8 @@ export function useTransactionalSends(params: { q: string; status: SendStatus | 
 export function useTransactionalSend(id: string | null) {
   return useQuery({
     queryKey: keys.send(id ?? ""),
-    queryFn: () => api<TransactionalSendDetail>("GET", `/api/transactional/sends/${id}`),
+    queryFn: () => api<TransactionalSend>("GET", `/api/transactional/sends/${id}`),
     enabled: id !== null,
-  });
-}
-
-export function useResend() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => api<TransactionalSend>("POST", `/api/transactional/sends/${id}/resend`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.all }),
   });
 }
 
@@ -59,4 +52,16 @@ export function useCreateTransactionalTemplate() {
 
 export function useTransactionalSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: () => api<TransactionalSettings>("GET", "/api/transactional/settings"), refetchInterval: 60_000 });
+}
+
+/** Owner: turn transactional email on (after accepting what it's for) or off. */
+export function useSetTransactionalEnabled() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { enabled: boolean; acknowledge?: boolean }) => api<TransactionalSettings>("PATCH", "/api/transactional/settings", input),
+    onSuccess: (s) => {
+      qc.setQueryData(keys.settings, s);
+      toast.success(s.enabled ? "Transactional email is on" : "Transactional email is off");
+    },
+  });
 }

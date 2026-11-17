@@ -99,6 +99,8 @@ pub fn unsubscribe_url(state: &AppState, account: &Account, message_id: Uuid) ->
 
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
     let p = spec.profile;
+    // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
+    let mut send_note: Option<String> = None;
     let to = match spec.channel {
         "email" => {
             // `pending`: a double opt-in sign-up that hasn't confirmed gets nothing until it does.
@@ -120,11 +122,39 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
             if !spec.is_test && (p.sms_consent != "subscribed" || p.phone_number.is_none()) {
                 return Ok(Outcome::Skipped("no sms consent"));
             }
-            // Quiet hours in the recipient's own time zone (the account's when we can't tell).
+            // Quiet hours in the recipient's own time zone: their phone number's (the account's when we can't tell).
             if !spec.is_test {
-                if let Some(until) = crate::features::sendtime::sms_quiet_until(&state.db, spec.account, p, Utc::now()).await? {
+                let hours = crate::features::sendtime::sms_hours(&state.db, spec.account, p, Utc::now()).await?;
+                if hours.skip {
+                    let why = "time zones disagree";
+                    match spec.message_id {
+                        Some(mid) => {
+                            sqlx::query("UPDATE messages SET send_note = $2 WHERE id = $1").bind(mid).bind(&hours.note).execute(&state.db).await?;
+                        }
+                        None => {
+                            sqlx::query(
+                                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error, send_note)
+                                 VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, 'skipped', $8, $9)",
+                            )
+                            .bind(Uuid::now_v7())
+                            .bind(spec.account.id)
+                            .bind(p.id)
+                            .bind(spec.campaign_id)
+                            .bind(spec.flow_id)
+                            .bind(spec.flow_node_id)
+                            .bind(p.phone_number.as_deref().unwrap_or_default())
+                            .bind(why)
+                            .bind(&hours.note)
+                            .execute(&state.db)
+                            .await?;
+                        }
+                    }
+                    return Ok(Outcome::Skipped(why));
+                }
+                if let Some(until) = hours.wait {
                     return Ok(Outcome::Deferred(until));
                 }
+                send_note = hours.note;
             }
             spec.to_override.clone().or_else(|| p.phone_number.clone())
         }
@@ -238,8 +268,8 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
 
     if spec.message_id.is_none() {
         sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -251,13 +281,15 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         .bind(&to)
         .bind(&subject)
         .bind(spec.is_test)
+        .bind(&send_note)
         .execute(&state.db)
         .await?;
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3 WHERE id = $1")
+        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note) WHERE id = $1")
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
+            .bind(&send_note)
             .execute(&state.db)
             .await?;
     }
@@ -269,6 +301,16 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
         }
         Rendered::Sms(s, provider, _) => {
             throttle("sms", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
+            // The window can close while waiting for a slot: check again right before the hand-off.
+            if !spec.is_test {
+                if let Some(until) = crate::features::sendtime::sms_quiet_until(&state.db, spec.account, p, Utc::now()).await? {
+                    if spec.message_id.is_none() {
+                        // A flow re-runs this step then and creates a new message.
+                        sqlx::query("DELETE FROM messages WHERE id = $1").bind(message_id).execute(&state.db).await?;
+                    }
+                    return Ok(Outcome::Deferred(until));
+                }
+            }
             provider.send(s).await
         }
     };
@@ -294,7 +336,10 @@ pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
                         account_id: spec.account.id,
                         profile_id: p.id,
                         metric,
-                        properties: json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        properties: match &send_note {
+                            Some(note) => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id, "time_zone_note": note}),
+                            None => json!({"subject": subject, "campaign_id": spec.campaign_id, "flow_id": spec.flow_id, "message_id": message_id}),
+                        },
                         value: None,
                         occurred_at: None,
                         unique_id: Some(message_id.to_string()),

@@ -62,9 +62,13 @@ export type SendProgress = {
   skip_reasons: { reason: string; count: number }[];
 };
 
+/** When someone's profile time zone and phone number never share texting hours. */
+export type SmsZoneConflict = "phone" | "skip";
+
 export type SendSettings = {
   sms_window_start: string;
   sms_window_end: string;
+  sms_zone_conflict: SmsZoneConflict;
   default_sms_window: { start: string; end: string };
   legal_sms_window: { start: string; end: string };
 };

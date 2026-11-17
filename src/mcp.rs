@@ -589,7 +589,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             let send_at: Option<DateTime<Utc>> = a["send_at"].as_str().map(|s| s.parse().map_err(|_| AppError::bad("send_at must be an ISO 8601 date-time"))).transpose()?;
             if let Some(opts) = a.get("send_options") {
                 if a["confirm"].as_bool() == Some(true) {
-                    msg::update_campaign(state, acct, id, msg::CampaignBody { send_options: Some(opts.clone()), ..Default::default() }).await?;
+                    msg::apply_send_options(state, acct, id, Some(opts)).await?;
                 } else {
                     crate::features::sendtime::checked(Some(opts))?;
                 }

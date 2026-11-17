@@ -296,7 +296,11 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
     let ab = ab_test(&c);
     let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
+    // Set once everyone who gets the campaign has a row (or a holdout row): a retried send job then adds
+    // nobody who joined the audience since.
+    let fixed: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut *tx).await?;
     let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
+    let mut fix = false;
     match (&ab, &c.ab_winner) {
         (Some(t), None) if !started => {
             // Test slice: a random sample, dealt round-robin across the versions.
@@ -311,13 +315,31 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             qb.push(" ORDER BY random() LIMIT ").push_bind(size).push(") x");
             qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
             qb.build().execute(&mut *tx).await?;
+            // Everyone else in the audience now gets the winner later, even if they leave the list meanwhile.
+            if t.test_percent < 100 {
+                let mut qb = QueryBuilder::new("INSERT INTO campaign_holdouts (campaign_id, profile_id) SELECT ");
+                qb.push_bind(c.id).push(", p.id");
+                append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
+                qb.push(" AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.campaign_id = ").push_bind(c.id).push(" AND m.profile_id = p.id AND NOT m.is_test) ON CONFLICT DO NOTHING");
+                qb.build().execute(&mut *tx).await?;
+            }
+            fix = true;
         }
         // The test slice was already created (this job is a retry): just send what's queued.
         (Some(_), None) => {}
-        // Everyone (no test), or everyone left after the test (a retry; pick_winner normally adds them).
-        _ => insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?,
+        // The audience was fixed when the send started (or the winner was picked): a retry adds nobody.
+        _ if fixed => {}
+        // Everyone (no test), or everyone left after a test that started before audiences were fixed.
+        _ => {
+            insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?;
+            fix = true;
+        }
     }
-    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), audience_fixed_at = CASE WHEN $2 THEN COALESCE(audience_fixed_at, now()) ELSE audience_fixed_at END, updated_at = now() WHERE id = $1")
+        .bind(c.id)
+        .bind(fix)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     // Send options (local time, best time, gradual): give each new recipient a release time.
@@ -342,12 +364,20 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
 }
 
 /// Queue a message (with no version: the winner, or the only content) for every audience member who has none yet.
+/// After an A/B test whose audience was fixed when it started, that's the holdouts who can still be messaged.
 async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState, c: &CampaignRow) -> AppResult<()> {
     let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
     let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
     let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
     qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
-    append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await?;
+    let holdouts: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL AND ab_test IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut **tx).await?;
+    if holdouts {
+        qb.push(" FROM profiles p JOIN campaign_holdouts h ON h.profile_id = p.id AND h.campaign_id = ").push_bind(c.id);
+        qb.push(" WHERE p.account_id = ").push_bind(c.account_id);
+        push_eligible(&mut qb, &c.channel);
+    } else {
+        append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await?;
+    }
     qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
     qb.build().execute(&mut **tx).await?;
     Ok(())
@@ -388,31 +418,26 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
     }
     let ab = ab_test(&c);
     let smart_hours = crate::features::sendtime::options::of(c.send_options.as_ref()).and_then(|o| o.smart_hours());
-    // Only messages whose release time has come; a batch for a later time zone waits for its own job.
-    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' AND (send_after IS NULL OR send_after <= now()) ORDER BY id")
+    // One read against one cutoff: each queued message in the batch is either due now (sent below) or
+    // waits for a batch of its own at its release time, so none can fall between two reads.
+    let cutoff = chrono::Utc::now();
+    let queued: Vec<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as("SELECT id, send_after FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
         .bind(ids)
         .fetch_all(&state.db)
         .await?;
-    // Texts held for their recipient's quiet hours, by when each may go.
+    // Messages waiting for their release time or (texts) their recipient's quiet hours, by when each may go.
     let mut held: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, Vec<Uuid>> = Default::default();
-    // Messages in this batch whose release time hasn't come yet wait for it in a batch of their own.
-    let later: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as("SELECT id, send_after FROM messages WHERE id = ANY($1) AND status = 'queued' AND send_after > now()")
-        .bind(ids)
-        .fetch_all(&state.db)
-        .await?;
-    for (id, at) in later {
-        held.entry(at).or_default().push(id);
+    let mut rows: Vec<Uuid> = Vec::with_capacity(queued.len());
+    for (id, at) in queued {
+        match at {
+            Some(t) if t > cutoff => held.entry(t).or_default().push(id),
+            _ => rows.push(id),
+        }
     }
     for (i, mid) in rows.iter().enumerate() {
         // Claim the message so a duplicate or retried batch can't send it again. A crash mid-send leaves it
         // 'sending'; release_abandoned_claims fails it later instead of retrying: at most once, never twice.
-        let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as(
-            "UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1 AND status = 'queued' AND (send_after IS NULL OR send_after <= now()) RETURNING profile_id, variant",
-        )
-            .bind(mid)
-            .fetch_optional(&state.db)
-            .await?;
-        let Some((pid, variant)) = claimed else { continue };
+        let Some((pid, variant)) = claim(&state.db, c.id, *mid, &c.channel, cutoff).await? else { continue };
         // Smart sending: skip people who just got a message on this channel.
         if let Some(hours) = smart_hours {
             if crate::features::sendtime::recently_messaged(&state.db, pid, &c.channel, hours).await? {
@@ -447,11 +472,15 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         match outcome {
             // A text outside its recipient's hours waits alone; everyone else in the batch goes on.
             Ok(Outcome::Deferred(until)) if c.channel == "sms" => {
-                sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL, send_after = $2 WHERE id = $1 AND status = 'sending'").bind(mid).bind(until).execute(&state.db).await?;
-                held.entry(until).or_default().push(*mid);
+                if requeue_claimed(&state.db, c.id, *mid, &c.channel, Some(until)).await? {
+                    held.entry(until).or_default().push(*mid);
+                }
             }
             Ok(Outcome::Deferred(until)) => {
-                sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(mid).execute(&state.db).await?;
+                if !requeue_claimed(&state.db, c.id, *mid, &c.channel, None).await? {
+                    // Cancelled or stopped meanwhile: the rest were skipped with it.
+                    return Ok(());
+                }
                 for (at, ids) in &held {
                     crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(*at)).await?;
                 }
@@ -480,6 +509,59 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(at)).await?;
     }
     finish_if_done(&state.db, c.id).await
+}
+
+/// Claim a due campaign message for sending: only while its campaign is still sending (and, for email,
+/// the account isn't paused). The campaign row is share-locked for the check, so a cancel or pause that
+/// is committing either lands first (no claim) or waits for the claim.
+pub async fn claim(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &str, cutoff: chrono::DateTime<chrono::Utc>) -> sqlx::Result<Option<(Uuid, Option<String>)>> {
+    sqlx::query_as(
+        "UPDATE messages m SET status = 'sending', claimed_at = now()
+         WHERE m.id = $1 AND m.status = 'queued' AND (m.send_after IS NULL OR m.send_after <= $2)
+           AND EXISTS (SELECT 1 FROM campaigns c JOIN accounts a ON a.id = c.account_id
+                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 = 'sms' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
+         RETURNING m.profile_id, m.variant",
+    )
+    .bind(message_id)
+    .bind(cutoff)
+    .bind(campaign_id)
+    .bind(channel)
+    .fetch_optional(db)
+    .await
+}
+
+/// Put a claimed message back in the queue (to go at `send_after`, or when its batch is re-run), unless
+/// its campaign was cancelled or stopped, or email was paused, since it was claimed: then it's skipped.
+/// Returns true when it's queued again. Locks the campaign row like [`claim`], so a cancel committing at
+/// the same moment can't leave it queued behind it.
+pub async fn requeue_claimed(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &str, send_after: Option<chrono::DateTime<chrono::Utc>>) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let st: Option<(String, bool)> = sqlx::query_as(
+        "SELECT c.status, a.sending_paused_at IS NOT NULL FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1 FOR SHARE OF c",
+    )
+    .bind(campaign_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let stop = match st.as_ref().map(|(s, p)| (s.as_str(), *p)) {
+        Some(("sending", true)) if channel == "email" => Some("sending paused"),
+        Some(("sending", _)) => None,
+        Some(("cancelled", _)) | None => Some("campaign cancelled"),
+        Some(_) => Some("campaign stopped"),
+    };
+    match stop {
+        None => {
+            sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL, send_after = COALESCE($2, send_after) WHERE id = $1 AND status = 'sending'")
+                .bind(message_id)
+                .bind(send_after)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Some(why) => {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = $2, claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(message_id).bind(why).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(stop.is_none())
 }
 
 /// Attribution: each conversion credited to the newest email opened/clicked in the prior 5 days,

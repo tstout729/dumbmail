@@ -45,6 +45,27 @@ async fn rows(h: &Harness, cid: &str) -> Vec<(String, Option<DateTime<Utc>>, Opt
         .unwrap()
 }
 
+/// A half hour from 10:00 on that no zone in `zones` reached in the last 20 minutes or reaches in the next 2.
+fn quiet_minute(zones: &[&str]) -> u32 {
+    let now = Utc::now();
+    (0..48u32)
+        .map(|i| (600 + i * 30) % 1440)
+        .find(|m| {
+            zones.iter().all(|z| {
+                let lm = clock::local_minute(z.parse().unwrap(), now);
+                (lm + 1440 - m) % 1440 > 20 && (m + 1440 - lm) % 1440 > 2
+            })
+        })
+        .unwrap()
+}
+
+/// When a local-time send asked for at `asked` reaches someone in `tz` (late: next day): at the hour
+/// on `day`, right away when it passed less than 15 minutes before, otherwise the next day's.
+fn expected_local(tz: Tz, asked: DateTime<Utc>, day: chrono::NaiveDate, minute: u32) -> DateTime<Utc> {
+    let slot = clock::local_instant(tz, day, minute);
+    if slot + chrono::Duration::minutes(15) >= asked { slot.max(asked) } else { clock::next_local(tz, asked, Some(day), minute) }
+}
+
 /// Make one zone's release time come now, and run every due batch (batches that run early re-queue
 /// the messages that aren't due yet).
 async fn release(h: &Harness, cid: &str, zone: Option<&str>) {
@@ -73,17 +94,22 @@ async fn local_time_send_releases_each_zone_once_and_stops_on_cancel() {
     let bounced = person(&mut h, &l, "bounced@x.test", json!({})).await;
     sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce' WHERE id = $1::uuid").bind(&bounced).execute(&h.state.db).await.unwrap();
 
-    let c = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Local hello", json!({"timing": "local_time", "local_time": "10:00"})))).await;
+    // A local time that isn't about to come, or just gone, in any of these zones while the test runs
+    // (a zone whose time passed less than 15 minutes before the send gets it right away).
+    let minute = quiet_minute(&["Asia/Kolkata", "Asia/Kathmandu", "America/New_York", "Pacific/Honolulu", "America/Los_Angeles"]);
+    let hm = clock::hhmm(minute);
+    let c = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Local hello", json!({"timing": "local_time", "local_time": hm})))).await;
     let cid = c["id"].as_str().unwrap().to_string();
-    assert_eq!(c["send_options"], json!({"timing": "local_time", "local_time": "10:00", "late": "next_day", "smart_sending": false}));
+    assert_eq!(c["send_options"], json!({"timing": "local_time", "local_time": hm, "late": "next_day", "smart_sending": false}));
     let sent = h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
     assert_eq!(sent["status"], "sending", "today's earliest zone already passed 10:00, so it starts now: {sent}");
     h.drain().await;
 
     // Each recipient planned once, at the first 10:00 in their zone on or after today's date in the
-    // account's zone, and nobody has it yet.
+    // account's zone (or right away when it passed less than 15 minutes before the send), and nobody
+    // has it yet.
     let la: Tz = "America/Los_Angeles".parse().unwrap();
-    let started: DateTime<Utc> = sqlx::query_scalar("SELECT sent_at FROM campaigns WHERE id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    let started: DateTime<Utc> = sqlx::query_scalar("SELECT send_at FROM campaigns WHERE id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
     let today = started.with_timezone(&la).date_naive();
     let planned = rows(&h, &cid).await;
     let zones: Vec<(&str, &str)> = planned.iter().map(|r| (r.0.as_str(), r.2.as_deref().unwrap())).collect();
@@ -95,9 +121,11 @@ async fn local_time_send_releases_each_zone_once_and_stops_on_cancel() {
         let tz: Tz = tz.as_deref().unwrap().parse().unwrap();
         let at = at.unwrap();
         assert_eq!(status, "queued", "{to}");
-        let expected = clock::next_local(tz, started, Some(today), 600);
+        let expected = expected_local(tz, started, today, minute);
         assert!((at - expected).num_seconds().abs() <= 5, "{to}: {at} vs {expected}");
-        assert_eq!(at.with_timezone(&tz).format("%H:%M").to_string(), "10:00", "{to}");
+        if at > started {
+            assert_eq!(at.with_timezone(&tz).format("%H:%M").to_string(), hm, "{to}");
+        }
     }
     assert_eq!(h.state.email.sent().iter().filter(|m| m.subject == "Local hello").count(), 0);
 
@@ -192,6 +220,10 @@ async fn smart_sending_skips_recent_recipients_and_gradual_spreads_batches() {
     h.drain().await;
     assert_eq!(received(&h, "a@x.test", "First one"), 1);
     // A receipt is not marketing: it doesn't make b look recently messaged.
+    h.ok("PATCH", "/api/transactional/settings", Some(json!({"enabled": true, "acknowledge": true}))).await;
+    let me = h.ok("GET", "/api/me", None).await;
+    let (s, _, body) = h.raw("POST", "/admin/transactional/mode", &[("authorization", "Bearer test-admin-token-0123456789abcdef0123"), ("content-type", "application/json")], &json!({"account_id": me["account"]["id"], "mode": "full"}).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
     h.ok("POST", "/api/transactional/send", Some(json!({"to": "b@x.test", "content": {"subject": "Your receipt", "text": "Thanks for your order."}}))).await;
     assert_eq!(received(&h, "b@x.test", "Your receipt"), 1);
 
@@ -366,5 +398,394 @@ async fn send_options_validation_api_and_mcp() {
     assert!(c2v["send_options"].is_null(), "a dry run saves nothing");
     let docs = mcp("resources/read", json!({"uri": "dumbmail://docs/sendtime"})).await;
     assert!(docs["result"]["contents"][0]["text"].as_str().unwrap().contains("local_time"));
+    h.cleanup().await;
+}
+
+/// Add `n` subscribed people to a list straight in the database (much faster than the API).
+async fn people(h: &Harness, list: &str, prefix: &str, n: i64) {
+    sqlx::query(
+        "WITH p AS (INSERT INTO profiles (id, account_id, email, email_consent)
+                    SELECT gen_random_uuid(), l.account_id, $2 || g || '@x.test', 'subscribed' FROM lists l, generate_series(1, $3) g WHERE l.id = $1::uuid
+                    RETURNING id)
+         INSERT INTO list_members (list_id, profile_id) SELECT $1::uuid, id FROM p",
+    )
+    .bind(list)
+    .bind(prefix)
+    .bind(n)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+}
+
+/// Run the campaign's send job now (and only that job).
+async fn prepare(h: &Harness, cid: &str) {
+    let n = sqlx::query("DELETE FROM jobs WHERE kind = 'campaign_send' AND payload->>'campaign_id' = $1").bind(cid).execute(&h.state.db).await.unwrap().rows_affected();
+    assert_eq!(n, 1, "one send job");
+    dumbmail::campaigns::prepare_send(&h.state, cid.parse().unwrap()).await.unwrap();
+}
+
+async fn campaign_row(h: &Harness, cid: &str) -> dumbmail::models::CampaignRow {
+    sqlx::query_as("SELECT * FROM campaigns WHERE id = $1::uuid").bind(cid).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn ids(h: &Harness, cid: &str) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1::uuid AND NOT is_test ORDER BY id").bind(cid).fetch_all(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_plain_send_now_campaign_goes_out_exactly_as_before() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let l = list(&mut h, "Everyone").await;
+    people(&h, &l, "plain", 250).await;
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Plain one", Value::Null))).await["id"].as_str().unwrap().to_string();
+    let asked = Utc::now();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    // The send job: every recipient queued, nothing planned, then batches of 100 in id order, due now.
+    prepare(&h, &cid).await;
+    let all = ids(&h, &cid).await;
+    assert_eq!(all.len(), 250);
+    let unplanned: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1::uuid AND status = 'queued' AND send_after IS NULL AND send_tz IS NULL AND planned_from IS NULL")
+        .bind(&cid)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(unplanned, 250);
+    let batches: Vec<(Value, DateTime<Utc>)> = sqlx::query_as("SELECT payload, run_at FROM jobs WHERE kind = 'campaign_batch' ORDER BY id").fetch_all(&h.state.db).await.unwrap();
+    let expected: Vec<Vec<String>> = all.chunks(100).map(|c| c.iter().map(|u| u.to_string()).collect()).collect();
+    let got: Vec<Vec<String>> = batches.iter().map(|(p, _)| serde_json::from_value(p["message_ids"].clone()).unwrap()).collect();
+    assert_eq!(got, expected);
+    assert!(batches.iter().all(|(_, at)| *at >= asked - chrono::Duration::seconds(1) && *at <= Utc::now()), "due right away: {batches:?}");
+    // Everyone gets it once, in that order.
+    h.drain().await;
+    let to: Vec<String> = sqlx::query_scalar("SELECT to_address FROM messages WHERE campaign_id = $1::uuid ORDER BY id").bind(&cid).fetch_all(&h.state.db).await.unwrap();
+    let sent: Vec<String> = h.state.email.sent().into_iter().filter(|m| m.subject == "Plain one").map(|m| m.to).collect();
+    assert_eq!(sent.len(), 250);
+    assert_eq!(sent, to[to.len() - sent.len()..].to_vec(), "sent in id order");
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_audience_is_fixed_when_the_send_starts() {
+    let mut h = harness!();
+    h.signup().await;
+    for opts in [Value::Null, json!({"timing": "gradual", "spread_hours": 3})] {
+        let l = list(&mut h, "Fixed").await;
+        let tag = if opts.is_null() { "now" } else { "slow" };
+        person(&mut h, &l, &format!("first-{tag}@x.test"), json!({})).await;
+        person(&mut h, &l, &format!("second-{tag}@x.test"), json!({})).await;
+        let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, &format!("Fixed {tag}"), opts.clone()))).await["id"].as_str().unwrap().to_string();
+        h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+        prepare(&h, &cid).await;
+        // Someone joins while it's going out, then the send job runs again (a retry or a duplicate).
+        let joiner = format!("joiner-{tag}@x.test");
+        person(&mut h, &l, &joiner, json!({})).await;
+        sqlx::query("INSERT INTO jobs (kind, payload) VALUES ('campaign_send', jsonb_build_object('campaign_id', $1::text))").bind(&cid).execute(&h.state.db).await.unwrap();
+        h.drain().await;
+        release(&h, &cid, None).await;
+        assert_eq!(rows(&h, &cid).await.len(), 2, "{tag}: nobody added after the start");
+        assert_eq!(received(&h, &joiner, &format!("Fixed {tag}")), 0, "{tag}");
+        assert_eq!(received(&h, &format!("second-{tag}@x.test"), &format!("Fixed {tag}")), 1, "{tag}");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_ab_holdout_who_leaves_the_list_still_gets_the_winner() {
+    let mut h = harness!();
+    h.signup().await;
+    let l = list(&mut h, "AB fixed").await;
+    for i in 0..10 {
+        person(&mut h, &l, &format!("h{i}@x.test"), json!({})).await;
+    }
+    let mut body = campaign(&l, "Version A", Value::Null);
+    body["ab_test"] = json!({"variants": [{"id": "b", "content": {"subject": "Version B", "blocks": [{"type": "text", "html": "<p>B</p>"}]}}], "test_percent": 20, "wait_hours": 1, "metric": "open_rate", "pick": "manual"});
+    let cid = h.ok("POST", "/api/campaigns", Some(body)).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    let slice: Vec<String> = rows(&h, &cid).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(slice.len(), 2);
+    let holdouts: Vec<String> = (0..10).map(|i| format!("h{i}@x.test")).filter(|e| !slice.contains(e)).collect();
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_holdouts WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(stored, 8);
+    // One holdout leaves the list (still subscribed); another unsubscribes; someone new joins.
+    sqlx::query("DELETE FROM list_members WHERE profile_id = (SELECT id FROM profiles WHERE email = $1)").bind(&holdouts[0]).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed' WHERE email = $1").bind(&holdouts[1]).execute(&h.state.db).await.unwrap();
+    person(&mut h, &l, "late@x.test", json!({})).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/winner"), Some(json!({"version": "b"}))).await;
+    h.drain().await;
+    assert_eq!(received(&h, &holdouts[0], "Version B"), 1, "left the list but was in the audience when it started");
+    assert_eq!(received(&h, &holdouts[1], "Version B"), 0, "consent is still checked");
+    assert_eq!(received(&h, "late@x.test", "Version B"), 0, "joined after the start");
+    for e in &holdouts[2..] {
+        assert_eq!(received(&h, e, "Version B"), 1, "{e}");
+    }
+    for e in &slice {
+        assert_eq!(received(&h, e, "Version B") + received(&h, e, "Version A"), 1, "{e}: test slice only once");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn interrupted_planning_gives_everyone_the_same_time_on_restart() {
+    let mut h = harness!();
+    h.signup().await;
+    let zones = ["Asia/Kolkata", "Asia/Kathmandu", "America/New_York", "Europe/London", "Pacific/Honolulu", "Australia/Adelaide"];
+    let minute = quiet_minute(&zones);
+    for opts in [json!({"timing": "gradual", "spread_hours": 4}), json!({"timing": "local_time", "local_time": clock::hhmm(minute)}), json!({"timing": "best_time", "within_hours": 24})] {
+        let l = list(&mut h, "Restart").await;
+        for (i, z) in zones.iter().enumerate() {
+            person(&mut h, &l, &format!("r{i}-{}@x.test", opts["timing"].as_str().unwrap()), json!({"properties": {"timezone": z}})).await;
+        }
+        let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Restart", opts.clone()))).await["id"].as_str().unwrap().to_string();
+        h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+        prepare(&h, &cid).await;
+        let before = rows(&h, &cid).await;
+        assert!(before.iter().all(|r| r.1.is_some() && r.2.is_some()), "{opts}: all planned");
+        // The worker died part way through the second step: half the messages have no release time yet
+        // (the first step, a single statement, either happened or didn't). The restart is later.
+        let all = ids(&h, &cid).await;
+        let half: Vec<uuid::Uuid> = all[all.len() / 2..].to_vec();
+        let gradual = opts["timing"] == "gradual";
+        sqlx::query("UPDATE messages SET send_tz = NULL, send_after = CASE WHEN $2 THEN send_after END WHERE id = ANY($1)").bind(&half).bind(gradual).execute(&h.state.db).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let n = dumbmail::features::sendtime::plan::plan_campaign(&h.state, &campaign_row(&h, &cid).await).await.unwrap();
+        assert_eq!(n as usize, half.len(), "{opts}");
+        assert_eq!(rows(&h, &cid).await, before, "{opts}: the same times as before the crash");
+        if gradual {
+            let start = before.iter().filter_map(|r| r.1).min().unwrap();
+            let mut hours: Vec<i64> = before.iter().map(|r| (r.1.unwrap() - start).num_minutes() / 60).collect();
+            hours.sort();
+            assert_eq!(hours, vec![0, 0, 1, 2, 2, 3], "{opts}: equal hourly batches");
+        }
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_batch_never_leaves_a_message_behind_between_its_reads() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let l = list(&mut h, "Dense").await;
+    people(&h, &l, "dense", 400).await;
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Dense", json!({"timing": "gradual", "spread_hours": 2})))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    prepare(&h, &cid).await;
+    sqlx::query("DELETE FROM jobs WHERE kind = 'campaign_batch'").execute(&h.state.db).await.unwrap();
+    // Release times a quarter of a millisecond apart, starting now: some come due while the batch reads.
+    sqlx::query(
+        "UPDATE messages m SET send_after = now() + x.rn * interval '250 microseconds'
+         FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM messages WHERE campaign_id = $1::uuid) x WHERE m.id = x.id",
+    )
+    .bind(&cid)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let all = ids(&h, &cid).await;
+    dumbmail::campaigns::send_batch(&h.state, cid.parse().unwrap(), &all).await.unwrap();
+    let orphans: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT m.id FROM messages m WHERE m.campaign_id = $1::uuid AND m.status = 'queued'
+           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'campaign_batch' AND j.run_at <> 'infinity' AND j.payload->'message_ids' ? m.id::text)",
+    )
+    .bind(&cid)
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    assert!(orphans.is_empty(), "queued with no batch to send them: {orphans:?}");
+    h.fast_forward().await;
+    assert_eq!(h.state.email.sent().iter().filter(|m| m.subject == "Dense").count(), 400);
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "sent");
+    h.cleanup().await;
+}
+
+/// A one-person campaign that is sending, with its message claimed by a worker.
+async fn claimed_race(h: &mut Harness, l: &str) -> (uuid::Uuid, uuid::Uuid) {
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(l, "Race", Value::Null))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    prepare(&h, &cid).await;
+    sqlx::query("DELETE FROM jobs WHERE kind = 'campaign_batch'").execute(&h.state.db).await.unwrap();
+    let mid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    let cid: uuid::Uuid = cid.parse().unwrap();
+    assert!(dumbmail::campaigns::claim(&h.state.db, cid, mid, "email", Utc::now()).await.unwrap().is_some());
+    (cid, mid)
+}
+
+#[tokio::test]
+async fn a_cancel_landing_between_claim_and_requeue_leaves_nothing_queued() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct: uuid::Uuid = h.ok("GET", "/api/me", None).await["account"]["id"].as_str().unwrap().parse().unwrap();
+    let l = list(&mut h, "Race").await;
+    person(&mut h, &l, "race@x.test", json!({})).await;
+    let db = h.state.db.clone();
+    let status = |mid: uuid::Uuid| {
+        let db = db.clone();
+        async move { sqlx::query_as::<_, (String, Option<String>)>("SELECT status, error FROM messages WHERE id = $1").bind(mid).fetch_one(&db).await.unwrap() }
+    };
+    // Claimed, then cancelled, then the worker puts it back (a warm-up or quiet-hours wait): skipped.
+    let (cid, mid) = claimed_race(&mut h, &l).await;
+    dumbmail::api::messaging::cancel(&h.state, acct, cid).await.unwrap();
+    assert!(!dumbmail::campaigns::requeue_claimed(&h.state.db, cid, mid, "email", None).await.unwrap());
+    assert_eq!(status(mid).await, ("skipped".to_string(), Some("campaign cancelled".to_string())));
+    // Put back first, then cancelled: skipped by the cancel. A claim after a cancel gets nothing.
+    let (cid, mid) = claimed_race(&mut h, &l).await;
+    assert!(dumbmail::campaigns::requeue_claimed(&h.state.db, cid, mid, "email", None).await.unwrap());
+    dumbmail::api::messaging::cancel(&h.state, acct, cid).await.unwrap();
+    assert_eq!(status(mid).await.0, "skipped");
+    assert!(dumbmail::campaigns::claim(&h.state.db, cid, mid, "email", Utc::now()).await.unwrap().is_none());
+    // Both at once, many times: never left queued behind a cancelled campaign.
+    for round in 0..25 {
+        let (cid, mid) = claimed_race(&mut h, &l).await;
+        let state = h.state.clone();
+        let (c, r) = tokio::join!(dumbmail::api::messaging::cancel(&state, acct, cid), dumbmail::campaigns::requeue_claimed(&state.db, cid, mid, "email", None));
+        c.unwrap();
+        r.unwrap();
+        assert_eq!(status(mid).await.0, "skipped", "round {round}");
+    }
+    // A pause stops the campaign the same way.
+    let (cid, mid) = claimed_race(&mut h, &l).await;
+    dumbmail::deliverability::pause(&h.state, acct, "test pause").await.unwrap();
+    assert!(!dumbmail::campaigns::requeue_claimed(&h.state.db, cid, mid, "email", None).await.unwrap());
+    assert_eq!(status(mid).await.0, "skipped");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn sms_uses_the_phone_numbers_clock_and_notes_when_zones_disagree() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    h.claim_number().await;
+    let l = list(&mut h, "Far").await;
+    // A New York number on a profile that says Manila: their texting hours never overlap.
+    let pid = h.ok("POST", "/api/profiles", Some(json!({"email": "far@x.test", "phone_number": "+12125550100", "sms_consent": "subscribed", "properties": {"timezone": "Asia/Manila"}, "list_ids": [l]}))).await["id"].as_str().unwrap().to_string();
+    let text = |name: &str| json!({"name": name, "channel": "sms", "audience": {"include": [{"type": "list", "id": l}]}, "content": {"body": "Hi from Acme. Reply STOP to opt out."}});
+    let cid = h.ok("POST", "/api/campaigns", Some(text("Far 1"))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let now = Utc::now();
+    h.drain().await;
+    let ny: Tz = "America/New_York".parse().unwrap();
+    let (status, send_after, note): (String, Option<DateTime<Utc>>, Option<String>) =
+        sqlx::query_as("SELECT status, send_after, send_note FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    match clock::window_wait(ny, now, 540, 1200) {
+        // New York's hours decide, whatever the time in Manila.
+        None => {
+            assert_eq!(status, "sent");
+            let note = note.expect("noted");
+            assert!(note.contains("America/New_York") && note.contains("Asia/Manila"), "{note}");
+            let detail = h.ok("GET", &format!("/api/profiles/{pid}"), None).await;
+            assert_eq!(detail["messages"][0]["note"], json!(note), "on the profile timeline");
+            assert!(detail["events"].as_array().unwrap().iter().any(|e| e["metric"] == "Received SMS" && e["properties"]["time_zone_note"] == json!(note)), "{detail}");
+        }
+        Some(until) => {
+            assert_eq!(status, "queued");
+            assert!((send_after.unwrap() - until).num_seconds().abs() <= 120, "waits for New York's 09:00, not Manila's");
+        }
+    }
+    // The account can choose not to text such people: skipped, with the reason and the note.
+    let s = h.ok("PATCH", "/api/sendtime/settings", Some(json!({"sms_zone_conflict": "skip"}))).await;
+    assert_eq!(s["sms_zone_conflict"], "skip");
+    assert_eq!(h.req("PATCH", "/api/sendtime/settings", Some(json!({"sms_zone_conflict": "manila"}))).await.0, StatusCode::BAD_REQUEST);
+    let before = h.state.sms.sent().len();
+    let cid = h.ok("POST", "/api/campaigns", Some(text("Far 2"))).await["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    let (status, error, note): (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT status, error, send_note FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), error.as_deref()), ("skipped", Some("time zones disagree")));
+    assert!(note.unwrap().contains("weren't texted"));
+    assert_eq!(h.state.sms.sent().len(), before);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_text_waiting_for_its_turn_checks_quiet_hours_again_before_it_goes() {
+    // One text a second, so the second waits about a second for its turn.
+    let mut h = match Harness::with(|c| c.send_rate_per_sec = 1).await {
+        Some(h) => h,
+        None => return,
+    };
+    h.signup().await;
+    h.credit(5.0).await;
+    h.claim_number().await;
+    let acct: uuid::Uuid = h.ok("GET", "/api/me", None).await["account"]["id"].as_str().unwrap().parse().unwrap();
+    // A number whose local time is inside 08:00-21:00 right now.
+    let now = Utc::now();
+    let (phone, tz) = [("+12125550100", "America/New_York"), ("+18085550100", "Pacific/Honolulu"), ("+919812345678", "Asia/Kolkata"), ("+13125550100", "America/Chicago")]
+        .into_iter()
+        .map(|(p, z)| (p, z.parse::<Tz>().unwrap()))
+        .find(|(_, z)| (8 * 60 + 2..21 * 60 - 2).contains(&clock::local_minute(*z, now)))
+        .unwrap();
+    h.ok("PATCH", "/api/sendtime/settings", Some(json!({"sms_window_start": "08:00", "sms_window_end": "21:00"}))).await;
+    let pid = h.ok("POST", "/api/profiles", Some(json!({"phone_number": phone, "sms_consent": "subscribed"}))).await["id"].as_str().unwrap().to_string();
+    let q = format!("SELECT {} FROM profiles p WHERE p.id = $1::uuid", dumbmail::models::PROFILE_COLS);
+    let profile: dumbmail::models::Profile = sqlx::query_as(&q).bind(&pid).fetch_one(&h.state.db).await.unwrap();
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
+    let content = json!({"body": "Your code is ready. Reply STOP to opt out."});
+    let spec = || dumbmail::sending::SendSpec {
+        account: &account,
+        profile: &profile,
+        channel: "sms",
+        content: &content,
+        campaign_id: None,
+        flow_id: None,
+        flow_node_id: None,
+        event: None,
+        is_test: false,
+        message_id: None,
+        to_override: None,
+    };
+    let first = dumbmail::sending::send(&h.state, spec()).await.unwrap();
+    assert!(matches!(first, dumbmail::sending::Outcome::Sent(_)), "{first:?}");
+    // The second waits for its turn; meanwhile the window closes.
+    let second = dumbmail::sending::send(&h.state, spec());
+    let close = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let window = if clock::local_minute(tz, Utc::now()) < 14 * 60 { ("19:00", "20:00") } else { ("08:00", "09:00") };
+        sqlx::query("UPDATE send_settings SET sms_start_minute = $2, sms_end_minute = $3 WHERE account_id = $1")
+            .bind(acct)
+            .bind(clock::parse_hhmm(window.0).unwrap() as i32)
+            .bind(clock::parse_hhmm(window.1).unwrap() as i32)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    };
+    let (second, ()) = tokio::join!(second, close);
+    match second.unwrap() {
+        dumbmail::sending::Outcome::Deferred(until) => assert!(until > Utc::now(), "{until}"),
+        other => panic!("sent after the window closed: {other:?}"),
+    }
+    assert_eq!(h.state.sms.sent().iter().filter(|m| m.to == phone).count(), 1);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE profile_id = $1::uuid").bind(&pid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 1, "the held text leaves no message behind (a flow re-runs it)");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn rest_send_and_schedule_take_send_options() {
+    let mut h = harness!();
+    h.signup().await;
+    let l = list(&mut h, "Rest").await;
+    person(&mut h, &l, "rest@x.test", json!({})).await;
+    let cid = h.ok("POST", "/api/campaigns", Some(campaign(&l, "Rest", Value::Null))).await["id"].as_str().unwrap().to_string();
+    let at = Utc::now() + chrono::Duration::days(2);
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at, "surprise": 1}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "unknown fields aren't ignored: {v}");
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at, "send_options": {"timing": "whenever"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["status"], "draft");
+    let c = h.ok("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at, "send_options": {"timing": "gradual", "spread_hours": 3}}))).await;
+    assert_eq!((c["status"].as_str(), c["send_options"]["timing"].as_str(), c["send_options"]["spread_hours"].as_i64()), (Some("scheduled"), Some("gradual"), Some(3)), "{c}");
+    h.ok("POST", &format!("/api/campaigns/{cid}/cancel"), None).await;
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/send"), Some(json!({"send_options": {"smart_sending": true, "smart_sending_hours": 0}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let c = h.ok("POST", &format!("/api/campaigns/{cid}/send"), Some(json!({"send_options": {"smart_sending": true}}))).await;
+    assert_eq!((c["status"].as_str(), c["send_options"]["smart_sending"].as_bool()), (Some("sending"), Some(true)), "{c}");
+    // Options can't change once it's sending.
+    let (s, _) = h.req("POST", &format!("/api/campaigns/{cid}/schedule"), Some(json!({"send_at": at, "send_options": null}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
     h.cleanup().await;
 }

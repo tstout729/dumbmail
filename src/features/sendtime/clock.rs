@@ -18,16 +18,16 @@ pub fn hhmm(minutes: u32) -> String {
 }
 
 /// The instant the clock in `tz` shows `minute` (after midnight) on `date`. A time skipped by a
-/// spring-forward change moves to the first minute that exists after it; a time that happens twice
-/// in a fall-back change is its first occurrence.
+/// spring-forward change moves to the first minute that exists after it (the end of the gap: 02:07
+/// on a 02:00-03:00 gap is 03:00); a time that happens twice in a fall-back change is its first occurrence.
 pub fn local_instant(tz: Tz, date: NaiveDate, minute: u32) -> DateTime<Utc> {
     let mut naive = date.and_time(NaiveTime::from_hms_opt(minute / 60 % 24, minute % 60, 0).unwrap_or(NaiveTime::MIN));
-    // Gaps are at most a couple of hours; step forward a quarter hour at a time until the clock exists.
-    for _ in 0..16 {
+    // Gaps are at most a couple of hours; step forward a minute at a time until the clock exists.
+    for _ in 0..(4 * 60) {
         match tz.from_local_datetime(&naive) {
             LocalResult::Single(t) => return t.with_timezone(&Utc),
             LocalResult::Ambiguous(a, b) => return a.min(b).with_timezone(&Utc),
-            LocalResult::None => naive += Duration::minutes(15),
+            LocalResult::None => naive += Duration::minutes(1),
         }
     }
     Utc.from_utc_datetime(&naive)
@@ -101,6 +101,13 @@ mod tests {
         // US spring forward 2026-03-08: 02:30 doesn't exist in New York; it becomes 03:00 EDT (07:00 UTC).
         let spring = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
         assert_eq!(local_instant(America::New_York, spring, 150), utc(2026, 3, 8, 7, 0));
+        // Not on a quarter hour: 02:07 is the first valid minute after the gap, 03:00, not 03:07.
+        assert_eq!(local_instant(America::New_York, spring, 127), utc(2026, 3, 8, 7, 0));
+        assert_eq!(local_instant(America::New_York, spring, 179), utc(2026, 3, 8, 7, 0));
+        // Lord Howe Island springs forward half an hour (02:00 -> 02:30, +10:30 -> +11 on 2026-10-04): 02:10 is 02:30 = 15:30 UTC.
+        let lhi: Tz = "Australia/Lord_Howe".parse().unwrap();
+        let lh = NaiveDate::from_ymd_opt(2026, 10, 4).unwrap();
+        assert_eq!(local_instant(lhi, lh, 130), utc(2026, 10, 3, 15, 30));
         // 10:00 that day is EDT (14:00 UTC), the day before EST (15:00 UTC).
         assert_eq!(local_instant(America::New_York, spring, 600), utc(2026, 3, 8, 14, 0));
         assert_eq!(local_instant(America::New_York, spring.pred_opt().unwrap(), 600), utc(2026, 3, 7, 15, 0));

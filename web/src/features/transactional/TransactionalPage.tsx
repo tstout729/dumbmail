@@ -1,13 +1,12 @@
 import { useDeferredValue, useState, type FormEvent } from "react";
 import { Link } from "react-router";
-import { AlertTriangle, Code2, Plus, Receipt, RotateCw, Search } from "lucide-react";
+import { AlertTriangle, Code2, Plus, Receipt, Search } from "lucide-react";
 import { useSession } from "../../api";
 import {
   Badge,
   Button,
   Card,
   CodeBlock,
-  ConfirmDialog,
   Drawer,
   EmptyRow,
   EmptyState,
@@ -31,11 +30,12 @@ import {
 } from "../../components/ui";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
-import { pageSize, useCreateTransactionalTemplate, useResend, useTransactionalSend, useTransactionalSends, useTransactionalSettings, useTransactionalTemplates } from "./api";
-import type { SendStatus, TransactionalSend } from "./types";
+import { pageSize, useCreateTransactionalTemplate, useTransactionalSend, useTransactionalSends, useTransactionalSettings, useTransactionalTemplates } from "./api";
+import type { SendStatus } from "./types";
 
 const statusTone: Record<SendStatus, Tone> = {
   queued: "blue",
+  sending: "blue",
   sent: "gray",
   delivered: "green",
   opened: "green",
@@ -44,9 +44,10 @@ const statusTone: Record<SendStatus, Tone> = {
   complained: "red",
   skipped: "amber",
   failed: "red",
+  unknown: "amber",
 };
 
-const statuses: SendStatus[] = ["queued", "sent", "delivered", "opened", "clicked", "bounced", "complained", "skipped", "failed"];
+const statuses: SendStatus[] = ["queued", "sending", "sent", "delivered", "opened", "clicked", "bounced", "complained", "skipped", "failed", "unknown"];
 
 function StatusPill({ status }: { status: SendStatus }) {
   return (
@@ -91,6 +92,22 @@ function Limits() {
   const s = useTransactionalSettings();
   return (
     <div className="mb-4 space-y-3">
+      {s.data?.mode === "off" ? (
+        <Notice tone="amber" icon={<AlertTriangle />} title="Transactional email is off">
+          Nothing can be sent through the API until the account owner turns it on in{" "}
+          <Link to="/settings/transactional" className="font-medium underline">
+            Settings → Transactional
+          </Link>
+          .
+        </Notice>
+      ) : s.data?.mode === "restricted" ? (
+        <Notice tone="blue" title="Restricted mode">
+          Only saved transactional templates can be sent, up to {formatNumber(s.data.daily_limit)} a day.{" "}
+          <Link to="/settings/transactional" className="font-medium underline">
+            How to get full mode
+          </Link>
+        </Notice>
+      ) : null}
       {s.data?.paused ? (
         <Notice tone="red" icon={<AlertTriangle />} title="Transactional email is paused for this account">
           {s.data.paused_reason ? `${s.data.paused_reason}. ` : null}Contact support to resume. Campaigns and flows aren't affected.
@@ -203,30 +220,18 @@ function Sends() {
           </Button>
         </div>
       ) : null}
-      {open ? <SendDrawer id={open} onClose={() => setOpen(null)} onOpen={setOpen} /> : null}
+      {open ? <SendDrawer id={open} onClose={() => setOpen(null)} /> : null}
     </>
   );
 }
 
-function SendDrawer({ id, onClose, onOpen }: { id: string; onClose: () => void; onOpen: (id: string) => void }) {
+function SendDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { account } = useSession();
   const send = useTransactionalSend(id);
-  const resend = useResend();
-  const [confirm, setConfirm] = useState(false);
   const s = send.data;
   const tz = account.timezone;
   return (
-    <Drawer
-      title="Transactional email"
-      onClose={onClose}
-      footer={
-        s ? (
-          <Button icon={<RotateCw className="size-3.5" />} onClick={() => setConfirm(true)}>
-            Resend
-          </Button>
-        ) : null
-      }
-    >
+    <Drawer title="Transactional email" onClose={onClose}>
       {send.isPending ? (
         <div className="space-y-3">
           <Skeleton className="h-6 w-2/3" />
@@ -265,6 +270,8 @@ function SendDrawer({ id, onClose, onOpen }: { id: string; onClose: () => void; 
                 <dd className="text-zinc-800">{at ? formatDateTime(at, tz) : "—"}</dd>
               </div>
             ))}
+            <dt className="text-zinc-500">Attempts</dt>
+            <dd className="text-zinc-800">{s.attempts}</dd>
             <dt className="text-zinc-500">Click tracking</dt>
             <dd className="text-zinc-800">{s.track_clicks ? "On" : "Off"}</dd>
             <dt className="text-zinc-500">Sent through</dt>
@@ -275,39 +282,15 @@ function SendDrawer({ id, onClose, onOpen }: { id: string; onClose: () => void; 
                 <dd className="break-all font-mono text-zinc-800">{s.idempotency_key}</dd>
               </>
             ) : null}
-            {s.resent_from ? (
-              <>
-                <dt className="text-zinc-500">Resend of</dt>
-                <dd>
-                  <button type="button" className="text-accent-700 hover:underline" onClick={() => onOpen(s.resent_from ?? id)}>
-                    the original email
-                  </button>
-                </dd>
-              </>
-            ) : null}
           </dl>
-          {s.request.variables && Object.keys(s.request.variables).length ? <CodeBlock label="Variables" code={JSON.stringify(s.request.variables, null, 2)} /> : null}
           {Object.keys(s.metadata).length ? <CodeBlock label="Metadata" code={JSON.stringify(s.metadata, null, 2)} /> : null}
+          <p className="text-xs text-zinc-500">
+            {s.status === "unknown"
+              ? "This send was cut off while it was being handed to the email provider, so it may have gone out. It's never sent again automatically. "
+              : null}
+            Variables and the email body aren't kept, since they can hold reset links and codes. To send it again, call the API again with fresh values.
+          </p>
         </div>
-      ) : null}
-      {confirm && s ? (
-        <ConfirmDialog
-          title="Send this email again?"
-          body={`${s.to} gets the same email again, as a new send.`}
-          confirmLabel="Resend"
-          loading={resend.isPending}
-          onConfirm={() =>
-            resend.mutate(id, {
-              onSuccess: (r: TransactionalSend) => {
-                setConfirm(false);
-                if (r.status === "skipped") toast.error(r.error ?? "Not sent");
-                else toast.success("Sent again");
-                onOpen(r.id);
-              },
-            })
-          }
-          onClose={() => setConfirm(false)}
-        />
       ) : null}
     </Drawer>
   );
@@ -321,7 +304,10 @@ function Templates() {
   return (
     <>
       <div className="mb-3 flex items-center justify-between gap-3">
-        <p className="text-sm text-zinc-500">Only templates made here can be sent through the transactional API. Each one is checked for promotional wording.</p>
+        <p className="text-sm text-zinc-500">
+          Only templates made here can be sent through the transactional API. Each one is checked for promotional wording when it's saved and every time it's
+          sent.
+        </p>
         <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setCreating(true)}>
           New template
         </Button>
@@ -351,9 +337,9 @@ function Templates() {
                     <Link to={`/content/templates/${t.id}`} className="text-zinc-900 hover:underline">
                       {t.name}
                     </Link>
-                    {t.review.flags.length ? (
-                      <span className="ml-2" title={`Reads a little promotional: ${t.review.flags.join(", ")}`}>
-                        <Badge tone="amber">Check wording</Badge>
+                    {t.review.blocked ? (
+                      <span className="ml-2" title={`Reads like marketing, so it won't send: ${t.review.flags.join(", ")}`}>
+                        <Badge tone="red">Won't send</Badge>
                       </span>
                     ) : null}
                   </Td>
@@ -385,7 +371,7 @@ function NewTemplate({ onClose }: { onClose: () => void }) {
       { name: String(d.get("name") ?? "").trim(), content: format === "text" ? { subject, text: body } : { subject, html: body } },
       {
         onSuccess: (t) => {
-          toast.success(t.review.flags.length ? `Saved. It reads a little promotional (${t.review.flags.join(", ")}).` : "Template saved");
+          toast.success(`Template "${t.name}" saved`);
           onClose();
         },
       },
@@ -448,11 +434,18 @@ function HowTo({ onClose }: { onClose: () => void }) {
           <Link to="/settings/developers" className="text-accent-700 hover:underline">
             Developers
           </Link>
-          . Use a template id from the Templates tab, or send <code className="rounded bg-zinc-100 px-1 text-xs">content</code> with a subject and text or HTML.
+          . Use a template id from the Templates tab
+          {settings.data?.mode === "full" ? (
+            <>
+              , or send <code className="rounded bg-zinc-100 px-1 text-xs">content</code> with a subject and text or HTML
+            </>
+          ) : null}
+          .
         </p>
         <CodeBlock label="Terminal" code={curl} />
         <ul className="list-disc space-y-1 pl-5">
           <li>Retry with the same idempotency key as often as you like: it sends once.</li>
+          <li>Variables aren't stored. To send again, make a new request with fresh values (a new reset link, for example).</li>
           <li>Click tracking is off unless you send "track_clicks": true. Opens are tracked.</li>
           <li>Add "address_footer": true to show your name and postal address.</li>
           <li>Addresses that bounced or complained come back with status "skipped".</li>
@@ -460,8 +453,8 @@ function HowTo({ onClose }: { onClose: () => void }) {
         <Card title="Limits" className="shadow-none">
           <p className="text-xs">
             {settings.data ? `${formatNumber(settings.data.per_minute_limit)} emails a minute and ${formatNumber(settings.data.daily_limit)} in any 24 hours. ` : null}
-            Promotional wording is refused, and sudden floods to people with no other activity pause
-            transactional email until support takes a look.
+            Promotional wording is refused (discount or offer language, "shop now", links to several products), and sudden floods to people with no
+            other activity pause transactional email until support takes a look.
           </p>
         </Card>
       </div>

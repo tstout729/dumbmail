@@ -161,14 +161,19 @@ pub fn describe(o: Option<&SendOptions>) -> String {
     let when = match o.timing {
         Timing::AllAtOnce => "Goes to everyone at once.".to_string(),
         Timing::LocalTime => format!(
-            "Goes out at {} in each person's time zone; people for whom it's already past {} when sending starts get it {}.",
+            "Goes out at {} in each person's time zone; people for whom {} had already passed more than 15 minutes before the send get it {}.",
             o.local_time.as_deref().unwrap_or("10:00"),
             o.local_time.as_deref().unwrap_or("10:00"),
             if o.late == Late::Immediately { "right away" } else { "at that time the next day" }
         ),
         Timing::BestTime => {
             let (s, e) = o.window();
-            format!("Goes out at each person's best hour between {} and {} their time, within {} hours of the send time.", hhmm(s), hhmm(e), o.within_hours())
+            format!(
+                "Goes out at each person's best hour between {} and {} their time, within {} hours of the send time (anyone whose window doesn't open in that time gets it when it next opens).",
+                hhmm(s),
+                hhmm(e),
+                o.within_hours()
+            )
         }
         Timing::Gradual => format!("Spread evenly over {} hours, one batch an hour.", o.spread_hours()),
     };

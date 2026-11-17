@@ -427,19 +427,50 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScheduleBody {
     send_at: DateTime<Utc>,
+    /// Saved on the campaign before it's scheduled (see `CampaignBody::send_options`).
+    #[serde(default, deserialize_with = "present")]
+    send_options: Option<Value>,
+}
+
+/// Save send options given with a send or schedule request, on a campaign that hasn't started.
+pub async fn apply_send_options(state: &AppState, account_id: Uuid, id: Uuid, send_options: Option<&Value>) -> AppResult<()> {
+    let Some(opts) = send_options else { return Ok(()) };
+    let c = campaigns::load(&state.db, account_id, id).await?;
+    if !matches!(c.status.as_str(), "draft" | "scheduled") {
+        return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
+    }
+    let opts = crate::features::sendtime::checked(Some(opts))?;
+    sqlx::query("UPDATE campaigns SET send_options = $3, updated_at = now() WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).bind(opts).execute(&state.db).await?;
+    Ok(())
 }
 
 async fn schedule_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ScheduleBody>) -> AppResult<Json<Value>> {
     if b.send_at < Utc::now() {
         return Err(AppError::bad("pick a time in the future, or send now"));
     }
+    apply_send_options(&state, ctx.account_id, id, b.send_options.as_ref()).await?;
     let c = launch(&state, ctx.account_id, id, Some(b.send_at)).await?;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
-async fn send_now_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SendNowBody {
+    #[serde(default, deserialize_with = "present")]
+    send_options: Option<Value>,
+}
+
+/// Send now. The body is optional: `{send_options}` saves them on the campaign first.
+async fn send_now_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, body: axum::body::Bytes) -> AppResult<Json<Value>> {
+    let b: SendNowBody = if body.iter().all(u8::is_ascii_whitespace) {
+        SendNowBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| AppError::bad(format!("invalid body: {e}")))?
+    };
+    apply_send_options(&state, ctx.account_id, id, b.send_options.as_ref()).await?;
     let c = launch(&state, ctx.account_id, id, None).await?;
     Ok(Json(campaign_json(&state, &c).await?))
 }
@@ -451,8 +482,20 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
         "sending" | "testing" => "cancelled",
         other => return Err(AppError::Conflict(format!("a {other} campaign can't be cancelled"))),
     };
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&state.db).await?;
-    Ok(sqlx::query_as("UPDATE campaigns SET status = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(new_status).fetch_one(&state.db).await?)
+    // The campaign first, then its queued messages, in one transaction: a batch claiming or re-queuing a
+    // message at the same moment checks the campaign under a lock (see `campaigns::claim`), so nothing is
+    // left queued or sent behind the cancel.
+    let mut tx = state.db.begin().await?;
+    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET status = $2, updated_at = now() WHERE id = $1 AND status = $3 RETURNING *")
+        .bind(id)
+        .bind(new_status)
+        .bind(&c.status)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while cancelling; try again".into()))?;
+    sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

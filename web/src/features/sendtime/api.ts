@@ -36,10 +36,10 @@ export function useSendSettings() {
 export function useUpdateSendSettings() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (patch: Pick<SendSettings, "sms_window_start" | "sms_window_end">) => api<SendSettings>("PATCH", "/api/sendtime/settings", patch),
+    mutationFn: (patch: Partial<Pick<SendSettings, "sms_window_start" | "sms_window_end" | "sms_zone_conflict">>) => api<SendSettings>("PATCH", "/api/sendtime/settings", patch),
     onSuccess: (s) => {
       qc.setQueryData(keys.settings, s);
-      toast.success("Text message hours saved");
+      toast.success("Text message settings saved");
     },
   });
 }
