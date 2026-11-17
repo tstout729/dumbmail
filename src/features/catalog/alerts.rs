@@ -379,18 +379,7 @@ pub async fn run_price_drop(state: &AppState, payload: &Value) -> anyhow::Result
     .bind(BATCH)
     .fetch_all(&state.db)
     .await?;
-    let claimed: Vec<Uuid> = sqlx::query_scalar(
-        "INSERT INTO catalog_price_drop_notices (profile_id, product_id, notified_at, drop_key) SELECT pid, $2, now(), $3 FROM unnest($1::uuid[]) pid
-         ON CONFLICT (profile_id, product_id) DO UPDATE SET notified_at = now(), drop_key = EXCLUDED.drop_key
-         WHERE catalog_price_drop_notices.notified_at <= now() - make_interval(days => $4) OR catalog_price_drop_notices.drop_key = EXCLUDED.drop_key
-         RETURNING profile_id",
-    )
-    .bind(&people)
-    .bind(p.id)
-    .bind(&key)
-    .bind(s.price_drop_cooldown_days)
-    .fetch_all(&state.db)
-    .await?;
+    let claimed = claim_price_drop(&state.db, p.id, &key, s.price_drop_cooldown_days, &people).await?;
     for pid in &claimed {
         let mut props = product_props(&p, None);
         props["old_price"] = json!(j.old);
@@ -422,6 +411,24 @@ pub async fn run_price_drop(state: &AppState, payload: &Value) -> anyhow::Result
         crate::jobs::enqueue(&state.db, "catalog_price_drop", next, None).await?;
     }
     Ok(())
+}
+
+/// Claim `people` for the price drop `key` on a product: only those not told about it within
+/// `cooldown_days` (or already claimed by this same drop, for a retry). The cooldown row is written
+/// with the check, so two drops can't both claim a person.
+pub async fn claim_price_drop(db: &PgPool, product_id: Uuid, key: &str, cooldown_days: i32, people: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "INSERT INTO catalog_price_drop_notices (profile_id, product_id, notified_at, drop_key) SELECT pid, $2, now(), $3 FROM unnest($1::uuid[]) pid
+         ON CONFLICT (profile_id, product_id) DO UPDATE SET notified_at = now(), drop_key = EXCLUDED.drop_key
+         WHERE catalog_price_drop_notices.notified_at <= now() - make_interval(days => $4) OR catalog_price_drop_notices.drop_key = EXCLUDED.drop_key
+         RETURNING profile_id",
+    )
+    .bind(people)
+    .bind(product_id)
+    .bind(key)
+    .bind(cooldown_days)
+    .fetch_all(db)
+    .await
 }
 
 // ---------- Public endpoints for the on-site widget ----------

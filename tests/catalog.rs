@@ -803,12 +803,24 @@ async fn alert_jobs_tell_each_person_once() {
     // Two price drops handled at the same moment.
     let drop = |old: f64, new: f64| json!({"account_id": account, "product_id": pid, "old": old, "new": new, "drop_id": uuid::Uuid::now_v7(), "after": null});
     let (d1, d2) = (drop(100.0, 80.0), drop(80.0, 70.0));
+    // Open the pool's connections first, so neither job waits on a new one and they truly overlap.
+    let warm = |ms: f64| sqlx::query("SELECT pg_sleep($1)").bind(ms / 1000.0).execute(&h.state.db);
+    let _ = tokio::join!(warm(50.0), warm(50.0), warm(50.0), warm(50.0));
     let (a, b) = tokio::join!(alerts::run_price_drop(&h.state, &d1), alerts::run_price_drop(&h.state, &d2));
     a.unwrap();
     b.unwrap();
     assert_eq!(metric_count(&h, "Price Dropped").await, 5, "each person told once");
     alerts::run_price_drop(&h.state, &d1).await.unwrap();
     assert_eq!(metric_count(&h, "Price Dropped").await, 5, "a retry tells nobody again");
+    // The claim itself: a second drop gets nobody in the cooldown; the same drop (a retry) gets its own back.
+    let viewers: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM profiles ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    let (other, retry) = tokio::join!(alerts::claim_price_drop(&h.state.db, pid, "another-drop", 30, &viewers), async {
+        let key: String = sqlx::query_scalar("SELECT drop_key FROM catalog_price_drop_notices LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+        let mine: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT profile_id FROM catalog_price_drop_notices WHERE drop_key = $1").bind(&key).fetch_all(&h.state.db).await.unwrap();
+        (alerts::claim_price_drop(&h.state.db, pid, &key, 30, &viewers).await.unwrap(), mine)
+    });
+    assert!(other.unwrap().is_empty(), "inside the cooldown, nobody is claimed twice");
+    assert_eq!(retry.0.len(), retry.1.len());
 
     // A restock with six people waiting and a limit of three.
     h.ok("PATCH", "/api/catalog/settings", Some(json!({"back_in_stock_limit": 3}))).await;
