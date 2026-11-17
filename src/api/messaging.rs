@@ -681,11 +681,11 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         }
         // Segment triggers: snapshot current members so only new entrants start the flow.
         if let Ok(flows::Trigger::Segment { segment_id }) = flows::parse_trigger(&f.trigger) {
-            let seg = super::audience::get_segment(state, account_id, segment_id).await?;
-            if seg.refreshed_at.is_none() {
-                let d = crate::segments::parse(&seg.definition)?;
-                crate::segments::refresh(&state.db, account_id, segment_id, &d).await?;
-            }
+            super::audience::get_segment(state, account_id, segment_id).await?;
+            // Always, not only the first time: segments refresh on a schedule, so anyone who joined
+            // since the last refresh would otherwise count as a new entrant of this flow. This runs
+            // before the flow is live, so it starts only the other live flows on this segment.
+            crate::flows::refresh_segment(state, segment_id).await.map_err(|e| AppError::bad(format!("couldn't refresh the trigger segment: {e}")))?;
         }
     }
     let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(status).fetch_one(&state.db).await?;

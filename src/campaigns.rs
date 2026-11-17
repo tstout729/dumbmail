@@ -133,7 +133,7 @@ async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResu
                     .fetch_optional(db)
                     .await?;
                 let def = def.ok_or_else(|| AppError::not_found("segment"))?;
-                out.push(Resolved::Segment(segments::parse(&def)?));
+                out.push(Resolved::Segment(segments::load(db, account_id, &def, Some(r.id)).await?));
             }
             other => return Err(AppError::bad(format!("audience type must be list or segment, got {other:?}"))),
         }

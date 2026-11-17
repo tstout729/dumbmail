@@ -3,11 +3,13 @@ import { api } from "./client";
 import { keys } from "./keys";
 import type { List, ListResponse } from "./types";
 
+export type ListInput = { name?: string; double_opt_in?: boolean; show_on_preferences?: boolean; description?: string };
+
 export const listsApi = {
   list: () => api<ListResponse<List>>("GET", "/api/lists"),
   get: (id: string) => api<List>("GET", `/api/lists/${id}`),
-  create: (input: { name: string; double_opt_in?: boolean }) => api<List>("POST", "/api/lists", input),
-  update: (id: string, input: { name?: string }) => api<List>("PATCH", `/api/lists/${id}`, input),
+  create: (input: ListInput & { name: string }) => api<List>("POST", "/api/lists", input),
+  update: (id: string, input: ListInput) => api<List>("PATCH", `/api/lists/${id}`, input),
   remove: (id: string) => api<List>("DELETE", `/api/lists/${id}`),
   addMembers: (id: string, input: { profile_ids?: string[]; emails?: string[] }) =>
     api<{ added: number }>("POST", `/api/lists/${id}/members`, input),
@@ -34,7 +36,7 @@ export function useCreateList() {
 export function useUpdateList(id: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (input: { name?: string }) => listsApi.update(id, input),
+    mutationFn: (input: ListInput) => listsApi.update(id, input),
     onSuccess: (list) => {
       qc.setQueryData(keys.list(id), list);
       void qc.invalidateQueries({ queryKey: keys.lists });

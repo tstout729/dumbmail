@@ -78,6 +78,10 @@ pub struct List {
     pub id: Uuid,
     pub name: String,
     pub double_opt_in: bool,
+    /// Listed on the preference page people reach from the unsubscribe link.
+    pub show_on_preferences: bool,
+    /// Shown under the list's name on the preference page.
+    pub description: String,
     pub member_count: i64,
     pub created_at: DateTime<Utc>,
 }

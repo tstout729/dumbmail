@@ -19,6 +19,7 @@ pub mod models;
 pub mod optin;
 pub mod phone;
 pub mod plans;
+pub mod preferences;
 pub mod providers;
 pub mod public;
 pub mod render;
@@ -27,6 +28,7 @@ pub mod sending;
 pub mod site;
 pub mod state;
 pub mod subscription;
+pub mod tz_countries;
 pub mod web;
 
 use axum::Router;

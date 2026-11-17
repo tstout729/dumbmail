@@ -336,7 +336,7 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
         return Ok(None);
     }
     if let Some(f) = &def.settings.profile_filter {
-        if !segments::profile_matches(&state.db, profile_id, &segments::parse(f)?).await? {
+        if !segments::profile_matches(&state.db, profile_id, &segments::load(&state.db, flow.account_id, f, None).await?).await? {
             return Ok(None);
         }
     }
@@ -408,7 +408,15 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
         .fetch_optional(&state.db)
         .await?;
     let Some((account_id, def, refreshed_at)) = row else { return Ok(()) };
-    let def = segments::parse(&def).map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    // Rules that can't load (e.g. they include a segment that was since deleted) won't fix themselves
+    // on a retry: log it and try again on the next scheduled refresh.
+    let def = match segments::load(&state.db, account_id, &def, Some(segment_id)).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(segment = %segment_id, error = %e.public_message(), "segment rules couldn't load; not refreshed");
+            return Ok(());
+        }
+    };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone.
     if refreshed_at.is_none() {
@@ -507,7 +515,10 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     let Some(person) = profile(&state.db, run.profile_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else {
         return finish(&state.db, run.id, "exited").await;
     };
-    let exit = def.settings.exit_condition.as_ref().map(segments::parse).transpose().map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let exit = match def.settings.exit_condition.as_ref() {
+        Some(raw) => Some(segments::load(&state.db, flow.account_id, raw, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?),
+        None => None,
+    };
     let mut context = run.context.clone();
     let mut current = run.current_node.clone();
 
@@ -607,7 +618,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "condition" => {
-                let cond = segments::parse(&node.data["condition"]).map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }

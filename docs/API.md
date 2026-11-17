@@ -40,17 +40,37 @@ type User = { id: string; email: string; name: string | null };
 
 // Segment definitions (also used for flow splits, flow filters and form/campaign rules)
 type SegmentDefinition = { match: "all" | "any"; conditions: Condition[] };
+// Dates written YYYY-MM-DD are whole days in the account's time zone. The MCP resource
+// dumbmail://docs/segments explains every rule with examples.
+type Window = { within_days?: number; since?: string; until?: string }; // since/until: YYYY-MM-DD, both days included
+type EventFilter = { field: string; op: PropOp; value?: unknown }; // field: "value" or an event property key
 type Condition =
   | { type: "property"; field: string; op: PropOp; value?: unknown }
-    // field: "email" | "phone_number" | "first_name" | "last_name" | "external_id" | "created_at"
-    //        | any custom property key, e.g. "city" or "vip"
-  | { type: "event"; metric: string; op: "at_least" | "at_most" | "exactly" | "zero"; count?: number;
-      within_days?: number; where?: { field: string; op: PropOp; value?: unknown }[] } // where.field: "value" or an event property key
+    // field: "email" | "phone_number" | "first_name" | "last_name" | "external_id" | "created_at" | "updated_at"
+    //        | "last_event_at" | "email_consent" | "sms_consent" | "email_suppressed_reason"
+    //        | any custom property key, e.g. "city" or "vip". Location: "country", "region", "city", "zip", "timezone".
+  | ({ type: "event"; metric: string; op: "at_least" | "at_most" | "exactly" | "zero"; count?: number; where?: EventFilter[] } & Window)
+  | ({ type: "event_value"; metric: string; aggregate: "sum" | "average" | "min" | "max"; field?: string; // default "value"
+       op: CmpOp; value: number | [number, number]; where?: EventFilter[] } & Window)
+  | { type: "event_time"; metric: string; which: "first" | "last";
+      op: "within_last_days" | "more_than_days_ago" | "before" | "after" | "between"; value: number | string | [string, string]; where?: EventFilter[] }
   | { type: "list"; list_id: string; op: "in" | "not_in" }
+  | { type: "segment"; segment_id: string; op: "in" | "not_in" } // the other segment's rules, evaluated live
   | { type: "consent"; channel: "email" | "sms"; status: Consent }
+  | { type: "can_receive"; channel: "email" | "sms"; value?: boolean } // a send would reach them now
+  | { type: "suppressed"; value?: boolean } // email suppressed after a hard bounce or complaint
+  | ({ type: "form"; form_id?: string; op?: "has" | "has_not" } & Window) // signed up through a form (any form without form_id)
+  | { type: "engagement"; channel: "email" | "sms" | "any"; engaged?: boolean; within_days: number }
+  | { type: "message"; action: "received" | "opened" | "clicked"; campaign_id?: string; flow_id?: string; // exactly one of the two
+      op?: "has" | "has_not"; within_days?: number }
+  | { type: "prediction"; measure: Prediction; op: CmpOp | "in"; value: number | [number, number] | string | string[]; metric?: string } // default "Placed Order"
+  | { type: "random"; percent: number; seed?: string } // stable share of profiles for a seed
   | { type: "group"; match: "all" | "any"; conditions: Condition[] };
-type PropOp = "eq" | "neq" | "contains" | "not_contains" | "starts_with" | "exists" | "not_exists"
-  | "gt" | "gte" | "lt" | "lte" | "in" | "within_last_days" | "more_than_days_ago";
+type PropOp = "eq" | "neq" | "contains" | "not_contains" | "starts_with" | "ends_with" | "exists" | "not_exists"
+  | "gt" | "gte" | "lt" | "lte" | "between" | "in" | "not_in" | "within_last_days" | "more_than_days_ago" | "anniversary_within_days";
+type CmpOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "between";
+type Prediction = "historic_clv" | "predicted_clv" | "order_count" | "average_order_value" | "days_since_last_order"
+  | "average_days_between_orders" | "expected_next_order_in_days" | "churn_risk"; // churn_risk: "low" | "medium" | "high" with eq, neq or in
 
 type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 type AudienceRef = { type: "list" | "segment"; id: string };
@@ -114,7 +134,7 @@ type Flow = {
   stats: MessageStats & { active_runs: number; total_runs: number };
 };
 
-type List = { id: string; name: string; double_opt_in: boolean; member_count: number; created_at: string };
+type List = { id: string; name: string; double_opt_in: boolean; show_on_preferences: boolean; description: string; member_count: number; created_at: string };
 type Segment = { id: string; name: string; definition: SegmentDefinition; member_count: number; refreshed_at: string | null; created_at: string; updated_at: string };
 type Template = { id: string; name: string; channel: "email" | "sms"; content: EmailContent | SmsContent; created_at: string; updated_at: string };
 type Form = {
@@ -160,13 +180,13 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | DELETE | `/api/profiles/:id` | – | `{ok: true}` |
 | POST | `/api/profiles/import` | `{csv: string, list_id?: string, email_consent?: Consent, sms_consent?: Consent, permission_confirmed?: boolean}` | `{created, updated, skipped, errors: string[]}`. On the hosted service `permission_confirmed: true` (everyone in the file agreed to get email) is required unless `email_consent` is `unsubscribed`; without it the import is refused with 400. Unless importing as unsubscribed, shared inboxes (info@, sales@, no-reply@ …) and throwaway addresses (mailinator.com …) are left out and summarized at the top of `errors`; a row with nothing else to match on (phone, external id) is skipped, otherwise the rest of it imports |
 | GET | `/api/lists` | – | `{data: List[], total}` |
-| POST | `/api/lists` | `{name, double_opt_in?}` | `List`. With `double_opt_in`, people who sign up through a form get a confirmation email and join only after confirming (see "Sending guardrails") |
-| GET/PATCH/DELETE | `/api/lists/:id` | `{name?}` | `List` |
+| POST | `/api/lists` | `{name, double_opt_in?, show_on_preferences?, description?}` | `List`. With `show_on_preferences`, the list appears on the preference page people reach from an email's unsubscribe link, where they can join or leave it themselves. With `double_opt_in`, people who sign up through a form get a confirmation email and join only after confirming (see "Sending guardrails") |
+| GET/PATCH/DELETE | `/api/lists/:id` | `{name?, double_opt_in?, show_on_preferences?, description?}` | `List` |
 | POST | `/api/lists/:id/members` | `{profile_ids?: string[], emails?: string[]}` | `{added}` |
 | DELETE | `/api/lists/:id/members` | `{profile_ids: string[]}` | `{removed}` |
 | GET | `/api/segments` | – | `{data: Segment[], total}` |
 | POST | `/api/segments` | `{name, definition}` | `Segment` |
-| GET/PATCH/DELETE | `/api/segments/:id` | `{name?, definition?}` | `Segment` |
+| GET/PATCH/DELETE | `/api/segments/:id` | `{name?, definition?}` | `Segment`. GET recounts members live. Saving fails with 400 if the rules include the segment itself (directly or through another segment); DELETE fails with 409 while another segment or a running flow uses it. Every segment's stored membership and `member_count` refresh about every 15 minutes (every 5 for segments that trigger flows). |
 | POST | `/api/segments/preview` | `{definition}` | `{count, sample: Profile[]}` |
 
 ## Events and metrics
@@ -218,13 +238,13 @@ Attribution: a conversion event (`Placed Order` by default) is credited to the n
 ## Public endpoints (no auth)
 
 - `POST /client/events?k=<public_key>` – browser tracking (`{metric, profile, properties}`), CORS open.
-- `POST /client/subscribe?k=<public_key>` – form submit (`{form_id, email?, phone_number?, first_name?, sms_consent?}`). Returns `{ok, message}`, plus `confirm: true` when the form's list is double opt-in and a confirmation email went out (the message then asks them to check their inbox; set `config.confirm_message` on the form to change it).
+- `POST /client/subscribe?k=<public_key>` – form submit (`{form_id, email?, phone_number?, first_name?, sms_consent?, timezone?}`; `timezone` is the browser's IANA zone and fills the profile's `timezone` and `country` properties when they're missing). Returns `{ok, message}`, plus `confirm: true` when the form's list is double opt-in and a confirmation email went out (the message then asks them to check their inbox; set `config.confirm_message` on the form to change it).
 - `GET|POST /c/:token` – double opt-in confirmation. GET shows a "Yes, subscribe me" button; only the POST confirms, so link scanners can't. Links work for 7 days.
 - `GET /f/:form_id` hosted sign-up page, `GET /f/:form_id/embed.js` embed script.
-- `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click).
+- `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click). For email, when the account has lists with `show_on_preferences`, GET shows a preference page instead: a checkbox per list, "Save preferences" (`action=save` with a `list` field per checked list; leaving a list records "Unsubscribed from List") and "Unsubscribe from all emails". Any POST without `action=save`, including one-click, unsubscribes from all email.
 - `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
-- `GET /healthz`.
+- `GET /healthz` – `{ok: true, git_sha}` (the deployed commit; empty for local builds).
 
 ## Automatic email pause
 

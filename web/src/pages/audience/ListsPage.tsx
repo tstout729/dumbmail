@@ -91,7 +91,7 @@ export function ListsPage() {
           value={tab}
           onChange={(t) => setParam("tab", t === "all" ? null : t)}
           tabs={[
-            { value: "all", label: "All" },
+            { value: "all", label: "All", count: lists.data && segments.data ? lists.data.length + segments.data.length : undefined },
             { value: "list", label: "Lists", count: lists.data?.length },
             { value: "segment", label: "Segments", count: segments.data?.length },
           ]}
