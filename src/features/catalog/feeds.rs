@@ -280,7 +280,8 @@ async fn vet(u: &str, hosts: Option<&[String]>) -> AppResult<(String, std::net::
             return Ok(("127.0.0.1".into(), std::net::SocketAddr::from(([127, 0, 0, 1], port))));
         }
     }
-    crate::flows::check_webhook_url(u).await.map_err(|_| AppError::bad("the feed address must be a public website (not a private or local network)"))
+    let what = if hosts.is_some() { "the product page" } else { "the feed address" };
+    crate::flows::check_webhook_url(u).await.map_err(|_| AppError::bad(format!("{what} must be a public website that can be reached (not a private or local network)")))
 }
 
 pub enum Fetched {
