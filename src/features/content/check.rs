@@ -121,7 +121,8 @@ impl Scan {
     fn html(&mut self, html: &str) {
         for c in ANCHOR.captures_iter(html) {
             let text = TAGS.replace_all(&c[2], "").trim().to_string();
-            self.link(&c[1], &text);
+            // The address as a browser reads the attribute.
+            self.link(&c[1].replace("&amp;", "&"), &text);
         }
         for tag in IMG.find_iter(html) {
             let src = ATTR_SRC.captures(tag.as_str()).map(|c| c[1].to_string()).unwrap_or_default();
@@ -507,6 +508,15 @@ fn exact_host(u: &str) -> Option<String> {
     url::Url::parse(u).ok().and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()))
 }
 
+/// Where a click-tracking link (`/t/c/...?u=`) leads, on any host.
+fn tracked_destination(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if !parsed.path().starts_with("/t/c/") {
+        return None;
+    }
+    parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned())
+}
+
 /// What `url` is, given DumbMail's own hosts. A click-tracking link is judged by where it leads.
 pub fn classify(url: &str, own: &HashSet<String>) -> Target {
     let Some(host) = exact_host(url) else { return Target::External(url.to_string()) };
@@ -868,7 +878,9 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input) -> AppResult<
     if !input.skip_links {
         let web = |u: &str| (u.starts_with("https://") || u.starts_with("http://")) && !u.contains("{{") && !u.contains("{%");
         let found: Vec<(String, bool)> = sc.links.iter().map(|(u, _)| (u.clone(), false)).chain(sc.images.iter().map(|(u, _, _)| (u.clone(), true))).filter(|(u, _)| web(u)).collect();
-        let hosts: HashSet<String> = found.iter().filter_map(|(u, _)| exact_host(u)).collect();
+        // Hosts of the addresses and of where tracked links lead, so a tracked link to another
+        // account's link domain is recognized as DumbMail's too.
+        let hosts: HashSet<String> = found.iter().flat_map(|(u, _)| [exact_host(u), tracked_destination(u).as_deref().and_then(exact_host)]).flatten().collect();
         let own = own_hosts(state, &hosts).await?;
         let mut urls: Vec<(String, bool)> = Vec::new();
         let mut own_images: Vec<Uuid> = Vec::new();

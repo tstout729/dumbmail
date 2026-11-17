@@ -714,9 +714,11 @@ async fn link_checks_never_request_dumbmail_links() {
     let pixel = find_link(&m.html, "https://pl.test/t/o/").replace("https://pl.test", "https://links.two.test");
     let click = find_link(&m.html, "https://pl.test/t/c/").replace("https://pl.test", "https://old.pl.test");
     let unsub = find_link(&m.html, "https://pl.test/u/");
+    // A tracked link that leads to another account's link domain.
+    let wrapped = format!("https://pl.test/t/c/x?u={}&s=1", url::form_urlencoded::byte_serialize(pixel.as_bytes()).collect::<String>());
     let content = json!({"subject": "Copied", "preheader": "p", "blocks": [
         {"type": "image", "src": pixel, "alt": "x"},
-        {"type": "text", "html": format!("<p><a href=\"{click}\">again</a> <a href=\"{unsub}\">unsub</a></p>")},
+        {"type": "text", "html": format!("<p><a href=\"{click}\">again</a> <a href=\"{unsub}\">unsub</a> <a href=\"{}\">wrapped</a></p>", wrapped.replace('&', "&amp;"))},
     ]});
     let r = h.ok("POST", "/api/content/check", Some(json!({"content": content}))).await;
     let links = r["links"].as_array().unwrap();
@@ -727,6 +729,7 @@ async fn link_checks_never_request_dumbmail_links() {
     }
     assert!(links.iter().any(|l| l["url"] == "https://shop.example.com/x"), "the tracked link is checked as where it leads: {links:?}");
     assert!(!links.iter().any(|l| l["url"] == click.as_str()));
+    assert!(links.iter().any(|l| l["url"] == wrapped.as_str() && l["note"] == "DumbMail link, not checked"), "a tracked link to another account's link domain isn't requested: {links:?}");
     let (opened, clicked): (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
         sqlx::query_as("SELECT opened_at, clicked_at FROM messages WHERE profile_id = $1").bind(p).fetch_one(&h.state.db).await.unwrap();
     assert!(opened.is_none() && clicked.is_none(), "the check recorded no open or click");

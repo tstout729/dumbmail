@@ -120,7 +120,9 @@ pub fn checked_expr(expr: &str) -> Option<&str> {
     static FILTER: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\|\s*([A-Za-z_]\w*)").unwrap());
     static CALL: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"(\|\s*)?\b([A-Za-z_]\w*)\s*\(").unwrap());
     let e = expr.trim();
-    if e.is_empty() || e.len() > 500 || e.contains(['{', '}', '%', '#']) || e.chars().any(|c| c.is_control()) {
+    // No backslashes: without escapes, a quoted string is exactly what STRINGS matches, so the
+    // screen below reads the rule the way the template engine will.
+    if e.is_empty() || e.len() > 500 || e.contains(['{', '}', '%', '#', '\\']) || e.chars().any(|c| c.is_control()) {
         return None;
     }
     let code = STRINGS.replace_all(e, "''");
@@ -870,12 +872,11 @@ mod tests {
         // Parses, but can't be worked out for this person: an error, never a panic or a send failure.
         assert!(eval_expr("person.properties.tier + 1 > 3", &c).is_err());
         // Anything that could make one rule expensive is refused when the rule is read.
-        for e in ["'x' * 100000000", "range(100000)|length > 1", "person.properties.tier ~ 'x' == 'y'", "person.properties.tier|indent(100000000)", "debug()", "event.value ** 99"] {
+        // An escaped quote would make a regex see `* 30000000` inside a string where the engine sees code.
+        for e in ["'x\\'y' * 30000000 == 'z'", "'x' * 100000000", "range(100000)|length > 1", "person.properties.tier ~ 'x' == 'y'", "person.properties.tier|indent(100000000)", "debug()", "event.value ** 99"] {
             assert!(checked_expr(e).is_none(), "{e}");
         }
-        for e in ["event.value * 2 > 1"] {
-            assert!(parse_rule(&json!({"expr": e})).is_err(), "{e}");
-        }
+        assert!(parse_rule(&json!({"expr": "event.value * 2 > 1"})).is_err(), "no * at all, so no repetition");
         for e in ["person.properties.tier|lower == 'gold'", "person.properties.visits|int > 10 and event.value is defined", "'a*b' in person.properties.tags", "person.properties.tags|length > 1"] {
             assert!(checked_expr(e).is_some(), "{e}");
         }
