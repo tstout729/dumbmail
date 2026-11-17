@@ -1,3 +1,4 @@
+import { isCouponConditionComplete, newCouponCondition } from "../../features/coupons/CouponConditionFields";
 import type { CmpOp, Condition, EventCountOp, EventWindow, FieldFilter, Prediction, PropOp, SegmentDefinition, TimeOp } from "../../api";
 
 export const conditionLabels: Record<Condition["type"], string> = {
@@ -9,6 +10,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
   message: "Got, opened or clicked a message",
   form: "Signed up through a form",
   product: "Viewed, carted or bought a product",
+  coupon: "Got or used a coupon code",
   list: "List membership",
   segment: "In another segment",
   consent: "Consent",
@@ -22,7 +24,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
 /** Condition types grouped for the pickers. */
 export const conditionGroups: { label: string; types: Condition["type"][] }[] = [
   { label: "Profile", types: ["property"] },
-  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form"] },
+  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form", "coupon"] },
   { label: "Membership", types: ["list", "segment"] },
   { label: "Reachability", types: ["consent", "can_receive", "suppressed"] },
   { label: "Predictive", types: ["prediction", "random"] },
@@ -117,6 +119,8 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return { type, op: "has" };
     case "product":
       return { type, action: "ordered", op: "at_least", count: 1, within_days: 90 };
+    case "coupon":
+      return newCouponCondition();
     case "list":
       return { type, list_id: firstListId ?? "", op: "in" };
     case "segment":
@@ -176,6 +180,8 @@ export function isConditionComplete(c: Condition): boolean {
       return windowComplete(c);
     case "product":
       return (c.op === "zero" || isNum(c.count)) && windowComplete(c) && [c.product_id, c.category, c.tag, c.brand].every((v) => v === undefined || v.trim() !== "");
+    case "coupon":
+      return isCouponConditionComplete(c);
     case "list":
       return c.list_id !== "";
     case "segment":
@@ -262,6 +268,8 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
       const count = c.op === "zero" ? "zero times" : `${eventOps.find((o) => o.value === c.op)?.label} ${c.count ?? 1}×`;
       return `${productActions.find((a) => a.value === c.action)?.label ?? c.action} ${what} ${count}${windowSummary(c)}`;
     }
+    case "coupon":
+      return `${c.op === "has" ? "" : "not "}${c.action === "redeemed" ? "redeemed" : "got"} a coupon code${c.within_days ? ` in the last ${c.within_days}d` : ""}`;
     case "list":
       return `${c.op === "in" ? "in" : "not in"} list ${list(c.list_id)}`;
     case "segment":

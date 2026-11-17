@@ -74,6 +74,7 @@ pub async fn create_template(state: &AppState, account_id: Uuid, b: TemplateBody
     check_channel(&channel)?;
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the template a name"))?;
     let content = b.content.unwrap_or(json!({}));
+    crate::features::coupons::template::check_content(&channel, &content)?;
     Ok(sqlx::query_as("INSERT INTO templates (id, account_id, name, channel, content) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, channel, content, created_at, updated_at")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -100,6 +101,9 @@ async fn get_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
 async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TemplateBody>) -> AppResult<Json<Template>> {
     // A transactional template's new content must pass the same content check as when it was created.
     crate::features::transactional::check_template_edit(&state.db, ctx.account_id, id, b.content.as_ref()).await?;
+    if let Some(content) = &b.content {
+        crate::features::coupons::template::check_content("", content)?;
+    }
     let t: Option<Template> = sqlx::query_as(
         // A template imported for review keeps its review marker whatever the edit sends (see import_review.rs).
         "UPDATE templates SET name = COALESCE($3, name), content = CASE WHEN import_review IS NULL OR $4::jsonb IS NULL THEN COALESCE($4, content)
@@ -150,6 +154,8 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
+    // A preview shows a sample coupon code and uses none.
+    crate::features::coupons::template::fill_sample(&mut ctx);
     if b.channel == "email" {
         let content: render::EmailContent = serde_json::from_value(content)?;
         let r = render::render_email(&account, &content, &ctx, None)?;
@@ -280,6 +286,7 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
     let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
+    crate::features::coupons::template::check_campaign(&channel, &content, ab_test.as_ref())?;
     Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test, send_options) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -334,6 +341,7 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     let channel = b.channel.as_deref().unwrap_or(&c.channel);
     let set_ab = b.ab_test.is_some() || b.channel.is_some();
     let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
+    crate::features::coupons::template::check_campaign(channel, b.content.as_ref().unwrap_or(&c.content), ab_test.as_ref())?;
     let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
     let set_send_options = b.send_options.is_some();
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
@@ -446,7 +454,9 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         set_options = true;
     }
     let account = load_account(&state.db, account_id).await?;
-    let problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    // Coupons the content uses: they exist, haven't expired and have codes for the audience.
+    problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &c).await?);
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
@@ -719,6 +729,9 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
             let id = n.data.get("list_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok())
                 .ok_or_else(|| AppError::bad(format!("step {} needs a valid list_id", n.id)))?;
             crate::audience::list_belongs(&state.db, account_id, id).await?;
+        }
+        if n.kind == "email" || n.kind == "sms" {
+            crate::features::coupons::template::check_content(&n.kind, n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
         }
         if n.kind == "webhook" {
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
