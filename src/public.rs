@@ -698,6 +698,19 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     let msg: Value = env["Message"].as_str().map(serde_json::from_str).transpose()?.unwrap_or(Value::Null);
     let kind = msg["eventType"].as_str().or(msg["notificationType"].as_str()).unwrap_or("");
     let Some(pid) = msg["mail"]["messageId"].as_str() else { return Ok(StatusCode::OK) };
+    // Hard bounces and complaints count toward the automatic sending pause through the send record,
+    // which outlives the message (deleting a profile deletes its messages). Addresses already on the
+    // SES account suppression list don't count toward AWS's bounce rate.
+    let strike = match kind {
+        "Bounce" => (msg["bounce"]["bounceType"].as_str() == Some("Permanent") && msg["bounce"]["bounceSubType"].as_str() != Some("OnAccountSuppressionList")).then_some(false),
+        "Complaint" => Some(true),
+        _ => None,
+    };
+    if let Some(complaint) = strike {
+        if let Some((account_id, campaign_id)) = crate::deliverability::record_strike(&state.db, pid, complaint).await? {
+            crate::deliverability::note_outcome(&state, account_id, campaign_id).await;
+        }
+    }
     let Some(m) = msg_by_provider_id(&state, pid).await? else { return Ok(StatusCode::OK) };
     match kind {
         "Delivery" => {
@@ -715,20 +728,11 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
                 sqlx::query("UPDATE profiles SET email_suppressed_reason = 'hard_bounce', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             }
             msg_event(&state, &m, "Bounced Email", json!({"bounce_type": msg["bounce"]["bounceType"]}), Some(format!("bounce:{}", m.id))).await?;
-            // Addresses already on the SES account suppression list don't count toward AWS's bounce rate.
-            if permanent && !m.is_test && msg["bounce"]["bounceSubType"].as_str() != Some("OnAccountSuppressionList") {
-                crate::deliverability::record_strike(&state.db, m.id, false).await?;
-                crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
-            }
         }
         "Complaint" => {
             sqlx::query("UPDATE messages SET status = 'complained' WHERE id = $1").bind(m.id).execute(&state.db).await?;
             sqlx::query("UPDATE profiles SET email_suppressed_reason = 'complaint', email_consent = 'unsubscribed', updated_at = now() WHERE id = $1").bind(m.profile_id).execute(&state.db).await?;
             msg_event(&state, &m, "Marked Email as Spam", json!({}), Some(format!("complaint:{}", m.id))).await?;
-            if !m.is_test {
-                crate::deliverability::record_strike(&state.db, m.id, true).await?;
-                crate::deliverability::note_outcome(&state, m.account_id, m.campaign_id).await;
-            }
         }
         _ => {}
     }

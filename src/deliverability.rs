@@ -79,21 +79,29 @@ pub async fn campaign_outcomes(db: &sqlx::PgPool, account_id: Uuid, campaign_id:
 }
 
 /// The provider accepted a real email: count it toward the account's rates.
-pub async fn record_send(db: &sqlx::PgPool, message_id: Uuid, account_id: Uuid, campaign_id: Option<Uuid>) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO email_sends (message_id, account_id, campaign_id) VALUES ($1, $2, $3) ON CONFLICT (message_id) DO NOTHING")
-        .bind(message_id)
-        .bind(account_id)
-        .bind(campaign_id)
-        .execute(db)
-        .await?;
+pub async fn record_send(db: &sqlx::PgPool, message_id: Uuid, provider_message_id: &str, account_id: Uuid, campaign_id: Option<Uuid>) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO email_sends (message_id, provider_message_id, account_id, campaign_id) VALUES ($1, $2, $3, $4) ON CONFLICT (message_id) DO NOTHING",
+    )
+    .bind(message_id)
+    .bind(provider_message_id)
+    .bind(account_id)
+    .bind(campaign_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
-/// SES reported a hard bounce (`complaint` false) or a complaint for a sent email.
-pub async fn record_strike(db: &sqlx::PgPool, message_id: Uuid, complaint: bool) -> sqlx::Result<()> {
-    let q = if complaint { "UPDATE email_sends SET complaint = true WHERE message_id = $1" } else { "UPDATE email_sends SET hard_bounce = true WHERE message_id = $1" };
-    sqlx::query(q).bind(message_id).execute(db).await?;
-    Ok(())
+/// SES reported a hard bounce (`complaint` false) or a complaint. Matched by the provider's message id,
+/// so it counts even when the message was deleted with its profile. Returns the send's (account, campaign),
+/// or None for mail that isn't a real send (tests, system alerts).
+pub async fn record_strike(db: &sqlx::PgPool, provider_message_id: &str, complaint: bool) -> sqlx::Result<Option<(Uuid, Option<Uuid>)>> {
+    let q = if complaint {
+        "UPDATE email_sends SET complaint = true WHERE provider_message_id = $1 RETURNING account_id, campaign_id"
+    } else {
+        "UPDATE email_sends SET hard_bounce = true WHERE provider_message_id = $1 RETURNING account_id, campaign_id"
+    };
+    sqlx::query_as(q).bind(provider_message_id).fetch_optional(db).await
 }
 
 /// Scheduler: send records only matter for the 7-day window.

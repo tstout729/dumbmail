@@ -1572,9 +1572,10 @@ async fn campaign_circuit_breaker_stops_a_bad_list_partway() {
     let ids = sent_ids(&h, &cid, 100).await;
     bounce_all(&h, &ids[..9], "Permanent").await;
     assert_eq!(paused(&mut h).await, None);
-    // Deleting the bounced profiles (which deletes their messages) doesn't erase the bounces or the sends.
+    // Deleting profiles (which deletes their messages) erases neither the sends nor the bounces, including
+    // bounces that arrive after the delete (ids 9..15).
     let bounced: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT profile_id FROM messages WHERE provider_message_id = ANY($1)")
-        .bind(&ids[..9])
+        .bind(&ids[..15])
         .fetch_all(&h.state.db)
         .await
         .unwrap();
