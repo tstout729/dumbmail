@@ -157,9 +157,81 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
                 btn = esc(btn)
             )
         }
+        "products" if depth == 0 => products_html(b, brand, font),
         "html" => format!(r#"<tr><td style="{pad}">{}</td></tr>"#, s(b, "html")),
         _ => String::new(),
     }
+}
+
+/// A web link for a product, or "#". Braces are percent-encoded so a link can't open a template tag.
+fn product_href(v: &Value) -> String {
+    match v.as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+        Some(u) => esc(&u.replace('{', "%7B").replace('}', "%7D")),
+        None => "#".into(),
+    }
+}
+
+/// Product text from the catalog: escaped, and unable to open a template tag.
+fn product_text(v: &Value) -> String {
+    no_tpl(&esc(v.as_str().unwrap_or("")))
+}
+
+/// A grid of products (1-4 across, stacking on phones), filled per recipient into `items` by the
+/// catalog before rendering. No items renders nothing.
+fn products_html(b: &Value, brand: &str, font: &str) -> String {
+    let items: Vec<&Value> = b.get("items").and_then(|i| i.as_array()).map(|a| a.iter().take(12).collect()).unwrap_or_default();
+    if items.is_empty() {
+        return String::new();
+    }
+    let cols = b.get("columns").and_then(|c| c.as_u64()).unwrap_or(2).clamp(1, 4) as usize;
+    let flag = |k: &str| b.get(k).and_then(|v| v.as_bool()).unwrap_or(true);
+    let (show_price, show_compare, show_button) = (flag("show_price"), flag("show_compare_at"), flag("show_button"));
+    let btn = no_tpl(&esc(Some(s(b, "button_text")).filter(|t| !t.is_empty()).unwrap_or("Shop now")));
+    let width = 100 / cols;
+    let img_w = [0, 552, 260, 168, 122][cols];
+    let cell = |it: &Value| {
+        let href = product_href(&it["url"]);
+        let title = product_text(&it["title"]);
+        // Without a web link the product shows unlinked and without a button.
+        let link = |inner: String| if href == "#" { inner } else { format!(r#"<a href="{href}" style="text-decoration:none;color:#111827;">{inner}</a>"#) };
+        let img = match it["image_url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+            Some(u) => link(format!(
+                r#"<img src="{}" alt="{title}" width="{img_w}" style="display:block;width:100%;max-width:{img_w}px;height:auto;border:0;border-radius:6px;margin:0 auto 10px;">"#,
+                esc(&u.replace('{', "%7B").replace('}', "%7D"))
+            )),
+            None => String::new(),
+        };
+        let mut price = String::new();
+        if show_price {
+            if let Some(p) = it["price_text"].as_str() {
+                let was = match it["compare_at_text"].as_str() {
+                    Some(c) if show_compare => format!(r#" <span style="color:#9ca3af;text-decoration:line-through;">{}</span>"#, product_text(&json!(c))),
+                    _ => String::new(),
+                };
+                price = format!(r#"<div style="font-family:{font};font-size:15px;color:#4b5563;margin:2px 0 10px;">{}{was}</div>"#, product_text(&json!(p)));
+            }
+        }
+        let button = if show_button && href != "#" {
+            format!(r#"<a href="{href}" style="display:inline-block;padding:9px 18px;background:{brand};color:#fff;border-radius:6px;font-family:{font};font-size:14px;font-weight:600;text-decoration:none;">{btn}</a>"#)
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<td class="pl-col" valign="top" width="{width}%" style="width:{width}%;padding:8px;text-align:center;">{img}<div style="font-family:{font};font-size:16px;font-weight:600;color:#111827;">{}</div>{price}{button}</td>"#,
+            link(title.clone())
+        )
+    };
+    let rows: String = items
+        .chunks(cols)
+        .map(|row| {
+            let mut tds: String = row.iter().map(|it| cell(it)).collect();
+            for _ in row.len()..cols {
+                tds.push_str(&format!(r#"<td class="pl-col" width="{width}%" style="width:{width}%;"></td>"#));
+            }
+            format!("<tr>{tds}</tr>")
+        })
+        .collect();
+    format!(r#"<tr><td style="padding:8px 16px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table></td></tr>"#)
 }
 
 fn block_text(b: &Value, out: &mut String) {
@@ -176,6 +248,17 @@ fn block_text(b: &Value, out: &mut String) {
         }
         "button" => out.push_str(&format!("{}: {}\n\n", s(b, "text"), s(b, "href"))),
         "product" => out.push_str(&format!("{} {} {}\n\n", s(b, "title"), s(b, "price"), s(b, "href"))),
+        "products" => {
+            // Catalog text can't open a template tag in the plain-text part either.
+            // A zero-width space after every brace: no sequence of them can open a tag.
+            let inert = |v: &Value| v.as_str().unwrap_or("").replace('{', "{\u{200B}");
+            for it in b.get("items").and_then(|i| i.as_array()).into_iter().flatten().take(12) {
+                let line = [inert(&it["title"]), inert(&it["price_text"]), inert(&it["url"])].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" ");
+                out.push_str(&line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
         "image" if !s(b, "href").is_empty() => out.push_str(&format!("{}\n\n", s(b, "href"))),
         "divider" => out.push_str("----\n\n"),
         "columns" => {
@@ -520,6 +603,27 @@ mod tests {
         assert!(!out.html.contains("javascript:"));
         assert!(out.html.contains("Acme &#123;&#123; oops"));
         assert!(out.text.contains("Instagram: https://instagram.com/acme"));
+    }
+
+    #[test]
+    fn products_block_renders_a_grid_and_keeps_catalog_text_inert() {
+        let content: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [
+            {"type": "products", "columns": 3, "button_text": "Buy", "items": [
+                {"title": "Mug {{ oops }}", "url": "https://shop.test/mug", "image_url": "https://shop.test/mug.jpg", "price_text": "$12.00", "compare_at_text": "$15.00"},
+                {"title": "Cap", "url": "javascript:alert(1)", "price_text": "$9.00"}
+            ]},
+            {"type": "products", "items": []}
+        ]})).unwrap();
+        let out = render_email(&account(), &content, &json!({}), None).unwrap();
+        assert!(out.html.contains("Mug &#123;&#123; oops &#125;&#125;"), "titles can't run template code");
+        assert!(out.html.contains("line-through;\">$15.00"));
+        assert!(out.html.contains("width=\"33%\""));
+        assert!(!out.html.contains("javascript:"));
+        assert_eq!(out.html.matches(">Buy</a>").count(), 1, "no button without a web link");
+        assert!(out.text.contains("Mug {\u{200B}{\u{200B} oops }} $12.00 https://shop.test/mug"));
+        let tricky: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "products", "items": [{"title": "{{{ 7*7 }}}{% if 1 %}x{% endif %}"}]}]})).unwrap();
+        let out = render_email(&account(), &tricky, &json!({}), None).unwrap();
+        assert!(!out.text.contains("49") && out.text.contains("7*7"), "{}", out.text);
     }
 
     #[test]
