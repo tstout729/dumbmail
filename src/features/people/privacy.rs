@@ -420,6 +420,12 @@ pub async fn delete_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
         }));
     }
     let mut removed = Vec::new();
+    let mut addresses: Vec<String> = vec![p.subject.clone()];
+    for pid in &p.profile_ids {
+        let a: (Option<String>, Option<String>) = sqlx::query_as("SELECT email, phone_number FROM profiles WHERE id = $1").bind(pid).fetch_one(&state.db).await?;
+        addresses.extend([a.0, a.1].into_iter().flatten());
+        addresses.push(pid.to_string());
+    }
     for pid in &p.profile_ids {
         if let Some(r) = delete_profile_fully(&state.db, account_id, *pid).await? {
             removed.push(Value::Object(r));
@@ -436,6 +442,24 @@ pub async fn delete_person(state: &AppState, account_id: Uuid, q: &PersonQuery, 
     .execute(&state.db)
     .await?
     .rows_affected();
+    // Bulk exports that include them, saved searches that name them, and pending bulk targets.
+    let bulk_files = sqlx::query("DELETE FROM people_files WHERE account_id = $1 AND kind = 'bulk_export' AND EXISTS (SELECT 1 FROM unnest($2::text[]) a WHERE position(convert_to(a, 'UTF8') IN bytes) > 0)")
+        .bind(account_id)
+        .bind(&addresses)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    sqlx::query("UPDATE bulk_actions SET selection = selection - 'q' WHERE account_id = $1 AND EXISTS (SELECT 1 FROM unnest($2::text[]) a WHERE selection->>'q' ILIKE '%' || a || '%')")
+        .bind(account_id)
+        .bind(&addresses)
+        .execute(&state.db)
+        .await?;
+    sqlx::query("DELETE FROM bulk_action_targets t USING bulk_actions b WHERE b.id = t.bulk_id AND b.account_id = $1 AND t.address = ANY($2)")
+        .bind(account_id)
+        .bind(&addresses)
+        .execute(&state.db)
+        .await?;
+    let files = files + bulk_files;
     let id = log_request(&state.db, account_id, "delete", &p, src, json!({"deleted_profiles": removed.len(), "export_files_deleted": files})).await?;
     Ok(json!({"request_id": id, "deleted": removed.len(), "removed": removed, "export_files_deleted": files}))
 }

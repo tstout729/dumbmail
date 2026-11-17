@@ -180,7 +180,7 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
                external_id = COALESCE($6, p.external_id), updated_at = now() WHERE p.id = $1 RETURNING {PROFILE_COLS}"
         );
-        return sqlx::query_as::<_, Profile>(&q)
+        let p = sqlx::query_as::<_, Profile>(&q)
             .bind(id)
             .bind(email.is_some())
             .bind(email.flatten())
@@ -192,7 +192,8 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             .map_err(|e| match AppError::from(e) {
                 AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
                 other => other,
-            });
+            })?;
+        return crate::features::people::consent::after_address_change(&state.db, account_id, p).await;
     }
     Ok(p)
 }

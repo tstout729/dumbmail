@@ -394,7 +394,9 @@ pub async fn after_upsert(db: &PgPool, account_id: Uuid, input: &ProfileInput, b
     record_diff(&mut conn, account_id, up.profile.id, if up.created { None } else { prev.as_ref() }, &after, &src).await?;
     drop(conn);
     note_identity_conflict(db, account_id, input).await;
-    if !up.created {
+    // A new profile, or an address new to this one: a deleted person's suppression record applies.
+    let new_address = before.is_none_or(|b| b.email != up.profile.email || b.phone_number != up.profile.phone_number);
+    if !up.created && !new_address {
         return Ok(up);
     }
     let restored = super::privacy::apply_tombstones(db, account_id, &up.profile, input, src.is_own_opt_in()).await?;
@@ -402,7 +404,16 @@ pub async fn after_upsert(db: &PgPool, account_id: Uuid, input: &ProfileInput, b
         return Ok(up);
     }
     let profile = super::load_profile(db, account_id, up.profile.id).await?;
-    Ok(Upserted { profile, created: true })
+    Ok(Upserted { profile, created: up.created })
+}
+
+/// After an email or phone number on a profile was changed directly (not through the upsert): a
+/// deleted person's suppression record for the new address applies. Returns the profile as it now is.
+pub async fn after_address_change(db: &PgPool, account_id: Uuid, profile: Profile) -> AppResult<Profile> {
+    if super::privacy::apply_tombstones(db, account_id, &profile, &ProfileInput::default(), false).await? {
+        return super::load_profile(db, account_id, profile.id).await;
+    }
+    Ok(profile)
 }
 
 /// An upsert named identifiers held by different profiles (an email on one, a phone number on

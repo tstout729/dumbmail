@@ -510,6 +510,10 @@ async fn privacy_export_and_delete() {
     send_campaign(&mut h, &list["id"]).await;
     h.raw("POST", &unsub_path(&h, "ann@x.test"), &[], "").await;
 
+    // A bulk export that includes Ann.
+    let bulk = h.ok("POST", "/api/people/bulk", Some(json!({"action": "export", "selection": {"q": "ann@x.test"}, "confirm": true, "expected_count": 1}))).await;
+    h.drain().await;
+    let bulk_url = h.ok("GET", &format!("/api/people/bulk/{}", bulk["id"].as_str().unwrap()), None).await["file_url"].as_str().unwrap().to_string();
     let ex = h.ok("POST", "/api/people/privacy/export", Some(json!({"email": "ANN@x.test"}))).await;
     assert_eq!(ex["found"], 1);
     let files = ex["files"].as_array().unwrap();
@@ -538,7 +542,11 @@ async fn privacy_export_and_delete() {
     assert_eq!((dry["dry_run"].as_bool(), dry["found"].as_i64()), (Some(true), Some(1)));
     let del = h.ok("POST", "/api/people/privacy/delete", Some(json!({"email": "ann@x.test", "confirm": true}))).await;
     assert_eq!(del["deleted"], 1);
-    assert_eq!(del["export_files_deleted"], 2);
+    assert_eq!(del["export_files_deleted"], 3, "both privacy files and the bulk export that held them");
+    let (s, _, _) = h.bytes("GET", &bulk_url, "text/plain", vec![]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let q: Value = sqlx::query_scalar("SELECT selection FROM bulk_actions WHERE id = $1::uuid").bind(bulk["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert!(q.get("q").is_none(), "a saved search naming them is cleared: {q}");
     for t in PROFILE_TABLES {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {} WHERE {} = $1::uuid", t.table, t.column)).bind(&id).fetch_one(&h.state.db).await.unwrap();
         assert_eq!(n, 0, "{}.{} still holds the deleted person", t.table, t.column);
@@ -561,6 +569,13 @@ async fn privacy_export_and_delete() {
     assert_eq!(back, vec!["unsubscribed".to_string(), "unsubscribed".to_string()]);
     let how: Vec<String> = sqlx::query_scalar("SELECT method FROM consent_events e JOIN profiles p ON p.id = e.profile_id WHERE p.email = 'ann@x.test' ORDER BY e.occurred_at").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(how, vec!["import".to_string(), "deleted_profile".to_string()]);
+
+    // An existing profile that takes on a deleted person's address gets their suppression too.
+    let carl = h.ok("POST", "/api/profiles", Some(json!({"email": "carl@x.test", "email_consent": "subscribed"}))).await;
+    sqlx::query("DELETE FROM profiles WHERE email LIKE 'ann%'").execute(&h.state.db).await.unwrap();
+    h.ok("PATCH", &format!("/api/profiles/{}", carl["id"].as_str().unwrap()), Some(json!({"email": "ann@x.test"}))).await;
+    let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE id = $1::uuid").bind(carl["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, "unsubscribed", "an address edit can't shed a deleted person's unsubscribe");
 
     // The plain profile delete keeps the record too.
     let bob = pid(&h, "bob@x.test").await;
