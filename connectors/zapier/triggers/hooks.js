@@ -65,9 +65,10 @@ const makeTrigger = (t) => {
   };
 
   const perform = async (z, bundle) => {
+    // Every hook gets its secret when it's made, so a request we can't check is dropped too.
     const secret = bundle.subscribeData && bundle.subscribeData.secret;
-    if (secret && !verified(bundle.rawRequest, secret)) {
-      z.console.log('Dropped a request to this hook that DumbMail did not sign.');
+    if (!secret || !verified(bundle.rawRequest, secret)) {
+      z.console.log(secret ? 'Dropped a request to this hook that DumbMail did not sign.' : 'Dropped a request: this hook has no signing secret; turn the Zap off and on again.');
       return [];
     }
     const body = bundle.cleanedRequest;

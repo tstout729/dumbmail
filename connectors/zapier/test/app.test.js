@@ -50,8 +50,9 @@ describe('REST hook trigger', () => {
 
   it('turns a delivery into one item and lists samples', async () => {
     const env = { id: 'e1', topic: 'event.tracked', data: { event: { metric: 'Placed Order' } } };
+    // Without the hook's secret nothing can be checked, so nothing gets through.
     const items = await appTester(trigger.perform, { authData, cleanedRequest: env });
-    expect(items).toEqual([env]);
+    expect(items).toEqual([]);
     nock(BASE, auth).get('/api/hooks/samples').query({ topic: 'event.tracked', metric: 'Placed Order' }).reply(200, [env]);
     const samples = await appTester(trigger.performList, { authData, inputData: { metric: 'Placed Order' } });
     expect(samples[0].id).toBe('e1');
