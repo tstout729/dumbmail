@@ -1,7 +1,7 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState, type FormEvent } from "react";
 import { useNavigate, useParams } from "react-router";
-import { MoreHorizontal, Search, Settings2, Trash2, Upload, UserPlus } from "lucide-react";
+import { Megaphone, MoreHorizontal, Search, Settings2, Trash2, Upload, UserPlus } from "lucide-react";
 import { type List, useAddListMembers, useDeleteList, useList, useProfiles, useRemoveListMembers, useUpdateList } from "../../api";
 import { ImportDialog } from "../../components/audience/ImportDialog";
 import { ProfilesTable } from "../../components/audience/ProfilesTable";
@@ -87,6 +87,7 @@ export function ListDetailPage() {
               )}
               items={[
                 { label: "Settings", icon: <Settings2 className="size-3.5" />, onSelect: () => setDialog("settings") },
+                { label: "Sync to ads", icon: <Megaphone className="size-3.5" />, onSelect: () => navigate(`/settings/ad-audiences?new=list:${id}`) },
                 { label: "Delete list", icon: <Trash2 className="size-3.5" />, danger: true, onSelect: () => setDialog("delete") },
               ]}
             />
