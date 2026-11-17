@@ -27,8 +27,8 @@ pub const PRICE_DROP_METRIC: &str = "Price Dropped";
 const BATCH: i64 = 200;
 /// Most products one person can wait on at once.
 const MAX_WAITING_PER_PERSON: i64 = 25;
-/// New back-in-stock requests an account takes per hour.
-const MAX_NEW_PER_HOUR: i64 = 2000;
+/// Back-in-stock requests one visitor (IP address) can make per hour.
+const MAX_PER_VISITOR_HOUR: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Settings {
@@ -456,14 +456,6 @@ pub async fn subscribe(db: &PgPool, account_id: Uuid, email: &str, product_id: O
     if in_stock {
         return Err(AppError::Conflict("Good news: it's in stock now.".into()));
     }
-    // Anyone can type an email here, so the account takes a bounded number of new requests an hour.
-    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE account_id = $1 AND created_at > now() - interval '1 hour'")
-        .bind(account_id)
-        .fetch_one(db)
-        .await?;
-    if recent >= MAX_NEW_PER_HOUR {
-        return Err(AppError::Conflict("We're getting a lot of requests right now. Please try again in a few minutes.".into()));
-    }
     let input = ProfileInput { email: Some(email), ..Default::default() };
     let profile = audience::upsert_profile_public(db, account_id, &input).await?.profile;
     let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_stock_subscriptions WHERE profile_id = $1 AND notified_at IS NULL").bind(profile.id).fetch_one(db).await?;
@@ -495,9 +487,40 @@ pub async fn subscribe(db: &PgPool, account_id: Uuid, email: &str, product_id: O
     Ok(json!({"ok": true, "message": msg}))
 }
 
-pub async fn subscribe_public(State(state): State<AppState>, Query(q): Query<KeyQuery>, body: Bytes) -> Response {
+/// The visitor's address as the proxy saw it (`X-Real-IP`, else the last `X-Forwarded-For` entry).
+fn client_ip(headers: &HeaderMap) -> Option<String> {
+    let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
+    let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
+    get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))
+}
+
+/// Anyone can type any email into the widget, so each visitor gets a bounded number of requests an
+/// hour. Counted per server process, which is enough to stop one script filling inboxes.
+fn visitor_allowed(ip: Option<&str>) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static SEEN: once_cell::sync::Lazy<Mutex<HashMap<String, (Instant, u32)>>> = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+    let Some(ip) = ip else { return true };
+    let Ok(mut m) = SEEN.lock() else { return true };
+    let hour = Duration::from_secs(3600);
+    if m.len() > 50_000 {
+        m.retain(|_, (at, _)| at.elapsed() < hour);
+    }
+    let e = m.entry(ip.to_string()).or_insert((Instant::now(), 0));
+    if e.0.elapsed() >= hour {
+        *e = (Instant::now(), 0);
+    }
+    e.1 += 1;
+    e.1 <= MAX_PER_VISITOR_HOUR
+}
+
+pub async fn subscribe_public(State(state): State<AppState>, Query(q): Query<KeyQuery>, headers: HeaderMap, body: Bytes) -> Response {
     let res: AppResult<Value> = async {
         let account_id = account_by_key(&state.db, &q.k).await?;
+        if !visitor_allowed(client_ip(&headers).as_deref()) {
+            return Err(AppError::Conflict("Too many requests from here. Please try again later.".into()));
+        }
         let b: SubscribeBody = serde_json::from_slice(&body).map_err(|_| AppError::bad("send JSON with email and product_id"))?;
         subscribe(&state.db, account_id, &b.email, b.product_id.as_deref(), b.variant_id.as_deref(), b.url.as_deref()).await
     }

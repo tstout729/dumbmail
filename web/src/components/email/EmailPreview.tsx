@@ -3,23 +3,25 @@ import { Loader2, Monitor, Smartphone } from "lucide-react";
 import type { EmailContent } from "../../api";
 import { useEmailRender } from "../../api";
 import { useDebouncedValue } from "../../lib/hooks";
+import { PreviewAsPicker } from "../../features/catalog/PreviewAsPicker";
 import { Segmented, cx } from "../ui";
 
 type Props = { content: EmailContent; fromName?: string; className?: string };
 
 export function EmailPreview({ content, fromName, className }: Props) {
   const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
+  const [profileId, setProfileId] = useState<string | undefined>();
   const debounced = useDebouncedValue(content, 450);
-  const render = useEmailRender(debounced);
+  const render = useEmailRender(debounced, profileId);
   const html = render.data?.html;
   const stale = render.isFetching || debounced !== content;
 
   return (
     <div className={cx("flex min-h-0 flex-col", className)}>
-      <div className="flex items-center justify-between gap-2 pb-2">
-        <div className="flex items-center gap-2 text-xs text-zinc-500">
-          Preview
-          {stale ? <Loader2 className="size-3 animate-spin" /> : null}
+      <div className="flex flex-wrap items-center justify-between gap-2 pb-2">
+        <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-500">
+          <PreviewAsPicker onChange={setProfileId} />
+          {stale ? <Loader2 className="size-3 shrink-0 animate-spin" /> : null}
         </div>
         <Segmented
           size="sm"

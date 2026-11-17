@@ -60,10 +60,10 @@ export function useDeleteTemplate() {
 }
 
 /** Server-side email render. Pass already-debounced content. */
-export function useEmailRender(content: EmailContent | null) {
+export function useEmailRender(content: EmailContent | null, profileId?: string) {
   return useQuery({
-    queryKey: keys.render({ channel: "email", content }),
-    queryFn: () => templatesApi.renderEmail(content as EmailContent),
+    queryKey: keys.render({ channel: "email", content, profileId }),
+    queryFn: () => templatesApi.renderEmail(content as EmailContent, profileId),
     enabled: content !== null,
     placeholderData: keepPreviousData,
     staleTime: 60_000,
