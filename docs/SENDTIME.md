@@ -17,15 +17,15 @@ Check what DumbMail uses for someone with `GET /api/profiles/{id}/timezone` (MCP
 
 ## Campaign send options
 
-Set `send_options` on a campaign (`POST /api/campaigns`, `PATCH /api/campaigns/{id}`, or MCP `create_campaign`, `update_campaign`, `send_campaign`). `null` or leaving it out sends to everyone at once with no smart sending, as before.
+Set `send_options` on a campaign (`POST /api/campaigns`, `PATCH /api/campaigns/{id}`, or with the send itself: `POST /api/campaigns/{id}/send` with `{"send_options": ...}`, `POST /api/campaigns/{id}/schedule` with `{"send_at", "send_options"}`, or MCP `create_campaign`, `update_campaign`, `send_campaign`). Options given with a send are checked and saved on the campaign first; unknown fields are refused. `null` or leaving it out sends to everyone at once with no smart sending, as before.
 
 | Field | Used with | Meaning |
 | --- | --- | --- |
 | `timing` | all | `all_at_once` (default), `local_time`, `best_time` or `gradual` |
 | `local_time` | `local_time` | The hour in each person's zone, `HH:MM` (default `10:00`) |
-| `late` | `local_time` | For people whose hour already passed when sending starts: `next_day` (default) gets it at that hour tomorrow, `immediately` gets it right away |
+| `late` | `local_time` | For people whose hour had already passed more than 15 minutes before the send was asked for: `next_day` (default) gets it at that hour tomorrow, `immediately` gets it right away. Anyone whose hour passed less than 15 minutes before gets it right away either way |
 | `window_start`, `window_end` | `best_time` | The local hours it may go out in (default `08:00` to `20:00`, at least an hour) |
-| `within_hours` | `best_time` | How far ahead of the send time to look (6 to 72, default 24) |
+| `within_hours` | `best_time` | How far ahead of the send time to look (6 to 72, default 24). Someone whose window doesn't open within it gets it when the window next opens, after it |
 | `spread_hours` | `gradual` | Hours to spread the send over, one equal batch an hour (2 to 72) |
 | `smart_sending` | all | `true` skips people who got a message on this channel recently |
 | `smart_sending_hours` | all | How recently (1 to 168 hours, default 16) |
@@ -40,11 +40,13 @@ Example:
 
 The campaign goes out at `local_time` in each person's zone on the send day. The send day is the day of the scheduled time in the account's time zone (or today when you send now). Sending starts when the first zone on Earth reaches that hour (UTC+14), so a whole day of zones takes about 26 hours. The campaign shows `sending` until the last zone is done. When you schedule it, the campaign's `send_at` becomes that first start time and `send_options.local_date` records the day.
 
-Half-hour and quarter-hour zones (India, Nepal, Newfoundland, Adelaide) get their own release. On a daylight-saving change, a time the clock skips moves to the first time after it, and a time the clock passes twice uses the first.
+Whether a zone's hour "already passed" is judged against when the send was asked for (the campaign's `send_at`: the click on Send, or the scheduled start), with 15 minutes' grace. So the first zone of a scheduled send, or New York when you click Send at 10:05 there, gets it right away rather than tomorrow.
+
+Half-hour and quarter-hour zones (India, Nepal, Newfoundland, Adelaide) get their own release. On a daylight-saving change, a time the clock skips moves to the first minute after the gap (02:07 on a 02:00 to 03:00 gap goes at 03:00), and a time the clock passes twice uses the first.
 
 ### Best time for each person
 
-DumbMail looks at each person's own opens and clicks from the last 180 days, by hour of the week in their zone, with recent ones counting more (half the weight every 30 days). It picks their best whole hour inside the window, within `within_hours` of the send time. People with fewer than 3 opens or clicks get the account's best hour (from everyone's engagement in the last 90 days, read in the account's zone and applied as each person's local hour); with too little account history, 10:00.
+DumbMail looks at each person's own opens and clicks from the last 180 days, by hour of the week in their zone, with recent ones counting more (half the weight every 30 days). It picks their best whole hour inside the window, within `within_hours` of the send time. With a short `within_hours`, someone's window may not open before it ends (21:00 for them with a 6-hour look-ahead and an 08:00 to 20:00 window): they get it when their window next opens, which is after the look-ahead. People with fewer than 3 opens or clicks get the account's best hour (from everyone's engagement in the last 90 days, read in the account's zone and applied as each person's local hour); with too little account history, 10:00.
 
 This is computed from past opens and clicks, so it's only as good as that history. Apple Mail's privacy protection opens many emails automatically at times the person didn't choose, which makes opens noisy. When someone has at least 3 clicks, only clicks count; otherwise clicks count twice as much as opens.
 
@@ -58,9 +60,10 @@ With `smart_sending` on, each recipient is checked when their message is about t
 
 ### What stays the same
 
-- The audience is fixed when sending starts. Each person gets at most one message per campaign: release times are planned once, and a retried or restarted send never plans or sends anyone twice.
-- A/B tests: the test group follows the same timing rule. The rest of the audience is planned when the winner is picked, by the same rule from that moment (for `local_time`, the next time it's that hour in their zone, or right away with `late: immediately`).
-- Cancelling stops everything not yet sent, including zones still waiting.
+- The audience is fixed when sending starts: people who join a list or segment later don't get it, even if the send is retried. Unsubscribes, bounces and complaints are still checked for everyone just before their message goes.
+- Each person gets at most one message per campaign. Release times are computed from when the send was asked for, not from when the planning step happens to run, so a planning step that's interrupted and run again gives everyone the same time, and a gradual send keeps its equal batches.
+- A/B tests: the test group follows the same timing rule. The rest of the audience is fixed when the test starts (so someone who leaves the list during the test still gets the winner, if they can still be emailed), and planned when the winner is picked, by the same rule from that moment (for `local_time`, the next time it's that hour in their zone, or right away with `late: immediately`).
+- Cancelling stops everything not yet sent, including zones still waiting. A message a worker had already picked up when the cancel landed is either already on its way or skipped; it's never left waiting.
 - The warm-up limit, the automatic pause for bounces and complaints, billing, unsubscribes and suppressions apply as always.
 
 ## Estimates and progress
@@ -70,16 +73,23 @@ With `smart_sending` on, each recipient is checked when their message is about t
 
 ## SMS quiet hours
 
-Texts from campaigns and flows only go out between 9:00 and 20:00 in the recipient's own time zone (found as above, falling back to the account's). A text outside those hours waits until the window opens; the rest of the batch goes on. Test sends aren't held.
+Texts from campaigns and flows only go out between 9:00 and 20:00 in the recipient's own time zone. A text outside those hours waits until the window opens; the rest of the batch goes on. Hours are checked again just before each text is handed to the carrier, so one waiting for its turn never goes out after the window closes. Test sends aren't held.
 
-A `timezone` property can come from a visitor's browser, so it never makes quiet hours looser than the phone number suggests: when the phone number points to a different zone, a text waits until it's within the hours in both zones. If the two windows never overlap, the phone number's zone decides.
+Whose clock counts: the phone number's own zone (from its country, or its US or Canadian area code) is the authority, because carriers and regulators go by it and nobody can set it from a browser. The profile's zone (found as above) can only narrow the hours: when the two differ, a text waits until it's within the hours in both. When there's no zone from the phone number, the profile's zone (falling back to the account's) is used.
+
+When the two zones never share texting hours (a New York number on a profile that says Manila), the account decides, in Settings → Send times or with `sms_zone_conflict`:
+
+- `phone` (default): text them during the phone number's hours.
+- `skip`: don't text them. The message is skipped with the reason `time zones disagree`.
+
+Either way the message records it (`send_note`), shown on the person's profile under Messages received and, when sent, on the "Received SMS" event as `time_zone_note`.
 
 You can make the window narrower, never wider than 8:00 to 21:00, and it must be at least an hour long:
 
 ```sh
 curl -X PATCH https://dumbmail.ai/api/sendtime/settings \
   -H "Authorization: Bearer $DUMBMAIL_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"sms_window_start": "10:00", "sms_window_end": "19:00"}'
+  -d '{"sms_window_start": "10:00", "sms_window_end": "19:00", "sms_zone_conflict": "phone"}'
 ```
 
-`GET /api/sendtime/settings` returns the window. MCP: `get_send_settings`, `update_send_settings`. A local-time SMS campaign must pick an hour inside the window, and best-time SMS sends stay inside it.
+`GET /api/sendtime/settings` returns the window and `sms_zone_conflict`. MCP: `get_send_settings`, `update_send_settings`. A local-time SMS campaign must pick an hour inside the window, and best-time SMS sends stay inside it.
