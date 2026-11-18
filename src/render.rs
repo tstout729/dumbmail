@@ -409,7 +409,9 @@ pub fn render_str(source: &str, ctx: &Value, html: bool) -> AppResult<String> {
         return Ok(source.to_string());
     }
     // `{% coupon_code 'NAME' %}` becomes the code prepared for this message (see features::coupons).
-    let source = crate::features::coupons::template::resolve(source, ctx)?;
+    let resolved = crate::features::coupons::template::resolve(source, ctx)?;
+    // A `{% review_link %}` nobody filled (a check or render without a person) renders empty (see features::reviews).
+    let source = crate::features::reviews::requests::strip_tags(&resolved);
     env(html)
         .render_str(&source, ctx)
         .map_err(|e| AppError::bad(format!("template error: {e}")))

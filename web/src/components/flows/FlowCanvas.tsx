@@ -12,6 +12,7 @@ import {
   MessageSquareReply,
   Plus,
   Shuffle,
+  Star,
   UserCog,
   Webhook,
   Zap,
@@ -21,6 +22,7 @@ import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport,
 import { delaySummary, eventSplitSummary, notifySummary, StepResultLine, type StepResult } from "../../features/flowsPlus";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
+import { reviewStepSummary } from "../../features/reviews/StepEditor";
 import { Menu, cx } from "../ui";
 import { getSlot, insertableTypes, isBranch, nodeLabels, type Slot } from "./graph";
 import { PanZoom } from "./PanZoom";
@@ -38,6 +40,7 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   remove_from_list: { icon: ListMinus, tone: "bg-red-50 text-red-700" },
   webhook: { icon: Webhook, tone: "bg-zinc-100 text-zinc-600" },
   notify: { icon: Bell, tone: "bg-amber-50 text-amber-700" },
+  review_request: { icon: Star, tone: "bg-amber-50 text-amber-700" },
 };
 
 type NodeStats = Map<string, { entered: number; stats: MessageStats }>;
@@ -191,7 +194,7 @@ function branchLabel(node: ConditionNode | RandomSplitNode | WaitForReplyNode, b
 }
 
 function nodeTitle(node: FlowNode): string {
-  if ((node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "notify") && node.name) return node.name;
+  if ((node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "notify" || node.type === "review_request") && node.name) return node.name;
   return nodeLabels[node.type];
 }
 
@@ -226,6 +229,8 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return { text: `${node.method ?? "POST"} ${node.url}` };
     case "notify":
       return notifySummary(node);
+    case "review_request":
+      return reviewStepSummary(node);
   }
 }
 
@@ -235,7 +240,7 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
   const summary = nodeSummary(node, ctx.lists);
   const s = ctx.stats.get(node.id);
   const r = ctx.results?.find((x) => x.node_id === node.id);
-  const isMessage = node.type === "email" || node.type === "sms" || node.type === "push";
+  const isMessage = node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "review_request";
   const selected = ctx.selected === node.id;
   return (
     <button

@@ -4,7 +4,7 @@
   "category": "Payments",
   "description": "Stripe payments become events: Placed Order for paid Checkout sessions (including delayed payment methods, once they succeed) and subscription invoices, Refunded Order for each refund, and Subscription Started and Subscription Cancelled. Customers who tick Checkout's promotional-emails box are subscribed to email; everyone else is held back from marketing.",
   "metrics": [
-    "Placed Order",
+    { "name": "Placed Order", "purchase": true },
     "Refunded Order",
     "Subscription Started",
     "Subscription Cancelled"
