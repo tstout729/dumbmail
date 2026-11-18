@@ -14,6 +14,10 @@
 //!   expression and filter argument for filter argument (quoted strings exactly), and may move
 //!   anywhere within the text, but never into or out of an attribute.
 //!
+//! - **Stylesheets and scripts** (the contents of `style`, `script` and the other raw-text
+//!   elements) aren't words: they must be byte for byte the original's. A `title` or `textarea`
+//!   holds words, read the way a browser reads it (no tags inside).
+//!
 //! Whitespace inside a tag outside quoted strings doesn't matter (`{{first_name}}` is
 //! `{{ first_name }}`).
 
@@ -28,6 +32,8 @@ enum Tok {
     /// `{% … %}` or `{# … #}`, normalized, with its opener.
     Ctl(String),
     Elem(Elem),
+    /// The contents of a raw-text element (`style`, `script` …), which must be identical.
+    Raw(String),
     /// A `<` that starts a tag but can't be read as one: everything from there on, which must be
     /// exactly the original's (a browser would read it in ways this can't predict).
     Bad(String),
@@ -225,21 +231,64 @@ fn parse_tag(s: &str, i: usize) -> Option<(usize, Elem)> {
     }
 }
 
-/// Read a string into tokens: text, template tags and HTML elements.
-fn tokens(s: &str) -> Vec<Tok> {
+/// Elements whose contents a browser reads as raw text (no tags inside), which aren't words.
+const RAW_TEXT: [&str; 6] = ["style", "script", "xmp", "iframe", "noembed", "noframes"];
+/// Elements whose contents are words read with no tags inside.
+const RC_DATA: [&str; 2] = ["title", "textarea"];
+
+/// Where the end tag `</name` (any case, then whitespace, `/` or `>`) is, from `from`.
+fn end_tag(s: &str, from: usize, name: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let n = name.len();
+    let mut i = from;
+    while i + 2 + n <= b.len() {
+        if b[i] == b'<' && b[i + 1] == b'/' && b[i + 2..i + 2 + n].eq_ignore_ascii_case(name.as_bytes()) && b.get(i + 2 + n).is_none_or(|c| c.is_ascii_whitespace() || *c == b'/' || *c == b'>') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Template tokens of words with no markup (a `title`'s contents), positions from `base`.
+fn word_tokens(s: &str, base: usize, out: &mut Vec<(usize, Tok)>) {
+    let b = s.as_bytes();
+    let (mut i, mut ts) = (0, 0);
+    while i < b.len() {
+        if at_template(b, i) {
+            if let Some(e) = tag_end(s, i) {
+                if i > ts {
+                    out.push((base + ts, Tok::Text(s[ts..i].to_string())));
+                }
+                out.push((base + i, template_tok(&s[i..e])));
+                i = e;
+                ts = e;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if b.len() > ts {
+        out.push((base + ts, Tok::Text(s[ts..].to_string())));
+    }
+}
+
+/// Read a string into tokens with where each starts: text, template tags, HTML elements and the
+/// contents of raw-text elements.
+fn tokens_at(s: &str) -> Vec<(usize, Tok)> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let (mut i, mut ts) = (0, 0);
-    let flush = |from: usize, to: usize, out: &mut Vec<Tok>| {
+    let flush = |from: usize, to: usize, out: &mut Vec<(usize, Tok)>| {
         if to > from {
-            out.push(Tok::Text(s[from..to].to_string()));
+            out.push((from, Tok::Text(s[from..to].to_string())));
         }
     };
     while i < b.len() {
         if at_template(b, i) {
             if let Some(e) = tag_end(s, i) {
                 flush(ts, i, &mut out);
-                out.push(template_tok(&s[i..e]));
+                out.push((i, template_tok(&s[i..e])));
                 i = e;
                 ts = e;
                 continue;
@@ -248,13 +297,29 @@ fn tokens(s: &str) -> Vec<Tok> {
             flush(ts, i, &mut out);
             match parse_tag(s, i) {
                 Some((e, el)) => {
-                    out.push(Tok::Elem(el));
+                    let name = el.name.clone();
+                    out.push((i, Tok::Elem(el)));
                     i = e;
                     ts = e;
+                    let raw = RAW_TEXT.contains(&name.as_str());
+                    if raw || RC_DATA.contains(&name.as_str()) {
+                        // Everything up to the matching end tag is its contents, whatever is in it.
+                        let Some(end) = end_tag(s, e, &name) else {
+                            out.push((e, Tok::Bad(s[e..].to_string())));
+                            return out;
+                        };
+                        if raw {
+                            out.push((e, Tok::Raw(s[e..end].to_string())));
+                        } else {
+                            word_tokens(&s[e..end], e, &mut out);
+                        }
+                        i = end;
+                        ts = end;
+                    }
                     continue;
                 }
                 None => {
-                    out.push(Tok::Bad(s[i..].to_string()));
+                    out.push((i, Tok::Bad(s[i..].to_string())));
                     return out;
                 }
             }
@@ -262,6 +327,57 @@ fn tokens(s: &str) -> Vec<Tok> {
         i += 1;
     }
     flush(ts, b.len(), &mut out);
+    out
+}
+
+fn tokens(s: &str) -> Vec<Tok> {
+    tokens_at(s).into_iter().map(|(_, t)| t).collect()
+}
+
+/// Where a browser closes the document's body: the first real `</body>` end tag (not inside an
+/// attribute, a comment, a `title` or a stylesheet), else the first real `</html>`. None when
+/// there's neither.
+pub fn body_close(html: &str) -> Option<usize> {
+    let toks = tokens_at(html);
+    let at = |n: &str| toks.iter().find(|(_, t)| matches!(t, Tok::Elem(e) if e.name == n)).map(|(p, _)| *p);
+    at("/body").or_else(|| at("/html"))
+}
+
+/// Whether `s` shows anything a reader can see: a letter or digit once character references are
+/// decoded and invisible characters dropped.
+pub fn visible(s: &str) -> bool {
+    decode_entities(s).chars().filter(|c| !is_hidden_control(*c)).any(char::is_alphanumeric)
+}
+
+/// The words inside each link (`<a>` … `</a>`) whose `href` satisfies `pick`, in order.
+pub fn link_words(s: &str, pick: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur: Option<String> = None;
+    for t in tokens(s) {
+        match t {
+            Tok::Elem(e) if e.name == "a" => {
+                if let Some(w) = cur.take() {
+                    out.push(w);
+                }
+                let href = e.attrs.iter().find(|(n, _)| n == "href").and_then(|(_, v)| v.clone()).unwrap_or_default();
+                cur = pick(&href).then(String::new);
+            }
+            Tok::Elem(e) if e.name == "/a" => {
+                if let Some(w) = cur.take() {
+                    out.push(w);
+                }
+            }
+            Tok::Text(x) => {
+                if let Some(w) = cur.as_mut() {
+                    w.push_str(&x);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = cur {
+        out.push(w);
+    }
     out
 }
 
@@ -305,6 +421,7 @@ fn describe(t: &Tok) -> String {
         Tok::Elem(e) if e.name == "!--" => "an HTML comment".into(),
         Tok::Elem(e) => format!("<{}>", e.name),
         Tok::Bad(_) => "an unfinished tag".into(),
+        Tok::Raw(_) => "a stylesheet or script".into(),
         _ => String::new(),
     }
 }
@@ -430,13 +547,15 @@ pub fn without_tags(s: &str, with: &str) -> String {
 /// Whether `translation` changes only words of `original` (see the module docs).
 pub fn compare(original: &str, translation: &str) -> Result<(), String> {
     let (o, t) = (tokens(original), tokens(translation));
-    let structural = |v: &[Tok]| v.iter().filter(|x| matches!(x, Tok::Ctl(_) | Tok::Elem(_) | Tok::Bad(_))).cloned().collect::<Vec<_>>();
+    let structural = |v: &[Tok]| v.iter().filter(|x| matches!(x, Tok::Ctl(_) | Tok::Elem(_) | Tok::Bad(_) | Tok::Raw(_))).cloned().collect::<Vec<_>>();
     let (os, ts) = (structural(&o), structural(&t));
     for (i, (a, b)) in os.iter().zip(&ts).enumerate() {
         match (a, b) {
             (Tok::Elem(x), Tok::Elem(y)) => same_elem(x, y)?,
             (Tok::Ctl(x), Tok::Ctl(y)) if x == y => {}
             (Tok::Bad(x), Tok::Bad(y)) if x == y => {}
+            (Tok::Raw(x), Tok::Raw(y)) if x == y => {}
+            (Tok::Raw(_), Tok::Raw(_)) => return Err("stylesheets and scripts aren't words: they must stay exactly as in the original".into()),
             _ => return Err(format!("it must keep the original's tags and markup in the same order: {} at position {} became {}", describe(a), i + 1, describe(b))),
         }
     }
@@ -513,6 +632,33 @@ mod tests {
             let _ = compare(weird, weird);
             let _ = compare("x", weird);
         }
+    }
+
+    #[test]
+    fn stylesheets_and_styles_stay_as_they_are() {
+        let doc = "<html><head><style>.foot{color:#666}</style></head><body><p style=\"color:#111\">Hi</p></body></html>";
+        assert!(compare(doc, &doc.replace("Hi", "Salut")).is_ok());
+        assert!(compare(doc, &doc.replace(".foot{color:#666}", ".foot{display:none}")).is_err(), "a stylesheet");
+        assert!(compare(doc, &doc.replace("color:#111", "color:#111;display:none")).is_err(), "a style attribute");
+        assert!(compare("<style>a{}</style>x", "<STYLE>a{}</STYLE>y").is_ok());
+        assert!(compare("<style>a{}</style>", "<style>a{}</style ><p>x</p>").is_err());
+        // A title holds words, with no tags inside it.
+        assert!(compare("<title>Hi</title>", "<title>Salut</body></title>").is_ok());
+    }
+
+    #[test]
+    fn the_body_closes_where_a_browser_closes_it() {
+        let doc = "<html><head><title>a </body> b</title><style>/* </body> */</style></head><body title=\"</body>\"><!-- </body> --><p>x</p></BODY></html>";
+        assert_eq!(body_close(doc), doc.find("</BODY>"));
+        assert_eq!(body_close("<html><body>x</html>"), Some(13));
+        assert_eq!(body_close("<p>x</p>"), None);
+    }
+
+    #[test]
+    fn link_words_and_what_shows() {
+        let h = "<p><a href=\"{{ unsubscribe_url }}\">Leave <b>now</b></a> <a href=\"https://a.test\">Shop</a></p>";
+        assert_eq!(link_words(h, |u| u.contains("unsubscribe_url")), vec!["Leave now".to_string()]);
+        assert!(visible("Partir") && visible("退订") && !visible(" ,.&nbsp;\u{200B}") && !visible("&#8203;"));
     }
 
     #[test]

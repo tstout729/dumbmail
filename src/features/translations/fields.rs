@@ -428,6 +428,14 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
     if kind == Kind::Link {
         check_link(source, text)?;
     }
+    // A link the original places for unsubscribing keeps words people can see.
+    if kind == Kind::Html {
+        let unsub = |u: &str| u.contains("unsubscribe_url");
+        let (want, got) = (super::structure::link_words(source, unsub), super::structure::link_words(text, unsub));
+        if want.iter().zip(&got).any(|(w, g)| super::structure::visible(w) && !super::structure::visible(g)) {
+            return Err("the unsubscribe link must keep words people can see".into());
+        }
+    }
     Ok(())
 }
 

@@ -588,6 +588,12 @@ pub fn render_email_hooked(
                 let own_unsubscribe = content.own_unsubscribe.filter(|_| lang.is_some()).unwrap_or_else(|| html.contains("unsubscribe_url"));
                 let doc = if own_unsubscribe || footer.is_empty() {
                     html.clone()
+                } else if lang.is_some() {
+                    // A language version: where a browser really closes the body (a `</body>` in a
+                    // translated attribute, title or comment isn't it), else the end.
+                    let div = format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div>"#);
+                    let at = crate::features::translations::structure::body_close(html).unwrap_or(html.len());
+                    format!("{}{div}{}", &html[..at], &html[at..])
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
                 };

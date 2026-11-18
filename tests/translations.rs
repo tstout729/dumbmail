@@ -737,6 +737,29 @@ async fn a_translation_cant_remove_the_unsubscribe_footer() {
     let own = r#"<html><body><p>Hi</p><a href="{{ unsubscribe_url }}">Leave</a></body></html>"#;
     let out = preview_fr(&mut h, own, r#"<html><body><p>Salut</p><a href="{{ unsubscribe_url }}">Partir</a></body></html>"#).await;
     assert!(out.contains(">Partir</a>") && !out.contains("Vous recevez cet e-mail"), "{out}");
+    // A `</body>` in a translated attribute isn't where the body ends: the footer goes in at the real end.
+    let doc = r#"<html><head><style>p{margin:0}</style></head><body><p title="Hello">Hello</p></body></html>"#;
+    let out = preview_fr(&mut h, doc, r#"<html><head><style>p{margin:0}</style></head><body><p title="</body><style>">Bonjour</p></body></html>"#).await;
+    let (words, foot) = (out.find("Bonjour</p>").unwrap(), out.find("Se désabonner</a>").unwrap());
+    assert!(foot > words && out[foot..].contains("</body>"), "{out}");
+    // The custom unsubscribe link keeps words people can see; stylesheets and styles aren't words.
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "Own", "channel": "email", "content": {"subject": "Hi", "html": own}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    for bad in [
+        r#"<html><body><p>Salut</p><a href="{{ unsubscribe_url }}"> . &#8203; </a></body></html>"#,
+        r#"<html><body><p>Salut</p><a href="{{ unsubscribe_url }}"></a></body></html>"#,
+    ] {
+        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "html", "text": bad}]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+    }
+    let styled = r#"<html><head><style>.f{color:#666}</style></head><body><p style="color:#111">Hi</p><a href="{{ unsubscribe_url }}">Leave</a></body></html>"#;
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "Styled", "channel": "email", "content": {"subject": "Hi", "html": styled}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    for bad in [styled.replace("Hi", "Salut").replace(".f{color:#666}", "a{display:none}"), styled.replace("Hi", "Salut").replace("color:#111", "color:#111;font-size:0")] {
+        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "html", "text": bad}]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+    }
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "html", "text": styled.replace("Hi", "Salut").replace("Leave", "Partir")}]}))).await;
     h.cleanup().await;
 }
 
