@@ -411,7 +411,25 @@ pub async fn load(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Optio
     let mut stack: Vec<Uuid> = self_id.into_iter().collect();
     let mut budget = Budget { refs: MAX_SEGMENT_REFS, conditions: MAX_EXPANDED_CONDITIONS };
     resolve(db, account_id, &mut def.conditions, &mut stack, &mut budget).await?;
+    // Object rules may not test a type's sensitive fields (they'd tell who has which value).
+    let mut rules = Vec::new();
+    object_rules(&def.conditions, &mut rules);
+    for (key, fields) in rules {
+        crate::features::objects::types::check_rule_fields(db, account_id, &key, &fields.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    }
     Ok(def)
+}
+
+/// Each object condition's type and the fields it tests, including inside groups and other segments.
+fn object_rules(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
+    for c in conds {
+        match c {
+            Condition::Object { object_type, where_, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.clone()).collect())),
+            Condition::Group { conditions, .. } => object_rules(conditions, out),
+            Condition::Segment { resolved: Some(d), .. } => object_rules(&d.conditions, out),
+            _ => {}
+        }
+    }
 }
 
 /// Limits on inlining other segments, so a chain of segments that each include another many times

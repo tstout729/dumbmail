@@ -24,8 +24,6 @@ CREATE TABLE objects (
     -- The id the object has in the customer's own system (a reservation id).
     external_id text NOT NULL,
     fields      jsonb NOT NULL DEFAULT '{}',
-    -- The title field's value, kept for lists and search.
-    title       text,
     -- Who last wrote it: api | mcp | integration:<id>.
     source      text,
     version     bigint NOT NULL DEFAULT 1,

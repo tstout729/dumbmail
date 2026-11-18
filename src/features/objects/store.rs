@@ -193,8 +193,14 @@ pub async fn resolve_links(db: &PgPool, account_id: Uuid, links: &[LinkInput]) -
     Ok(out)
 }
 
-fn title_of(t: &ObjectType, fields: &Map<String, Value>) -> Option<String> {
-    let v = fields.get(t.title_field.as_deref()?)?;
+/// The title from the type as it is now (never a sensitive field; read again on every view, so a
+/// title field that later became sensitive or changed never shows a stale value).
+pub fn title_of(t: &ObjectType, fields: &Map<String, Value>) -> Option<String> {
+    let key = t.title_field.as_deref()?;
+    if t.field(key).is_none_or(|f| f.sensitive) {
+        return None;
+    }
+    let v = fields.get(key)?;
     let s = match v {
         Value::String(s) => s.clone(),
         Value::Null => return None,
@@ -244,7 +250,7 @@ pub async fn write(state: &AppState, w: &Writer, type_key: &str, external_id: &s
     let norm = normalize_all(&t, &fields)?;
     let fresh: Map<String, Value> = norm.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())).collect();
     let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO objects (id, account_id, type_id, external_id, fields, title, source, as_of) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "INSERT INTO objects (id, account_id, type_id, external_id, fields, source, as_of) VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (type_id, external_id) DO NOTHING RETURNING id",
     )
     .bind(Uuid::now_v7())
@@ -252,7 +258,6 @@ pub async fn write(state: &AppState, w: &Writer, type_key: &str, external_id: &s
     .bind(t.id)
     .bind(&external_id)
     .bind(Value::Object(fresh.clone()))
-    .bind(title_of(&t, &fresh))
     .bind(&w.source)
     .bind(as_of)
     .fetch_optional(&mut *tx)
@@ -295,11 +300,10 @@ pub async fn write(state: &AppState, w: &Writer, type_key: &str, external_id: &s
                 (id, "unchanged", changed, before, after, version)
             } else {
                 let version: i64 = sqlx::query_scalar(
-                    "UPDATE objects SET fields = $2, title = $3, source = $4, as_of = COALESCE($5, as_of), version = version + 1, updated_at = now() WHERE id = $1 RETURNING version",
+                    "UPDATE objects SET fields = $2, source = $3, as_of = COALESCE($4, as_of), version = version + 1, updated_at = now() WHERE id = $1 RETURNING version",
                 )
                 .bind(id)
                 .bind(Value::Object(merged.clone()))
-                .bind(title_of(&t, &merged))
                 .bind(&w.source)
                 .bind(as_of)
                 .fetch_one(&mut *tx)
@@ -420,7 +424,6 @@ pub struct ObjectRow {
     pub type_id: Uuid,
     pub external_id: String,
     pub fields: Value,
-    pub title: Option<String>,
     pub source: Option<String>,
     pub version: i64,
     pub as_of: Option<String>,
@@ -428,26 +431,33 @@ pub struct ObjectRow {
     pub updated_at: DateTime<Utc>,
 }
 
-const OBJECT_COLS: &str = "o.id, o.type_id, o.external_id, o.fields, o.title, o.source, o.version, o.as_of, o.created_at, o.updated_at";
+const OBJECT_COLS: &str = "o.id, o.type_id, o.external_id, o.fields, o.source, o.version, o.as_of, o.created_at, o.updated_at";
 
 /// The fields this caller may see: sensitive fields only in a detail view, for people who can read
-/// profiles. Returns the visible fields and the names of those held back.
+/// profiles. Values of keys the type no longer defines (a field removed from it, maybe one that was
+/// sensitive) are held back the same way. Returns the visible fields and the names held back.
 pub fn visible(t: &ObjectType, fields: &Value, detail_with_sensitive: bool) -> (Map<String, Value>, Vec<String>) {
-    let mut out = fields.as_object().cloned().unwrap_or_default();
+    let all = fields.as_object().cloned().unwrap_or_default();
+    if detail_with_sensitive {
+        return (all, Vec::new());
+    }
+    let mut out = Map::new();
     let mut hidden = Vec::new();
-    if !detail_with_sensitive {
-        for k in t.sensitive() {
-            if out.remove(k).is_some() {
-                hidden.push(k.to_string());
+    for (k, v) in all {
+        match t.field(&k) {
+            Some(f) if !f.sensitive => {
+                out.insert(k, v);
             }
+            _ => hidden.push(k),
         }
     }
+    hidden.sort();
     (out, hidden)
 }
 
 fn summary(t: &ObjectType, r: &ObjectRow) -> Value {
     let (fields, _) = visible(t, &r.fields, false);
-    json!({"id": r.id, "type": t.key, "external_id": r.external_id, "title": r.title, "fields": fields, "version": r.version, "created_at": r.created_at, "updated_at": r.updated_at})
+    json!({"id": r.id, "type": t.key, "external_id": r.external_id, "title": title_of(t, r.fields.as_object().unwrap_or(&Map::new())), "fields": fields, "version": r.version, "created_at": r.created_at, "updated_at": r.updated_at})
 }
 
 fn like_escape(s: &str) -> String {
@@ -459,14 +469,17 @@ fn like_escape(s: &str) -> String {
 pub async fn list(db: &PgPool, t: &ObjectType, q: Option<&str>, limit: i64, offset: i64) -> AppResult<Value> {
     let q = q.map(str::trim).filter(|s| !s.is_empty()).map(|s| format!("%{}%", like_escape(&s.chars().take(100).collect::<String>())));
     let sql = format!(
-        "SELECT {OBJECT_COLS} FROM objects o WHERE o.type_id = $1 AND o.account_id = $2 AND ($3::text IS NULL OR o.title ILIKE $3 OR o.external_id ILIKE $3)
+        "SELECT {OBJECT_COLS} FROM objects o WHERE o.type_id = $1 AND o.account_id = $2 AND ($3::text IS NULL OR o.fields->>$6::text ILIKE $3 OR o.external_id ILIKE $3)
          ORDER BY o.updated_at DESC, o.id DESC LIMIT $4 OFFSET $5"
     );
-    let rows: Vec<ObjectRow> = sqlx::query_as(&sql).bind(t.id).bind(t.account_id).bind(&q).bind(limit).bind(offset).fetch_all(db).await?;
-    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM objects o WHERE o.type_id = $1 AND o.account_id = $2 AND ($3::text IS NULL OR o.title ILIKE $3 OR o.external_id ILIKE $3)")
+    // Search the current, non-sensitive title field (never a stored title that may be stale).
+    let title_key = t.title_field.clone().filter(|k| t.field(k).is_some_and(|f| !f.sensitive)).unwrap_or_default();
+    let rows: Vec<ObjectRow> = sqlx::query_as(&sql).bind(t.id).bind(t.account_id).bind(&q).bind(limit).bind(offset).bind(&title_key).fetch_all(db).await?;
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM objects o WHERE o.type_id = $1 AND o.account_id = $2 AND ($3::text IS NULL OR o.fields->>$4::text ILIKE $3 OR o.external_id ILIKE $3)")
         .bind(t.id)
         .bind(t.account_id)
         .bind(&q)
+        .bind(&title_key)
         .fetch_one(db)
         .await?;
     Ok(json!({"data": rows.iter().map(|r| summary(t, r)).collect::<Vec<_>>(), "total": total}))
@@ -495,13 +508,12 @@ pub async fn detail(db: &PgPool, account_id: Uuid, id: Uuid, profiles_read: bool
     .bind(account_id)
     .fetch_all(db)
     .await?;
-    let secret = t.sensitive();
     let mask = |v: &Value| -> Value {
         let mut m = v.as_object().cloned().unwrap_or_default();
         if !profiles_read {
-            for k in &secret {
-                if m.contains_key(*k) {
-                    m.insert(k.to_string(), json!("(hidden)"));
+            for (k, x) in m.iter_mut() {
+                if t.field(k).is_none_or(|f| f.sensitive) {
+                    *x = json!("(hidden)");
                 }
             }
         }
@@ -512,7 +524,7 @@ pub async fn detail(db: &PgPool, account_id: Uuid, id: Uuid, profiles_read: bool
         .map(|(cid, kind, changed, before, after, source, version, at)| json!({"id": cid, "kind": kind, "changed": changed, "before": mask(before), "after": mask(after), "source": source, "version": version, "at": at}))
         .collect();
     let mut out = json!({
-        "id": r.id, "type": t.key, "type_name": t.name, "external_id": r.external_id, "title": r.title, "fields": fields, "hidden_fields": hidden,
+        "id": r.id, "type": t.key, "type_name": t.name, "external_id": r.external_id, "title": title_of(&t, r.fields.as_object().unwrap_or(&Map::new())), "fields": fields, "hidden_fields": hidden,
         "source": r.source, "version": r.version, "as_of": r.as_of, "created_at": r.created_at, "updated_at": r.updated_at, "history": history,
     });
     let links: i64 = sqlx::query_scalar("SELECT count(*) FROM object_links WHERE object_id = $1").bind(id).fetch_one(db).await?;
@@ -551,7 +563,7 @@ pub async fn for_profile(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> App
         let keys: Vec<&str> = t.fields.iter().filter(|f| !f.sensitive && (f.kind.is_date() || f.kind == types::Kind::Enum || Some(f.key.as_str()) == t.title_field.as_deref())).map(|f| f.key.as_str()).take(6).collect();
         let (fields, _) = visible(t, &r.fields, false);
         let key_fields: Map<String, Value> = keys.iter().filter_map(|k| fields.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
-        let v = json!({"id": r.id, "external_id": r.external_id, "title": r.title, "relationship": rel, "fields": key_fields, "updated_at": r.updated_at});
+        let v = json!({"id": r.id, "external_id": r.external_id, "title": title_of(t, r.fields.as_object().unwrap_or(&Map::new())), "relationship": rel, "fields": key_fields, "updated_at": r.updated_at});
         match groups.iter_mut().find(|(g, _)| g.id == t.id) {
             Some((_, list)) => list.push(v),
             None => groups.push((t.clone(), vec![v])),

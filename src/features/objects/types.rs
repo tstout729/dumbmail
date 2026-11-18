@@ -99,6 +99,22 @@ impl ObjectType {
     }
 }
 
+/// The fields rules may test: those the type defines and doesn't mark sensitive. Trigger filters,
+/// exit checks and condition splits only ever see these, so a rule can't be used to learn a
+/// sensitive value.
+pub fn rule_fields(t: &ObjectType, fields: &Map<String, Value>) -> Map<String, Value> {
+    fields.iter().filter(|(k, _)| t.field(k).is_some_and(|f| !f.sensitive)).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Refuse rules (segment conditions, trigger filters) on a type's sensitive fields.
+pub async fn check_rule_fields(db: &sqlx::PgPool, account_id: Uuid, key: &str, fields: &[&str]) -> AppResult<()> {
+    let Some(t) = by_key(db, account_id, key).await? else { return Ok(()) };
+    if let Some(f) = fields.iter().find(|f| t.field(f.trim()).is_some_and(|d| d.sensitive)) {
+        return Err(AppError::bad(format!("{f:?} is a sensitive field of {}; rules can't test it", t.key)));
+    }
+    Ok(())
+}
+
 pub fn valid_type_key(k: &str) -> bool {
     let b = k.as_bytes();
     !b.is_empty() && b.len() <= 40 && b[0].is_ascii_lowercase() && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')

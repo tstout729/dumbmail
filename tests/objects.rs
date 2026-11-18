@@ -112,6 +112,16 @@ async fn upserts_merge_record_history_and_stay_in_their_account() {
     assert!(!list.to_string().contains("4417"), "{list}");
     let o = h.ok("GET", &format!("/api/objects/{id}"), None).await;
     assert_eq!(o["fields"]["door_code"], "4417", "the owner can read profiles");
+    // Rules can't test a sensitive field (a segment count or a flow start would tell who has which code).
+    let (st, e) = h.req("POST", "/api/segments/preview", Some(json!({"definition": {"conditions": [{"type": "object", "object_type": "reservation", "where": [{"field": "door_code", "op": "eq", "value": "4417"}]}]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    let (st, e) = h.req("POST", "/api/flows", Some(json!({"name": "Probe", "trigger": {"type": "object", "object_type": "reservation", "filters": [{"field": "door_code", "op": "starts_with", "value": "4"}]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    // A field taken off the type keeps its values, but they're held back like sensitive ones.
+    h.ok("POST", "/api/objects", Some(json!({"type": "reservation", "external_id": "R1", "fields": {"wifi": "pw-77"}}))).await;
+    let defs: Vec<Value> = h.ok("GET", "/api/object-types/reservation", None).await["fields"].as_array().unwrap().iter().filter(|f| f["key"] != "wifi").cloned().collect();
+    h.ok("PATCH", "/api/object-types/reservation", Some(json!({"fields": defs}))).await;
+    assert!(!h.ok("GET", "/api/object-types/reservation/objects", None).await.to_string().contains("pw-77"));
     let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'ana@example.com'").fetch_one(&h.state.db).await.unwrap();
     let mine = h.ok("GET", &format!("/api/profiles/{pid}/objects"), None).await;
     assert_eq!(mine["types"][0]["objects"][0]["external_id"], "R1");
@@ -121,7 +131,8 @@ async fn upserts_merge_record_history_and_stay_in_their_account() {
     set_role(&h, "content").await;
     let o = h.ok("GET", &format!("/api/objects/{id}"), None).await;
     assert!(o.get("profiles").is_none() && !o.to_string().contains("4417") && !o.to_string().contains("ana@"), "{o}");
-    assert_eq!(o["hidden_fields"], json!(["door_code"]));
+    assert_eq!(o["hidden_fields"], json!(["door_code", "wifi"]));
+    assert!(!o.to_string().contains("pw-77"), "{o}");
     assert_eq!(h.req("POST", "/api/objects", Some(reservation("R3", "x@example.com", json!({})))).await.0, StatusCode::FORBIDDEN);
     assert_eq!(h.req("GET", &format!("/api/profiles/{pid}/objects"), None).await.0, StatusCode::FORBIDDEN);
     assert_eq!(h.req("DELETE", &format!("/api/objects/{id}"), None).await.0, StatusCode::FORBIDDEN);

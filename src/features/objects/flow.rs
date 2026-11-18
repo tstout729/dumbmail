@@ -106,12 +106,15 @@ pub fn validate_trigger(t: &Trigger) -> AppResult<()> {
 
 /// The type (and for date triggers, its date field) must exist in the account.
 pub async fn check_trigger_refs(db: &PgPool, account_id: Uuid, t: &Trigger) -> AppResult<()> {
-    let (key, date_field) = match t {
-        Trigger::Object { object_type, .. } => (object_type, None),
-        Trigger::ObjectDate { object_type, field, .. } => (object_type, Some(field)),
+    let (key, date_field, filters, changed) = match t {
+        Trigger::Object { object_type, filters, field, .. } => (object_type, None, filters, field.as_deref()),
+        Trigger::ObjectDate { object_type, field, filters, .. } => (object_type, Some(field), filters, None),
         _ => return Ok(()),
     };
     let ty = super::types::require(db, account_id, key).await?;
+    let mut tested: Vec<&str> = filters.iter().map(|f| f.field.as_str()).collect();
+    tested.extend(changed);
+    super::types::check_rule_fields(db, account_id, &ty.key, &tested).await?;
     if let Some(f) = date_field {
         match ty.field(f.trim()) {
             Some(d) if d.kind.is_date() => {}
@@ -264,17 +267,20 @@ async fn fire_one(state: &AppState) -> anyhow::Result<bool> {
 struct Obj {
     type_key: String,
     external_id: String,
+    /// Only the fields rules may test (see `types::rule_fields`).
     fields: Map<String, Value>,
 }
 
-async fn load_obj(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid) -> sqlx::Result<Option<Obj>> {
-    let row: Option<(String, String, Value)> =
-        sqlx::query_as("SELECT t.key, o.external_id, o.fields FROM objects o JOIN object_types t ON t.id = o.type_id WHERE o.id = $1 AND o.account_id = $2")
-            .bind(object_id)
-            .bind(account_id)
-            .fetch_optional(conn)
-            .await?;
-    Ok(row.map(|(type_key, external_id, fields)| Obj { type_key, external_id, fields: fields.as_object().cloned().unwrap_or_default() }))
+async fn load_obj(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid) -> AppResult<Option<Obj>> {
+    let row: Option<(Uuid, String, Value)> = sqlx::query_as("SELECT o.type_id, o.external_id, o.fields FROM objects o WHERE o.id = $1 AND o.account_id = $2")
+        .bind(object_id)
+        .bind(account_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((type_id, external_id, fields)) = row else { return Ok(None) };
+    let Some(t) = super::types::by_id(&mut *conn, account_id, type_id).await? else { return Ok(None) };
+    let fields = super::types::rule_fields(&t, fields.as_object().unwrap_or(&Map::new()));
+    Ok(Some(Obj { type_key: t.key, external_id, fields }))
 }
 
 async fn linked(conn: &mut PgConnection, object_id: Uuid, relationship: Option<&str>) -> sqlx::Result<Vec<Uuid>> {
@@ -310,7 +316,7 @@ async fn insert_run(conn: &mut PgConnection, f: &FlowRow, profile_id: Uuid, entr
 /// person (re-entry doesn't apply: each object's date starts the flow once).
 async fn date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, object_id: Uuid, due: DateTime<Utc>) -> anyhow::Result<Result<(Uuid, i32), &'static str>> {
     let Ok(Trigger::ObjectDate { object_type, field, filters, relationship, .. }) = flows::parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
-    let Some(o) = load_obj(tx, f.account_id, object_id).await? else { return Ok(Err("not_started")) };
+    let Some(o) = load_obj(tx, f.account_id, object_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else { return Ok(Err("not_started")) };
     if o.type_key != object_type.trim() {
         return Ok(Err("not_started"));
     }
@@ -447,7 +453,7 @@ pub async fn run_change(state: &AppState, change_id: Uuid) -> anyhow::Result<()>
     let row: Option<(Uuid, Uuid, String, Vec<String>, Value)> = sqlx::query_as("SELECT object_id, account_id, kind, changed, after FROM object_changes WHERE id = $1").bind(change_id).fetch_optional(&state.db).await?;
     let Some((object_id, account_id, kind, changed, after)) = row else { return Ok(()) };
     let mut conn = state.db.acquire().await?;
-    let Some(o) = load_obj(&mut conn, account_id, object_id).await? else { return Ok(()) };
+    let Some(o) = load_obj(&mut conn, account_id, object_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else { return Ok(()) };
     drop(conn);
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'object' AND trigger->>'object_type' = $2 ORDER BY created_at")
         .bind(account_id)
@@ -467,6 +473,10 @@ pub async fn run_change(state: &AppState, change_id: Uuid) -> anyhow::Result<()>
         }
         if let Some(fk) = field.as_deref().map(str::trim) {
             if !changed.iter().any(|c| c == fk) {
+                continue;
+            }
+            // A field rules can't test (sensitive, or no longer defined) never matches.
+            if !o.fields.contains_key(fk) && after.get(fk).is_some_and(|v| !v.is_null()) {
                 continue;
             }
             if let Some(want) = &to {
@@ -549,9 +559,9 @@ pub enum Check {
 /// Before each step of a run that belongs to an object. Runs without one cost nothing.
 pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uuid) -> anyhow::Result<Check> {
     let Some(object_id) = context.get("object").and_then(|o| o.get("id")).and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(Check::NotObject) };
-    let row: Option<(String, String, Value, bool, Option<String>)> = sqlx::query_as(
+    let row: Option<(String, String, Value, bool, Option<String>, Value)> = sqlx::query_as(
         "SELECT t.key, o.external_id, o.fields, EXISTS (SELECT 1 FROM object_links l WHERE l.object_id = o.id AND l.profile_id = $3),
-                (SELECT a.timezone FROM accounts a WHERE a.id = o.account_id)
+                (SELECT a.timezone FROM accounts a WHERE a.id = o.account_id), t.fields
          FROM objects o JOIN object_types t ON t.id = o.type_id WHERE o.id = $1 AND o.account_id = $2",
     )
     .bind(object_id)
@@ -559,16 +569,19 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     .bind(profile_id)
     .fetch_optional(db)
     .await?;
-    let Some((key, external_id, fields, is_linked, tz)) = row else { return Ok(Check::Exit("object deleted")) };
+    let Some((key, external_id, all, is_linked, tz, defs)) = row else { return Ok(Check::Exit("object deleted")) };
     if !is_linked {
         return Ok(Check::Exit("no longer linked to the object"));
     }
-    let fields = fields.as_object().cloned().unwrap_or_default();
+    let all = all.as_object().cloned().unwrap_or_default();
+    // Rules see only the fields they may test; messages see them all.
+    let defs: Vec<super::types::FieldDef> = serde_json::from_value(defs).unwrap_or_default();
+    let fields: Map<String, Value> = all.iter().filter(|(k, _)| defs.iter().any(|d| &d.key == *k && !d.sensitive)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let tz = tz.and_then(|t| t.parse::<chrono_tz::Tz>().ok()).unwrap_or(chrono_tz::America::Los_Angeles).name().to_string();
     let filters = match flows::parse_trigger(&f.trigger) {
         Ok(Trigger::ObjectDate { object_type, field, filters, .. }) if object_type.trim() == key => {
             let started = context["object"].get("date").cloned().unwrap_or(Value::Null);
-            if context["object"]["date_field"].as_str() == Some(field.trim()) && fields.get(field.trim()).cloned().unwrap_or(Value::Null) != started {
+            if context["object"]["date_field"].as_str() == Some(field.trim()) && all.get(field.trim()).cloned().unwrap_or(Value::Null) != started {
                 return Ok(Check::Exit("date moved"));
             }
             filters
@@ -579,7 +592,7 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     if !filters.iter().all(|flt| filter_matches(&fields, flt, &tz, Utc::now())) {
         return Ok(Check::Exit("no longer matches the trigger"));
     }
-    let mut view = fields.clone();
+    let mut view = all;
     view.entry("external_id").or_insert(json!(external_id));
     view.entry("type").or_insert(json!(key));
     Ok(Check::Live { view: Value::Object(view), fields, tz })
