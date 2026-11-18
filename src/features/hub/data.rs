@@ -407,6 +407,13 @@ pub async fn order(db: &PgPool, shopper: &Shopper, id: &str) -> AppResult<Option
     Ok(one.pop())
 }
 
+/// A field's key as a label: `check_in` → "Check in".
+fn label_of(key: &str) -> String {
+    let s = key.replace('_', " ");
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 fn field_text(account: &Account, t: &ObjectType, key: &str, v: &Value) -> Option<String> {
     let def = t.field(key)?;
     let s = match (def.kind, v) {
@@ -455,7 +462,7 @@ fn record(account: &Account, t: &ObjectType, kind: ObjectKind, chosen: &[String]
         .filter_map(|k| {
             let def = t.field(k)?;
             let v = field_text(account, t, k, fields.get(k.as_str())?)?;
-            Some((def.label.clone().unwrap_or_else(|| k.replace('_', " ")), v))
+            Some((def.label.clone().unwrap_or_else(|| label_of(k)), v))
         })
         .collect();
     let title = crate::features::objects::store::title_of(t, &fields).filter(|_| t.title_field.as_deref().is_none_or(|k| settings::showable(t, kind, k))).unwrap_or_else(|| t.name.clone());
@@ -582,7 +589,7 @@ pub fn sample(account: &Account, s: &Settings, types: &[ObjectType]) -> View {
                         Kind::Enum => def.options.first().cloned().unwrap_or_else(|| "Sample".into()),
                         _ => "Sample".into(),
                     };
-                    Some((def.label.clone().unwrap_or_else(|| k.replace('_', " ")), v))
+                    Some((def.label.clone().unwrap_or_else(|| label_of(k)), v))
                 })
                 .collect();
             Some(Record { type_name: t.name.clone(), kind: c.kind, title: format!("Sample {}", t.name.to_lowercase()), fields })
