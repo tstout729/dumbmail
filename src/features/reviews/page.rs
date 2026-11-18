@@ -70,7 +70,7 @@ main{max-width:560px;margin:0 auto;padding:16px}.card{background:#fff;border-rad
 .item{display:flex;gap:14px;align-items:center}.item img{width:72px;height:72px;object-fit:cover;border-radius:8px;flex:none}.item h1{font-size:20px;margin:0}
 label,.label{display:block;font-size:14px;font-weight:600;margin:16px 0 6px}.hint{font-size:13px;color:#6b7280;font-weight:400}
 input[type=text],input[type=email],textarea,select{width:100%;padding:12px;border:1px solid #d1d5db;border-radius:8px;font:inherit;font-size:16px;background:#fff;color:#111827}
-textarea{min-height:120px;resize:vertical}.stars{display:flex;gap:4px;border:0;padding:0;margin:0}.stars input{position:absolute;opacity:0;width:1px;height:1px}
+textarea{min-height:120px;resize:vertical}.stars{display:flex;flex-wrap:wrap;gap:4px;border:0;padding:0;margin:0}.stars legend{padding:0;margin:20px 0 6px;width:100%}.stars input{position:absolute;opacity:0;width:1px;height:1px}
 .stars label{margin:0;font-size:40px;line-height:1;color:#d1d5db;cursor:pointer;padding:2px}.stars label.on{color:#f59e0b}.stars input:focus-visible+label{outline:2px solid #2563eb;border-radius:4px}
 .choices{display:flex;flex-wrap:wrap;gap:8px}.choices label{margin:0;font-weight:400;border:1px solid #d1d5db;border-radius:999px;padding:8px 14px;cursor:pointer}
 .choices input{margin-right:6px}button{font:inherit;font-size:16px;font-weight:600;border:0;border-radius:8px;padding:14px 20px;cursor:pointer}

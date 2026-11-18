@@ -235,6 +235,18 @@ pub async fn ready_event(state: &AppState, r: &Request, subject: &Subject) -> Ap
     Ok(())
 }
 
+/// Whether the event that started this came from a trusted source (the API, an integration,
+/// DumbMail itself), not a browser. A flow's event says so; otherwise its row is read. Unknown is
+/// untrusted.
+async fn event_trusted(db: &PgPool, event: Option<&Value>) -> AppResult<bool> {
+    let Some(e) = event else { return Ok(false) };
+    if let Some(b) = e.get("from_browser").and_then(|v| v.as_bool()) {
+        return Ok(!b);
+    }
+    let Some(id) = e.get("id").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(false) };
+    Ok(sqlx::query_scalar::<_, Option<bool>>("SELECT from_browser FROM events WHERE id = $1").bind(id).fetch_optional(db).await?.flatten() == Some(false))
+}
+
 fn may_receive(p: &Profile, channel: &str) -> bool {
     match channel {
         "sms" => p.sms_consent == "subscribed" && p.phone_number.is_some(),
@@ -315,7 +327,7 @@ pub async fn flow_step(
         by_ids(&state.db, account.id, person.id, &claimed).await.map_err(err)?
     } else {
         let event = context.get("event");
-        let verified = event.is_some_and(|e| e.get("from_browser").and_then(|v| v.as_bool()) == Some(false));
+        let verified = event_trusted(&state.db, event).await?;
         let m = Make { source: "flow", verified, batch_id: Uuid::now_v7(), flow_run_id: Some(run_id) };
         let mut out = Vec::new();
         for item in items_from_event(event) {
@@ -437,12 +449,13 @@ impl Asker<'_> {
         }
         let Some(profile) = self.profile.filter(|_| self.allowed && !self.preview) else { return Ok(Vec::new()) };
         let event_items = items_from_event(self.event);
+        let trusted = event_trusted(&self.state.db, self.event).await?;
         let (items, verified) = match product {
             Some(p) => match event_items.iter().find(|i| i.key == p) {
-                Some(i) => (vec![i.clone()], self.event_trusted()),
+                Some(i) => (vec![i.clone()], trusted),
                 None => (vec![Item { key: p.to_string(), ..Default::default() }], false),
             },
-            None => (event_items, self.event_trusted()),
+            None => (event_items, trusted),
         };
         let mut out = Vec::new();
         for item in items {
@@ -470,9 +483,7 @@ impl Asker<'_> {
         Ok(out)
     }
 
-    fn event_trusted(&self) -> bool {
-        self.event.is_some_and(|e| e.get("from_browser").and_then(|v| v.as_bool()) == Some(false))
-    }
+
 }
 
 fn star_cells(href: Option<&str>, color: &str, size: u32) -> String {

@@ -13,9 +13,9 @@ export function InstallTab() {
       <Notice tone="blue" title="Uses the DumbMail script you already have">
         Put these where each widget goes. They load on pages that have one, in your colours, and don't count toward billing. Replace PRODUCT_ID with the id your catalog or orders use (on Shopify, {"{{ product.id }}"}).
       </Notice>
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {snippets.map((s) => (
-          <Card key={s.title} title={s.title}>
+          <Card key={s.title} title={s.title} className="min-w-0">
             <p className="mb-3 text-sm text-zinc-600">{s.text}</p>
             <CodeBlock code={s.code} />
           </Card>

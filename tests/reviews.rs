@@ -580,3 +580,40 @@ async fn import_export_segments_and_profile_deletion() {
     assert_eq!(summary_row(&h, acct, "777").await, (1, 4, vec![0, 0, 0, 1, 0]));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_stay_flow_asks_after_check_out_about_the_listing() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "guest@x.test", "subscribed").await;
+    person(&h, acct, "held@x.test", "never_subscribed").await;
+    sqlx::query("UPDATE profiles SET marketing_hold = true WHERE email = 'held@x.test'").execute(&h.state.db).await.unwrap();
+    let f = h.ok("POST", "/api/reviews/flows", Some(json!({"kind": "stay"}))).await;
+    assert_eq!(f["trigger"]["type"], "event_date");
+    assert_eq!(f["trigger"]["field"], "check_out");
+    assert_eq!(f["trigger"]["cancelled_by"], json!(["Reservation Cancelled"]));
+    let id = f["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{id}/status"), Some(json!({"status": "live"}))).await;
+    // Start it the way the check-out date would, straight from a Reservation Confirmed event.
+    sqlx::query("UPDATE flows SET trigger = '{\"type\": \"metric\", \"metric\": \"Reservation Confirmed\"}' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    for who in ["guest@x.test", "held@x.test"] {
+        h.ok("POST", "/api/events", Some(json!({"metric": "Reservation Confirmed", "profile": {"email": who}, "properties": {"reservation_id": format!("R-{who}"), "listing_id": "L1", "check_out": "2026-11-10"}}))).await;
+    }
+    h.drain().await;
+    let mails = mails_to(&h, "guest@x.test");
+    assert_eq!(mails.len(), 1);
+    assert!(mails[0].html.contains("How was your stay?") && mails[0].html.contains("your stay"), "{}", mails[0].html);
+    assert!(mails_to(&h, "held@x.test").is_empty(), "people held back from marketing are never asked");
+    let (verified, kind): (bool, String) = sqlx::query_as("SELECT rq.verified, s.kind FROM review_requests rq JOIN review_subjects s ON s.id = rq.subject_id").fetch_one(&h.state.db).await.unwrap();
+    assert!(verified, "a booking from the API is a real stay");
+    assert_eq!(kind, "listing");
+    // Listings get no Google review markup.
+    let t = tokens(&mails[0].html);
+    submit(&h, &t[0], json!({"rating": 5})).await;
+    let pk = site_key(&h, acct).await;
+    let (s, _, _) = h.raw("GET", &format!("/client/reviews/jsonld?k={pk}&product_id=L1"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    h.cleanup().await;
+}
