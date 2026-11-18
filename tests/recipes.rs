@@ -1471,6 +1471,45 @@ async fn patching_a_profiles_phone_leaves_the_sms_subscription_with_the_old_numb
     // Setting the consent in the same request applies it to the new number.
     let opted = h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed"}))).await;
     assert_eq!(opted["sms_consent"], "subscribed");
+    // A first number on a profile that had none doesn't inherit a subscription either.
+    let first = h.ok("POST", "/api/profiles", Some(json!({"email": "quinn@example.com", "sms_consent": "subscribed"}))).await;
+    let fid = first["id"].as_str().unwrap().to_string();
+    let numbered = h.ok("PATCH", &format!("/api/profiles/{fid}"), Some(json!({"phone_number": "+15035550161"}))).await;
+    assert_eq!(numbered["sms_consent"], "never_subscribed");
+    // A number another profile uses, or one that isn't valid, writes nothing at all.
+    let (s, _) = h.req("PATCH", &format!("/api/profiles/{fid}"), Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed", "first_name": "Quinn", "properties": {"tier": "gold"}}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, _) = h.req("PATCH", &format!("/api/profiles/{fid}"), Some(json!({"phone_number": "not a number", "sms_consent": "subscribed", "first_name": "Quinn"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let after = h.ok("GET", &format!("/api/profiles/{fid}"), None).await;
+    let after = if after.get("profile").is_some() { after["profile"].clone() } else { after };
+    assert_eq!((after["phone_number"].as_str(), after["sms_consent"].as_str(), after["first_name"].as_str()), (Some("+15035550161"), Some("never_subscribed"), None), "{after}");
+    assert!(after["properties"].get("tier").is_none(), "{after}");
+    // The profile.updated webhook reports the consent the write replaced.
+    dumbmail::features::webhooks::net::allow_localhost_for_tests();
+    let hits: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+    let app = axum::Router::new()
+        .route(
+            "/hook",
+            axum::routing::post(|axum::extract::State(hits): axum::extract::State<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>, body: String| async move {
+                match serde_json::from_str::<Value>(&body).unwrap_or(Value::Null) {
+                    Value::Array(a) => hits.lock().unwrap().extend(a),
+                    v => hits.lock().unwrap().push(v),
+                }
+                "ok"
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    h.ok("POST", "/api/webhooks", Some(json!({"url": format!("http://{addr}/hook"), "topics": ["profile.updated"]}))).await;
+    h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"phone_number": "+15035550188"}))).await;
+    h.drain().await;
+    let got = hits.lock().unwrap().clone();
+    let updated: Vec<&Value> = got.iter().filter(|e| e["topic"] == "profile.updated" && e["data"]["profile"]["id"] == id.as_str()).collect();
+    assert_eq!(updated.len(), 1, "{got:?}");
+    assert_eq!(updated[0]["data"]["changed"], json!(["phone_number", "sms_consent"]), "{got:?}");
     h.cleanup().await;
 }
 
