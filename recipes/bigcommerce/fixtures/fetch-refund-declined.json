@@ -3,11 +3,14 @@
   "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-operations/payment-actions/get-order-refund-by-id (example response, order id aligned with the order fixture)",
   "expect": [
     {
-      "message": "refund 12 was declined",
+      "message": "refund 12 has no successful payment",
       "type": "log"
     }
   ],
   "input": {
+    "context": {
+      "webhook_order_id": "218"
+    },
     "payload": {
       "data": {
         "created": "2022-06-16T16:44:15+00:00",

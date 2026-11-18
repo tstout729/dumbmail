@@ -1,0 +1,54 @@
+{
+  "description": "a refund that belongs to another order than the webhook named is ignored",
+  "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-operations/payment-actions/get-order-refund-by-id (example response, order id aligned with the order fixture)",
+  "expect": [
+    {
+      "message": "refund 12 belongs to order 218, not 999; ignored",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "context": {
+      "webhook_order_id": "999"
+    },
+    "payload": {
+      "data": {
+        "created": "2022-06-16T16:44:15+00:00",
+        "id": 12,
+        "items": [
+          {
+            "item_id": 87,
+            "item_type": "PRODUCT",
+            "quantity": 1,
+            "requested_amount": null
+          }
+        ],
+        "order_id": 218,
+        "payments": [
+          {
+            "amount": 50,
+            "declined_message": "",
+            "id": 13,
+            "is_declined": false,
+            "offline": true,
+            "provider_id": "storecredit"
+          }
+        ],
+        "reason": "Customer requires a refund.",
+        "total_amount": 50,
+        "total_tax": 5,
+        "user_id": 0,
+        "uses_merchant_override_values": false
+      },
+      "meta": {}
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://api.bigcommerce.com/stores/abc123/v3/orders/999/payment_actions/refunds/12"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    },
+    "source": "fetch"
+  }
+}

@@ -280,6 +280,11 @@ async fn woocommerce_orders_refunds_and_customers() {
     h.signup().await;
     h.credit(5.0).await;
     let w = install(&mut h, "woocommerce", Sign::Base64("X-WC-Webhook-Signature"), "wc-webhook-secret-0001", true).await;
+    let (api, base) = mock_woo().await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", w.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/wp-json/wc/v3/orders"));
+    h.ok("PATCH", &format!("/api/integrations/{}", w.id), Some(json!({"pull": pull, "credentials": {"consumer_key": "ck_test", "consumer_secret": "cs_test"}}))).await;
     let thanks = live_flow(&mut h, "Placed Order", "Thanks for your order", true).await;
     // Riley was already here, subscribed to texts on another number.
     h.ok("POST", "/api/profiles", Some(json!({"email": "riley.example@example.com", "phone_number": "+15035550100", "sms_consent": "subscribed"}))).await;
@@ -298,12 +303,21 @@ async fn woocommerce_orders_refunds_and_customers() {
     w.post_as(&h, &body, &headers, &json!({}), &w.secret).await;
     let (_, r) = w.post_as(&h, &body, &headers, &json!({}), &w.secret).await;
     assert!(r.contains("duplicate"), "{r}");
-    // Refunds: once per refund id, positive amounts, however often the order is resent.
+    // Refunds come from the refund records (fetched): once per refund id, each with its own amount
+    // and date, however often the order is resent; the merchant-only refund carries gateway: false.
     w.post(&h, "order-updated-refunded.json").await;
     w.post(&h, "order-updated-refunded.json").await;
+    assert!(api.seen.lock().unwrap().iter().any(|p| p == "refunds:727"));
     assert_eq!(values(&h, "Refunded Order", "riley.example@example.com").await, vec![9.0, 10.0]);
     assert_eq!(prop(&h, "Refunded Order", "currency").await, vec!["USD", "USD"]);
+    assert_eq!(prop(&h, "Refunded Order", "gateway").await, vec!["true", "false"], "724 went through the gateway; 726 didn't");
+    let when: Vec<String> = sqlx::query_scalar("SELECT to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Refunded Order' ORDER BY 1").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(when, vec!["2017-03-21 19:55:37", "2017-03-21 20:07:11"], "each refund's own date");
     w.post(&h, "order-updated-cancelled.json").await;
+    assert_eq!(events(&h, "Cancelled Order").await, 1);
+    // An order that was never paid, cancelled: recorded apart from orders.
+    w.post(&h, "order-updated-cancelled-unpaid.json").await;
+    assert_eq!(events(&h, "Unpaid Order Cancelled").await, 1);
     assert_eq!(events(&h, "Cancelled Order").await, 1);
     // Buyers and customers are held back from marketing; the service flow still reached the buyer.
     // The order brought a different number: the SMS subscription belonged to the old one.
@@ -318,6 +332,94 @@ async fn woocommerce_orders_refunds_and_customers() {
     let _ = thanks;
     let names = ["order-created-paid.json", "order-updated-refunded.json"];
     never_stored(&mut h, &w, &sensitive("woocommerce", &names), &names).await;
+    h.cleanup().await;
+}
+
+#[derive(Default)]
+struct MockWoo {
+    orders: std::sync::Mutex<Vec<Value>>,
+    /// The query of each orders-list request, and each refunds path.
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+/// A stand-in for a WooCommerce store's REST API (HTTP Basic with the consumer key and secret):
+/// `GET /wp-json/wc/v3/orders` (modified_after and modified_before, both exclusive; orderby=modified,
+/// order=asc; per_page and page) and `GET /wp-json/wc/v3/orders/{id}/refunds` (the documented example).
+async fn mock_woo() -> (std::sync::Arc<MockWoo>, String) {
+    use axum::extract::{Path, Query, State};
+    use axum::routing::get;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let m: Arc<MockWoo> = Default::default();
+    let authed = |h: &axum::http::HeaderMap| h.get("authorization").and_then(|v| v.to_str().ok()) == Some(&format!("Basic {}", b64(b"ck_test:cs_test")));
+    let app = axum::Router::new()
+        .route(
+            "/wp-json/wc/v3/orders",
+            get(move |State(m): State<Arc<MockWoo>>, h: axum::http::HeaderMap, uri: axum::http::Uri, Query(q): Query<HashMap<String, String>>| async move {
+                assert!(authed(&h));
+                assert!(!q.contains_key("offset"), "no offsets into a changing list: {q:?}");
+                m.seen.lock().unwrap().push(uri.query().unwrap_or("").to_string());
+                let t = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+                let after = q.get("modified_after").map(|s| t(s));
+                let before = q.get("modified_before").map(|s| t(s));
+                let per: usize = q.get("per_page").and_then(|v| v.parse().ok()).unwrap_or(10);
+                let page: usize = q.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
+                let mut rows: Vec<Value> = m.orders.lock().unwrap().iter().filter(|o| {
+                    let mt = chrono::NaiveDateTime::parse_from_str(o["date_modified_gmt"].as_str().unwrap(), "%Y-%m-%dT%H:%M:%S").unwrap().and_utc().timestamp();
+                    after.is_none_or(|a| mt > a) && before.is_none_or(|b| mt < b)
+                }).cloned().collect();
+                rows.sort_by(|a, b| a["date_modified_gmt"].as_str().cmp(&b["date_modified_gmt"].as_str()).then(a["id"].as_i64().cmp(&b["id"].as_i64())));
+                axum::Json(Value::Array(rows.into_iter().skip((page - 1) * per).take(per).collect()))
+            }),
+        )
+        .route(
+            "/wp-json/wc/v3/orders/{id}/refunds",
+            get(move |State(m): State<Arc<MockWoo>>, h: axum::http::HeaderMap, Path(id): Path<u64>| async move {
+                assert!(authed(&h));
+                m.seen.lock().unwrap().push(format!("refunds:{id}"));
+                axum::Json(fixture("woocommerce", "fetch-refunds.json")["input"]["payload"].clone())
+            }),
+        )
+        .with_state(m.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (m, format!("http://{addr}"))
+}
+
+#[tokio::test]
+async fn woocommerce_history_reads_time_windows_without_offsets() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (api, base) = mock_woo().await;
+    let w = install(&mut h, "woocommerce", Sign::Base64("X-WC-Webhook-Signature"), "wc-webhook-secret-0001", false).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", w.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/wp-json/wc/v3/orders"));
+    h.ok("PATCH", &format!("/api/integrations/{}", w.id), Some(json!({"pull": pull, "credentials": {"consumer_key": "ck_test", "consumer_secret": "cs_test"}}))).await;
+    // 250 paid orders, many changed in the same second.
+    let base_order = fixture("woocommerce", "order-created-paid.json")["input"]["payload"].clone();
+    let orders: Vec<Value> = (0..250)
+        .map(|k| {
+            let mut o = base_order.clone();
+            o["id"] = json!(2000 + k);
+            o["number"] = json!((2000 + k).to_string());
+            o["billing"]["email"] = json!(format!("buyer{k}@example.com"));
+            o["billing"]["phone"] = json!("");
+            o["date_modified_gmt"] = json!(format!("2026-03-{:02}T10:00:{:02}", 1 + k / 20, (k % 3)));
+            o
+        })
+        .collect();
+    *api.orders.lock().unwrap() = orders;
+    h.ok("POST", &format!("/api/integrations/{}/pull", w.id), Some(json!({"backfill_since": "2026-01-01"}))).await;
+    for _ in 0..20 {
+        retry_now(&h).await;
+    }
+    let st = h.ok("GET", &format!("/api/integrations/{}", w.id), None).await;
+    assert_eq!(st["backfill"]["status"], "done", "{}", st["backfill"]);
+    assert_eq!(events(&h, "Placed Order").await, 250, "every order once: {:?}", api.seen.lock().unwrap());
+    assert_eq!(count(&h, "SELECT count(DISTINCT unique_id) FROM events").await, count(&h, "SELECT count(*) FROM events").await);
     h.cleanup().await;
 }
 

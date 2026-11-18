@@ -7,6 +7,7 @@
     "Placed Order",
     "Fulfilled Order",
     "Cancelled Order",
+    "Unpaid Order Cancelled",
     "Refunded Order"
   ],
   "docs": [
@@ -33,7 +34,7 @@
     {
       "name": "consumer_key",
       "label": "REST API consumer key",
-      "help": "Only needed to import past orders. WooCommerce \u2192 Settings \u2192 Advanced \u2192 REST API \u2192 Add key, with Read permission. Starts with ck_."
+      "help": "Used to read each refund's record and to import past orders. WooCommerce \u2192 Settings \u2192 Advanced \u2192 REST API \u2192 Add key, with Read permission. Starts with ck_."
     },
     {
       "name": "consumer_secret",
@@ -46,19 +47,27 @@
     "method": "GET",
     "url": "https://your-store.example.com/wp-json/wc/v3/orders",
     "query": {
-      "per_page": 50,
+      "per_page": 100,
       "orderby": "modified",
       "order": "asc",
       "dates_are_gmt": "true",
       "modified_after": "{{state.after|since}}",
-      "offset": "{{state.skip|'0'}}"
+      "page": "1"
     },
     "auth": {
       "type": "basic",
       "username": "{{secret.consumer_key}}",
       "password": "{{secret.consumer_secret}}"
     },
-    "max_pages": 20
+    "max_pages": 20,
+    "fetch": {
+      "paths": [
+        "/wp-json/wc/v3/orders/{id}/refunds"
+      ],
+      "context": [
+        "order"
+      ]
+    }
   },
   "redact": [
     "**.customer_ip_address",
@@ -73,7 +82,7 @@
     "In WordPress, go to WooCommerce \u2192 Settings \u2192 Advanced \u2192 Webhooks \u2192 Add webhook. Name it DumbMail orders, set Status to Active, Topic to Order created, Delivery URL to the webhook URL, and Secret to the same secret. Save.",
     "Add three more webhooks the same way, with the topics Order updated, Customer created and Customer updated.",
     "Place a test order (or open a webhook's Logs) and check the delivery log. A paid order shows up as Placed Order on the buyer's profile.",
-    "To import past orders: in the Pull tab, change your-store.example.com to your store's address, save a REST API key with Read permission as the credentials consumer_key and consumer_secret, then Import history from a start date. Imported orders are marked historical.",
+    "In the Pull tab, change your-store.example.com to your store's address, and save a REST API key with Read permission as the credentials consumer_key and consumer_secret. DumbMail reads each refund's own record with it (its date, and whether the payment gateway refunded the money), and imports past orders when you Import history from a start date. Imported orders are marked historical; their refunds aren't imported.",
     "Buyers are held back from marketing (WooCommerce doesn't record a marketing opt-in). Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every customer."
   ],
   "flows": []

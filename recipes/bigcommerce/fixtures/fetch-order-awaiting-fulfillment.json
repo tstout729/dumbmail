@@ -1,5 +1,5 @@
 {
-  "description": "the fetched order, Awaiting Fulfillment (paid): Placed Order once; the gate code in form_fields and the IP address never reach anything stored",
+  "description": "the fetched order, Awaiting Fulfillment with payment_status captured: Placed Order once; the gate code in form_fields and the IP address never reach anything stored",
   "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order (example response, trimmed; personal data replaced)",
   "expect": [
     {
@@ -80,7 +80,7 @@
       "order_source": "external",
       "payment_method": "Cash",
       "payment_provider_id": "",
-      "payment_status": "authorized",
+      "payment_status": "captured",
       "refunded_amount": "0.0000",
       "staff_notes": "",
       "status": "Awaiting Fulfillment",

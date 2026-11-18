@@ -6,14 +6,17 @@
 // Refunds are fetched, then their order (for the buyer and the currency). The pull imports past
 // orders. See README.md for the BigCommerce page behind each assumption.
 //
-// Placed Order: once per order, when its status says it's been paid. Fulfilled Order: once, when
-// Shipped or Completed. Cancelled Order: once. Refunded Order: once per refund, with its own amount,
-// unless every payment in it was declined. A shopper who ticked the checkout's email opt-in box
+// Placed Order: once per order, when its payment_status says the money was taken. Fulfilled Order:
+// once, when Shipped or Completed. Cancelled Order: once. Refunded Order: once per refund, with the
+// sum of its successful (not declined) payments, and only when it belongs to the webhook's order. A shopper who ticked the checkout's email opt-in box
 // (is_email_opt_in) is subscribed to email only when settings.checkout_opt_in_is_marketing is true
 // (the installer confirms the box is an unticked marketing opt-in); otherwise everyone is held.
 
+// Paid comes from the order's payment_status (GET /v2/orders/{id}), never from fulfilment: these
+// mean the money was taken (and possibly refunded later). authorized, pending, declined, void and
+// the rest don't.
+var PAID = ["captured", "paid", "partially refunded", "refunded"];
 // Order status ids (GET /v2/order_statuses).
-var PAID = [2, 3, 4, 8, 9, 10, 11, 13, 14]; // Shipped, Partially Shipped, Refunded, Awaiting Pickup, Awaiting Shipment, Completed, Awaiting Fulfillment, Disputed, Partially Refunded
 var FULFILLED = [2, 10];
 var CANCELLED = 5;
 var MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
@@ -69,12 +72,13 @@ function orderActions(o, ctx, historical) {
   var base = clean({ order_id: o.id, status: o.status, currency: currency, channel_id: o.channel_id, historical: historical || undefined });
   var modified = rfc2822(o.date_modified);
   var total = num(o.total_inc_tax);
-  if (PAID.indexOf(o.status_id) >= 0 && total > 0) {
+  var paid = PAID.indexOf(String(o.payment_status || "").toLowerCase()) >= 0;
+  if (paid && total > 0) {
     var placed = JSON.parse(JSON.stringify(base));
     placed.item_count = o.items_total;
     out.push({ type: "track_event", metric: "Placed Order", profile: who, value: total, time: rfc2822(o.date_created), unique_id: "bigcommerce:order:" + o.id + ":placed", properties: placed });
-  } else if (PAID.indexOf(o.status_id) < 0) {
-    out.push({ type: "log", message: "order " + o.id + " is " + o.status + "; it's recorded once it's paid" });
+  } else if (!paid) {
+    out.push({ type: "log", message: "order " + o.id + "'s payment is " + (o.payment_status || "unknown") + "; it's recorded once it's paid" });
   }
   if (FULFILLED.indexOf(o.status_id) >= 0) out.push({ type: "track_event", metric: "Fulfilled Order", profile: who, time: rfc2822(o.date_shipped) || modified, unique_id: "bigcommerce:order:" + o.id + ":fulfilled", properties: base });
   if (o.status_id === CANCELLED) out.push({ type: "track_event", metric: "Cancelled Order", profile: who, time: modified, unique_id: "bigcommerce:order:" + o.id + ":cancelled", properties: base });
@@ -96,11 +100,15 @@ function fetched(input) {
   if (/\/payment_actions\/refunds\/\d+/.test(url)) {
     var r = p.data;
     if (!r || !r.id) return [{ type: "log", message: "no refund in the answer" }];
-    var pays = r.payments || [];
-    if (pays.length && pays.every(function (x) { return x.is_declined; })) return [{ type: "log", message: "refund " + r.id + " was declined" }];
+    // The refund must belong to the order the webhook named (BigCommerce resolves a refund id from
+    // another order too), and only its successful payments count.
+    if (ctx.webhook_order_id && String(r.order_id) !== String(ctx.webhook_order_id)) return [{ type: "log", message: "refund " + r.id + " belongs to order " + r.order_id + ", not " + ctx.webhook_order_id + "; ignored" }];
+    var ok = (r.payments || []).filter(function (x) { return !x.is_declined && num(x.amount) > 0; });
+    var amount = ok.reduce(function (t, x) { return t + num(x.amount); }, 0);
+    if (!(amount > 0)) return [{ type: "log", message: "refund " + r.id + " has no successful payment" }];
     // The order gives the buyer and the currency.
     if (!idOf(r.order_id)) return [{ type: "log", message: "refund " + r.id + " names no order" }];
-    return [{ type: "next_request", url: "/stores/" + input.settings.store_hash + "/v2/orders/" + idOf(r.order_id), context: { refund: clean({ id: r.id, total_amount: r.total_amount, created: r.created, reason: r.reason }) } }];
+    return [{ type: "next_request", url: "/stores/" + input.settings.store_hash + "/v2/orders/" + idOf(r.order_id), context: { refund: clean({ id: r.id, total_amount: Math.round(amount * 100) / 100, created: r.created, reason: r.reason }) } }];
   }
   if (/\/v3\/customers/.test(url)) {
     return (p.data || []).filter(function (c) { return c.email; }).map(function (c) {

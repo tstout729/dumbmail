@@ -13,7 +13,7 @@
       "type": "upsert_profile"
     },
     {
-      "message": "order 218 is Awaiting Payment; it's recorded once it's paid",
+      "message": "order 218's payment is pending; it's recorded once it's paid",
       "type": "log"
     }
   ],
@@ -66,7 +66,7 @@
       "order_source": "external",
       "payment_method": "Cash",
       "payment_provider_id": "",
-      "payment_status": "authorized",
+      "payment_status": "pending",
       "refunded_amount": "0.0000",
       "staff_notes": "",
       "status": "Awaiting Payment",

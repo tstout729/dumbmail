@@ -1,5 +1,5 @@
 {
-  "description": "order.updated with two refunds (documented shape: id, refund, total as a negative string): one Refunded Order per refund id, positive amounts",
+  "description": "order.updated listing two refunds (documented summary shape: id, refund, total): the summary isn't trusted for money, so the refund records are fetched next",
   "doc": "https://woocommerce.github.io/woocommerce-rest-api-docs/#retrieve-an-order (example response, personal data replaced)",
   "expect": [
     {
@@ -43,36 +43,16 @@
       "value": 29.35
     },
     {
-      "metric": "Refunded Order",
-      "profile": {
-        "email": "riley.example@example.com"
+      "context": {
+        "order": {
+          "currency": "USD",
+          "email": "riley.example@example.com",
+          "id": 727,
+          "number": "727"
+        }
       },
-      "properties": {
-        "currency": "USD",
-        "order_id": 727,
-        "order_number": "727",
-        "refund_id": 726
-      },
-      "time": "2017-03-24T09:00:00Z",
-      "type": "track_event",
-      "unique_id": "woocommerce:refund:726",
-      "value": 10
-    },
-    {
-      "metric": "Refunded Order",
-      "profile": {
-        "email": "riley.example@example.com"
-      },
-      "properties": {
-        "currency": "USD",
-        "order_id": 727,
-        "order_number": "727",
-        "refund_id": 724
-      },
-      "time": "2017-03-24T09:00:00Z",
-      "type": "track_event",
-      "unique_id": "woocommerce:refund:724",
-      "value": 9
+      "type": "next_request",
+      "url": "/wp-json/wc/v3/orders/727/refunds"
     }
   ],
   "input": {
