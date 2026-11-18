@@ -242,7 +242,9 @@ async fn fire_one(state: &AppState) -> anyhow::Result<bool> {
     let mut tx = state.db.begin().await?;
     let claimed: Option<(Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
         "SELECT x.flow_id, x.object_id, x.due_at FROM flow_object_date_fires x JOIN flows fl ON fl.id = x.flow_id AND fl.status = 'live'
-         WHERE x.outcome = 'pending' AND x.due_at <= now() ORDER BY x.due_at LIMIT 1 FOR UPDATE OF x SKIP LOCKED",
+         WHERE x.outcome = 'pending' AND x.due_at <= now()
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = x.account_id AND a.closed_at IS NOT NULL)
+         ORDER BY x.due_at LIMIT 1 FOR UPDATE OF x SKIP LOCKED",
     )
     .fetch_optional(&mut *tx)
     .await?;
