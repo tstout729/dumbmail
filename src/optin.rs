@@ -243,7 +243,7 @@ pub fn confirmation_email_in(t: &crate::features::translations::texts::Texts, ac
         t.get("confirm.email_ignore", ""),
     );
     let copy = ConfirmCopy { subject: &subject, heading: &heading, line: &line, text_line: &text_line, button: &button, didnt: "" };
-    let (subject, html, text) = confirm_email_with(account, url, &copy, &ignore);
+    let (subject, html, text) = confirm_email_with(account, url, &copy, &ignore, t.rtl());
     (subject, t.page(html.replacen("<html>", r#"<html lang="en">"#, 1)), text)
 }
 
@@ -263,14 +263,16 @@ pub struct ConfirmCopy<'a> {
 /// A confirmation email in the account's style: a heading, one line and one button.
 pub fn confirm_email(account: &Account, url: &str, copy: &ConfirmCopy<'_>) -> (String, String, String) {
     let ignore = format!("If you didn't {}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.", copy.didnt);
-    confirm_email_with(account, url, copy, &ignore)
+    confirm_email_with(account, url, copy, &ignore, false)
 }
 
 /// [`confirm_email`] with its last line (`ignore`) given whole.
-fn confirm_email_with(account: &Account, url: &str, copy: &ConfirmCopy<'_>, ignore: &str) -> (String, String, String) {
+/// `rtl`: the email is in a right-to-left language, so the address and link keep their own direction.
+fn confirm_email_with(account: &Account, url: &str, copy: &ConfirmCopy<'_>, ignore: &str, rtl: bool) -> (String, String, String) {
     let name = esc(&account.name);
     let color = crate::render::safe_color(&account.brand_color, "#1f6f5c");
-    let address = account.address.as_deref().map(esc).map(|a| format!(" · {a}")).unwrap_or_default();
+    let address = account.address.as_deref().map(esc).map(|a| if rtl { format!(r#" · <span dir="ltr">{a}</span>"#) } else { format!(" · {a}") }).unwrap_or_default();
+    let iso = |s: &str| if rtl { format!("\u{2066}{s}\u{2069}") } else { s.to_string() };
     let logo = account
         .logo_url
         .as_deref()
@@ -297,12 +299,13 @@ fn confirm_email_with(account: &Account, url: &str, copy: &ConfirmCopy<'_>, igno
         ignore = esc(ignore),
     );
     let text = format!(
-        "{}\n\n{}:\n{url}\n\n{}\n\n--\n{}{}\n",
+        "{}\n\n{}:\n{}\n\n{}\n\n--\n{}{}\n",
         copy.heading,
         copy.text_line,
+        iso(url),
         ignore,
         account.name,
-        account.address.as_deref().map(|a| format!(", {a}")).unwrap_or_default(),
+        account.address.as_deref().map(|a| format!(", {}", iso(a))).unwrap_or_default(),
     );
     (subject, html, text)
 }

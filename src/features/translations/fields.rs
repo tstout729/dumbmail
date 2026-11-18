@@ -416,6 +416,7 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
     if text.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
         return Err("a translation can't contain control characters".into());
     }
+    super::structure::hidden_controls(text)?;
     // Only words change: the same template tags in the same places, the same markup (see `structure`).
     super::structure::compare(source, text)?;
     if text.contains("{{") || text.contains("{%") {

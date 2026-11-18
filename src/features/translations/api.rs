@@ -514,6 +514,10 @@ pub async fn set_system_texts(state: &AppState, ctx: &Ctx, b: TextsBody) -> AppR
                 if t.chars().count() > texts::MAX_TEXT || t.chars().any(char::is_control) {
                     return Err(AppError::bad(format!("{k}: at most {} characters on one line", texts::MAX_TEXT)));
                 }
+                super::structure::hidden_controls(t).map_err(|e| AppError::bad(format!("{k}: {e}")))?;
+                if texts::OPT_OUT_KEYS.contains(&k.as_str()) && !super::structure::decode_entities(t).chars().any(char::is_alphanumeric) {
+                    return Err(AppError::bad(format!("{k}: this is how people opt out, so it must show words")));
+                }
                 if texts::placeholders(t) != texts::placeholders(en) {
                     return Err(AppError::bad(format!("{k}: keep the placeholders of the original ({})", texts::placeholders(en).join(", "))));
                 }

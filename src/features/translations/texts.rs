@@ -270,6 +270,9 @@ pub fn shipped_text(lang: &str, key: &str) -> Option<&'static str> {
     }
 }
 
+/// System texts that are how people opt out or manage what they get: they must show words.
+pub const OPT_OUT_KEYS: [&str; 6] = ["footer.unsubscribe", "unsub.title", "unsub.button", "prefs.title", "prefs.save", "prefs.all"];
+
 /// The placeholders a text uses (`{name}`, `{days}`), sorted.
 pub fn placeholders(text: &str) -> Vec<&str> {
     let mut v: Vec<&str> = ["{name}", "{days}"].into_iter().filter(|p| text.contains(p)).collect();

@@ -1257,3 +1257,30 @@ async fn the_stock_form_and_the_website_script_send_the_browsers_language() {
     assert!(form.contains("data.locale = navigator.language"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_opt_out_stays_visible() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr", "ar"])).await;
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "T", "channel": "email", "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Write to us</p>"}]}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    // Direction marks and invisible characters, typed or as HTML references, are refused.
+    for bad in ["<p>Écrivez\u{202E}-nous</p>", "<p>Écrivez&#x202E;-nous</p>", "<p>Écrivez&rlm;-nous</p>", "<p>\u{200B}</p>", "<p>Écrivez&#8203;-nous</p>"] {
+        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "b0:html", "text": bad}]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}: {e}");
+    }
+    // Joiners scripts need are fine.
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "ar", "strings": [{"id": "b0:html", "text": "<p>اكتب\u{200C}لنا</p>"}]}))).await;
+    // The opt-out wording must show words.
+    for bad in ["\u{200B}", "...", "\u{202E}Se désabonner", "&#x200B;"] {
+        let (s, e) = h.req("PUT", "/api/translations/system-texts", Some(json!({"language": "fr", "texts": {"footer.unsubscribe": bad}}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}: {e}");
+    }
+    // Right to left: the address and the links in the footer keep their own direction.
+    let content = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": content, "language": "ar"}))).await;
+    assert!(p["html"].as_str().unwrap().contains(r#"<span dir="ltr">1 Main St, Portland, OR 97201</span>"#), "{}", p["html"]);
+    assert!(p["text"].as_str().unwrap().contains("\u{2066}1 Main St, Portland, OR 97201\u{2069}"), "{}", p["text"]);
+    h.cleanup().await;
+}

@@ -334,6 +334,51 @@ fn same_elem(a: &Elem, b: &Elem) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters that change how text around them is shown without showing anything themselves:
+/// bidirectional controls (which can reorder an address or a link) and invisible format
+/// characters (which can make a label look empty). Zero-width joiners and non-joiners stay
+/// allowed: Persian, Arabic, Indic scripts and emoji need them.
+pub fn is_hidden_control(c: char) -> bool {
+    matches!(c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+        | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}' | '\u{180E}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}')
+}
+
+/// `s` with HTML character references decoded (`&#x202E;`, `&#8238;`, `&rlm;` …), for checking
+/// what a reader would actually get.
+pub fn decode_entities(s: &str) -> String {
+    static REF: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[A-Za-z]{2,8});?").unwrap());
+    REF.replace_all(s, |c: &regex::Captures<'_>| {
+        let e = &c[1];
+        let n = if let Some(h) = e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
+            u32::from_str_radix(h, 16).ok()
+        } else if let Some(d) = e.strip_prefix('#') {
+            d.parse().ok()
+        } else {
+            match e {
+                "lrm" => Some(0x200E),
+                "rlm" => Some(0x200F),
+                "zwsp" => Some(0x200B),
+                "NoBreak" => Some(0x2060),
+                "ZeroWidthSpace" => Some(0x200B),
+                "nbsp" => Some(0xA0),
+                _ => None,
+            }
+        };
+        n.and_then(char::from_u32).map(String::from).unwrap_or_else(|| c[0].to_string())
+    })
+    .into_owned()
+}
+
+/// Why a text can't be shown as written, if it can't: it hides characters (see
+/// [`is_hidden_control`]), directly or as an HTML character reference.
+pub fn hidden_controls(s: &str) -> Result<(), String> {
+    if s.chars().any(is_hidden_control) || decode_entities(s).chars().any(is_hidden_control) {
+        return Err("it contains invisible characters (direction marks or zero-width characters) that can hide or reorder text; type it without them".into());
+    }
+    Ok(())
+}
+
 /// `s` with every template tag replaced by `with` (for parsing an address that has tags in it).
 pub fn without_tags(s: &str, with: &str) -> String {
     let mut out = String::new();

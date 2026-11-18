@@ -512,6 +512,7 @@ pub fn render_email_hooked(
     let address = account.address.clone().unwrap_or_default();
     let socials = social_links(account);
     let lang = lang_attrs(content.lang.as_deref());
+    let rtl = lang.as_ref().is_some_and(|(_, r)| *r);
     let ft = content.footer_texts.as_ref().filter(|_| lang.is_some());
     let reason = ft.map(|f| f.reason.as_str()).filter(|t| !t.trim().is_empty()).unwrap_or("You're receiving this because you subscribed.");
     let unsub_label = ft.map(|f| f.unsubscribe.as_str()).filter(|t| !t.trim().is_empty()).unwrap_or("Unsubscribe");
@@ -531,7 +532,7 @@ pub fn render_email_hooked(
             // from a website) must not be able to open a template tag.
             social_html = no_tpl(&social_html),
             name = no_tpl(&esc(&account.name)),
-            addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
+            addr = if address.is_empty() { String::new() } else if rtl { format!(r#" · <span dir="ltr">{}</span>"#, no_tpl(&esc(&address))) } else { format!(" · {}", no_tpl(&esc(&address))) },
             unsub = esc(&unsub),
             reason = no_tpl(&esc(reason)),
             unsub_label = no_tpl(&esc(unsub_label)),
@@ -577,13 +578,15 @@ pub fn render_email_hooked(
     let preheader = render_str(content.preheader.as_deref().unwrap_or(""), ctx, false)?;
     let mut html = render_str(&html_source, ctx, true)?;
     let mut text = render_str(&text_source, ctx, false)?;
-    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {address}") });
+    // Right to left: the address and links shown in the text part keep their own direction.
+    let iso = |s: &str| if rtl { format!("\u{2066}{s}\u{2069}") } else { s.to_string() };
+    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {}", iso(&address)) });
     match opts.footer {
         Footer::Marketing => {
             for (label, url) in &socials {
-                text.push_str(&format!("\n{label}: {url}"));
+                text.push_str(&format!("\n{label}: {}", iso(url)));
             }
-            text.push_str(&format!("\n--\n{signature}\n{unsub_label}: {unsub}\n"));
+            text.push_str(&format!("\n--\n{signature}\n{unsub_label}: {}\n", iso(&unsub)));
         }
         Footer::Address => text.push_str(&format!("\n--\n{signature}\n")),
         Footer::None => {}
