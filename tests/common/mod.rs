@@ -66,6 +66,8 @@ impl Harness {
             price_sms_segment: 0.0099,
             price_mms: 0.025,
             price_number_monthly: 2.20,
+            price_push: 0.0,
+            push_api_base: None,
             free_emails_per_month: 25,
             aws_region: "us-east-1".into(),
             railway_api_token: None,

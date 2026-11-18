@@ -375,11 +375,12 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
             <option value="no">can't</option>
           </Select>
           <Hint>receive</Hint>
-          <Select value={c.channel} onChange={(e) => onChange({ ...c, channel: e.target.value as "email" | "sms" })} className={small} aria-label="Channel">
+          <Select value={c.channel} onChange={(e) => onChange({ ...c, channel: e.target.value as "email" | "sms" | "push" })} className={small} aria-label="Channel">
             <option value="email">email</option>
             <option value="sms">SMS</option>
+            <option value="push">push</option>
           </Select>
-          <Hint>right now (address, consent and no suppression)</Hint>
+          <Hint>{c.channel === "push" ? "right now (a device that allowed notifications, push not turned off)" : "right now (address, consent and no suppression)"}</Hint>
         </>
       );
     case "suppressed":

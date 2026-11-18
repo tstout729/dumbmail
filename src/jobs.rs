@@ -147,6 +147,8 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("reviews_send", "intent_id", "SELECT account_id FROM review_sends WHERE id = $1"),
     ("reviews_import", "import_id", "SELECT account_id FROM review_imports WHERE id = $1"),
     ("reviews_rebuild", "account_id", "SELECT $1::uuid"),
+    // push_retry isn't here: its final claim settles a closed account's deliveries as skipped.
+    // push_event isn't either: it records what already happened (a push the device accepted).
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).

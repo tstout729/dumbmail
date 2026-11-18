@@ -329,6 +329,8 @@ pub enum HasOp {
 pub enum Channel {
     Email,
     Sms,
+    /// Only for `can_receive` (push consent is a device's permission plus no opt-out, not a status).
+    Push,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -507,7 +509,10 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 check_time(*op, value)?;
                 check_filters(where_)?;
             }
-            Condition::Consent { status, .. } => {
+            Condition::Consent { status, channel } => {
+                if *channel == Channel::Push {
+                    return Err(AppError::bad("push has no consent status; use can_receive with channel push"));
+                }
                 if !crate::models::valid_consent(status) {
                     return Err(AppError::bad("consent status must be subscribed, unsubscribed, never_subscribed or pending"));
                 }
@@ -1076,7 +1081,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
         Condition::Consent { channel, status } => {
             let col = match channel {
                 Channel::Email => "p.email_consent",
-                Channel::Sms => "p.sms_consent",
+                Channel::Sms | Channel::Push => "p.sms_consent",
             };
             qb.push(format!("({col} = ")).push_bind(status.clone()).push(")");
         }
@@ -1087,6 +1092,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             qb.push(match channel {
                 Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold)",
                 Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed')",
+                Channel::Push => crate::features::push::send::REACHABLE_SQL,
             });
         }
         Condition::Suppressed { value } => {
@@ -1140,9 +1146,9 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
         }
         Condition::Message { action, campaign_id, flow_id, op, within_days } => {
             let names: Vec<String> = match action {
-                MessageAction::Received => vec!["Received Email".into(), "Received SMS".into()],
+                MessageAction::Received => vec!["Received Email".into(), "Received SMS".into(), "Received Push".into()],
                 MessageAction::Opened => vec!["Opened Email".into()],
-                MessageAction::Clicked => vec!["Clicked Email".into(), "Clicked SMS".into()],
+                MessageAction::Clicked => vec!["Clicked Email".into(), "Clicked SMS".into(), "Clicked Push".into()],
             };
             if *op == HasOp::HasNot {
                 qb.push("NOT ");

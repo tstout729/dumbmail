@@ -41,7 +41,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 fn check_channel(c: &str) -> AppResult<()> {
-    if c == "email" || c == "sms" { Ok(()) } else { Err(AppError::bad("channel must be email or sms")) }
+    if matches!(c, "email" | "sms" | "push") { Ok(()) } else { Err(AppError::bad("channel must be email, sms or push")) }
 }
 
 // ---------- Templates ----------
@@ -149,6 +149,9 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
+    if b.channel == "push" {
+        return crate::features::push::preview(&account, &b.content, &ctx);
+    }
     // Saved blocks and display rules (see features::content); email without them goes on untouched.
     let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
@@ -241,7 +244,11 @@ fn checked_ab_test(channel: &str, v: Option<&Value>) -> AppResult<Option<Value>>
                         _ => Err(AppError::bad(format!("version {label} {k} must be text"))),
                     }
                 };
-                if channel == "sms" {
+                if channel == "push" {
+                    o.entry("title").or_insert(json!(""));
+                    text(o, "title", true)?;
+                    crate::features::push::content::parse(&var.content).map_err(|e| AppError::bad(format!("version {label}: {}", e.public_message())))?;
+                } else if channel == "sms" {
                     o.entry("body").or_insert(json!(""));
                     text(o, "body", true)?;
                     text(o, "media_url", false)?;
@@ -273,9 +280,21 @@ fn normalize_audience(v: &Value) -> AppResult<Value> {
 pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody) -> AppResult<CampaignRow> {
     let channel = b.channel.unwrap_or_else(|| "email".into());
     check_channel(&channel)?;
-    let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{} campaign {}", if channel == "sms" { "SMS" } else { "Email" }, Utc::now().format("%b %-d")));
+    let label = match channel.as_str() {
+        "sms" => "SMS",
+        "push" => "Push",
+        _ => "Email",
+    };
+    let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{label} campaign {}", Utc::now().format("%b %-d")));
     let audience = normalize_audience(&b.audience.unwrap_or(json!({})))?;
-    let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
+    let content = b.content.unwrap_or_else(|| match channel.as_str() {
+        "sms" => json!({"body": ""}),
+        "push" => crate::features::push::content::starter(),
+        _ => json!({"subject": "", "blocks": []}),
+    });
+    if channel == "push" {
+        crate::features::push::content::parse(&content)?;
+    }
     let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
     crate::features::coupons::template::check_campaign(&channel, &content, ab_test.as_ref())?;
@@ -336,6 +355,9 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     let set_ab = b.ab_test.is_some() || b.channel.is_some();
     let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
     crate::features::coupons::template::check_campaign(channel, b.content.as_ref().unwrap_or(&c.content), ab_test.as_ref())?;
+    if channel == "push" {
+        crate::features::push::content::parse(b.content.as_ref().unwrap_or(&c.content))?;
+    }
     let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
     let set_send_options = b.send_options.is_some();
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
@@ -420,6 +442,9 @@ async fn delete_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pa
 pub struct EstimateBody {
     pub channel: String,
     pub audience: Value,
+    /// Push: count only devices on these platforms (a campaign's targets).
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
 }
 
 async fn estimate_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<EstimateBody>) -> AppResult<Json<Value>> {
@@ -428,7 +453,8 @@ async fn estimate_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson
     if a.include.is_empty() {
         return Ok(Json(json!({"count": 0})));
     }
-    Ok(Json(json!({"count": campaigns::estimate(&state.db, ctx.account_id, &b.channel, &a).await?})))
+    let platforms = b.platforms.filter(|p| b.channel == "push" && !p.is_empty() && p.iter().all(|k| crate::features::push::content::PLATFORMS.contains(&k.as_str())));
+    Ok(Json(json!({"count": campaigns::estimate_targeted(&state.db, ctx.account_id, &b.channel, &a, platforms).await?})))
 }
 
 #[derive(Deserialize)]
@@ -462,11 +488,17 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     // (Saved blocks are read as they are now, the way the send will freeze them.)
     let filled = crate::features::content::prepare::with_saved_filled(state, &c).await?;
     problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &filled).await?);
+    if c.channel == "push" {
+        let mut contents = vec![&c.content];
+        let ab = campaigns::ab_test(&c);
+        contents.extend(ab.iter().flat_map(|t| t.variants.iter().map(|v| &v.content)));
+        problems.extend(crate::features::push::setup_problems(state, account_id, &contents).await?);
+    }
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
     let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
-    let count = campaigns::estimate(&state.db, account_id, &c.channel, &audience).await?;
+    let count = campaigns::estimate_targeted(&state.db, account_id, &c.channel, &audience, campaigns::push_platforms(&c.channel, &c.content, c.ab_test.as_ref())).await?;
     if count == 0 {
         return Err(AppError::bad("nobody in this audience can receive this campaign (check consent and that profiles have an address)"));
     }
@@ -752,6 +784,9 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
         if n.kind == "email" || n.kind == "sms" {
             crate::features::coupons::template::check_content(&n.kind, n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
         }
+        if n.kind == "push" {
+            crate::features::push::content::parse(n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
+        }
         if n.kind == "webhook" {
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
         }
@@ -881,8 +916,14 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         if has_sms && account.sms_from.is_none() {
             return Err(AppError::bad("set an SMS sending number in Settings → SMS before turning on a flow with texts"));
         }
+        let pushes: Vec<&Value> = def.nodes.iter().filter(|n| n.kind == "push").filter_map(|n| n.data.get("content")).collect();
+        if !pushes.is_empty() {
+            if let Some(p) = crate::features::push::setup_problems(state, account_id, &pushes).await?.into_iter().next() {
+                return Err(AppError::bad(format!("push step: {p}")));
+            }
+        }
         for n in &def.nodes {
-            if matches!(n.kind.as_str(), "email" | "sms" | "review_request") {
+            if matches!(n.kind.as_str(), "email" | "sms" | "push" | "review_request") {
                 let content = n.data.get("content").cloned().unwrap_or(json!({}));
                 render_preview(state, account_id, RenderBody { channel: channel(n), content, profile_id: None, event: Some(json!({"properties": {}})) })
                     .await

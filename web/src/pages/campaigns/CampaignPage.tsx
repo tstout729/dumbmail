@@ -20,6 +20,8 @@ import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
 import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
+import { PushEditor } from "../../features/push/PushEditor";
+import type { PushContent } from "../../features/push/types";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
@@ -111,7 +113,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const blocker = useBlocker(({ currentLocation, nextLocation }) => dirty && currentLocation.pathname !== nextLocation.pathname);
 
   const edit = (patch: Partial<Draft>) => setDraft({ ...current, ...patch });
-  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience });
+  // Push: only devices on the platforms this campaign targets (across its versions).
+  const pushPlatforms =
+    campaign.channel === "push"
+      ? [...new Set(versionIds(current.ab_test).flatMap((v) => (versionContent(current, v) as PushContent).platforms ?? ["web", "ios", "android"]))]
+      : undefined;
+  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience, platforms: pushPlatforms });
 
   const save = async () => {
     if (!draft) return true;
@@ -125,14 +132,15 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   };
 
   const email = isEmail(current.content, campaign.channel) ? current.content : null;
-  const sms = email ? null : (current.content as SmsContent);
+  const push = campaign.channel === "push" ? (current.content as PushContent) : null;
+  const sms = email || push ? null : (current.content as SmsContent);
   // Every version's sender must be on a verified domain.
   const domainVerified = versions.every((v) => {
     const c = versionContent(current, v);
     return isVerifiedSender(sending.data, (isEmail(c, campaign.channel) && c.from_email) || account.from_email);
   });
   const shown = versionContent(current, version);
-  const editVersion = (content: EmailContent | SmsContent) => setDraft(withVersionContent(current, version, content));
+  const editVersion = (content: EmailContent | SmsContent | PushContent) => setDraft(withVersionContent(current, version, content));
 
   // Each version's own checks; with a test they're labelled "Version B: …".
   const versionChecks = versions.flatMap((v) => {
@@ -143,6 +151,10 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
         { ok: (content.subject ?? "").trim() !== "", label: `${prefix}Add a subject line`, blocking: true },
         { ok: Boolean(content.from_email || account.from_email), label: `${prefix}Set a from email (here or in Settings)`, blocking: true },
       ];
+    }
+    if (campaign.channel === "push") {
+      const p = content as PushContent;
+      return [{ ok: (p.title ?? "").trim() !== "" || (p.body ?? "").trim() !== "", label: `${prefix}Write the notification's title or message`, blocking: true }];
     }
     const body = (content as SmsContent).body ?? "";
     return [
@@ -163,12 +175,21 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const ready = checks.every((c) => c.ok || !c.blocking);
   const contentDone = versions.every((v) => {
     const content = versionContent(current, v);
+    if (campaign.channel === "push") return Boolean((content as PushContent).title || (content as PushContent).body);
     return isEmail(content, campaign.channel) ? Boolean(content.subject) : Boolean((content as SmsContent).body);
   });
 
   const contentSummary = [
     test ? `A/B test, ${versions.length} versions` : null,
-    email ? (email.subject ? `Subject: ${email.subject}` : "No subject yet") : sms?.body ? sms.body.slice(0, 90) : "No message yet",
+    email
+      ? email.subject
+        ? `Subject: ${email.subject}`
+        : "No subject yet"
+      : push
+        ? push.title || push.body || "No notification yet"
+        : sms?.body
+          ? sms.body.slice(0, 90)
+          : "No message yet",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -243,7 +264,9 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                 {current.audience.include.length === 0 ? "—" : estimate.data ? formatNumber(estimate.data.count) : <Skeleton className="h-7 w-20" />}
               </div>
               <p className="mt-1 text-xs text-zinc-500">
-                People with {campaign.channel === "email" ? "email" : "SMS"} consent, after exclusions and suppressions.
+                {campaign.channel === "push"
+                  ? "People with a device that allowed notifications and who haven't turned push off, after exclusions."
+                  : `People with ${campaign.channel === "email" ? "email" : "SMS"} consent, after exclusions and suppressions.`}
               </p>
               {estimate.error ? <p className="mt-2 text-xs text-red-600">{estimate.error.message}</p> : null}
             </div>
@@ -285,6 +308,8 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           {/* Keyed by version so each tab's editor keeps its own UI state (open blocks, dialogs). */}
           {isEmail(shown, campaign.channel) ? (
             <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} />
+          ) : campaign.channel === "push" ? (
+            <PushEditor key={version} value={shown as PushContent} onChange={editVersion} readOnly={!editable} />
           ) : (
             <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} />
           )}
@@ -323,7 +348,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
               {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
-                defaultTo={campaign.channel === "email" ? user.email : ""}
+                defaultTo={campaign.channel !== "sms" ? user.email : ""}
                 channel={campaign.channel}
                 versions={test ? versions : null}
                 loading={testSend.isPending}
@@ -440,9 +465,18 @@ function TestSend({ defaultTo, channel, versions, loading, disabled, onSend }: T
     .filter(Boolean);
   return (
     <div className="rounded-lg border border-zinc-200 p-3">
-      <Field label="Send a test" hint={channel === "email" ? "Comma-separated email addresses." : "Comma-separated phone numbers in +1… format."}>
+      <Field
+        label="Send a test"
+        hint={
+          channel === "email"
+            ? "Comma-separated email addresses."
+            : channel === "push"
+              ? "Email addresses of people whose devices get it. Yours includes the browsers you added in Settings → Push."
+              : "Comma-separated phone numbers in +1… format."
+        }
+      >
         <div className="flex gap-2">
-          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "email" ? "you@company.com" : "+15035550100"} disabled={disabled} />
+          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "sms" ? "+15035550100" : "you@company.com"} disabled={disabled} />
           {versions ? (
             <Select value={version} onChange={(e) => setPicked(e.target.value as VersionId)} disabled={disabled} aria-label="Version to test" className="w-32 shrink-0">
               {versions.map((v) => (

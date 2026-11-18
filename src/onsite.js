@@ -1078,8 +1078,21 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
+  // Web push (when the account turned it on) lives in its own small script; browsers that can't
+  // show notifications never load it.
+  function loadPush() {
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.isSecureContext) return;
+      var s = document.createElement("script");
+      s.async = true;
+      s.src = BASE + "/client/push.js?k=" + encodeURIComponent(KEY);
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+  }
+
   function start() {
     if (!ONLY_FORM) {
+      if (!TEST) loadPush();
       PLATFORM = platform();
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();
