@@ -88,7 +88,14 @@ fn message(channel: &str, rendered: &Value) -> Value {
 async fn render(state: &AppState, account_id: Uuid, channel: &str, content: &Value, flow: bool) -> AppResult<Value> {
     let event = flow.then(|| json!({"properties": {}}));
     let r = crate::api::messaging::render_preview(state, account_id, crate::api::messaging::RenderBody { channel: channel.to_string(), content: content.clone(), profile_id: None, event }).await?;
-    Ok(message(channel, &r))
+    let mut m = message(channel, &r);
+    if channel == "sms" {
+        // A text's preview shows sample short links (features::short_links): judge where the links
+        // really go, from the text as written.
+        let raw = content["body"].as_str().unwrap_or("");
+        m["links"] = json!(BARE_URL.find_iter(raw).take(MAX_LINKS).filter_map(|u| host(u.as_str()).map(|d| json!({"text": "", "to": destination(u.as_str()), "domain": d}))).collect::<Vec<_>>());
+    }
+    Ok(m)
 }
 
 /// What a check is about.

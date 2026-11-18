@@ -611,3 +611,23 @@ async fn a_saved_block_change_is_checked_for_the_live_flows_that_use_it() {
     h.ok("PATCH", &format!("/api/content/saved-blocks/{id}"), Some(json!({"blocks": [{"type": "text", "html": "<p>Thanks, and see you soon.</p>"}]}))).await;
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_texts_real_link_destinations_are_judged() {
+    let (mut h, calls) = screened!(true);
+    h.signup().await;
+    approve_directly(&h).await;
+    h.credit(5.0).await;
+    h.claim_number().await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Texts"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed", "list_ids": [list["id"]]}))).await;
+    let c = h
+        .ok("POST", "/api/campaigns", Some(json!({"name": "T", "channel": "sms", "audience": {"include": [{"type": "list", "id": list["id"]}]},
+            "content": {"body": "Unusual sign-in on your account. Verify your account: https://login.evil-site.test/x"}})))
+        .await;
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("can't be sent"), "{v}");
+    assert!(calls.lock().unwrap().is_empty(), "the rules refused it");
+    h.cleanup().await;
+}

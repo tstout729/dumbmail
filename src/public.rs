@@ -129,11 +129,17 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
     if auth::link_sig(&state.cfg.secret_key, id, &q.u) != q.s || !(q.u.starts_with("https://") || q.u.starts_with("http://")) {
         return (StatusCode::BAD_REQUEST, "invalid link").into_response();
     }
-    if let Ok(Some(m)) = load_msg(&state, id).await {
+    record_click(&state, id, &q.u).await
+}
+
+/// Record a click on message `id` and redirect to `url`, which the caller has verified is a link
+/// DumbMail put in that message. Shared by `/t/c/` and short links (`features::short_links`).
+pub(crate) async fn record_click(state: &AppState, id: Uuid, url: &str) -> Response {
+    if let Ok(Some(m)) = load_msg(state, id).await {
         // A transactional link can carry a secret (a password-reset token): keep only that a click
         // happened, when, and the site it went to.
         // A marketing link keeps the URL, without the person's own coupon codes (the redirect keeps them).
-        let recorded = if m.transactional { url::Url::parse(&q.u).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { crate::features::coupons::assign::mask_link(&state.db, m.profile_id, &q.u).await };
+        let recorded = if m.transactional { url::Url::parse(url).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { crate::features::coupons::assign::mask_link(&state.db, m.profile_id, url).await };
         let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&recorded).execute(&state.db).await;
         let first: Result<Option<Uuid>, _> = sqlx::query_scalar(
             "UPDATE messages SET clicked_at = COALESCE(clicked_at, now()), opened_at = CASE WHEN channel = 'email' THEN COALESCE(opened_at, now()) ELSE opened_at END
@@ -143,21 +149,21 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
         .fetch_optional(&state.db)
         .await;
         let metric = if m.channel == "sms" { "Clicked SMS" } else { "Clicked Email" };
-        let _ = msg_event(&state, &m, metric, json!({"url": recorded}), None).await;
+        let _ = msg_event(state, &m, metric, json!({"url": recorded}), None).await;
         if matches!(first, Ok(Some(_))) && m.channel == "email" {
-            let _ = msg_event(&state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
+            let _ = msg_event(state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
         }
         if !m.is_test {
             // Lets the onsite script recognize the person on the brand's own site.
-            if let (Ok(mut dest), Some(account)) = (url::Url::parse(&q.u), account_for_msg(&state, &m).await) {
+            if let (Ok(mut dest), Some(account)) = (url::Url::parse(url), account_for_msg(state, &m).await) {
                 if is_own_site(&account, &dest) {
-                    dest.query_pairs_mut().append_pair("_pl", &profile_token(&state, m.account_id, m.profile_id));
+                    dest.query_pairs_mut().append_pair("_pl", &profile_token(state, m.account_id, m.profile_id));
                     return Redirect::to(dest.as_str()).into_response();
                 }
             }
         }
     }
-    Redirect::to(&q.u).into_response()
+    Redirect::to(url).into_response()
 }
 
 /// A small branded page (confirmations, unsubscribes) around `body`, which must already be escaped HTML.

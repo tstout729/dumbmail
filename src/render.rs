@@ -100,6 +100,92 @@ pub trait LinkHook: Sync {
     fn destination(&self, url: &str) -> Option<String>;
 }
 
+/// Short links in a text (see `features::short_links`). Links are found in the rendered text, and
+/// only a link made entirely of characters written literally in the template is offered: a link
+/// that a variable or tag produced, or completed, keeps the long form.
+pub trait SmsLinks: Sync {
+    /// The short link for `link`, or None to keep the long tracked form.
+    fn short(&self, link: &str) -> Option<String>;
+}
+
+/// Template tags (`{{ }}`, `{% %}`, `{# #}`): a link inside or touching one isn't literal.
+static TEMPLATE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}").unwrap());
+
+/// Put `open` and `close` around each link written literally in `template` (outside template tags),
+/// so that after rendering the marks show which characters came from the template itself.
+fn mark_literal_links(template: &str, url: &Regex, open: &str, close: &str) -> String {
+    let tags: Vec<std::ops::Range<usize>> = TEMPLATE_TAG.find_iter(template).map(|m| m.range()).collect();
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut at = 0;
+    for m in url.find_iter(template) {
+        if tags.iter().any(|t| t.start < m.end() && m.start() < t.end) {
+            continue;
+        }
+        out.push_str(&template[at..m.start()]);
+        out.push_str(open);
+        out.push_str(m.as_str());
+        out.push_str(close);
+        at = m.end();
+    }
+    out.push_str(&template[at..]);
+    out
+}
+
+/// Take the marks out of a rendered text: the text, and where its literal stretches are.
+fn take_marks(rendered: &str, open: &str, close: &str) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut out = String::with_capacity(rendered.len());
+    let mut spans = Vec::new();
+    let mut rest = rendered;
+    let mut start: Option<usize> = None;
+    loop {
+        let next_open = rest.find(open);
+        let next_close = rest.find(close);
+        match (next_open, next_close) {
+            (Some(o), c) if c.is_none_or(|c| o < c) => {
+                out.push_str(&rest[..o]);
+                start = Some(out.len());
+                rest = &rest[o + open.len()..];
+            }
+            (_, Some(c)) => {
+                out.push_str(&rest[..c]);
+                if let Some(s) = start.take() {
+                    spans.push(s..out.len());
+                }
+                rest = &rest[c + close.len()..];
+            }
+            _ => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    (out, spans)
+}
+
+/// How much of what the URL pattern found in a text is the link: trailing sentence punctuation
+/// (`.` `,` `!` `?` `;` `:`, quotes, and closing brackets that aren't balanced inside the link) is
+/// left out and stays in the text after it, so "Shop the sale: https://shop.example/sale." links to
+/// `/sale`. So is a trailing character from another script that isn't a letter or digit (an emoji,
+/// `”`, `’`, `…`, `。`); letters and digits in any script, and the marks that combine with them,
+/// stay part of the link. Long tracked links and short links (`features::short_links`) end in the
+/// same place.
+pub fn sms_link_len(found: &str) -> usize {
+    // Combining marks (accents written as a separate character) belong to the letter before them.
+    let combining = |c: char| matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F);
+    let mut end = found.len();
+    while let Some(last) = found[..end].chars().last() {
+        let link = &found[..end];
+        let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
+        let other_script_ending = !last.is_ascii() && !last.is_alphanumeric() && !combining(last);
+        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') || other_script_ending {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -712,13 +798,37 @@ fn rewrite_links(html: &str, t: &Tracking<'_>, links: Option<&dyn LinkHook>) -> 
 
 /// SMS: render the body, shorten links through click tracking and add opt-out language when needed.
 pub fn render_sms(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool) -> AppResult<String> {
+    render_sms_with(account, content, ctx, tracking, first_message, None)
+}
+
+/// [`render_sms`], with `links` shortening the links it can (also in previews, without tracking).
+pub fn render_sms_with(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool, links: Option<&dyn SmsLinks>) -> AppResult<String> {
     static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
-    let mut body = render_str(&content.body, ctx, false)?;
+    // With short links, mark the links written literally (marks no variable can produce: a fresh
+    // random word each time), render, and keep where the literal stretches ended up.
+    let (mut body, literal) = match links {
+        Some(_) => {
+            let nonce = Uuid::new_v4().simple().to_string();
+            let (open, close) = (format!("\u{E000}{nonce}\u{E001}"), format!("\u{E002}{nonce}\u{E001}"));
+            let rendered = render_str(&mark_literal_links(&content.body, &URL, &open, &close), ctx, false)?;
+            take_marks(&rendered, &open, &close)
+        }
+        None => (render_str(&content.body, ctx, false)?, Vec::new()),
+    };
     // The words the sender wrote, without links: a link that happens to contain "stop" isn't opt-out language.
     let words = URL.replace_all(&body, " ").to_lowercase();
-    if let Some(t) = tracking {
+    if tracking.is_some() || links.is_some() {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &c[0]))
+            .replace_all(&body, |c: &regex::Captures<'_>| {
+                let m = c.get(0).expect("whole match");
+                let (link, rest) = m.as_str().split_at(sms_link_len(m.as_str()));
+                let whole_literal = literal.iter().any(|r| r.start <= m.start() && m.start() + link.len() <= r.end);
+                match (links.filter(|_| whole_literal).and_then(|l| l.short(link)), tracking) {
+                    (Some(short), _) => format!("{short}{rest}"),
+                    (None, Some(t)) => format!("{}{rest}", tracked_url(t, link)),
+                    (None, None) => m.as_str().to_string(),
+                }
+            })
             .into_owned();
     }
     let lower = body.to_lowercase();
@@ -863,6 +973,52 @@ mod tests {
         let tricky: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "products", "items": [{"title": "{{{ 7*7 }}}{% if 1 %}x{% endif %}"}]}]})).unwrap();
         let out = render_email(&account(), &tricky, &json!({}), None).unwrap();
         assert!(!out.text.contains("49") && out.text.contains("7*7"), "{}", out.text);
+    }
+
+    #[test]
+    fn sms_tracked_links_leave_trailing_punctuation_in_the_text() {
+        let acct = account();
+        let t = Tracking { public_url: "https://pl.test", secret: "s", message_id: Uuid::nil(), unsubscribe_url: "https://pl.test/u/x".into() };
+        let content = SmsContent { body: "Acme: Shop the sale: https://shop.test/sale. Or go https://shop.test/go! (https://en.wikipedia.org/wiki/Foo_(bar))".into(), media_url: None };
+        let body = render_sms(&acct, &content, &json!({}), Some(&t), false).unwrap();
+        let sale = tracked_url(&t, "https://shop.test/sale");
+        let go = tracked_url(&t, "https://shop.test/go");
+        let wiki = tracked_url(&t, "https://en.wikipedia.org/wiki/Foo_(bar)");
+        assert!(body.contains(&format!("Shop the sale: {sale}. Or go {go}! ({wiki})")), "{body}");
+        // What each link records and redirects to is the link without the punctuation.
+        for (link, dest) in [(&sale, "https://shop.test/sale"), (&go, "https://shop.test/go")] {
+            let u = url::form_urlencoded::parse(link.split_once('?').unwrap().1.as_bytes()).find(|(k, _)| k == "u").unwrap().1.into_owned();
+            assert_eq!(u, dest);
+        }
+        assert_eq!(sms_link_len("https://shop.test/a?b=1"), "https://shop.test/a?b=1".len(), "a link with nothing after it is whole");
+    }
+
+    /// Shortens every link it's offered to `<link>`.
+    struct Angle;
+    impl SmsLinks for Angle {
+        fn short(&self, link: &str) -> Option<String> {
+            Some(format!("<{link}>"))
+        }
+    }
+
+    #[test]
+    fn only_links_made_entirely_of_literal_template_text_are_offered_for_shortening() {
+        let acct = account();
+        let t = Tracking { public_url: "https://pl.test", secret: "s", message_id: Uuid::nil(), unsubscribe_url: "https://pl.test/u/x".into() };
+        let body = "Acme: https://shop.test/buy {{- 'now' }} and https://shop.test/plain. Also {{ 'https://shop.test/var' }} and {% if true %} https://shop.test/in-if {% endif %}{% if true %}https://shop.test/touching{% endif %}";
+        let out = render_sms_with(&acct, &SmsContent { body: body.into(), media_url: None }, &json!({}), Some(&t), false, Some(&Angle)).unwrap();
+        // Completed by a tag: the rendered link is /buynow, so it keeps the long form, to /buynow.
+        assert!(out.starts_with(&format!("Acme: {} and <https://shop.test/plain>. Also ", tracked_url(&t, "https://shop.test/buynow"))), "{out}");
+        assert!(out.contains(&tracked_url(&t, "https://shop.test/var")), "a variable's link keeps the long form: {out}");
+        assert!(out.contains("<https://shop.test/in-if>"), "literal text inside a block is literal: {out}");
+        assert!(out.contains(&tracked_url(&t, "https://shop.test/touching")), "a link touching a tag isn't counted as literal: {out}");
+        // A preview (no tracking) leaves links it doesn't shorten as they are.
+        let preview = render_sms_with(&acct, &SmsContent { body: body.into(), media_url: None }, &json!({}), None, false, Some(&Angle)).unwrap();
+        assert!(preview.starts_with("Acme: https://shop.test/buynow and <https://shop.test/plain>. Also https://shop.test/var"), "{preview}");
+        // A profile value can't pass for literal text.
+        let ctx = json!({"x": "\u{E000}https://shop.test/forged\u{E001}"});
+        let out = render_sms_with(&acct, &SmsContent { body: "Acme: {{ x }}".into(), media_url: None }, &ctx, Some(&t), false, Some(&Angle)).unwrap();
+        assert!(!out.contains('<'), "{out}");
     }
 
     #[test]

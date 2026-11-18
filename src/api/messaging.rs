@@ -170,9 +170,12 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         Ok(json!({"subject": r.subject, "preheader": r.preheader, "html": r.html, "text": r.text}))
     } else {
         let content: render::SmsContent = serde_json::from_value(content)?;
-        let body = render::render_sms(&account, &content, &ctx, None, false)?;
+        // Links the send would shorten show as a sample short link of the real length (features::short_links).
+        let sample = crate::features::short_links::send::preview(state, &account, &content.body).await?;
+        let body = render::render_sms_with(&account, &content, &ctx, None, false, sample.as_ref().map(|s| s as &dyn render::SmsLinks))?;
         let (chars, segs) = crate::providers::sms::segment_count(&body);
-        Ok(json!({"body": body, "characters": chars, "segments": segs}))
+        let short_links = sample.as_ref().map_or(0, |s| s.count_in(&body));
+        Ok(json!({"body": body, "characters": chars, "segments": segs, "short_links": short_links}))
     }
 }
 
@@ -524,12 +527,16 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let (segments, mms) = if c.channel == "sms" {
         // Personalization changes length a little; estimate from the template plus compliance text,
         // using the costliest version of an A/B test (priced per version: MMS and long SMS cost differently).
+        // A text may go out with short links or, from a server that doesn't issue them yet, long ones
+        // (features::short_links): count whichever is longer.
         let p = crate::billing::prices(state);
+        let short_links = crate::features::short_links::send::sample_for(state, &account).await?;
         let per_version: Vec<(i64, bool)> = versions
             .iter()
             .map(|content| {
-                let body = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
-                let n = crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64;
+                let raw = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                let segments = |body: &str| crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64;
+                let n = short_links.as_ref().map_or(segments(raw), |s| segments(raw).max(segments(&s.estimate(raw))));
                 (n.max(1), content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
             })
             .collect();
