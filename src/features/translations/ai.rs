@@ -206,13 +206,29 @@ pub fn same_literals(source: &str, draft: &str) -> bool {
     literals(source) == literals(draft)
 }
 
-/// Why a request failed, short and safe to store (no strings, no key, no response body).
+/// Why a request failed, short and safe to store (no strings, no key, no response body), whether
+/// trying again may help (busy, a server problem, no answer in time), and how long the service
+/// asked us to wait.
 #[derive(Debug)]
-pub struct Failure(pub String);
+pub struct Failure {
+    pub msg: String,
+    pub transient: bool,
+    pub retry_after: Option<Duration>,
+}
+
+impl Failure {
+    pub fn fatal(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), transient: false, retry_after: None }
+    }
+
+    pub fn transient(msg: impl Into<String>, retry_after: Option<Duration>) -> Self {
+        Self { msg: msg.into(), transient: true, retry_after }
+    }
+}
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.msg)
     }
 }
 
@@ -223,7 +239,7 @@ fn client() -> Result<reqwest::Client, Failure> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| Failure("couldn't start the translation client".into()))
+        .map_err(|_| Failure::fatal("couldn't start the translation client"))
 }
 
 /// Translate the strings in one request. Returns id → translation (still with placeholders).
@@ -236,9 +252,9 @@ pub async fn translate(r: &Request<'_>) -> Result<BTreeMap<String, String>, Fail
         "output_config": {"effort": "medium"},
         "fallbacks": "default",
     });
-    let body = serde_json::to_vec(&body).map_err(|_| Failure("couldn't write the request".into()))?;
+    let body = serde_json::to_vec(&body).map_err(|_| Failure::fatal("couldn't write the request"))?;
     if body.len() > MAX_REQUEST_BYTES {
-        return Err(Failure("the text was too big for one request".into()));
+        return Err(Failure::fatal("the text was too big for one request"));
     }
     let url = format!("{}/v1/messages", api_base(r.base_url).trim_end_matches('/'));
     let res = client()?
@@ -250,21 +266,22 @@ pub async fn translate(r: &Request<'_>) -> Result<BTreeMap<String, String>, Fail
         .body(body)
         .send()
         .await
-        .map_err(|e| Failure(if e.is_timeout() { "the translation service didn't answer in time".into() } else { "couldn't reach the translation service".into() }))?;
+        .map_err(|e| if e.is_timeout() { Failure::transient("the translation service didn't answer in time", None) } else { Failure::transient("couldn't reach the translation service", None) })?;
     let status = res.status();
     if !status.is_success() {
-        return Err(Failure(match status.as_u16() {
-            401 | 403 => "the translation service refused DumbMail's key".into(),
-            429 => "the translation service is busy; try again in a few minutes".into(),
-            s if s >= 500 => format!("the translation service had a problem ({s})"),
-            s => format!("the translation service refused the request ({s})"),
-        }));
+        let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
+        return Err(match status.as_u16() {
+            401 | 403 => Failure::fatal("the translation service refused DumbMail's key"),
+            429 => Failure::transient("the translation service is busy; try again in a few minutes", retry_after),
+            s if s >= 500 => Failure::transient(format!("the translation service had a problem ({s})"), retry_after),
+            s => Failure::fatal(format!("the translation service refused the request ({s})")),
+        });
     }
     let bytes = read_capped(res).await?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|_| Failure("the translation service sent something unreadable".into()))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::fatal("the translation service sent something unreadable"))?;
     match v.get("stop_reason").and_then(|s| s.as_str()) {
-        Some("refusal") => return Err(Failure("the translation model declined this text".into())),
-        Some("max_tokens") => return Err(Failure("the translation was cut off; translate fewer strings at a time".into())),
+        Some("refusal") => return Err(Failure::fatal("the translation model declined this text")),
+        Some("max_tokens") => return Err(Failure::fatal("the translation was cut off; translate fewer strings at a time")),
         _ => {}
     }
     let texts: Vec<&str> = v.get("content").and_then(|c| c.as_array()).into_iter().flatten().filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")).filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
@@ -273,14 +290,14 @@ pub async fn translate(r: &Request<'_>) -> Result<BTreeMap<String, String>, Fail
             return Ok(m);
         }
     }
-    Err(Failure("the translation service's answer wasn't in the expected form".into()))
+    Err(Failure::fatal("the translation service's answer wasn't in the expected form"))
 }
 
 async fn read_capped(mut res: reqwest::Response) -> Result<Vec<u8>, Failure> {
     let mut out = Vec::new();
-    while let Some(chunk) = res.chunk().await.map_err(|_| Failure("the translation service's answer broke off".into()))? {
+    while let Some(chunk) = res.chunk().await.map_err(|_| Failure::transient("the translation service's answer broke off", None))? {
         if out.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(Failure("the translation service's answer was too big".into()));
+            return Err(Failure::fatal("the translation service's answer was too big"));
         }
         out.extend_from_slice(&chunk);
     }

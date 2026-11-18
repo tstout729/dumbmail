@@ -173,7 +173,14 @@ fn campaign_editable(status: &str, scheduled_ok: bool) -> AppResult<()> {
 /// like any save of it, write it. `scheduled_ok`: a scheduled campaign may change too.
 pub async fn update<R>(db: &PgPool, account_id: Uuid, t: &Target, scheduled_ok: bool, f: impl FnOnce(&mut Loaded) -> AppResult<R>) -> AppResult<R> {
     let mut tx = db.begin().await?;
-    let (mut l, status) = load_on(&mut tx, account_id, t, true).await?;
+    let out = update_in(&mut tx, account_id, t, scheduled_ok, f).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// [`update`] inside the caller's transaction (it commits).
+pub async fn update_in<R>(tx: &mut PgConnection, account_id: Uuid, t: &Target, scheduled_ok: bool, f: impl FnOnce(&mut Loaded) -> AppResult<R>) -> AppResult<R> {
+    let (mut l, status) = load_on(&mut *tx, account_id, t, true).await?;
     if let Target::Campaign { .. } = t {
         campaign_editable(&status, scheduled_ok)?;
     }
@@ -213,6 +220,5 @@ pub async fn update<R>(db: &PgPool, account_id: Uuid, t: &Target, scheduled_ok: 
             sqlx::query("UPDATE saved_blocks SET blocks = $3, updated_at = now() WHERE id = $1 AND account_id = $2").bind(id).bind(account_id).bind(&blocks).execute(&mut *tx).await?;
         }
     }
-    tx.commit().await?;
     Ok(out)
 }

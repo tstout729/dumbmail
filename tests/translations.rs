@@ -328,12 +328,16 @@ async fn translators_work_round_trips_through_xliff_and_csv() {
 #[derive(Default)]
 struct Calls {
     requests: Vec<(Value, String, String)>,
+    /// When set, the stand-in hands the run to another worker while answering (as if this worker's
+    /// lease had run out and someone else picked the run up).
+    steal: Option<(sqlx::PgPool, Uuid)>,
 }
 
 /// A stand-in for `POST /v1/messages`: answers each string with "DE:" in front of it, keeping its
 /// placeholders, except strings containing "MANGLE" (placeholders dropped).
 async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
     use axum::extract::State;
+    use axum::response::IntoResponse;
     use axum::http::HeaderMap;
     let calls: Arc<Mutex<Calls>> = Default::default();
     let app = axum::Router::new()
@@ -342,7 +346,21 @@ async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
             axum::routing::post(|State(c): State<Arc<Mutex<Calls>>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
                 let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 let version = headers.get("anthropic-version").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                c.lock().unwrap().requests.push((body.clone(), key, version));
+                let steal = {
+                    let mut c = c.lock().unwrap();
+                    c.requests.push((body.clone(), key, version));
+                    c.steal.clone()
+                };
+                if let Some((db, job)) = steal {
+                    sqlx::query("UPDATE translation_jobs SET lease_owner = gen_random_uuid() WHERE id = $1").bind(job).execute(&db).await.unwrap();
+                }
+                let text = body["messages"][0]["content"].as_str().unwrap().to_string();
+                if text.contains("FAIL500") {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, [("retry-after", "0")], axum::Json(json!({"type": "error"}))).into_response();
+                }
+                if text.contains("FAIL400") {
+                    return (axum::http::StatusCode::BAD_REQUEST, [("retry-after", "0")], axum::Json(json!({"type": "error"}))).into_response();
+                }
                 let user: Value = serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
                 let strings = user["strings"].as_object().unwrap().clone();
                 let out: serde_json::Map<String, Value> = strings
@@ -366,6 +384,7 @@ async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
                 axum::Json(json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-5-5", "stop_reason": "end_turn",
                     "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": format!("```json\n{}\n```", Value::Object(out))}],
                     "usage": {"input_tokens": 10, "output_tokens": 10}}))
+                .into_response()
             }),
         )
         .with_state(calls.clone());
@@ -1043,5 +1062,91 @@ async fn machine_drafts_cant_quietly_change_the_facts() {
     let saved = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
     assert!(p["html"].as_str().unwrap().contains("29.99"));
+    h.cleanup().await;
+}
+
+async fn draft_harness(price: f64) -> Option<(Harness, Arc<Mutex<Calls>>)> {
+    let (calls, url) = mock_anthropic().await;
+    let mut h = Harness::with(|c| {
+        c.anthropic_api_key = Some("sk-ant-test".into());
+        c.anthropic_api_base = Some(url.clone());
+        c.price_translation_per_1000_chars = price;
+    })
+    .await?;
+    h.signup().await;
+    set_languages(&mut h, json!(["de"])).await;
+    Some((h, calls))
+}
+
+async fn job_row(h: &Harness, id: &str) -> (String, Option<String>, Value, i32, i32) {
+    sqlx::query_as("SELECT status, error, strings, sent_chars, chars FROM translation_jobs WHERE id = $1::uuid").bind(id).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn used_today(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(sum(chars), 0)::bigint FROM translation_usage").fetch_one(&h.state.db).await.unwrap()
+}
+
+/// A campaign with a subject and one heading, and a draft run into German: (campaign id, run id).
+async fn start_draft_run(h: &mut Harness, heading: &str) -> (String, String) {
+    let content = json!({"subject": "Hello", "blocks": [{"type": "heading", "text": heading}]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": format!("C{}", Uuid::now_v7().simple()), "content": content}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let job = h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de", "confirm": true}))).await;
+    (cid, job["id"].as_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn one_worker_owns_a_draft_run_and_a_failed_run_still_counts() {
+    let Some((mut h, calls)) = draft_harness(0.0).await else { return };
+    // A failure that may pass is tried again (Retry-After honoured); the run then ends failed,
+    // saying what wasn't drafted, the characters it sent still count, and its copied text is cleared.
+    let (_, job) = start_draft_run(&mut h, "FAIL500 now").await;
+    h.drain().await;
+    let (status, error, strings, sent, chars) = job_row(&h, &job).await;
+    assert_eq!(status, "failed");
+    assert!(error.as_deref().unwrap_or("").contains("2 texts weren't drafted"), "{error:?}");
+    assert_eq!(strings, json!([]));
+    assert_eq!(calls.lock().unwrap().requests.len(), 3, "tried three times");
+    assert_eq!(sent, chars, "everything was sent");
+    assert_eq!(used_today(&h).await, i64::from(chars), "and it counts against today's allowance");
+    // A failure that won't pass isn't tried again.
+    let before = calls.lock().unwrap().requests.len();
+    let (_, job) = start_draft_run(&mut h, "FAIL400 now").await;
+    h.drain().await;
+    assert_eq!(calls.lock().unwrap().requests.len(), before + 1);
+    assert_eq!(job_row(&h, &job).await.0, "failed");
+
+    // Another worker holds the run: this one leaves it alone.
+    let (_, job) = start_draft_run(&mut h, "Held").await;
+    sqlx::query("UPDATE translation_jobs SET status = 'running', lease_owner = gen_random_uuid(), lease_until = now() + interval '1 hour' WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+    let before = calls.lock().unwrap().requests.len();
+    dumbmail::features::translations::draft::run(&h.state, &json!({"job_id": job})).await.unwrap();
+    assert_eq!(calls.lock().unwrap().requests.len(), before, "nothing sent");
+    assert_eq!(job_row(&h, &job).await.0, "running");
+    sqlx::query("UPDATE translation_jobs SET status = 'failed', strings = '[]', lease_owner = NULL WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+
+    // The run is taken over while this worker waits for the model: it writes nothing.
+    let (cid, job) = start_draft_run(&mut h, "Taken").await;
+    calls.lock().unwrap().steal = Some((h.state.db.clone(), job.parse().unwrap()));
+    h.drain().await;
+    calls.lock().unwrap().steal = None;
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    assert!(v["strings"].as_array().unwrap().iter().all(|s| s["status"] == "missing"), "{v}");
+    assert_eq!(job_row(&h, &job).await.0, "running", "only the worker holding it can end it");
+    sqlx::query("UPDATE translation_jobs SET status = 'failed', strings = '[]', lease_owner = NULL WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+
+    // A run that has used up its time ends failed without sending anything, and gives back what it never sent.
+    let used = used_today(&h).await;
+    let (_, job) = start_draft_run(&mut h, "Late").await;
+    let chars = job_row(&h, &job).await.4;
+    assert_eq!(used_today(&h).await, used + i64::from(chars));
+    sqlx::query("UPDATE translation_jobs SET started_at = now() - interval '11 minutes' WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+    let before = calls.lock().unwrap().requests.len();
+    h.drain().await;
+    let (status, error, strings, ..) = job_row(&h, &job).await;
+    assert_eq!((status.as_str(), strings), ("failed", json!([])));
+    assert!(error.unwrap().contains("10 minutes"));
+    assert_eq!(calls.lock().unwrap().requests.len(), before);
+    assert_eq!(used_today(&h).await, used, "nothing was sent, so nothing counts");
     h.cleanup().await;
 }

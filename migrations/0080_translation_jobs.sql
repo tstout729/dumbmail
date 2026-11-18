@@ -17,7 +17,17 @@ CREATE TABLE translation_jobs (
     error text,
     requested_by uuid,
     created_at timestamptz NOT NULL DEFAULT now(),
-    finished_at timestamptz
+    finished_at timestamptz,
+    -- The worker that holds the run, and until when; every write is conditional on holding it.
+    lease_owner uuid,
+    lease_until timestamptz,
+    -- When a worker first picked the run up (its total time is bounded from here).
+    started_at timestamptz,
+    -- Field ids already handled (written or given up on), characters actually sent to the model,
+    -- and what was charged.
+    done_ids jsonb NOT NULL DEFAULT '[]',
+    sent_chars integer NOT NULL DEFAULT 0,
+    charged_micros bigint NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX translation_jobs_one_running ON translation_jobs (account_id) WHERE status IN ('queued', 'running');
 CREATE INDEX translation_jobs_account ON translation_jobs (account_id, created_at DESC);

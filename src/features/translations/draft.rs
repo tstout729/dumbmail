@@ -3,12 +3,18 @@
 //! Starting a run fixes what it translates (the strings and the default text they come from are
 //! copied into the run), reserves the characters against the account's daily limit in the same
 //! statement that checks it, and enqueues the work on the background lane, all in one
-//! transaction. At most one run per account is queued or running (a unique index). The run calls
-//! the model with no database connection held, then writes each draft only where the default text
-//! is still the one it translated and nobody has put a reviewed translation there meanwhile.
-//! Drafts are marked `machine` until a person marks them reviewed. A run that dies is picked up
-//! again by the job queue; one stuck for [`STUCK_MINUTES`] is closed so the account can start
-//! another.
+//! transaction. At most one run per account is queued or running (a unique index).
+//!
+//! One worker owns a run at a time: it takes a lease (owner and expiry) and renews it between
+//! batches, and every write (drafts, charge, progress) happens in one transaction that first
+//! checks it still holds the lease and the run is still running. A run has [`MAX_RUN`] in all;
+//! past that it ends failed. The model is called with no database connection held; failures that
+//! may pass (busy, a server problem, no answer in time) are tried again within that bound,
+//! honouring `Retry-After`; others end the run, saying how many texts weren't drafted.
+//! Characters count against the daily limit once they're sent, whether or not what came back was
+//! usable; only characters never sent are given back. The copied text is cleared whenever a run
+//! ends. Drafts are written only where the default text is still the one that was translated and
+//! nobody has put a reviewed translation there meanwhile.
 
 use std::collections::BTreeMap;
 
@@ -23,7 +29,15 @@ use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
 pub const JOB_KIND: &str = "translations_draft";
-pub const STUCK_MINUTES: i32 = 30;
+/// A run's lease, renewed between batches.
+pub const LEASE_SECS: i64 = 120;
+/// The longest a run may take in all.
+pub const MAX_RUN: std::time::Duration = std::time::Duration::from_secs(600);
+/// A queued run nobody picked up for this long, or a running one whose lease ran out, no longer
+/// blocks the account from starting another.
+pub const STUCK_MINUTES: i32 = 15;
+/// Tries per batch for failures that may pass.
+const TRIES: u32 = 3;
 
 /// Whether machine translation is set up on this server.
 pub fn available(state: &AppState) -> bool {
@@ -106,8 +120,12 @@ pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Opt
     }
     let id = Uuid::now_v7();
     let mut tx = state.db.begin().await?;
-    // A run that stopped long ago without finishing doesn't block the account forever.
-    sqlx::query("UPDATE translation_jobs SET status = 'failed', error = 'stopped before it finished', finished_at = now() WHERE account_id = $1 AND status IN ('queued', 'running') AND created_at < now() - make_interval(mins => $2)")
+    // A run that stopped without finishing doesn't block the account forever. Its worker, if any is
+    // left, no longer holds the lease, so it can't write anything after this.
+    sqlx::query(
+        "UPDATE translation_jobs SET status = 'failed', error = 'stopped before it finished', strings = '[]', lease_owner = NULL, finished_at = now()
+         WHERE account_id = $1 AND ((status = 'queued' AND created_at < now() - make_interval(mins => $2)) OR (status = 'running' AND lease_until < now()))",
+    )
         .bind(ctx.account_id)
         .bind(STUCK_MINUTES)
         .execute(&mut *tx)
@@ -167,27 +185,27 @@ pub async fn job_json(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult
     Ok(json!({"id": r.0, "target": {"kind": r.1, "id": r.2, "part": r.3}, "language": r.4, "status": r.5, "characters": r.6, "translated": r.7, "skipped": r.8, "error": r.9, "created_at": r.10, "finished_at": r.11}))
 }
 
-/// Record how a run ended, and give back its reserved characters when it translated nothing
-/// (`refund`), in one transaction: a replay after this finds the run finished and stops.
-#[allow(clippy::too_many_arguments)]
-async fn finish(state: &AppState, id: Uuid, status: &str, translated: usize, skipped: usize, error: Option<&str>, refund: Option<(Uuid, i32, chrono::DateTime<chrono::Utc>)>) -> anyhow::Result<()> {
+/// Record how a run ended, if this worker still holds it, and give back the characters it never
+/// sent (`refund`), in one transaction. The copied text is cleared.
+async fn finish(state: &AppState, id: Uuid, owner: Uuid, status: &str, error: Option<&str>, refund: i64) -> anyhow::Result<()> {
     let mut tx = state.db.begin().await?;
-    let n = sqlx::query("UPDATE translation_jobs SET status = $2, translated = $3, skipped = $4, error = $5, strings = '[]', finished_at = now() WHERE id = $1 AND status = 'running'")
-        .bind(id)
-        .bind(status)
-        .bind(translated as i32)
-        .bind(skipped as i32)
-        .bind(error)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if let (1, Some((account_id, chars, created_at))) = (n, refund) {
+    let row: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "UPDATE translation_jobs SET status = $3, error = $4, strings = '[]', lease_owner = NULL, finished_at = now()
+         WHERE id = $1 AND lease_owner = $2 AND status = 'running' RETURNING account_id, created_at",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(status)
+    .bind(error)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let (Some((account_id, created_at)), true) = (row, refund > 0) {
         sqlx::query(
             "UPDATE translation_usage u SET chars = GREATEST(u.chars - $2, 0) FROM accounts a
              WHERE u.account_id = $1 AND a.id = u.account_id AND u.day = ($3 AT TIME ZONE a.timezone)::date",
         )
         .bind(account_id)
-        .bind(i64::from(chars))
+        .bind(refund)
         .bind(created_at)
         .execute(&mut *tx)
         .await?;
@@ -196,30 +214,160 @@ async fn finish(state: &AppState, id: Uuid, status: &str, translated: usize, ski
     Ok(())
 }
 
-/// The background job: translate, write the drafts back, record the outcome.
+/// Renew this worker's lease. False: it no longer holds the run (it must stop).
+async fn renew(state: &AppState, id: Uuid, owner: Uuid) -> sqlx::Result<bool> {
+    let n = sqlx::query("UPDATE translation_jobs SET lease_until = now() + make_interval(secs => $3) WHERE id = $1 AND lease_owner = $2 AND status = 'running'")
+        .bind(id)
+        .bind(owner)
+        .bind(LEASE_SECS as f64)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    Ok(n == 1)
+}
+
+/// What one batch produced, written in one transaction.
+struct BatchResult {
+    /// field id → (draft, status)
+    drafts: BTreeMap<String, (String, &'static str)>,
+    /// Field ids handled (drafted or given up on).
+    done: Vec<String>,
+    skipped: usize,
+    /// Characters sent for this batch.
+    sent: i64,
+}
+
+enum Written {
+    Ok,
+    /// The worker lost the run; nothing was written.
+    Lost,
+    /// The run can't go on (the message can't be changed now, the balance ran out).
+    Stop(String),
+}
+
+/// Write a batch's drafts, its charge and the run's progress together, if this worker still holds
+/// the run.
+#[allow(clippy::too_many_arguments)]
+async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, target: &Target, scheduled_ok: bool, lang: &str, default_lang: &str, hashes: &BTreeMap<String, String>, batch_no: usize, b: &BatchResult) -> anyhow::Result<Written> {
+    let mut tx = state.db.begin().await?;
+    let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM translation_jobs WHERE id = $1 AND lease_owner = $2 AND status = 'running' FOR UPDATE").bind(id).bind(owner).fetch_optional(&mut *tx).await?;
+    if held.is_none() {
+        return Ok(Written::Lost);
+    }
+    let mut written = 0usize;
+    let mut later = 0usize;
+    if !b.drafts.is_empty() {
+        let res = store::update_in(&mut tx, account_id, target, scheduled_ok, |l| {
+            let current = fields::fields(&l.content);
+            for (fid, (text, status)) in &b.drafts {
+                let Some(f) = current.iter().find(|f| &f.id == fid) else {
+                    later += 1;
+                    continue;
+                };
+                if hashes.get(fid) != Some(&fields::hash(&f.source)) || fields::status(&l.content, f, lang) == fields::REVIEWED {
+                    later += 1;
+                    continue;
+                }
+                fields::set_entry(&mut l.content, fid, lang, Some((text, status)))?;
+                written += 1;
+            }
+            if written > 0 && !matches!(target, Target::SavedBlock { .. }) {
+                let default = fields::languages(&l.content).0.unwrap_or(default_lang.to_string());
+                fields::add_language(&mut l.content, &default, lang);
+            }
+            Ok(())
+        })
+        .await;
+        match res {
+            Ok(()) => {}
+            Err(AppError::Internal(e)) => return Err(e),
+            Err(e) => return Ok(Written::Stop(e.public_message())),
+        }
+    }
+    // The charge for what was sent, with the drafts (a unique reference per batch).
+    let price = price_micros(state, b.sent);
+    if price > 0 {
+        let balance: i64 = sqlx::query_scalar("SELECT balance_micros FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
+        if balance < price {
+            return Ok(Written::Stop("your balance is empty; add credit in Settings → Billing".into()));
+        }
+        crate::billing::post_entry_tx(&mut tx, account_id, "translation", -price, "Machine translation", &format!("translation:{id}:{batch_no}")).await?;
+    }
+    sqlx::query(
+        "UPDATE translation_jobs SET translated = translated + $2, skipped = skipped + $3, sent_chars = sent_chars + $4, charged_micros = charged_micros + $5,
+            done_ids = done_ids || $6, lease_until = now() + make_interval(secs => $7) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(written as i32)
+    .bind((b.skipped + later) as i32)
+    .bind(b.sent as i32)
+    .bind(price)
+    .bind(json!(b.done))
+    .bind(LEASE_SECS as f64)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Written::Ok)
+}
+
+/// One request, tried again within the run's bound when the failure may pass.
+async fn translate_with_retries(state: &AppState, id: Uuid, owner: Uuid, deadline: std::time::Instant, req: &ai::Request<'_>) -> anyhow::Result<Result<BTreeMap<String, String>, ai::Failure>> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match ai::translate(req).await {
+            Ok(out) => return Ok(Ok(out)),
+            Err(f) if f.transient && tries < TRIES => {
+                let wait = f.retry_after.unwrap_or(std::time::Duration::from_secs(2u64.pow(tries)));
+                if std::time::Instant::now() + wait >= deadline {
+                    return Ok(Err(f));
+                }
+                tracing::info!(job = %id, error = %f, "machine translation will be tried again");
+                tokio::time::sleep(wait).await;
+                if !renew(state, id, owner).await? {
+                    return Ok(Err(ai::Failure::fatal("the run was taken over")));
+                }
+            }
+            Err(f) => return Ok(Err(f)),
+        }
+    }
+}
+
+/// The background job: translate batch by batch, writing each batch's drafts, charge and progress
+/// together, and record the outcome.
 pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let Some(id) = payload.get("job_id").and_then(|v| v.as_str()).and_then(|v| v.parse::<Uuid>().ok()) else { return Ok(()) };
     let scheduled_ok = payload.get("scheduled_ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Claimed again on a retry; a finished run isn't run twice.
-    type Row = (Uuid, String, Uuid, String, String, Value, i32, chrono::DateTime<chrono::Utc>);
+    let owner = Uuid::now_v7();
+    // Take the run (a finished one, or one another worker holds, isn't touched).
+    type Row = (Uuid, String, Uuid, String, String, Value, i32, f64, Value, i32);
     let row: Option<Row> = sqlx::query_as(
-        "UPDATE translation_jobs SET status = 'running' WHERE id = $1 AND status IN ('queued', 'running')
-         RETURNING account_id, target_kind, target_id, target_part, language, strings, chars, created_at",
+        "UPDATE translation_jobs SET status = 'running', lease_owner = $2, lease_until = now() + make_interval(secs => $3), started_at = COALESCE(started_at, now())
+         WHERE id = $1 AND status IN ('queued', 'running') AND (lease_until IS NULL OR lease_until < now())
+         RETURNING account_id, target_kind, target_id, target_part, language, strings, chars, EXTRACT(EPOCH FROM now() - started_at)::float8, done_ids, sent_chars",
     )
     .bind(id)
+    .bind(owner)
+    .bind(LEASE_SECS as f64)
     .fetch_optional(&state.db)
     .await?;
-    let Some((account_id, kind, target_id, part, lang, strings, chars, created_at)) = row else { return Ok(()) };
-    let refund = Some((account_id, chars, created_at));
-    let Some(target) = Target::from_parts(&kind, target_id, &part) else { return finish(state, id, "failed", 0, 0, Some("unknown message kind"), refund).await };
+    let Some((account_id, kind, target_id, part, lang, strings, chars, elapsed, done_ids, sent_before)) = row else { return Ok(()) };
+    let unsent = |sent: i64| (i64::from(chars) - sent).max(0);
+    let elapsed = std::time::Duration::from_secs_f64(elapsed.max(0.0));
+    if elapsed >= MAX_RUN {
+        return finish(state, id, owner, "failed", Some("it took longer than 10 minutes"), unsent(i64::from(sent_before))).await;
+    }
+    let deadline = std::time::Instant::now() + (MAX_RUN - elapsed);
+    let Some(target) = Target::from_parts(&kind, target_id, &part) else { return finish(state, id, owner, "failed", Some("unknown message kind"), unsent(i64::from(sent_before))).await };
     let Some(key) = state.cfg.anthropic_api_key.clone().filter(|k| !k.trim().is_empty()) else {
-        return finish(state, id, "failed", 0, 0, Some("machine translation isn't set up on this server"), refund).await;
+        return finish(state, id, owner, "failed", Some("machine translation isn't set up on this server"), unsent(i64::from(sent_before))).await;
     };
     let settings = super::texts::settings(&state.db, account_id).await?;
     let source_lang = store::load(&state.db, account_id, &target).await.ok().and_then(|l| fields::languages(&l.content).0).unwrap_or(settings.default_language.clone());
     let glossary = glossary_for(&state.db, account_id, &lang).await?;
+    let done: Vec<String> = done_ids.as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
 
-    // Protect each string; group them into requests within the size limits.
+    // The strings still to do, protected; grouped into requests within the size limits.
     let list: Vec<(String, Kind, String, String)> = strings
         .as_array()
         .into_iter()
@@ -231,15 +379,17 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
             };
             Some((s["id"].as_str()?.to_string(), kind, s["source"].as_str()?.to_string(), s["hash"].as_str()?.to_string()))
         })
+        .filter(|(fid, ..)| !done.contains(fid))
         .collect();
+    let hashes: BTreeMap<String, String> = list.iter().map(|(fid, _, _, h)| (fid.clone(), h.clone())).collect();
     let mut protected = BTreeMap::new();
-    let mut skipped = 0usize;
+    let mut unusable: Vec<String> = Vec::new();
     for (fid, kind, source, _) in &list {
         match ai::protect(*kind, source, &glossary) {
             Some(p) => {
                 protected.insert(fid.clone(), p);
             }
-            None => skipped += 1,
+            None => unusable.push(fid.clone()),
         }
     }
     // Batches are bounded by characters, strings and the request's size in bytes (the
@@ -252,7 +402,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         let n = p.text.chars().count();
         let b = ai::entry_bytes(fid, &p.text);
         if b > budget {
-            skipped += 1;
+            unusable.push(fid.clone());
             continue;
         }
         if !cur.is_empty() && (size + n > ai::MAX_REQUEST_CHARS || bytes + b > budget || cur.len() >= ai::MAX_REQUEST_STRINGS) {
@@ -267,78 +417,66 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     if !cur.is_empty() {
         batches.push(cur);
     }
-
-    // Each draft with its status: `check` when its numbers, links or addresses differ from the original's.
-    let mut drafts: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
-    let mut failure: Option<String> = None;
-    for batch in &batches {
+    // Texts that can't be machine translated at all are recorded as skipped up front.
+    let source_of = |fid: &str| list.iter().find(|x| x.0 == fid).map(|x| x.2.clone()).unwrap_or_default();
+    let mut sent_total = i64::from(sent_before);
+    if !unusable.is_empty() {
+        let b = BatchResult { drafts: BTreeMap::new(), done: unusable.clone(), skipped: unusable.len(), sent: 0 };
+        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, 0, &b).await? {
+            Written::Ok => {}
+            Written::Lost => return Ok(()),
+            Written::Stop(why) => return finish(state, id, owner, "failed", Some(&why), unsent(sent_total)).await,
+        }
+    }
+    let first_batch = done.len();
+    for (i, batch) in batches.iter().enumerate() {
+        if std::time::Instant::now() >= deadline {
+            return finish(state, id, owner, "failed", Some("it took longer than 10 minutes; what was drafted so far is kept"), unsent(sent_total)).await;
+        }
+        if !renew(state, id, owner).await? {
+            return Ok(());
+        }
+        let sent: i64 = batch.values().map(|t| t.chars().count() as i64).sum();
         let req = ai::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch };
-        match ai::translate(&req).await {
-            Ok(out) => {
-                for fid in batch.keys() {
-                    let (Some(p), Some(t), Some((_, _, source, _))) = (protected.get(fid), out.get(fid), list.iter().find(|x| &x.0 == fid)) else {
-                        skipped += 1;
-                        continue;
-                    };
-                    match ai::restore(p, t, source) {
-                        Ok(text) => {
-                            let status = if ai::same_literals(source, &text) { fields::MACHINE } else { fields::CHECK };
-                            drafts.insert(fid.clone(), (text, status));
-                        }
-                        Err(why) => {
-                            tracing::info!(job = %id, reason = why, "a machine translation was rejected");
-                            skipped += 1;
-                        }
-                    }
+        let answer = translate_with_retries(state, id, owner, deadline, &req).await?;
+        sent_total += sent;
+        let out = match answer {
+            Ok(out) => out,
+            Err(f) => {
+                // What was sent counts; the run ends saying what wasn't drafted.
+                tracing::warn!(job = %id, error = %f, "machine translation request failed");
+                let left: usize = batches[i..].iter().map(|b| b.len()).sum();
+                let b = BatchResult { drafts: BTreeMap::new(), done: batch.keys().cloned().collect(), skipped: batch.len(), sent };
+                if let Written::Lost = write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, first_batch + i + 1, &b).await? {
+                    return Ok(());
+                }
+                let msg = format!("{left} {} weren't drafted: {}", if left == 1 { "text" } else { "texts" }, f.msg);
+                return finish(state, id, owner, "failed", Some(&msg), unsent(sent_total)).await;
+            }
+        };
+        let mut b = BatchResult { drafts: BTreeMap::new(), done: batch.keys().cloned().collect(), skipped: 0, sent };
+        for fid in batch.keys() {
+            let source = source_of(fid);
+            let restored = match (protected.get(fid), out.get(fid)) {
+                (Some(p), Some(t)) => ai::restore(p, t, &source),
+                _ => Err("missing from the answer"),
+            };
+            match restored {
+                Ok(text) => {
+                    let status = if ai::same_literals(&source, &text) { fields::MACHINE } else { fields::CHECK };
+                    b.drafts.insert(fid.clone(), (text, status));
+                }
+                Err(why) => {
+                    tracing::info!(job = %id, reason = why, "a machine translation was rejected");
+                    b.skipped += 1;
                 }
             }
-            Err(e) => {
-                tracing::warn!(job = %id, error = %e, "machine translation request failed");
-                skipped += batch.len();
-                failure = Some(e.0);
-            }
+        }
+        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, first_batch + i + 1, &b).await? {
+            Written::Ok => {}
+            Written::Lost => return Ok(()),
+            Written::Stop(why) => return finish(state, id, owner, "failed", Some(&why), unsent(sent_total)).await,
         }
     }
-    if drafts.is_empty() {
-        return finish(state, id, "failed", 0, skipped, Some(failure.as_deref().unwrap_or("no usable translations came back")), refund).await;
-    }
-
-    // Write each draft where its default text is unchanged and nobody reviewed a translation since.
-    let hashes: BTreeMap<&str, &str> = list.iter().map(|(fid, _, _, h)| (fid.as_str(), h.as_str())).collect();
-    let written = store::update(&state.db, account_id, &target, scheduled_ok, |l| {
-        let mut n = 0;
-        let mut later = 0;
-        let current = fields::fields(&l.content);
-        for (fid, (text, status)) in &drafts {
-            let Some(f) = current.iter().find(|f| &f.id == fid) else {
-                later += 1;
-                continue;
-            };
-            if hashes.get(fid.as_str()).copied() != Some(fields::hash(&f.source).as_str()) || fields::status(&l.content, f, &lang) == fields::REVIEWED {
-                later += 1;
-                continue;
-            }
-            fields::set_entry(&mut l.content, fid, &lang, Some((text, status)))?;
-            n += 1;
-        }
-        if n > 0 {
-            let default = fields::languages(&l.content).0.unwrap_or(settings.default_language.clone());
-            if !matches!(target, Target::SavedBlock { .. }) {
-                fields::add_language(&mut l.content, &default, &lang);
-            }
-        }
-        Ok((n, later))
-    })
-    .await;
-    match written {
-        Ok((n, later)) => {
-            let price = price_micros(state, chars as i64);
-            if price > 0 && n > 0 {
-                crate::billing::post_entry(&state.db, account_id, "translation", -price, "Machine translation", &format!("translation:{id}")).await?;
-            }
-            finish(state, id, "done", n, skipped + later, failure.as_deref(), None).await
-        }
-        Err(AppError::Internal(e)) => Err(e),
-        Err(e) => finish(state, id, "failed", 0, skipped + drafts.len(), Some(&e.public_message()), refund).await,
-    }
+    finish(state, id, owner, "done", None, unsent(sent_total)).await
 }
