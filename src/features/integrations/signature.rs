@@ -132,8 +132,8 @@ impl Signature {
                 if prefix.as_ref().is_some_and(|p| p.len() > 40) {
                     return Err(AppError::bad("signature prefix is too long"));
                 }
-                if tolerance_seconds.is_some_and(|t| !(10..=86_400).contains(&t)) {
-                    return Err(AppError::bad("tolerance_seconds must be 10 to 86400"));
+                if tolerance_seconds.is_some_and(|t| !(10..=172_800).contains(&t)) {
+                    return Err(AppError::bad("tolerance_seconds must be 10 to 172800 (48 hours)"));
                 }
             }
             Signature::SharedSecret { header, query } => match (header, query) {

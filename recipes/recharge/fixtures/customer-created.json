@@ -1,20 +1,10 @@
 {
   "description": "customer/created: a held profile keyed by the Recharge customer id",
   "doc": "https://developer.rechargepayments.com/2021-11/customers (the customer object example; personal data replaced)",
-  "expect": [
-    {
-      "email": "jamie.example@example.com",
-      "first_name": "Jamie",
-      "keys": {
-        "recharge_customer": "43845860"
-      },
-      "last_name": "Example",
-      "type": "upsert_profile"
-    }
-  ],
   "input": {
     "payload": {
       "customer": {
+        "id": 43845860,
         "analytics_data": {
           "utm_params": []
         },
@@ -29,7 +19,6 @@
         "has_payment_method_in_dunning": false,
         "has_valid_payment_method": true,
         "hash": "7e706455cbd13e40",
-        "id": 43845860,
         "last_name": "Example",
         "phone": null,
         "subscriptions_active_count": 0,
@@ -41,5 +30,16 @@
     "query": {
       "topic": "customer/created"
     }
-  }
+  },
+  "expect": [
+    {
+      "email": "jamie.example@example.com",
+      "first_name": "Jamie",
+      "keys": {
+        "recharge_customer": "43845860"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    }
+  ]
 }

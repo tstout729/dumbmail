@@ -94,6 +94,7 @@
         "courier": "usps",
         "expected_delivery": "2022-01-07T12:00:00",
         "order_number": "1001",
+        "shipment_id": "00000000000000000000000000000000",
         "status": "Exception",
         "status_detail": "Exception",
         "title": "0000000000000000",

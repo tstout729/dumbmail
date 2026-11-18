@@ -182,7 +182,7 @@ In a pull, fetch another page. In a webhook, fetch the record it names: many app
 | `{"type": "shared_secret", "header": "X-Webhook-Token"}` | The secret itself in a header |
 | `{"type": "shared_secret", "query": "token"}` | The secret in a query parameter (removed before storing) |
 
-Other options for `hmac`: `secret_encoding: "base64"` when the secret is base64 (plain format), `tolerance_seconds` 10 to 86400. All comparisons are constant-time.
+Other options for `hmac`: `secret_encoding: "base64"` when the secret is base64 (plain format), `tolerance_seconds` 10 to 172800 (48 hours, as Recharge documents). All comparisons are constant-time.
 
 The signature is checked before anything else, so requests without the secret never use up the integration's allowance. Rejected requests are logged only while they're few (30 a minute per integration); the rest are refused without a log line.
 

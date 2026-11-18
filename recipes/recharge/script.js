@@ -5,8 +5,8 @@
 // its topic in the URL (…?topic=charge/paid) and the script reads input.query.topic.
 // See README.md for the Recharge page behind each assumption.
 //
-// Subscription Started (created), Subscription Reactivated (activated), Subscription Cancelled,
-// Subscription Skipped, Upcoming Charge, Charge Paid and Charge Failed. Ids come from Recharge's
+// Subscription Started, Subscription Reactivated, Subscription Cancelled, Upcoming Charge, Charge
+// Paid, Charge Failed and Charge Skipped. Ids come from Recharge's
 // own ids and times, so a resend never records twice. People come from charges and customers
 // (they carry the email); subscriptions find them by their Recharge customer id and wait (retry)
 // when that customer hasn't arrived yet. Nobody is subscribed to marketing.
@@ -62,69 +62,72 @@ function customerUpsert(c) {
   return p;
 }
 
-// The topic comes from the URL, which Recharge doesn't sign, so it must agree with the signed body:
-// a replayed body can't be relabelled (an active subscription posted as "cancelled", say).
-var STATUS_FOR = {
-  "subscription/activated": ["active"],
-  "subscription/cancelled": ["cancelled"],
-  "subscription/skipped": ["active"],
-  "charge/upcoming": ["queued"],
-  "charge/paid": ["success"],
-  "charge/failed": ["error"],
-};
+// The topic comes from the URL, which Recharge doesn't sign, so it's only a hint: what happened is
+// read from the signed body (the subscription's or charge's status and times). A replayed body
+// relabelled with another topic records only what that body itself shows.
+var SKIP_HINT = "a skip is recorded from its charge (charge/updated with status skipped)";
 
-function agrees(topic, status) {
-  var want = STATUS_FOR[topic];
-  return !want || want.indexOf(String(status || "").toLowerCase()) >= 0;
+function subscriptionEvents(topic, s) {
+  var who = byCustomer(s.customer_id);
+  var status = String(s.status || "").toLowerCase();
+  var base = "recharge:subscription:" + s.id + ":";
+  if (status === "cancelled") {
+    var when = s.cancelled_at || s.updated_at;
+    if (!when) return [{ type: "log", message: "subscription " + s.id + " has no time from Recharge, so it can't be put in order" }];
+    return [{ type: "track_event", metric: "Subscription Cancelled", profile: who, time: when, unique_id: base + "cancelled:" + when, properties: subProps(s) }];
+  }
+  if (status !== "active") return [{ type: "log", message: "subscription " + s.id + " is " + status + "; not recorded" }];
+  if (!s.created_at) return [{ type: "log", message: "subscription " + s.id + " has no creation time" }];
+  var out = [{ type: "track_event", metric: "Subscription Started", profile: who, time: s.created_at, unique_id: base + "started", properties: subProps(s) }];
+  // A reactivation: the topic says so, and the body shows an active subscription changed well after
+  // it was created (a new subscription's body can't be passed off as one).
+  var changedLater = s.updated_at && Date.parse(s.updated_at) - Date.parse(s.created_at) > 60000;
+  if (topic === "subscription/activated" && changedLater && !s.cancelled_at) {
+    out.push({ type: "track_event", metric: "Subscription Reactivated", profile: who, time: s.updated_at, unique_id: base + "activated:" + s.updated_at, properties: subProps(s) });
+  }
+  if (topic === "subscription/skipped") out.push({ type: "log", message: SKIP_HINT });
+  return out;
 }
 
-var SUB_EVENTS = {
-  "subscription/created": function (s) { return { metric: "Subscription Started", id: "started", time: s.created_at }; },
-  "subscription/activated": function (s) { return { metric: "Subscription Reactivated", id: "activated:" + s.updated_at, time: s.updated_at }; },
-  "subscription/cancelled": function (s) { return { metric: "Subscription Cancelled", id: "cancelled:" + (s.cancelled_at || s.updated_at), time: s.cancelled_at || s.updated_at }; },
-  "subscription/skipped": function (s) { return { metric: "Subscription Skipped", id: "skipped:" + s.updated_at, time: s.updated_at }; },
-};
+function chargeEvents(topic, ch) {
+  var status = String(ch.status || "").toLowerCase();
+  var out = [];
+  if (ch.customer.email) out.push(customerUpsert(ch.customer));
+  var who = ch.customer.email ? { email: ch.customer.email } : byCustomer(ch.customer.id);
+  var base = "recharge:charge:" + ch.id + ":";
+  if (status === "success") {
+    if (!(num(ch.total_price) > 0)) out.push({ type: "log", message: "charge " + ch.id + " was free, so it isn't recorded as paid" });
+    else out.push({ type: "track_event", metric: "Charge Paid", profile: who, value: num(ch.total_price), time: ch.processed_at || ch.updated_at, unique_id: base + "paid", properties: chargeProps(ch) });
+  } else if (status === "error") {
+    out.push({ type: "track_event", metric: "Charge Failed", profile: who, time: ch.updated_at, unique_id: base + "failed:" + ch.updated_at, properties: chargeProps(ch) });
+  } else if (status === "skipped") {
+    out.push({ type: "track_event", metric: "Charge Skipped", profile: who, time: ch.updated_at, unique_id: base + "skipped", properties: chargeProps(ch) });
+  } else if (status === "queued" && topic === "charge/upcoming") {
+    out.push({ type: "track_event", metric: "Upcoming Charge", profile: who, time: ch.updated_at, unique_id: base + "upcoming:" + ch.scheduled_at, properties: chargeProps(ch) });
+  } else {
+    out.push({ type: "log", message: "charge " + ch.id + " is " + status + "; not recorded for " + topic });
+  }
+  return out;
+}
 
 function handle(input) {
   var topic = String((input.query && input.query.topic) || "").toLowerCase();
   var p = input.payload || {};
   if (!topic) return [{ type: "log", message: "no topic: create each Recharge webhook with ?topic=<its topic> at the end of the URL" }];
-
   if (topic.indexOf("customer/") === 0) {
     var c = p.customer;
     if (!c || !c.email) return [{ type: "log", message: "customer without an email" }];
     return [customerUpsert(c)];
   }
-
-  if (SUB_EVENTS[topic]) {
+  if (topic.indexOf("subscription/") === 0) {
     var s = p.subscription;
     if (!s || !s.customer_id) return [{ type: "log", message: topic + " without a subscription or customer" }];
-    if (!agrees(topic, s.status)) return [{ type: "log", message: "subscription " + s.id + " is " + s.status + ", which doesn't fit " + topic + "; ignored" }];
-    var ev = SUB_EVENTS[topic](s);
-    if (!ev.time) return [{ type: "log", message: "subscription " + s.id + " has no time from Recharge, so it can't be put in order" }];
-    return [{ type: "track_event", metric: ev.metric, profile: byCustomer(s.customer_id), time: ev.time, unique_id: "recharge:subscription:" + s.id + ":" + ev.id, properties: subProps(s) }];
+    return subscriptionEvents(topic, s);
   }
-
-  if (topic === "charge/upcoming" || topic === "charge/paid" || topic === "charge/failed") {
+  if (topic.indexOf("charge/") === 0) {
     var ch = p.charge;
     if (!ch || !ch.customer) return [{ type: "log", message: topic + " without a charge or customer" }];
-    if (!agrees(topic, ch.status)) return [{ type: "log", message: "charge " + ch.id + " is " + ch.status + ", which doesn't fit " + topic + "; ignored" }];
-    var out = [];
-    if (ch.customer.email) out.push(customerUpsert(ch.customer));
-    var who = ch.customer.email ? { email: ch.customer.email } : byCustomer(ch.customer.id);
-    if (topic === "charge/upcoming") {
-      out.push({ type: "track_event", metric: "Upcoming Charge", profile: who, time: ch.updated_at, unique_id: "recharge:charge:" + ch.id + ":upcoming:" + ch.scheduled_at, properties: chargeProps(ch) });
-    } else if (topic === "charge/paid") {
-      if (!(num(ch.total_price) > 0)) {
-        out.push({ type: "log", message: "charge " + ch.id + " was free, so it isn't recorded as paid" });
-      } else {
-        out.push({ type: "track_event", metric: "Charge Paid", profile: who, value: num(ch.total_price), time: ch.processed_at || ch.updated_at, unique_id: "recharge:charge:" + ch.id + ":paid", properties: chargeProps(ch) });
-      }
-    } else {
-      out.push({ type: "track_event", metric: "Charge Failed", profile: who, time: ch.updated_at, unique_id: "recharge:charge:" + ch.id + ":failed:" + ch.updated_at, properties: chargeProps(ch) });
-    }
-    return out;
+    return chargeEvents(topic, ch);
   }
-
   return [{ type: "log", message: "ignored Recharge topic " + topic }];
 }

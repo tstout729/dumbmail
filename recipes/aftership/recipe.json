@@ -27,7 +27,9 @@
     "field": "event_id"
   },
   "credentials": [],
-  "settings": {},
+  "settings": {
+    "recipient_role": "buyer"
+  },
   "pull": null,
   "redact": [
     "**.destination_raw_location",
@@ -49,21 +51,28 @@
     "Create the integration from this recipe and copy its webhook URL.",
     "In AfterShip, go to Tracking \u2192 Settings \u2192 Webhooks, add the webhook URL, and tick the In transit, Out for delivery, Delivered, Exception and Failed attempt updates. Save.",
     "Copy the webhook secret shown on the same page and save it as the integration's signing secret.",
+    "Events go to the shipment's customer whose role is recipient_role in the settings: buyer by default, or set it to receiver. Customers with other roles get nothing.",
     "Add a shipment with a customer email (or use AfterShip's test webhook) and check the delivery log.",
     "Review the draft out-for-delivery flow and turn it on. It's a service message about the customer's own order, so it reaches people held back from marketing."
   ],
   "flows": [
     {
       "name": "AfterShip: out for delivery",
-      "description": "When a shipment is out for delivery, tells the customer it arrives today, with the tracking link. A service message about their own order.",
+      "description": "When a shipment is out for delivery, tells the customer it arrives today, with the tracking link. Not sent if AfterShip has already reported it delivered or an exception (even when the updates arrive out of order). A service message about their own order.",
       "trigger": {
         "type": "metric",
-        "metric": "Out For Delivery"
+        "metric": "Out For Delivery",
+        "key": "shipment_id",
+        "cancelled_by": [
+          "Delivered",
+          "Shipment Exception"
+        ]
       },
       "definition": {
         "entry": "o1",
         "settings": {
-          "service_messages": true
+          "service_messages": true,
+          "reentry": "always"
         },
         "nodes": [
           {

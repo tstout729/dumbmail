@@ -1,35 +1,12 @@
 {
-  "description": "subscription/skipped",
+  "description": "subscription/skipped: the body is an active subscription, which shows no skip; the skip is recorded from its charge",
   "doc": "https://developer.rechargepayments.com/2021-11/subscriptions (the subscription object example; personal data replaced)",
-  "expect": [
-    {
-      "metric": "Subscription Skipped",
-      "profile": {
-        "if_missing": "retry",
-        "property": "recharge_customer",
-        "value": "43845860"
-      },
-      "properties": {
-        "currency": "USD",
-        "interval_frequency": 15,
-        "interval_unit": "day",
-        "next_charge_scheduled_at": "2020-07-15",
-        "price": 5,
-        "product_title": "Powder Milk 50.00% Off Auto renew",
-        "quantity": 3,
-        "status": "active",
-        "subscription_id": 89559201,
-        "variant_title": "Milk 10 - 500"
-      },
-      "time": "2020-07-12T08:00:00+00:00",
-      "type": "track_event",
-      "unique_id": "recharge:subscription:89559201:skipped:2020-07-12T08:00:00+00:00"
-    }
-  ],
   "input": {
     "payload": {
       "subscription": {
+        "id": 89559201,
         "address_id": 69282975,
+        "customer_id": 43845860,
         "analytics_data": {
           "utm_params": []
         },
@@ -38,7 +15,6 @@
         "cancelled_at": null,
         "charge_interval_frequency": 15,
         "created_at": "2021-02-25T21:27:19+00:00",
-        "customer_id": 43845860,
         "expire_after_specific_number_of_charges": null,
         "external_product_id": {
           "ecommerce": "1255183683"
@@ -47,7 +23,6 @@
           "ecommerce": "3844924611"
         },
         "has_queued_charges": true,
-        "id": 89559201,
         "is_prepaid": false,
         "is_skippable": true,
         "is_swappable": false,
@@ -72,5 +47,34 @@
     "query": {
       "topic": "subscription/skipped"
     }
-  }
+  },
+  "expect": [
+    {
+      "metric": "Subscription Started",
+      "profile": {
+        "if_missing": "retry",
+        "property": "recharge_customer",
+        "value": "43845860"
+      },
+      "properties": {
+        "currency": "USD",
+        "interval_frequency": 15,
+        "interval_unit": "day",
+        "next_charge_scheduled_at": "2020-07-15",
+        "price": 5,
+        "product_title": "Powder Milk 50.00% Off Auto renew",
+        "quantity": 3,
+        "status": "active",
+        "subscription_id": 89559201,
+        "variant_title": "Milk 10 - 500"
+      },
+      "time": "2021-02-25T21:27:19+00:00",
+      "type": "track_event",
+      "unique_id": "recharge:subscription:89559201:started"
+    },
+    {
+      "message": "a skip is recorded from its charge (charge/updated with status skipped)",
+      "type": "log"
+    }
+  ]
 }

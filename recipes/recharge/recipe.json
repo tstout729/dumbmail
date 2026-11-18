@@ -2,15 +2,15 @@
   "key": "recharge",
   "name": "Recharge",
   "category": "Subscriptions",
-  "description": "Recharge subscriptions become events: Subscription Started, Reactivated, Cancelled and Skipped, Upcoming Charge, Charge Paid (with its amount and currency) and Charge Failed, on the subscriber's profile. Subscribers are held back from marketing: Recharge doesn't record a marketing opt-in.",
+  "description": "Recharge subscriptions become events: Subscription Started, Reactivated and Cancelled, Upcoming Charge, Charge Paid (with its amount and currency), Charge Failed and Charge Skipped, on the subscriber's profile. Subscribers are held back from marketing: Recharge doesn't record a marketing opt-in.",
   "metrics": [
     "Subscription Started",
     "Subscription Reactivated",
     "Subscription Cancelled",
-    "Subscription Skipped",
     "Upcoming Charge",
     "Charge Paid",
-    "Charge Failed"
+    "Charge Failed",
+    "Charge Skipped"
   ],
   "docs": [
     "https://developer.rechargepayments.com/v2/webhooks_validation",
@@ -26,7 +26,7 @@
     "type": "hmac",
     "header": "X-Recharge-Webhook-Signature",
     "format": "stripe",
-    "tolerance_seconds": 86400
+    "tolerance_seconds": 172800
   },
   "signature_secret": {
     "label": "Recharge API Client Secret",
@@ -45,22 +45,29 @@
   "setup": [
     "Create the integration from this recipe and copy its webhook URL.",
     "In Recharge, create an API token (Tools and apps \u2192 API tokens) with read access to customers, subscriptions and orders. Save its API Client Secret as the integration's signing secret.",
-    "Create one Recharge webhook per topic with POST https://api.rechargeapps.com/webhooks (header X-Recharge-Version: 2021-11). Add the topic to the end of the webhook URL so DumbMail knows which one it is, for example {\"address\": \"<webhook URL>?topic=charge/paid\", \"topic\": \"charge/paid\"}. The topics: customer/created, customer/updated, subscription/created, subscription/activated, subscription/cancelled, subscription/skipped, charge/upcoming, charge/paid, charge/failed.",
+    "Create one Recharge webhook per topic with POST https://api.rechargeapps.com/webhooks (header X-Recharge-Version: 2021-11). Add the topic to the end of the webhook URL so DumbMail knows which one it is, for example {\"address\": \"<webhook URL>?topic=charge/paid\", \"topic\": \"charge/paid\"}. The topics: customer/created, customer/updated, subscription/created, subscription/activated, subscription/cancelled, charge/upcoming, charge/updated, charge/paid, charge/failed.",
     "Make a test change in Recharge and check the delivery log. A subscription that arrives before its customer is tried again a few minutes later.",
     "Subscribers are held back from marketing. The suggested upcoming-charge reminder is a service message about their own subscription, so it still reaches them. Review it and turn it on."
   ],
   "flows": [
     {
       "name": "Recharge: upcoming charge reminder",
-      "description": "When Recharge says a charge is coming up, tells the subscriber what will be charged and when, so they can skip or change it. A service message about their own subscription.",
+      "description": "When Recharge says a charge is coming up, tells the subscriber what will be charged and when, so they can skip or change it. Not sent once that charge is paid, skipped or failed. A service message about their own subscription.",
       "trigger": {
         "type": "metric",
-        "metric": "Upcoming Charge"
+        "metric": "Upcoming Charge",
+        "key": "charge_id",
+        "cancelled_by": [
+          "Charge Paid",
+          "Charge Failed",
+          "Charge Skipped"
+        ]
       },
       "definition": {
         "entry": "u1",
         "settings": {
-          "service_messages": true
+          "service_messages": true,
+          "reentry": "always"
         },
         "nodes": [
           {

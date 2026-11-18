@@ -349,17 +349,31 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
     assert_eq!(events(&h, "Subscription Cancelled").await, 1, "a resend counts once");
     let order: Vec<String> = sqlx::query_scalar("SELECT m.name FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name IN ('Subscription Cancelled', 'Subscription Reactivated') ORDER BY e.occurred_at, e.id").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(order, vec!["Subscription Cancelled", "Subscription Reactivated"]);
-    for name in ["subscription-skipped.json", "charge-upcoming.json", "charge-paid.json", "charge-paid.json", "charge-failed.json", "no-topic.json"] {
+    // The topic in the URL is only a hint: relabelled bodies record only what they show.
+    for name in ["subscription-relabelled.json", "subscription-created-relabelled-activated.json", "charge-queued-relabelled-paid.json"] {
+        r.post(&h, name).await;
+    }
+    assert_eq!(events(&h, "Subscription Cancelled").await, 1);
+    assert_eq!(events(&h, "Subscription Reactivated").await, 1);
+    assert_eq!(events(&h, "Charge Paid").await, 0);
+    // The charge is paid before its (late) upcoming notice: the reminder stands down.
+    for name in ["subscription-skipped.json", "charge-paid.json", "charge-upcoming.json", "charge-paid.json", "charge-failed.json", "no-topic.json"] {
         r.post(&h, name).await;
     }
     assert_eq!(values(&h, "Charge Paid", "jamie.example@example.com").await, vec![13.14]);
     assert_eq!(prop(&h, "Charge Paid", "currency").await, vec!["USD"]);
     assert_eq!(events(&h, "Charge Failed").await, 1);
-    assert_eq!(events(&h, "Subscription Skipped").await, 1);
+    assert!(sent_to(&h, "Your next order is coming up").is_empty(), "the charge it announces was already paid");
+    // A charge that's still coming up gets its reminder; once skipped, a late notice doesn't.
+    let mut next = fixture("recharge", "charge-upcoming.json")["input"]["payload"].clone();
+    next["charge"]["id"] = json!(100714429);
+    r.post_as(&h, &next.to_string(), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
+    r.post(&h, "charge-updated-skipped.json").await;
+    assert_eq!(events(&h, "Charge Skipped").await, 1);
     // Held back from marketing, but the upcoming-charge reminder (a service message) reached them.
     assert_eq!(consent(&h, "jamie.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "jamie.example@example.com").await);
-    assert_eq!(sent_to(&h, "Your next order is coming up"), vec!["jamie.example@example.com"]);
+    assert_eq!(sent_to(&h, "Your next order is coming up"), vec!["jamie.example@example.com"], "once, for the charge that wasn't paid yet");
     let names = ["charge-upcoming.json"];
     never_stored(&mut h, &r, &sensitive("recharge", &names), &names).await;
     h.cleanup().await;
@@ -809,9 +823,19 @@ async fn aftership_updates_reach_the_buyer_once_per_status() {
         assert_eq!(events(&h, m).await, 1, "{m}");
     }
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'shop@example.com'").await, 0, "the sender isn't the customer");
+    assert!(sent_to(&h, "Your order arrives today").is_empty(), "a late 'out for delivery' after 'delivered' starts nothing");
+    // Another shipment, in order: out for delivery reaches the buyer, once.
+    let mut other = fixture("aftership", "out-for-delivery.json")["input"]["payload"].clone();
+    other["event_id"] = json!("f4dadd60-0000-46d0-aa52-3ced925a50ff");
+    other["msg"]["id"] = json!("11111111111111111111111111111111");
+    a.post_as(&h, &other.to_string(), &json!({}), &json!({}), &a.secret).await;
+    assert_eq!(sent_to(&h, "Your order arrives today"), vec!["sky.example@example.com"], "a service message, once");
+    // Only the configured role: a customer without it gets nothing (no "first non-sender").
+    let before = events(&h, "Out For Delivery").await;
+    a.post(&h, "no-buyer.json").await;
+    assert_eq!(events(&h, "Out For Delivery").await, before);
     assert_eq!(consent(&h, "sky.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "sky.example@example.com").await);
-    assert_eq!(sent_to(&h, "Your order arrives today"), vec!["sky.example@example.com"], "a service message, once");
     never_stored(&mut h, &a, &sensitive("aftership", &["in-transit.json"]), &["in-transit.json"]).await;
     h.cleanup().await;
 }
