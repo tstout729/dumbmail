@@ -1,11 +1,13 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState } from "react";
 import { useBlocker, useParams } from "react-router";
-import { Settings2 } from "lucide-react";
+import { Settings2, UserPlus } from "lucide-react";
 import type { Flow, FlowDefinition, FlowNode, FlowStatus, FlowTrigger } from "../../api";
 import { useFlow, useFlowReport, useLists, useSegments, useSession, useSetFlowStatus, useUpdateFlow } from "../../api";
 import { EmailEditor } from "../../components/email/EmailEditor";
 import { CheckPanel } from "../../features/content/CheckPanel";
+import { BackfillDialog, ResultsRange, StepResultDetail, WaitingDrawer, useFlowResults } from "../../features/flowsPlus";
+import { useCan } from "../../features/team/api";
 import { FlowCanvas, nodeIcons } from "../../components/flows/FlowCanvas";
 import { FlowSettingsEditor } from "../../components/flows/FlowSettingsEditor";
 import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
@@ -62,6 +64,16 @@ function FlowBuilder({ flow }: { flow: Flow }) {
   const [panel, setPanel] = useState<Panel>(null);
   const [emailNodeId, setEmailNodeId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<FlowNode | null>(null);
+  // Per-step results, the waiting list and back-populate (features/flowsPlus).
+  const [days, setDays] = useState(30);
+  const canReadResults = useCan("messaging.read");
+  const results = useFlowResults(flow.id, days, flow.status !== "draft" && canReadResults);
+  const canSeePeople = useCan("profiles.read");
+  const canGoLive = useCan("flows.live");
+  const [waitingAt, setWaitingAt] = useState<string | null>(null);
+  const [backfill, setBackfill] = useState<{ justTurnedOn: boolean } | null>(null);
+  // Back-populate is for list and segment flows (see features/flowsPlus).
+  const canBackfill = flow.trigger.type === "list" || flow.trigger.type === "segment";
 
   const current: Draft = draft ?? { name: flow.name, trigger: flow.trigger, definition: flow.definition };
   const def = current.definition;
@@ -88,7 +100,12 @@ function FlowBuilder({ flow }: { flow: Flow }) {
     if (!(await save())) return;
     setStatus.mutate(
       { id: flow.id, status },
-      { onSuccess: () => toast.success(status === "live" ? "Flow is live" : status === "paused" ? "Flow paused" : "Flow set to draft") },
+      {
+        onSuccess: () => {
+          toast.success(status === "live" ? "Flow is live" : status === "paused" ? "Flow paused" : "Flow set to draft");
+          if (status === "live" && canBackfill && canGoLive) setBackfill({ justTurnedOn: true });
+        },
+      },
     );
   };
 
@@ -110,6 +127,8 @@ function FlowBuilder({ flow }: { flow: Flow }) {
   };
 
   const selectedNode = panel?.kind === "node" ? def.nodes.find((n) => n.id === panel.id) : undefined;
+  const selectedResult = selectedNode ? results.data?.steps.find((s) => s.node_id === selectedNode.id) : undefined;
+  const waitingNode = waitingAt ? def.nodes.find((x) => x.id === waitingAt) : undefined;
   const emailNode = emailNodeId ? def.nodes.find((n) => n.id === emailNodeId) : undefined;
   const stats = report.data?.stats ?? flow.stats;
 
@@ -133,6 +152,11 @@ function FlowBuilder({ flow }: { flow: Flow }) {
                     { value: "paused", label: "Paused" },
                   ]}
                 />
+                {canBackfill && flow.status !== "draft" ? (
+                  <Button variant="ghost" icon={<UserPlus className="size-3.5" />} onClick={() => setBackfill({ justTurnedOn: false })}>
+                    Add people
+                  </Button>
+                ) : null}
                 <Button variant="ghost" icon={<Settings2 className="size-3.5" />} onClick={() => setPanel({ kind: "settings" })}>
                   Settings
                 </Button>
@@ -151,6 +175,12 @@ function FlowBuilder({ flow }: { flow: Flow }) {
               <Stat label="Revenue" value={formatCurrency(stats.revenue)} />
             </div>
           ) : null}
+          {results.data ? (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500">
+              <span>Step numbers on the canvas: people who entered in this range, and who's waiting now.</span>
+              <ResultsRange days={days} onChange={setDays} />
+            </div>
+          ) : null}
         </Page>
       </div>
       <div className="min-h-80 flex-1">
@@ -160,6 +190,8 @@ function FlowBuilder({ flow }: { flow: Flow }) {
           triggerLabel={triggerSummary(current.trigger, listData, segments.data)}
           lists={listData}
           report={report.data}
+          results={results.data?.steps}
+          onWaiting={canSeePeople ? setWaitingAt : undefined}
           selected={panel?.kind === "node" ? panel.id : panel?.kind === "trigger" ? "trigger" : null}
           onSelectTrigger={() => setPanel({ kind: "trigger" })}
           onSelectNode={(nid) => setPanel({ kind: "node", id: nid })}
@@ -192,10 +224,15 @@ function FlowBuilder({ flow }: { flow: Flow }) {
           width={panelWidths[selectedNode.type]}
           footer={<DeleteStepButton onDelete={() => requestDelete(selectedNode)} />}
         >
-          <NodeStats node={selectedNode} report={report.data} />
+          {selectedResult ? (
+            <StepResultDetail result={selectedResult} />
+          ) : (
+            <NodeStats node={selectedNode} report={report.data} />
+          )}
           <NodeEditor
             key={selectedNode.id}
             node={selectedNode}
+            trigger={current.trigger}
             lists={listData}
             onChange={(n) => editDef(replaceNode(def, n))}
             onEditEmail={() => setEmailNodeId(selectedNode.id)}
@@ -223,6 +260,18 @@ function FlowBuilder({ flow }: { flow: Flow }) {
           onConfirm={() => doDelete(pendingDelete)}
           onClose={() => setPendingDelete(null)}
         />
+      ) : null}
+      {waitingAt ? (
+        <WaitingDrawer
+          flowId={flow.id}
+          nodeId={waitingAt}
+          stepName={waitingNode ? ("name" in waitingNode && waitingNode.name) || nodeLabels[waitingNode.type] : "this step"}
+          timeZone={account.timezone}
+          onClose={() => setWaitingAt(null)}
+        />
+      ) : null}
+      {backfill ? (
+        <BackfillDialog flowId={flow.id} live={flow.status === "live"} canStart={canGoLive} timeZone={account.timezone} justTurnedOn={backfill.justTurnedOn} onClose={() => setBackfill(null)} />
       ) : null}
       {blocker.state === "blocked" ? (
         <ConfirmDialog

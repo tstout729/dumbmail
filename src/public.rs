@@ -1168,6 +1168,16 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     let msg: Value = env["Message"].as_str().map(serde_json::from_str).transpose()?.unwrap_or(Value::Null);
     let kind = msg["eventType"].as_str().or(msg["notificationType"].as_str()).unwrap_or("");
     let Some(pid) = msg["mail"]["messageId"].as_str() else { return Ok(StatusCode::OK) };
+    // A flow notification's hard bounce or complaint only blocks that address (see
+    // features::flows_plus): it's found first, so it never counts toward pausing the account.
+    let blocks = match kind {
+        "Bounce" => msg["bounce"]["bounceType"].as_str() == Some("Permanent"),
+        "Complaint" => true,
+        _ => false,
+    };
+    if blocks && crate::features::flows_plus::notify::provider_strike(&state.db, pid, kind == "Complaint").await? {
+        return Ok(StatusCode::OK);
+    }
     // Hard bounces and complaints count toward the automatic sending pause through the send record,
     // which outlives the message (deleting a profile deletes its messages). Addresses already on the
     // SES account suppression list don't count toward AWS's bounce rate.

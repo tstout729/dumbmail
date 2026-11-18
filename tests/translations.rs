@@ -878,7 +878,7 @@ async fn translations_inside_a_saved_block_are_used_on_their_own() {
     h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
     h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "ann@x.test"}}))).await;
     h.fast_forward().await;
-    let m = h.state.email.sent().into_iter().filter(|m| m.to == "ann@x.test").last().unwrap();
+    let m = h.state.email.sent().into_iter().rfind(|m| m.to == "ann@x.test").unwrap();
     assert!(m.html.contains("À bientôt"), "{}", m.html);
     h.cleanup().await;
 }

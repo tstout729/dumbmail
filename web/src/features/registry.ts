@@ -5,6 +5,7 @@ import { feature as campaignsPlus } from "./campaignsPlus";
 import { feature as catalog } from "./catalog";
 import { feature as content } from "./content";
 import { feature as coupons } from "./coupons";
+import { feature as flowsPlus } from "./flowsPlus";
 import { feature as hub } from "./hub";
 import { feature as inbox } from "./inbox";
 import { feature as integrations } from "./integrations";
@@ -25,7 +26,7 @@ import type { DashboardFeature, FeatureNavItem, FeatureSettingsTab } from "./typ
 
 // Each feature keeps its dashboard code in its own folder and is listed here once, so adding
 // pages or menu items to a feature doesn't touch the shared router or sidebar.
-const features: DashboardFeature[] = [agent, audiences, campaignsPlus, catalog, content, coupons, hub, inbox, integrations, klaviyoImport, objects, push, reports, reviews, sendtime, shopify, team, transactional, translations, warehouse, webhooks, whatsapp];
+const features: DashboardFeature[] = [agent, audiences, campaignsPlus, catalog, content, coupons, flowsPlus, hub, inbox, integrations, klaviyoImport, objects, push, reports, reviews, sendtime, shopify, team, transactional, translations, warehouse, webhooks, whatsapp];
 
 export const featureRoutes: RouteObject[] = features.flatMap((f) => f.routes ?? []);
 export const featurePublicRoutes: RouteObject[] = features.flatMap((f) => f.publicRoutes ?? []);
