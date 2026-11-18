@@ -4,7 +4,7 @@
   "category": "Payments",
   "description": "Square orders become Placed Order once they're fully paid (counted once, in full, even when paid in several parts), and refunds Refunded Order (once per refund, its own amount, when completed). Square customers become profiles held back from marketing, and customers who unsubscribed from Square's marketing emails are never sent marketing here.",
   "metrics": [
-    "Placed Order",
+    {"name": "Placed Order", "purchase": true},
     "Refunded Order"
   ],
   "docs": [

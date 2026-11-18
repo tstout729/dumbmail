@@ -9,7 +9,7 @@
     "Subscription Cancelled",
     "Upcoming Charge",
     "Charge Processed",
-    "Charge Paid",
+    {"name": "Charge Paid", "purchase": true},
     "Charge Failed",
     "Charge Skipped"
   ],

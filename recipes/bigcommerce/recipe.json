@@ -4,7 +4,7 @@
   "category": "Ecommerce",
   "description": "BigCommerce orders become events: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount). BigCommerce's webhooks only carry an id, so DumbMail fetches each order, refund and customer from your store's API. Shoppers are held back from marketing unless you confirm that your checkout's email box is an unticked marketing opt-in.",
   "metrics": [
-    "Placed Order",
+    {"name": "Placed Order", "purchase": true},
     "Fulfilled Order",
     "Cancelled Order",
     "Refunded Order"

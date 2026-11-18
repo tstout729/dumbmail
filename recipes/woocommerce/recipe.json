@@ -4,7 +4,7 @@
   "category": "Ecommerce",
   "description": "WooCommerce orders become events on each buyer's profile: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount), with the order's items and currency. Customers become profiles held back from marketing, because WooCommerce has no marketing opt-in field. Past orders import through the REST API.",
   "metrics": [
-    "Placed Order",
+    {"name": "Placed Order", "purchase": true},
     "Fulfilled Order",
     "Cancelled Order",
     "Unpaid Order Cancelled",

@@ -166,6 +166,29 @@ mod tests {
         }
     }
 
+    /// Only real purchases and stays are marked as such (a review asked about one is verified):
+    /// paid orders and charges and confirmed reservations, never inquiries, carts, forms or calls
+    /// anyone with a write key could send.
+    #[test]
+    fn purchase_metrics_are_paid_orders_and_confirmed_stays() {
+        let marked: std::collections::BTreeMap<String, Vec<String>> =
+            all().iter().map(|r| (r.key.clone(), metric_names(&r.manifest["metrics"], true))).filter(|(_, m)| !m.is_empty()).collect();
+        let want: std::collections::BTreeMap<String, Vec<String>> = [
+            ("bigcommerce", "Placed Order"),
+            ("guesty", "Reservation Confirmed"),
+            ("hostaway", "Reservation Confirmed"),
+            ("paddle", "Placed Order"),
+            ("recharge", "Charge Paid"),
+            ("square", "Placed Order"),
+            ("stripe", "Placed Order"),
+            ("woocommerce", "Placed Order"),
+        ]
+        .into_iter()
+        .map(|(k, m)| (k.to_string(), vec![m.to_string()]))
+        .collect();
+        assert_eq!(marked, want);
+    }
+
     /// The script input a fixture describes, filled in the way the engine fills it.
     fn fixture_input(r: &Recipe, f: &Value) -> Value {
         let mut input = f["input"].clone();

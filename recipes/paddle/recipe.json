@@ -4,7 +4,7 @@
   "category": "Subscriptions",
   "description": "Paddle Billing becomes events: Placed Order for each completed transaction, Refunded Order for each approved refund (its own amount), and Subscription Started and Cancelled. Customers who ticked Paddle Checkout's marketing box are subscribed to email; everyone else is held back from marketing.",
   "metrics": [
-    "Placed Order",
+    {"name": "Placed Order", "purchase": true},
     "Refunded Order",
     "Subscription Started",
     "Subscription Cancelled"
