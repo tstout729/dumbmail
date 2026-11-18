@@ -28,6 +28,8 @@ const TEXT_CHARS: usize = 6000;
 /// The most messages in one check (a flow's steps, a campaign's versions).
 const MAX_MESSAGES: usize = 25;
 const MAX_LINKS: usize = 40;
+/// The most live flows one saved block edit checks (more: the edit is refused).
+const MAX_FLOWS_PER_BLOCK: i64 = 10;
 /// Established accounts (rules decide when the model can't be reached): approved, this many real
 /// emails over at least this many days, and no pause in the last 30 days.
 pub const ESTABLISHED_EMAILS: i64 = 1000;
@@ -41,6 +43,20 @@ static BARE_URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"')
 
 fn host(u: &str) -> Option<String> {
     url::Url::parse(u.trim()).ok().and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
+}
+
+/// Where a link goes, as judged: scheme, host, path and query, without link tags (`utm_…`, added
+/// at send time) or the fragment, so any other change to a destination is checked again.
+fn destination(href: &str) -> String {
+    let Ok(mut u) = url::Url::parse(href.trim()) else { return href.chars().take(300).collect() };
+    let kept: Vec<(String, String)> = u.query_pairs().filter(|(k, _)| !k.to_ascii_lowercase().starts_with("utm_")).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    u.set_fragment(None);
+    if kept.is_empty() {
+        u.set_query(None);
+    } else {
+        u.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    u.to_string().chars().take(300).collect()
 }
 
 /// One rendered message, reduced to what a check looks at.
@@ -57,8 +73,7 @@ fn message(channel: &str, rendered: &Value) -> Value {
         .filter_map(|c| {
             let href = c[1].replace("&amp;", "&");
             let d = host(&href)?;
-            // The destination's domain only: link tags added at send time don't change what's judged.
-            Some(json!({"text": fetch::visible_text(&c[2], 120), "domain": d}))
+            Some(json!({"text": fetch::visible_text(&c[2], 120), "to": destination(&href), "domain": d}))
         })
         .collect();
     json!({
@@ -484,29 +499,42 @@ pub async fn before_saved_block_edit(state: &AppState, account_id: Uuid, id: Uui
     if !super::on(state) {
         return Ok(());
     }
+    // Every live flow that uses it is checked; past the cap the edit is refused rather than any skipped.
     let flows: Vec<FlowRow> = sqlx::query_as(
-        "SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND jsonb_path_exists(definition, '$.** ? (@.type == \"saved\" && @.saved_block_id == $id)'::jsonpath, jsonb_build_object('id', $2::text)) LIMIT 50",
+        "SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND jsonb_path_exists(definition, '$.** ? (@.type == \"saved\" && @.saved_block_id == $id)'::jsonpath, jsonb_build_object('id', $2::text)) ORDER BY id LIMIT $3",
     )
     .bind(account_id)
     .bind(id.to_string())
+    .bind(MAX_FLOWS_PER_BLOCK + 1)
     .fetch_all(&state.db)
     .await?;
     if flows.is_empty() {
         return Ok(());
     }
+    if flows.len() as i64 > MAX_FLOWS_PER_BLOCK {
+        return Err(AppError::Conflict(format!(
+            "This saved block is used by more than {MAX_FLOWS_PER_BLOCK} live flows, too many to check at once. Turn some of them off or detach the block, then save again."
+        )));
+    }
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
+    let mut materials = Vec::new();
     for f in flows {
         let uses: BTreeMap<String, (String, Value)> = steps(&f.definition)
             .into_iter()
             .filter(|(_, (_, c))| c.to_string().contains(&id.to_string()))
             .map(|(k, (ch, c))| (k, (ch, with_saved(&c, &id.to_string(), blocks))))
             .collect();
-        if uses.is_empty() {
-            continue;
+        if !uses.is_empty() {
+            materials.push(flow_material(state, &f, &uses).await?);
         }
-        let m = flow_material(state, &f, &uses).await?;
-        let r = check(state, &account, &m, DEADLINE).await?;
-        apply(state, account_id, &m, &r).await?;
+    }
+    // Checked side by side (the model calls are limited server-wide), all within the deadline.
+    let checks = futures_util::future::join_all(materials.iter().map(|m| check(state, &account, m, DEADLINE)));
+    let results = tokio::time::timeout(DEADLINE + Duration::from_secs(5), checks)
+        .await
+        .map_err(|_| AppError::Busy("Checking the live flows that use this block took too long. Try saving again in a minute.".into()))?;
+    for (m, r) in materials.iter().zip(results) {
+        apply(state, account_id, m, &r?).await?;
     }
     Ok(())
 }
@@ -523,6 +551,13 @@ mod tests {
             first_campaign: first,
             messages: vec![message("email", &json!({"subject": subject, "preheader": "", "html": html}))],
         }
+    }
+
+    #[test]
+    fn destinations_keep_all_but_link_tags() {
+        assert_eq!(destination("https://acme.test/fall?utm_source=dm&utm_campaign=x#top"), "https://acme.test/fall");
+        assert_eq!(destination("https://acme.test/p?id=7&utm_medium=email"), "https://acme.test/p?id=7");
+        assert_ne!(destination("https://acme.test/a"), destination("https://acme.test/b"));
     }
 
     #[test]

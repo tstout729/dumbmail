@@ -39,12 +39,14 @@ fn email_column(h: &str) -> bool {
 /// Headers and statistics, in one pass over the file, without keeping any address.
 pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).trim(csv::Trim::All).from_reader(csv_text.as_bytes());
-    let headers: Vec<String> = match rdr.headers() {
-        Ok(h) => h.iter().map(|h| h.trim_start_matches('\u{feff}').chars().take(80).collect()).collect(),
+    // The full names pick the email columns, as the import does; only the copy kept is shortened.
+    let full: Vec<String> = match rdr.headers() {
+        Ok(h) => h.iter().map(|h| h.trim_start_matches('\u{feff}').to_string()).collect(),
         Err(_) => return (Vec::new(), ImportStats::default(), Vec::new()),
     };
+    let headers: Vec<String> = full.iter().take(200).map(|h| h.chars().take(80).collect()).collect();
     // The same column the import reads: of the email columns, the last one filled in on each row.
-    let cols: Vec<usize> = headers.iter().enumerate().filter(|(_, h)| email_column(h)).map(|(i, _)| i).collect();
+    let cols: Vec<usize> = full.iter().enumerate().filter(|(_, h)| email_column(h)).map(|(i, _)| i).collect();
     let mut s = ImportStats { consent_columns: headers.iter().filter(|h| consent_column(h)).take(10).cloned().collect(), ..Default::default() };
     let mut domains: HashMap<String, u64> = HashMap::new();
     for rec in rdr.records() {
