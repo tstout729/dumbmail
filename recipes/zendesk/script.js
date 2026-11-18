@@ -24,14 +24,19 @@ function handle(input) {
   var up = { type: "upsert_profile", email: p.requester_email, keys: { zendesk_ticket: String(p.ticket_id) } };
   // Anyone can email support under any name, so the requester's name never changes a profile.
   var props = { ticket_id: String(p.ticket_id), subject: p.subject, status: p.status, via: p.via };
+  // Zendesk's times are to the minute, so the event id also takes the trigger's invocation id
+  // (the same on every retry of one notification, different for each new one) and the status or
+  // rating: two solves or ratings in one minute stay apart, a retry stays the same.
+  var invocation = String((input.headers || {})["x-zendesk-webhook-invocation-id"] || "");
+  var version = when + ":" + (p.status || "") + ":" + (p.rating || "") + (invocation ? ":" + invocation : "");
   for (var k in props) if (props[k] === undefined || props[k] === null || props[k] === "") delete props[k];
   var ev = String(p.event || "");
   if (ev === "created") return [up, { type: "track_event", metric: "Ticket Created", profile: who, time: iso(p.created_at) || when, unique_id: "zendesk:" + p.ticket_id + ":created", properties: props }];
-  if (ev === "solved") return [up, { type: "track_event", metric: "Ticket Solved", profile: who, time: when, unique_id: "zendesk:" + p.ticket_id + ":solved:" + when, properties: props }];
+  if (ev === "solved") return [up, { type: "track_event", metric: "Ticket Solved", profile: who, time: when, unique_id: "zendesk:" + p.ticket_id + ":solved:" + version, properties: props }];
   if (ev === "satisfaction") {
     if (!p.rating) return [{ type: "log", message: "ticket " + p.ticket_id + " has no rating" }];
     props.rating = p.rating;
-    return [up, { type: "track_event", metric: "Satisfaction Rated", profile: who, time: when, unique_id: "zendesk:" + p.ticket_id + ":rating:" + when, properties: props }];
+    return [up, { type: "track_event", metric: "Satisfaction Rated", profile: who, time: when, unique_id: "zendesk:" + p.ticket_id + ":rating:" + version, properties: props }];
   }
   return [{ type: "log", message: "unknown event " + (ev || "(none)") + " in the trigger body" }];
 }

@@ -11,22 +11,13 @@
       "type": "upsert_profile"
     },
     {
-      "metric": "Placed Order",
-      "profile": {
-        "email": "avery.example@example.com"
+      "context": {
+        "who": {
+          "email": "avery.example@example.com"
+        }
       },
-      "properties": {
-        "currency": "USD",
-        "location_id": "S8GWD5R9QB376",
-        "order_id": "03O3USaPaAaFnI6kkwB1JxGgBsUZY",
-        "payment_id": "hYy9pRFVxpDsO1FB05SunFWUe9JZY",
-        "receipt_number": "hYy9",
-        "source_type": "CARD"
-      },
-      "time": "2020-11-22T21:19:00.831Z",
-      "type": "track_event",
-      "unique_id": "square:payment:hYy9pRFVxpDsO1FB05SunFWUe9JZY",
-      "value": 1
+      "type": "next_request",
+      "url": "/v2/orders/03O3USaPaAaFnI6kkwB1JxGgBsUZY"
     }
   ],
   "input": {

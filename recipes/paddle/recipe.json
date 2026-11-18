@@ -16,7 +16,8 @@
     "https://developer.paddle.com/webhooks/adjustments/adjustment-updated",
     "https://developer.paddle.com/webhooks/subscriptions/subscription-created",
     "https://developer.paddle.com/webhooks/subscriptions/subscription-canceled",
-    "https://developer.paddle.com/webhooks/customers/customer-created"
+    "https://developer.paddle.com/webhooks/customers/customer-created",
+    "https://developer.paddle.com/concepts/sell/supported-currencies"
   ],
   "signature": {
     "type": "hmac",

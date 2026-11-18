@@ -1,7 +1,7 @@
 // Segment → DumbMail (Webhooks destination)
 //
-// identify calls with traits.email become profiles (matched by email; the Segment userId is kept as a
-// key). track calls become events named after the Segment event, only for the event names listed in
+// identify calls with traits.email become profiles (matched by the Segment userId first, then
+// email; the userId is kept as a key, on one profile only). track calls become events named after the Segment event, only for the event names listed in
 // settings.events (and in the integration's metrics), on the person an earlier identify gave that
 // userId (waiting for it if needed). An email inside a track call is never used to pick the person.
 // Each call's messageId is its unique id. Nobody is subscribed: Segment calls carry no marketing
@@ -40,7 +40,11 @@ function handle(input) {
   if (c.type === "identify") {
     var t = c.traits || {};
     if (!t.email) return [{ type: "log", message: "identify without traits.email" }];
+    // Matched by the Segment userId first (as a namespaced external id), so a new email for the same
+    // user changes that profile's address (its consent doesn't carry over) instead of putting the
+    // userId on a second profile.
     var up = { type: "upsert_profile", email: t.email };
+    if (c.userId) up.external_id = "segment:" + String(c.userId).slice(0, 190);
     if (c.userId) up.keys = { segment_user_id: String(c.userId) };
     return [up];
   }

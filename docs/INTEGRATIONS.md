@@ -90,6 +90,7 @@ Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `e
 
 - Needs at least one of `email`, `phone_number` (E.164, like `+15035550100`), `external_id`. Matching order: external id, then email, then phone.
 - `properties` merge into the profile's properties.
+- A `consent` block may carry `as_of` (the app's own time for the preference: an older change than one this integration already applied is ignored) and, with `subscribed: false`, `only_own: true` (withdraw only a subscription this integration made; consent from anywhere else is left alone).
 - **Consent never changes unless you send a `consent` block**, which must name the `channel` (`email` or `sms`), `subscribed` (`true` or `false`) and the `source` of the opt-in. Use it only when the person actually opted in through the app. Subscribing never overrides an earlier unsubscribe. A subscription records a "Subscribed to Email Marketing" (or SMS) event with the source.
 - `marketing: false` suppresses the email address from all marketing email, with a reason shown on the profile. Use it for addresses that must never get marketing.
 - Booking-site relay addresses (Airbnb `@guest.airbnb.com`, Booking.com `@guest.booking.com`, Vrbo/HomeAway, Expedia and others) are detected automatically on every profile an integration writes and suppressed from email, with the reason "booking-site relay address". Their terms forbid marketing to them.
@@ -136,6 +137,14 @@ Records an unsubscribe on `email` or `sms`, as if they clicked the link.
 ```
 
 The address must never get marketing: an email is suppressed, a phone number is unsubscribed from SMS. Creates the profile if needed.
+
+### add_keys
+
+```json
+{"type": "add_keys", "profile": {"property": "square_customer", "value": "C1", "if_missing": "retry"}, "keys": {"square_payment": "P1"}}
+```
+
+Adds ids to the `keys` of a person found another way, so later actions find them by these ids too (a payment that names only its customer, so the refund that names only the payment finds them). Up to 20 keys, as in `upsert_profile`.
 
 ### set_state
 

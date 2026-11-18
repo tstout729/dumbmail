@@ -4,6 +4,7 @@
   "expect": [
     {
       "email": "achilles.example@example.com",
+      "external_id": "segment:019mr8mf4r",
       "keys": {
         "segment_user_id": "019mr8mf4r"
       },

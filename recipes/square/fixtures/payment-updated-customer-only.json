@@ -1,26 +1,28 @@
 {
-  "description": "a completed payment with a customer id but no buyer email: found through the customer key (retried until the customer is known)",
+  "description": "a completed payment with a customer id but no buyer email: the payment is linked to the customer's person (so its refund finds them), then its order is fetched",
   "doc": "https://developer.squareup.com/reference/square/payments-api/webhooks/payment.updated (example; buyer_email_address and customer_id are documented Payment fields, with fake values)",
   "expect": [
     {
-      "metric": "Placed Order",
+      "keys": {
+        "square_payment": "R2NoEmailPayment0000000000000"
+      },
       "profile": {
         "if_missing": "retry",
         "property": "square_customer",
         "value": "QPTXM8PQNX3Q726ZYHPMNP46XC"
       },
-      "properties": {
-        "currency": "USD",
-        "location_id": "S8GWD5R9QB376",
-        "order_id": "03O3USaPaAaFnI6kkwB1JxGgBsUZY",
-        "payment_id": "R2NoEmailPayment0000000000000",
-        "receipt_number": "hYy9",
-        "source_type": "CARD"
+      "type": "add_keys"
+    },
+    {
+      "context": {
+        "who": {
+          "if_missing": "retry",
+          "property": "square_customer",
+          "value": "QPTXM8PQNX3Q726ZYHPMNP46XC"
+        }
       },
-      "time": "2020-11-22T21:19:00.831Z",
-      "type": "track_event",
-      "unique_id": "square:payment:R2NoEmailPayment0000000000000",
-      "value": 1
+      "type": "next_request",
+      "url": "/v2/orders/03O3USaPaAaFnI6kkwB1JxGgBsUZY"
     }
   ],
   "input": {

@@ -483,12 +483,55 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
 
 // ---------- Square ----------
 
+#[derive(Default)]
+struct MockSquare {
+    /// What the order says is still due (in cents).
+    due: std::sync::atomic::AtomicI64,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+/// A stand-in for Square's `GET /v2/orders/{order_id}` (`{"order": {...}}`, Bearer token), with the
+/// documented example order paid in two parts.
+async fn mock_square() -> (std::sync::Arc<MockSquare>, String) {
+    use axum::extract::State;
+    use axum::routing::get;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    let m: Arc<MockSquare> = Default::default();
+    let app = axum::Router::new()
+        .route(
+            "/v2/orders/{id}",
+            get(|State(m): State<Arc<MockSquare>>, h: axum::http::HeaderMap| async move {
+                assert_eq!(h.get("authorization").and_then(|v| v.to_str().ok()), Some("Bearer sq-access-token-0001"));
+                m.reads.fetch_add(1, Ordering::SeqCst);
+                let mut o = fixture("square", "fetch-order-paid.json")["input"]["payload"].clone();
+                let due = m.due.load(Ordering::SeqCst);
+                o["order"]["net_amount_due_money"]["amount"] = json!(due);
+                if due > 0 {
+                    o["order"]["state"] = json!("OPEN");
+                }
+                axum::Json(o)
+            }),
+        )
+        .with_state(m.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (m, format!("http://{addr}"))
+}
+
 #[tokio::test]
-async fn square_signs_its_url_and_refunds_find_their_payment() {
+async fn square_signs_its_url_counts_orders_once_and_refunds_find_their_payment() {
     let mut h = integ_harness!();
     h.signup().await;
     h.credit(5.0).await;
+    let (api, base) = mock_square().await;
     let s = install(&mut h, "square", Sign::SquareUrl, "square-signature-key-0001", false).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", s.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/v2/locations"));
+    h.ok("PATCH", &format!("/api/integrations/{}", s.id), Some(json!({"pull": pull, "credentials": {"access_token": "sq-access-token-0001"}}))).await;
     live_flow(&mut h, "Placed Order", "Your receipt", true).await;
     s.refused(&h, "payment-updated-completed.json").await;
     // The signature covers the URL: the right body and secret on another URL is refused.
@@ -498,29 +541,38 @@ async fn square_signs_its_url_and_refunds_find_their_payment() {
     let mut hdrs: Vec<(&str, &str)> = wrong.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     hdrs.push(("content-type", "application/json"));
     assert_eq!(h.raw("POST", &s.path(), &hdrs, &body).await.0, StatusCode::UNAUTHORIZED);
-    // A refund that arrives before its payment waits for it; pending ones aren't counted.
-    s.post(&h, "refund-created-pending.json").await;
-    s.post(&h, "refund-updated-completed.json").await;
+    s.post(&h, "customer-created.json").await;
     s.post(&h, "payment-created-approved.json").await;
-    assert_eq!(events(&h, "Placed Order").await, 0, "approved isn't completed");
+    // The first of two payments for one order: 1.50 is still due, so it isn't an order yet.
+    api.due.store(150, std::sync::atomic::Ordering::SeqCst);
     s.post(&h, "payment-updated-completed.json").await;
+    assert_eq!(events(&h, "Placed Order").await, 0, "part paid");
     let (_, again) = s.post_as(&h, &body, &json!({}), &json!({}), &s.secret).await;
     assert!(again.contains("duplicate"), "Square's resend is recognized by event_id: {again}");
-    retry_now(&h).await;
-    assert_eq!(values(&h, "Placed Order", "avery.example@example.com").await, vec![1.0]);
-    assert_eq!(values(&h, "Refunded Order", "avery.example@example.com").await, vec![0.6]);
-    // A payment naming only the customer finds them once the customer arrives.
+    // The second payment names only the customer; once it completes, nothing is due: one order, in full.
+    api.due.store(0, std::sync::atomic::Ordering::SeqCst);
     s.post(&h, "payment-updated-customer-only.json").await;
-    s.post(&h, "customer-created.json").await;
+    assert_eq!(values(&h, "Placed Order", "avery.example@example.com").await, vec![2.5], "the whole order once, not one per payment");
+    assert_eq!(prop(&h, "Placed Order", "order_id").await, vec!["03O3USaPaAaFnI6kkwB1JxGgBsUZY"]);
+    // A refund of the customer-only payment finds the person through the link that payment saved.
+    let mut rf = fixture("square", "refund-updated-completed.json")["input"]["payload"].clone();
+    rf["event_id"] = json!("refund-for-customer-only");
+    rf["data"]["object"]["refund"]["id"] = json!("R2Refund0001");
+    rf["data"]["object"]["refund"]["payment_id"] = json!("R2NoEmailPayment0000000000000");
+    s.post_as(&h, &rf.to_string(), &json!({}), &json!({}), &s.secret).await;
+    s.post(&h, "refund-created-pending.json").await;
+    s.post(&h, "refund-updated-completed.json").await;
+    assert_eq!(values(&h, "Refunded Order", "avery.example@example.com").await, vec![0.6, 0.6], "both refunds found their buyer; the pending one isn't counted");
     s.post(&h, "customer-updated-unsubscribed.json").await;
-    assert_eq!(events(&h, "Placed Order").await, 2);
     assert_eq!(consent(&h, "avery.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "avery.example@example.com").await);
     let reason: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE email = 'quinn.example@example.com'").fetch_one(&h.state.db).await.unwrap();
     assert!(reason.is_some(), "unsubscribed from Square's marketing: never sent marketing here");
     assert_eq!(sent_to(&h, "Your receipt"), vec!["avery.example@example.com"]);
+    let mut needles = sensitive("square", &["payment-updated-completed.json", "customer-created.json"]);
+    needles.push("sq-access-token-0001".into());
     let names = ["payment-updated-completed.json", "customer-created.json"];
-    never_stored(&mut h, &s, &sensitive("square", &names), &names).await;
+    never_stored(&mut h, &s, &needles, &names).await;
     h.cleanup().await;
 }
 
@@ -927,7 +979,9 @@ async fn zendesk_tickets_keep_only_subject_and_status() {
         z.post(&h, name).await;
     }
     assert_eq!(events(&h, "Ticket Created").await, 1);
-    assert_eq!(events(&h, "Ticket Solved").await, 1, "the resent solve counts once");
+    assert_eq!(events(&h, "Ticket Solved").await, 1, "the resent solve (same invocation) counts once");
+    z.post(&h, "ticket-solved-again.json").await;
+    assert_eq!(events(&h, "Ticket Solved").await, 2, "solved again in the same minute: a new invocation, a second event");
     assert_eq!(prop(&h, "Satisfaction Rated", "rating").await, vec!["Good, I'm satisfied"]);
     assert_eq!(consent(&h, "kai.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "kai.example@example.com").await);
@@ -984,13 +1038,17 @@ async fn segment_identify_then_track() {
     retry_now(&h).await;
     s.post(&h, "track-unlisted.json").await;
     s.post(&h, "track-from-browser.json").await;
+    // The same userId with a new email: the same profile's address changes; the userId is never on two profiles.
+    s.post(&h, "identify-new-email.json").await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE integration_keys->'segment_user_id' ? '019mr8mf4r'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'achilles.new@example.com' AND external_id = 'segment:019mr8mf4r'").await, 1);
     s.post(&h, "page.json").await;
     let (_, again) = s.post_as(&h, &fixture("segment", "track-order-completed.json")["input"]["payload"].to_string(), &json!({}), &json!({}), &s.secret).await;
     assert!(again.contains("duplicate"), "{again}");
-    assert_eq!(values(&h, "Order Completed", "achilles.example@example.com").await, vec![39.95]);
+    assert_eq!(values(&h, "Order Completed", "achilles.new@example.com").await, vec![39.95], "the order stays with the person (now at the new address)");
     assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE name = 'Purchased an Item'").await, 0);
-    assert_eq!(consent(&h, "achilles.example@example.com").await, (true, "never_subscribed".into()));
-    assert!(!campaign_reaches(&mut h, "achilles.example@example.com").await);
+    assert_eq!(consent(&h, "achilles.new@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "achilles.new@example.com").await);
     assert_eq!(sent_to(&h, "Thanks from Segment"), vec!["achilles.example@example.com"]);
     never_stored(&mut h, &s, &sensitive("segment", &["identify.json"]), &["identify.json"]).await;
     h.cleanup().await;

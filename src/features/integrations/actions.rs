@@ -166,6 +166,15 @@ pub struct Suppress {
     pub phone_number: Option<String>,
 }
 
+/// Add ids to the `keys` of a person found another way (by a key or property, say), so later
+/// actions find them by these ids too: a payment that names only its customer, say.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddKeys {
+    pub profile: Who,
+    pub keys: Map<String, Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetState {
@@ -209,12 +218,13 @@ pub enum Action {
     RemoveFromList(ListAction),
     Unsubscribe(Unsubscribe),
     Suppress(Suppress),
+    AddKeys(AddKeys),
     SetState(SetState),
     Log(Log),
     NextRequest(NextRequest),
 }
 
-pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "set_state", "log", "next_request"];
+pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request"];
 
 fn part<T: DeserializeOwned>(i: usize, kind: &str, v: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(v)).map_err(|e| format!("action {i} ({kind}): {e}"))
@@ -397,6 +407,20 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     return Err(format!("action {i} ({k}): needs an email or phone_number"));
                 }
                 Action::Suppress(a)
+            }
+            "add_keys" => {
+                let a: AddKeys = part(i, k, obj)?;
+                check_who(i, k, &a.profile)?;
+                if a.keys.is_empty() || a.keys.len() > 20 {
+                    return Err(format!("action {i} ({k}): give 1 to 20 keys"));
+                }
+                for (name, v) in &a.keys {
+                    let ok = v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200);
+                    if name.is_empty() || name.len() > 100 || !ok {
+                        return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
+                    }
+                }
+                Action::AddKeys(a)
             }
             "set_state" => {
                 let a: SetState = part(i, k, obj)?;
@@ -925,6 +949,20 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     out.counts.list_removes += n as u32;
                 }
                 out.effect(i, format!("{} {} {} {list_name:?}", if adding { "added" } else { "removed" }, who_label(&l.profile), if adding { "to" } else { "from" }));
+            }
+            Action::AddKeys(k) => {
+                let Some(found) = resolve(state, src, &k.profile, dry, out).await? else {
+                    out.counts.skipped += 1;
+                    out.effect(i, format!("skipped adding keys: no profile has {}", who_label(&k.profile)));
+                    continue;
+                };
+                let names: Vec<&str> = k.keys.keys().map(String::as_str).collect();
+                if dry {
+                    out.effect(i, format!("would add {} to {}", names.join(", "), who_label(&k.profile)));
+                    continue;
+                }
+                add_keys(state, src.account_id, found.id, &k.keys).await?;
+                out.effect(i, format!("added {} to {}", names.join(", "), who_label(&k.profile)));
             }
             Action::Unsubscribe(u) => {
                 let Some(found) = resolve(state, src, &u.profile, dry, out).await? else {

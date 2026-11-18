@@ -12,7 +12,9 @@
 // subscription that came from Paddle (and leaves consent from anywhere else alone).
 // See README.md for the Paddle page behind each assumption.
 
-var ZERO_DECIMAL = ["JPY", "KRW"];
+// Paddle's currency exponents (Supported currencies): these have no minor unit; the others it
+// lists use two decimals.
+var ZERO_DECIMAL = ["CLP", "JPY", "KRW"];
 
 function money(s, currency) {
   var n = parseInt(s, 10);

@@ -1,7 +1,10 @@
 // Square → DumbMail
 //
-// Placed Order: once per payment (square:payment:<id>), when payment.created or payment.updated
-//   says it's COMPLETED. Approved, pending, canceled and failed payments aren't orders.
+// Placed Order: once per order. A COMPLETED payment for an order (payment.created or
+//   payment.updated) fetches the order (GET /v2/orders/{id}), and the order counts once, by its
+//   id, at its total_money, when nothing is due on it any more (net_amount_due_money 0): an order
+//   paid in several parts counts once, in full. A payment with no order counts on its own, once.
+//   Approved, pending, canceled and failed payments aren't orders.
 // Refunded Order: once per refund (square:refund:<id>), when refund.created or refund.updated says
 //   it's COMPLETED, with the refund's own amount. A refund names only its payment, so it finds the
 //   buyer through the payment id saved on their profile (and waits for the payment if needed).
@@ -43,8 +46,14 @@ function payment(e, p) {
     who = { email: p.buyer_email_address };
   } else if (p.customer_id) {
     who = { property: "square_customer", value: p.customer_id, if_missing: "retry" };
+    // Link the payment to its person, so a refund (which names only the payment) finds them.
+    out.push({ type: "add_keys", profile: who, keys: { square_payment: p.id } });
   } else {
     return [{ type: "log", message: "payment " + p.id + " names no buyer email or customer, so there's nobody to match" }];
+  }
+  if (p.order_id && /^[A-Za-z0-9_-]{1,64}$/.test(p.order_id)) {
+    out.push({ type: "next_request", url: "/v2/orders/" + p.order_id, context: { who: who } });
+    return out;
   }
   out.push({
     type: "track_event", metric: "Placed Order", profile: who, value: amount,
@@ -76,7 +85,23 @@ function customer(c) {
   return [p];
 }
 
+// The order a completed payment belongs to: counted once, in full, when nothing is due on it.
+function order(input) {
+  var o = (input.payload || {}).order;
+  var who = input.context && input.context.who;
+  if (!o || !o.id || !who) return [{ type: "log", message: "no order in the answer" }];
+  var due = o.net_amount_due_money ? o.net_amount_due_money.amount : undefined;
+  var total = money(o.total_money);
+  if (due !== 0 || !(total > 0)) return [{ type: "log", message: "order " + o.id + " isn't fully paid yet; it's recorded when its last payment completes" }];
+  return [{
+    type: "track_event", metric: "Placed Order", profile: who, value: total,
+    time: o.closed_at || o.updated_at, unique_id: "square:order:" + o.id,
+    properties: clean({ order_id: o.id, location_id: o.location_id, currency: o.total_money.currency, payments: (o.tenders || []).length || undefined }),
+  }];
+}
+
 function handle(input) {
+  if (input.source === "fetch") return order(input);
   var e = input.payload || {};
   var obj = (e.data && e.data.object) || {};
   if (e.type === "payment.created" || e.type === "payment.updated") return obj.payment ? payment(e, obj.payment) : [{ type: "log", message: "no payment in " + e.type }];

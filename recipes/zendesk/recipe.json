@@ -25,6 +25,9 @@
     "label": "Zendesk webhook signing secret",
     "help": "Admin Center \u2192 Apps and integrations \u2192 Webhooks \u2192 your webhook \u2192 Reveal secret."
   },
+  "message_id": {
+    "header": "x-zendesk-webhook-invocation-id"
+  },
   "credentials": [],
   "settings": {},
   "pull": null,
