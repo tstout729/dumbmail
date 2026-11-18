@@ -754,7 +754,7 @@ async fn browser_details_are_never_loaded_and_a_trusted_order_takes_over_the_lin
     // names the product, with no image: the name becomes public, the browser's image never does.
     let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "TEE", "name": "Comfy tee", "order_id": "77"}))).await;
     let url = v["requests"][0]["url"].as_str().unwrap_or_else(|| panic!("the verified order takes the line: {v}"));
-    let new_links = vec![url.rsplit('/').next().unwrap().to_string()];
+    let new_links = [url.rsplit('/').next().unwrap().to_string()];
     assert_ne!(new_links[0], old);
     let (s, _, _) = h.raw("GET", &format!("/e/review/{old}"), &[], "").await;
     assert_eq!(s, StatusCode::NOT_FOUND, "the old link stops working");
