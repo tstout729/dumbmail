@@ -6,13 +6,20 @@ Ready-made integrations (*recipes*) exist for Guesty, Stripe and Calendly. Start
 
 ## Build one in five steps
 
-1. `create_integration` with a name and a script. The answer includes `inbound_url`, the secret URL the app should POST to.
+1. `create_integration` with a name, a script and the `metrics` (event names) the script records. The answer includes `inbound_url`, the secret URL the app should POST to.
 2. Find out how the app signs its webhooks and set `signature` and `signature_secret` (see Signatures).
 3. `test_integration` with a real sample payload from the app's docs. It returns exactly what would be written, and writes nothing. Fix the script until it's right.
 4. Point the app at `inbound_url` (in its dashboard or through its API).
 5. Watch `list_integration_deliveries`. Fix the script and `replay_integration_deliveries` with `all_failed: true` if anything failed.
 
 For apps without webhooks, or to import history, add a `pull` (see Pulls) and test it with `test_integration` and `pull: true`.
+
+## Who can do what
+
+- **Managers, admins and the owner** (`integrations.read`) see integrations, their status and the delivery log: each delivery's time, status, error and counts. API keys need the `account` scope (`account:read` to read); plain `read` isn't enough, because an integration's URL is itself a credential.
+- **Admins and the owner** (`integrations.manage`) create, change and delete integrations, their secrets and credentials, test and run them, replay deliveries, import history, install recipes, and see the inbound URL, saved state, stored payloads and what the script wrote (personal data).
+- Creating, changing and deleting integrations, changing their secrets, replays and history imports are recorded in the audit log (field names and credential names, never values or payloads).
+- Only the inbound URL (`POST /webhooks/in/{token}`) is public. It's checked by its token and the integration's signature settings.
 
 ## Consent: people an integration adds are held back from marketing
 
@@ -22,11 +29,14 @@ An integration usually learns about people because they booked or bought, not be
 - Flows email them only when the flow is marked as service messages (`definition.settings.service_messages: true`): messages about their own booking or order, like a booking confirmation or arrival details. Never use it for promotions.
 - Unsubscribed and suppressed people get nothing, service messages or not.
 - The hold clears the moment they subscribe by any route: a sign-up form, double opt-in, the API, or a `consent` block from the integration.
-- It's never set on someone who already existed, and the profile page says "Hasn't agreed to marketing. Added by <integration>."
+- It's never set on someone who already existed, and the profile page says "Hasn't agreed to marketing. Added by <integration>." It's set in the same step that creates the profile, so a failure never leaves an unheld one behind.
+- A service-message flow reaches a held person only at the email address an integration supplied. If the address changes any other way, they get nothing more until they opt in.
+- A back-in-stock alert the person asked for and confirmed still reaches them (it doesn't clear the hold).
+- A web form or the website script never adds or changes an email or phone on a profile an integration wrote when it matched that profile by another identifier: a different email gets its own profile. Consent from a form applies only to the address or number typed into it.
 
 If everyone the app sends really did agree to marketing email from this business (for example a newsletter tool), set `contacts_opted_in: true` on the integration. Only do this when the user confirms it.
 
-Events an integration records are trusted by flows, so their metrics become *server-only*: the public browser endpoint (`/client/events`) refuses them for that account. The private API and MCP can still record them.
+Events an integration records are trusted by flows. So each integration declares the metrics its script records (`metrics`, up to 50), and they become *server-only* the moment the integration is saved: the public browser endpoint (`/client/events`) refuses them for that account, even before the first real one arrives. The script can record only declared metrics (anything else fails the delivery with a message saying so), and never DumbMail's own alerts (`Back in Stock`, `Price Dropped`, `Subscribed to Back in Stock`). The private API and MCP can still record them. When a trusted event (from DumbMail, the API or an integration) has the same `unique_id` as one a browser sent earlier, it replaces the browser's copy, so flows treat it as new.
 
 ## The script
 
@@ -83,6 +93,7 @@ Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `e
 - `marketing: false` suppresses the email address from all marketing email, with a reason shown on the profile. Use it for addresses that must never get marketing.
 - Booking-site relay addresses (Airbnb `@guest.airbnb.com`, Booking.com `@guest.booking.com`, Vrbo/HomeAway, Expedia and others) are detected automatically on every profile an integration writes and suppressed from email, with the reason "booking-site relay address". Their terms forbid marketing to them.
 - Profiles an integration creates are marked with it as their source (shown on the profile), and held back from marketing unless the action opts them in or the integration has `contacts_opted_in` (see Consent).
+- `keys` (`{"stripe_payment_intent": "pi_123"}`): ids that identify the person in the app and can be many (payments, bookings). Each value is added to the person's list for that key (the newest 100 are kept), not shown as a property, and found later with `profile: {"property": "stripe_payment_intent", "value": "pi_123"}`. Plain property values the integration writes can be looked up the same way.
 - A match by phone or external id that brings a different email changes the address. The new address hasn't agreed to anything, so a subscribed profile becomes `never_subscribed`. Unsubscribed stays unsubscribed, a hard bounce (it belonged to the old address) is cleared, and a spam complaint stays.
 
 ### track_event
@@ -94,7 +105,8 @@ Where an action takes a `profile`, give identifiers (`email`, `phone_number`, `e
 ```
 
 - `metric` up to 128 characters. Events start metric-triggered flows and power segments.
-- `value` is revenue (a number). `time` is ISO 8601 (default now).
+- `metric` must be one of the integration's `metrics`.
+- `value` is revenue (a number). `time` is ISO 8601 (default: when the script first ran for this delivery).
 - Always set `unique_id`: the same metric and unique id is recorded once, so a resent webhook or an overlapping pull never counts twice. Without one, the event gets an id from its delivery and position, so one delivery (with its retries and replays) still never records it twice.
 - For something that changes over time (a booking's dates), record a new event per version, with `time` set to the app's own update time and the version in the `unique_id`. Flows keyed on the thing follow the newest by time, so a late, older version never replaces a newer one. Count revenue on a separate event that has one `unique_id` per order or booking, so a change never counts it again.
 
@@ -221,11 +233,14 @@ Every webhook, pull page and replay is a *delivery* with its time, source (`webh
 
 - A webhook is checked, stored and queued in one step, and answered with 200 in milliseconds; the script runs right after in the background.
 - A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again.
-- Each delivery remembers which actions it already wrote. A retry or replay skips those (`already_written` in the counts), so a half-written delivery never repeats its first half.
+- The first time a delivery's script runs successfully, its list of actions is kept with the delivery (missing `unique_id`s and `time`s filled in). A retry applies exactly that list; it never runs the script again, so a script whose output depends on the time can't record something twice. Each delivery also records which actions it already wrote, and a retry or replay skips those (`already_written` in the counts).
+- Nothing secret is stored or shown: every credential value, the access token, the encoded Basic value and anything else a request sent are masked wherever they appear (payloads, response headers such as `Link`, errors, the script's actions and logs, test results), including short ones (a PIN is masked where it stands as a whole word). The next-page request between pages is kept encrypted.
 - `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`. Replays count against the same limits as new webhooks.
-- While an integration is turned off, webhooks are still stored (as `ignored`) so they can be replayed later.
-- **Payloads may contain personal data** (names, addresses, booking notes, door codes). Only signed-in members of the account and its API keys can read them. They're kept at most 30 days, and each account keeps at most 256 MB of payloads: past that the oldest finished deliveries lose their payload (the log line stays).
-- Scripts run in their own short-lived process with no network, files or environment. At most 2 run at once per account (8 in total by default); work over that waits a few seconds in the queue.
+- While an integration is turned off, a webhook gets a log line (as `ignored`), but nothing is written and its payload isn't kept.
+- **Payloads may contain personal data** (names, addresses, booking notes). Only admins and the owner can read them (`integrations.manage`). Set `redact` to remove fields before a payload is stored or shown: dot paths like `results[].notes` or `reservation.notes`, `[]` for each item of a list, `*` for every key and `**` for any depth (`**.keyCode`). The script still sees the whole payload. A payload that isn't JSON or a form can't be checked, so with a redact list it isn't kept. Recipes come with their list (Guesty's removes door codes and access notes).
+- Payloads are kept at most 30 days, and each account keeps at most 256 MB of them. A new payload makes room by dropping the oldest finished ones (their log lines stay); when payloads still waiting to run fill the budget, the webhook is answered 429 so the app sends it again later (a pull page keeps its log line without the page).
+- Scripts run in their own short-lived process with no network, files, open descriptors or environment. At most 2 run at once per account (8 in total by default); work over that waits a few seconds in the queue.
+- All integration work (deliveries, retries, pulls, backfills) runs in the background queue, apart from sending. A scheduled pull isn't queued while one for the same integration is waiting or running, and one pull runs at a time per account (4 in all by default, `INTEGRATION_PULL_SLOTS`).
 
 ## Flows from integration events
 
@@ -233,7 +248,7 @@ Events from integrations start flows like any other events, and `{{ event.proper
 
 - **Metric trigger with cancellation:** `{"type": "metric", "metric": "Reservation Confirmed", "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"]}`. People leave the flow before the next step if a "Reservation Cancelled" with the same `reservation_id` comes later, or a newer "Reservation Confirmed" with the same id replaces this one.
 - **Event date trigger:** `{"type": "event_date", "metric": "Reservation Confirmed", "field": "check_in", "offset_days": -2, "hour": 10, "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"], "filters": []}` starts the flow 2 days before each event's `check_in`, at 10am in the account's time zone. Each event starts it once, so a guest with two bookings gets both. A plain date (`2026-12-17`) is used as is; a date-time is read in the account's time zone. The same cancellation and replacement rules apply, checked when it fires and again before each step. `offset_days` is -365 to 365; `hour` 0-23 (default 9); at most 20 filters.
-- Each event is scheduled when it's recorded (and existing events when the flow goes live or its trigger changes). If the scheduler was down, anything due in the last 24 hours still goes out; older ones are marked `missed` instead of sending a stale reminder. `get_flow_report` shows the counts under `event_dates` (`pending`, `started`, `superseded`, `cancelled`, `filtered`, `missed`).
+- Each event is scheduled when it's recorded (and existing events when the flow goes live or its trigger changes, up to 20,000 events a minute across all flows). Due reminders go out before older events are scheduled. Anything due in the last 24 hours still goes out; a reminder that was due longer ago, whether the scheduler was down or the event arrived (or was imported) late, is marked `missed` instead of sending a stale one. A newer version of the same booking (same `key`) that didn't move its date doesn't send the reminder again (`already_sent`). When the account's time zone changes, waiting reminders move to the same hour in the new one. `get_flow_report` shows the counts under `event_dates` (`pending`, `started`, `superseded`, `cancelled`, `already_sent`, `filtered`, `missed`).
 - Mark flows that are about the person's own booking or order `"service_messages": true` in `definition.settings`, so they reach guests held back from marketing (see Consent).
 - Mark old records you import (for example `historical: true` in the event's properties) and filter them out of "right after it happened" flows with `{"field": "historical", "op": "neq", "value": true}`, so a backfill doesn't email everyone about old bookings.
 
@@ -250,17 +265,19 @@ Events from integrations start flows like any other events, and `{{ event.proper
 | Script result | 1 MB, 500 actions |
 | Properties per action | 200 keys, 64 KB |
 | Saved state | 64 KB |
+| Declared metrics, redact paths | 50 each |
 | Pull answer | 5 MB, 20-second timeout |
 | Pull interval | 5 minutes or more |
 | Integrations per account | 50 |
-| Delivery log | 30 days; 256 MB of payloads per account |
+| Delivery log | 30 days; 256 MB of payloads per account, checked when each one arrives |
+| Pulls at once | 1 per account, 4 in total (`INTEGRATION_PULL_SLOTS`) |
 
 ## Recipes
 
 A recipe is a ready-made integration kept in the DumbMail repository under `recipes/<key>/`: `recipe.json` (name, description, signature, pull, settings, the credentials it needs, setup steps and suggested flows), `script.js`, and `fixtures/` with sample payloads and the actions they must produce. `create_integration_from_recipe` copies it into the account and creates the suggested flows as drafts (nothing sends until someone turns them on). Add one by pull request; the test suite runs every fixture.
 
-- **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Confirmed (one per version), Reservation Cancelled, Reservation Updated and Inquiry Received; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); and draft booking confirmation, pre-arrival and review request flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
-- **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order, Refunded Order (once per refund, its own amount), Subscription Started / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
+- **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Total (the booking's value, once), Reservation Confirmed (one per version of its dates, listing, status or guest), Reservation Cancelled, Reservation Updated and Inquiry Received, ordered by Guesty's own update time; door codes and access notes removed from stored payloads; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); and draft booking confirmation, pre-arrival and review request flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
+- **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order (not for checkouts that needed no payment), Refunded Order (once per refund, its own amount, once it has succeeded, found through its PaymentIntent or charge), Subscription Started (when it becomes active, once) / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
 - **calendly**: bookings and cancellations → Meeting Scheduled / Meeting Cancelled, with draft reminder and follow-up flows.
 
 ## Worked example: "connect my Guesty"

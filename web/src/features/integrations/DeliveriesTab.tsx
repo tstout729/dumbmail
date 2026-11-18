@@ -11,7 +11,7 @@ import type { DeliveryStatus, Integration } from "./types";
 
 const sources = { webhook: "Webhook", pull: "Pull", test: "Test", replay: "Replay" } as const;
 
-export function DeliveriesTab({ integration: i }: { integration: Integration }) {
+export function DeliveriesTab({ integration: i, canManage }: { integration: Integration; canManage: boolean }) {
   const { account } = useSession();
   const [status, setStatus] = useState<DeliveryStatus | "">("");
   const list = useDeliveries(i.id, status);
@@ -47,9 +47,11 @@ export function DeliveriesTab({ integration: i }: { integration: Integration }) 
             { value: "pending", label: "Waiting" },
           ]}
         />
-        <Button size="sm" variant="secondary" icon={<RotateCcw className="size-3.5" />} onClick={() => setReplayAll(true)}>
-          Replay all failed
-        </Button>
+        {canManage ? (
+          <Button size="sm" variant="secondary" icon={<RotateCcw className="size-3.5" />} onClick={() => setReplayAll(true)}>
+            Replay all failed
+          </Button>
+        ) : null}
       </div>
       <p className="text-xs text-zinc-500">Kept for 30 days. Failed webhooks retry after 1, 5, 30 and 120 minutes, then wait for a replay.</p>
       <Table>
@@ -90,7 +92,7 @@ export function DeliveriesTab({ integration: i }: { integration: Integration }) 
                   <div className="truncate text-sm text-zinc-700">{d.error ?? (countsSummary(d.counts) || "—")}</div>
                 </Td>
                 <Td className="text-right">
-                  {d.status === "error" && d.replayable ? (
+                  {canManage && d.status === "error" && d.replayable ? (
                     <Button
                       size="sm"
                       variant="ghost"
@@ -134,7 +136,7 @@ function DeliveryDrawer({ integrationId, deliveryId, onClose, onReplay }: { inte
       onClose={onClose}
       width="w-[min(640px,100vw)]"
       footer={
-        d && d.body !== null ? (
+        d && d.body ? (
           <Button variant="secondary" icon={<RotateCcw className="size-3.5" />} onClick={() => onReplay(d.id)}>
             Replay with the current script
           </Button>
@@ -156,6 +158,11 @@ function DeliveryDrawer({ integrationId, deliveryId, onClose, onReplay }: { inte
           </div>
           {d.next_attempt_at ? <p className="text-xs text-amber-700">Next try {formatRelative(d.next_attempt_at)}.</p> : null}
           {d.error ? <div className="break-words rounded-md border border-red-200 bg-red-50 px-3 py-2 text-red-800">{d.error}</div> : null}
+          {d.payload_hidden ? (
+            <p className="text-xs text-zinc-500">
+              {d.counts ? `${countsSummary(d.counts) || "Nothing written"}. ` : ""}Payloads and what the script wrote can hold people's details, so only owners and admins see them.
+            </p>
+          ) : null}
           {d.result ? (
             <section>
               <h3 className="mb-1 text-xs font-medium text-zinc-700">What was written</h3>
@@ -172,17 +179,23 @@ function DeliveryDrawer({ integrationId, deliveryId, onClose, onReplay }: { inte
               {d.result.logs.length > 0 ? <JsonBlock value={d.result.logs.join("\n")} className="mt-2" /> : null}
             </section>
           ) : null}
-          <section>
-            <h3 className="mb-1 text-xs font-medium text-zinc-700">Payload</h3>
-            {d.body === null ? <p className="text-xs text-zinc-500">Not kept (the signature check failed, or the answer was over 1 MB).</p> : <JsonBlock value={d.payload} />}
-          </section>
+          {d.payload_hidden ? null : (
+            <section>
+              <h3 className="mb-1 text-xs font-medium text-zinc-700">Payload</h3>
+              {d.body ? (
+                <JsonBlock value={d.payload} />
+              ) : (
+                <p className="text-xs text-zinc-500">Not kept (the signature check failed, the integration was off, the answer was over 1 MB, or the account's payload storage was full).</p>
+              )}
+            </section>
+          )}
           {d.request ? (
             <section>
               <h3 className="mb-1 text-xs font-medium text-zinc-700">Request (secrets hidden)</h3>
               <JsonBlock value={d.request} />
             </section>
           ) : null}
-          {Object.keys(d.headers).length > 0 ? (
+          {d.headers && Object.keys(d.headers).length > 0 ? (
             <details>
               <summary className="cursor-pointer text-xs font-medium text-zinc-700">Headers</summary>
               <JsonBlock value={d.headers} className="mt-1" />

@@ -43,7 +43,10 @@ export type IntegrationSummary = {
 };
 
 export type Integration = IntegrationSummary & {
-  inbound_url: string;
+  /** Null for people who can see integrations but not manage them (the URL is a credential). */
+  inbound_url: string | null;
+  /** True when this is the read-only view (no URL, saved state or credential hints). */
+  limited?: boolean;
   signature: Signature;
   signature_secret: { saved: boolean; hint?: string };
   signature_ready: boolean;
@@ -52,11 +55,15 @@ export type Integration = IntegrationSummary & {
   pull: Record<string, unknown> | null;
   pull_next_at: string | null;
   /** Saved credential names with a short hint each; values are never returned. */
-  credentials: Record<string, string>;
+  credentials?: Record<string, string>;
   missing_credentials: string[];
   oauth_token_cached_until: string | null;
-  state: Record<string, unknown>;
+  state?: Record<string, unknown>;
   backfill: Backfill | null;
+  /** The metrics the script may record; they can't be sent from a browser. */
+  metrics: string[];
+  /** Fields removed from payloads before they're stored or shown, like "**.keyCode". */
+  redact: string[];
   /** Everyone this integration adds has agreed to get marketing email. */
   contacts_opted_in: boolean;
   /** Where a webhook carries the app's own message id, so resends are ignored. */
@@ -74,6 +81,8 @@ export type IntegrationChanges = {
   credentials?: Record<string, string | null>;
   state?: Record<string, unknown>;
   contacts_opted_in?: boolean;
+  metrics?: string[];
+  redact?: string[];
 };
 
 export type RecipeCredential = { name: string; label: string; help?: string };
@@ -130,13 +139,16 @@ export type Delivery = {
 };
 
 export type DeliveryDetail = Omit<Delivery, "counts" | "has_payload" | "replayable"> & {
-  content_type: string | null;
-  headers: Record<string, string>;
-  query: Record<string, string>;
-  payload: unknown;
-  body: string | null;
-  request: Record<string, unknown> | null;
-  result: { counts: WriteCounts; effects: string[]; logs: string[] } | null;
+  content_type?: string | null;
+  headers?: Record<string, string>;
+  query?: Record<string, string>;
+  payload?: unknown;
+  body?: string | null;
+  request?: Record<string, unknown> | null;
+  result?: { counts: WriteCounts; effects: string[]; logs: string[] } | null;
+  /** Set when the caller may see the log line but not the payload or script output. */
+  payload_hidden?: boolean;
+  counts?: WriteCounts | null;
 };
 
 export type TestResult = {

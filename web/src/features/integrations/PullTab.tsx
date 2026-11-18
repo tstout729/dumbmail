@@ -81,7 +81,7 @@ function Credentials({ integration: i }: { integration: Integration }) {
   const recipes = useRecipes();
   const labels = new Map((recipes.data ?? []).find((r) => r.key === i.recipe)?.credentials.map((c) => [c.name, c] as const) ?? []);
   const [added, setAdded] = useState<string[]>([]);
-  const names = Array.from(new Set([...Object.keys(i.credentials), ...i.missing_credentials, ...labels.keys(), ...added]));
+  const names = Array.from(new Set([...Object.keys(i.credentials ?? {}), ...i.missing_credentials, ...labels.keys(), ...added]));
   const [values, setValues] = useState<Record<string, string>>({});
   const [extra, setExtra] = useState("");
   const changed = Object.entries(values).filter(([, v]) => v.trim() !== "");
@@ -101,7 +101,7 @@ function Credentials({ integration: i }: { integration: Integration }) {
       <p className="mb-3 text-sm text-zinc-600">Secrets the pull uses. They're stored encrypted and never shown again; only the last few characters are.</p>
       <div className="space-y-3">
         {names.map((n) => {
-          const saved = i.credentials[n] as string | undefined;
+          const saved = (i.credentials ?? {})[n] as string | undefined;
           return (
             <div key={n} className="flex items-end gap-2">
               <Field

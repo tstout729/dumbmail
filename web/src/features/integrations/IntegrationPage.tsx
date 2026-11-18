@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { AlertTriangle, RotateCw, Trash2 } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import { Button, Card, Checkbox, ConfirmDialog, CopyField, InlineError, Notice, Page, PageHeader, Skeleton, Stat, Tabs, Toggle } from "../../components/ui";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
@@ -18,11 +19,29 @@ type Tab = "setup" | "script" | "pull" | "deliveries";
 const TABS: Tab[] = ["setup", "script", "pull", "deliveries"];
 
 export function IntegrationPage() {
+  const canRead = useCan("integrations.read");
+  if (!canRead) {
+    return (
+      <Page>
+        <PageHeader title="Integration" breadcrumbs={[{ label: "Integrations", to: "/integrations" }]} />
+        <Notice tone="gray" title="Integrations are for managers and admins">
+          Ask an owner or admin of this account if you need to see this integration.
+        </Notice>
+      </Page>
+    );
+  }
+  return <IntegrationDetail />;
+}
+
+function IntegrationDetail() {
+  const canManage = useCan("integrations.manage");
   const { id = "" } = useParams();
   const q = useIntegration(id);
   const [params, setParams] = useSearchParams();
   const tabParam = params.get("tab");
-  const tab: Tab = TABS.find((t) => t === tabParam) ?? "setup";
+  // The script and pull tabs edit and run things: only for people who manage integrations.
+  const allowed: Tab[] = canManage ? TABS : ["setup", "deliveries"];
+  const tab: Tab = allowed.find((t) => t === tabParam) ?? "setup";
   const setTab = (t: Tab) => {
     const next = new URLSearchParams(params);
     if (t === "setup") next.delete("tab");
@@ -49,22 +68,22 @@ export function IntegrationPage() {
   const i = q.data;
   return (
     <Page>
-      <PageHeader title={i.name} breadcrumbs={[{ label: "Integrations", to: "/integrations" }]} description={<IntegrationStatusBadge status={i.status} error={i.last_error} />} actions={<HeaderActions integration={i} />} />
-      <Problems integration={i} onTab={setTab} />
+      <PageHeader title={i.name} breadcrumbs={[{ label: "Integrations", to: "/integrations" }]} description={<IntegrationStatusBadge status={i.status} error={i.last_error} />} actions={canManage ? <HeaderActions integration={i} /> : undefined} />
+      <Problems integration={i} onTab={setTab} canManage={canManage} />
       <Tabs
         value={tab}
         onChange={setTab}
         tabs={[
-          { value: "setup", label: "Setup" },
-          { value: "script", label: "Script" },
-          { value: "pull", label: "Pull" },
-          { value: "deliveries", label: "Delivery log" },
-        ]}
+          { value: "setup" as const, label: "Setup" },
+          { value: "script" as const, label: "Script" },
+          { value: "pull" as const, label: "Pull" },
+          { value: "deliveries" as const, label: "Delivery log" },
+        ].filter((t) => allowed.includes(t.value))}
       />
-      {tab === "setup" ? <SetupTab integration={i} /> : null}
+      {tab === "setup" ? <SetupTab integration={i} canManage={canManage} /> : null}
       {tab === "script" ? <ScriptTab key={i.updated_at} integration={i} /> : null}
       {tab === "pull" ? <PullTab key={i.updated_at} integration={i} /> : null}
-      {tab === "deliveries" ? <DeliveriesTab integration={i} /> : null}
+      {tab === "deliveries" ? <DeliveriesTab integration={i} canManage={canManage} /> : null}
     </Page>
   );
 }
@@ -106,23 +125,23 @@ function HeaderActions({ integration: i }: { integration: Integration }) {
   );
 }
 
-function Problems({ integration: i, onTab }: { integration: Integration; onTab: (t: Tab) => void }) {
+function Problems({ integration: i, onTab, canManage }: { integration: Integration; onTab: (t: Tab) => void; canManage: boolean }) {
   const items = [];
   if (i.status === "disabled") {
     items.push(
       <Notice key="off" tone="gray" title="This integration is off">
-        Webhooks are kept in the delivery log but nothing is written, and scheduled pulls are paused. Turn it on, then replay what arrived.
+        Webhooks get a line in the delivery log but nothing is written and their payloads aren't kept, and scheduled pulls are paused.
       </Notice>,
     );
   }
-  if (!i.signature_ready) {
+  if (canManage && !i.signature_ready) {
     items.push(
       <Notice key="sig" tone="amber" icon={<AlertTriangle />} title="Add the signing secret">
         Webhooks are refused until the secret for the signature check is saved below.
       </Notice>,
     );
   }
-  if (i.missing_credentials.length > 0) {
+  if (canManage && i.missing_credentials.length > 0) {
     items.push(
       <Notice key="creds" tone="amber" icon={<AlertTriangle />} title={`Add credentials: ${i.missing_credentials.join(", ")}`}>
         The pull needs them.{" "}
@@ -145,7 +164,7 @@ function Problems({ integration: i, onTab }: { integration: Integration; onTab: 
   return items.length > 0 ? <div className="mb-4 space-y-2">{items}</div> : null;
 }
 
-function SetupTab({ integration: i }: { integration: Integration }) {
+function SetupTab({ integration: i, canManage }: { integration: Integration; canManage: boolean }) {
   const { account } = useSession();
   const rotate = useRotateIntegrationUrl(i.id);
   const recipes = useRecipes();
@@ -161,16 +180,30 @@ function SetupTab({ integration: i }: { integration: Integration }) {
       <Card
         title="Webhook URL"
         actions={
-          <Button size="sm" variant="ghost" icon={<RotateCw className="size-3.5" />} onClick={() => setRotating(true)}>
-            New URL
-          </Button>
+          canManage ? (
+            <Button size="sm" variant="ghost" icon={<RotateCw className="size-3.5" />} onClick={() => setRotating(true)}>
+              New URL
+            </Button>
+          ) : undefined
         }
       >
         <p className="mb-2 text-sm text-zinc-600">Have the app send webhooks (POST requests) here. Anyone with this URL can send data, so keep it private.</p>
-        <CopyField value={i.inbound_url} />
+        {i.inbound_url ? <CopyField value={i.inbound_url} /> : <p className="text-sm text-zinc-500">Only owners and admins can see the URL.</p>}
       </Card>
-      <SignatureCard key={i.updated_at} integration={i} secretHelp={recipe?.signature_secret ?? null} />
-      <ConsentCard integration={i} />
+      {canManage ? (
+        <>
+          <SignatureCard key={i.updated_at} integration={i} secretHelp={recipe?.signature_secret ?? null} />
+          <ConsentCard integration={i} />
+        </>
+      ) : (
+        <Card title="Marketing consent">
+          <p className="text-sm text-zinc-600">
+            {i.contacts_opted_in
+              ? "The owner confirmed everyone this integration adds agreed to get marketing email."
+              : "People this integration adds are held back from marketing unless they opt in. Only flows marked as service messages reach them."}
+          </p>
+        </Card>
+      )}
       {recipe ? (
         <Card title={`${recipe.name} setup`}>
           <ol className="list-decimal space-y-1.5 pl-5 text-sm text-zinc-700">

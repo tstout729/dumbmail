@@ -2,9 +2,10 @@ import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Plug, Plus, Sparkles } from "lucide-react";
 import { errorMessage } from "../../api/client";
-import { Button, Checkbox, EmptyRow, EmptyState, Field, InlineError, Input, Modal, Page, PageHeader, RowLink, SkeletonRows, Table, Td, Th } from "../../components/ui";
+import { Button, Checkbox, EmptyRow, EmptyState, Field, InlineError, Input, Modal, Notice, Page, PageHeader, RowLink, SkeletonRows, Table, Td, Th } from "../../components/ui";
 import { formatNumber, formatRelative } from "../../lib/format";
 import { useCreateFromRecipe, useCreateIntegration, useIntegrations, useRecipes } from "./api";
+import { useCan } from "../team/api";
 import { IntegrationStatusBadge } from "./parts";
 import type { Recipe } from "./types";
 
@@ -20,6 +21,22 @@ function handle(input) {
 `;
 
 export function IntegrationsPage() {
+  const canRead = useCan("integrations.read");
+  if (!canRead) {
+    return (
+      <Page>
+        <PageHeader title="Integrations" />
+        <Notice tone="gray" title="Integrations are for managers and admins">
+          Ask an owner or admin of this account if you need to see which apps send it data.
+        </Notice>
+      </Page>
+    );
+  }
+  return <IntegrationsList />;
+}
+
+function IntegrationsList() {
+  const canManage = useCan("integrations.manage");
   const integrations = useIntegrations();
   const [params, setParams] = useSearchParams();
   const adding = params.get("add") === "1";
@@ -37,9 +54,11 @@ export function IntegrationsPage() {
         title="Integrations"
         description="Bring in bookings, orders and sign-ups from any app, by webhook or on a schedule."
         actions={
-          <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setAdding(true)}>
-            Add integration
-          </Button>
+          canManage ? (
+            <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setAdding(true)}>
+              Add integration
+            </Button>
+          ) : null
         }
       />
       <Table>
@@ -68,9 +87,11 @@ export function IntegrationsPage() {
                 title="No integrations yet"
                 description="Start from Guesty, Stripe or Calendly, or connect any other app. You can also ask Claude to build one for you through the MCP server: just say which app."
                 action={
-                  <Button variant="primary" onClick={() => setAdding(true)}>
-                    Add integration
-                  </Button>
+                  canManage ? (
+                    <Button variant="primary" onClick={() => setAdding(true)}>
+                      Add integration
+                    </Button>
+                  ) : undefined
                 }
               />
             </EmptyRow>
@@ -92,7 +113,7 @@ export function IntegrationsPage() {
           )}
         </tbody>
       </Table>
-      {adding ? <AddIntegration onClose={() => setAdding(false)} /> : null}
+      {adding && canManage ? <AddIntegration onClose={() => setAdding(false)} /> : null}
     </Page>
   );
 }

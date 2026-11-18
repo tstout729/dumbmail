@@ -60,6 +60,7 @@ export function ScriptTab({ integration: i }: { integration: Integration }) {
           <InlineError message={sampleError} />
           {test.data ? <TestResultView result={test.data} /> : null}
         </Card>
+        <MetricsCard integration={i} />
         <SettingsCard integration={i} />
       </div>
     </div>
@@ -110,11 +111,48 @@ export function TestResultView({ result: r }: { result: TestResult }) {
   );
 }
 
+/** One entry per line (blank lines and surrounding spaces dropped). */
+function lines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+}
+
+function MetricsCard({ integration: i }: { integration: Integration }) {
+  const save = useUpdateIntegration(i.id);
+  const [metrics, setMetrics] = useState(i.metrics.join("\n"));
+  const [redact, setRedact] = useState(i.redact.join("\n"));
+  const dirty = metrics !== i.metrics.join("\n") || redact !== i.redact.join("\n");
+  return (
+    <Card title="Events and stored payloads">
+      <div className="space-y-4">
+      <Field label="Events the script records" hint="One per line. The script can record only these, and nobody can send them from a web page, so flows can trust them.">
+        <Textarea value={metrics} onChange={(e) => setMetrics(e.target.value)} rows={4} spellCheck={false} className={monoTextarea} />
+      </Field>
+      <Field
+        label="Fields to remove before a payload is kept"
+        hint="One per line, like results[].notes or **.keyCode (any depth). Use it for door codes, access notes and anything else that mustn't sit in the delivery log. The script still sees the whole payload."
+      >
+        <Textarea value={redact} onChange={(e) => setRedact(e.target.value)} rows={4} spellCheck={false} className={monoTextarea} />
+      </Field>
+      </div>
+      <InlineError message={save.error ? errorMessage(save.error) : null} />
+      <div className="mt-2 flex justify-end">
+        <Button size="sm" variant="secondary" disabled={!dirty} loading={save.isPending} onClick={() => save.mutate({ metrics: lines(metrics), redact: lines(redact) }, { onSuccess: () => toast.success("Saved") })}>
+          Save
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
 function SettingsCard({ integration: i }: { integration: Integration }) {
   const save = useUpdateIntegration(i.id);
   const [settings, setSettings] = useState(JSON.stringify(i.settings, null, 2));
   const [error, setError] = useState<string | null>(null);
-  const hasState = Object.keys(i.state).length > 0;
+  const state = i.state ?? {};
+  const hasState = Object.keys(state).length > 0;
   const onSave = () => {
     const parsed = parseJson(settings);
     if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null || Array.isArray(parsed.value)) {
@@ -144,7 +182,7 @@ function SettingsCard({ integration: i }: { integration: Integration }) {
             </Button>
           ) : null}
         </div>
-        {hasState ? <JsonBlock value={i.state} /> : <p className="text-xs text-zinc-500">Nothing saved. Scripts save cursors here with set_state.</p>}
+        {hasState ? <JsonBlock value={state} /> : <p className="text-xs text-zinc-500">Nothing saved. Scripts save cursors here with set_state.</p>}
       </div>
     </Card>
   );
