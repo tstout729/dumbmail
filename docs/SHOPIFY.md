@@ -6,7 +6,7 @@ One store per DumbMail account. A store connected to one account can't be connec
 
 ## Connecting
 
-Settings → Shopify: type the store's address (`your-store.myshopify.com`, or just `your-store`) and choose **Connect**. Only an owner or admin of the account can connect a store. DumbMail gives a link that goes on to Shopify, where the merchant approves the app, and Shopify sends them back. The link is good for 15 minutes. It finishes only in the browser that opened it, signed in to DumbMail as the person who started it, who must still be an owner or admin. So nobody can attach a store to someone else's account, or finish a teammate's install, by sending a link. (`connect_shopify` with an API key: the first owner or admin who opens the link is the one who finishes it.)
+Settings → Shopify: type the store's address (`your-store.myshopify.com`, or just `your-store`) and choose **Connect**. Only a member with `shopify.manage` (an admin or the owner) can connect a store. DumbMail gives a link that goes on to Shopify, where the merchant approves the app, and Shopify sends them back. The link is good for 15 minutes. It finishes only in the browser that opened it, signed in to DumbMail as the person who started it, who must still hold `shopify.manage`. So nobody can attach a store to someone else's account, or finish a teammate's install, by sending a link. (`connect_shopify` with an API key: the first member with `shopify.manage` who opens the link is the one who finishes it.)
 
 Opening the app from the store's Shopify admin (or installing it from the App Store) lands on Settings → Shopify with the store filled in; sign in and choose Connect.
 
@@ -42,7 +42,7 @@ Shopify signs each webhook with the app's secret; anything with a wrong signatur
 
 Properties use the same names as the website snippet and checkout pixel: `items` (each with `name`, `product_id`, `variant_id`, `variant`, `sku`, `price`, `quantity`, `image_url`, `url`, `brand`, `categories`), `item_names`, `item_count`, `total`, `currency`, `discount_codes`, `order_id`, `order_name` (#1001), `order_number`, and for checkouts `checkout_url`. Every event has `tracked_by: "shopify"`.
 
-**One order, one event.** The snippet and pixel send `Placed Order` with `unique_id` `order:<id>` and `Started Checkout` with `checkout:<token>`; Shopify's events use the same ids. If the browser's copy arrives first, Shopify's facts replace it in place and it becomes a server event (trusted); if Shopify's arrives first, the browser's is dropped as a duplicate. The history import uses the same ids too. Revenue is never counted twice.
+**One order, one event.** The snippet and pixel send `Placed Order` with `unique_id` `order:<id>` and `Started Checkout` with `checkout:<token>`; Shopify's events use the same ids. If a browser's copy (recorded before the store was connected) is there first, the trusted event replaces it as a fresh row with only Shopify's data (nothing of the browser's is kept), so flows, catalog learning and coupon redemption see it as new; a person already in a flow from the browser's copy isn't started again. The history import uses the same ids too. Revenue is never counted twice.
 
 **Refunds and cancellations.** Revenue everywhere (the overview, reports, attribution, cohorts, segment totals and predictions) adds up `Placed Order` values. So rather than add negative events, DumbMail keeps each `Placed Order` value equal to what the store kept: the total less what was refunded, and 0 once the order is cancelled. `Ordered Product` values follow their line's refunds.
 
@@ -50,13 +50,13 @@ What was refunded is read from Shopify's Admin API for the whole order whenever 
 
 **Flows.** Events that happen now start flows. Events that reach DumbMail more than a day after they happened (an old order edited, or anything from the history import) are recorded as history: no flow starts, nothing is sent or billed.
 
-**Trusted only from Shopify.** `Ordered Product`, `Fulfilled Order`, `Fulfilled Partial Order`, `Cancelled Order` and `Refunded Order` can't be sent from a browser (the public `/client/events` endpoint refuses them). `Placed Order` and `Started Checkout` can still come from the snippet, so stores without the app keep working; the browser's copies stay marked as from the browser until Shopify confirms them.
+**Trusted only from Shopify.** When a store connects, the app's metrics (`Placed Order`, `Started Checkout`, `Ordered Product`, `Fulfilled Order`, `Fulfilled Partial Order`, `Cancelled Order`, `Refunded Order`) become server-only for that account: the public `/client/events` endpoint refuses them, so the snippet and pixel can't add or change orders any more, and flows ignore browser copies recorded earlier. They stay server-only after a disconnect (the safer choice; ask support to change it). Accounts without the app keep sending these names from their sites as before.
 
 Test orders (`test: true`) are ignored.
 
 ## Customers and consent
 
-Shopify customers become profiles, matched by email, then phone, with Shopify's customer id kept (`shopify_customer_id`). Names, `city`, `region`, `country` (ISO code), `zip`, `shopify_tags`, `shopify_order_count`, `shopify_total_spent` and `shopify_currency` are saved as properties.
+Shopify customers become profiles, matched by email, then phone, with Shopify's customer id kept (`shopify_customer_id`). A profile made here from the store's data (a customer, an order or a checkout) is held back from marketing (`marketing_hold`) until the person subscribes: campaigns skip them, and only flows marked as service messages (`settings.service_messages`: order and shipping updates) email them, at the address the store supplied (`email_source` is `integration:shopify:<store>`). Shopify's own subscribed state clears the hold. A profile that already existed is never held. Mark your order and shipping flows as service messages; leave marketing flows (winback, review asks) unmarked. Names, `city`, `region`, `country` (ISO code), `zip`, `shopify_tags`, `shopify_order_count`, `shopify_total_spent` and `shopify_currency` are saved as properties.
 
 Consent comes only from Shopify's own consent fields, for the exact address or number Shopify reports it for:
 
@@ -75,7 +75,7 @@ An unsubscribe in DumbMail (from an email's link, the preference page, a reply S
 
 Connecting starts it. `start_shopify_import` (`confirm: true`), or **Import history** in Settings → Shopify, runs it again. It reads every customer, every product, and orders from the last 3 years (`order_days` changes that), with their line items, refunds and shipments, using Shopify's bulk operations. It runs in the background in small steps; pause, resume and cancel it any time (`pause_shopify_import`, `resume_shopify_import`, `cancel_shopify_import`), and follow it with `get_shopify_import`. Running it again adds nothing twice.
 
-Imported orders are history: they don't start flows, send anything, cost anything or count as fresh activity. Imported products queue no back-in-stock or price-drop alerts. Results are read with byte ranges; a server answering with the wrong range stops the import with a plain error, and one that ignores ranges is read by skipping ahead, up to 64 MB. While an import runs, and on the first segment refresh after it ends, segment-triggered flows don't start for people who entered the segment; that refresh just records who's in.
+Imported orders are history: they don't start flows, send anything, cost anything or count as fresh activity. Imported products queue no back-in-stock or price-drop alerts. Results are read with byte ranges; a server answering with the wrong range stops the import with a plain error, and one that ignores ranges is read by skipping ahead, up to 64 MB. While a page of history is being written, segments take in new members quietly (the same `absorb_entries` mechanism as the Klaviyo import): segment-triggered flows don't start for people history moved in. The window closes as soon as the import pauses, finishes, fails or is cancelled; each segment is refreshed once more quietly and then triggers as usual. A real order that arrives while an import is paused or between pages starts segment flows normally. Imported events go through the shared history path: no flows, no sends, no billing.
 
 Orders older than 60 days need Shopify's `read_all_orders` permission (see below); without it Shopify returns only the last 60 days.
 
@@ -85,13 +85,13 @@ Products, variants, prices, compare-at prices, stock, images, collections (as ca
 
 ## Discount codes
 
-Coupons can be made in Shopify on demand: each person gets a real, single-use code (one use, once per customer) from a template: percentage or fixed amount, minimum subtotal, expiry, and everything or chosen collections. Codes are made with the Admin API ahead of a campaign send in small batches (Shopify rate-limits them), never one call inside the send. Each code belongs to one store, one template, one person and one grant: a retry after a crash makes the same code, not a second one, and accepts it only if the store's discount under that code has the template's terms. Reconnecting another store, reusing a template or the same grant for someone else never hands out another code. The template's stacking setting applies to order, product and shipping discounts alike. A code counts as used when an order from that store's servers carries it.
+A coupon (Content → Coupons) can get its codes from the store: link it with `set_shopify_coupon` (or `PUT /api/shopify/coupons/{coupon_id}`) and a template: `title`, `value` (`{"percentage": 10}` or `{"fixed_amount": 5}`), `minimum_subtotal`, `collection_ids`, `prefix`, `combines_with_other_discounts`, and optionally `expires_after_days` (otherwise the coupon's own expiry). When a message that shows the coupon is about to go and the coupon has no free code for that person, the coupons module asks the store through its one hook (`give_code`'s `CreateInStore`): the person gets a real, single-use Shopify code (one use, once per customer), saved as their code in the coupon. If Shopify is rate-limiting or down, that message waits 30 seconds and tries again. Sign-up forms hand out only codes already in the coupon. `remove_shopify_coupon` unlinks it; codes already given stay theirs. Each code belongs to one store, one template, one person and one grant: a retry after a crash makes the same code, not a second one, and accepts it only if the store's discount under that code has the template's terms. Reconnecting another store, reusing a template or the same grant for someone else never hands out another code. The template's stacking setting applies to order, product and shipping discounts alike. A code counts as used when an order from that store's servers carries it.
 
 ## On the storefront
 
 The app can put DumbMail on the store without pasting code:
 
-- **Theme app embed** (`connectors/shopify/extensions/dumbmail-embed`): loads the website snippet on every page, once Shopify's Customer Privacy API says the visitor allows analytics. Recognising visitors by the email they type also needs marketing to be allowed; without it the snippet loads with email capture off. Consent given later loads it then. Disconnecting clears its settings. DumbMail saves the snippet's address in the app's settings in the store when it connects; the merchant turns the embed on once in the theme editor (Settings → Shopify has a link that opens it ready to save).
+- **Theme app embed** (`connectors/shopify/extensions/dumbmail-embed`): loads the website snippet on every page, once Shopify's Customer Privacy API says the visitor allows analytics. Recognising visitors by the email they type also needs marketing to be allowed; without it the snippet loads with email capture off. Consent given later loads it then. Consent withdrawn after it loaded calls the snippet's `dumbmail.stop()`: the page sends no more events, pings or identification and writes no more tracking data to the browser, and events still waiting to be sent (for a visitor not yet recognised) are deleted along with who the snippet thought the visitor was. A sign-up form the visitor submits still goes through. Disconnecting clears its settings. DumbMail saves the snippet's address in the app's settings in the store when it connects; the merchant turns the embed on once in the theme editor (Settings → Shopify has a link that opens it ready to save).
 - **Web pixel** (`connectors/shopify/extensions/dumbmail-pixel`): reports Started Checkout and Placed Order from checkout pages and tells the storefront who checked out. DumbMail installs it when it connects. An event with no order id or checkout token is not sent (it couldn't be matched to Shopify's own copy).
 
 Both need the app's extensions deployed with the Shopify CLI (see `connectors/shopify/README.md`). Without them, the snippet and the custom checkout pixel from Settings → Website still work as before.
@@ -133,19 +133,24 @@ New public apps get expiring access tokens; DumbMail refreshes them on its own. 
 
 ## Reference
 
-MCP tools: `get_shopify_status`, `connect_shopify`, `disconnect_shopify`, `start_shopify_import`, `get_shopify_import`, `pause_shopify_import`, `resume_shopify_import`, `cancel_shopify_import`, `resync_shopify_products`, `get_shopify_data_request`.
+MCP tools: `get_shopify_status`, `connect_shopify`, `disconnect_shopify`, `start_shopify_import`, `get_shopify_import`, `pause_shopify_import`, `resume_shopify_import`, `cancel_shopify_import`, `resync_shopify_products`, `get_shopify_data_request`, `set_shopify_coupon`, `remove_shopify_coupon`.
+
+**Permissions.** Seeing the connection, its status and import progress needs `account.read` (every role). Connecting, disconnecting, starting, pausing, resuming or cancelling the import, syncing products, linking coupons and downloading a privacy export need `shopify.manage` (admins and the owner); the dashboard hides those controls from other roles. Connecting, disconnecting, the import actions, coupon links and privacy exports are recorded in the audit log, without tokens or customer data. Shopify's own requests (the app URL, the OAuth callback, webhooks) are public and checked by Shopify's signature; the install link and callback check the signed-in member themselves.
+
+**Background work.** Webhook processing, write-backs, imports, product reconciles, privacy requests, segment re-baselines and clean-up all run as jobs in the shared background lane, never in the lane sending uses; one worker at a time per store.
 
 REST (signed-in session or API key):
 
 | | |
 |---|---|
 | `GET /api/shopify` | status (as `get_shopify_status`) |
-| `POST /api/shopify/connect` | `{shop}` → `{url}` to open (owner or admin) |
+| `POST /api/shopify/connect` | `{shop}` → `{url}` to open |
 | `POST /api/shopify/disconnect` | `{confirm: true}` |
 | `GET /api/shopify/import` | latest import and product sync |
 | `POST /api/shopify/import` | `{confirm: true, order_days?}` |
 | `POST /api/shopify/import/pause` · `/resume` · `/cancel` | |
 | `POST /api/shopify/products/resync` | |
 | `GET /api/shopify/data-requests/{id}` | the export |
+| `PUT /api/shopify/coupons/{coupon_id}` · `DELETE` | link a coupon to the store, or unlink it |
 
-Public (signed by Shopify): `GET /api/shopify/app`, `GET /api/shopify/callback`, `POST /webhooks/shopify`. `GET /api/shopify/install?state=…` is the install link `connect` returns; it needs a signed-in owner or admin.
+Public (signed by Shopify): `GET /api/shopify/app`, `GET /api/shopify/callback`, `POST /webhooks/shopify`. `GET /api/shopify/install?state=…` is the install link `connect` returns; it needs a signed-in member with `shopify.manage`.

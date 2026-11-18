@@ -107,4 +107,4 @@ API keys follow the same rules through their scopes (`content` for writes, `cont
 
 ## For store integrations
 
-`features::coupons::give_code` is the one way to give someone a code outside a send. It takes an optional `CreateInStore` callback, called (with no database lock held) when the pool is empty, so an integration can create a real discount code in the store for that person. The code it returns must follow the code rule above, and is saved as that person's code.
+`features::coupons::give_code` is the one way to give someone a code outside the pool (sends use it too for a coupon linked to the Shopify store, see docs/SHOPIFY.md). It takes an optional `CreateInStore` callback, called (with no database lock held) when the pool is empty, so an integration can create a real discount code in the store for that person. The code it returns must follow the code rule above, and is saved as that person's code.
