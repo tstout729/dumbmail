@@ -115,7 +115,7 @@ function Glossary({ settings }: { settings: LanguageSettings }) {
         </form>
         <InlineError message={save.error?.message} />
       </div>
-      <div className="mt-4 overflow-x-auto">
+      <div className="relative mt-4 overflow-x-auto">
         <Table>
           <thead>
             <tr>
