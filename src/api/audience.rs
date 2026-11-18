@@ -186,8 +186,11 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         None => None,
     };
     if email.is_some() || phone.is_some() || input.external_id.is_some() {
+        // A different number hasn't agreed to texts: an SMS subscription stays with the old one
+        // (unless this same request sets the SMS consent itself).
         let q = format!(
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
+               sms_consent = CASE WHEN $4 AND NOT $7 AND p.phone_number IS NOT NULL AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed' ELSE p.sms_consent END,
                external_id = COALESCE($6, p.external_id), updated_at = now() WHERE p.id = $1 RETURNING {PROFILE_COLS}"
         );
         let saved = sqlx::query_as::<_, Profile>(&q)
@@ -197,6 +200,7 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             .bind(phone.is_some())
             .bind(phone.flatten())
             .bind(&input.external_id)
+            .bind(input.sms_consent.is_some())
             .fetch_one(&state.db)
             .await
             .map_err(|e| match AppError::from(e) {
