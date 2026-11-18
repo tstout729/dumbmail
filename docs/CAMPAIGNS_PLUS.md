@@ -5,8 +5,9 @@ archiving for campaigns, flows and templates, and a calendar of campaigns.
 
 ## Link tagging (UTM)
 
-When it's on, every web link in a campaign or flow message gets UTM parameters, so your analytics
-tool can tell which email or text brought a visitor.
+When it's on, every web link in a campaign or flow email gets UTM parameters, so your analytics
+tool can tell which email brought a visitor. Text messages aren't tagged yet: a tracked link in a
+text carries the whole destination, so tags could make the text longer and cost another segment.
 
 - Turn it on and set the values in Settings → Tracking (`GET`/`PUT /api/link-tags`, MCP
   `get_link_tagging` / `update_link_tagging`). Off by default.
@@ -28,9 +29,9 @@ tool can tell which email or text brought a visitor.
 - `GET /api/campaigns/{id}/link-tags` shows what its links will get, with the variables filled in
   (`preview`, like `utm_source=dumbmail&utm_medium=email&utm_campaign=...`).
 
-What gets tagged: the destination of each link that click tracking wraps, in email (HTML) and in
-texts (the text keeps its length, because the tracked link is what's in the text). Only `http` and
-`https` links. Never DumbMail's own links (unsubscribe, preferences, view online, tracking),
+What gets tagged: the destination of each link that click tracking wraps in an email's HTML. Only
+`http` and `https` links. Never DumbMail's own links (unsubscribe, preferences, view online,
+tracking, and older DumbMail link hosts that still work),
 `mailto:` or `tel:` links, or a skipped domain. A parameter the link already has is kept, not
 replaced. The rest of the link, its query string and its `#fragment` stay exactly as written. An
 email's plain-text part isn't tagged.
@@ -50,22 +51,30 @@ is sent until you send it like any other campaign (`send_campaign`, which needs 
 Who gets it, worked out once when the resend starts sending and never again on a retry:
 everyone the original went to (sent or delivered; not bounced, failed or skipped) who hasn't opened
 (`no_open`; a click counts as an open) or clicked (`no_click`) the original or an earlier resend of
-it by then, and who is subscribed to email now. Lists and segments don't apply. Unsubscribes,
-suppressions, smart sending, sunsetting and every other send-time check apply as usual.
+it by then, whose email address is still the one the original went to, and who is subscribed to
+email now. Right before each email goes out, the address and subscription are checked again; anyone
+whose address changed or who isn't subscribed any more is skipped. Lists and segments don't apply.
+Unsubscribes, suppressions, smart sending, sunsetting and every other send-time check apply as usual.
+
+A resend stays a resend: its audience and channel can't be changed (through the dashboard, the API
+or MCP). Its subject, preview text, content and send options can.
 
 Rules:
 
-- Email only. The original must have finished sending at least 4 hours ago (so opens can come in)
-  and at most 30 days ago. A resend must also start sending within those 30 days.
+- Email only. The original must have finished sending (after an A/B test, the winner send) at least
+  4 hours ago, so opens can come in, and at most 30 days ago. A resend must also start sending
+  within those 30 days. These are checked when the resend is made and again when it starts sending.
 - At most 2 resends per campaign, and a resend can't itself be resent. The limit holds even when
   two people click at once.
+- Deleting a draft resend that never sent frees its slot. A resend that started sending keeps its
+  slot for good and can't be deleted (archive it instead); its sends stay in the combined totals.
 - Opens are undercounted: some email apps (Apple Mail, for one) hide or fake opens, so some people
   who read the original will get it again. DumbMail doesn't record which opens came from privacy
   proxies, so it can't leave those people out; every recorded open counts.
 
 `GET /api/campaigns/{id}/resends` (MCP `get_campaign_resends`): for an original, its resends with
 their stats, combined totals across the original and its resends (people reached, opened and
-clicked, each person counted once) and whether it can be resent now (`can_resend`, with
+clicked, each person counted once, all among the people reached) and whether it can be resent now (`can_resend`, with
 `earliest_at` and `latest_at`). For a resend, which campaign it resends.
 
 A resend's audience is `{"include": [{"type": "resend", "id": <the resend's own id>}]}`. Only that
@@ -86,7 +95,9 @@ Tags are free text shared by the account's campaigns, flows and templates: at mo
   `{"ids": [...], "archived": true | false}`. Archived items are hidden from lists unless you ask for
   them, stay in reports, and can't be sent or scheduled (campaigns) or turned on (flows). A
   scheduled, sending or A/B-testing campaign, or a live flow, isn't archived: unschedule, cancel or
-  turn it off first. The answer lists what changed and what was skipped, and why.
+  turn it off first. The answer lists what changed and what was skipped, and why. An archived
+  campaign can't send tests either. Archived templates still work for transactional sends that name
+  them.
 
 The lists take optional filters, all query parameters:
 
@@ -96,7 +107,8 @@ The lists take optional filters, all query parameters:
   `true`, or `all`), `limit` (up to 500, the default) and `offset`. `total` is the number matching.
   Each campaign also has `tags`, `archived_at` and `resend_of`. MCP: `search_campaigns`.
 - `GET /api/flows` and `GET /api/templates`: `tag`, `q` (name), `archived`, `limit`, `offset`;
-  flows also `status`, templates also `channel`.
+  flows also `status`, templates also `channel`. A filter a list doesn't have is refused (400).
+  MCP `list_templates` leaves archived templates out unless `archived` is `true` or `all`.
 - `GET /api/campaigns/counts`: campaigns per status (not archived) and how many are archived.
 
 ## Calendar
@@ -110,9 +122,11 @@ status, local `date` and `time`, `timing` (`all_at_once`, `local_time`, `best_ti
 
 `POST /api/campaigns/{id}/reschedule` `{"date": "2026-11-20"}` (MCP `reschedule_campaign`, with
 `confirm=true`) moves a scheduled campaign to another day and keeps its time of day; a local-time
-send moves the day it goes out by the same number of days. It goes through the normal scheduling
-checks. It's refused within 15 minutes of sending, once sending started, or when the new time would
-send it right away.
+send moves the day it goes out by the same number of days. It's one write that only succeeds while
+the campaign is still scheduled and unchanged since it was read, with both its current and its new
+send time more than 15 minutes away; it never sends anything right away. A local-time or best-time
+send whose start wouldn't fall on the chosen day in your time zone (each person's local time can
+cross a day around a clock change) is refused with a note to pick another day.
 
 ## Permissions
 

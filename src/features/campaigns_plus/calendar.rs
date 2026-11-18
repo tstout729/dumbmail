@@ -89,10 +89,18 @@ pub async fn calendar(state: &AppState, account_id: Uuid, from: NaiveDate, to: N
     Ok(json!({"from": from, "to": to, "timezone": tz.name(), "items": items, "truncated": items.len() as i64 >= MAX_ITEMS}))
 }
 
+/// A planned move: the send time to store, the send options to store with it (a local-time send
+/// records its new day), and the day it was asked for.
+pub struct Move {
+    pub send_at: DateTime<Utc>,
+    pub send_options: Option<serde_json::Value>,
+}
+
 /// Where a scheduled campaign would go when moved to `date` (its day in the account's time zone),
 /// keeping its time of day. For a local-time send the day it goes out moves by as many days as its
-/// start does. Returns the send time to give `launch`, and when it would start.
-pub async fn plan_move(state: &AppState, account_id: Uuid, c: &CampaignRow, date: NaiveDate) -> AppResult<(DateTime<Utc>, DateTime<Utc>)> {
+/// start does. Refused when the start wouldn't fall on `date` in the account's zone (a local-time
+/// send across a clock change can start a day off), or would be within 15 minutes.
+pub async fn plan_move(state: &AppState, account_id: Uuid, c: &CampaignRow, date: NaiveDate) -> AppResult<Move> {
     if c.status != "scheduled" {
         return Err(AppError::Conflict(format!("only scheduled campaigns can be moved; this one is {}", c.status)));
     }
@@ -105,7 +113,7 @@ pub async fn plan_move(state: &AppState, account_id: Uuid, c: &CampaignRow, date
     let tz = crate::sending::account_tz(&account);
     let old_day = old.with_timezone(&tz).date_naive();
     let o = options::of(c.send_options.as_ref());
-    let send_at = match o.as_ref() {
+    let wanted = match o.as_ref() {
         Some(o) if o.timing == Timing::LocalTime => {
             let day = o.local_date.unwrap_or(old_day) + (date - old_day);
             local_instant(tz, day, 12 * 60)
@@ -113,19 +121,58 @@ pub async fn plan_move(state: &AppState, account_id: Uuid, c: &CampaignRow, date
         _ => local_instant(tz, date, local_minute(tz, old)),
     };
     // When it would start, worked out the way scheduling does; None means right away.
-    let (start, _) = crate::features::sendtime::plan::launch_start(state, &account, c, Some(send_at)).await?;
-    match start {
-        Some(s) if s > now + Duration::minutes(FREEZE_MINUTES) => Ok((send_at, s)),
-        _ => Err(AppError::bad(format!("that would send it now or within {FREEZE_MINUTES} minutes; pick a later day"))),
+    let (start, dated) = crate::features::sendtime::plan::launch_start(state, &account, c, Some(wanted)).await?;
+    let start = match start {
+        Some(s) if s > now + Duration::minutes(FREEZE_MINUTES) => s,
+        _ => return Err(AppError::bad(format!("that would send it now or within {FREEZE_MINUTES} minutes; pick a later day"))),
+    };
+    let start_day = start.with_timezone(&tz).date_naive();
+    if start_day != date {
+        return Err(AppError::bad(format!(
+            "moved to {}, it would start on {} in your time zone (each person's local time crosses a day there); pick another day",
+            date.format("%b %-d"),
+            start_day.format("%b %-d")
+        )));
     }
+    Ok(Move { send_at: start, send_options: dated })
 }
 
-/// Move a scheduled campaign to another day through the normal scheduling path (readiness, billing,
-/// send options, and a write that only succeeds if the campaign hasn't changed meanwhile).
+/// Move a scheduled campaign to another day, in one conditional write: only while it's still
+/// scheduled, unarchived and unchanged since it was read, and only while both its current and its
+/// new send time are more than 15 minutes away by the database's clock. Never sends it now.
 pub async fn reschedule(state: &AppState, account_id: Uuid, id: Uuid, date: NaiveDate) -> AppResult<(CampaignRow, DateTime<Utc>)> {
     let c = crate::campaigns::load(&state.db, account_id, id).await?;
     let old = c.send_at.unwrap_or_else(Utc::now);
-    let (send_at, _) = plan_move(state, account_id, &c, date).await?;
-    let row = crate::api::messaging::launch(state, account_id, id, Some(send_at), None).await?;
-    Ok((row, old))
+    let m = plan_move(state, account_id, &c, date).await?;
+    let account = crate::campaigns::load_account(&state.db, account_id).await?;
+    let problems = crate::campaigns::readiness(&account, &c, state.email.name() == "ses");
+    if !problems.is_empty() {
+        return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
+    }
+    let row: Option<CampaignRow> = sqlx::query_as(
+        "UPDATE campaigns SET send_at = $3, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
+         WHERE id = $1 AND account_id = $2 AND status = 'scheduled' AND updated_at = $6 AND archived_at IS NULL
+           AND send_at > now() + make_interval(mins => $7) AND $3 > now() + make_interval(mins => $7)
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(m.send_at)
+    .bind(m.send_options.is_some())
+    .bind(&m.send_options)
+    .bind(c.updated_at)
+    .bind(FREEZE_MINUTES as i32)
+    .fetch_optional(&state.db)
+    .await?;
+    match row {
+        Some(r) => Ok((r, old)),
+        None => {
+            let now = crate::campaigns::load(&state.db, account_id, id).await?;
+            Err(AppError::Conflict(if now.status != "scheduled" {
+                format!("this campaign is {} now and can't be moved", now.status)
+            } else {
+                format!("this campaign changed while you were moving it, or is less than {FREEZE_MINUTES} minutes from going out; open it again")
+            }))
+        }
+    }
 }

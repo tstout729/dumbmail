@@ -27,8 +27,8 @@ function TrackingForm({ defaults }: { defaults: LinkDefaults }) {
       <Card title="Link tracking (UTM)">
         <div className="flex items-start justify-between gap-4">
           <p className="text-sm text-zinc-600">
-            Add UTM parameters to the web links in your campaigns and flows, so Google Analytics and similar tools can tell which message brought a visitor. Links that
-            already have a parameter keep their own value. Unsubscribe and other DumbMail links are never changed.
+            Add UTM parameters to the web links in your campaign and flow emails, so Google Analytics and similar tools can tell which email brought a visitor. Links
+            that already have a parameter keep their own value. Unsubscribe and other DumbMail links are never changed. Text messages aren't tagged yet.
           </p>
           <Toggle checked={enabled} onChange={setEnabled} label="Tag links" />
         </div>

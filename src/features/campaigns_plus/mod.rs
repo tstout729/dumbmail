@@ -390,8 +390,8 @@ impl Feature for Module {
                 let day = date(a["date"].as_str().unwrap_or(""), "date")?;
                 if a["confirm"].as_bool() != Some(true) {
                     let c = crate::campaigns::load(&state.db, acct, id).await?;
-                    let (_, start) = calendar::plan_move(state, acct, &c, day).await?;
-                    return Ok(json!({"dry_run": true, "from": c.send_at, "would_start": start, "note": "Nothing changed. Call again with confirm=true once the user approves."}));
+                    let m = calendar::plan_move(state, acct, &c, day).await?;
+                    return Ok(json!({"dry_run": true, "from": c.send_at, "would_start": m.send_at, "note": "Nothing changed. Call again with confirm=true once the user approves."}));
                 }
                 reschedule(state, ctx, id, day).await
             }

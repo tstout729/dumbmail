@@ -131,11 +131,18 @@ export function useSetLinkTags(kind: "campaign" | "flow", id: string) {
   });
 }
 
-/** A flow or template list with this feature's fields, archived ones or the rest. */
-export function useItems<T>(kind: "flows" | "templates", archived: boolean) {
+/** Rows per page in the flow and template lists. */
+export const ITEMS_PAGE = 100;
+
+/** A page of flows or templates with this feature's fields: archived ones or the rest, searched by name. */
+export function useItems<T>(kind: "flows" | "templates", q: { archived: boolean; q?: string; channel?: string; offset: number }) {
   return useQuery({
-    queryKey: [kind, "with-tags", archived] as const,
-    queryFn: () => api<ListResponse<T & { tags: TagRef[]; archived_at: string | null }>>("GET", withQuery(`/api/${kind}`, { archived: archived ? "true" : undefined })),
-    select: (r) => r.data,
+    queryKey: [kind, "with-tags", q] as const,
+    queryFn: () =>
+      api<ListResponse<T & { tags: TagRef[]; archived_at: string | null }>>(
+        "GET",
+        withQuery(`/api/${kind}`, { archived: q.archived ? "true" : undefined, q: q.q || undefined, channel: q.channel, limit: ITEMS_PAGE, offset: q.offset || undefined }),
+      ),
+    placeholderData: keepPreviousData,
   });
 }

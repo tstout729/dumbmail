@@ -272,7 +272,7 @@ pub async fn archive(state: &AppState, account_id: Uuid, kind: Kind, b: ArchiveB
 pub async fn refuse_if_archived(db: &sqlx::PgPool, kind: Kind, account_id: Uuid, id: Uuid) -> AppResult<()> {
     let archived: Option<bool> = sqlx::query_scalar(&format!("SELECT archived_at IS NOT NULL FROM {} WHERE id = $1 AND account_id = $2", kind.table())).bind(id).bind(account_id).fetch_optional(db).await?;
     if archived == Some(true) {
-        let action = if kind == Kind::Flow { "turned on" } else { "sent or scheduled" };
+        let action = if kind == Kind::Flow { "turned on" } else { "sent, tested or scheduled" };
         return Err(AppError::Conflict(format!("this {} is archived and can't be {action}; unarchive it first", kind.noun())));
     }
     Ok(())
@@ -365,13 +365,51 @@ fn extras(row: &PgRow) -> (Value, Option<chrono::DateTime<Utc>>, i64) {
     (row.try_get("cp_tags").unwrap_or(json!([])), row.try_get("archived_at").ok().flatten(), row.try_get("cp_total").unwrap_or(0))
 }
 
+impl ListQuery {
+    /// Whether any filter or paging was asked for.
+    fn any(&self) -> bool {
+        [&self.channel, &self.status, &self.tag, &self.archived, &self.q, &self.from, &self.to, &self.limit, &self.offset].iter().any(|v| v.as_deref().is_some_and(|s| !s.is_empty()))
+    }
+
+    /// Refuse filters a list doesn't have, instead of ignoring them.
+    fn only(&self, list: &str, allowed: &[&str]) -> AppResult<()> {
+        let given = [("channel", &self.channel), ("status", &self.status), ("from", &self.from), ("to", &self.to)];
+        for (name, v) in given {
+            if v.as_deref().is_some_and(|s| !s.is_empty()) && !allowed.contains(&name) {
+                return Err(AppError::bad(format!("the {list} list can't be filtered by {name}")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Each listed campaign's tags and the campaign it resends, in one query for the page.
+async fn page_extras(state: &AppState, ids: &[Uuid]) -> AppResult<std::collections::HashMap<Uuid, (Value, Option<Uuid>)>> {
+    let rows: Vec<(Uuid, Value, Option<Uuid>)> = sqlx::query_as(
+        "SELECT i, COALESCE((SELECT jsonb_agg(jsonb_build_object('id', t.id, 'name', t.name) ORDER BY lower(t.name)) FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.campaign_id = i), '[]'),
+                (SELECT r.original_id FROM campaign_resends r WHERE r.campaign_id = i)
+         FROM unnest($1::uuid[]) i",
+    )
+    .bind(ids)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(rows.into_iter().map(|(id, tags, of)| (id, (tags, of))).collect())
+}
+
 /// The campaign list: each campaign as the API shows it, plus `tags`, `archived_at` and `resend_of`;
-/// and the total matching (for paging). One statement, then each campaign's stats as before.
+/// and the total matching. With no filters it does what the list always did (one statement, no
+/// full count; each campaign's stats as before), plus one query for the page's tags and resends
+/// only when the account has any.
 pub async fn campaigns(state: &AppState, account_id: Uuid, q: &ListQuery) -> AppResult<(Vec<Value>, i64)> {
     let f = parse(q)?;
-    let mut qb = QueryBuilder::new("SELECT c.*, count(*) OVER () AS cp_total, ");
-    qb.push(tags_sql("campaign_id", "c"));
-    qb.push(", (SELECT r.original_id FROM campaign_resends r WHERE r.campaign_id = c.id) AS cp_resend_of FROM campaigns c WHERE c.account_id = ").push_bind(account_id);
+    let counted = q.any();
+    let mut qb = QueryBuilder::new("SELECT c.*, ");
+    if counted {
+        qb.push("count(*) OVER () AS cp_total, ");
+    }
+    // Uncorrelated: worked out once for the statement, not per row.
+    qb.push("(EXISTS (SELECT 1 FROM tags WHERE account_id = ").push_bind(account_id).push(") OR EXISTS (SELECT 1 FROM campaign_resends WHERE account_id = ").push_bind(account_id);
+    qb.push(")) AS cp_extras FROM campaigns c WHERE c.account_id = ").push_bind(account_id);
     if let Some(ch) = &f.channel {
         qb.push(" AND c.channel = ").push_bind(ch.clone());
     }
@@ -388,16 +426,19 @@ pub async fn campaigns(state: &AppState, account_id: Uuid, q: &ListQuery) -> App
             qb.push(" AND COALESCE(c.sent_at, c.send_at, c.created_at) < (").push_bind(d).push(format!("::date + 1)::timestamp AT TIME ZONE {zone}"));
         }
     }
-    qb.push(" ORDER BY COALESCE(c.sent_at, c.send_at, c.created_at) DESC, c.id DESC LIMIT ").push_bind(f.limit).push(" OFFSET ").push_bind(f.offset);
+    qb.push(" ORDER BY COALESCE(c.sent_at, c.send_at, c.created_at) DESC, c.id DESC LIMIT ").push_bind(f.limit);
+    if f.offset > 0 {
+        qb.push(" OFFSET ").push_bind(f.offset);
+    }
     let rows = qb.build().fetch_all(&state.db).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    let mut total = 0;
-    for row in &rows {
-        let c = CampaignRow::from_row(row)?;
-        let (tags, archived_at, t) = extras(row);
-        total = t;
-        let resend_of: Option<Uuid> = row.try_get("cp_resend_of").ok().flatten();
-        let mut v = crate::api::messaging::campaign_json(state, &c).await?;
+    let total = if counted { rows.first().and_then(|r| r.try_get::<i64, _>("cp_total").ok()).unwrap_or(0) } else { rows.len() as i64 };
+    let any_extras = rows.first().and_then(|r| r.try_get::<bool, _>("cp_extras").ok()).unwrap_or(false);
+    let campaigns: Vec<(CampaignRow, Option<chrono::DateTime<Utc>>)> = rows.iter().map(|r| Ok((CampaignRow::from_row(r)?, r.try_get("archived_at").ok().flatten()))).collect::<sqlx::Result<_>>()?;
+    let extras = if any_extras { page_extras(state, &campaigns.iter().map(|(c, _)| c.id).collect::<Vec<_>>()).await? } else { Default::default() };
+    let mut out = Vec::with_capacity(campaigns.len());
+    for (c, archived_at) in &campaigns {
+        let (tags, resend_of) = extras.get(&c.id).cloned().unwrap_or((json!([]), None));
+        let mut v = crate::api::messaging::campaign_json(state, c).await?;
         v["tags"] = tags;
         v["archived_at"] = json!(archived_at);
         v["resend_of"] = json!(resend_of);
@@ -408,6 +449,7 @@ pub async fn campaigns(state: &AppState, account_id: Uuid, q: &ListQuery) -> App
 
 /// The flow list (live first, then most recently changed), with `tags` and `archived_at`.
 pub async fn flows(state: &AppState, account_id: Uuid, q: &ListQuery) -> AppResult<(Vec<Value>, i64)> {
+    q.only("flow", &["status"])?;
     let f = parse(q)?;
     let mut qb = QueryBuilder::new("SELECT f.*, count(*) OVER () AS cp_total, ");
     qb.push(tags_sql("flow_id", "f"));
@@ -434,6 +476,7 @@ pub async fn flows(state: &AppState, account_id: Uuid, q: &ListQuery) -> AppResu
 
 /// The template list (most recently changed first), with `tags` and `archived_at`.
 pub async fn templates(state: &AppState, account_id: Uuid, q: &ListQuery) -> AppResult<(Vec<Value>, i64)> {
+    q.only("template", &["channel"])?;
     let f = parse(q)?;
     let mut qb = QueryBuilder::new("SELECT t0.id, t0.name, t0.channel, t0.content, t0.created_at, t0.updated_at, t0.archived_at, count(*) OVER () AS cp_total, ");
     qb.push(tags_sql("template_id", "t0"));

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Button, Field, InlineError, Modal, TagInput } from "../../components/ui";
+import { formatNumber } from "../../lib/format";
 import { useApplyTags, type ItemKind } from "./api";
 import type { TagRef } from "./types";
 
@@ -42,5 +43,25 @@ export function TagsDialog({ kind, id, name, tags, onClose }: { kind: ItemKind; 
         </div>
       </div>
     </Modal>
+  );
+}
+
+/** Previous and next under a paged list, shown only when there's more than one page. */
+export function Pager({ offset, total, page, onChange }: { offset: number; total: number; page: number; onChange: (offset: number) => void }) {
+  if (total <= page) return null;
+  return (
+    <div className="mt-3 flex items-center justify-between text-sm text-zinc-600">
+      <span className="tabular-nums">
+        {formatNumber(offset + 1)}–{formatNumber(Math.min(offset + page, total))} of {formatNumber(total)}
+      </span>
+      <div className="flex gap-2">
+        <Button size="sm" disabled={offset === 0} onClick={() => onChange(Math.max(0, offset - page))}>
+          Previous
+        </Button>
+        <Button size="sm" disabled={offset + page >= total} onClick={() => onChange(offset + page)}>
+          Next
+        </Button>
+      </div>
+    </div>
   );
 }

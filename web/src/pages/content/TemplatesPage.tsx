@@ -3,8 +3,8 @@ import { Link, useNavigate, useSearchParams } from "react-router";
 import { Archive, ArchiveRestore, LayoutTemplate, Mail, MessageSquare, MoreHorizontal, Plus, Tag } from "lucide-react";
 import type { Channel, EmailContent, SmsContent, Template } from "../../api";
 import { useCreateTemplate, useSession } from "../../api";
-import { useArchive, useItems } from "../../features/campaignsPlus/api";
-import { TagChips, TagsDialog } from "../../features/campaignsPlus/TagsDialog";
+import { ITEMS_PAGE, useArchive, useItems } from "../../features/campaignsPlus/api";
+import { Pager, TagChips, TagsDialog } from "../../features/campaignsPlus/TagsDialog";
 import type { TagRef } from "../../features/campaignsPlus/types";
 import { starterEmail } from "../../components/email/blocks";
 import { EmailThumbnail } from "../../components/email/EmailPreview";
@@ -17,13 +17,15 @@ type Tab = "all" | Channel;
 
 export function TemplatesPage() {
   const [showArchived, setShowArchived] = useState(false);
-  const templates = useItems<Template>("templates", showArchived);
+  const [offset, setOffset] = useState(0);
   const archive = useArchive("templates");
   const [tagging, setTagging] = useState<(Template & { tags: TagRef[] }) | null>(null);
   const [params, setParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>("all");
+  const page = useItems<Template>("templates", { archived: showArchived, channel: tab === "all" ? undefined : tab, offset });
+  const templates = { ...page, data: page.data?.data };
   const creating = params.get("create") === "1";
-  const rows = (templates.data ?? []).filter((t) => tab === "all" || t.channel === tab);
+  const rows = templates.data ?? [];
 
   const setCreating = (on: boolean) => {
     const next = new URLSearchParams(params);
@@ -46,14 +48,25 @@ export function TemplatesPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <Tabs
           value={tab}
-          onChange={setTab}
+          onChange={(t) => {
+            setTab(t);
+            setOffset(0);
+          }}
           tabs={[
             { value: "all", label: "All" },
             { value: "email", label: "Email" },
             { value: "sms", label: "SMS" },
           ]}
         />
-        <Checkbox label="Archived" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} className="mt-1.5" />
+        <Checkbox
+          label="Archived"
+          checked={showArchived}
+          onChange={(e) => {
+            setShowArchived(e.target.checked);
+            setOffset(0);
+          }}
+          className="mt-1.5"
+        />
       </div>
       {templates.isPending ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
@@ -125,6 +138,7 @@ export function TemplatesPage() {
           ))}
         </div>
       )}
+      <Pager offset={offset} total={page.data?.total ?? 0} page={ITEMS_PAGE} onChange={setOffset} />
       {creating ? <CreateTemplateDialog onClose={() => setCreating(false)} /> : null}
       {tagging ? <TagsDialog kind="templates" id={tagging.id} name={tagging.name} tags={tagging.tags} onClose={() => setTagging(null)} /> : null}
     </Page>
