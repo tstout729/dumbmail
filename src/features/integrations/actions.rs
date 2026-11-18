@@ -813,7 +813,10 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
     let created = insert_profile_in(&mut tx, src.account_id, &src.tag(), src.contacts_opted_in, input, props, extra_keys, no_marketing).await?;
     let Some(p) = created else { return Ok(None) };
     if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
-        mark_applied(&mut *tx, d, i, print).await?;
+        // Another attempt of this delivery got there first: its profile is the one to update.
+        if !mark_applied(&mut *tx, d, i, print).await? {
+            return Ok(None);
+        }
     }
     tx.commit().await?;
     crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
@@ -867,15 +870,18 @@ pub async fn insert_profile_in(
         .await?)
 }
 
-/// Record in the delivery's ledger that action `i` was written.
-pub(crate) async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<()> {
-    sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1")
+/// Record in the delivery's ledger that action `i` was written. False: another attempt already
+/// recorded it (it waited on this row and saw that attempt's entry), so a caller writing in the
+/// same transaction must roll back.
+pub(crate) async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<bool> {
+    let n = sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1 AND (applied->>$2) IS DISTINCT FROM $3")
         .bind(delivery)
         .bind(i.to_string())
         .bind(print)
         .execute(db)
-        .await?;
-    Ok(())
+        .await?
+        .rows_affected();
+    Ok(n > 0)
 }
 
 /// Note that this integration supplied the profile's current email and phone (only where the

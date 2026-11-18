@@ -304,15 +304,22 @@ async fn seal_sensitive(state: &AppState, integ: &Integration, list: Vec<Value>)
     Ok((out, sealed))
 }
 
-/// The stored list with its sealed sensitive fields put back (in memory only).
-fn unsealed(state: &AppState, list: &[Value], sealed: Option<&str>) -> anyhow::Result<Vec<Value>> {
+/// The stored list with its sealed sensitive fields put back (in memory only), each only while its
+/// type still marks it sensitive: a field un-marked since (its old values erased) never gets an
+/// old private value written into it by a late retry.
+async fn unsealed(state: &AppState, account_id: Uuid, list: &[Value], sealed: Option<&str>) -> Result<Vec<Value>, String> {
     let Some(s) = sealed else { return Ok(list.to_vec()) };
-    let map: Map<String, Value> = serde_json::from_str(&crate::crypto::decrypt(&state.cfg.secret_key, s)?)?;
+    let unreadable = || "the delivery's hidden fields couldn't be read".to_string();
+    let opened = crate::crypto::decrypt(&state.cfg.secret_key, s).map_err(|_| unreadable())?;
+    let map: Map<String, Value> = serde_json::from_str(&opened).map_err(|_| unreadable())?;
     let mut out = list.to_vec();
     for (i, taken) in map {
         let Ok(i) = i.parse::<usize>() else { continue };
-        if let (Some(fields), Some(taken)) = (out.get_mut(i).and_then(|a| a.get_mut("fields")).and_then(Value::as_object_mut), taken.as_object()) {
-            fields.extend(taken.clone());
+        let Some(action) = out.get_mut(i) else { continue };
+        let key = action["object_type"].as_str().unwrap_or("").to_string();
+        let t = crate::features::objects::types::by_key(&state.db, account_id, &key).await.map_err(|e| e.public_message())?;
+        if let (Some(fields), Some(taken), Some(t)) = (action.get_mut("fields").and_then(Value::as_object_mut), taken.as_object(), t) {
+            fields.extend(taken.iter().filter(|(k, _)| t.is_sensitive(k)).map(|(k, v)| (k.clone(), v.clone())));
         }
     }
     Ok(out)
@@ -414,10 +421,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
         // Applied with the sealed fields put back; fingerprints come from the stored list.
         // A sealed list that can't be opened fails like any other bad delivery (and its seal is
         // dropped once no retry is left), rather than erroring the job forever.
-        Ok(list) => match unsealed(state, &list, sealed.as_deref())
-            .map_err(|_| "the delivery's hidden fields couldn't be read".to_string())
-            .and_then(|full| actions::parse(&Value::Array(full), true))
-        {
+        Ok(list) => match unsealed(state, account_id, &list, sealed.as_deref()).await.and_then(|full| actions::parse(&Value::Array(full), true)) {
             Ok(acts) => {
                 let (o, err) = actions::apply(state, &src, &acts, &list, &skip, &integ.state_map(), false).await;
                 match err {
@@ -936,6 +940,30 @@ async fn pull_failed(state: &AppState, integ: &Integration, scrub: &Scrub, run_i
     Ok(())
 }
 
+/// Where a pull page is: its integration, run (or the live pull) and request position.
+fn page_key(integration_id: Uuid, run: Option<&str>, pages: u32, next: &NextRequest) -> String {
+    use sha2::Digest;
+    let at = json!({"integration": integration_id, "run": run.unwrap_or("live"), "page": pages, "next": next});
+    hex::encode(sha2::Sha256::digest(at.to_string().as_bytes()))
+}
+
+/// Give `delivery` the page's key and the ledger of any earlier attempt at that page not yet
+/// checkpointed (taking the key from it), in one statement. Returns the ledger to skip by.
+async fn resume_page(state: &AppState, integration_id: Uuid, delivery: Uuid, key: &str) -> anyhow::Result<Map<String, Value>> {
+    let applied: Value = sqlx::query_scalar(
+        "WITH old AS (UPDATE integration_deliveries SET page_key = NULL
+                      WHERE integration_id = $1 AND page_key = $2 AND id <> $3 AND created_at > now() - interval '7 days' RETURNING applied),
+              carried AS (SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) AS a FROM old, jsonb_each(old.applied) e)
+         UPDATE integration_deliveries SET page_key = $2, applied = (SELECT a FROM carried) || applied WHERE id = $3 RETURNING applied",
+    )
+    .bind(integration_id)
+    .bind(key)
+    .bind(delivery)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(applied.as_object().cloned().unwrap_or_default())
+}
+
 /// Job: fetch up to a few pages of a pull (or backfill), running the script on each, then hand
 /// over to a new job if the script asks for more. At most [`PULLS_PER_ACCOUNT`] run at once per
 /// account (and a few in all); the rest wait in the queue.
@@ -1026,6 +1054,11 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         extra.insert("backfill".into(), if backfill { json!({"since": bf["since"]}) } else { Value::Null });
         let input = Input { source: "pull".into(), content_type: ct.clone(), body: resp.body.clone(), extra, ..Default::default() };
         let delivery = store_log(state, &integ, &scrub, NewDelivery { content_type: ct.as_deref(), body, request: Some(logged_req), ..NewDelivery::log("pull", "ok", None) }).await?;
+        // The same page tried again (its job retried after a crash, or the next scheduled pull
+        // from the same place) carries on with the earlier attempt's ledger: what it already wrote
+        // is skipped, so a retried delete never removes a replacement made since. The key is
+        // cleared when the page's progress is saved.
+        let skip = resume_page(state, integ.id, delivery, &page_key(integ.id, run, pages, &next)).await?;
         let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub, &super::redact::paths(&integ.redact)).await;
         drop(slot);
         // A backfill page is applied under a lock on the integration that a replacement or a
@@ -1040,7 +1073,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 .await?;
             if current.is_none() {
                 guard.rollback().await?;
-                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1, sealed_fields = NULL WHERE id = $1")
+                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1, sealed_fields = NULL, page_key = NULL WHERE id = $1")
                     .bind(delivery)
                     .execute(&state.db)
                     .await?;
@@ -1057,7 +1090,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 sqlx::query("UPDATE integration_deliveries SET actions = $2 WHERE id = $1").bind(delivery).bind(Value::Array(list.clone())).execute(&state.db).await?;
                 match actions::parse(&Value::Array(full), true) {
                     Ok(acts) => {
-                        let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery), Some(delivery)), &acts, &list, &Map::new(), &run_state, false).await;
+                        let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery), Some(delivery)), &acts, &list, &skip, &run_state, false).await;
                         match err {
                             None => Ok((o, acts)),
                             Some(e) => Err(e.public_message()),
@@ -1072,7 +1105,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         pages += 1;
         match res {
             Ok((o, acts)) => {
-                sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, duration_ms = $4, attempts = 1 WHERE id = $1")
+                sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, duration_ms = $4, attempts = 1, page_key = NULL WHERE id = $1")
                     .bind(delivery)
                     .bind(status_for(acts.len()))
                     .bind(scrub.value(&result_json(&o)))

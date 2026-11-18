@@ -386,13 +386,14 @@ pub const MAX_CONVERT: i64 = 100_000;
 /// Stored values of fields whose definition changed: refused (with a count) unless `convert`, in
 /// which case values that fit are put in the new form and the rest removed. In the edit's
 /// transaction, under the type's row lock.
-async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef], convert: bool) -> AppResult<u64> {
+/// (`erased`: fields whose values this edit already deleted.)
+async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef], convert: bool, erased: &[String]) -> AppResult<u64> {
     // One bound for the whole edit, across fields, and a deadline for its statements.
     sqlx::query("SET LOCAL statement_timeout = '30s'").execute(&mut *conn).await?;
     let mut checked: i64 = 0;
     let mut converted = 0;
     for f in new {
-        let Some(old) = t.field(&f.key) else { continue };
+        let Some(old) = t.field(&f.key).filter(|_| !erased.contains(&f.key)) else { continue };
         if old.kind == f.kind && old.options == f.options && old.currency == f.currency {
             continue;
         }
@@ -499,7 +500,8 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
                     f.sensitive = true;
                 }
             }
-            if let Some(old) = c.field(&f.key).filter(|o| o.sensitive && o.kind == Kind::Enum) {
+            // (Not into a field being un-marked: its hidden options aren't revealed; send them.)
+            if let Some(old) = c.field(&f.key).filter(|o| o.sensitive && o.kind == Kind::Enum && !unmark.contains(&o.key)) {
                 if f.kind == Kind::Enum && f.options.is_empty() {
                     f.options = old.options.clone();
                 }
@@ -515,7 +517,7 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
     check_fields(&fields, title.as_deref())?;
     let created = cur.is_none();
     if let Some(c) = &cur {
-        check_stored(&mut tx, c, &fields, b.convert).await?;
+        // Erased first: a field being un-marked has no values left for the checks below.
         if !unmark.is_empty() {
             if !b.confirm {
                 return Err(AppError::bad(format!(
@@ -525,6 +527,7 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
             }
             erase_field_values(&mut tx, c.id, &unmark).await?;
         }
+        check_stored(&mut tx, c, &fields, b.convert, &unmark).await?;
     }
     let row: ObjectType = match cur {
         Some(c) => {
@@ -597,8 +600,15 @@ pub async fn for_upsert(conn: &mut PgConnection, account_id: Uuid, key: &str, va
     if !valid_type_key(key) {
         return Err(bad_type_key(key));
     }
-    let existing = by_key(&mut *conn, account_id, key).await?;
     let needs = |t: &ObjectType| values.iter().any(|(k, v)| !v.is_null() && t.field(k).is_none());
+    let mut existing = by_key(&mut *conn, account_id, key).await?;
+    if existing.as_ref().is_some_and(|t| !needs(t)) {
+        // Held (key share) until the write commits: a type edit that un-marks a sensitive field
+        // waits for writes in flight, so it erases what they wrote too. Writes don't block each
+        // other (a write that adds a field takes the row lock below instead, without this first).
+        let q = format!("SELECT {TYPE_COLS} FROM object_types WHERE account_id = $1 AND key = $2 FOR KEY SHARE");
+        existing = sqlx::query_as(&q).bind(account_id).bind(key).fetch_optional(&mut *conn).await?;
+    }
     match existing {
         Some(t) if !needs(&t) => Ok(t),
         Some(_) => {

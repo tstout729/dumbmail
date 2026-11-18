@@ -397,10 +397,8 @@ pub fn redacted(redact: &[crate::features::integrations::redact::Path], fields: 
 async fn record_receipt(conn: &mut PgConnection, r: Receipt<'_>, result: &str) -> AppResult<bool> {
     match r {
         Receipt::None => Ok(true),
-        Receipt::Ledger { delivery, index, print } => {
-            crate::features::integrations::actions::mark_applied(&mut *conn, delivery, index, print).await?;
-            Ok(true)
-        }
+        // Claimed only if no other attempt recorded it first; otherwise the write rolls back.
+        Receipt::Ledger { delivery, index, print } => crate::features::integrations::actions::mark_applied(&mut *conn, delivery, index, print).await,
         Receipt::Bulk { id, index } => {
             let col = match result {
                 "created" => "created",
@@ -430,6 +428,7 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
     let tz = super::flow::account_tz(&state.db, w.account_id).await?;
     let mut tx = state.db.begin().await?;
     let t = types::for_upsert(&mut tx, w.account_id, req.type_key, &fields).await?;
+    super::hooks::pause(w.account_id, "type_read").await;
     let norm = normalize_all(&t, &fields)?;
     // One kind of version per type, set by the first write that gives one.
     if let Some(v) = &req.as_of {

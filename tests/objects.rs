@@ -1236,8 +1236,9 @@ async fn sensitive_stays_sensitive_and_rules_on_it_never_match_everyone() {
     let mut h = harness!();
     h.signup().await;
     h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [
-        {"key": "status", "type": "text"}, {"key": "check_in", "type": "date"}, {"key": "pin", "type": "text", "sensitive": true}]}))).await;
-    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"status": "confirmed", "check_in": day(5), "pin": "4417"}, "profiles": [{"email": "a@example.com"}]}))).await;
+        {"key": "status", "type": "text"}, {"key": "check_in", "type": "date"}, {"key": "pin", "type": "text", "sensitive": true},
+        {"key": "lock", "type": "enum", "options": ["front", "back"], "sensitive": true}]}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"status": "confirmed", "check_in": day(5), "pin": "4417", "lock": "front"}, "profiles": [{"email": "a@example.com"}]}))).await;
     h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"pin": "5512"}}))).await;
     h.ok("POST", "/api/profiles", Some(json!({"email": "nobody@example.com"}))).await;
     let mut fields: Vec<Value> = h.ok("GET", "/api/object-types/stay", None).await["fields"].as_array().unwrap().clone();
@@ -1256,6 +1257,14 @@ async fn sensitive_stays_sensitive_and_rules_on_it_never_match_everyone() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let t = h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone(), "unmark_sensitive": ["pin"], "confirm": true}))).await;
     assert_eq!(pin_sensitive(&t), Value::Null, "an ordinary field now: {t}");
+    // An un-marked enum doesn't get its hidden options back (the type shows them now).
+    for f in fields.iter_mut() {
+        if f["key"] == "lock" {
+            f["sensitive"] = json!(false);
+        }
+    }
+    let t = h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone(), "unmark_sensitive": ["lock"], "confirm": true}))).await;
+    assert!(!t.to_string().contains("front") && !t.to_string().contains("back"), "{t}");
     let left: String = sqlx::query_scalar("SELECT concat_ws(' ', (SELECT string_agg(fields::text, ' ') FROM objects), (SELECT string_agg(concat_ws(' ', before::text, after::text), ' ') FROM object_changes))").fetch_one(&h.state.db).await.unwrap();
     assert!(!left.contains("4417") && !left.contains("5512"), "{left}");
     // "Not in a segment" whose rule becomes untestable matches nobody, not everyone.
@@ -1285,5 +1294,93 @@ async fn sensitive_stays_sensitive_and_rules_on_it_never_match_everyone() {
     // The date report hides itself when a filter's field becomes sensitive, not just the date's.
     let report = h.ok("GET", &report_path, None).await;
     assert_eq!(report["object_dates"]["hidden"], true, "{report}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_unmark_waits_for_writes_in_flight_and_late_retries_skip_its_old_values() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "n", "type": "number"}, {"key": "pin", "type": "text", "sensitive": true}]}))).await;
+    // A write has read the type (pin sensitive) and is about to store a pin.
+    let (mut points, go) = dumbmail::features::objects::hooks::install_only(acct, &["type_read"]);
+    let state = h.state.clone();
+    let write = tokio::spawn(async move {
+        use dumbmail::features::objects::store;
+        let fields = json!({"pin": "4417"}).as_object().cloned().unwrap();
+        let req = store::Write { type_key: "stay", external_id: "S1", fields: &fields, links: vec![], replace: vec![], as_of: None, at_most: None };
+        store::write(&state, &store::Writer::new(acct, "api"), &req, store::Receipt::None).await.map(|_| ())
+    });
+    assert_eq!(points.recv().await, Some("type_read"));
+    let unmark: dumbmail::features::objects::types::TypeInput = serde_json::from_value(json!({"key": "stay", "fields": [{"key": "n", "type": "number"}, {"key": "pin", "type": "text"}], "unmark_sensitive": ["pin"], "confirm": true})).unwrap();
+    let db = h.state.db.clone();
+    let edit = tokio::spawn(async move { dumbmail::features::objects::types::upsert(&db, acct, unmark).await.map(|_| ()) });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!edit.is_finished(), "the un-mark waits for the write");
+    go.notify_one();
+    write.await.unwrap().unwrap();
+    edit.await.unwrap().unwrap();
+    dumbmail::features::objects::hooks::remove(acct);
+    let pin: Option<String> = sqlx::query_scalar("SELECT fields->>'pin' FROM objects").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pin, None, "the write in flight was erased with the rest");
+    // A delivery waiting with a sealed pin: its retry after an un-mark doesn't write the old value.
+    h.ok("POST", "/api/object-types", Some(json!({"key": "visit", "fields": [{"key": "n", "type": "number"}, {"key": "code", "type": "text", "sensitive": true}]}))).await;
+    let script = "function handle(i) { return [{type: 'track_event', metric: 'Visit', profile: {property: 'pms_id', value: 'p1', if_missing: 'retry'}}, {type: 'upsert_object', object_type: 'visit', external_id: 'V1', fields: {n: 2, code: 'C-9931'}}] }";
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "PMS", "script": script, "metrics": ["Visit"]}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    h.raw("POST", &url[url.find("/webhooks/in/").unwrap()..], &[("content-type", "application/json")], "{}").await;
+    h.drain().await;
+    let sealed: Option<String> = sqlx::query_scalar("SELECT sealed_fields FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert!(sealed.is_some());
+    h.ok("PATCH", "/api/object-types/visit", Some(json!({"fields": [{"key": "n", "type": "number"}, {"key": "code", "type": "text"}], "unmark_sensitive": ["code"], "confirm": true}))).await;
+    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) SELECT $1, account_id, 'p@example.com', '{\"pms_id\": \"p1\"}' FROM integrations").bind(uuid::Uuid::now_v7()).execute(&h.state.db).await.unwrap();
+    h.fast_forward().await;
+    let (n, code): (Option<String>, Option<String>) = sqlx::query_as("SELECT fields->>'n', fields->>'code' FROM objects WHERE external_id = 'V1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((n.as_deref(), code), (Some("2"), None), "the rest is written; the old private value isn't");
+    h.cleanup().await;
+}
+
+async fn mock_pages(body: Value) -> String {
+    use axum::routing::get;
+    let app = axum::Router::new().route("/page", get(move || async move { axum::Json(body) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/page")
+}
+
+#[tokio::test]
+async fn a_retried_pull_page_never_deletes_a_replacement() {
+    let page = mock_pages(json!({"del": true})).await;
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    let script = "function handle(i) { var p = i.payload; return p.del ? [{type: 'delete_object', object_type: 'stay', external_id: 'S1'}] : [{type: 'upsert_object', object_type: 'stay', external_id: 'S1', fields: {n: p.n}}] }";
+    let (id, path) = integration(&mut h, script, json!([])).await;
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"pull": {"url": page}}))).await;
+    h.raw("POST", &path, &[("content-type", "application/json")], &json!({"n": 1}).to_string()).await;
+    h.drain().await;
+    let job = json!({"integration_id": id, "mode": "live", "pages": 0});
+    // The pull's page deletes S1, and the job dies right after (before its progress is saved).
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let state = h.state.clone();
+    let payload = job.clone();
+    let run = tokio::spawn(async move { dumbmail::features::integrations::engine::run_pull(&state, &payload).await });
+    assert_eq!(points.recv().await, Some("before_delete"));
+    go.notify_one();
+    assert_eq!(points.recv().await, Some("after_action"));
+    run.abort();
+    let _ = run.await;
+    dumbmail::features::objects::hooks::remove(acct);
+    assert_eq!(count(&h, "SELECT count(*) FROM objects").await, 0);
+    // A replacement arrives under the same id; then the pull job runs again.
+    h.raw("POST", &path, &[("content-type", "application/json")], &json!({"n": 2}).to_string()).await;
+    h.drain().await;
+    dumbmail::features::integrations::engine::run_pull(&h.state, &job).await.unwrap();
+    let n: Option<String> = sqlx::query_scalar("SELECT fields->>'n' FROM objects WHERE external_id = 'S1'").fetch_optional(&h.state.db).await.unwrap();
+    assert_eq!(n.as_deref(), Some("2"), "the retried page saw its delete already written");
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE page_key IS NOT NULL").await, 0, "checkpointed: no page left open");
     h.cleanup().await;
 }

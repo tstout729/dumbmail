@@ -5,3 +5,5 @@
 -- Nullable columns with no default: no table rewrite.
 ALTER TABLE integration_deliveries ADD COLUMN sealed_fields text;
 ALTER TABLE integration_deliveries ADD COLUMN page_key text;
+-- Pull pages not yet checkpointed, found by their key (small: cleared once the page's progress is saved).
+CREATE INDEX integration_deliveries_open_pages ON integration_deliveries (integration_id, page_key) WHERE page_key IS NOT NULL;
