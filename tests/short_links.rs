@@ -575,3 +575,38 @@ async fn shortening_changes_nothing_but_the_link() {
     assert_eq!(location.as_deref(), Some("https://shop.test/deal!"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_send_and_every_estimate_decide_the_same_way() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    h.ok("PUT", "/api/link-tags", Some(json!({"enabled": true}))).await;
+    let (_, phone) = texter(&mut h, &list, 8101).await;
+    // A link just under the limit: its tags would take it over, so it's shortened untagged, and the
+    // preview (which knows no tags) shows the same short link the send uses.
+    let near = format!("https://shop.test/p?{}", "a".repeat(2000 - "https://shop.test/p?".len()));
+    let body = format!("Acme Goods: {near}");
+    let r = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": body}}))).await;
+    assert_eq!(short_paths(r["body"].as_str().unwrap()).len(), 1, "{r}");
+    let id = sms_campaign(&mut h, &list, &body).await;
+    launch(&mut h, &id).await;
+    let sent = body_to(&h, &phone);
+    let p = short_paths(&sent);
+    assert_eq!(p.len(), 1, "{sent}");
+    assert_eq!(sent.chars().count(), r["body"].as_str().unwrap().chars().count());
+    assert_eq!(click(&h, &p[0]).await.1.as_deref(), Some(near.as_str()), "untagged: the tags didn't fit");
+
+    // The launch check counts the short link: one segment each, not the raw template's two.
+    let list2 = h.ok("POST", "/api/lists", Some(json!({"name": "Two"}))).await["id"].as_str().unwrap().to_string();
+    texter(&mut h, &list2, 8102).await;
+    texter(&mut h, &list2, 8103).await;
+    let link = format!("https://shop.test/collections/{}", "winter-".repeat(20));
+    let body = format!("Acme Goods: new arrivals {link}");
+    assert_eq!(dumbmail::providers::sms::segment_count(&format!("Acme Goods: {body} Reply STOP to opt out.")).1, 2);
+    let id = sms_campaign(&mut h, &list2, &body).await;
+    let one_segment_each = 2 * dumbmail::billing::to_micros(0.0099);
+    sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(one_segment_each).execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{id}/send"), None).await;
+    assert!(s.is_success(), "{s}: {v}");
+    h.cleanup().await;
+}

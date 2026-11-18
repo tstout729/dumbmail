@@ -114,15 +114,17 @@ fn replace_literals<'a>(template: &'a str, own: &HashSet<String>, short: impl Fn
     Cow::Owned(out)
 }
 
-/// Each written link and where it goes: the link with the message's link tags added.
+/// Each written link and where it goes: the link with the message's link tags added, or as written
+/// when the tags would take it past [`MAX_URL`]. Whether a link is shortened never depends on its
+/// tags, so previews and estimates (which don't know them) decide exactly as the send does.
 fn destinations(links: Vec<String>, hook: Option<&dyn LinkHook>) -> Vec<(String, String)> {
     links
         .into_iter()
         .map(|l| {
-            let dest = hook.and_then(|h| h.destination(&l)).unwrap_or_else(|| l.clone());
+            let tagged = hook.and_then(|h| h.destination(&l)).filter(|d| (d.starts_with("https://") || d.starts_with("http://")) && d.len() <= MAX_URL);
+            let dest = tagged.unwrap_or_else(|| l.clone());
             (l, dest)
         })
-        .filter(|(_, d)| (d.starts_with("https://") || d.starts_with("http://")) && d.len() <= MAX_URL)
         .collect()
 }
 
@@ -298,19 +300,25 @@ impl SmsLinks for Sample {
 
 /// See [`Sample`]. One statement, only when the body has a link the sender wrote.
 pub async fn preview(state: &AppState, account: &Account, body: &str) -> AppResult<Option<Sample>> {
-    // Until the index is in place, sends use the long form, so the preview does too.
-    if !runtime::issuing(state) {
+    if written_links(body, &own_hosts(state, account.link_domain.as_deref())).is_empty() {
         return Ok(None);
     }
-    let own = own_hosts(state, account.link_domain.as_deref());
-    if written_links(body, &own).is_empty() {
+    sample_for(state, account).await
+}
+
+/// The sample for any text of this account (one statement), for estimates over several texts:
+/// [`SmsLinks::source`] on it gives a template with every link the send would shorten replaced by
+/// a short link of the real length. None when the send wouldn't shorten anything now.
+pub async fn sample_for(state: &AppState, account: &Account) -> AppResult<Option<Sample>> {
+    // Until this server issues short links, sends use the long form, so estimates do too.
+    if !runtime::issuing(state) {
         return Ok(None);
     }
     let on: bool = sqlx::query_scalar("SELECT sms_short_links FROM accounts WHERE id = $1").bind(account.id).fetch_optional(&state.db).await?.unwrap_or(false);
     if !on {
         return Ok(None);
     }
-    Ok(Some(Sample { own, short: sample_link(state, account) }))
+    Ok(Some(Sample { own: own_hosts(state, account.link_domain.as_deref()), short: sample_link(state, account) }))
 }
 
 /// A short link of the real length on this account's link domain.

@@ -507,11 +507,14 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let (segments, mms) = if c.channel == "sms" {
         // Personalization changes length a little; estimate from the template plus compliance text,
         // using the costliest version of an A/B test (priced per version: MMS and long SMS cost differently).
+        // Links the send will shorten count as short links (features::short_links).
         let p = crate::billing::prices(state);
+        let short_links = crate::features::short_links::send::sample_for(state, &account).await?;
         let per_version: Vec<(i64, bool)> = versions
             .iter()
             .map(|content| {
-                let body = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                let raw = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                let body = short_links.as_ref().map_or(std::borrow::Cow::Borrowed(raw), |s| render::SmsLinks::source(s, raw));
                 let n = crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64;
                 (n.max(1), content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
             })
