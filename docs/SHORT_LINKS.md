@@ -1,0 +1,97 @@
+# Short links in text messages
+
+A link in a text is billed by its length. Without short links, a tracked link carries its whole
+destination (`https://<link domain>/t/c/<token>?u=<the whole URL>&s=<signature>`), so one link can
+push a text into a second or third segment. With short links, every link the sender wrote becomes
+
+```
+https://<link domain>/s/Ab12Cd34Ef56Gh78Jk90Lm12
+```
+
+the same length whatever it points to: `/s/` and 24 letters and digits. On dumbmail.ai's shared
+link domain that's 46 characters. Short links are on for every account, new and existing; turn
+them off in Settings → Texting (`PATCH /api/short-links/settings`, MCP
+`update_short_link_settings`).
+
+## What gets shortened
+
+- Links the sender typed into the text: `http` and `https` links with no template tag in them.
+  Punctuation that ends a sentence stays outside the link ("Shop now: https://shop.com/sale." keeps
+  its full stop).
+- Not shortened (they keep the long tracked form, as before): links built from a variable (they can
+  differ per person, like `https://shop.com/?ref={{ email }}` or a product link), DumbMail's own
+  links (unsubscribe, forms, tracking), links longer than 2,000 characters, and links past the
+  tenth in one text.
+- The brand name, the opt-out line ("Reply STOP to opt out.") and STOP handling are unchanged.
+- Campaign texts, flow texts, replies typed in the inbox, keyword answers and automatic replies all
+  use short links. Email links are unchanged.
+
+## Link tags (UTM)
+
+With short links on, the link tags from Settings → Tracking (or the campaign's or flow's own) are
+added to the destination of each short link, exactly as for email. They cost nothing: the short
+link stays 24 characters after `/s/`. Links that keep the long form aren't tagged, since tags would
+make them longer.
+
+## Previews and segment counts
+
+The text editor's preview, `POST /api/render` and the inbox's reply preview show each link that
+would be shortened as a sample short link of the real length, so the character and segment counts
+match what's sent. Billing counts segments from the final text, with its short links.
+
+## How a short link works
+
+The 24 characters are three parts:
+
+| Part | Length | What it is |
+| --- | --- | --- |
+| Target | 6 | A random code for the destination. One row per destination per account (`short_link_targets`), reused by every text that links there, never one per recipient. |
+| Message | 6 | A random reference written on the text's message row (`messages.short_ref`). |
+| Tag | 12 | HMAC-SHA256 under the server's secret key over the target code and the message's full id, in base 62. |
+
+A click on `/s/...` looks up the target and the messages in its account with that reference, keeps
+the one the tag was made for, records the click exactly as a `/t/c/` click is recorded (the
+`Clicked SMS` event, the message's `clicked_at`, the click history, attribution and webhooks) and
+redirects to the stored destination. The destination is only ever one the send path stored for
+that account, so a short link can't be pointed anywhere else. A link of the wrong shape, an unknown
+or changed link, a deleted target or a closed account's link gets the plain "link not found" page.
+Old `/t/c/` links keep working.
+
+### Why 12 characters of tag is enough
+
+The tag ties one destination to one message: changing any character fails, and a valid link for
+one message can't record a click for another (the tag covers the message's full id, not only its
+6-character reference). Target codes and message references aren't secret; the tag is what
+can't be guessed. 12 base-62 characters is 62^12, about 3.2 × 10^21 (71 bits). The click endpoint
+has no rate limit, so assume an attacker sends 100,000 guesses a second for ten years
+(3 × 10^13 guesses): each guess matches with probability at most 1 in 3.2 × 10^21 for each message
+sharing that reference (almost always one), so the chance of forging a single click in all that time
+is about 1 in 100 million. Message references are 6 characters (5.7 × 10^10 values per account): two
+of an account's texts can share one, and the tag tells them apart, so a shared reference never
+fails a send or misattributes a click.
+
+## Cost
+
+- A text without a link: nothing extra.
+- A flow text, reply, keyword answer or test with links: one statement for all of its links (it
+  creates or reuses their targets and checks the setting).
+- A campaign text: none per recipient. A text campaign's targets are created once, when its
+  audience is fixed, and ride on its content. A campaign keeps the setting it started with.
+- The message's reference is written by the statement that already writes the message row.
+
+## Housekeeping
+
+- Targets not put in a text for 400 days are deleted by a background job, in batches. A click on a
+  deleted target shows the "link not found" page.
+- A closed account's short links stop redirecting.
+- Lookups use an index on `messages (account_id, short_ref)`, built in the background after the
+  server starts. Until it's in place (briefly, after an upgrade), texts use the long form; the
+  setting's `ready` says which.
+
+## API and MCP
+
+- `GET /api/short-links/settings` (MCP `get_short_link_settings`): `enabled`, `sample` (a short link
+  of the real length on your link domain), `link_length` and `ready`.
+- `PATCH /api/short-links/settings` with `{"enabled": true | false}` (MCP
+  `update_short_link_settings`). Needs permission to change settings. Recorded in the activity log.
+- `GET /s/{path}`: the click (public).

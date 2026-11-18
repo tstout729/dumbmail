@@ -333,6 +333,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // Link tagging (UTM, email only): resolved tags ride on the content; none renders as before (features::campaigns_plus::utm).
     let link_tags = crate::features::campaigns_plus::utm::Tagger::from_content(state, spec.account, spec.content);
     let link_hook = link_tags.as_ref().map(|t| t as &dyn render::LinkHook);
+    // Short links in texts (features::short_links): at most one statement, none for a text without
+    // links or a campaign text (its links were set up when its audience was fixed).
+    let short_links = crate::features::short_links::for_send(state, &spec, &content, link_hook, message_id, &link_base).await?;
 
     // Render first so template errors never leave a half-sent message.
     enum Rendered {
@@ -373,7 +376,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(p.id)
             .fetch_one(&state.db)
             .await?;
-        let body = render::render_sms(spec.account, &content, &ctx, Some(&tracking), !prior_sms)?;
+        let body = render::render_sms_with(spec.account, &content, &ctx, Some(&tracking), !prior_sms, short_links.as_ref().map(|s| s as &dyn render::SmsLinks))?;
         (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider))
     };
 
@@ -404,8 +407,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
 
     if spec.message_id.is_none() {
         sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, short_ref)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -418,14 +421,16 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&subject)
         .bind(spec.is_test)
         .bind(&send_note)
+        .bind(short_links.as_ref().map(|s| s.message_ref()))
         .execute(&state.db)
         .await?;
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note) WHERE id = $1")
+        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), short_ref = $5 WHERE id = $1")
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
             .bind(&send_note)
+            .bind(short_links.as_ref().map(|s| s.message_ref()))
             .execute(&state.db)
             .await?;
     }

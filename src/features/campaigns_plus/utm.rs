@@ -1,5 +1,7 @@
-//! Link tagging: UTM parameters added to the web links in campaign and flow emails. Text messages
-//! aren't tagged: a tracked link in a text carries the whole destination, so tags could add a segment.
+//! Link tagging: UTM parameters added to the web links in campaign and flow emails, and to the links
+//! in texts that are shortened (`features::short_links`): a short link is the same length whatever its
+//! destination, so tags cost nothing. A text link that isn't shortened carries its whole destination,
+//! so it isn't tagged (tags could add a segment).
 //!
 //! An account turns tagging on and sets default values (Settings → Tracking); a campaign or flow can
 //! use those, turn tagging off, or set its own values. Values may use a fixed set of variables
@@ -312,9 +314,11 @@ pub async fn load_defaults(db: &mut PgConnection, account_id: Uuid) -> sqlx::Res
 }
 
 /// A campaign's resolved tags for one version (`{version}`), or None when its links aren't tagged.
-fn campaign_frozen(defaults: Option<&Defaults>, c: &CampaignRow, over: Option<&Override>, version: Option<&str>, send_date: &str) -> Option<Frozen> {
-    // Texts aren't tagged: a tracked link carries the whole destination, so tags could add a segment.
-    if c.channel != "email" {
+/// `short_links`: the account shortens links in texts (`accounts.sms_short_links`).
+fn campaign_frozen(defaults: Option<&Defaults>, c: &CampaignRow, over: Option<&Override>, version: Option<&str>, send_date: &str, short_links: bool) -> Option<Frozen> {
+    // A text's links are tagged only when they're shortened (see `features::short_links`): a long
+    // tracked link carries the whole destination, so tags could add a segment.
+    if c.channel != "email" && !short_links {
         return None;
     }
     let (params, skip) = effective(defaults, over)?;
@@ -336,18 +340,19 @@ pub async fn freeze_campaign(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::
     if started {
         return Ok(());
     }
-    let (over, tz): (Option<Value>, String) = sqlx::query_as("SELECT c.link_tags, a.timezone FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(campaign_id).fetch_one(&mut *db).await?;
+    let (over, tz, short_links): (Option<Value>, String, bool) =
+        sqlx::query_as("SELECT c.link_tags, a.timezone, a.sms_short_links FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(campaign_id).fetch_one(&mut *db).await?;
     let defaults = load_defaults(db, c.account_id).await?;
     let over = parse_override(over.as_ref());
     let send_date = local_date(&tz, c.sent_at.unwrap_or_else(Utc::now));
     let ab = crate::campaigns::ab_test(&c);
     let mut content = c.content.clone();
-    let mut changed = set_on(&mut content, campaign_frozen(defaults.as_ref(), &c, over.as_ref(), ab.as_ref().map(|_| "a"), &send_date).as_ref());
+    let mut changed = set_on(&mut content, campaign_frozen(defaults.as_ref(), &c, over.as_ref(), ab.as_ref().map(|_| "a"), &send_date, short_links).as_ref());
     let mut ab_test = c.ab_test.clone();
     if let Some(variants) = ab_test.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
         for v in variants {
             let id = v["id"].as_str().unwrap_or("").to_string();
-            let frozen = campaign_frozen(defaults.as_ref(), &c, over.as_ref(), Some(&id), &send_date);
+            let frozen = campaign_frozen(defaults.as_ref(), &c, over.as_ref(), Some(&id), &send_date, short_links);
             if let Some(vc) = v.get_mut("content") {
                 changed |= set_on(vc, frozen.as_ref());
             }
@@ -364,7 +369,7 @@ pub async fn freeze_campaign(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::
 /// [`DEFAULTS_FOR_ACCOUNT_1`]): no query here.
 pub fn for_test(account: &Account, c: &CampaignRow, version: Option<&str>, content: &Value, over: Option<&Value>, defaults: Option<&Value>) -> Value {
     let version = crate::campaigns::ab_test(c).map(|_| version.unwrap_or("a"));
-    let frozen = campaign_frozen(parse_defaults(defaults).as_ref(), c, parse_override(over).as_ref(), version, &local_date(&account.timezone, Utc::now()));
+    let frozen = campaign_frozen(parse_defaults(defaults).as_ref(), c, parse_override(over).as_ref(), version, &local_date(&account.timezone, Utc::now()), true);
     let mut out = content.clone();
     set_on(&mut out, frozen.as_ref());
     out
@@ -376,7 +381,7 @@ pub const DEFAULTS_FOR_ACCOUNT_1: &str = "(SELECT jsonb_build_object('enabled', 
 /// A flow step's content with its tags, from the settings loaded with the flow row: no query.
 pub fn for_flow_step(account: &Account, flow: &FlowRow, node_name: Option<&str>, channel: &str, mut content: Value) -> Value {
     let defaults = parse_defaults(flow.link_tag_defaults.as_ref());
-    let frozen = effective(defaults.as_ref(), parse_override(flow.link_tags.as_ref()).as_ref()).filter(|_| channel == "email").map(|(params, skip)| {
+    let frozen = effective(defaults.as_ref(), parse_override(flow.link_tags.as_ref()).as_ref()).map(|(params, skip)| {
         let message_name = node_name.filter(|n| !n.trim().is_empty()).unwrap_or(&flow.name);
         let vars = Vars { campaign: None, flow: Some((flow.id, &flow.name)), message_name, channel, send_date: local_date(&account.timezone, Utc::now()), version: None };
         Frozen { params: resolve(&params, &vars), skip_domains: skip }
@@ -399,6 +404,11 @@ fn host_of(u: &str) -> Option<String> {
 impl Tagger {
     /// The tags riding on `content`, checked again (content can be typed by hand), or None.
     pub fn from_content(state: &AppState, account: &Account, content: &Value) -> Option<Tagger> {
+        Self::from_content_with(state, account.link_domain.as_deref(), content)
+    }
+
+    /// [`Tagger::from_content`] with the account's link domain instead of the account.
+    pub fn from_content_with(state: &AppState, link_domain: Option<&str>, content: &Value) -> Option<Tagger> {
         let f: Frozen = serde_json::from_value(content.get(CONTENT_KEY)?.clone()).ok()?;
         let params: Vec<(String, String)> = f
             .params
@@ -411,7 +421,7 @@ impl Tagger {
         }
         // DumbMail's own links (tracking, unsubscribe, preferences, view online) are never tagged.
         let mut own_hosts: Vec<String> = crate::features::content::check::configured_own_hosts(&state.cfg).into_iter().collect();
-        own_hosts.extend(account.link_domain.as_deref().map(str::to_ascii_lowercase));
+        own_hosts.extend(link_domain.map(str::to_ascii_lowercase));
         Some(Tagger { params, skip_domains: f.skip_domains.into_iter().take(MAX_SKIP_DOMAINS).collect(), own_hosts })
     }
 
@@ -560,7 +570,8 @@ fn override_json(o: Option<&Override>) -> Value {
 pub async fn campaign_tags(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
     let c = crate::campaigns::load(&state.db, account_id, id).await?;
     let mut conn = state.db.acquire().await?;
-    let (over, tz): (Option<Value>, String) = sqlx::query_as("SELECT c.link_tags, a.timezone FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(id).fetch_one(&mut *conn).await?;
+    let (over, tz, short_links): (Option<Value>, String, bool) =
+        sqlx::query_as("SELECT c.link_tags, a.timezone, a.sms_short_links FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(id).fetch_one(&mut *conn).await?;
     let defaults = load_defaults(&mut conn, account_id).await?;
     let over = parse_override(over.as_ref());
     // Once its audience is fixed, what it was sent with (on its content), not today's settings.
@@ -569,7 +580,7 @@ pub async fn campaign_tags(state: &AppState, account_id: Uuid, id: Uuid) -> AppR
         c.content.get(CONTENT_KEY).and_then(|v| serde_json::from_value::<Frozen>(v.clone()).ok())
     } else {
         let version = crate::campaigns::ab_test(&c).map(|_| "a");
-        campaign_frozen(defaults.as_ref(), &c, over.as_ref(), version, &local_date(&tz, c.sent_at.unwrap_or_else(Utc::now)))
+        campaign_frozen(defaults.as_ref(), &c, over.as_ref(), version, &local_date(&tz, c.sent_at.unwrap_or_else(Utc::now)), short_links)
     };
     let mut v = tags_json(over.as_ref(), defaults.as_ref(), frozen);
     v["sent"] = json!(fixed);
@@ -619,7 +630,7 @@ pub async fn flow_tags(state: &AppState, account_id: Uuid, id: Uuid) -> AppResul
         Frozen { params: resolve(&params, &vars), skip_domains: skip }
     });
     let mut v = tags_json(over.as_ref(), defaults.as_ref(), frozen);
-    v["note"] = json!("Shown for an email step named like the flow; each email step uses its own name for {message_name}. Text message steps aren't tagged.");
+    v["note"] = json!("Shown for an email step named like the flow; each email step uses its own name for {message_name}. Text message steps are tagged too when their links are shortened (Settings → Texting).");
     Ok(v)
 }
 

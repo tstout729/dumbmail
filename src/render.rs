@@ -67,6 +67,12 @@ pub trait LinkHook: Sync {
     fn destination(&self, url: &str) -> Option<String>;
 }
 
+/// Replaces a link in a text with a short link (see `features::short_links`). Gets each link as the
+/// rendered body has it and returns what goes in its place, or None to keep the long tracked form.
+pub trait SmsLinks: Sync {
+    fn short(&self, link: &str) -> Option<String>;
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -582,13 +588,22 @@ fn rewrite_links(html: &str, t: &Tracking<'_>, links: Option<&dyn LinkHook>) -> 
 
 /// SMS: render the body, shorten links through click tracking and add opt-out language when needed.
 pub fn render_sms(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool) -> AppResult<String> {
+    render_sms_with(account, content, ctx, tracking, first_message, None)
+}
+
+/// [`render_sms`], with `links` shortening the links it can (also in previews, without tracking).
+pub fn render_sms_with(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool, links: Option<&dyn SmsLinks>) -> AppResult<String> {
     static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
     let mut body = render_str(&content.body, ctx, false)?;
     // The words the sender wrote, without links: a link that happens to contain "stop" isn't opt-out language.
     let words = URL.replace_all(&body, " ").to_lowercase();
-    if let Some(t) = tracking {
+    if tracking.is_some() || links.is_some() {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &c[0]))
+            .replace_all(&body, |c: &regex::Captures<'_>| match (links.and_then(|l| l.short(&c[0])), tracking) {
+                (Some(short), _) => short,
+                (None, Some(t)) => tracked_url(t, &c[0]),
+                (None, None) => c[0].to_string(),
+            })
             .into_owned();
     }
     let lower = body.to_lowercase();

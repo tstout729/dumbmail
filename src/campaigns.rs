@@ -404,6 +404,10 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             fix = true;
         }
     }
+    // A text campaign's short links are set up once, here, with its audience (see features::short_links).
+    if c.channel == "sms" && !started && !fixed {
+        crate::features::short_links::freeze_campaign(state, &mut tx, c.id).await?;
+    }
     sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), audience_fixed_at = CASE WHEN $2 THEN COALESCE(audience_fixed_at, now()) ELSE audience_fixed_at END, updated_at = now() WHERE id = $1")
         .bind(c.id)
         .bind(fix)

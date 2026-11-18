@@ -137,7 +137,9 @@ pub async fn send_reply(state: &AppState, account_id: Uuid, conversation_id: Uui
             .bind(profile.id)
             .fetch_one(&state.db)
             .await?;
-        let text = crate::render::render_sms(&account, &sms, &ctx, None, !prior)?;
+        // Links the send would shorten show as a sample short link of the real length.
+        let sample = crate::features::short_links::send::preview(state, &account, &sms.body).await?;
+        let text = crate::render::render_sms_with(&account, &sms, &ctx, None, !prior, sample.as_ref().map(|s| s as &dyn crate::render::SmsLinks))?;
         let (_, segments) = crate::providers::sms::segment_count(&text);
         return Ok(json!({
             "dry_run": true, "to": theirs, "from": ours, "body": text, "segments": segments,
