@@ -1076,3 +1076,19 @@ async fn daylight_saving_moments_are_pinned() {
     assert_eq!(due("fall", "One").await, vec![utc("2026-11-01T09:00:00Z")]);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn guesty_payment_evidence_older_than_the_last_change_does_not_count() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let g = guesty_live(&mut h, None).await;
+    g.post(&h, legacy("R1", ("gA", "ana@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    let (paid, checked): (Option<bool>, Option<String>) = sqlx::query_as("SELECT (fields->>'paid_in_full')::boolean, fields->>'paid_checked_at' FROM objects").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((paid, checked.as_deref()), (Some(true), Some("2026-11-17T10:00:00Z")), "evidence is recorded with when it was taken");
+    // A newer change that says nothing about payment (here through the API): the evidence is older now.
+    h.ok("POST", "/api/objects", Some(json!({"type": "reservation", "external_id": "R1", "fields": {"guests": 4}, "as_of": "2026-11-17T11:00:00Z"}))).await;
+    fire(&h).await;
+    assert!(pre_arrivals(&h).is_empty(), "paid evidence from before the last change doesn't count");
+    h.cleanup().await;
+}
