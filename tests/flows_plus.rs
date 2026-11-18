@@ -463,7 +463,7 @@ async fn notification_recipients_are_fixed_the_first_time_and_handoffs_are_never
     let sent_to: Vec<String> = h.state.email.sent().into_iter().filter(|e| e.subject.starts_with("New lead")).map(|e| e.to).collect();
     assert_eq!(sent_to, vec!["first@outside.test"]);
 
-    // A handoff cut off before its result was recorded: never sent again, marked unconfirmed, billed.
+    // A handoff cut off before its result was recorded: never sent again, marked unconfirmed, not billed.
     let (run, ..) = run_of(&h, &fid, "g@x.test").await;
     sqlx::query("UPDATE flow_notifications SET status = 'handing', handed_at = now() - interval '1 hour', provider_message_id = NULL, cost_micros = NULL WHERE run_id = $1")
         .bind(run)
@@ -475,7 +475,7 @@ async fn notification_recipients_are_fixed_the_first_time_and_handoffs_are_never
     dumbmail::features::flows_plus::notify::sweep(&h.state).await.unwrap();
     let (status, cost): (String, Option<i64>) = sqlx::query_as("SELECT status, cost_micros FROM flow_notifications WHERE run_id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(status, "unconfirmed");
-    assert!(cost.is_some(), "billed, since it may have gone out");
+    assert!(cost.is_none(), "not billed: we can't know it went out");
     assert_eq!(h.state.email.sent().into_iter().filter(|e| e.subject.starts_with("New lead")).count(), 1);
     let r = h.ok("GET", &format!("/api/flows/{fid}/results"), None).await;
     assert_eq!(r["steps"][0]["notifications"]["unconfirmed"], 1, "{r}");
@@ -1194,5 +1194,63 @@ async fn a_wait_wakes_once() {
     dumbmail::flows::step(&h.state, run).await.unwrap();
     assert_eq!(prop(&h, "once@x.test", "woke").await, None);
     assert_eq!(run_of(&h, &fid, "once@x.test").await.2.as_deref(), Some("d2"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn notifications_keep_to_themselves() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Lead"}), notify_flow(json!(["owner@acme.test"]), json!({}))).await;
+
+    // A database error after the daily slot was taken gives the slot back: with room for exactly one
+    // email, the retry still sends it.
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = 1 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+    sqlx::query("ALTER TABLE flow_notifications RENAME COLUMN handed_at TO handed_at_gone").execute(&h.state.db).await.unwrap();
+    event(&mut h, "Lead", "slot@x.test", json!({"nights": 1})).await;
+    let _ = dumbmail::jobs::drain(&h.state).await;
+    sqlx::query("ALTER TABLE flow_notifications RENAME COLUMN handed_at_gone TO handed_at").execute(&h.state.db).await.unwrap();
+    assert!(notes_to(&h, "owner@acme.test").is_empty());
+    let (run, ..) = run_of(&h, &fid, "slot@x.test").await;
+    // (The failed job's claim would run out by itself; skip the wait.)
+    sqlx::query("UPDATE flow_runs SET claim_until = now() - interval '1 second' WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(notes_to(&h, "owner@acme.test").len(), 1, "the slot was given back, so it goes out");
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+
+    // A hard bounce of a notification blocks the address and is kept out of the account's bounce
+    // counts that pause its marketing.
+    let pid: String = sqlx::query_scalar("SELECT provider_message_id FROM flow_notifications WHERE run_id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    let ses = json!({"Type": "Notification", "Message": json!({"eventType": "Bounce", "mail": {"messageId": pid}, "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}}).to_string()}).to_string();
+    h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &ses).await;
+    let counted: bool = sqlx::query_scalar("SELECT hard_bounce FROM email_sends WHERE provider_message_id = $1").bind(&pid).fetch_one(&h.state.db).await.unwrap();
+    assert!(!counted, "not counted toward pausing the account");
+    assert_eq!(h.ok("GET", "/api/flows-plus/notify-addresses?emails=owner@acme.test", None).await["statuses"][0]["status"], "bounced");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_notification_with_nobody_to_email_stays_that_way() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": "mgr@outside.test"}))).await;
+    sqlx::query("UPDATE flow_notify_addresses SET confirmed_at = now()").execute(&h.state.db).await.unwrap();
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Lead"}), notify_flow(json!([]), json!({"to_property": "manager"}))).await;
+    // No `manager` property yet: nobody to email, and that is recorded.
+    event(&mut h, "Lead", "none@x.test", json!({"nights": 1})).await;
+    h.drain().await;
+    let (run, ..) = run_of(&h, &fid, "none@x.test").await;
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT to_email, status FROM flow_notifications WHERE run_id = $1").bind(run).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows, vec![(String::new(), "none".to_string())]);
+    // The property is set, then the step runs again (a retry): still nobody.
+    sqlx::query("UPDATE profiles SET properties = '{\"manager\": \"mgr@outside.test\"}' WHERE email = 'none@x.test'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flow_runs SET status = 'active', current_node = 'n', finished_at = NULL, claim_id = NULL, claim_until = NULL WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert!(h.state.email.sent().into_iter().all(|e| e.to != "mgr@outside.test"), "a retry picks nobody new");
+    let r = h.ok("GET", &format!("/api/flows/{fid}/results"), None).await;
+    assert_eq!(r["steps"][0]["notifications"], json!({"sent": 0, "skipped": 0, "failed": 0, "unconfirmed": 0}), "{r}");
     h.cleanup().await;
 }

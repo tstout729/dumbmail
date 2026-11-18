@@ -14,7 +14,7 @@
 //! Exactly once: the first time the step runs for a run, its recipients and rendered message are
 //! stored (`pending`), with the day's count; a retry uses that list. Each send is marked `handing`
 //! just before the provider call: a crash before that leaves it `pending` and it's sent on the retry;
-//! a crash after it makes it `unconfirmed` (never sent again, billed since it may have gone out).
+//! a crash after it makes it `unconfirmed` (never sent again, and not billed: we can't know it went out).
 
 use std::collections::HashSet;
 
@@ -504,6 +504,20 @@ async fn record_recipients(state: &AppState, account: &Account, flow: &FlowRow, 
     let cap = daily_cap(&flow.definition);
     let day = Utc::now().with_timezone(&crate::sending::account_tz(account)).date_naive();
     let mut tx = state.db.begin().await?;
+    if to.is_empty() {
+        // Nobody to email: recorded too, so a retry after the profile changes picks nobody new.
+        sqlx::query(
+            "INSERT INTO flow_notifications (id, account_id, flow_id, run_id, node_id, to_email, status, error) VALUES ($1, $2, $3, $4, $5, '', 'none', 'no recipients')
+             ON CONFLICT (run_id, node_id, to_email) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(account.id)
+        .bind(flow.id)
+        .bind(run_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     for e in &to {
         // Only addresses that may get it now are pending (and use the day's count); checked again
         // when each is sent.
@@ -553,6 +567,29 @@ async fn record_recipients(state: &AppState, account: &Account, flow: &FlowRow, 
     Ok(())
 }
 
+/// A slot taken from the account's daily allowance: given back when dropped, unless the email was
+/// handed over (or may have been), so no path out of a send (an error included) keeps it.
+struct Slot<'a> {
+    state: &'a AppState,
+    account_id: Uuid,
+    done: bool,
+}
+
+impl Slot<'_> {
+    fn used(mut self) {
+        self.done = true;
+        crate::deliverability::complete_daily_slot(self.state, self.account_id);
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            crate::deliverability::return_daily_slot(self.state, self.account_id);
+        }
+    }
+}
+
 /// Send one stored, pending notification. `Some(t)`: wait until `t` and try again (it stays pending).
 async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
     let db = &state.db;
@@ -584,20 +621,19 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) 
     if let Err(until) = crate::deliverability::take_daily_slot(state, account.id).await? {
         return Ok(Some(until));
     }
+    let slot = Slot { state, account_id: account.id, done: false };
     crate::sending::throttle_email(state).await;
     // A pause, a removed member or address, or a bounce can land while waiting for a slot.
     let (allowed, bad, paused): (bool, bool, bool) =
         sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}, COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true)")).bind(account.id).bind(&r.to_email).fetch_one(db).await?;
     let stop = if paused { Some("sending paused") } else if bad { Some("address bounced or complained") } else if !allowed { Some("address not confirmed") } else { None };
     if let Some(why) = stop {
-        crate::deliverability::return_daily_slot(state, account.id);
         settle(db, r.id, "pending", "skipped", why).await?;
         return Ok(None);
     }
     // Recorded as handed over before the call: a crash after this never sends it again.
     let handing: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'handing', handed_at = now() WHERE id = $1 AND status = 'pending' RETURNING id").bind(r.id).fetch_optional(db).await?;
     if handing.is_none() {
-        crate::deliverability::return_daily_slot(state, account.id);
         return Ok(None);
     }
     let subject = r.subject.clone().unwrap_or_default();
@@ -621,6 +657,8 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) 
     };
     match state.email.send_once(&email).await {
         Ok(provider_id) => {
+            // Handed over: it counts in the allowance whatever happens below.
+            slot.used();
             let mut tx = db.begin().await?;
             let first: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'sent', sent_at = now(), provider_message_id = $2, error = NULL WHERE id = $1 AND status = 'handing' RETURNING id")
                 .bind(r.id)
@@ -633,25 +671,24 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) 
             tx.commit().await?;
             // Counts toward the account's limit and its bounce and complaint rates, like any email.
             crate::deliverability::record_send(db, r.id, &provider_id, account.id, None).await?;
-            crate::deliverability::complete_daily_slot(state, account.id);
             Ok(None)
         }
         Err(e) => {
             if let Some(busy) = e.downcast_ref::<crate::providers::email::ProviderBusy>() {
                 // Refused for now, so not sent: back to pending, and the step waits.
-                crate::deliverability::return_daily_slot(state, account.id);
+                drop(slot);
                 settle(db, r.id, "handing", "pending", "the email provider was busy").await?;
                 let wait = chrono::Duration::from_std(busy.retry_after).unwrap_or(chrono::Duration::minutes(15)).clamp(chrono::Duration::minutes(1), chrono::Duration::hours(1));
                 return Ok(Some(Utc::now() + wait));
             }
             if e.downcast_ref::<crate::providers::email::ProviderMaybeSent>().is_some() {
-                crate::deliverability::complete_daily_slot(state, account.id);
+                slot.used();
                 unconfirmed(state, r.id, "the email provider may have taken it; not sent again").await?;
                 return Ok(None);
             }
             // Only a short class is kept: a provider's own words can echo addresses or settings.
             tracing::warn!(notification = %r.id, flow = %flow.id, "flow notification refused by the email provider");
-            crate::deliverability::return_daily_slot(state, account.id);
+            drop(slot);
             settle(db, r.id, "handing", "failed", "the email provider refused it").await?;
             Ok(None)
         }
@@ -668,23 +705,14 @@ async fn charge(state: &AppState, tx: &mut sqlx::PgConnection, account_id: Uuid,
     Ok(())
 }
 
-/// A send whose handoff is uncertain: never sent again, and billed, since it may have gone out.
+/// A send whose handoff is uncertain: never sent again, and not billed (we can't know it went out).
 async fn unconfirmed(state: &AppState, id: Uuid, why: &str) -> anyhow::Result<()> {
-    let mut tx = state.db.begin().await?;
-    let row: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'unconfirmed', error = $2 WHERE id = $1 AND status = 'handing' RETURNING account_id")
-        .bind(id)
-        .bind(why)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if let Some(account_id) = row {
-        charge(state, &mut tx, account_id, id).await?;
-    }
-    tx.commit().await?;
+    sqlx::query("UPDATE flow_notifications SET status = 'unconfirmed', error = $2 WHERE id = $1 AND status = 'handing'").bind(id).bind(why).execute(&state.db).await?;
     Ok(())
 }
 
 /// Scheduler: handoffs cut off before their result was recorded may have gone out; they become
-/// `unconfirmed` (never sent again, billed). Old daily counters are deleted.
+/// `unconfirmed` (never sent again, not billed). Old daily counters are deleted.
 pub async fn sweep(state: &AppState) -> anyhow::Result<()> {
     let cut: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM flow_notifications WHERE status = 'handing' AND handed_at < now() - interval '15 minutes' LIMIT 500").fetch_all(&state.db).await?;
     for id in cut {
