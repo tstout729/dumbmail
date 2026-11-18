@@ -62,6 +62,22 @@ function customerUpsert(c) {
   return p;
 }
 
+// The topic comes from the URL, which Recharge doesn't sign, so it must agree with the signed body:
+// a replayed body can't be relabelled (an active subscription posted as "cancelled", say).
+var STATUS_FOR = {
+  "subscription/activated": ["active"],
+  "subscription/cancelled": ["cancelled"],
+  "subscription/skipped": ["active"],
+  "charge/upcoming": ["queued"],
+  "charge/paid": ["success"],
+  "charge/failed": ["error"],
+};
+
+function agrees(topic, status) {
+  var want = STATUS_FOR[topic];
+  return !want || want.indexOf(String(status || "").toLowerCase()) >= 0;
+}
+
 var SUB_EVENTS = {
   "subscription/created": function (s) { return { metric: "Subscription Started", id: "started", time: s.created_at }; },
   "subscription/activated": function (s) { return { metric: "Subscription Reactivated", id: "activated:" + s.updated_at, time: s.updated_at }; },
@@ -83,6 +99,7 @@ function handle(input) {
   if (SUB_EVENTS[topic]) {
     var s = p.subscription;
     if (!s || !s.customer_id) return [{ type: "log", message: topic + " without a subscription or customer" }];
+    if (!agrees(topic, s.status)) return [{ type: "log", message: "subscription " + s.id + " is " + s.status + ", which doesn't fit " + topic + "; ignored" }];
     var ev = SUB_EVENTS[topic](s);
     if (!ev.time) return [{ type: "log", message: "subscription " + s.id + " has no time from Recharge, so it can't be put in order" }];
     return [{ type: "track_event", metric: ev.metric, profile: byCustomer(s.customer_id), time: ev.time, unique_id: "recharge:subscription:" + s.id + ":" + ev.id, properties: subProps(s) }];
@@ -91,6 +108,7 @@ function handle(input) {
   if (topic === "charge/upcoming" || topic === "charge/paid" || topic === "charge/failed") {
     var ch = p.charge;
     if (!ch || !ch.customer) return [{ type: "log", message: topic + " without a charge or customer" }];
+    if (!agrees(topic, ch.status)) return [{ type: "log", message: "charge " + ch.id + " is " + ch.status + ", which doesn't fit " + topic + "; ignored" }];
     var out = [];
     if (ch.customer.email) out.push(customerUpsert(ch.customer));
     var who = ch.customer.email ? { email: ch.customer.email } : byCustomer(ch.customer.id);
