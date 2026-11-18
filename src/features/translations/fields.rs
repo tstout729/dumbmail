@@ -528,14 +528,36 @@ fn scheme(u: &str) -> String {
     u.trim().split(':').next().unwrap_or("").to_ascii_lowercase()
 }
 
+/// A link the way a browser reads it: the scheme and a web address's host in lower case and without
+/// a trailing dot (`HTTPS://Example.COM./x` is `https://example.com/x`). The path, query and
+/// anything else are left as they are.
+pub fn canonical_link(u: &str) -> String {
+    let t = u.trim();
+    let Some(colon) = t.find(':') else { return t.to_string() };
+    let scheme = t[..colon].to_ascii_lowercase();
+    let rest = &t[colon + 1..];
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return format!("{scheme}:{rest}");
+    }
+    let Some(after) = rest.strip_prefix("//") else { return format!("{scheme}:{rest}") };
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let (authority, tail) = after.split_at(end);
+    // A port stays after the host.
+    let (host, port) = match authority.rfind(':').filter(|i| !authority[*i..].contains(']')) {
+        Some(i) => authority.split_at(i),
+        None => (authority, ""),
+    };
+    format!("{scheme}://{}{port}{tail}", host.trim_end_matches('.').to_ascii_lowercase())
+}
+
 /// Whether a link is one of DumbMail's own (unsubscribe, preferences, any address on `own` hosts),
 /// which can't be localized.
 pub fn dumbmail_link(u: &str, own: &[String]) -> bool {
     if u.contains("unsubscribe_url") {
         return true;
     }
-    let plain = super::structure::without_tags(u.trim(), "x");
-    url::Url::parse(&plain).ok().and_then(|p| p.host_str().map(str::to_ascii_lowercase)).is_some_and(|h| own.iter().any(|o| h == *o || h.ends_with(&format!(".{o}"))))
+    let plain = super::structure::without_tags(&canonical_link(u), "x");
+    url::Url::parse(&plain).ok().and_then(|p| p.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase())).is_some_and(|h| own.iter().any(|o| h == *o || h.ends_with(&format!(".{o}"))))
 }
 
 /// Why `text` can't replace the link `source`, if it can't: a real web address (https, or http when
@@ -799,7 +821,8 @@ pub fn localize_block(b: &mut Value, lang: &str, own: &[String]) {
                     if text.is_empty() || s(e, "source") != hash(source) || s(e, "status") == CHECK || check_text_for(kind, source, text, own).is_err() {
                         continue;
                     }
-                    let text = text.to_string();
+                    // Tracked and tagged like the original: read the way a browser reads it.
+                    let text = if kind == Kind::Link { canonical_link(text) } else { text.to_string() };
                     set_path(b, path, &text);
                 }
             }
@@ -892,6 +915,15 @@ pub fn summary(content: &Value, lang: &str) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_read_the_way_a_browser_reads_them() {
+        assert_eq!(canonical_link("HTTPS://Example.COM./x/Y?Q=1"), "https://example.com/x/Y?Q=1");
+        assert_eq!(canonical_link("https://Shop.Test.:8443/a"), "https://shop.test:8443/a");
+        assert_eq!(canonical_link("MAILTO:Hi@Acme.test"), "mailto:Hi@Acme.test");
+        assert!(dumbmail_link("HTTPS://PL.TEST./u/x", &["pl.test".into()]));
+        assert!(dumbmail_link("https://links.pl.test./x", &["pl.test".into()]));
+    }
 
     fn email() -> Value {
         json!({
