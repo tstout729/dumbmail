@@ -460,6 +460,15 @@ mod tests {
         assert!(!ok("https://169.254.169.254/latest"));
     }
 
+    #[tokio::test]
+    async fn response_bodies_are_capped() {
+        let big = vec![b'x'; 4 * super::MAX_RESPONSE];
+        let res = reqwest::Response::from(axum::http::Response::new(big));
+        assert_eq!(super::read_capped(res).await.len(), super::MAX_RESPONSE);
+        let res = reqwest::Response::from(axum::http::Response::new(r#"{"reason":"Unregistered"}"#.to_string()));
+        assert_eq!(super::json_capped(res).await["reason"], "Unregistered");
+    }
+
     #[test]
     fn caches_stay_bounded() {
         let mut m: std::collections::HashMap<String, i64> = (0..10).map(|i| (i.to_string(), i)).collect();
