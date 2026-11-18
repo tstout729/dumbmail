@@ -1,0 +1,572 @@
+//! The ready-made integrations (recipes) end to end, through the real webhook endpoint and the
+//! real script sandbox: each vendor's signature accepted and refused, every documented event turned
+//! into the expected events, resent and out-of-order deliveries, sensitive fields never stored,
+//! people held back from marketing, and a run through a flow. What each script returns for each
+//! fixture is checked literally by the unit test `recipe_scripts_match_their_fixtures`.
+
+#[macro_use]
+mod common;
+use common::*;
+
+use axum::http::StatusCode;
+use base64::Engine;
+use hmac::Mac;
+use serde_json::{json, Value};
+
+macro_rules! integ_harness {
+    () => {{
+        dumbmail::features::integrations::sandbox::set_program(env!("CARGO_BIN_EXE_dumbmail"));
+        dumbmail::features::integrations::sandbox::set_global_cap(64);
+        harness!()
+    }};
+}
+
+/// How a vendor signs its webhooks, for the test to sign like it.
+#[derive(Clone, Copy)]
+enum Sign {
+    /// HMAC-SHA256 of the body, base64, in `header` (WooCommerce, AfterShip, Acuity).
+    Base64(&'static str),
+    /// HMAC-SHA256 of the body, base64 after a prefix (Typeform's `sha256=`).
+    Base64Prefixed(&'static str, &'static str),
+    /// HMAC-SHA1 of the body, hex (Segment).
+    Sha1Hex(&'static str),
+    /// `t=…,v1=…` over `t.body` (Stripe style: Recharge).
+    Stripe(&'static str),
+    /// `ts=…;h1=…` over `ts:body` (Paddle).
+    Paddle,
+    /// base64 HMAC-SHA256 of the webhook URL + body (Square).
+    SquareUrl,
+    /// hex HMAC-SHA256 of `<ms>:body`, with the timestamp in a header (Webflow).
+    Webflow,
+    /// base64 HMAC-SHA256 of `<ISO time>body` (Zendesk).
+    Zendesk,
+    /// The secret itself in a header (BigCommerce custom headers, Gorgias).
+    Header(&'static str),
+}
+
+fn mac256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    m.update(data);
+    m.finalize().into_bytes().to_vec()
+}
+
+fn b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+fn sign(how: Sign, secret: &str, url: &str, body: &str) -> Vec<(String, String)> {
+    let now = chrono::Utc::now();
+    let t = now.timestamp();
+    match how {
+        Sign::Base64(h) => vec![(h.into(), b64(&mac256(secret.as_bytes(), body.as_bytes())))],
+        Sign::Base64Prefixed(h, p) => vec![(h.into(), format!("{p}{}", b64(&mac256(secret.as_bytes(), body.as_bytes()))))],
+        Sign::Sha1Hex(h) => {
+            let mut m = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).unwrap();
+            m.update(body.as_bytes());
+            vec![(h.into(), hex::encode(m.finalize().into_bytes()))]
+        }
+        Sign::Stripe(h) => vec![(h.into(), format!("t={t},v1={}", hex::encode(mac256(secret.as_bytes(), format!("{t}.{body}").as_bytes()))))],
+        Sign::Paddle => vec![("Paddle-Signature".into(), format!("ts={t};h1={}", hex::encode(mac256(secret.as_bytes(), format!("{t}:{body}").as_bytes()))))],
+        Sign::SquareUrl => vec![("x-square-hmacsha256-signature".into(), b64(&mac256(secret.as_bytes(), format!("{url}{body}").as_bytes())))],
+        Sign::Webflow => {
+            let ms = now.timestamp_millis();
+            vec![("x-webflow-timestamp".into(), ms.to_string()), ("x-webflow-signature".into(), hex::encode(mac256(secret.as_bytes(), format!("{ms}:{body}").as_bytes())))]
+        }
+        Sign::Zendesk => {
+            let ts = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            vec![("X-Zendesk-Webhook-Signature-Timestamp".into(), ts.clone()), ("X-Zendesk-Webhook-Signature".into(), b64(&mac256(secret.as_bytes(), format!("{ts}{body}").as_bytes())))]
+        }
+        Sign::Header(h) => vec![(h.into(), secret.into())],
+    }
+}
+
+fn fixture(recipe: &str, name: &str) -> Value {
+    let p = format!("{}/recipes/{recipe}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    serde_json::from_str(&std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p}: {e}"))).unwrap()
+}
+
+/// An installed recipe and how to post to it.
+struct Installed {
+    recipe: &'static str,
+    id: String,
+    url: String,
+    sign: Sign,
+    secret: String,
+    flows: Vec<Value>,
+}
+
+async fn install(h: &mut Harness, recipe: &'static str, sign: Sign, secret: &str, create_flows: bool) -> Installed {
+    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": recipe, "create_flows": create_flows}))).await;
+    let id = created["integration"]["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature_secret": secret}))).await;
+    for f in created["flows"].as_array().unwrap() {
+        assert_eq!(f["status"], "draft", "{recipe}: suggested flows start as drafts");
+    }
+    Installed { recipe, id, url: created["integration"]["inbound_url"].as_str().unwrap().to_string(), sign, secret: secret.into(), flows: created["flows"].as_array().unwrap().clone() }
+}
+
+impl Installed {
+    fn path(&self) -> String {
+        self.url[self.url.find("/webhooks/in/").unwrap()..].to_string()
+    }
+
+    /// Post a payload as the vendor would (signed with `secret`), with the fixture's headers and query.
+    async fn post_as(&self, h: &Harness, body: &str, headers: &Value, query: &Value, secret: &str) -> (StatusCode, String) {
+        let qs: Vec<String> = query.as_object().into_iter().flatten().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect();
+        let (path, url) = if qs.is_empty() { (self.path(), self.url.clone()) } else { (format!("{}?{}", self.path(), qs.join("&")), format!("{}?{}", self.url, qs.join("&"))) };
+        let mut hdrs: Vec<(String, String)> = headers.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
+        if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            hdrs.push(("content-type".into(), "application/json".into()));
+        }
+        hdrs.extend(sign(self.sign, secret, &url, body));
+        let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (s, _, r) = h.raw("POST", &path, &hdrs, body).await;
+        h.drain().await;
+        (s, r)
+    }
+
+    /// Post a fixture, signed; it must be accepted.
+    async fn post(&self, h: &Harness, name: &str) -> String {
+        let f = fixture(self.recipe, name);
+        let body = body_of(&f["input"]["payload"]);
+        let (s, r) = self.post_as(h, &body, &f["input"]["headers"], &f["input"]["query"], &self.secret).await;
+        assert_eq!(s, StatusCode::OK, "{}/{name}: {r}", self.recipe);
+        r
+    }
+
+    /// The same fixture signed with the wrong secret is refused and writes nothing.
+    async fn refused(&self, h: &Harness, name: &str) {
+        let f = fixture(self.recipe, name);
+        let body = body_of(&f["input"]["payload"]);
+        let before = count(h, "SELECT count(*) FROM events").await;
+        let (s, _) = self.post_as(h, &body, &f["input"]["headers"], &f["input"]["query"], "not-the-secret-0000").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{}/{name} with a wrong signature", self.recipe);
+        assert_eq!(count(h, "SELECT count(*) FROM events").await, before);
+    }
+
+    async fn deliveries(&self, h: &mut Harness) -> Vec<Value> {
+        h.ok("GET", &format!("/api/integrations/{}/deliveries", self.id), None).await["data"].as_array().unwrap().clone()
+    }
+
+    fn flow(&self, contains: &str) -> String {
+        self.flows.iter().find(|f| f["name"].as_str().unwrap().contains(contains)).unwrap_or_else(|| panic!("no flow named like {contains}"))["id"].as_str().unwrap().to_string()
+    }
+}
+
+fn body_of(payload: &Value) -> String {
+    match payload {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+async fn count(h: &Harness, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn events(h: &Harness, metric: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = $1").bind(metric).fetch_one(&h.state.db).await.unwrap()
+}
+
+/// Values of `metric` on `email`'s profile, in order.
+async fn values(h: &Harness, metric: &str, email: &str) -> Vec<f64> {
+    sqlx::query_scalar("SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE m.name = $1 AND p.email = $2 ORDER BY e.value")
+        .bind(metric)
+        .bind(email)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap()
+}
+
+async fn prop(h: &Harness, metric: &str, key: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT e.properties->>$2 FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = $1 ORDER BY e.occurred_at, e.id")
+        .bind(metric)
+        .bind(key)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap()
+}
+
+/// (marketing_hold, email_consent) of a profile.
+async fn consent(h: &Harness, email: &str) -> (bool, String) {
+    sqlx::query_as("SELECT marketing_hold, email_consent FROM profiles WHERE email = $1").bind(email).fetch_one(&h.state.db).await.unwrap_or_else(|e| panic!("{email}: {e}"))
+}
+
+/// Whether an email campaign to everyone would reach `email` (marketing).
+async fn campaign_reaches(h: &mut Harness, email: &str) -> bool {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": format!("All {email}")}))).await;
+    let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = $1").bind(email).fetch_one(&h.state.db).await.unwrap();
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM profiles WHERE id = $1").bind(pid).fetch_one(&h.state.db).await.unwrap();
+    dumbmail::audience::add_to_list(&h.state.db, account, list["id"].as_str().unwrap().parse().unwrap(), &[pid]).await.unwrap();
+    let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": list["id"]}]}}))).await;
+    est["count"].as_i64().unwrap() > 0
+}
+
+/// None of `needles` appears in anything stored or shown: delivery payloads, headers, requests,
+/// results and action lists, the delivery API (with payloads), events, profiles, or a dry run of
+/// the same payloads.
+async fn never_stored(h: &mut Harness, inst: &Installed, needles: &[String], fixtures: &[&str]) {
+    if needles.is_empty() {
+        return;
+    }
+    let stored: String = sqlx::query_scalar(
+        "SELECT COALESCE(string_agg(concat_ws(' ', body, headers::text, query::text, request::text, result::text, actions::text, error), ' '), '') FROM integration_deliveries",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    let written: String = sqlx::query_scalar(
+        "SELECT concat((SELECT COALESCE(string_agg(properties::text, ' '), '') FROM events), ' ', (SELECT COALESCE(string_agg(concat_ws(' ', properties::text, integration_keys::text), ' '), '') FROM profiles))",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    let mut shown = String::new();
+    for d in inst.deliveries(h).await {
+        let one = h.ok("GET", &format!("/api/integrations/{}/deliveries/{}", inst.id, d["id"].as_str().unwrap()), None).await;
+        shown.push_str(&one.to_string());
+    }
+    for name in fixtures {
+        let f = fixture(inst.recipe, name);
+        let mut body = json!({"payload": f["input"]["payload"]});
+        for k in ["headers", "query", "source"] {
+            if f["input"][k].is_object() || f["input"][k].is_string() {
+                body[k] = f["input"][k].clone();
+            }
+        }
+        let out = h.ok("POST", &format!("/api/integrations/{}/test", inst.id), Some(body)).await;
+        assert_eq!(out["ok"], true, "{name}: {out}");
+        shown.push_str(&out.to_string());
+    }
+    for n in needles {
+        assert!(!stored.contains(n.as_str()), "{}: {n:?} was stored with a delivery", inst.recipe);
+        assert!(!written.contains(n.as_str()), "{}: {n:?} reached an event or profile", inst.recipe);
+        assert!(!shown.contains(n.as_str()), "{}: {n:?} was shown by the API or a dry run", inst.recipe);
+    }
+}
+
+/// The `sensitive` values every fixture of a recipe lists.
+fn sensitive(recipe: &str, names: &[&str]) -> Vec<String> {
+    names.iter().flat_map(|n| fixture(recipe, n)["sensitive"].as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_str().map(String::from)).collect()
+}
+
+/// A live flow on `metric` sending one email (`service` marks it as service messages).
+async fn live_flow(h: &mut Harness, metric: &str, subject: &str, service: bool) -> String {
+    let def = json!({"entry": "e1", "settings": {"service_messages": service}, "nodes": [
+        {"id": "e1", "type": "email", "name": "Note", "next": null, "content": {"subject": subject, "blocks": [{"type": "text", "html": "<p>Thanks.</p>"}]}}]});
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": subject, "trigger": {"type": "metric", "metric": metric}, "definition": def}))).await;
+    let id = f["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{id}/status"), Some(json!({"status": "live"}))).await;
+    id
+}
+
+fn sent_to(h: &Harness, subject_starts: &str) -> Vec<String> {
+    let mut v: Vec<String> = h.state.email.sent().into_iter().filter(|m| m.subject.starts_with(subject_starts)).map(|m| m.to).collect();
+    v.sort();
+    v
+}
+
+/// Make deliveries waiting to retry due now, and run them.
+async fn retry_now(h: &Harness) {
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind LIKE 'integrations_%'").execute(&h.state.db).await.unwrap();
+    h.drain().await;
+}
+
+// ---------- WooCommerce ----------
+
+#[tokio::test]
+async fn woocommerce_orders_refunds_and_customers() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let w = install(&mut h, "woocommerce", Sign::Base64("X-WC-Webhook-Signature"), "wc-webhook-secret-0001", true).await;
+    let thanks = live_flow(&mut h, "Placed Order", "Thanks for your order", true).await;
+    // Riley was already here, subscribed to texts on another number.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "riley.example@example.com", "phone_number": "+15035550100", "sms_consent": "subscribed"}))).await;
+    w.refused(&h, "order-created-paid.json").await;
+    // Out of order: the completion arrives before the order was created; both count once.
+    for name in ["ping.json", "order-updated-completed.json", "order-created-paid.json", "order-created-pending.json", "order-created-free.json", "customer-created.json"] {
+        w.post(&h, name).await;
+    }
+    assert_eq!(events(&h, "Placed Order").await, 1, "the pending and free orders aren't orders; the paid one counts once");
+    assert_eq!(events(&h, "Fulfilled Order").await, 1);
+    // A resend with the same delivery id is acknowledged and ignored.
+    let f = fixture("woocommerce", "order-updated-completed.json");
+    let mut headers = f["input"]["headers"].clone();
+    headers["x-wc-webhook-delivery-id"] = json!("d-1001");
+    let body = f["input"]["payload"].to_string();
+    w.post_as(&h, &body, &headers, &json!({}), &w.secret).await;
+    let (_, r) = w.post_as(&h, &body, &headers, &json!({}), &w.secret).await;
+    assert!(r.contains("duplicate"), "{r}");
+    // Refunds: once per refund id, positive amounts, however often the order is resent.
+    w.post(&h, "order-updated-refunded.json").await;
+    w.post(&h, "order-updated-refunded.json").await;
+    assert_eq!(values(&h, "Refunded Order", "riley.example@example.com").await, vec![9.0, 10.0]);
+    assert_eq!(prop(&h, "Refunded Order", "currency").await, vec!["USD", "USD"]);
+    w.post(&h, "order-updated-cancelled.json").await;
+    assert_eq!(events(&h, "Cancelled Order").await, 1);
+    // Buyers and customers are held back from marketing; the service flow still reached the buyer.
+    // The order brought a different number: the SMS subscription belonged to the old one.
+    let (phone, sms): (Option<String>, String) = sqlx::query_as("SELECT phone_number, sms_consent FROM profiles WHERE email = 'riley.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((phone.as_deref(), sms.as_str()), (Some("+14155550142"), "never_subscribed"));
+    // Riley existed before (never held); Morgan was created by the integration and is held.
+    assert_eq!(consent(&h, "morgan.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "morgan.example@example.com").await);
+    assert_eq!(sent_to(&h, "Thanks for your order"), vec!["riley.example@example.com"]);
+    let keys: Value = sqlx::query_scalar("SELECT integration_keys FROM profiles WHERE email = 'morgan.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(keys["woocommerce_customer"], json!(["25"]), "{keys}");
+    let _ = thanks;
+    let names = ["order-created-paid.json", "order-updated-refunded.json"];
+    never_stored(&mut h, &w, &sensitive("woocommerce", &names), &names).await;
+    h.cleanup().await;
+}
+
+// ---------- Recharge ----------
+
+#[tokio::test]
+async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charges() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let r = install(&mut h, "recharge", Sign::Stripe("X-Recharge-Webhook-Signature"), "rc-client-secret-0001", true).await;
+    let remind = r.flow("upcoming charge");
+    let f = h.ok("GET", &format!("/api/flows/{remind}"), None).await;
+    assert_eq!(f["definition"]["settings"]["service_messages"], true);
+    h.ok("POST", &format!("/api/flows/{remind}/status"), Some(json!({"status": "live"}))).await;
+    r.refused(&h, "subscription-created.json").await;
+    // The subscription arrives before its customer: it waits, then finds them.
+    r.post(&h, "subscription-created.json").await;
+    let d = r.deliveries(&mut h).await;
+    assert_eq!(d[0]["status"], "error", "{:?}", d[0]);
+    assert!(d[0]["next_attempt_at"].is_string(), "retried, not dropped");
+    r.post(&h, "customer-created.json").await;
+    retry_now(&h).await;
+    assert_eq!(events(&h, "Subscription Started").await, 1);
+    // Cancelled, then reactivated, delivered newest first: both kept with Recharge's own times.
+    r.post(&h, "subscription-activated.json").await;
+    r.post(&h, "subscription-cancelled.json").await;
+    r.post(&h, "subscription-cancelled.json").await;
+    assert_eq!(events(&h, "Subscription Cancelled").await, 1, "a resend counts once");
+    let order: Vec<String> = sqlx::query_scalar("SELECT m.name FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name IN ('Subscription Cancelled', 'Subscription Reactivated') ORDER BY e.occurred_at, e.id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(order, vec!["Subscription Cancelled", "Subscription Reactivated"]);
+    for name in ["subscription-skipped.json", "charge-upcoming.json", "charge-paid.json", "charge-paid.json", "charge-failed.json", "no-topic.json"] {
+        r.post(&h, name).await;
+    }
+    assert_eq!(values(&h, "Charge Paid", "jamie.example@example.com").await, vec![13.14]);
+    assert_eq!(prop(&h, "Charge Paid", "currency").await, vec!["USD"]);
+    assert_eq!(events(&h, "Charge Failed").await, 1);
+    assert_eq!(events(&h, "Subscription Skipped").await, 1);
+    // Held back from marketing, but the upcoming-charge reminder (a service message) reached them.
+    assert_eq!(consent(&h, "jamie.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "jamie.example@example.com").await);
+    assert_eq!(sent_to(&h, "Your next order is coming up"), vec!["jamie.example@example.com"]);
+    let names = ["charge-upcoming.json"];
+    never_stored(&mut h, &r, &sensitive("recharge", &names), &names).await;
+    h.cleanup().await;
+}
+
+// ---------- Square ----------
+
+#[tokio::test]
+async fn square_signs_its_url_and_refunds_find_their_payment() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let s = install(&mut h, "square", Sign::SquareUrl, "square-signature-key-0001", false).await;
+    live_flow(&mut h, "Placed Order", "Your receipt", true).await;
+    s.refused(&h, "payment-updated-completed.json").await;
+    // The signature covers the URL: the right body and secret on another URL is refused.
+    let f = fixture("square", "payment-updated-completed.json");
+    let body = f["input"]["payload"].to_string();
+    let wrong = sign(Sign::SquareUrl, &s.secret, "https://pl.test/webhooks/in/other", &body);
+    let mut hdrs: Vec<(&str, &str)> = wrong.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    hdrs.push(("content-type", "application/json"));
+    assert_eq!(h.raw("POST", &s.path(), &hdrs, &body).await.0, StatusCode::UNAUTHORIZED);
+    // A refund that arrives before its payment waits for it; pending ones aren't counted.
+    s.post(&h, "refund-created-pending.json").await;
+    s.post(&h, "refund-updated-completed.json").await;
+    s.post(&h, "payment-created-approved.json").await;
+    assert_eq!(events(&h, "Placed Order").await, 0, "approved isn't completed");
+    s.post(&h, "payment-updated-completed.json").await;
+    let (_, again) = s.post_as(&h, &body, &json!({}), &json!({}), &s.secret).await;
+    assert!(again.contains("duplicate"), "Square's resend is recognized by event_id: {again}");
+    retry_now(&h).await;
+    assert_eq!(values(&h, "Placed Order", "avery.example@example.com").await, vec![1.0]);
+    assert_eq!(values(&h, "Refunded Order", "avery.example@example.com").await, vec![0.6]);
+    // A payment naming only the customer finds them once the customer arrives.
+    s.post(&h, "payment-updated-customer-only.json").await;
+    s.post(&h, "customer-created.json").await;
+    s.post(&h, "customer-updated-unsubscribed.json").await;
+    assert_eq!(events(&h, "Placed Order").await, 2);
+    assert_eq!(consent(&h, "avery.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "avery.example@example.com").await);
+    let reason: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE email = 'quinn.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert!(reason.is_some(), "unsubscribed from Square's marketing: never sent marketing here");
+    assert_eq!(sent_to(&h, "Your receipt"), vec!["avery.example@example.com"]);
+    let names = ["payment-updated-completed.json", "customer-created.json"];
+    never_stored(&mut h, &s, &sensitive("square", &names), &names).await;
+    h.cleanup().await;
+}
+
+// ---------- Paddle ----------
+
+#[tokio::test]
+async fn paddle_orders_refunds_and_its_marketing_consent_box() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let p = install(&mut h, "paddle", Sign::Paddle, "pdl_ntfset_test_0001", true).await;
+    let winback = p.flow("win-back");
+    h.ok("POST", &format!("/api/flows/{winback}/status"), Some(json!({"status": "live"}))).await;
+    p.refused(&h, "transaction-completed.json").await;
+    // The transaction comes before its customer: it waits, then counts once.
+    p.post(&h, "transaction-completed.json").await;
+    p.post(&h, "adjustment-created-pending.json").await;
+    p.post(&h, "adjustment-updated-approved.json").await;
+    p.post(&h, "customer-created.json").await;
+    retry_now(&h).await;
+    let (_, again) = p.post_as(&h, &fixture("paddle", "transaction-completed.json")["input"]["payload"].to_string(), &json!({}), &json!({}), &p.secret).await;
+    assert!(again.contains("duplicate"), "{again}");
+    assert_eq!(values(&h, "Placed Order", "jo.example@example.com").await, vec![652.15]);
+    assert_eq!(values(&h, "Refunded Order", "jo.example@example.com").await, vec![1.0], "the pending refund isn't counted; the approved one once");
+    for name in ["subscription-created.json", "subscription-activated.json", "subscription-canceled.json"] {
+        p.post(&h, name).await;
+    }
+    assert_eq!(events(&h, "Subscription Started").await, 1, "created and activated are one start");
+    assert_eq!(events(&h, "Subscription Cancelled").await, 1);
+    // Only the marketing box subscribes; the held customer gets no win-back (a marketing flow).
+    p.post(&h, "customer-updated-consent.json").await;
+    assert_eq!(consent(&h, "jo.example@example.com").await, (true, "never_subscribed".into()));
+    assert_eq!(consent(&h, "sam.example@example.com").await, (false, "subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "jo.example@example.com").await);
+    assert!(campaign_reaches(&mut h, "sam.example@example.com").await);
+    // Sam's subscription is cancelled too: the win-back reaches Sam, not Jo.
+    let mut sams = fixture("paddle", "subscription-canceled.json")["input"]["payload"].clone();
+    sams["event_id"] = json!("evt_sam_cancel");
+    sams["data"]["id"] = json!("sub_sam");
+    sams["data"]["customer_id"] = json!("ctm_01hv6y1consent00000000000");
+    p.post_as(&h, &sams.to_string(), &json!({}), &json!({}), &p.secret).await;
+    h.fast_forward().await;
+    h.fast_forward().await;
+    assert_eq!(sent_to(&h, "We'd like you back"), vec!["sam.example@example.com"]);
+    let names = ["transaction-completed.json"];
+    never_stored(&mut h, &p, &sensitive("paddle", &names), &names).await;
+    h.cleanup().await;
+}
+
+// ---------- BigCommerce (webhooks that only carry an id; DumbMail fetches the record) ----------
+
+#[derive(Default)]
+struct MockStore {
+    /// (X-Auth-Token, path with query) of each request.
+    seen: std::sync::Mutex<Vec<(String, String)>>,
+    /// Answer 404 to this many order reads first (the order isn't readable yet).
+    not_yet: std::sync::atomic::AtomicUsize,
+}
+
+/// A stand-in for BigCommerce's store API, answering with the documented example bodies kept in
+/// the recipe's fixtures: `GET /stores/{hash}/v2/orders/{id}`,
+/// `GET /stores/{hash}/v3/orders/{id}/payment_actions/refunds/{refund_id}` and
+/// `GET /stores/{hash}/v3/customers?id:in=…`, all behind `X-Auth-Token`.
+async fn mock_bigcommerce() -> (std::sync::Arc<MockStore>, String) {
+    use axum::extract::{Path, State};
+    use axum::routing::get;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    let m: Arc<MockStore> = Default::default();
+    let note = |m: &MockStore, h: &axum::http::HeaderMap, uri: &axum::http::Uri| -> bool {
+        let tok = h.get("x-auth-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        m.seen.lock().unwrap().push((tok.clone(), uri.path_and_query().map(|p| p.to_string()).unwrap_or_default()));
+        tok == "bc-access-token-0001"
+    };
+    let app = axum::Router::new()
+        .route(
+            "/stores/abc123/v2/orders/{id}",
+            get(move |State(m): State<Arc<MockStore>>, h: axum::http::HeaderMap, uri: axum::http::Uri, Path(id): Path<u64>| async move {
+                if !note(&m, &h, &uri) {
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"status": 401})));
+                }
+                if m.not_yet.load(Ordering::SeqCst) > 0 {
+                    m.not_yet.fetch_sub(1, Ordering::SeqCst);
+                    return (StatusCode::NOT_FOUND, axum::Json(json!({"status": 404, "title": "The requested resource was not found."})));
+                }
+                let mut o = fixture("bigcommerce", "fetch-order-awaiting-fulfillment.json")["input"]["payload"].clone();
+                o["id"] = json!(id);
+                (StatusCode::OK, axum::Json(o))
+            }),
+        )
+        .route(
+            "/stores/abc123/v3/orders/{id}/payment_actions/refunds/{rid}",
+            get(move |State(m): State<Arc<MockStore>>, h: axum::http::HeaderMap, uri: axum::http::Uri| async move {
+                if !note(&m, &h, &uri) {
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"status": 401})));
+                }
+                (StatusCode::OK, axum::Json(fixture("bigcommerce", "fetch-refund.json")["input"]["payload"].clone()))
+            }),
+        )
+        .route(
+            "/stores/abc123/v3/customers",
+            get(move |State(m): State<Arc<MockStore>>, h: axum::http::HeaderMap, uri: axum::http::Uri| async move {
+                if !note(&m, &h, &uri) {
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"status": 401})));
+                }
+                (StatusCode::OK, axum::Json(fixture("bigcommerce", "fetch-customer.json")["input"]["payload"].clone()))
+            }),
+        )
+        .with_state(m.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (m, format!("http://{addr}"))
+}
+
+#[tokio::test]
+async fn bigcommerce_webhooks_fetch_what_they_name() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let (store, base) = mock_bigcommerce().await;
+    let b = install(&mut h, "bigcommerce", Sign::Header("X-Webhook-Token"), "bc-webhook-token-0001", false).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", b.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/stores/{{{{settings.store_hash}}}}/v2/orders"));
+    h.ok("PATCH", &format!("/api/integrations/{}", b.id), Some(json!({"pull": pull, "settings": {"store_hash": "abc123"}, "credentials": {"access_token": "bc-access-token-0001"}}))).await;
+    live_flow(&mut h, "Placed Order", "Order confirmed", true).await;
+    b.refused(&h, "webhook-order-created.json").await;
+    // The order isn't readable yet: the fetch is tried again, then the order is recorded once.
+    store.not_yet.store(1, std::sync::atomic::Ordering::SeqCst);
+    b.post(&h, "webhook-order-created.json").await;
+    assert_eq!(events(&h, "Placed Order").await, 0);
+    let failed = b.deliveries(&mut h).await.into_iter().find(|d| d["source"] == "fetch").unwrap();
+    assert_eq!(failed["status"], "error", "{failed}");
+    retry_now(&h).await;
+    assert_eq!(events(&h, "Placed Order").await, 1);
+    b.post(&h, "webhook-order-status-updated.json").await;
+    assert_eq!(events(&h, "Placed Order").await, 1, "a second webhook for the same order reads it again; it still counts once");
+    // A refund: the refund is fetched, then its order; recorded once, in the order's currency.
+    b.post(&h, "webhook-refund-created.json").await;
+    b.post(&h, "webhook-refund-created.json").await;
+    assert_eq!(values(&h, "Refunded Order", "casey.example@example.com").await, vec![50.0]);
+    assert_eq!(prop(&h, "Refunded Order", "currency").await, vec!["USD"]);
+    b.post(&h, "webhook-customer-created.json").await;
+    b.post(&h, "webhook-other-store.json").await;
+    let seen = store.seen.lock().unwrap().clone();
+    assert!(seen.iter().all(|(tok, _)| tok == "bc-access-token-0001"), "{seen:?}");
+    let paths: Vec<&str> = seen.iter().map(|(_, p)| p.as_str()).collect();
+    assert!(paths.contains(&"/stores/abc123/v3/orders/218/payment_actions/refunds/12"), "{paths:?}");
+    assert!(paths.contains(&"/stores/abc123/v3/customers?id%3Ain=32"), "{paths:?}");
+    assert_eq!(paths.iter().filter(|p| p.starts_with("/stores/abc123/v2/orders/218")).count(), 5, "404, then the order, the status update and twice for the refund: {paths:?}");
+    // Buyers and customers are held back from marketing; the service flow still reached the buyer.
+    for email in ["casey.example@example.com", "drew.example@example.com"] {
+        assert_eq!(consent(&h, email).await, (true, "never_subscribed".into()), "{email}");
+    }
+    assert!(!campaign_reaches(&mut h, "casey.example@example.com").await);
+    assert_eq!(sent_to(&h, "Order confirmed"), vec!["casey.example@example.com"]);
+    // The access token, the gate code a shopper typed and IP addresses are never stored or shown.
+    let mut needles = sensitive("bigcommerce", &["fetch-order-awaiting-fulfillment.json", "fetch-customer.json"]);
+    needles.push("bc-access-token-0001".into());
+    let names = ["webhook-order-created.json", "webhook-refund-created.json"];
+    never_stored(&mut h, &b, &needles, &names).await;
+    h.cleanup().await;
+}
