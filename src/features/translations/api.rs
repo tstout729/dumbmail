@@ -341,7 +341,8 @@ pub struct DraftBody {
     /// Only these field ids (default: every text that's missing or out of date).
     #[serde(default)]
     pub ids: Option<Vec<String>>,
-    /// MCP only: without it, says what a run would translate and cost.
+    /// Without it, MCP only says what a run would translate and cost, and REST does too when the
+    /// run costs money.
     #[serde(default)]
     pub confirm: bool,
 }
@@ -355,17 +356,15 @@ pub async fn start_draft(state: &AppState, ctx: &Ctx, t: &Target, b: &DraftBody,
     if b.ids.as_ref().is_some_and(|i| i.len() > fields::MAX_ENTRIES) {
         return Err(AppError::bad("too many ids"));
     }
-    // MCP always quotes first; REST quotes first when the run costs money. Either way it runs only
-    // with confirm=true.
-    if dry_run || !b.confirm {
+    // MCP always quotes first. Otherwise the quote is worked out, and paid, in the transaction that
+    // starts the run: a run that costs money starts only with confirm=true.
+    if dry_run {
         let mut p = draft::plan(state, ctx.account_id, t, &lang, b.ids.as_deref()).await?;
-        if dry_run || p["price_usd"].as_f64().unwrap_or(0.0) > 0.0 {
-            p["dry_run"] = json!(true);
-            p["note"] = json!("Nothing was translated. Call again with confirm=true to draft these with AI.");
-            return Ok(p);
-        }
+        p["dry_run"] = json!(true);
+        p["note"] = json!(draft::QUOTE_NOTE);
+        return Ok(p);
     }
-    draft::start(state, ctx, t, &lang, b.ids.as_deref(), scheduled_ok(ctx)).await
+    draft::start(state, ctx, t, &lang, b.ids.as_deref(), scheduled_ok(ctx), b.confirm).await
 }
 
 // ---------- Glossary ----------

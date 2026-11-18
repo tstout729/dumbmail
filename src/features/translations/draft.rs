@@ -1,9 +1,13 @@
 //! "Draft with AI": machine-translated drafts of a message's missing or out-of-date text.
 //!
 //! Starting a run fixes what it translates (the strings and the default text they come from are
-//! copied into the run), reserves the characters against the account's daily limit in the same
-//! statement that checks it, and enqueues the work on the background lane, all in one
-//! transaction. At most one run per account is queued or running (a unique index).
+//! copied into the run), works out its price from exactly those strings, reserves the characters
+//! against the account's daily limit in the same statement that checks it, debits the price (a
+//! ledger entry with the run's own reference) and enqueues the work on the background lane, all
+//! in one transaction. A run that costs money starts only when the caller confirmed it; otherwise
+//! nothing is started and the quote is the answer. However a run ends, what it didn't use is given
+//! back: unsent characters to the day's allowance and their price to the balance (its own
+//! reference). At most one run per account is queued or running (a unique index).
 //!
 //! One worker owns a run at a time: it takes a lease (owner and expiry) and renews it between
 //! batches. Every renewal, write (drafts, progress) and the run's end is conditional, in the same
@@ -41,6 +45,8 @@ pub const MAX_RUN: std::time::Duration = std::time::Duration::from_secs(600);
 pub const STUCK_MINUTES: i32 = 15;
 /// Tries per batch for failures that may pass.
 const TRIES: u32 = 3;
+/// What a quote says.
+pub const QUOTE_NOTE: &str = "Nothing was translated. Call again with confirm=true to draft these with AI.";
 
 /// Whether machine translation is set up on this server.
 pub fn available(state: &AppState) -> bool {
@@ -92,21 +98,73 @@ pub async fn usage_today(state: &AppState, account_id: Uuid) -> AppResult<(i64, 
     Ok((used.unwrap_or(0), state.cfg.translation_daily_chars))
 }
 
-/// What a run would translate, without starting it.
-pub async fn plan(state: &AppState, account_id: Uuid, t: &Target, lang: &str, ids: Option<&[String]>) -> AppResult<Value> {
-    let l = store::load(&state.db, account_id, t).await?;
-    let strings = picked(&l.content, lang, ids);
-    let chars: i64 = strings.iter().map(|s| s["source"].as_str().unwrap_or("").chars().count() as i64).sum();
+fn chars_of(strings: &[Value]) -> i64 {
+    strings.iter().map(|s| s["source"].as_str().unwrap_or("").chars().count() as i64).sum()
+}
+
+async fn quote(state: &AppState, account_id: Uuid, strings: &[Value]) -> AppResult<Value> {
+    let chars = chars_of(strings);
     let (used, limit) = usage_today(state, account_id).await?;
     Ok(json!({"strings": strings.len(), "characters": chars, "price_usd": crate::billing::to_usd(price_micros(state, chars)), "used_today": used, "daily_limit": limit, "available": available(state)}))
 }
 
-/// Start a run translating `t` into `lang` (the missing and out-of-date text, or only `ids`).
-pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Option<&[String]>, scheduled_ok: bool) -> AppResult<Value> {
+/// What a run would translate, without starting it.
+pub async fn plan(state: &AppState, account_id: Uuid, t: &Target, lang: &str, ids: Option<&[String]>) -> AppResult<Value> {
+    let l = store::load(&state.db, account_id, t).await?;
+    quote(state, account_id, &picked(&l.content, lang, ids)).await
+}
+
+/// Give back what a run that just ended didn't use: `unsent` characters to the allowance of the day
+/// it started, and the price of what it never sent to the balance (reference
+/// `translation:<run>:refund`).
+#[allow(clippy::too_many_arguments)]
+async fn settle(state: &AppState, tx: &mut sqlx::PgConnection, id: Uuid, account_id: Uuid, created_at: chrono::DateTime<chrono::Utc>, unsent: i64, charged: i64, sent: i64) -> anyhow::Result<()> {
+    if unsent > 0 {
+        sqlx::query(
+            "UPDATE translation_usage u SET chars = GREATEST(u.chars - $2, 0) FROM accounts a
+             WHERE u.account_id = $1 AND a.id = u.account_id AND u.day = ($3 AT TIME ZONE a.timezone)::date",
+        )
+        .bind(account_id)
+        .bind(unsent)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let back = charged - price_micros(state, sent).min(charged);
+    if back > 0 {
+        if crate::billing::post_entry_tx(tx, account_id, "translation", back, "Machine translation: unused part given back", &format!("translation:{id}:refund")).await? {
+            sqlx::query("UPDATE translation_jobs SET charged_micros = charged_micros - $2 WHERE id = $1").bind(id).bind(back).execute(&mut *tx).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Start a run translating `t` into `lang` (the missing and out-of-date text, or only `ids`). When
+/// it costs money and `confirm` is false, nothing starts and the quote is returned (`dry_run`).
+#[allow(clippy::too_many_arguments)]
+pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Option<&[String]>, scheduled_ok: bool, confirm: bool) -> AppResult<Value> {
     if !available(state) {
         return Err(AppError::Conflict("Machine translation isn't set up on this server (ANTHROPIC_API_KEY). Export the text for a translator instead.".into()));
     }
-    let l = store::load(&state.db, ctx.account_id, t).await?;
+    let id = Uuid::now_v7();
+    let mut tx = state.db.begin().await?;
+    // A run that stopped without finishing doesn't block the account forever. Its worker, if any is
+    // left, no longer holds the lease, so it can't write anything after this; what it didn't use
+    // is given back.
+    let stuck: Vec<(Uuid, chrono::DateTime<chrono::Utc>, i32, i32, i64)> = sqlx::query_as(
+        "UPDATE translation_jobs SET status = 'failed', error = 'stopped before it finished', strings = '[]', lease_owner = NULL, finished_at = now()
+         WHERE account_id = $1 AND ((status = 'queued' AND created_at < now() - make_interval(mins => $2)) OR (status = 'running' AND lease_until < now()))
+         RETURNING id, created_at, chars, sent_chars, charged_micros",
+    )
+    .bind(ctx.account_id)
+    .bind(STUCK_MINUTES)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (sid, created_at, chars, sent, charged) in stuck {
+        settle(state, &mut tx, sid, ctx.account_id, created_at, i64::from(chars - sent).max(0), charged, i64::from(sent)).await?;
+    }
+    // What the run translates and what it costs, from the message as it is now.
+    let l = store::load_in(&mut tx, ctx.account_id, t).await?;
     let (default, _) = fields::languages(&l.content);
     if default.as_deref() == Some(lang) {
         return Err(AppError::bad("that's this message's default language; pick a language to translate into"));
@@ -115,26 +173,18 @@ pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Opt
     if strings.is_empty() {
         return Err(AppError::bad("nothing to translate: every text in this language is already translated and up to date"));
     }
-    let chars: i64 = strings.iter().map(|s| s["source"].as_str().unwrap_or("").chars().count() as i64).sum();
+    let chars = chars_of(&strings);
     let limit = state.cfg.translation_daily_chars;
     let price = price_micros(state, chars);
-    if price > 0 {
-        crate::billing::ensure_funds(state, ctx.account_id, price, "machine translation").await?;
+    if price > 0 && !confirm {
+        drop(tx);
+        let mut q = quote(state, ctx.account_id, &strings).await?;
+        q["dry_run"] = json!(true);
+        q["note"] = json!(QUOTE_NOTE);
+        return Ok(q);
     }
-    let id = Uuid::now_v7();
-    let mut tx = state.db.begin().await?;
-    // A run that stopped without finishing doesn't block the account forever. Its worker, if any is
-    // left, no longer holds the lease, so it can't write anything after this.
-    sqlx::query(
-        "UPDATE translation_jobs SET status = 'failed', error = 'stopped before it finished', strings = '[]', lease_owner = NULL, finished_at = now()
-         WHERE account_id = $1 AND ((status = 'queued' AND created_at < now() - make_interval(mins => $2)) OR (status = 'running' AND lease_until < now()))",
-    )
-        .bind(ctx.account_id)
-        .bind(STUCK_MINUTES)
-        .execute(&mut *tx)
-        .await?;
     let inserted = sqlx::query(
-        "INSERT INTO translation_jobs (id, account_id, target_kind, target_id, target_part, language, strings, chars, requested_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "INSERT INTO translation_jobs (id, account_id, target_kind, target_id, target_part, language, strings, chars, requested_by, charged_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(ctx.account_id)
@@ -145,6 +195,7 @@ pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Opt
     .bind(Value::Array(strings.clone()))
     .bind(chars as i32)
     .bind(ctx.user_id)
+    .bind(price)
     .execute(&mut *tx)
     .await;
     match inserted {
@@ -169,6 +220,18 @@ pub async fn start(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, ids: Opt
     if reserved.is_none() {
         return Err(AppError::LimitReached(format!("That's more than today's machine translation allowance ({limit} characters a day); translate less at a time or try tomorrow.")));
     }
+    // The price, paid now (what isn't used is given back when the run ends).
+    if price > 0 {
+        let balance: i64 = sqlx::query_scalar("SELECT balance_micros FROM accounts WHERE id = $1 FOR UPDATE").bind(ctx.account_id).fetch_one(&mut *tx).await?;
+        if balance < price {
+            return Err(AppError::LimitReached(format!(
+                "Machine translation costs ${:.2} but your balance is ${:.2}. Add credit in Settings → Billing.",
+                crate::billing::to_usd(price),
+                crate::billing::to_usd(balance.max(0))
+            )));
+        }
+        crate::billing::post_entry_tx(&mut tx, ctx.account_id, "translation", -price, "Machine translation", &format!("translation:{id}:reserve")).await?;
+    }
     crate::jobs::enqueue_background(&mut *tx, JOB_KIND, json!({"job_id": id, "scheduled_ok": scheduled_ok}), None).await?;
     tx.commit().await?;
     crate::features::team::audit(state, ctx, "translation.draft", Some(&t.describe()), json!({"language": lang, "strings": strings.len(), "characters": chars})).await;
@@ -188,13 +251,14 @@ pub async fn job_json(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult
     Ok(json!({"id": r.0, "target": {"kind": r.1, "id": r.2, "part": r.3}, "language": r.4, "status": r.5, "characters": r.6, "translated": r.7, "skipped": r.8, "error": r.9, "created_at": r.10, "finished_at": r.11}))
 }
 
-/// Record how a run ended, if this worker still holds it, and give back the characters it never
-/// sent (`refund`), in one transaction. The copied text is cleared.
+/// Record how a run ended, if this worker still holds it, and give back what it didn't use (the
+/// `refund` characters it never sent, and their price), in one transaction. The copied text is
+/// cleared.
 async fn finish(state: &AppState, id: Uuid, owner: Uuid, status: &str, error: Option<&str>, refund: i64) -> anyhow::Result<()> {
     let mut tx = state.db.begin().await?;
-    let row: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+    let row: Option<(Uuid, chrono::DateTime<chrono::Utc>, i64, i32)> = sqlx::query_as(
         "UPDATE translation_jobs SET status = $3, error = $4, strings = '[]', lease_owner = NULL, finished_at = now()
-         WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() RETURNING account_id, created_at",
+         WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() RETURNING account_id, created_at, charged_micros, sent_chars",
     )
     .bind(id)
     .bind(owner)
@@ -202,16 +266,8 @@ async fn finish(state: &AppState, id: Uuid, owner: Uuid, status: &str, error: Op
     .bind(error)
     .fetch_optional(&mut *tx)
     .await?;
-    if let (Some((account_id, created_at)), true) = (row, refund > 0) {
-        sqlx::query(
-            "UPDATE translation_usage u SET chars = GREATEST(u.chars - $2, 0) FROM accounts a
-             WHERE u.account_id = $1 AND a.id = u.account_id AND u.day = ($3 AT TIME ZONE a.timezone)::date",
-        )
-        .bind(account_id)
-        .bind(refund)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await?;
+    if let Some((account_id, created_at, charged, sent)) = row {
+        settle(state, &mut tx, id, account_id, created_at, refund, charged, i64::from(sent)).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -244,14 +300,13 @@ enum Written {
     Ok,
     /// The worker lost the run; nothing was written.
     Lost,
-    /// The run can't go on (the message can't be changed now, the balance ran out).
+    /// The run can't go on (the message can't be changed now).
     Stop(String),
 }
 
-/// Write a batch's drafts, its charge and the run's progress together, if this worker still holds
-/// the run.
+/// Write a batch's drafts and the run's progress together, if this worker still holds the run.
 #[allow(clippy::too_many_arguments)]
-async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, target: &Target, scheduled_ok: bool, lang: &str, default_lang: &str, hashes: &BTreeMap<String, String>, batch_no: usize, b: &BatchResult) -> anyhow::Result<Written> {
+async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, target: &Target, scheduled_ok: bool, lang: &str, default_lang: &str, hashes: &BTreeMap<String, String>, b: &BatchResult) -> anyhow::Result<Written> {
     let mut tx = state.db.begin().await?;
     let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM translation_jobs WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() FOR UPDATE").bind(id).bind(owner).fetch_optional(&mut *tx).await?;
     if held.is_none() {
@@ -287,24 +342,14 @@ async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, 
             Err(e) => return Ok(Written::Stop(e.public_message())),
         }
     }
-    // The charge for what was sent, with the drafts (a unique reference per batch).
-    let price = price_micros(state, b.sent);
-    if price > 0 {
-        let balance: i64 = sqlx::query_scalar("SELECT balance_micros FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
-        if balance < price {
-            return Ok(Written::Stop("your balance is empty; add credit in Settings → Billing".into()));
-        }
-        crate::billing::post_entry_tx(&mut tx, account_id, "translation", -price, "Machine translation", &format!("translation:{id}:{batch_no}")).await?;
-    }
     sqlx::query(
-        "UPDATE translation_jobs SET translated = translated + $2, skipped = skipped + $3, sent_chars = sent_chars + $4, charged_micros = charged_micros + $5,
-            done_ids = done_ids || $6, lease_until = now() + make_interval(secs => $7) WHERE id = $1",
+        "UPDATE translation_jobs SET translated = translated + $2, skipped = skipped + $3, sent_chars = sent_chars + $4,
+            done_ids = done_ids || $5, lease_until = now() + make_interval(secs => $6) WHERE id = $1",
     )
     .bind(id)
     .bind(written as i32)
     .bind((b.skipped + later) as i32)
     .bind(b.sent as i32)
-    .bind(price)
     .bind(json!(b.done))
     .bind(LEASE_SECS as f64)
     .execute(&mut *tx)
@@ -487,13 +532,12 @@ async fn drive(state: &AppState, payload: &Value, held: &mut Option<(Uuid, Uuid,
     let mut sent_total = i64::from(sent_before);
     if !unusable.is_empty() {
         let b = BatchResult { drafts: BTreeMap::new(), done: unusable.clone(), skipped: unusable.len(), sent: 0 };
-        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, 0, &b).await? {
+        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, &b).await? {
             Written::Ok => {}
             Written::Lost => return Ok(()),
             Written::Stop(why) => return finish(state, id, owner, "failed", Some(&why), unsent(sent_total)).await,
         }
     }
-    let first_batch = done.len();
     for (i, batch) in batches.iter().enumerate() {
         if std::time::Instant::now() >= deadline {
             return finish(state, id, owner, "failed", Some("it took longer than 10 minutes; what was drafted so far is kept"), unsent(sent_total)).await;
@@ -514,7 +558,7 @@ async fn drive(state: &AppState, payload: &Value, held: &mut Option<(Uuid, Uuid,
                 tracing::warn!(job = %id, error = %f, "machine translation request failed");
                 let left: usize = batches[i..].iter().map(|b| b.len()).sum();
                 let b = BatchResult { drafts: BTreeMap::new(), done: batch.keys().cloned().collect(), skipped: batch.len(), sent };
-                if let Written::Lost = write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, first_batch + i + 1, &b).await? {
+                if let Written::Lost = write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, &b).await? {
                     return Ok(());
                 }
                 let msg = format!("{left} {} weren't drafted: {}", if left == 1 { "text" } else { "texts" }, f.msg);
@@ -539,7 +583,7 @@ async fn drive(state: &AppState, payload: &Value, held: &mut Option<(Uuid, Uuid,
                 }
             }
         }
-        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, first_batch + i + 1, &b).await? {
+        match write_batch(state, id, owner, account_id, &target, scheduled_ok, &lang, &settings.default_language, &hashes, &b).await? {
             Written::Ok => {}
             Written::Lost => return Ok(()),
             Written::Stop(why) => return finish(state, id, owner, "failed", Some(&why), unsent(sent_total)).await,

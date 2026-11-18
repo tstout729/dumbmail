@@ -127,6 +127,11 @@ pub async fn load(db: &PgPool, account_id: Uuid, t: &Target) -> AppResult<Loaded
     load_on(&mut conn, account_id, t, false).await.map(|(l, _)| l)
 }
 
+/// Read a message on `conn` (inside a transaction).
+pub async fn load_in(conn: &mut PgConnection, account_id: Uuid, t: &Target) -> AppResult<Loaded> {
+    load_on(conn, account_id, t, false).await.map(|(l, _)| l)
+}
+
 /// Read a message on `conn`, locking its row when `lock` (inside a transaction). Also returns the
 /// campaign's status.
 async fn load_on(conn: &mut PgConnection, account_id: Uuid, t: &Target, lock: bool) -> AppResult<(Loaded, String)> {
