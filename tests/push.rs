@@ -1660,3 +1660,67 @@ async fn a_lost_install_secret_is_recovered_only_through_the_owners_grant() {
     assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "ios", &tok, json!({"install_secret": new})).await.0, StatusCode::OK);
     h.cleanup().await;
 }
+
+/// A device row as stored, whole enough to see that nothing about it changed.
+async fn snapshot(h: &Harness, address: &str) -> Option<Value> {
+    sqlx::query_scalar("SELECT to_jsonb(d) - 'last_seen_at' FROM push_devices d WHERE address = $1").bind(address).fetch_optional(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_refused_move_changes_nothing() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = mobile_setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    person(&mut h, &l, "ana@x.test", "Ana").await;
+    person(&mut h, &l, "bob@x.test", "Bob").await;
+
+    // Web: the old subscription proven, but the new endpoint is someone else's.
+    let mine = browser(&base, "mine");
+    enroll(&h, &a, &mine, "bob@x.test").await;
+    let theirs = browser(&base, "theirs");
+    enroll(&h, &a, &theirs, "ana@x.test").await;
+    let (m0, t0) = (snapshot(&h, &mine.endpoint).await, snapshot(&h, &theirs.endpoint).await);
+    let fake = Browser { endpoint: theirs.endpoint.clone(), ..browser(&base, "theirs") };
+    let (st, _) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": fake.endpoint, "keys": {"p256dh": fake.p256dh, "auth": fake.auth}}, "previous": {"endpoint": mine.endpoint, "auth": mine.auth}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!((snapshot(&h, &mine.endpoint).await, snapshot(&h, &theirs.endpoint).await), (m0.clone(), t0.clone()), "both exactly as they were");
+    // The old subscription not proven: nothing moves, nothing new is stored.
+    let next = browser(&base, "next");
+    let (st, _) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": next.endpoint, "keys": {"p256dh": next.p256dh, "auth": next.auth}}, "previous": {"endpoint": mine.endpoint, "auth": "x".repeat(22)}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!((snapshot(&h, &mine.endpoint).await, snapshot(&h, &next.endpoint).await), (m0, None));
+
+    // Apps: the old token proven, the new one someone else's; then a bad environment.
+    let old = "1".repeat(64);
+    let secret = app_call(&h, &a, "/client/push/devices", "ios", &old, json!({"identity": a.grant("email", "bob@x.test")})).await.1["install_secret"].as_str().unwrap().to_string();
+    let other = "2".repeat(64);
+    app_call(&h, &a, "/client/push/devices", "ios", &other, json!({"identity": a.grant("email", "ana@x.test")})).await;
+    let (o0, x0) = (snapshot(&h, &old).await, snapshot(&h, &other).await);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &other, json!({"previous_token": old, "install_secret": secret})).await.0, StatusCode::CONFLICT);
+    assert_eq!((snapshot(&h, &old).await, snapshot(&h, &other).await), (o0.clone(), x0), "both exactly as they were");
+    let new = "3".repeat(64);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &new, json!({"previous_token": old, "install_secret": secret, "environment": "staging"})).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!((snapshot(&h, &old).await, snapshot(&h, &new).await), (o0.clone(), None));
+    // A caps refusal too: at the account's cap a move still fits (the old one goes in the same step),
+    // a new device doesn't, and nothing changes.
+    dumbmail::features::push::client::caps::lower(a.id, count(&h, "SELECT count(*) FROM push_devices").await, 1_000);
+    assert_ne!(app_call(&h, &a, "/client/push/devices", "ios", &"4".repeat(64), json!({"identity": a.grant("email", "bob@x.test")})).await.0, StatusCode::OK);
+    assert_eq!(snapshot(&h, &old).await, o0);
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "ios", &new, json!({"previous_token": old, "install_secret": secret})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(snapshot(&h, &old).await, None);
+    assert_eq!(snapshot(&h, &new).await.unwrap()["install_secret_hash"], o0.unwrap()["install_secret_hash"], "the install keeps its secret");
+    h.cleanup().await;
+}
