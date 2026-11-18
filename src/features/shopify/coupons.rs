@@ -102,3 +102,27 @@ pub async fn list(db: &sqlx::PgPool, account_id: Uuid) -> sqlx::Result<Vec<Value
     .fetch_all(db)
     .await
 }
+
+/// Is this store-made code from the store (and install) connected now? A code made by a store that
+/// has since been disconnected, or by an earlier install of this one, isn't reused: the coupons
+/// module retires it ([`retire`]) and the hook makes a new one.
+pub async fn code_is_current(db: &sqlx::PgPool, coupon: &Coupon, code: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM shopify_discount_codes d JOIN shopify_shops s ON s.account_id = d.account_id
+            AND s.status = 'connected' AND s.shop_domain = d.shop_domain AND s.generation = d.generation
+          WHERE d.account_id = $1 AND upper(d.code) = upper($2))",
+    )
+    .bind(coupon.account_id)
+    .bind(code)
+    .fetch_one(db)
+    .await
+}
+
+/// Stop reusing a person's store-made code (it stays on record for redemptions and reports).
+pub async fn retire(db: &sqlx::PgPool, coupon_code_id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE coupon_codes SET send_key = 'retired:' || id || ':' || COALESCE(send_key, '') WHERE id = $1 AND assigned_via = 'store'")
+        .bind(coupon_code_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}

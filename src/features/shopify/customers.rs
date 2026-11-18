@@ -162,23 +162,10 @@ async fn by_id(db: &PgPool, account_id: Uuid, id: Uuid) -> sqlx::Result<Option<P
     sqlx::query_as("SELECT id, email, phone_number FROM profiles WHERE account_id = $1 AND id = $2").bind(account_id).bind(id).fetch_optional(db).await
 }
 
-/// Was this customer, order or the whole store erased by a privacy request?
-pub async fn erased(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, order_id: Option<i64>) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM shopify_erasures WHERE account_id = $1 AND shop_domain = $2 AND (
-            kind = 'shop' OR (kind = 'customer' AND shopify_id = $3) OR (kind = 'order' AND shopify_id = $4)))",
-    )
-    .bind(account_id)
-    .bind(shop)
-    .bind(customer_id)
-    .bind(order_id)
-    .fetch_one(db)
-    .await
-}
-
 /// Remember that this store's customer (0 for a guest order or checkout) touched this profile.
 pub async fn note_profile(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, profile_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO shopify_customer_profiles (account_id, shop_domain, customer_id, profile_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO shopify_customer_profiles (account_id, shop_domain, customer_id, profile_id, generation) VALUES ($1, $2, $3, $4, (SELECT generation FROM shopify_shops WHERE account_id = $1))
+         ON CONFLICT (account_id, shop_domain, customer_id, profile_id) DO UPDATE SET generation = EXCLUDED.generation")
         .bind(account_id)
         .bind(shop)
         .bind(customer_id.unwrap_or(0))
@@ -222,7 +209,7 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         .await;
         match r {
             Ok(p) => {
-                sqlx::query("INSERT INTO shopify_created_profiles (account_id, shop_domain, profile_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                sqlx::query("INSERT INTO shopify_created_profiles (account_id, shop_domain, profile_id, generation) VALUES ($1, $2, $3, (SELECT generation FROM shopify_shops WHERE account_id = $1)) ON CONFLICT DO NOTHING")
                     .bind(account_id)
                     .bind(shop)
                     .bind(p.id)
@@ -243,10 +230,17 @@ pub fn source_tag(shop: &str) -> String {
     format!("integration:shopify:{shop}")
 }
 
-/// Give a profile that has no email this address. Its email consent starts over (never subscribed):
-/// consent never comes from somewhere else. False if another profile has the address or this one got one.
-async fn attach_email(db: &PgPool, id: Uuid, email: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET email = $2, email_consent = 'never_subscribed', updated_at = now() WHERE id = $1 AND email IS NULL").bind(id).bind(email).execute(db).await;
+/// Give a profile that has no email this address, marked as the store's (`email_source`), so a
+/// service-message flow can reach a held person there. Its email consent starts over (never
+/// subscribed): consent never comes from somewhere else. False if another profile has the address or
+/// this one got one.
+async fn attach_email(db: &PgPool, shop: &str, id: Uuid, email: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE profiles SET email = $2, email_consent = 'never_subscribed', email_source = $3, updated_at = now() WHERE id = $1 AND email IS NULL")
+        .bind(id)
+        .bind(email)
+        .bind(source_tag(shop))
+        .execute(db)
+        .await;
     match r {
         Ok(r) => Ok(r.rows_affected() == 1),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
@@ -254,8 +248,13 @@ async fn attach_email(db: &PgPool, id: Uuid, email: &str) -> sqlx::Result<bool> 
     }
 }
 
-async fn attach_phone(db: &PgPool, id: Uuid, phone: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', updated_at = now() WHERE id = $1 AND phone_number IS NULL").bind(id).bind(phone).execute(db).await;
+async fn attach_phone(db: &PgPool, shop: &str, id: Uuid, phone: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', phone_source = $3, updated_at = now() WHERE id = $1 AND phone_number IS NULL")
+        .bind(id)
+        .bind(phone)
+        .bind(source_tag(shop))
+        .execute(db)
+        .await;
     match r {
         Ok(r) => Ok(r.rows_affected() == 1),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
@@ -266,7 +265,7 @@ async fn attach_phone(db: &PgPool, id: Uuid, phone: &str) -> sqlx::Result<bool> 
 /// Claim the right to apply Shopify's consent report for this address or number: only when it's
 /// newer than the last one applied (a report without a time only when nothing was applied yet).
 /// One conditional statement, so two workers can't both apply out of order.
-async fn newer_consent(db: &PgPool, account_id: Uuid, channel: &str, contact: &str, state: Option<&str>, at: Option<DateTime<Utc>>) -> sqlx::Result<bool> {
+async fn newer_consent(db: &mut sqlx::PgConnection, account_id: Uuid, channel: &str, contact: &str, state: Option<&str>, at: Option<DateTime<Utc>>) -> sqlx::Result<bool> {
     let won: Option<String> = sqlx::query_scalar(
         "INSERT INTO shopify_consent (account_id, channel, contact, state, consent_at) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (account_id, channel, contact) DO UPDATE SET state = EXCLUDED.state, consent_at = EXCLUDED.consent_at, applied_at = now()
@@ -285,7 +284,7 @@ async fn newer_consent(db: &PgPool, account_id: Uuid, channel: &str, contact: &s
 
 /// Apply Shopify's email state to the profile that has exactly this address. Conditional on the
 /// current row, so a DumbMail unsubscribe or a suppression written a moment ago still wins.
-async fn apply_email_state(db: &PgPool, id: Uuid, email: &str, state: Option<&str>) -> sqlx::Result<()> {
+async fn apply_email_state(db: &mut sqlx::PgConnection, id: Uuid, email: &str, state: Option<&str>) -> sqlx::Result<()> {
     let sql = match state {
         Some("SUBSCRIBED") => {
             "UPDATE profiles SET email_consent = 'subscribed', updated_at = now()
@@ -300,7 +299,7 @@ async fn apply_email_state(db: &PgPool, id: Uuid, email: &str, state: Option<&st
     Ok(())
 }
 
-async fn apply_sms_state(db: &PgPool, id: Uuid, phone: &str, state: Option<&str>) -> sqlx::Result<()> {
+async fn apply_sms_state(db: &mut sqlx::PgConnection, id: Uuid, phone: &str, state: Option<&str>) -> sqlx::Result<()> {
     let sql = match state {
         Some("SUBSCRIBED") => "UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND phone_number = $2 AND sms_consent IN ('never_subscribed', 'pending')",
         Some("UNSUBSCRIBED") => "UPDATE profiles SET sms_consent = 'unsubscribed', updated_at = now() WHERE id = $1 AND phone_number = $2 AND sms_consent <> 'unsubscribed'",
@@ -314,10 +313,16 @@ async fn apply_sms_state(db: &PgPool, id: Uuid, phone: &str, state: Option<&str>
 /// Save a Shopify customer: find or make the right profile, apply consent for its exact address and
 /// number, fill in details, and remember the link. Returns the profile it's linked to. A customer
 /// erased by a privacy request, or a snapshot older than the one already saved, changes nothing.
-pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> anyhow::Result<Option<Uuid>> {
-    if erased(db, account_id, shop, Some(c.id), None).await? {
-        return Ok(None);
-    }
+/// `history`: written by a history import (segment-triggered flows don't start for this person).
+pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, c: &Customer, history: bool) -> anyhow::Result<Option<Uuid>> {
+    // Written inside the fence: not into a newer install, and not after a privacy request erased it.
+    let Some(fence) = super::fence::open(db, account_id, shop, generation, Some(c.id), None).await? else { return Ok(None) };
+    let r = apply_inner(db, account_id, shop, c, history).await?;
+    fence.done().await?;
+    Ok(r)
+}
+
+async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, history: bool) -> anyhow::Result<Option<Uuid>> {
     let email = c.email.as_deref().and_then(normalize_email);
     let phone = c.phone.as_deref().and_then(normalize_phone);
     let saved: Option<(Option<Uuid>, Option<DateTime<Utc>>)> = sqlx::query_as("SELECT profile_id, shopify_updated_at FROM shopify_customers WHERE account_id = $1 AND customer_id = $2")
@@ -342,7 +347,7 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
         Some(e) => match by_email(db, account_id, e).await? {
             Some(p) => Some(p),
             None => match &linked {
-                Some(l) if l.email.is_none() && attach_email(db, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
+                Some(l) if l.email.is_none() && attach_email(db, shop, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
                 _ => create(db, account_id, shop, Some(e), None, first, last).await?,
             },
         },
@@ -350,7 +355,7 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
             Some(ph) => match by_phone(db, account_id, ph).await? {
                 Some(p) => Some(p),
                 None => match &linked {
-                    Some(l) if l.phone_number.is_none() && attach_phone(db, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
+                    Some(l) if l.phone_number.is_none() && attach_phone(db, shop, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
                     _ => create(db, account_id, shop, None, Some(ph), first, last).await?,
                 },
             },
@@ -358,25 +363,38 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
         },
     };
     let Some(main) = main else { return Ok(None) };
+    if history {
+        // Before anything about them changes: their segment entries from this are history.
+        super::events::touch_history(db, account_id, &[main.id]).await?;
+    }
     note_profile(db, account_id, shop, Some(c.id), main.id).await?;
     if let Some(e) = &email {
-        if newer_consent(db, account_id, "email", e, c.email_state.as_deref(), parse_time(c.email_updated_at.as_deref())).await? {
-            apply_email_state(db, main.id, e, c.email_state.as_deref()).await?;
+        // The consent time and the profile's consent commit together: a crash between them can't
+        // leave the time recorded and the change (an unsubscribe, say) unapplied.
+        let mut tx = db.begin().await?;
+        if newer_consent(&mut tx, account_id, "email", e, c.email_state.as_deref(), parse_time(c.email_updated_at.as_deref())).await? {
+            apply_email_state(&mut tx, main.id, e, c.email_state.as_deref()).await?;
         }
+        tx.commit().await?;
     }
     // SMS consent goes to whoever has that number: the profile that has it, else this profile if it
     // has none, else a profile of its own (a changed number is never left unlinked).
     if let Some(ph) = &phone {
         let sms_owner = match by_phone(db, account_id, ph).await? {
             Some(p) => Some(p.id),
-            None if main.phone_number.is_none() && attach_phone(db, main.id, ph).await? => Some(main.id),
+            None if main.phone_number.is_none() && attach_phone(db, shop, main.id, ph).await? => Some(main.id),
             None => create(db, account_id, shop, None, Some(ph), first, last).await?.map(|p| p.id),
         };
         if let Some(owner) = sms_owner {
-            note_profile(db, account_id, shop, Some(c.id), owner).await?;
-            if newer_consent(db, account_id, "sms", ph, c.sms_state.as_deref(), parse_time(c.sms_updated_at.as_deref())).await? {
-                apply_sms_state(db, owner, ph, c.sms_state.as_deref()).await?;
+            if history {
+                super::events::touch_history(db, account_id, &[owner]).await?;
             }
+            note_profile(db, account_id, shop, Some(c.id), owner).await?;
+            let mut tx = db.begin().await?;
+            if newer_consent(&mut tx, account_id, "sms", ph, c.sms_state.as_deref(), parse_time(c.sms_updated_at.as_deref())).await? {
+                apply_sms_state(&mut tx, owner, ph, c.sms_state.as_deref()).await?;
+            }
+            tx.commit().await?;
         }
     }
     let mut props = Map::new();
@@ -415,10 +433,16 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
     .await?;
     // The link, unless a newer snapshot got there first (checked in the same statement).
     sqlx::query(
-        "INSERT INTO shopify_customers (account_id, customer_id, profile_id, email, phone, email_state, sms_state, shop_domain, shopify_updated_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-         ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id, email = EXCLUDED.email, phone = EXCLUDED.phone,
-            email_state = EXCLUDED.email_state, sms_state = EXCLUDED.sms_state, shop_domain = EXCLUDED.shop_domain,
+        "INSERT INTO shopify_customers (account_id, customer_id, profile_id, email, phone, email_state, sms_state, shop_domain, shopify_updated_at, updated_at, generation)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), (SELECT generation FROM shopify_shops WHERE account_id = $1))
+         ON CONFLICT (account_id, customer_id) DO UPDATE SET generation = EXCLUDED.generation,
+            -- An order moved the link after this snapshot was taken: the link (and its contact) stay.
+            profile_id = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.profile_id ELSE shopify_customers.profile_id END,
+            email = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.email ELSE shopify_customers.email END,
+            phone = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.phone ELSE shopify_customers.phone END,
+            email_state = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.email_state ELSE shopify_customers.email_state END,
+            sms_state = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.sms_state ELSE shopify_customers.sms_state END,
+            shop_domain = EXCLUDED.shop_domain,
             shopify_updated_at = COALESCE(EXCLUDED.shopify_updated_at, shopify_customers.shopify_updated_at), deleted_at = NULL,
             email_wb_attempts = CASE WHEN shopify_customers.email IS DISTINCT FROM EXCLUDED.email THEN 0 ELSE shopify_customers.email_wb_attempts END,
             sms_wb_attempts = CASE WHEN shopify_customers.phone IS DISTINCT FROM EXCLUDED.phone THEN 0 ELSE shopify_customers.sms_wb_attempts END,
@@ -454,7 +478,7 @@ pub struct Buyer {
 /// consent or an existing profile's identity. A customer seen for the first time is queued to be read
 /// in full (that's where their consent comes from).
 #[allow(clippy::too_many_arguments)]
-pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, email: Option<&str>, phone: Option<&str>, first: Option<&str>, last: Option<&str>) -> anyhow::Result<Option<Buyer>> {
+pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, email: Option<&str>, phone: Option<&str>, first: Option<&str>, last: Option<&str>, at: Option<DateTime<Utc>>) -> anyhow::Result<Option<Buyer>> {
     let email = email.and_then(normalize_email);
     let phone = phone.and_then(normalize_phone);
     let found = match (&email, &phone) {
@@ -476,9 +500,15 @@ pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id:
     let Some(p) = found else { return Ok(None) };
     note_profile(db, account_id, shop, customer_id, p.id).await?;
     if let Some(cid) = customer_id {
+        // Moving the link also moves its contact to this event's, and records when (`linked_at`,
+        // the event's own time): a customer snapshot no newer than the event (a bulk import running
+        // alongside) can't move it back. The snapshot time (`shopify_updated_at`) isn't touched, so
+        // the customer's own later updates (and their consent) still apply.
         let new: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id, updated_at = now()
+            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain, email, phone, linked_at, generation) VALUES ($1, $2, $3, $4, $5, $6, $7, (SELECT generation FROM shopify_shops WHERE account_id = $1))
+             ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id, generation = EXCLUDED.generation,
+                email = COALESCE(EXCLUDED.email, shopify_customers.email), phone = COALESCE(EXCLUDED.phone, shopify_customers.phone),
+                linked_at = GREATEST(shopify_customers.linked_at, EXCLUDED.linked_at), updated_at = now()
                 WHERE shopify_customers.profile_id IS DISTINCT FROM EXCLUDED.profile_id
              RETURNING (xmax = 0)::int::bigint",
         )
@@ -486,6 +516,9 @@ pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id:
         .bind(cid)
         .bind(p.id)
         .bind(shop)
+        .bind(&email)
+        .bind(&phone)
+        .bind(at)
         .fetch_optional(db)
         .await?;
         if new == Some(1) {
@@ -503,7 +536,7 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
     // Ids Shopify doesn't return (null) were deleted: nothing to read.
     for n in data["nodes"].as_array().into_iter().flatten() {
         if let Some(c) = Customer::from_graphql(n) {
-            apply(&state.db, shop.account_id, &shop.shop_domain, &c).await.map_err(|_| ApiError::Network("database"))?;
+            apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c, false).await.map_err(|_| ApiError::Network("database"))?;
         }
     }
     Ok(())
@@ -583,7 +616,8 @@ pub async fn write_back(state: &AppState, shop: &ShopRow, max: i64, deadline: st
                         .map_err(db_err)?
                         .flatten();
                     if let Some(contact) = contact {
-                        newer_consent(&state.db, shop.account_id, channel, &contact, Some("UNSUBSCRIBED"), Some(now)).await.map_err(db_err)?;
+                        let mut c = state.db.acquire().await.map_err(db_err)?;
+                        newer_consent(&mut c, shop.account_id, channel, &contact, Some("UNSUBSCRIBED"), Some(now)).await.map_err(db_err)?;
                     }
                     n += 1;
                 }

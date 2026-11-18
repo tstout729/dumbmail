@@ -157,6 +157,14 @@ pub struct SaveMode {
 
 /// Save products into the catalog, recording which store each came from. Returns how many were saved.
 pub async fn save(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode) -> anyhow::Result<u64> {
+    // Inside the fence: not into a newer install, and nothing for a store a privacy request erased.
+    let Some(fence) = super::fence::open(db, shop.account_id, &shop.shop_domain, shop.generation, None, None).await? else { return Ok(0) };
+    let n = save_inner(db, shop, nodes, mode).await?;
+    fence.done().await?;
+    Ok(n)
+}
+
+async fn save_inner(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode) -> anyhow::Result<u64> {
     let quiet = mode.quiet || shop.catalog_loaded_at.is_none();
     let mut keep: Vec<&Node> = Vec::new();
     for n in nodes {
@@ -180,8 +188,8 @@ pub async fn save(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode) -
             }
         }
         sqlx::query(
-            "INSERT INTO shopify_products (account_id, product_id, shop_domain, shopify_updated_at, seen_by, deleted_at, touched_at) VALUES ($1, $2, $3, $4, $5, NULL, now())
-             ON CONFLICT (account_id, product_id) DO UPDATE SET shop_domain = EXCLUDED.shop_domain, shopify_updated_at = COALESCE(EXCLUDED.shopify_updated_at, shopify_products.shopify_updated_at),
+            "INSERT INTO shopify_products (account_id, product_id, shop_domain, shopify_updated_at, seen_by, deleted_at, touched_at, generation) VALUES ($1, $2, $3, $4, $5, NULL, now(), (SELECT generation FROM shopify_shops WHERE account_id = $1))
+             ON CONFLICT (account_id, product_id) DO UPDATE SET shop_domain = EXCLUDED.shop_domain, generation = EXCLUDED.generation, shopify_updated_at = COALESCE(EXCLUDED.shopify_updated_at, shopify_products.shopify_updated_at),
                 seen_by = COALESCE(EXCLUDED.seen_by, shopify_products.seen_by), deleted_at = NULL, touched_at = now()",
         )
         .bind(shop.account_id)
@@ -210,6 +218,13 @@ pub async fn save(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode) -
 /// A full scan of the store's products finished: products of this store it didn't see, and that
 /// nothing touched since the scan started, are gone from Shopify. Unpublish them. Returns how many.
 pub async fn finish_scan(db: &PgPool, shop: &ShopRow, scan: Uuid, started: chrono::DateTime<chrono::Utc>) -> sqlx::Result<u64> {
+    let Some(fence) = super::fence::open(db, shop.account_id, &shop.shop_domain, shop.generation, None, None).await? else { return Ok(0) };
+    let n = finish_scan_inner(db, shop, scan, started).await?;
+    fence.done().await?;
+    Ok(n)
+}
+
+async fn finish_scan_inner(db: &PgPool, shop: &ShopRow, scan: Uuid, started: chrono::DateTime<chrono::Utc>) -> sqlx::Result<u64> {
     let gone: Vec<i64> = sqlx::query_scalar(
         "UPDATE shopify_products SET deleted_at = now() WHERE account_id = $1 AND shop_domain = $2 AND deleted_at IS NULL
            AND seen_by IS DISTINCT FROM $3 AND touched_at < $4 RETURNING product_id",
@@ -270,9 +285,15 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
         });
     }
     save(&state.db, shop, &nodes, SaveMode::default()).await.map_err(|_| ApiError::Network("database"))?;
-    for id in ids.iter().filter(|i| !found.contains(i)) {
-        mark_deleted(&state.db, shop, *id).await.map_err(|_| ApiError::Network("database"))?;
+    let gone: Vec<i64> = ids.iter().filter(|i| !found.contains(i)).copied().collect();
+    if gone.is_empty() {
+        return Ok(());
     }
+    let Some(fence) = super::fence::open(&state.db, shop.account_id, &shop.shop_domain, shop.generation, None, None).await.map_err(|_| ApiError::Network("database"))? else { return Ok(()) };
+    for id in gone {
+        mark_deleted(&state.db, shop, id).await.map_err(|_| ApiError::Network("database"))?;
+    }
+    fence.done().await.map_err(|_| ApiError::Network("database"))?;
     Ok(())
 }
 
@@ -280,8 +301,8 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
 /// older snapshot never brings it back, and unpublished.
 pub async fn mark_deleted(db: &PgPool, shop: &ShopRow, product_id: i64) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO shopify_products (account_id, product_id, shop_domain, deleted_at) VALUES ($1, $2, $3, now())
-         ON CONFLICT (account_id, product_id) DO UPDATE SET deleted_at = now(), touched_at = now()",
+        "INSERT INTO shopify_products (account_id, product_id, shop_domain, deleted_at, generation) VALUES ($1, $2, $3, now(), (SELECT generation FROM shopify_shops WHERE account_id = $1))
+         ON CONFLICT (account_id, product_id) DO UPDATE SET deleted_at = now(), touched_at = now(), generation = EXCLUDED.generation",
     )
     .bind(shop.account_id)
     .bind(product_id)
