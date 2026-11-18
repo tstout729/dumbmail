@@ -91,7 +91,7 @@ pub fn parse_ab_test(channel: &str, v: &Value) -> AppResult<AbTest> {
     }
     match (t.metric.as_str(), channel) {
         ("open_rate", "email") | ("click_rate", _) | ("revenue", _) => {}
-        ("open_rate", _) => return Err(AppError::bad("SMS has no opens; pick the winner by click_rate or revenue")),
+        ("open_rate", _) => return Err(AppError::bad("only email has opens; pick the winner by click_rate or revenue")),
         _ => return Err(AppError::bad("metric must be open_rate, click_rate or revenue")),
     }
     if !matches!(t.pick.as_str(), "auto" | "manual") {
@@ -162,12 +162,52 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
 }
 
 pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
-    if channel == "sms" {
+    if channel == "push" {
+        qb.push(" AND ").push(crate::features::push::send::REACHABLE_SQL);
+    } else if channel == "sms" {
         qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }
     crate::marketing_hold::push_campaign_filter(qb, channel);
+}
+
+/// [`push_eligible`], counting for a push campaign only devices on the platforms it targets.
+fn push_eligible_targeted(qb: &mut QueryBuilder<'_, Postgres>, channel: &str, push_platforms: Option<&[String]>) {
+    match (channel, push_platforms) {
+        ("push", Some(p)) => {
+            qb.push(" AND ");
+            crate::features::push::send::push_reachable(qb, Some(p));
+            crate::marketing_hold::push_campaign_filter(qb, channel);
+        }
+        _ => push_eligible(qb, channel),
+    }
+}
+
+/// The platforms a push campaign targets across its versions (None for other channels, or all).
+pub fn push_platforms(channel: &str, content: &Value, ab_test: Option<&Value>) -> Option<Vec<String>> {
+    if channel != "push" {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let versions = std::iter::once(content).chain(ab_test.and_then(|t| t.get("variants")).and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.get("content")));
+    for c in versions {
+        let p = crate::features::push::content::parse(c).map(|c| c.platforms()).unwrap_or_default();
+        for k in p {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// [`estimate`] for a push campaign's targeted platforms.
+pub async fn estimate_targeted(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience, push_platforms: Option<Vec<String>>) -> AppResult<i64> {
+    let mut qb = QueryBuilder::new("SELECT count(*)");
+    let r = resolve_audience(db, account_id, channel, audience).await?.with_push_platforms(push_platforms);
+    push_audience(&mut qb, account_id, channel, &r);
+    Ok(qb.build_query_scalar().fetch_one(db).await?)
 }
 
 pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<i64> {
@@ -189,6 +229,15 @@ pub struct ResolvedAudience {
     include: Vec<Resolved>,
     exclude: Vec<Resolved>,
     sunset: bool,
+    /// A push campaign's targeted platforms (see [`push_platforms`]); None counts every platform.
+    push_platforms: Option<Vec<String>>,
+}
+
+impl ResolvedAudience {
+    pub fn with_push_platforms(mut self, p: Option<Vec<String>>) -> Self {
+        self.push_platforms = p;
+        self
+    }
 }
 
 pub async fn resolve_audience(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<ResolvedAudience> {
@@ -199,7 +248,7 @@ pub async fn resolve_audience(db: &PgPool, account_id: Uuid, channel: &str, audi
     let exclude = resolve(db, account_id, &audience.exclude).await?;
     let sunset = channel == "email"
         && sqlx::query_scalar::<_, bool>("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
-    Ok(ResolvedAudience { include, exclude, sunset })
+    Ok(ResolvedAudience { include, exclude, sunset, push_platforms: None })
 }
 
 /// Appends `FROM profiles p WHERE ...` for a resolved audience (see [`append_audience`]).
@@ -210,7 +259,7 @@ pub fn push_audience(qb: &mut QueryBuilder<'_, Postgres>, account_id: Uuid, chan
         qb.push(" AND NOT ");
         push_any(qb, &r.exclude);
     }
-    push_eligible(qb, channel);
+    push_eligible_targeted(qb, channel, r.push_platforms.as_deref());
     if r.sunset {
         crate::deliverability::push_not_unengaged(qb);
     }
@@ -265,6 +314,8 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         if account.address.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
         }
+    } else if c.channel == "push" {
+        // Push setup is checked when it launches (`features::push::setup_problems`).
     } else if account.sms_from.is_none() {
         problems.push("Set an SMS sending number in Settings → SMS".into());
     }
@@ -293,6 +344,8 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
                 problems.push(e);
             }
         }
+    } else if channel == "push" {
+        problems.extend(crate::features::push::content::problems(content));
     } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
         problems.push("Write the SMS message".into());
     }
@@ -306,13 +359,14 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
     // Look up the audience's lists and segments first: everything below runs on the one connection
     // that holds the campaign lock, so busy workers can't each hold a lock while waiting for another.
-    // With whether it's a resend and whether link tags need working out (see `features::campaigns_plus`).
-    let pre: Option<(Value, String, Uuid, String, bool, bool)> =
-        sqlx::query_as(&format!("SELECT audience, status, account_id, channel, {} FROM campaigns c WHERE id = $1", crate::features::campaigns_plus::PREPARE_COLUMNS))
+    // With whether it's a resend and whether link tags need working out (see `features::campaigns_plus`),
+    // and (push) the content's targeted platforms.
+    let pre: Option<(Value, String, Uuid, String, bool, bool, Value, Option<Value>)> =
+        sqlx::query_as(&format!("SELECT audience, status, account_id, channel, {}, content, ab_test FROM campaigns c WHERE id = $1", crate::features::campaigns_plus::PREPARE_COLUMNS))
             .bind(campaign_id)
             .fetch_optional(&state.db)
             .await?;
-    let Some((pre_audience, pre_status, account_id, channel, is_resend, link_tags)) = pre else { return Ok(()) };
+    let Some((pre_audience, pre_status, account_id, channel, is_resend, link_tags, pre_content, pre_ab)) = pre else { return Ok(()) };
     if pre_status != "sending" {
         return Ok(());
     }
@@ -320,7 +374,7 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     // A resend always goes to its own audience, whatever the editable one says.
     let audience = crate::features::campaigns_plus::resend::send_audience(campaign_id, is_resend, audience);
     // Only needed when this run adds recipients; a retry of a fixed audience mustn't fail on a list deleted since.
-    let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await;
+    let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await.map(|r| r.with_push_platforms(push_platforms(&channel, &pre_content, pre_ab.as_ref())));
 
     // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
     let mut tx = state.db.begin().await?;
@@ -364,7 +418,7 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             return Ok(());
         }
     }
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let addr = recipient_column(&c.channel);
     let ab = ab_test(&c);
     let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
     // Set once everyone who gets the campaign has a row (or a holdout row): a retried send job then adds
@@ -444,20 +498,30 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
 /// Runs entirely on `tx`: the audience is resolved beforehand (and only used, so only has to have
 /// resolved, when there are no holdouts).
 async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, resolved: AppResult<ResolvedAudience>) -> AppResult<()> {
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let addr = recipient_column(&c.channel);
     let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
     qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
     let holdouts: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL AND ab_test IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut **tx).await?;
     if holdouts {
         qb.push(" FROM profiles p JOIN campaign_holdouts h ON h.profile_id = p.id AND h.campaign_id = ").push_bind(c.id);
         qb.push(" WHERE p.account_id = ").push_bind(c.account_id);
-        push_eligible(&mut qb, &c.channel);
+        push_eligible_targeted(&mut qb, &c.channel, push_platforms(&c.channel, &c.content, c.ab_test.as_ref()).as_deref());
     } else {
         push_audience(&mut qb, c.account_id, &c.channel, &resolved?);
     }
     qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
     qb.build().execute(&mut **tx).await?;
     Ok(())
+}
+
+/// What a campaign's queued message rows record as the recipient's address.
+fn recipient_column(channel: &str) -> &'static str {
+    match channel {
+        "sms" => "p.phone_number",
+        // Push goes to the person's devices, fixed when each message is claimed.
+        "push" => "'push'",
+        _ => "p.email",
+    }
 }
 
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
@@ -559,8 +623,8 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         )
         .await;
         match outcome {
-            // A text outside its recipient's hours waits alone; everyone else in the batch goes on.
-            Ok(Outcome::Deferred(until)) if c.channel == "sms" => {
+            // A text or push outside its recipient's hours waits alone; everyone else in the batch goes on.
+            Ok(Outcome::Deferred(until)) if c.channel != "email" => {
                 if requeue_claimed(&state.db, c.id, *mid, &c.channel, Some(until)).await? {
                     held.entry(until).or_default().push(*mid);
                 }
@@ -614,7 +678,7 @@ pub async fn claim(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &s
         "UPDATE messages m SET status = 'sending', claimed_at = now()
          WHERE m.id = $1 AND m.status = 'queued' AND (m.send_after IS NULL OR m.send_after <= $2)
            AND EXISTS (SELECT 1 FROM campaigns c JOIN accounts a ON a.id = c.account_id
-                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 = 'sms' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
+                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 <> 'email' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
          RETURNING m.profile_id, m.variant",
     )
     .bind(message_id)
@@ -758,7 +822,7 @@ pub async fn pick_winner(state: &AppState, c: &CampaignRow, chosen: Option<&str>
     };
     // Looked up before the transaction, which then holds the campaign row on one connection only.
     let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
-    let resolved = resolve_audience(&state.db, c.account_id, &c.channel, &audience).await;
+    let resolved = resolve_audience(&state.db, c.account_id, &c.channel, &audience).await.map(|r| r.with_push_platforms(push_platforms(&c.channel, &c.content, c.ab_test.as_ref())));
     // One transaction: record the winner, queue everyone else and the send job, so a crash can't leave
     // a campaign 'sending' with nothing queued, and no batch can mark it sent before the rest are queued.
     let mut tx = state.db.begin().await?;
@@ -867,6 +931,9 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
     let content = &crate::features::campaigns_plus::utm::for_test(account, c, version, content, link_override.as_ref(), link_defaults.as_ref());
     if recent + to.len() as i64 > 50 {
         return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
+    }
+    if c.channel == "push" {
+        return crate::features::push::campaign_test(state, account, c, content, to, create_profiles).await;
     }
     let mut sent = 0;
     for raw in to {
