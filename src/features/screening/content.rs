@@ -533,8 +533,20 @@ pub async fn before_saved_block_edit(state: &AppState, account_id: Uuid, id: Uui
     let results = tokio::time::timeout(DEADLINE + Duration::from_secs(5), checks)
         .await
         .map_err(|_| AppError::Busy("Checking the live flows that use this block took too long. Try saving again in a minute.".into()))?;
+    // Every result takes effect (a block's standing change first); the most severe one is answered.
+    let mut done: Vec<(&Material, Checked)> = Vec::new();
     for (m, r) in materials.iter().zip(results) {
-        apply(state, account_id, m, &r?).await?;
+        done.push((m, r?));
+    }
+    done.sort_by(|a, b| b.1.verdict.cmp(&a.1.verdict));
+    let mut first = None;
+    for (m, r) in &done {
+        if let Err(e) = apply(state, account_id, m, r).await {
+            first.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first {
+        return Err(e);
     }
     Ok(())
 }

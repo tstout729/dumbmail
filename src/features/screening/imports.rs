@@ -36,7 +36,8 @@ fn email_column(h: &str) -> bool {
     matches!(k.as_str(), "email" | "emailaddress" | "email1" | "mail")
 }
 
-/// Headers and statistics, in one pass over the file, without keeping any address.
+/// Headers (in full, for the rules), statistics and the domains to look up, in one pass over the
+/// file, without keeping any address.
 pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).trim(csv::Trim::All).from_reader(csv_text.as_bytes());
     // The full names pick the email columns, as the import does; only the copy kept is shortened.
@@ -44,10 +45,9 @@ pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
         Ok(h) => h.iter().map(|h| h.trim_start_matches('\u{feff}').to_string()).collect(),
         Err(_) => return (Vec::new(), ImportStats::default(), Vec::new()),
     };
-    let headers: Vec<String> = full.iter().take(200).map(|h| h.chars().take(80).collect()).collect();
     // The same column the import reads: of the email columns, the last one filled in on each row.
     let cols: Vec<usize> = full.iter().enumerate().filter(|(_, h)| email_column(h)).map(|(i, _)| i).collect();
-    let mut s = ImportStats { consent_columns: headers.iter().filter(|h| consent_column(h)).take(10).cloned().collect(), ..Default::default() };
+    let mut s = ImportStats { consent_columns: full.iter().filter(|h| consent_column(h)).take(10).map(|h| h.chars().take(80).collect()).collect(), ..Default::default() };
     let mut domains: HashMap<String, u64> = HashMap::new();
     for rec in rdr.records() {
         let Ok(rec) = rec else { continue };
@@ -91,7 +91,7 @@ pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
         .map(|(d, n)| format!("{n}\t{d}"))
         .collect();
     s.mx_checked = by_count.iter().filter(|(d, _)| rules::is_consumer(d)).map(|(_, n)| n).sum();
-    (headers, s, picked)
+    (full, s, picked)
 }
 
 /// Look up mail servers for the picked domains (`count\tdomain`), within a deadline, and add them
@@ -119,7 +119,9 @@ pub async fn check_import(state: &AppState, account_id: Uuid, csv_text: &str, fi
     let file_name = file_name.map(|f| crate::deliverability::plain(f, 200)).filter(|f| !f.is_empty());
     let (headers, mut s, picked) = stats(csv_text);
     add_mail_servers(state, &mut s, &picked).await;
+    // The rules read every column name in full; what's stored and sent is shortened.
     let (rules_verdict, mut reasons) = rules::judge_import(file_name.as_deref(), &headers, &s);
+    let headers: Vec<String> = headers.iter().take(200).map(|h| h.chars().take(80).collect()).collect();
     let mut signals = json!({"file_name": file_name, "headers": headers, "stats": s, "rules": rules_verdict.as_str()});
     let mut judged = None;
     let verdict = if rules_verdict == Verdict::Block {
