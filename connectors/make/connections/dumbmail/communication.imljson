@@ -1,0 +1,20 @@
+{
+	"url": "{{ifempty(parameters.baseUrl, 'https://dumbmail.ai')}}/api/hooks/me",
+	"method": "GET",
+	"headers": {
+		"Authorization": "Bearer {{parameters.apiKey}}"
+	},
+	"response": {
+		"valid": "{{statusCode === 200}}",
+		"error": {
+			"message": "[{{statusCode}}] {{body.error.message}}"
+		},
+		"metadata": {
+			"type": "text",
+			"value": "{{body.account.name}}"
+		}
+	},
+	"log": {
+		"sanitize": ["request.headers.authorization"]
+	}
+}

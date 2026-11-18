@@ -1277,15 +1277,26 @@ pub async fn profile_matches(db: &sqlx::PgPool, profile_id: Uuid, def: &Definiti
 
 /// Recompute materialized membership. Returns profile ids that newly entered.
 pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def: &Definition) -> AppResult<Vec<Uuid>> {
+    // Webhooks want who left (and whether this is the first refresh); with nothing watching, the
+    // refresh runs exactly as it would without them.
+    let watched = crate::features::webhooks::wants_segment_changes(db, account_id);
     let mut tx = db.begin().await?;
+    let first_refresh: bool = if watched {
+        sqlx::query_scalar("SELECT refreshed_at IS NULL FROM segments WHERE id = $1").bind(segment_id).fetch_optional(&mut *tx).await?.unwrap_or(true)
+    } else {
+        true
+    };
     let mut qb = QueryBuilder::new("CREATE TEMP TABLE seg_now ON COMMIT DROP AS SELECT p.id FROM profiles p WHERE p.account_id = ");
     qb.push_bind(account_id).push(" AND ");
     push_definition(&mut qb, def);
     qb.build().execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id)")
-        .bind(segment_id)
-        .execute(&mut *tx)
-        .await?;
+    const LEAVE: &str = "DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id)";
+    let left: Vec<Uuid> = if watched {
+        sqlx::query_scalar(&format!("{LEAVE} RETURNING profile_id")).bind(segment_id).fetch_all(&mut *tx).await?
+    } else {
+        sqlx::query(LEAVE).bind(segment_id).execute(&mut *tx).await?;
+        Vec::new()
+    };
     let entered: Vec<Uuid> = sqlx::query_scalar("INSERT INTO segment_members (segment_id, profile_id) SELECT $1, id FROM seg_now ON CONFLICT DO NOTHING RETURNING profile_id")
         .bind(segment_id)
         .fetch_all(&mut *tx)
@@ -1294,6 +1305,11 @@ pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def:
         .bind(segment_id)
         .execute(&mut *tx)
         .await?;
+    // The first refresh only records who is already in the segment. Webhook events are written in
+    // this transaction, so they go out exactly when the change does (a failure can't spoil it).
+    if watched && !first_refresh {
+        crate::features::webhooks::segment_changed_in(&mut tx, db, account_id, segment_id, &entered, &left).await;
+    }
     tx.commit().await?;
     Ok(entered)
 }

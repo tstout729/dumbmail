@@ -212,11 +212,12 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                             sqlx::query("UPDATE messages SET send_note = $2 WHERE id = $1").bind(mid).bind(&hours.note).execute(&state.db).await?;
                         }
                         None => {
+                            let mid = Uuid::now_v7();
                             sqlx::query(
                                 "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error, send_note)
                                  VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, 'skipped', $8, $9)",
                             )
-                            .bind(Uuid::now_v7())
+                            .bind(mid)
                             .bind(spec.account.id)
                             .bind(p.id)
                             .bind(spec.campaign_id)
@@ -227,6 +228,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                             .bind(&hours.note)
                             .execute(&state.db)
                             .await?;
+                            crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
                         }
                     }
                     return Ok(Outcome::Skipped(why));
@@ -259,13 +261,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         match spec.message_id {
             Some(mid) => {
                 sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE id = $1").bind(mid).execute(&state.db).await?;
+                crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
             }
             None => {
+                let mid = Uuid::now_v7();
                 sqlx::query(
                     "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error)
                      VALUES ($1, $2, $3, 'email', $4, $5, $6, $7, 'skipped', 'sending paused')",
                 )
-                .bind(Uuid::now_v7())
+                .bind(mid)
                 .bind(spec.account.id)
                 .bind(p.id)
                 .bind(spec.campaign_id)
@@ -274,6 +278,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 .bind(&to)
                 .execute(&state.db)
                 .await?;
+                crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
             }
         }
         return Ok(Outcome::Skipped("sending paused"));
@@ -363,6 +368,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     if price > 0 && crate::billing::balance(&state.db, spec.account.id).await? < price {
         if let Some(mid) = spec.message_id {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'insufficient credit' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
         }
         if spec.is_test {
             return Err(AppError::LimitReached("your balance is empty; add credit in Settings → Billing".into()));
@@ -444,6 +450,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                         .bind(note)
                         .execute(&state.db)
                         .await?;
+                    crate::features::messages_unsent(&state.db, spec.account.id, &[message_id]).await;
                 }
                 Ok(Outcome::Skipped(why))
             }
@@ -532,6 +539,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 .bind(&msg)
                 .execute(&state.db)
                 .await?;
+            if !spec.is_test {
+                crate::features::messages_unsent(&state.db, spec.account.id, &[message_id]).await;
+            }
             Ok(Outcome::Failed(msg))
         }
     }
@@ -645,12 +655,16 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
     };
     match &stop {
         Some(Stop::Skip(why, note)) => {
-            sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1 AND status IN ('queued', 'sending')")
+            let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1 AND status IN ('queued', 'sending')")
                 .bind(message_id)
                 .bind(why)
                 .bind(note)
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
+            if n > 0 && !spec.is_test {
+                crate::features::messages_unsent_in(&mut tx, &state.db, account.id, &[message_id]).await;
+            }
         }
         Some(Stop::Defer(_)) => {}
         None => {

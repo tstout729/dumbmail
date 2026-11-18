@@ -217,8 +217,17 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_public(IpAddr::V4(v4));
             }
-            let seg = v6.segments();
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80)
+            let (seg, o) = (v6.segments(), v6.octets());
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses carry an IPv4 address: judge that one.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])));
+            }
+            if seg[0] == 0x2002 {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5])));
+            }
+            // Otherwise only global unicast (2000::/3), minus Teredo tunnels and the documentation range.
+            // That leaves out loopback, IPv4-compatible, unique-local, link-local, site-local and multicast.
+            (seg[0] & 0xe000) == 0x2000 && !(seg[0] == 0x2001 && (seg[1] == 0 || seg[1] == 0x0db8))
         }
     }
 }
@@ -236,7 +245,9 @@ pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::Socket
         .await
         .map_err(|_| AppError::bad(format!("webhook host {host:?} doesn't resolve")))?
         .collect();
-    if addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip())) {
+    // Development and tests may allow localhost (WEBHOOKS_ALLOW_LOCALHOST); never private networks.
+    let local_ok = crate::features::webhooks::net::localhost_allowed() && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback());
+    if !local_ok && (addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip()))) {
         return Err(AppError::bad("webhook url must point to a public internet address"));
     }
     Ok((host, addrs[0]))
@@ -260,8 +271,12 @@ pub struct Fetched {
 pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     let mut url = raw.to_string();
     for _ in 0..5 {
-        let (host, addr) = check_webhook_url(&url).await.map_err(|_| AppError::bad("enter a public website address"))?;
+        let (host, addr) = tokio::time::timeout(std::time::Duration::from_secs(5), check_webhook_url(&url))
+            .await
+            .map_err(|_| AppError::bad("that address didn't resolve in time"))?
+            .map_err(|_| AppError::bad("enter a public website address"))?;
         let client = reqwest::Client::builder()
+            .no_proxy()
             .resolve(&host, addr)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
@@ -297,17 +312,30 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     Err(AppError::bad("that page redirects too many times"))
 }
 
-async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
-    let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let client = reqwest::Client::builder()
-        .resolve(&host, addr)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("dumbmail-webhook/0.1")
-        .build()?;
-    let req = if get { client.get(url) } else { client.post(url).json(payload) };
-    req.send().await?.error_for_status()?;
-    Ok(())
+/// Signed with the account's flow webhook secret (see docs/WEBHOOKS.md); a GET signs an empty body.
+/// One 10-second deadline covers resolving and checking the address, reading the signing secret
+/// (only once the address passed) and the request; no proxy is used, so the connection goes to the
+/// address that was checked.
+async fn call_webhook(state: &AppState, account_id: Uuid, url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
+    let body = if get { Vec::new() } else { serde_json::to_vec(payload)? };
+    let send = async {
+        let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let headers = crate::features::webhooks::flow_signature_headers(state, account_id, &body).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(&host, addr)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("dumbmail-webhook/0.1")
+            .build()?;
+        let mut req = if get { client.get(url) } else { client.post(url).header("content-type", "application/json").body(body.clone()) };
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req.send().await?.error_for_status()?;
+        anyhow::Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), send).await.map_err(|_| anyhow::anyhow!("no response within 10 seconds"))?
 }
 
 async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
@@ -698,7 +726,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     if node.kind == "add_to_list" {
                         crate::audience::add_to_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     } else {
-                        sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = $2").bind(list_id).bind(run.profile_id).execute(&state.db).await?;
+                        crate::audience::remove_from_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     }
                 }
             }
@@ -708,7 +736,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     "flow": {"id": flow.id, "name": flow.name}, "node_id": node_id,
                     "profile": person, "event": context.get("event"), "body": node.data.get("body"),
                 });
-                if let Err(e) = call_webhook(&url, node.str("method") == Some("GET"), &payload).await {
+                if let Err(e) = call_webhook(state, flow.account_id, &url, node.str("method") == Some("GET"), &payload).await {
                     tracing::warn!(run = %run.id, url = %url, error = %e, "flow webhook failed");
                 }
             }
@@ -966,6 +994,18 @@ pub async fn from_blueprint(db: &PgPool, account_id: Uuid, key: &str, name: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_public_addresses() {
+        let public = |s: &str| super::ip_is_public(s.parse().unwrap());
+        for ok in ["8.8.8.8", "2606:4700:4700::1111", "2002:808:808::1", "64:ff9b::808:808"] {
+            assert!(public(ok), "{ok}");
+        }
+        for no in ["10.0.0.1", "127.0.0.1", "169.254.169.254", "::1", "::ffff:10.0.0.1", "::10.0.0.1", "64:ff9b::a00:1", "64:ff9b::a9fe:a9fe",
+            "2002:a00:1::1", "2001:0:4136:e378::1", "2001:db8::1", "fec0::1", "fd00::1", "fe80::1", "ff02::1"] {
+            assert!(!public(no), "{no}");
+        }
+    }
+
     use super::*;
 
     #[test]

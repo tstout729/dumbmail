@@ -1,0 +1,5 @@
+[
+	{ "name": "list_id", "type": "text", "label": "List ID" },
+	{ "name": "email", "type": "email", "label": "Email" },
+	{ "name": "added", "type": "number", "label": "Added (0 if already on the list)" }
+]

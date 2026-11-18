@@ -93,6 +93,7 @@ impl Role {
                         | AccountRead
                         | SettingsWrite
                         | TeamRead
+                        | WebhooksRead
                 ),
                 Role::Analyst => matches!(perm, AudienceRead | ProfilesRead | Export | MessagingRead | ContentRead | AnalyticsRead | AccountRead | TeamRead),
                 // Content may send test emails, but only to team members (see `super::sends`).
@@ -197,10 +198,18 @@ pub enum Perm {
     /// Owners only, in a browser: single sign-on settings. Ownership changes also need a fresh
     /// password or code (see [`require_fresh_sign_in`]).
     Ownership,
+    /// See webhook endpoints and their delivery log, without payloads. Managers and up.
+    WebhooksRead,
+    /// Create, change and delete webhook endpoints and REST hooks, rotate their secrets, send
+    /// tests, read delivery payloads (personal data) and resend. Admins and owners.
+    WebhooksManage,
+    /// Everything about data export destinations and runs (they copy every profile out). Admins
+    /// and owners.
+    ExportsManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 38] = [
+    pub const ALL: [Perm; 41] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -239,6 +248,9 @@ impl Perm {
         Perm::Security,
         Perm::AuditRead,
         Perm::Ownership,
+        Perm::WebhooksRead,
+        Perm::WebhooksManage,
+        Perm::ExportsManage,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -283,6 +295,9 @@ impl Perm {
             Security => "security.manage",
             AuditRead => "audit.read",
             Ownership => "ownership.transfer",
+            WebhooksRead => "webhooks.read",
+            WebhooksManage => "webhooks.manage",
+            ExportsManage => "exports.manage",
         }
     }
 
@@ -300,8 +315,8 @@ impl Perm {
             ContentWrite | FormsWrite | CatalogWrite | CatalogDelete => (Area::Content, true),
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
-            AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead => (Area::Account, false),
-            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys => (Area::Account, true),
+            AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead => (Area::Account, false),
+            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage => (Area::Account, true),
         })
     }
 
@@ -390,9 +405,9 @@ pub fn scopes_allow(scopes: &[String], perm: Perm) -> bool {
         return scopes.iter().any(|s| s == TRANSACTIONAL_SCOPE);
     }
     let Some((area, write)) = perm.area() else { return true };
-    // The team and the audit log are about people, not marketing data: plain `read` doesn't
-    // include them; they need the account scope.
-    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::TeamSecurityRead | Perm::AuditRead);
+    // The team and the audit log are about people, not marketing data, and webhook URLs can
+    // themselves be credentials: plain `read` doesn't include them; they need the account scope.
+    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::TeamSecurityRead | Perm::AuditRead | Perm::WebhooksRead);
     scopes.iter().any(|s| {
         let s = s.as_str();
         s == area.as_str() || (!write && (s.strip_suffix(":read") == Some(area.as_str()) || (broad_read_ok && s == "read")))

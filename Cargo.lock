@@ -1439,6 +1439,7 @@ dependencies = [
  "clap",
  "csv",
  "ed25519-dalek 2.2.0",
+ "flate2",
  "futures-util",
  "gif",
  "hex",

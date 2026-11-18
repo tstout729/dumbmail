@@ -57,6 +57,7 @@ impl Harness {
             // Most tests send more than a new account's first-day limit; the warm-up test sets its own.
             warmup_start_daily: 1_000_000,
             workers: 1,
+            background_workers: 1,
             secure_cookies: false,
             stripe_secret_key: None,
             stripe_webhook_secret: Some("whsec_test".into()),

@@ -1,0 +1,23 @@
+{
+  "name": "dumbmail-zapier",
+  "version": "1.0.0",
+  "description": "Zapier integration for DumbMail: triggers from webhooks (REST hooks) and actions for profiles, events and lists.",
+  "main": "index.js",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "jest --testTimeout 10000",
+    "validate": "zapier-platform validate --without-style"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "zapier-platform-core": "19.3.0"
+  },
+  "devDependencies": {
+    "jest": "29.7.0",
+    "nock": "13.5.6",
+    "zapier-platform-cli": "19.3.0"
+  }
+}
