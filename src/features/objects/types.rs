@@ -389,6 +389,11 @@ async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef],
         if old.kind == f.kind && old.options == f.options && old.currency == f.currency {
             continue;
         }
+        // A sensitive field's stored values never decide the answer: changing how it's typed always
+        // needs convert, whether or not they fit.
+        if (old.sensitive || f.sensitive) && !convert {
+            return Err(AppError::Conflict(format!("Changing the type, options or currency of {} (a sensitive field) needs convert: values that fit are converted and the rest removed.", f.key)));
+        }
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE type_id = $1 AND fields ? $2").bind(t.id).bind(&f.key).fetch_one(&mut *conn).await?;
         checked += n;
         if checked > MAX_CONVERT {
@@ -416,10 +421,6 @@ async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef],
             continue;
         }
         if !convert {
-            // A sensitive field's values aren't described, not even by count.
-            if old.sensitive || f.sensitive {
-                return Err(AppError::Conflict(format!("Stored values of {} (a sensitive field) don't all fit its new type. Save with convert to convert those that fit and remove the rest.", f.key)));
-            }
             let n = ids.len();
             return Err(AppError::Conflict(format!(
                 "{n} {} {} a value in {} that a {} field holds differently ({misfit} can't be kept). Save with convert to convert those that fit and remove the rest.",
