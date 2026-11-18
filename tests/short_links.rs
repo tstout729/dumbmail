@@ -913,13 +913,8 @@ async fn a_person_deleted_mid_campaign_is_skipped_and_the_campaign_goes_on() {
         sqlx::query("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
         let q = format!("SELECT {} FROM profiles p WHERE p.id = $1", dumbmail::models::PROFILE_COLS);
         let profile: dumbmail::models::Profile = sqlx::query_as(&q).bind(gone).fetch_one(&h.state.db).await.unwrap();
-        if channel == "sms" {
-            sqlx::query("DELETE FROM profiles WHERE id = $1").bind(gone).execute(&h.state.db).await.unwrap();
-        } else {
-            // An email reads the person again earlier in the send (its suppression check, as on
-            // main), so here only the message row goes, as the person's deletion does to it.
-            sqlx::query("DELETE FROM messages WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
-        }
+        // The person goes, and their message row with them.
+        sqlx::query("DELETE FROM profiles WHERE id = $1").bind(gone).execute(&h.state.db).await.unwrap();
         let out = send_campaign_message(&h, cid, mid, &profile).await;
         assert!(matches!(out, dumbmail::sending::Outcome::Skipped("profile deleted")), "{channel}: {out:?}");
         let sent_to_gone = if channel == "sms" { h.state.sms.sent().iter().filter(|s| s.to == gone_to).count() } else { h.state.email.sent().iter().filter(|e| e.to == gone_to).count() };
