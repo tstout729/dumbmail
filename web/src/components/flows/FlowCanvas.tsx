@@ -17,7 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode, WaitForReplyNode } from "../../api";
-import { delaySummary, notifySummary, StepResultLine, type StepResult } from "../../features/flowsPlus";
+import { delaySummary, eventSplitSummary, notifySummary, StepResultLine, type StepResult } from "../../features/flowsPlus";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
 import { Menu, cx } from "../ui";
@@ -189,7 +189,7 @@ function branchLabel(node: ConditionNode | RandomSplitNode | WaitForReplyNode, b
 }
 
 function nodeTitle(node: FlowNode): string {
-  if ((node.type === "email" || node.type === "sms") && node.name) return node.name;
+  if ((node.type === "email" || node.type === "sms" || node.type === "notify") && node.name) return node.name;
   return nodeLabels[node.type];
 }
 
@@ -202,10 +202,11 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return node.content.subject ? { text: node.content.subject } : { text: "No subject", warning: "Add a subject line" };
     case "sms":
       return node.content.body ? { text: node.content.body } : { text: "Empty message", warning: "Write a message" };
-    case "condition":
-      return node.condition.conditions.length
-        ? { text: definitionSummary(node.condition, listName) }
-        : { text: "No conditions", warning: "Add a condition" };
+    case "condition": {
+      const event = eventSplitSummary(node.event_condition);
+      if (node.condition.conditions.length) return { text: [definitionSummary(node.condition, listName), event].filter(Boolean).join("; ") };
+      return event ? { text: event } : { text: "No conditions", warning: "Add a condition" };
+    }
     case "random_split":
       return { text: `${node.percent}% A / ${100 - node.percent}% B` };
     case "wait_for_reply":

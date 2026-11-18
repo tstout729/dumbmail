@@ -53,3 +53,15 @@ export function readsEvent(node: { type: string; until?: { field: string } | nul
   if (node.type === "condition") return (node.event_condition?.filters.length ?? 0) > 0;
   return false;
 }
+
+const opText: Record<string, string> = { eq: "=", neq: "≠", gt: ">", gte: "≥", lt: "<", lte: "≤", contains: "contains", exists: "is set", not_exists: "is not set" };
+
+/** The event filters of a trigger split, in one line ("" when it has none). */
+export function eventSplitSummary(split: { match: "all" | "any"; filters: { field: string; op: string; value?: unknown }[] } | undefined): string {
+  if (!split?.filters.length) return "";
+  const parts = split.filters.map((f) => {
+    const value = f.op === "exists" || f.op === "not_exists" ? "" : ` ${Array.isArray(f.value) ? f.value.join(", ") : String(f.value ?? "")}`;
+    return `${f.field} ${opText[f.op] ?? f.op.replace(/_/g, " ")}${value}`;
+  });
+  return `Event: ${parts.join(split.match === "any" ? " or " : " and ")}`;
+}

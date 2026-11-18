@@ -10,6 +10,6 @@ export { NotifyEditor } from "./NotifyEditor";
 export { ResultsRange, StepResultDetail, StepResultLine } from "./StepResults";
 export { WaitingDrawer } from "./WaitingDrawer";
 export { useFlowResults } from "./api";
-export { delaySummary, notifySummary } from "./summaries";
+export { delaySummary, eventSplitSummary, notifySummary } from "./summaries";
 export type { DelayOptions, EventSplit, NotifyNode, StepResult } from "./types";
 export { NotifyCapField } from "./NotifyCapField";
