@@ -74,6 +74,7 @@ pub async fn create_template(state: &AppState, account_id: Uuid, b: TemplateBody
     check_channel(&channel)?;
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the template a name"))?;
     let content = b.content.unwrap_or(json!({}));
+    crate::features::coupons::template::check_content(&channel, &content)?;
     Ok(sqlx::query_as("INSERT INTO templates (id, account_id, name, channel, content) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, channel, content, created_at, updated_at")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -100,6 +101,9 @@ async fn get_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
 async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TemplateBody>) -> AppResult<Json<Template>> {
     // A transactional template's new content must pass the same content check as when it was created.
     crate::features::transactional::check_template_edit(&state.db, ctx.account_id, id, b.content.as_ref()).await?;
+    if let Some(content) = &b.content {
+        crate::features::coupons::template::check_content("", content)?;
+    }
     let t: Option<Template> = sqlx::query_as(
         "UPDATE templates SET name = COALESCE($3, name), content = COALESCE($4, content), updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING id, name, channel, content, created_at, updated_at",
@@ -118,6 +122,7 @@ async fn delete_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pa
     if n == 0 {
         return Err(AppError::not_found("template"));
     }
+    crate::features::team::audit(&state, &ctx, "template.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -130,7 +135,8 @@ pub struct RenderBody {
     pub event: Option<Value>,
 }
 
-/// Preview a message as a given profile (or a sample person) without tracking.
+/// Preview a message as a given profile (or a sample person) without tracking. Callers drop
+/// `profile_id` for people who can't read profiles (`features::team::access`).
 pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -> AppResult<Value> {
     check_channel(&b.channel)?;
     let account = load_account(&state.db, account_id).await?;
@@ -145,7 +151,11 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
-    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
+    // Saved blocks and display rules (see features::content); email without them goes on untouched.
+    let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
+    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
+    // A preview shows a sample coupon code and uses none.
+    crate::features::coupons::template::fill_sample(&mut ctx);
     if b.channel == "email" {
         let content: render::EmailContent = serde_json::from_value(content)?;
         let r = render::render_email(&account, &content, &ctx, None)?;
@@ -158,7 +168,11 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
     }
 }
 
-async fn render_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<RenderBody>) -> AppResult<Json<Value>> {
+async fn render_h(State(state): State<AppState>, ctx: Ctx, ApiJson(mut b): ApiJson<RenderBody>) -> AppResult<Json<Value>> {
+    // A real person's data only for people who may read profiles; others see the sample person.
+    if !ctx.can(crate::features::team::Perm::ProfilesRead) {
+        b.profile_id = None;
+    }
     Ok(Json(render_preview(&state, ctx.account_id, b).await?))
 }
 
@@ -272,6 +286,7 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     let content = b.content.unwrap_or_else(|| if channel == "sms" { json!({"body": ""}) } else { json!({"subject": "", "blocks": []}) });
     let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
+    crate::features::coupons::template::check_campaign(&channel, &content, ab_test.as_ref())?;
     Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test, send_options) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -295,10 +310,28 @@ async fn get_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
+/// Statuses a campaign can be edited in, by people who can send campaigns and by people who can
+/// only edit drafts (who must never change a campaign that's scheduled to go out).
+pub const EDITABLE: &[&str] = &["draft", "scheduled", "failed", "cancelled"];
+pub const DRAFT_EDITABLE: &[&str] = &["draft", "failed", "cancelled"];
+
 pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: CampaignBody) -> AppResult<CampaignRow> {
+    update_campaign_in(state, account_id, id, b, EDITABLE).await
+}
+
+/// Edit a campaign only while its status is one of `allowed`. The status is checked in the UPDATE
+/// itself, so a campaign scheduled (or sent) a moment ago isn't changed.
+pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b: CampaignBody, allowed: &[&str]) -> AppResult<CampaignRow> {
     let c = campaigns::load(&state.db, account_id, id).await?;
-    if !matches!(c.status.as_str(), "draft" | "scheduled" | "failed" | "cancelled") {
-        return Err(AppError::Conflict(format!("this campaign is {} and can't be edited; duplicate it instead", c.status)));
+    let refused = |status: &str| {
+        if EDITABLE.contains(&status) {
+            AppError::Conflict(format!("this campaign is {status}; only people who can send campaigns can change it now"))
+        } else {
+            AppError::Conflict(format!("this campaign is {status} and can't be edited; duplicate it instead"))
+        }
+    };
+    if !allowed.contains(&c.status.as_str()) {
+        return Err(refused(&c.status));
     }
     let audience = b.audience.as_ref().map(normalize_audience).transpose()?;
     if let Some(ch) = &b.channel {
@@ -308,6 +341,8 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     let channel = b.channel.as_deref().unwrap_or(&c.channel);
     let set_ab = b.ab_test.is_some() || b.channel.is_some();
     let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
+    crate::features::coupons::template::check_campaign(channel, b.content.as_ref().unwrap_or(&c.content), ab_test.as_ref())?;
+    let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
     let set_send_options = b.send_options.is_some();
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
     // Only from the state checked above. A failed or cancelled campaign goes back to draft and forgets
@@ -319,7 +354,7 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
             ab_test = CASE WHEN $8 THEN $9 ELSE ab_test END,
             send_options = CASE WHEN $10 THEN $11 ELSE send_options END,
             status = CASE WHEN status IN ('failed','cancelled') THEN 'draft' ELSE status END, error = NULL
-         WHERE id = $1 AND account_id = $2 AND status = $12 RETURNING *",
+         WHERE id = $1 AND account_id = $2 AND status = $12 AND status = ANY($13) RETURNING *",
     )
     .bind(id)
     .bind(account_id)
@@ -333,9 +368,16 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     .bind(set_send_options)
     .bind(send_options)
     .bind(&c.status)
+    .bind(&allowed)
     .fetch_optional(&mut *tx)
     .await?;
-    let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while saving; try again".into()))?;
+    let Some(row) = row else {
+        let now = campaigns::load(&state.db, account_id, id).await?.status;
+        if !allowed.contains(&now) {
+            return Err(refused(&now));
+        }
+        return Err(AppError::Conflict("the campaign changed while saving; try again".into()));
+    };
     if matches!(c.status.as_str(), "failed" | "cancelled") {
         campaigns::reset_for_relaunch(&mut tx, id).await?;
     }
@@ -343,17 +385,29 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
     Ok(row)
 }
 
+/// The statuses `ctx` may edit a campaign in.
+pub fn editable_for(ctx: &Ctx) -> &'static [&'static str] {
+    if ctx.can(crate::features::team::Perm::CampaignSend) { EDITABLE } else { DRAFT_EDITABLE }
+}
+
 async fn patch_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<CampaignBody>) -> AppResult<Json<Value>> {
-    let c = update_campaign(&state, ctx.account_id, id, b).await?;
+    let c = update_campaign_in(&state, ctx.account_id, id, b, editable_for(&ctx)).await?;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
-async fn delete_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    if matches!(c.status.as_str(), "sending" | "testing" | "sent") {
+/// Delete a campaign unless it has gone out (checked in the DELETE itself).
+pub async fn delete_campaign(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
+    let n = sqlx::query("DELETE FROM campaigns WHERE id = $1 AND account_id = $2 AND status NOT IN ('sending', 'testing', 'sent')").bind(id).bind(account_id).execute(&state.db).await?.rows_affected();
+    if n == 0 {
+        campaigns::load(&state.db, account_id, id).await?;
         return Err(AppError::Conflict("sent campaigns are kept for reporting and can't be deleted".into()));
     }
-    sqlx::query("DELETE FROM campaigns WHERE id = $1").bind(id).execute(&state.db).await?;
+    Ok(())
+}
+
+async fn delete_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    delete_campaign(&state, ctx.account_id, id).await?;
+    crate::features::team::audit(&state, &ctx, "campaign.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -380,9 +434,7 @@ struct TestBody {
 }
 
 async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TestBody>) -> AppResult<Json<Value>> {
-    let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    let account = load_account(&state.db, ctx.account_id).await?;
-    let sent = campaigns::send_test(&state, &account, &c, &b.to, b.version.as_deref()).await?;
+    let sent = crate::features::team::sends::test_send(&state, &ctx, id, &b.to, b.version.as_deref()).await?;
     Ok(Json(json!({"sent": sent})))
 }
 
@@ -400,7 +452,11 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         set_options = true;
     }
     let account = load_account(&state.db, account_id).await?;
-    let problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
+    // Coupons the content uses: they exist, haven't expired and have codes for the audience.
+    // (Saved blocks are read as they are now, the way the send will freeze them.)
+    let filled = crate::features::content::prepare::with_saved_filled(state, &c).await?;
+    problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &filled).await?);
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
@@ -438,38 +494,44 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         c.send_options = Some(opts);
         set_options = true;
     }
+    // The status was checked above; check it again in the write, so two launches (or a launch and
+    // an edit) can't both go through. The send options go in the same statement, and starting the
+    // send and queueing it commit together.
     let now = Utc::now();
-    let changed = || AppError::Conflict("the campaign changed while it was being sent; try again".into());
-    // Only from the state it was checked in; the send options go in the same statement.
+    let changed = || AppError::Conflict("this campaign changed while you were sending it; open it again".into());
+    let mut tx = state.db.begin().await?;
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
         Some(t) => sqlx::query_as(
             "UPDATE campaigns SET status = 'scheduled', send_at = $2, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
-             WHERE id = $1 AND status = $3 RETURNING *",
+             WHERE id = $1 AND status = $3 AND updated_at = $6 RETURNING *",
         )
         .bind(id)
         .bind(t)
         .bind(&c.status)
         .bind(set_options)
         .bind(&c.send_options)
-        .fetch_optional(&state.db)
+        .bind(c.updated_at)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(changed)?,
         None => {
             let r: CampaignRow = sqlx::query_as(
                 "UPDATE campaigns SET status = 'sending', send_at = now(), send_options = CASE WHEN $3 THEN $4 ELSE send_options END, updated_at = now()
-                 WHERE id = $1 AND status = $2 RETURNING *",
+                 WHERE id = $1 AND status = $2 AND updated_at = $5 RETURNING *",
             )
             .bind(id)
             .bind(&c.status)
             .bind(set_options)
             .bind(&c.send_options)
-            .fetch_optional(&state.db)
+            .bind(c.updated_at)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(changed)?;
-            crate::jobs::enqueue(&state.db, "campaign_send", json!({"campaign_id": id}), None).await?;
+            crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": id}), None).await?;
             r
         }
     };
+    tx.commit().await?;
     Ok(row)
 }
 
@@ -487,6 +549,7 @@ async fn schedule_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
         return Err(AppError::bad("pick a time in the future, or send now"));
     }
     let c = launch(&state, ctx.account_id, id, Some(b.send_at), b.send_options.as_ref()).await?;
+    crate::features::team::audit::campaign(&state, &ctx, "campaign.schedule", &c).await;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
@@ -505,6 +568,7 @@ async fn send_now_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
         serde_json::from_slice(&body).map_err(|e| AppError::bad(format!("invalid body: {e}")))?
     };
     let c = launch(&state, ctx.account_id, id, None, b.send_options.as_ref()).await?;
+    crate::features::team::audit::campaign(&state, &ctx, "campaign.send", &c).await;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
@@ -517,7 +581,7 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
     };
     // The campaign first, then its queued messages, in one transaction: a batch claiming or re-queuing a
     // message at the same moment checks the campaign under a lock (see `campaigns::claim`), so nothing is
-    // left queued or sent behind the cancel.
+    // left queued or sent behind the cancel. Only from the status it had when we looked.
     let mut tx = state.db.begin().await?;
     let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET status = $2, updated_at = now() WHERE id = $1 AND status = $3 RETURNING *")
         .bind(id)
@@ -526,19 +590,29 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
         .fetch_optional(&mut *tx)
         .await?;
     let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while cancelling; try again".into()))?;
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    if crate::features::observes_unsent(&state.db, account_id) {
+        let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued' RETURNING id")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        crate::features::messages_unsent_in(&mut tx, &state.db, account_id, &skipped).await;
+    } else {
+        sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(row)
 }
 
 async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = cancel(&state, ctx.account_id, id).await?;
+    crate::features::team::audit::campaign(&state, &ctx, "campaign.cancel", &c).await;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(c.content), send_at: None, ab_test: c.ab_test, send_options: c.send_options }).await?;
+    // The copy is a new, unsent email: its saved blocks show their current content again.
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(crate::features::content::prepare::relink(&c.content)), send_at: None, ab_test: crate::features::content::prepare::relink_ab(&c.ab_test), send_options: c.send_options }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 
@@ -600,6 +674,7 @@ struct WinnerBody {
 async fn winner_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<WinnerBody>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
     let c = campaigns::pick_winner(&state, &c, b.version.as_deref()).await?;
+    crate::features::team::audit::campaign(&state, &ctx, "campaign.pick_winner", &c).await;
     Ok(Json(campaign_json(&state, &c).await?))
 }
 
@@ -657,6 +732,9 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
             let id = n.data.get("list_id").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok())
                 .ok_or_else(|| AppError::bad(format!("step {} needs a valid list_id", n.id)))?;
             crate::audience::list_belongs(&state.db, account_id, id).await?;
+        }
+        if n.kind == "email" || n.kind == "sms" {
+            crate::features::coupons::template::check_content(&n.kind, n.data.get("content").unwrap_or(&Value::Null)).map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
         }
         if n.kind == "webhook" {
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
@@ -725,15 +803,23 @@ pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, b: FlowBo
 
 async fn patch_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<FlowBody>) -> AppResult<Json<Value>> {
     let f = update_flow(&state, ctx.account_id, id, b).await?;
+    crate::features::team::audit::flow(&state, &ctx, "flow.update", &f).await;
     Ok(Json(flow_json(&state, &f).await?))
 }
 
-async fn delete_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let f = load_flow(&state, ctx.account_id, id).await?;
-    if f.status == "live" {
+/// Delete a flow unless it's live (checked in the DELETE itself).
+pub async fn delete_flow(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
+    let n = sqlx::query("DELETE FROM flows WHERE id = $1 AND account_id = $2 AND status <> 'live'").bind(id).bind(account_id).execute(&state.db).await?.rows_affected();
+    if n == 0 {
+        load_flow(state, account_id, id).await?;
         return Err(AppError::Conflict("turn the flow off before deleting it".into()));
     }
-    sqlx::query("DELETE FROM flows WHERE id = $1").bind(id).execute(&state.db).await?;
+    Ok(())
+}
+
+async fn delete_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    delete_flow(&state, ctx.account_id, id).await?;
+    crate::features::team::audit(&state, &ctx, "flow.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -776,7 +862,16 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             crate::flows::refresh_segment(state, segment_id).await.map_err(|e| AppError::bad(format!("couldn't refresh the trigger segment: {e}")))?;
         }
     }
-    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 RETURNING *").bind(id).bind(status).fetch_one(&state.db).await?;
+    // Turning live was checked against this version of the flow; an edit meanwhile means check again.
+    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 RETURNING *")
+        .bind(id)
+        .bind(status)
+        .bind(account_id)
+        .bind(f.updated_at)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::Conflict("this flow changed while you were turning it on; open it again".into()))?;
+    crate::features::webhooks::flow_status_changed(&state.db, account_id, id, &row.name, &f.status, status, &row.trigger).await;
     if status == "live" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"first_flow\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
@@ -793,6 +888,7 @@ struct StatusBody {
 
 async fn flow_status_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<StatusBody>) -> AppResult<Json<Value>> {
     let f = set_flow_status(&state, ctx.account_id, id, &b.status).await?;
+    crate::features::team::audit::flow(&state, &ctx, "flow.status_change", &f).await;
     Ok(Json(flow_json(&state, &f).await?))
 }
 
@@ -800,7 +896,11 @@ pub async fn flow_report(state: &AppState, account_id: Uuid, id: Uuid) -> AppRes
     let f = load_flow(state, account_id, id).await?;
     let (stats, active, total) = flows::stats(&state.db, account_id, id).await?;
     let nodes = flows::node_report(&state.db, account_id, &f).await?;
-    Ok(json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes}))
+    let mut out = json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes});
+    if f.trigger["type"] == "event_date" {
+        out["event_dates"] = flows::event_date_report(&state.db, f.id).await?;
+    }
+    Ok(out)
 }
 
 async fn flow_report_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -1021,7 +1121,9 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
 }
 
 async fn patch_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<FormBody>) -> AppResult<Json<Value>> {
-    Ok(Json(form_one(&state, &update_form(&state, ctx.account_id, id, b).await?).await?))
+    let f = update_form(&state, ctx.account_id, id, b).await?;
+    crate::features::team::audit(&state, &ctx, "form.update", Some(&id.to_string()), json!({"name": f.name, "status": f.status})).await;
+    Ok(Json(form_one(&state, &f).await?))
 }
 
 async fn delete_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
@@ -1029,5 +1131,6 @@ async fn delete_form_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
     if n == 0 {
         return Err(AppError::not_found("form"));
     }
+    crate::features::team::audit(&state, &ctx, "form.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }

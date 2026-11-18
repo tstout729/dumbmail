@@ -7,6 +7,8 @@ import { starterEmail } from "../../components/email/blocks";
 import { EmailThumbnail } from "../../components/email/EmailPreview";
 import { Button, EmptyState, Field, Input, Modal, Page, PageHeader, Segmented, Skeleton, Tabs, cx } from "../../components/ui";
 import { formatRelative } from "../../lib/format";
+import { useTemplateFromStarter } from "../../features/content/api";
+import { StarterGallery } from "../../features/content/StarterGallery";
 
 type Tab = "all" | Channel;
 
@@ -99,18 +101,22 @@ export function TemplatesPage() {
 function CreateTemplateDialog({ onClose }: { onClose: () => void }) {
   const { account } = useSession();
   const [channel, setChannel] = useState<Channel>("email");
+  const [starter, setStarter] = useState<string>("blank");
   const create = useCreateTemplate();
+  const fromStarter = useTemplateFromStarter();
   const navigate = useNavigate();
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const name = String(new FormData(e.currentTarget).get("name")).trim();
-    create.mutate(
-      { name, channel, content: channel === "email" ? starterEmail(account.brand_color) : { body: "" } },
-      { onSuccess: (t) => navigate(`/content/templates/${t.id}`) },
-    );
+    const open = { onSuccess: (t: { id: string }) => navigate(`/content/templates/${t.id}`) };
+    if (channel === "email" && starter !== "blank") {
+      fromStarter.mutate({ key: starter, name }, open);
+      return;
+    }
+    create.mutate({ name, channel, content: channel === "email" ? starterEmail(account.brand_color) : { body: "" } }, open);
   };
   return (
-    <Modal title="Create template" onClose={onClose} size="sm">
+    <Modal title="Create template" onClose={onClose} size={channel === "email" ? "lg" : "sm"}>
       <form onSubmit={onSubmit} className="space-y-4">
         <Segmented
           value={channel}
@@ -123,11 +129,16 @@ function CreateTemplateDialog({ onClose }: { onClose: () => void }) {
         <Field label="Name">
           <Input name="name" required autoFocus placeholder="Monthly newsletter" />
         </Field>
+        {channel === "email" ? (
+          <Field label="Start from" hint="Starter designs use your brand color, logo and social links.">
+            <StarterGallery blank selected={starter} onPick={(s) => setStarter(s.key)} className="max-h-[50vh] overflow-y-auto p-0.5" />
+          </Field>
+        ) : null}
         <div className={cx("flex justify-end gap-2")}>
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" loading={create.isPending}>
+          <Button type="submit" variant="primary" loading={create.isPending || fromStarter.isPending}>
             Create and edit
           </Button>
         </div>

@@ -147,6 +147,16 @@ pub enum Condition {
         #[serde(default)]
         within_days: Option<i64>,
     },
+    /// Got a code from a coupon (it reached them), or used it in a verified order (see features::coupons).
+    Coupon {
+        coupon_id: Uuid,
+        #[serde(default)]
+        action: CouponAction,
+        #[serde(default)]
+        op: HasOp,
+        #[serde(default)]
+        within_days: Option<i64>,
+    },
     /// Predictions from someone's order history (see `Prediction`).
     Prediction {
         measure: Prediction,
@@ -335,6 +345,16 @@ pub enum MessageAction {
     Clicked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CouponAction {
+    /// A code reached them (a message carrying it was sent, or a form showed it).
+    #[default]
+    Given,
+    /// They used it in an order recorded by the API, MCP or a store integration.
+    Redeemed,
+}
+
 /// Figures from someone's order history (orders = the order metric's events, revenue = their value).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -502,6 +522,11 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 }
                 check_window(*within_days, &None, &None)?;
             }
+            Condition::Coupon { within_days, .. } => {
+                if within_days.is_some_and(|d| !(1..=3650).contains(&d)) {
+                    return Err(AppError::bad("a coupon condition's within_days must be 1 to 3650"));
+                }
+            }
             Condition::Prediction { measure, op, value, metric } => {
                 if metric.as_deref().is_some_and(|m| m.trim().is_empty()) {
                     return Err(AppError::bad("prediction metric can't be empty (leave it out for Placed Order)"));
@@ -639,6 +664,8 @@ fn as_f64(v: &Value) -> Option<f64> {
 
 const TEXT_COLUMNS: &[&str] = &["email", "phone_number", "first_name", "last_name", "external_id", "email_consent", "sms_consent", "email_suppressed_reason"];
 const TIME_COLUMNS: &[&str] = &["created_at", "updated_at", "last_event_at"];
+/// True/false profile columns, compared as text ('true' / 'false').
+const BOOL_COLUMNS: &[&str] = &["marketing_hold"];
 
 /// The account's time zone, for calendar dates.
 const ACCOUNT_TZ: &str = "(SELECT a.timezone FROM accounts a WHERE a.id = p.account_id)";
@@ -655,7 +682,7 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         Source::Profile if TEXT_COLUMNS.contains(&field) => {
             qb.push(format!("p.{field}"));
         }
-        Source::Profile if TIME_COLUMNS.contains(&field) => {
+        Source::Profile if TIME_COLUMNS.contains(&field) || BOOL_COLUMNS.contains(&field) => {
             qb.push(format!("p.{field}::text"));
         }
         Source::Event if field == "value" => {
@@ -672,7 +699,7 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
 
 fn push_json_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str) -> bool {
     match src {
-        Source::Profile if !TEXT_COLUMNS.contains(&field) && !TIME_COLUMNS.contains(&field) => {
+        Source::Profile if !TEXT_COLUMNS.contains(&field) && !TIME_COLUMNS.contains(&field) && !BOOL_COLUMNS.contains(&field) => {
             qb.push("(p.properties->").push_bind(field.to_string()).push(")");
             true
         }
@@ -1055,7 +1082,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
                 qb.push("NOT ");
             }
             qb.push(match channel {
-                Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL)",
+                Channel::Email => "(p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL AND NOT p.marketing_hold)",
                 Channel::Sms => "(p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed')",
             });
         }
@@ -1089,6 +1116,24 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             push_metrics(qb, names.into_iter().map(String::from).collect());
             push_window(qb, Some(*within_days), &None, &None);
             qb.push(")");
+        }
+        Condition::Coupon { coupon_id, action, op, within_days } => {
+            // A coupon that isn't this account's (deleted, or a wrong id) matches nobody, either way round.
+            qb.push("(EXISTS (SELECT 1 FROM coupons c WHERE c.id = ").push_bind(*coupon_id).push(" AND c.account_id = p.account_id AND c.deleted_at IS NULL) AND ");
+            if *op == HasOp::HasNot {
+                qb.push("NOT ");
+            }
+            // Given: a message carrying the code was sent, or a form showed it. Redeemed: a verified order.
+            let at = match action {
+                CouponAction::Given => "cc.delivered_at",
+                CouponAction::Redeemed => "cc.redeemed_at",
+            };
+            qb.push("EXISTS (SELECT 1 FROM coupon_codes cc WHERE cc.coupon_id = ").push_bind(*coupon_id).push(" AND cc.profile_id = p.id");
+            qb.push(format!(" AND {at} IS NOT NULL"));
+            if let Some(d) = within_days {
+                qb.push(format!(" AND {at} >= now() - make_interval(days => ")).push_bind(*d as i32).push(")");
+            }
+            qb.push("))");
         }
         Condition::Message { action, campaign_id, flow_id, op, within_days } => {
             let names: Vec<String> = match action {
@@ -1234,15 +1279,26 @@ pub async fn profile_matches(db: &sqlx::PgPool, profile_id: Uuid, def: &Definiti
 
 /// Recompute materialized membership. Returns profile ids that newly entered.
 pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def: &Definition) -> AppResult<Vec<Uuid>> {
+    // Webhooks want who left (and whether this is the first refresh); with nothing watching, the
+    // refresh runs exactly as it would without them.
+    let watched = crate::features::webhooks::wants_segment_changes(db, account_id);
     let mut tx = db.begin().await?;
+    let first_refresh: bool = if watched {
+        sqlx::query_scalar("SELECT refreshed_at IS NULL FROM segments WHERE id = $1").bind(segment_id).fetch_optional(&mut *tx).await?.unwrap_or(true)
+    } else {
+        true
+    };
     let mut qb = QueryBuilder::new("CREATE TEMP TABLE seg_now ON COMMIT DROP AS SELECT p.id FROM profiles p WHERE p.account_id = ");
     qb.push_bind(account_id).push(" AND ");
     push_definition(&mut qb, def);
     qb.build().execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id)")
-        .bind(segment_id)
-        .execute(&mut *tx)
-        .await?;
+    const LEAVE: &str = "DELETE FROM segment_members sm WHERE sm.segment_id = $1 AND NOT EXISTS (SELECT 1 FROM seg_now s WHERE s.id = sm.profile_id)";
+    let left: Vec<Uuid> = if watched {
+        sqlx::query_scalar(&format!("{LEAVE} RETURNING profile_id")).bind(segment_id).fetch_all(&mut *tx).await?
+    } else {
+        sqlx::query(LEAVE).bind(segment_id).execute(&mut *tx).await?;
+        Vec::new()
+    };
     let entered: Vec<Uuid> = sqlx::query_scalar("INSERT INTO segment_members (segment_id, profile_id) SELECT $1, id FROM seg_now ON CONFLICT DO NOTHING RETURNING profile_id")
         .bind(segment_id)
         .fetch_all(&mut *tx)
@@ -1251,6 +1307,11 @@ pub async fn refresh(db: &sqlx::PgPool, account_id: Uuid, segment_id: Uuid, def:
         .bind(segment_id)
         .execute(&mut *tx)
         .await?;
+    // The first refresh only records who is already in the segment. Webhook events are written in
+    // this transaction, so they go out exactly when the change does (a failure can't spoil it).
+    if watched && !first_refresh {
+        crate::features::webhooks::segment_changed_in(&mut tx, db, account_id, segment_id, &entered, &left).await;
+    }
     tx.commit().await?;
     Ok(entered)
 }
@@ -1322,6 +1383,22 @@ mod tests {
     }
 
     #[test]
+    fn coupon_rules_need_the_coupon_either_way_round() {
+        for (action, op) in [("given", "has"), ("given", "has_not"), ("redeemed", "has"), ("redeemed", "has_not")] {
+            let def = parse(&json!({"conditions": [{"type": "coupon", "coupon_id": "0190a8a2-0000-7000-8000-000000000004", "action": action, "op": op, "within_days": 7}]})).unwrap();
+            let mut qb = QueryBuilder::<Postgres>::new("SELECT 1 FROM profiles p WHERE ");
+            push_definition(&mut qb, &def);
+            let sql = qb.sql();
+            // The coupon must exist in the person's account before "has not" can match anyone.
+            let exists = sql.find("FROM coupons c WHERE c.id = $1 AND c.account_id = p.account_id AND c.deleted_at IS NULL").expect(sql);
+            assert!(exists < sql.find("FROM coupon_codes").unwrap(), "{sql}");
+            assert_eq!(sql.contains("NOT EXISTS (SELECT 1 FROM coupon_codes"), op == "has_not", "{sql}");
+            assert!(sql.contains(if action == "given" { "cc.delivered_at IS NOT NULL" } else { "cc.redeemed_at IS NOT NULL" }), "{sql}");
+            assert!(!sql.contains("0190a8a2"), "values are bound");
+        }
+    }
+
+    #[test]
     fn every_new_rule_compiles_with_bound_values() {
         let def = parse(&json!({"match": "any", "conditions": [
             {"type": "event", "metric": "Placed Order", "op": "at_least", "count": 1, "since": "2026-11-01", "until": "2026-11-30"},
@@ -1335,6 +1412,7 @@ mod tests {
             {"type": "form", "form_id": "0190a8a2-0000-7000-8000-000000000002", "within_days": 30},
             {"type": "engagement", "channel": "any", "engaged": false, "within_days": 90},
             {"type": "message", "action": "clicked", "campaign_id": "0190a8a2-0000-7000-8000-000000000003"},
+            {"type": "coupon", "coupon_id": "0190a8a2-0000-7000-8000-000000000004", "action": "redeemed", "op": "has_not", "within_days": 30},
             {"type": "prediction", "measure": "churn_risk", "op": "in", "value": ["medium", "high"]},
             {"type": "prediction", "measure": "predicted_clv", "op": "gte", "value": 1000},
             {"type": "random", "percent": 10, "seed": "holdout-nov"},
@@ -1388,6 +1466,9 @@ mod tests {
         assert!(parse(&json!({"conditions": [{"type": "random", "percent": 0}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "random", "percent": 101}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "message", "action": "opened"}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "coupon", "coupon_id": "0190a8a2-0000-7000-8000-000000000004", "within_days": 0}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "coupon", "coupon_id": "not-an-id"}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "coupon", "coupon_id": "0190a8a2-0000-7000-8000-000000000004", "action": "shared"}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "engagement", "channel": "email", "within_days": 0}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "property", "field": "zip", "op": "between", "value": [1]}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "event_time", "metric": "x", "which": "last", "op": "before", "value": "soon"}]})).is_err());

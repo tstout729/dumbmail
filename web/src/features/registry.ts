@@ -26,6 +26,7 @@ import type { DashboardFeature, FeatureNavItem, FeatureSettingsTab } from "./typ
 const features: DashboardFeature[] = [agent, audiences, catalog, content, coupons, hub, inbox, integrations, klaviyoImport, objects, push, reports, reviews, sendtime, shopify, team, transactional, warehouse, webhooks, whatsapp];
 
 export const featureRoutes: RouteObject[] = features.flatMap((f) => f.routes ?? []);
+export const featurePublicRoutes: RouteObject[] = features.flatMap((f) => f.publicRoutes ?? []);
 export const featureSettingsRoutes: RouteObject[] = features.flatMap((f) => f.settingsRoutes ?? []);
 export const featureNav: FeatureNavItem[] = features.flatMap((f) => f.nav ?? []);
 export const featureSettingsTabs: FeatureSettingsTab[] = features.flatMap((f) => f.settingsTabs ?? []);
