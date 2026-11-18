@@ -11,6 +11,8 @@ export type ImportInput = {
   sms_consent?: Consent;
   /** Everyone in the file agreed to get email (required unless importing them as unsubscribed). */
   permission_confirmed?: boolean;
+  /** The uploaded file's name (checked with the file on the hosted service). */
+  file_name?: string;
 };
 
 export const profilesApi = {

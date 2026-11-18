@@ -538,7 +538,7 @@ pub async fn before_saved_block_edit(state: &AppState, account_id: Uuid, id: Uui
     for (m, r) in materials.iter().zip(results) {
         done.push((m, r?));
     }
-    done.sort_by(|a, b| b.1.verdict.cmp(&a.1.verdict));
+    done.sort_by_key(|d| std::cmp::Reverse(d.1.verdict));
     let mut first = None;
     for (m, r) in &done {
         if let Err(e) = apply(state, account_id, m, r).await {

@@ -30,6 +30,7 @@ export function ImportDialog({ onClose, listId }: Props) {
     importer.mutate(
       {
         csv,
+        file_name: fileName ?? undefined,
         list_id: targetList || undefined,
         email_consent: emailConsent,
         sms_consent: smsConsent || undefined,
