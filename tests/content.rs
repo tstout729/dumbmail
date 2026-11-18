@@ -985,6 +985,19 @@ async fn a_coupon_tag_in_a_persons_data_never_becomes_a_tag() {
     h.cleanup().await;
 }
 
+/// A finished check gives its slot back before it answers, so checks one after another all run.
+#[tokio::test]
+async fn checks_one_after_another_are_never_told_one_is_running() {
+    let mut h = harness!();
+    h.signup().await;
+    let content = json!({"subject": "Hi", "blocks": [{"type": "text", "html": "<p>Hello</p>"}]});
+    for i in 0..25 {
+        let (s, v) = h.req("POST", "/api/content/check", Some(json!({"content": content, "skip_links": true}))).await;
+        assert_eq!(s, StatusCode::OK, "check {i}: {v}");
+    }
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn the_check_takes_its_account_slot_before_any_audience_work() {
     let mut h = harness!();
