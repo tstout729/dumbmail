@@ -105,7 +105,9 @@ async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
         crate::features::coupons::template::check_content("", content)?;
     }
     let t: Option<Template> = sqlx::query_as(
-        "UPDATE templates SET name = COALESCE($3, name), content = COALESCE($4, content), updated_at = now()
+        // A template imported for review keeps its review marker whatever the edit sends (see import_review.rs).
+        "UPDATE templates SET name = COALESCE($3, name), content = CASE WHEN import_review IS NULL OR $4::jsonb IS NULL THEN COALESCE($4, content)
+                ELSE jsonb_set($4::jsonb, '{imported}', COALESCE(CASE WHEN jsonb_typeof($4::jsonb->'imported') = 'object' THEN $4::jsonb->'imported' END, jsonb_build_object('from', 'klaviyo')) || jsonb_build_object('review', import_review)) END, updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING id, name, channel, content, created_at, updated_at",
     )
     .bind(id)
@@ -350,7 +352,9 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     let mut tx = state.db.begin().await?;
     let row: Option<CampaignRow> = sqlx::query_as(
         "UPDATE campaigns SET name = COALESCE($3, name), channel = COALESCE($4, channel), audience = COALESCE($5, audience),
-            content = COALESCE($6, content), send_at = COALESCE($7, send_at), updated_at = now(),
+            -- A campaign imported for review keeps its review marker whatever the edit sends (see import_review.rs).
+            content = CASE WHEN import_review IS NULL OR $6::jsonb IS NULL THEN COALESCE($6, content)
+                ELSE jsonb_set($6::jsonb, '{imported}', COALESCE(CASE WHEN jsonb_typeof($6::jsonb->'imported') = 'object' THEN $6::jsonb->'imported' END, jsonb_build_object('from', 'klaviyo')) || jsonb_build_object('review', import_review)) END, send_at = COALESCE($7, send_at), updated_at = now(),
             ab_test = CASE WHEN $8 THEN $9 ELSE ab_test END,
             send_options = CASE WHEN $10 THEN $11 ELSE send_options END,
             status = CASE WHEN status IN ('failed','cancelled') THEN 'draft' ELSE status END, error = NULL
@@ -611,8 +615,14 @@ async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    // The copy is a new, unsent email: its saved blocks show their current content again.
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(crate::features::content::prepare::relink(&c.content)), send_at: None, ab_test: crate::features::content::prepare::relink_ab(&c.ab_test), send_options: c.send_options }).await?;
+    // The copy is a new, unsent email: its saved blocks show their current content again. A copy
+    // of an imported campaign still needing review needs the review too.
+    let mut content = crate::features::content::prepare::relink(&c.content);
+    let notes = crate::import_review::campaign_notes(&c);
+    if !notes.is_empty() {
+        crate::import_review::mirror(&mut content, &notes);
+    }
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(content), send_at: None, ab_test: crate::features::content::prepare::relink_ab(&c.ab_test), send_options: c.send_options }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 
@@ -779,7 +789,11 @@ async fn get_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
 }
 
 pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, b: FlowBody) -> AppResult<FlowRow> {
-    load_flow(state, account_id, id).await?;
+    let cur = load_flow(state, account_id, id).await?;
+    // A live flow can't take in imported content that still needs review.
+    if let (true, Some(why)) = (cur.status == "live", b.definition.as_ref().and_then(crate::import_review::live_edit_problem)) {
+        return Err(AppError::bad(why));
+    }
     let trigger = match &b.trigger {
         Some(t) => {
             let t = flows::parse_trigger(t)?;
@@ -791,14 +805,23 @@ pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, b: FlowBo
     if let Some(d) = &b.definition {
         check_node_refs(state, account_id, d).await?;
     }
-    Ok(sqlx::query_as("UPDATE flows SET name = COALESCE($3, name), trigger = COALESCE($4, trigger), definition = COALESCE($5, definition), updated_at = now() WHERE id = $1 AND account_id = $2 RETURNING *")
-        .bind(id)
-        .bind(account_id)
-        .bind(b.name.filter(|n| !n.trim().is_empty()))
-        .bind(trigger)
-        .bind(b.definition)
-        .fetch_one(&state.db)
-        .await?)
+    // A flow imported for review keeps its review marker whatever the edit sends, and a flow that went live
+    // meanwhile still can't take in content needing review (see import_review.rs).
+    let row: Option<FlowRow> = sqlx::query_as(
+        "UPDATE flows SET name = COALESCE($3, name), trigger = COALESCE($4, trigger),
+            definition = CASE WHEN import_review IS NULL OR $5::jsonb IS NULL THEN COALESCE($5, definition)
+                ELSE jsonb_set($5::jsonb, '{imported}', COALESCE(CASE WHEN jsonb_typeof($5::jsonb->'imported') = 'object' THEN $5::jsonb->'imported' END, jsonb_build_object('from', 'klaviyo')) || jsonb_build_object('review', import_review)) END,
+            updated_at = now()
+         WHERE id = $1 AND account_id = $2 AND NOT (status = 'live' AND COALESCE($5::jsonb, '{}') @? '$.**.imported.review') RETURNING *",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(b.name.filter(|n| !n.trim().is_empty()))
+    .bind(trigger)
+    .bind(b.definition)
+    .fetch_optional(&state.db)
+    .await?;
+    row.ok_or_else(|| AppError::Conflict("This flow is live and some of this content was imported from Klaviyo and still needs review.".into()))
 }
 
 async fn patch_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<FlowBody>) -> AppResult<Json<Value>> {
@@ -829,6 +852,9 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
     }
     let f = load_flow(state, account_id, id).await?;
     if status == "live" {
+        if let Some(why) = crate::import_review::flow_problem(&f) {
+            return Err(AppError::bad(format!("{why} before it can go live.")));
+        }
         let def = flows::parse_definition(&f.definition)?;
         if def.entry.is_none() {
             return Err(AppError::bad("add at least one step before turning the flow on"));
@@ -862,7 +888,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             crate::flows::refresh_segment(state, segment_id).await.map_err(|e| AppError::bad(format!("couldn't refresh the trigger segment: {e}")))?;
         }
     }
-    // Turning live was checked against this version of the flow; an edit meanwhile means check again.
+    // Turning live was checked against this version of the flow (review included); an edit meanwhile means check again.
     let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 RETURNING *")
         .bind(id)
         .bind(status)
@@ -1086,8 +1112,15 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
     }
     check_form_config(&b.config)?;
     let mut tx = state.db.begin().await?;
-    let before: Option<Value> = sqlx::query_scalar("SELECT config FROM forms WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(id).bind(account_id).fetch_optional(&mut *tx).await?;
-    let before = before.ok_or_else(|| AppError::not_found("form"))?;
+    let before: Option<(Value, String, Option<Uuid>, Option<Value>)> =
+        sqlx::query_as("SELECT config, status, list_id, import_review FROM forms WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(id).bind(account_id).fetch_optional(&mut *tx).await?;
+    let (before, status_before, list_before, review) = before.ok_or_else(|| AppError::not_found("form"))?;
+    // An imported form whose sign-up list was missing or ambiguous is published only once a list is chosen.
+    if b.status.as_deref().unwrap_or(&status_before) == "live" {
+        if let Some(why) = crate::import_review::form_problem(review.as_ref(), b.list_id.or(list_before)) {
+            return Err(AppError::bad(why));
+        }
+    }
     let config = b.config.map(|patch| {
         let mut c = before.clone();
         crate::forms::apply(&mut c, patch);
@@ -1095,7 +1128,8 @@ pub async fn update_form(state: &AppState, account_id: Uuid, id: Uuid, b: FormBo
     });
     let f: FormRow = sqlx::query_as(
         "UPDATE forms SET name = COALESCE($3, name), kind = COALESCE($4, kind), list_id = COALESCE($5, list_id),
-           config = COALESCE($6, config), status = COALESCE($7, status), updated_at = now()
+           config = COALESCE($6, config), status = COALESCE($7, status), updated_at = now(),
+           import_review = CASE WHEN $5::uuid IS NOT NULL THEN NULL ELSE import_review END
          WHERE id = $1 AND account_id = $2 RETURNING *",
     )
     .bind(id)
