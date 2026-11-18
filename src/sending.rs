@@ -204,12 +204,16 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 return Ok(Outcome::Skipped("not emailable"));
             }
             if !spec.is_test {
-                let (suppressed, held): (Option<String>, bool) =
+                // No row: the person was deleted after the caller loaded them (a campaign batch, a flow step).
+                let Some((suppressed, held)): Option<(Option<String>, bool)> =
                     sqlx::query_as(&format!("SELECT p.email_suppressed_reason, {} FROM profiles p WHERE p.id = $1", crate::marketing_hold::blocks_email_sql("$2")))
                         .bind(p.id)
                         .bind(spec.flow_id)
-                        .fetch_one(&state.db)
-                        .await?;
+                        .fetch_optional(&state.db)
+                        .await?
+                else {
+                    return Ok(Outcome::Skipped("profile deleted"));
+                };
                 if suppressed.is_some() {
                     return Ok(Outcome::Skipped("suppressed"));
                 }

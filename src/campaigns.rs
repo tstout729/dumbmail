@@ -655,6 +655,12 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
             }
             Ok(_) => {}
             Err(e) => {
+                // The person was deleted while their message was being sent (the message row went with
+                // them): nothing wrong with the campaign, so everyone else still gets it.
+                let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM profiles WHERE id = $1)").bind(pid).fetch_one(&state.db).await?;
+                if gone {
+                    continue;
+                }
                 // A content problem affects every recipient: fail the campaign instead of retrying forever.
                 const FAIL_REST: &str = "UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)";
                 if crate::features::observes_unsent(&state.db, c.account_id) {
