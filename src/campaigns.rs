@@ -246,6 +246,7 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
     }
     problems.extend(crate::features::campaigns_plus::resend::audience_problems(c, &aud));
     problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
+    problems.extend(crate::import_review::campaign_problem(c));
     if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
         match parse_ab_test(&c.channel, v) {
             Ok(t) => {
@@ -324,6 +325,12 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     }
     if c.audience != pre_audience || c.channel != channel {
         anyhow::bail!("the campaign changed while its send was being prepared; retrying");
+    }
+    // Imported content still waiting for review never goes out (this also covers an A/B winner send).
+    if let Some(why) = crate::import_review::campaign_problem(&c) {
+        tx.commit().await?;
+        crate::deliverability::stop_campaign(&state.db, c.id, &format!("Not sent: {why}.")).await?;
+        return Ok(());
     }
     // Copy in the saved blocks it uses, in the same transaction that fixes the audience, so every
     // recipient (also those held for their local or best time) gets this copy and editing a saved
@@ -831,6 +838,9 @@ pub async fn finish_due_tests(state: &AppState) -> anyhow::Result<()> {
 pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>, create_profiles: bool) -> AppResult<usize> {
     if to.is_empty() || to.len() > 10 {
         return Err(AppError::bad("send tests to 1-10 addresses"));
+    }
+    if let Some(why) = crate::import_review::campaign_problem(c) {
+        return Err(AppError::bad(format!("{why}. Test sends wait for the review too.")));
     }
     let ab = ab_test(c);
     let content = version_content(c, ab.as_ref(), version).ok_or_else(|| AppError::bad("this campaign has no such version"))?;

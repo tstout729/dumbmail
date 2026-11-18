@@ -129,6 +129,9 @@ pub struct CampaignRow {
     /// When each recipient's message goes out and smart sending; see `features::sendtime::SendOptions`.
     #[sqlx(default)]
     pub send_options: Option<Value>,
+    /// Imported (from Klaviyo) and needing a person's review before it can be sent; see `features::klaviyo_import::review`.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -149,6 +152,9 @@ pub struct FlowRow {
     #[sqlx(default)]
     #[serde(skip)]
     pub link_tag_defaults: Option<Value>,
+    /// Imported and needing review before it can go live; see `features::klaviyo_import::review`.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -165,6 +171,9 @@ pub struct FormRow {
     pub submits: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Imported without a sign-up list it could be sure of; can't be published until a list is chosen.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
