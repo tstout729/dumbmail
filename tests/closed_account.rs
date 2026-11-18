@@ -331,3 +331,22 @@ async fn a_transactional_retry_for_a_closed_account_is_settled_not_left_queued()
     assert_eq!(send, "skipped");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_closed_accounts_klaviyo_import_does_not_run() {
+    let Some(mut h) = harness_signed().await else { return };
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let import = Uuid::now_v7();
+    sqlx::query("INSERT INTO klaviyo_imports (id, account_id, status) VALUES ($1, $2, 'importing')").bind(import).bind(acct).execute(&h.state.db).await.unwrap();
+    // The kinds the import module really queues.
+    for kind in [dumbmail::features::klaviyo_import::store::JOB_RUN, dumbmail::features::klaviyo_import::store::JOB_SURVEY] {
+        dumbmail::jobs::enqueue_background(&h.state.db, kind, json!({"import_id": import}), None).await.unwrap();
+    }
+    close(&h, acct).await;
+    sqlx::query("DELETE FROM jobs WHERE kind = $1").bind(dumbmail::features::team::google_link::RELEASE_NUMBERS_JOB).execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::drain(&h.state).await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM klaviyo_imports WHERE id = $1").bind(import).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "importing", "nothing ran for the closed account's import");
+    h.cleanup().await;
+}

@@ -126,6 +126,9 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("inbox_auto_send", "id", "SELECT account_id FROM sms_auto_sends WHERE id = $1"),
     ("inbox_digest", "account_id", "SELECT $1::uuid"),
     ("coupons_alert", "coupon_id", "SELECT account_id FROM coupons WHERE id = $1"),
+    ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
+    ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
+    ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).
