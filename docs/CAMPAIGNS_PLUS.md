@@ -6,8 +6,10 @@ archiving for campaigns, flows and templates, and a calendar of campaigns.
 ## Link tagging (UTM)
 
 When it's on, every web link in a campaign or flow email gets UTM parameters, so your analytics
-tool can tell which email brought a visitor. Text messages aren't tagged yet: a tracked link in a
-text carries the whole destination, so tags could make the text longer and cost another segment.
+tool can tell which email brought a visitor. Links in text messages get them too when they're
+shortened (Settings → Texting, on by default; see the short links doc): a short link is the same
+length whatever it points to, so tags cost nothing. A text link that keeps the long tracked form
+carries its whole destination, so it isn't tagged (tags could cost another segment).
 
 - Turn it on and set the values in Settings → Tracking (`GET`/`PUT /api/link-tags`, MCP
   `get_link_tagging` / `update_link_tagging`). Off by default.
@@ -29,7 +31,8 @@ text carries the whole destination, so tags could make the text longer and cost 
 - `GET /api/campaigns/{id}/link-tags` shows what its links will get, with the variables filled in
   (`preview`, like `utm_source=dumbmail&utm_medium=email&utm_campaign=...`).
 
-What gets tagged: the destination of each link that click tracking wraps in an email's HTML. Only
+What gets tagged: the destination of each link that click tracking wraps in an email's HTML, and of
+each short link in a text. Only
 `http` and `https` links. Never DumbMail's own links (unsubscribe, preferences, view online,
 tracking, and older DumbMail link hosts that still work),
 `mailto:` or `tel:` links, or a skipped domain. A parameter the link already has is kept, not
