@@ -101,7 +101,7 @@ pub fn validate(n: &Node) -> AppResult<()> {
         if crate::features::coupons::template::may_use_coupons(&json!(v)) {
             return Err(AppError::bad(format!("notification {}: coupon codes can't go in notifications", n.id)));
         }
-        crate::render::render_str(v, &json!({"person": {"properties": {}}, "event": {}}), false)
+        crate::render::render_str(v, &json!({"person": {"properties": {}}, "event": {"properties": {}}}), false)
             .map_err(|e| AppError::bad(format!("notification {} {k}: {}", n.id, e.public_message())))?;
     }
     Ok(())
@@ -140,10 +140,17 @@ const ALLOWED: &str = "(EXISTS (SELECT 1 FROM memberships m JOIN users u ON u.id
 const BAD_ADDRESS: &str = "(EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND email = $2 AND email_suppressed_reason IS NOT NULL)
      OR EXISTS (SELECT 1 FROM messages WHERE account_id = $1 AND to_address = $2 AND (status = 'complained' OR (status = 'bounced' AND bounce_type = 'Permanent'))))";
 
-/// Ask outside addresses to confirm (team members' addresses need nothing). New addresses get a
-/// confirmation email; `resend` sends another to one still waiting, at most once an hour. Returns
-/// each address's status: team, confirmed, pending (a link was sent) or waiting (sent recently).
-pub async fn request_confirmations(state: &AppState, account_id: Uuid, emails: &[String], resend: bool) -> AppResult<Vec<(String, &'static str)>> {
+/// Confirmation emails an account may send in 24 hours.
+pub const MAX_CONFIRMATIONS_PER_DAY: i64 = 50;
+
+/// Ask outside addresses to confirm (team members' addresses need nothing). An address never seen
+/// gets a confirmation email; `ask_again` (someone added the address by hand) sends another to one
+/// still waiting or removed earlier. Each address gets at most one an hour and each account at most
+/// [`MAX_CONFIRMATIONS_PER_DAY`] a day; addresses that bounced or complained, and accounts whose
+/// sending is paused, get none. Returns each address's status: team, confirmed, pending (a link was
+/// sent), waiting (one was sent within the hour, or it was removed and saving a flow doesn't ask
+/// again) or unreachable.
+pub async fn request_confirmations(state: &AppState, account_id: Uuid, emails: &[String], ask_again: bool) -> AppResult<Vec<(String, &'static str)>> {
     let emails: Vec<String> = emails.iter().filter_map(|e| normalize_email(e)).collect::<HashSet<_>>().into_iter().collect();
     let team = team_addresses(&state.db, account_id, &emails).await?;
     let mut out = Vec::new();
@@ -153,30 +160,58 @@ pub async fn request_confirmations(state: &AppState, account_id: Uuid, emails: &
             continue;
         }
         let mut tx = state.db.begin().await?;
-        // One at a time per account, so the pending limit holds.
-        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
-        let existing: Option<(Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> =
-            sqlx::query_as("SELECT confirmed_at, requested_at FROM flow_notify_addresses WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).fetch_optional(&mut *tx).await?;
-        let status = match existing {
-            Some((Some(_), _)) => "confirmed",
-            Some((None, requested)) => {
-                if resend && requested < Utc::now() - chrono::Duration::hours(1) {
-                    sqlx::query("UPDATE flow_notify_addresses SET requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL").bind(account_id).bind(&e).execute(&mut *tx).await?;
-                    crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
-                    "pending"
-                } else {
-                    "waiting"
-                }
-            }
+        // One at a time per account, so the limits below hold.
+        let paused: bool = sqlx::query_scalar("SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
+        type Known = (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>);
+        let existing: Option<Known> =
+            sqlx::query_as("SELECT confirmed_at, removed_at FROM flow_notify_addresses WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).fetch_optional(&mut *tx).await?;
+        if let Some((Some(_), None)) = existing {
+            out.push((e, "confirmed"));
+            continue;
+        }
+        let bad: bool = sqlx::query_scalar(&format!("SELECT {BAD_ADDRESS}")).bind(account_id).bind(&e).fetch_one(&mut *tx).await?;
+        if bad {
+            out.push((e, "unreachable"));
+            continue;
+        }
+        match existing {
             None => {
-                let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_addresses WHERE account_id = $1 AND confirmed_at IS NULL").bind(account_id).fetch_one(&mut *tx).await?;
+                let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_addresses WHERE account_id = $1 AND confirmed_at IS NULL AND removed_at IS NULL")
+                    .bind(account_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
                 if pending >= MAX_PENDING {
                     return Err(AppError::LimitReached(format!("{MAX_PENDING} addresses are already waiting to confirm; remove some before adding more")));
                 }
                 sqlx::query("INSERT INTO flow_notify_addresses (account_id, email) VALUES ($1, $2)").bind(account_id).bind(&e).execute(&mut *tx).await?;
-                crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
-                "pending"
             }
+            Some((_, removed)) => {
+                if !ask_again {
+                    tx.commit().await?;
+                    out.push((e, "waiting"));
+                    continue;
+                }
+                if removed.is_some() {
+                    sqlx::query("UPDATE flow_notify_addresses SET removed_at = NULL, confirmed_at = NULL, requested_at = now() WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).execute(&mut *tx).await?;
+                }
+            }
+        }
+        let (this_hour, today): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE email = $2 AND sent_at > now() - interval '1 hour'), count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'",
+        )
+        .bind(account_id)
+        .bind(&e)
+        .fetch_one(&mut *tx)
+        .await?;
+        let status = if paused || this_hour > 0 {
+            "waiting"
+        } else if today >= MAX_CONFIRMATIONS_PER_DAY {
+            tx.commit().await?;
+            return Err(AppError::LimitReached(format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow")));
+        } else {
+            sqlx::query("INSERT INTO flow_notify_confirm_sends (account_id, email) VALUES ($1, $2)").bind(account_id).bind(&e).execute(&mut *tx).await?;
+            crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
+            "pending"
         };
         tx.commit().await?;
         out.push((e, status));
@@ -189,7 +224,7 @@ pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Res
     let (Some(account_id), Some(email)) = (payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()), payload["email"].as_str()) else { return Ok(()) };
     let token = crate::auth::random_token(32);
     let updated: Option<String> = sqlx::query_scalar(
-        "UPDATE flow_notify_addresses SET token_hash = $3, requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL RETURNING email",
+        "UPDATE flow_notify_addresses SET token_hash = $3, requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND removed_at IS NULL RETURNING email",
     )
     .bind(account_id)
     .bind(email)
@@ -214,7 +249,7 @@ pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Res
 pub async fn link_account(db: &PgPool, token: &str) -> sqlx::Result<Option<(String, String)>> {
     sqlx::query_as(&format!(
         "SELECT ac.name, a.email FROM flow_notify_addresses a JOIN accounts ac ON ac.id = a.account_id
-         WHERE a.token_hash = $1 AND a.confirmed_at IS NULL AND a.requested_at > now() - interval '{LINK_DAYS} days'"
+         WHERE a.token_hash = $1 AND a.confirmed_at IS NULL AND a.removed_at IS NULL AND a.requested_at > now() - interval '{LINK_DAYS} days'"
     ))
     .bind(crate::auth::sha256_hex(token))
     .fetch_optional(db)
@@ -225,7 +260,7 @@ pub async fn link_account(db: &PgPool, token: &str) -> sqlx::Result<Option<(Stri
 pub async fn confirm(db: &PgPool, token: &str) -> sqlx::Result<Option<(String, String)>> {
     sqlx::query_as(&format!(
         "UPDATE flow_notify_addresses a SET confirmed_at = now(), token_hash = NULL FROM accounts ac
-         WHERE ac.id = a.account_id AND a.token_hash = $1 AND a.confirmed_at IS NULL AND a.requested_at > now() - interval '{LINK_DAYS} days'
+         WHERE ac.id = a.account_id AND a.token_hash = $1 AND a.confirmed_at IS NULL AND a.removed_at IS NULL AND a.requested_at > now() - interval '{LINK_DAYS} days'
          RETURNING ac.name, a.email"
     ))
     .bind(crate::auth::sha256_hex(token))
@@ -235,18 +270,18 @@ pub async fn confirm(db: &PgPool, token: &str) -> sqlx::Result<Option<(String, S
 
 pub async fn list_addresses(db: &PgPool, account_id: Uuid) -> AppResult<Vec<Value>> {
     let rows: Vec<(String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> =
-        sqlx::query_as("SELECT email, confirmed_at, requested_at FROM flow_notify_addresses WHERE account_id = $1 ORDER BY email LIMIT 500").bind(account_id).fetch_all(db).await?;
+        sqlx::query_as("SELECT email, confirmed_at, requested_at FROM flow_notify_addresses WHERE account_id = $1 AND removed_at IS NULL ORDER BY email LIMIT 500").bind(account_id).fetch_all(db).await?;
     Ok(rows
         .into_iter()
         .map(|(email, confirmed_at, requested_at)| json!({"email": email, "status": if confirmed_at.is_some() { "confirmed" } else { "pending" }, "confirmed_at": confirmed_at, "requested_at": requested_at}))
         .collect())
 }
 
-/// The status of each address for notifications: team, confirmed, pending or new (never asked).
+/// The status of each address for notifications: team, confirmed, pending, removed or new (never asked).
 pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppResult<Vec<Value>> {
     let emails: Vec<String> = emails.iter().filter_map(|e| normalize_email(e)).take(50).collect();
     let team = team_addresses(db, account_id, &emails).await?;
-    let known: Vec<(String, bool)> = sqlx::query_as("SELECT email, confirmed_at IS NOT NULL FROM flow_notify_addresses WHERE account_id = $1 AND email = ANY($2)")
+    let known: Vec<(String, bool, bool)> = sqlx::query_as("SELECT email, confirmed_at IS NOT NULL, removed_at IS NOT NULL FROM flow_notify_addresses WHERE account_id = $1 AND email = ANY($2)")
         .bind(account_id)
         .bind(&emails)
         .fetch_all(db)
@@ -258,8 +293,9 @@ pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppRe
                 "team"
             } else {
                 match known.iter().find(|k| &k.0 == e) {
-                    Some((_, true)) => "confirmed",
-                    Some((_, false)) => "pending",
+                    Some((_, _, true)) => "removed",
+                    Some((_, true, _)) => "confirmed",
+                    Some((_, false, _)) => "pending",
                     None => "new",
                 }
             };
@@ -270,7 +306,14 @@ pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppRe
 
 pub async fn remove_address(db: &PgPool, account_id: Uuid, email: &str) -> AppResult<bool> {
     let email = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
-    Ok(sqlx::query("DELETE FROM flow_notify_addresses WHERE account_id = $1 AND email = $2").bind(account_id).bind(&email).execute(db).await?.rows_affected() > 0)
+    // Kept as removed, so adding it again is held to the same limits as asking again.
+    Ok(sqlx::query("UPDATE flow_notify_addresses SET removed_at = now(), confirmed_at = NULL, token_hash = NULL WHERE account_id = $1 AND email = $2 AND removed_at IS NULL")
+        .bind(account_id)
+        .bind(&email)
+        .execute(db)
+        .await?
+        .rows_affected()
+        > 0)
 }
 
 /// When a flow is saved: outside fixed addresses in its notification steps that were never asked

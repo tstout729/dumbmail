@@ -8,9 +8,21 @@ CREATE TABLE flow_notify_addresses (
     token_hash    text,
     requested_at  timestamptz NOT NULL DEFAULT now(),
     confirmed_at  timestamptz,
+    -- Removed addresses are kept (without their confirmation), so removing and adding one again
+    -- can't be used to send it link after link.
+    removed_at    timestamptz,
     created_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (account_id, email)
 );
+
+-- Every confirmation email sent, for the hourly per-address and daily per-account limits.
+CREATE TABLE flow_notify_confirm_sends (
+    id         bigserial PRIMARY KEY,
+    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email      text NOT NULL,
+    sent_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX flow_notify_confirm_sends_idx ON flow_notify_confirm_sends (account_id, sent_at);
 CREATE UNIQUE INDEX flow_notify_addresses_token_uq ON flow_notify_addresses (token_hash) WHERE token_hash IS NOT NULL;
 
 -- One row per run, step and recipient: the claim, written before the provider call.

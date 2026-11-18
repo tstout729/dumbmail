@@ -143,15 +143,33 @@ pub fn parse(n: &Node) -> AppResult<Option<Plan>> {
     Ok(Some(Plan { at, weekdays, until, recompute_zone }))
 }
 
+/// Dates outside these years are treated as unreadable (event properties can hold anything, and
+/// date arithmetic must never overflow).
+const MIN_YEAR: i32 = 1900;
+const MAX_YEAR: i32 = 2200;
+/// Longest plain wait this module computes with (ten years).
+const MAX_WAIT_SECS: f64 = 10.0 * 366.0 * 86400.0;
+
+fn sane(t: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    (MIN_YEAR..MAX_YEAR).contains(&t.year()).then_some(t)
+}
+
 /// A date or date-time from a property, in `tz` when it has no zone of its own. A date alone is the
-/// start of that day.
+/// start of that day. Dates before 1900 or after 2199 count as unreadable.
 pub fn parse_when(v: &Value, tz: Tz) -> Option<DateTime<Utc>> {
+    parse_when_any(v, tz).and_then(sane)
+}
+
+fn parse_when_any(v: &Value, tz: Tz) -> Option<DateTime<Utc>> {
     let s = match v {
         Value::String(s) => s.trim(),
         // Unix seconds (or milliseconds, for numbers that big).
         Value::Number(n) => {
-            let x = n.as_f64()?;
+            let x = n.as_f64().filter(|x| x.is_finite())?;
             let secs = if x.abs() > 1e11 { x / 1000.0 } else { x };
+            if secs.abs() > 1e13 {
+                return None;
+            }
             return DateTime::from_timestamp(secs as i64, 0);
         }
         _ => return None,
@@ -163,11 +181,14 @@ pub fn parse_when(v: &Value, tz: Tz) -> Option<DateTime<Utc>> {
         return Some(t.with_timezone(&Utc));
     }
     for f in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
-        if let Ok(n) = NaiveDateTime::parse_from_str(s, f) {
+        if let Ok(n) = NaiveDateTime::parse_from_str(s, f).map_err(|_| ()).and_then(|n| if (MIN_YEAR..MAX_YEAR).contains(&n.year()) { Ok(n) } else { Err(()) }) {
             return Some(clock::local_instant(tz, n.date(), (n.time().num_seconds_from_midnight() / 60) as u32));
         }
     }
     let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok())?;
+    if !(MIN_YEAR..MAX_YEAR).contains(&d.year()) {
+        return None;
+    }
     Some(clock::local_instant(tz, d, 0))
 }
 
@@ -181,21 +202,27 @@ pub fn end(plan: &Plan, amount_secs: f64, from: DateTime<Utc>, tz: Tz, context: 
     let base = match &plan.until {
         Some(u) => {
             let root = if u.event { context.get("event").and_then(|e| e.get("properties")).unwrap_or(&Value::Null) } else { profile_props };
-            parse_when(lookup(root, &u.path)?, tz)? + Duration::seconds(u.offset_secs)
+            parse_when(lookup(root, &u.path)?, tz)?.checked_add_signed(Duration::seconds(u.offset_secs))?
         }
-        None => from + Duration::milliseconds((amount_secs * 1000.0) as i64),
+        None => after(from, amount_secs)?,
     };
-    Some(align(plan, base, tz))
+    align(plan, base, tz)
 }
 
-/// Move `base` forward to the time of day and allowed weekday a plan asks for.
-pub fn align(plan: &Plan, base: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
-    let mut t = base;
+/// `from` plus `secs` (at most ten years), or None if that can't be represented.
+pub fn after(from: DateTime<Utc>, secs: f64) -> Option<DateTime<Utc>> {
+    from.checked_add_signed(Duration::milliseconds((secs.clamp(0.0, MAX_WAIT_SECS) * 1000.0) as i64)).and_then(sane)
+}
+
+/// Move `base` forward to the time of day and allowed weekday a plan asks for. None for a moment
+/// outside the years dates may take.
+pub fn align(plan: &Plan, base: DateTime<Utc>, tz: Tz) -> Option<DateTime<Utc>> {
+    let mut t = sane(base)?;
     if let Some(at) = plan.at {
         let day = t.with_timezone(&tz).date_naive();
         t = clock::local_instant(tz, day, at);
         if t < base {
-            t = clock::local_instant(tz, day + Duration::days(1), at);
+            t = clock::local_instant(tz, day.succ_opt()?, at);
         }
     }
     if let Some(mask) = plan.weekdays {
@@ -206,10 +233,10 @@ pub fn align(plan: &Plan, base: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
             if mask & (1 << local.weekday().num_days_from_monday()) != 0 {
                 break;
             }
-            t = clock::local_instant(tz, local.date_naive() + Duration::days(1), minute);
+            t = clock::local_instant(tz, local.date_naive().succ_opt()?, minute);
         }
     }
-    t
+    sane(t)
 }
 
 fn amount_secs(n: &Node) -> f64 {
@@ -263,7 +290,7 @@ pub fn wake(account: &Account, person: &Profile, node: &Node, context: &mut Valu
         }
     }
     // Woken early (a second early is close enough).
-    if target > now + Duration::seconds(1) {
+    if target > now + Duration::seconds(1) && target < now + Duration::days(11 * 366) {
         context["_wait_until"] = json!(target);
         return Some(target);
     }
@@ -396,6 +423,18 @@ mod tests {
             assert_eq!(decide(&cont, &n, now, now, Los_Angeles, &mut c, &json!({})), Wait::Continue, "{ctx}");
             assert!(c.get("_wait_until").is_none());
         }
+    }
+
+    #[test]
+    fn extreme_dates_are_unreadable_not_a_crash() {
+        let plan = parse(&node(json!({"amount": 0, "unit": "days", "at": "10:00", "weekdays": ["mon"], "until": {"field": "event.d", "offset_amount": 366, "offset_unit": "days"}}))).unwrap().unwrap();
+        let now = la(2026, 11, 17, 9, 0);
+        for v in [json!("+262143-12-31"), json!("262143-12-31T23:59:59"), json!(9.9e307), json!(-9.9e307), json!(1e300), json!("9999-12-31"), json!("1000-01-01")] {
+            let ctx = json!({"event": {"properties": {"d": v}}});
+            assert_eq!(end(&plan, 0.0, now, Los_Angeles, &ctx, &json!({})), None, "{v}");
+        }
+        let plain = parse(&node(json!({"amount": 1, "unit": "days", "at": "10:00"}))).unwrap().unwrap();
+        assert!(end(&plain, 1e300, now, Los_Angeles, &json!({}), &json!({})).is_some(), "huge amounts are capped");
     }
 
     #[test]

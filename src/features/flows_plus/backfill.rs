@@ -76,9 +76,11 @@ pub fn place(def: &FlowDef, trigger_at: DateTime<Utc>, now: DateTime<Utc>, tz: T
             if plan.as_ref().is_some_and(|p| p.until.is_some()) {
                 return Some(Placement { node: id, run_at: None, context });
             }
-            let secs = delay::fixed_secs(n).unwrap_or(0.0);
-            let base = t + Duration::milliseconds((secs * 1000.0) as i64);
-            let end = plan.as_ref().map_or(base, |p| delay::align(p, base, tz));
+            let base = delay::after(t, delay::fixed_secs(n).unwrap_or(0.0))?;
+            let end = match &plan {
+                Some(p) => delay::align(p, base, tz)?,
+                None => base,
+            };
             if end > now {
                 context["_waited"] = json!(id);
                 if plan.is_some() {
@@ -469,4 +471,86 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use chrono_tz::America::Los_Angeles;
+
+    fn def(v: Value) -> FlowDef {
+        crate::flows::parse_definition(&v).unwrap()
+    }
+
+    fn la(m: u32, d: u32, h: u32) -> DateTime<Utc> {
+        Los_Angeles.with_ymd_and_hms(2026, m, d, h, 0, 0).unwrap().with_timezone(&Utc)
+    }
+
+    /// Trigger a week before, email, wait 5 days, email, wait 2 days, email.
+    fn countdown() -> FlowDef {
+        def(json!({"entry": "e1", "nodes": [
+            {"id": "e1", "type": "email", "content": {"subject": "a"}, "next": "d1"},
+            {"id": "d1", "type": "delay", "amount": 5, "unit": "days", "next": "e2"},
+            {"id": "e2", "type": "email", "content": {"subject": "b"}, "next": "d2"},
+            {"id": "d2", "type": "delay", "amount": 2, "unit": "days", "next": "e3"},
+            {"id": "e3", "type": "email", "content": {"subject": "c"}, "next": null}]}))
+    }
+
+    #[test]
+    fn places_people_where_their_date_puts_them() {
+        let d = countdown();
+        assert_eq!(plan_days(&d), 7);
+        // Triggered 3 days ago: the first email has passed; they join the 5-day delay with 2 days left.
+        let trig = la(11, 14, 9);
+        let p = place(&d, trig, la(11, 17, 9), Los_Angeles, json!({})).unwrap();
+        assert_eq!(p.node, "d1");
+        assert_eq!(p.run_at, Some(la(11, 19, 9)));
+        assert_eq!(p.context, json!({"_waited": "d1"}), "a plain delay keeps the plain context");
+        // Triggered 6 days ago: the second email has passed too; they wait in the 2-day delay.
+        let p = place(&d, la(11, 11, 9), la(11, 17, 9), Los_Angeles, json!({})).unwrap();
+        assert_eq!((p.node.as_str(), p.run_at), ("d2", Some(la(11, 18, 9))));
+        // Triggered 8 days ago: everything has passed.
+        assert_eq!(place(&d, la(11, 9, 9), la(11, 17, 9), Los_Angeles, json!({})), None);
+    }
+
+    #[test]
+    fn stops_at_splits_and_until_delays() {
+        let d = def(json!({"entry": "d1", "nodes": [
+            {"id": "d1", "type": "delay", "amount": 1, "unit": "days", "next": "c"},
+            {"id": "c", "type": "condition", "condition": {"conditions": []}, "yes": null, "no": null}]}));
+        let p = place(&d, la(11, 10, 9), la(11, 17, 9), Los_Angeles, json!({})).unwrap();
+        assert_eq!((p.node.as_str(), p.run_at), ("c", None));
+        let d = def(json!({"entry": "u", "nodes": [
+            {"id": "u", "type": "delay", "amount": 0, "unit": "days", "until": {"field": "profile.check_in"}, "next": null}]}));
+        assert_eq!(place(&d, la(11, 10, 9), la(11, 17, 9), Los_Angeles, json!({})).unwrap().node, "u");
+        assert_eq!(plan_days(&d), 0);
+    }
+
+    #[test]
+    fn delays_with_a_time_of_day_keep_their_end() {
+        let d = def(json!({"entry": "d1", "nodes": [
+            {"id": "d1", "type": "delay", "amount": 2, "unit": "days", "at": "10:00", "next": "e"},
+            {"id": "e", "type": "email", "content": {"subject": "x"}, "next": null}]}));
+        let p = place(&d, la(11, 16, 9), la(11, 17, 9), Los_Angeles, json!({"date_field": "birthday"})).unwrap();
+        assert_eq!(p.run_at, Some(la(11, 18, 10)));
+        assert_eq!(p.context["_wait_until"], json!(la(11, 18, 10)));
+        assert_eq!(p.context["date_field"], "birthday");
+    }
+
+    #[test]
+    fn finds_the_missed_trigger_day() {
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let today = day(2026, 11, 17);
+        // Birthday Nov 20, triggered 7 days before (Nov 13): missed, within an 8-day window.
+        assert_eq!(missed_trigger_day(day(1990, 11, 20), -7, today, 8), Some(day(2026, 11, 13)));
+        // Triggered today or later: the daily check handles it.
+        assert_eq!(missed_trigger_day(day(1990, 11, 24), -7, today, 8), None);
+        // Too long ago.
+        assert_eq!(missed_trigger_day(day(1990, 11, 1), 0, today, 8), None);
+        // Across the new year.
+        assert_eq!(missed_trigger_day(day(1990, 1, 2), 0, day(2027, 1, 5), 8), Some(day(2027, 1, 2)));
+        // Feb 29 only in leap years.
+        assert_eq!(missed_trigger_day(day(1992, 2, 29), 0, day(2027, 3, 2), 8), None);
+    }
 }
