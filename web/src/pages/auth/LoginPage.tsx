@@ -28,6 +28,8 @@ const googleErrors: Record<string, string> = {
   conflict: "This email is already linked to a different Google account.",
   closed: "No account uses this Google address, and sign-ups are closed.",
   failed: "Couldn't sign you in. Try again.",
+  link_expired: "That Google sign-in expired or was already used. Continue with Google again.",
+  use_password: "A DumbMail login already uses this email address. Log in with its password, or reset the password if you made that login.",
   sso_unavailable: "Single sign-on isn't set up for that email. Use your password or Google.",
   sso_failed: "Your identity provider didn't finish the sign-in. Try again, or ask your admin.",
   sso_expired: "Your single sign-on expired. Try again.",

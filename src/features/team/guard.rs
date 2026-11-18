@@ -97,7 +97,24 @@ fn is_write(method: &Method) -> bool {
 /// Public routes that sign people in or out. They refuse requests from other sites; the ones that
 /// use an existing session also need [`ACCOUNT_HEADER`] when one is signed in.
 fn sign_in_route(path: &str) -> bool {
-    matches!(path, "/api/auth/login" | "/api/auth/signup" | "/api/auth/logout" | "/api/auth/password/forgot" | "/api/auth/password/reset" | "/api/invites/{token}/accept")
+    matches!(
+        path,
+        "/api/auth/login"
+            | "/api/auth/signup"
+            | "/api/auth/logout"
+            | "/api/auth/password/forgot"
+            | "/api/auth/password/reset"
+            | "/api/auth/confirm-email"
+            | "/api/invites/{token}/accept"
+            | "/api/auth/google/link/password"
+            | "/api/auth/google/link/fresh"
+    )
+}
+
+/// Sign-in routes that act on a cookie a Google sign-in left (see `google_link`): only the app's
+/// own pages may call them, so they need an `Origin` (or `Referer`) naming the app.
+fn google_link_route(path: &str) -> bool {
+    matches!(path, "/api/auth/google/link/password" | "/api/auth/google/link/fresh")
 }
 
 /// The host a browser says the request came from: `Origin`, else `Referer`. `Some(None)`: a header
@@ -141,7 +158,7 @@ async fn public_write_refused(state: &AppState, headers: HeaderMap, method: &Met
     if !is_write(method) || !sign_in_route(path) {
         return None;
     }
-    if from_app(state, &headers) == Some(false) {
+    if from_app(state, &headers) == Some(false) || (google_link_route(path) && from_app(state, &headers) != Some(true)) {
         return Some(other_site(state));
     }
     if !uses_session_cookie(&headers) || !matches!(path, "/api/auth/logout" | "/api/invites/{token}/accept") {

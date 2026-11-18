@@ -171,6 +171,16 @@ pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversat
 }
 
 async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
+    // A closed account sends nothing on any channel: campaigns, flows, replies, alerts, tests.
+    if spec.account.closed_at.is_some() {
+        if spec.is_test {
+            return Err(AppError::Conflict("this account is closed, so it can't send".into()));
+        }
+        if let Some(mid) = spec.message_id {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'account closed' WHERE id = $1 AND status IN ('queued', 'sending')").bind(mid).execute(&state.db).await?;
+        }
+        return Ok(Outcome::Skipped("account closed"));
+    }
     let p = spec.profile;
     // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
     let mut send_note: Option<String> = None;
@@ -626,20 +636,23 @@ fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>
 /// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
 /// settled it. None: claimed, send it.
 async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>) -> AppResult<Option<Stop>> {
-    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>);
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool);
     let account = spec.account;
     let mut tx = state.db.begin().await?;
     crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
     let ours = conversational.map(|_| from);
-    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start): Row = sqlx::query_as(&format!(
+    // The account row is held (shared) until the claim commits, so an account closing right now
+    // either finishes first (and this sees it) or waits for this claim.
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed): Row = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
                 p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
                 ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
                 $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
                 (SELECT max(i.provider_received_at) FROM sms_inbound i
-                  WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {})
+                  WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {}),
+                a.closed_at IS NOT NULL
          FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
-         WHERE a.id = $1",
+         WHERE a.id = $1 FOR SHARE OF a",
         crate::features::inbox::store::NO_WINDOW_KINDS
     ))
     .bind(account.id)
@@ -650,7 +663,9 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
     .fetch_one(&mut *tx)
     .await?;
     let help = conversational.is_some_and(|c| c.kind == "help");
-    let stop = if opted_out && !help {
+    let stop = if closed {
+        Some(Stop::Skip("account closed", None))
+    } else if opted_out && !help {
         Some(Stop::Skip("opted out", None))
     } else if consent.is_none() {
         Some(Stop::Skip("profile deleted", None))
@@ -730,6 +745,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             sending_paused_at: None,
             sending_paused_reason: None,
+            closed_at: None,
             email_daily_limit_override: None,
             email_sunset_enabled: true,
             link_domain: None,
