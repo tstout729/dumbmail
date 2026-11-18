@@ -1245,3 +1245,15 @@ fn klaviyos_locale_becomes_the_trusted_language() {
     let p = json!({"id": "01L", "attributes": {"email": "l@x.test", "locale": "French", "subscriptions": {}}});
     assert_eq!(dumbmail::features::klaviyo_import::profiles::parse(&p, false, Uuid::nil()).unwrap().locale, None);
 }
+
+#[tokio::test]
+async fn the_stock_form_and_the_website_script_send_the_browsers_language() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let (_, _, onsite) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[], "").await;
+    assert!(onsite.contains("profile: withLocale(") && onsite.contains("navigator.language"));
+    let (_, _, form) = h.raw("GET", "/client/form-render.js", &[], "").await;
+    assert!(form.contains("data.locale = navigator.language"));
+    h.cleanup().await;
+}
