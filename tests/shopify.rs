@@ -2416,3 +2416,50 @@ async fn closed_accounts_only_get_privacy_requests() {
     assert_eq!((status.as_str(), tok), ("uninstalled", None));
     h.cleanup().await;
 }
+
+// ---------- Before switch-on ----------
+
+/// Item 1: the event's own email and phone come first; the nested customer's contact only when the
+/// event has none, and then nothing is sent because of the event.
+#[tokio::test]
+async fn own_contact_before_the_customer_record() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    live_flow(&mut h, "Placed Order").await;
+    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "NOT_SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    h.drain().await;
+    let ann = profile_id_of(&h, "ann@example.com").await.unwrap();
+    // A new phone on the order, and only the stale email on the customer record: the phone wins.
+    let mut o = order_body(5001, 1, "", chrono::Utc::now());
+    o["email"] = Value::Null;
+    o["phone"] = json!("+15035550123");
+    o["customer"] = json!({"id": 1, "email": "ann@example.com"});
+    hook(&h, "orders/create", "o1", &o).await;
+    h.drain().await;
+    let (_, props, _, owner) = event(&h, "Placed Order", "order:5001").await.unwrap();
+    let by_phone: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE phone_number = '+15035550123'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(owner, by_phone, "the order's own phone, not the customer record's email");
+    assert_ne!(owner, ann);
+    assert!(props.get("$no_contact").is_none());
+    assert_eq!(flow_runs(&h).await, 1);
+    // A checkout with only a shipping phone of its own: that phone.
+    let checkout = json!({"token": "tok1", "email": null, "shipping_address": {"phone": "+15035550124"}, "completed_at": null, "created_at": chrono::Utc::now().to_rfc3339(),
+        "currency": "USD", "total_price": "10.00", "customer": {"id": 1, "email": "ann@example.com"}, "line_items": []});
+    hook(&h, "checkouts/create", "k1", &checkout).await;
+    h.drain().await;
+    let by_ship: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE phone_number = '+15035550124'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(event(&h, "Started Checkout", "checkout:tok1").await.unwrap().3, by_ship);
+    // No contact on the order itself, only on the customer record: recorded, marked, starts nothing.
+    let mut bare = order_body(5002, 2, "", chrono::Utc::now());
+    bare["email"] = Value::Null;
+    bare["customer"] = json!({"id": 2, "email": "cust-only@example.com"});
+    hook(&h, "orders/create", "o2", &bare).await;
+    h.drain().await;
+    let (_, props, _, _) = event(&h, "Placed Order", "order:5002").await.unwrap();
+    assert_eq!(props["$no_contact"], true);
+    assert_eq!(flow_runs(&h).await, 1, "an order without its own contact starts nothing");
+    h.cleanup().await;
+}

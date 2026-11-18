@@ -77,8 +77,12 @@ pub struct Order {
     pub id: i64,
     pub name: Option<String>,
     pub number: Option<i64>,
+    /// The order's own contact (what the buyer gave for this order).
     pub email: Option<String>,
     pub phone: Option<String>,
+    /// The nested customer record's contact: used only when the order has none of its own.
+    pub customer_email: Option<String>,
+    pub customer_phone: Option<String>,
     pub customer_id: Option<i64>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
@@ -162,8 +166,10 @@ impl Order {
             id,
             name: s(&v["name"]),
             number: v["order_number"].as_i64(),
-            email: s(&v["email"]).or_else(|| s(&v["contact_email"])).or_else(|| s(&c["email"])),
-            phone: s(&v["phone"]).or_else(|| s(&c["phone"])),
+            email: s(&v["email"]).or_else(|| s(&v["contact_email"])),
+            phone: s(&v["phone"]),
+            customer_email: s(&c["email"]),
+            customer_phone: s(&c["phone"]),
             customer_id: num_id(&c["id"]),
             first_name: s(&c["first_name"]),
             last_name: s(&c["last_name"]),
@@ -223,6 +229,8 @@ impl Order {
             name,
             email: s(&v["email"]),
             phone: s(&v["phone"]),
+            customer_email: None,
+            customer_phone: None,
             customer_id: num_id(&v["customer"]["id"]),
             first_name: s(&v["customer"]["firstName"]),
             last_name: s(&v["customer"]["lastName"]),
@@ -287,6 +295,33 @@ pub const REFUNDS_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on
 
 /// Orders read per refunds query.
 pub const REFUNDS_PER_QUERY: usize = 5;
+
+/// An email and phone, either the event's own or its nested customer record's.
+#[derive(Clone, Copy)]
+pub struct Contact<'a> {
+    pub email: Option<&'a str>,
+    pub phone: Option<&'a str>,
+}
+
+impl Contact<'_> {
+    fn any(&self) -> bool {
+        self.email.and_then(crate::models::normalize_email).is_some() || self.phone.and_then(crate::models::normalize_phone).is_some()
+    }
+}
+
+/// Who an order or checkout is for. The event's own email and phone come first (so a new phone on
+/// the order is never overridden by a stale email on the customer record). Only when the event has
+/// neither is the nested customer's contact used, and then the event counts as having no contact of
+/// its own: it's recorded, but nothing is sent because of it. With no contact anywhere, the linked
+/// customer's profile, likewise marked.
+#[allow(clippy::too_many_arguments)]
+pub async fn buyer_for(db: &sqlx::PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, own: Contact<'_>, nested: Contact<'_>, first: Option<&str>, last: Option<&str>) -> anyhow::Result<Option<super::customers::Buyer>> {
+    if own.any() {
+        return profile_for(db, account_id, shop, customer_id, own.email, own.phone, first, last).await;
+    }
+    let b = profile_for(db, account_id, shop, customer_id, nested.email, nested.phone, first, last).await?;
+    Ok(b.map(|b| super::customers::Buyer { no_contact: true, ..b }))
+}
 
 pub struct Ctx<'a> {
     pub state: &'a AppState,
@@ -440,7 +475,9 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         }
     }
     let db = &cx.state.db;
-    let Some(buyer) = profile_for(db, cx.account_id, cx.shop, o.customer_id, o.email.as_deref(), o.phone.as_deref(), o.first_name.as_deref(), o.last_name.as_deref()).await? else {
+    let own = Contact { email: o.email.as_deref(), phone: o.phone.as_deref() };
+    let nested = Contact { email: o.customer_email.as_deref(), phone: o.customer_phone.as_deref() };
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, o.customer_id, own, nested, o.first_name.as_deref(), o.last_name.as_deref()).await? else {
         return Ok(());
     };
     let profile_id = buyer.profile_id;
@@ -716,9 +753,11 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     if erased(db, cx.account_id, cx.shop, customer_id, None).await? {
         return Ok(());
     }
-    let email = s(&v["email"]).or_else(|| s(&c["email"]));
-    let phone = s(&v["phone"]).or_else(|| s(&c["phone"])).or_else(|| s(&v["shipping_address"]["phone"]));
-    let Some(buyer) = profile_for(db, cx.account_id, cx.shop, customer_id, email.as_deref(), phone.as_deref(), s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref()).await? else {
+    let (email, phone) = (s(&v["email"]), s(&v["phone"]).or_else(|| s(&v["shipping_address"]["phone"])));
+    let (c_email, c_phone) = (s(&c["email"]), s(&c["phone"]));
+    let own = Contact { email: email.as_deref(), phone: phone.as_deref() };
+    let nested = Contact { email: c_email.as_deref(), phone: c_phone.as_deref() };
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, customer_id, own, nested, s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref()).await? else {
         return Ok(());
     };
     let shop_currency = s(&v["currency"]);
