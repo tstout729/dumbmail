@@ -570,3 +570,126 @@ async fn bigcommerce_webhooks_fetch_what_they_name() {
     never_stored(&mut h, &b, &needles, &names).await;
     h.cleanup().await;
 }
+
+// ---------- Hostaway (a pull, with a paid-in-full pre-arrival flow) ----------
+
+#[derive(Default)]
+struct MockHostaway {
+    tokens: std::sync::atomic::AtomicUsize,
+    /// The reservations the list returns, newest change first.
+    rows: std::sync::Mutex<Vec<Value>>,
+    /// afterId of each list request ("" for the first page).
+    pages: std::sync::Mutex<Vec<String>>,
+}
+
+/// A stand-in for Hostaway's API: `POST /v1/accessTokens` (client credentials, scope general) and
+/// `GET /v1/reservations` (`{"status": "success", "result": [...]}`, newest change first, paged with
+/// `afterId`), as documented.
+async fn mock_hostaway() -> (std::sync::Arc<MockHostaway>, String) {
+    use axum::extract::{Query, State};
+    use axum::routing::{get, post};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    let m: Arc<MockHostaway> = Default::default();
+    let app = axum::Router::new()
+        .route(
+            "/v1/accessTokens",
+            post(|State(m): State<Arc<MockHostaway>>, axum::Form(f): axum::Form<HashMap<String, String>>| async move {
+                assert_eq!(f.get("grant_type").map(String::as_str), Some("client_credentials"));
+                assert_eq!(f.get("scope").map(String::as_str), Some("general"));
+                assert_eq!(f.get("client_id").map(String::as_str), Some("10450"));
+                let n = m.tokens.fetch_add(1, Ordering::SeqCst) + 1;
+                axum::Json(json!({"token_type": "Bearer", "expires_in": 15897600, "access_token": format!("ha-token-{n}")}))
+            }),
+        )
+        .route(
+            "/v1/reservations",
+            get(|State(m): State<Arc<MockHostaway>>, headers: axum::http::HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                assert!(headers.get("authorization").and_then(|v| v.to_str().ok()).is_some_and(|a| a.starts_with("Bearer ha-token-")));
+                let after = q.get("afterId").cloned().unwrap_or_default();
+                m.pages.lock().unwrap().push(after.clone());
+                let rows = m.rows.lock().unwrap().clone();
+                let start = if after.is_empty() { 0 } else { rows.iter().position(|r| r["id"].to_string() == after).map(|i| i + 1).unwrap_or(rows.len()) };
+                let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+                let page: Vec<Value> = rows.into_iter().skip(start).take(limit).collect();
+                axum::Json(json!({"status": "success", "result": page, "count": null, "limit": limit, "offset": null}))
+            }),
+        )
+        .with_state(m.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (m, format!("http://{addr}"))
+}
+
+#[tokio::test]
+async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let (api, base) = mock_hostaway().await;
+    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "hostaway"}))).await;
+    let id = created["integration"]["id"].as_str().unwrap().to_string();
+    let mut pull = created["integration"]["pull"].clone();
+    pull["url"] = json!(format!("{base}/v1/reservations"));
+    pull["auth"]["token_url"] = json!(format!("{base}/v1/accessTokens"));
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"pull": pull, "credentials": {"account_id": "10450", "api_key": "ha-api-key-secret-0001"}}))).await;
+    let pre = created["flows"][0]["id"].as_str().unwrap().to_string();
+    let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
+    assert_eq!(f["status"], "draft");
+    assert_eq!(f["definition"]["settings"]["service_messages"], true);
+    let mut trigger = f["trigger"].clone();
+    trigger["hour"] = json!(0);
+    h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
+    h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
+
+    let first = fixture("hostaway", "pull-first-page.json")["input"]["payload"]["result"].as_array().unwrap().clone();
+    let now = chrono::Utc::now();
+    let stamp = |mins: i64| (now - chrono::Duration::minutes(mins)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let today = now.with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
+    let in_two = (today + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
+    // Robin: paid in full. Guest 20: a balance is still due. Guest 21: cancelled. All arriving in two days.
+    let mut rows: Vec<Value> = first[..3].to_vec();
+    for (i, r) in rows.iter_mut().enumerate() {
+        r["updatedOn"] = json!(stamp(30 + i as i64 * 10));
+        r["arrivalDate"] = json!(in_two);
+    }
+    *api.rows.lock().unwrap() = rows.clone();
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    assert_eq!(events(&h, "Reservation Booked").await, 2);
+    assert_eq!(values(&h, "Reservation Total", "robin.example@example.com").await, vec![867.0]);
+    assert_eq!(events(&h, "Reservation Cancelled").await, 1);
+    // The next run reads back only to the change the last one saw: nothing new, nothing twice.
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    assert_eq!(events(&h, "Reservation Confirmed").await, 2);
+    // Guest 20 pays: a new version arrives, newest first, and is the only one read.
+    let mut paid = rows[1].clone();
+    paid["remainingBalance"] = json!(0);
+    paid["updatedOn"] = json!(stamp(1));
+    rows.insert(0, paid);
+    rows.remove(2);
+    *api.rows.lock().unwrap() = rows;
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    assert_eq!(events(&h, "Reservation Confirmed").await, 3);
+    assert_eq!(api.tokens.load(std::sync::atomic::Ordering::SeqCst), 1, "the token is reused");
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent_to(&h, "See you soon"), vec!["guest20@example.com", "robin.example@example.com"], "paid stays only, once each; none for the cancelled one");
+    // Held back from marketing.
+    assert_eq!(consent(&h, "robin.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "robin.example@example.com").await);
+    // Door codes, lockbox instructions and guest notes never stored or shown, and no access detail in the email.
+    let needles = sensitive("hostaway", &["pull-first-page.json"]);
+    let mail: String = h.state.email.sent().into_iter().map(|m| format!("{} {}", m.subject, m.html)).collect();
+    for n in &needles {
+        assert!(!mail.contains(n.as_str()), "{n:?} reached an email");
+    }
+    let inst = Installed { recipe: "hostaway", id, url: created["integration"]["inbound_url"].as_str().unwrap().into(), sign: Sign::Header("x"), secret: String::new(), flows: vec![] };
+    never_stored(&mut h, &inst, &needles, &[]).await;
+    h.cleanup().await;
+}
