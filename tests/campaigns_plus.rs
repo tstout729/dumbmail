@@ -1120,3 +1120,31 @@ async fn stopping_and_deleting_a_started_resend_at_once_keeps_its_slot() {
     }
     h.cleanup().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_insert_that_takes_a_slot_checks_eligibility_itself() {
+    let mut h = harness!();
+    let (acct, _list, orig, _) = sent_original(&mut h, &["a@x.test"]).await;
+    let orig_u: Uuid = orig.parse().unwrap();
+    // Another transaction is taking slot 1 (a resend starting). Making a resend reads the original as
+    // eligible, then waits on that slot.
+    let mut tx = h.state.db.begin().await.unwrap();
+    sqlx::query("INSERT INTO campaign_resends (id, account_id, original_id, target, number, started_at) VALUES ($1, $2, $3, 'no_open', 1, now())")
+        .bind(Uuid::now_v7())
+        .bind(acct)
+        .bind(orig_u)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let state = h.state.clone();
+    let mk = tokio::spawn(async move { resend::create(&state, acct, orig_u, Default::default()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Meanwhile the original stops being eligible (here: it counts as having just finished).
+    sqlx::query("UPDATE campaigns SET finished_at = now() WHERE id = $1").bind(orig_u).execute(&h.state.db).await.unwrap();
+    tx.commit().await.unwrap();
+    let r = mk.await.unwrap();
+    assert!(r.is_err(), "slot 2 isn't taken: the insert itself saw the original was no longer eligible");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_resends WHERE original_id = $1").bind(orig_u).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 1);
+    h.cleanup().await;
+}
