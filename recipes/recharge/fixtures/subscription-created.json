@@ -1,0 +1,76 @@
+{
+  "description": "subscription/created: Subscription Started, found by the Recharge customer id (retried until the customer is known)",
+  "doc": "https://developer.rechargepayments.com/2021-11/subscriptions (the subscription object example; personal data replaced)",
+  "expect": [
+    {
+      "metric": "Subscription Started",
+      "profile": {
+        "if_missing": "retry",
+        "property": "recharge_customer",
+        "value": "43845860"
+      },
+      "properties": {
+        "currency": "USD",
+        "interval_frequency": 15,
+        "interval_unit": "day",
+        "next_charge_scheduled_at": "2020-07-15",
+        "price": 5,
+        "product_title": "Powder Milk 50.00% Off Auto renew",
+        "quantity": 3,
+        "status": "active",
+        "subscription_id": 89559201,
+        "variant_title": "Milk 10 - 500"
+      },
+      "time": "2021-02-25T21:27:19+00:00",
+      "type": "track_event",
+      "unique_id": "recharge:subscription:89559201:started"
+    }
+  ],
+  "input": {
+    "payload": {
+      "subscription": {
+        "address_id": 69282975,
+        "analytics_data": {
+          "utm_params": []
+        },
+        "cancellation_reason": null,
+        "cancellation_reason_comments": null,
+        "cancelled_at": null,
+        "charge_interval_frequency": 15,
+        "created_at": "2021-02-25T21:27:19+00:00",
+        "customer_id": 43845860,
+        "expire_after_specific_number_of_charges": null,
+        "external_product_id": {
+          "ecommerce": "1255183683"
+        },
+        "external_variant_id": {
+          "ecommerce": "3844924611"
+        },
+        "has_queued_charges": true,
+        "id": 89559201,
+        "is_prepaid": false,
+        "is_skippable": true,
+        "is_swappable": false,
+        "max_retries_reached": false,
+        "next_charge_scheduled_at": "2020-07-15",
+        "order_day_of_month": null,
+        "order_day_of_week": null,
+        "order_interval_frequency": 15,
+        "order_interval_unit": "day",
+        "presentment_currency": "USD",
+        "price": 5,
+        "product_title": "Powder Milk 50.00% Off Auto renew",
+        "properties": [],
+        "quantity": 3,
+        "sku": null,
+        "sku_override": false,
+        "status": "active",
+        "updated_at": "2020-07-10T10:30:51+00:00",
+        "variant_title": "Milk 10 - 500"
+      }
+    },
+    "query": {
+      "topic": "subscription/created"
+    }
+  }
+}

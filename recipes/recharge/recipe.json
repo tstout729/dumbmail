@@ -1,0 +1,95 @@
+{
+  "key": "recharge",
+  "name": "Recharge",
+  "category": "Subscriptions",
+  "description": "Recharge subscriptions become events: Subscription Started, Reactivated, Cancelled and Skipped, Upcoming Charge, Charge Paid (with its amount and currency) and Charge Failed, on the subscriber's profile. Subscribers are held back from marketing: Recharge doesn't record a marketing opt-in.",
+  "metrics": [
+    "Subscription Started",
+    "Subscription Reactivated",
+    "Subscription Cancelled",
+    "Subscription Skipped",
+    "Upcoming Charge",
+    "Charge Paid",
+    "Charge Failed"
+  ],
+  "docs": [
+    "https://developer.rechargepayments.com/v2/webhooks_validation",
+    "https://developer.rechargepayments.com/2021-11/webhooks_explained",
+    "https://developer.rechargepayments.com/2021-11/webhooks_endpoints",
+    "https://docs.getrecharge.com/docs/webhooks-overview",
+    "https://docs.getrecharge.com/docs/webhook-payload-examples",
+    "https://developer.rechargepayments.com/2021-11/subscriptions",
+    "https://developer.rechargepayments.com/2021-11/charges",
+    "https://developer.rechargepayments.com/2021-11/customers"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "X-Recharge-Webhook-Signature",
+    "format": "stripe",
+    "tolerance_seconds": 86400
+  },
+  "signature_secret": {
+    "label": "Recharge API Client Secret",
+    "help": "Recharge \u2192 Tools and apps \u2192 API tokens \u2192 your token. The Edit API token page shows the API Client Secret (not the same as the token)."
+  },
+  "credentials": [],
+  "settings": {},
+  "pull": null,
+  "redact": [
+    "**.client_details",
+    "**.payment_methods",
+    "**.payment_method",
+    "**.billing_address",
+    "**.analytics_data"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Recharge, create an API token (Tools and apps \u2192 API tokens) with read access to customers, subscriptions and orders. Save its API Client Secret as the integration's signing secret.",
+    "Create one Recharge webhook per topic with POST https://api.rechargeapps.com/webhooks (header X-Recharge-Version: 2021-11). Add the topic to the end of the webhook URL so DumbMail knows which one it is, for example {\"address\": \"<webhook URL>?topic=charge/paid\", \"topic\": \"charge/paid\"}. The topics: customer/created, customer/updated, subscription/created, subscription/activated, subscription/cancelled, subscription/skipped, charge/upcoming, charge/paid, charge/failed.",
+    "Make a test change in Recharge and check the delivery log. A subscription that arrives before its customer is tried again a few minutes later.",
+    "Subscribers are held back from marketing. The suggested upcoming-charge reminder is a service message about their own subscription, so it still reaches them. Review it and turn it on."
+  ],
+  "flows": [
+    {
+      "name": "Recharge: upcoming charge reminder",
+      "description": "When Recharge says a charge is coming up, tells the subscriber what will be charged and when, so they can skip or change it. A service message about their own subscription.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Upcoming Charge"
+      },
+      "definition": {
+        "entry": "u1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "u1",
+            "type": "email",
+            "name": "Upcoming charge",
+            "next": null,
+            "content": {
+              "subject": "Your next order is coming up",
+              "preheader": "Change or skip it before {{ event.properties.scheduled_at }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your next order ships soon"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, we'll charge {{ event.properties.total_price }} {{ event.properties.currency }} on {{ event.properties.scheduled_at }}.</p><p>Want to skip it or change what's in it? You can do that from your account.</p>"
+                },
+                {
+                  "type": "button",
+                  "text": "Manage my subscription",
+                  "href": "{{ organization.website }}"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
