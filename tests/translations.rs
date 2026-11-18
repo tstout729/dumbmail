@@ -1150,3 +1150,51 @@ async fn one_worker_owns_a_draft_run_and_a_failed_run_still_counts() {
     assert_eq!(used_today(&h).await, used, "nothing was sent, so nothing counts");
     h.cleanup().await;
 }
+
+/// The ledger total charged for machine translation (positive), optionally for one run.
+async fn translation_charges(h: &Harness, run: Option<&str>) -> i64 {
+    let pattern = run.map(|r| format!("translation:{r}:%")).unwrap_or_else(|| "translation:%".into());
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(sum(amount_micros), 0)::bigint FROM ledger WHERE kind = 'translation' AND reference LIKE $1").bind(pattern).fetch_one(&h.state.db).await.unwrap();
+    total.abs()
+}
+
+#[tokio::test]
+async fn a_paid_draft_run_asks_first_and_charges_with_its_drafts() {
+    let Some((mut h, calls)) = draft_harness(1.0).await else { return };
+    h.credit(5.0).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Paid", "content": {"subject": "Hello there", "blocks": [{"type": "heading", "text": "Fresh picks"}]}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    // Without confirm, REST answers with a quote and starts nothing.
+    let q = h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de"}))).await;
+    assert_eq!(q["dry_run"], true, "{q}");
+    assert!(q["price_usd"].as_f64().unwrap() > 0.0);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM translation_jobs").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(runs, 0);
+    // With it, the drafts, the charge and the run's progress land together.
+    let job = h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de", "confirm": true}))).await;
+    let jid = job["id"].as_str().unwrap().to_string();
+    h.drain().await;
+    let charged: i64 = sqlx::query_scalar("SELECT charged_micros FROM translation_jobs WHERE id = $1::uuid").bind(&jid).fetch_one(&h.state.db).await.unwrap();
+    let ledger = translation_charges(&h, Some(&jid)).await;
+    assert!(charged > 0);
+    assert_eq!(ledger, charged, "every charge is in the ledger under the run");
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    assert_eq!(v["summary"]["de"]["machine"], 2);
+    // A replay changes nothing and charges nothing more.
+    let requests = calls.lock().unwrap().requests.len();
+    dumbmail::features::translations::draft::run(&h.state, &json!({"job_id": jid})).await.unwrap();
+    assert_eq!((translation_charges(&h, None).await, calls.lock().unwrap().requests.len()), (ledger, requests));
+    // A batch the balance can't cover writes nothing: no drafts, no charge.
+    let c2 = h.ok("POST", "/api/campaigns", Some(json!({"name": "Broke", "content": {"subject": "Hi again", "blocks": [{"type": "heading", "text": "More"}]}}))).await;
+    let c2id = c2["id"].as_str().unwrap().to_string();
+    let job = h.ok("POST", &format!("/api/translations/campaigns/{c2id}/draft"), Some(json!({"language": "de", "confirm": true}))).await;
+    sqlx::query("UPDATE accounts SET balance_micros = 0").execute(&h.state.db).await.unwrap();
+    h.drain().await;
+    let (status, error, ..) = job_row(&h, job["id"].as_str().unwrap()).await;
+    assert_eq!(status, "failed");
+    assert!(error.unwrap().contains("balance"));
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{c2id}?language=de"), None).await;
+    assert!(v["strings"].as_array().unwrap().iter().all(|s| s["status"] == "missing"), "{v}");
+    assert_eq!(translation_charges(&h, None).await, ledger);
+    h.cleanup().await;
+}

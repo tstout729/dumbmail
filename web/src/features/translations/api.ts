@@ -96,8 +96,11 @@ export function storedTranslations(t: TranslationTarget, language: string) {
   return api<TranslationView>("GET", withQuery(targetPath(t), { language, version: version(t) }));
 }
 
-export function startDraft(t: TranslationTarget, language: string, ids?: string[]) {
-  return api<TranslationRun>("POST", `${targetPath(t)}/draft`, { language, ids, version: version(t) });
+/** What a run would cost, when it costs money (the run starts only after `confirm`). */
+export type DraftQuote = { dry_run: true; strings: number; characters: number; price_usd: number };
+
+export function startDraft(t: TranslationTarget, language: string, ids?: string[], confirm = false) {
+  return api<TranslationRun | DraftQuote>("POST", `${targetPath(t)}/draft`, { language, ids, version: version(t), confirm });
 }
 
 /** A Draft with AI run; polls until it ends. */

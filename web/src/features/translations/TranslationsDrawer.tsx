@@ -4,9 +4,9 @@ import { Link } from "react-router";
 import { Download, Eye, Sparkles, Upload } from "lucide-react";
 import { errorMessage } from "../../api/client";
 import { toast } from "../../lib/toast";
-import { Badge, Button, Drawer, EmptyState, InlineError, Input, Menu, Modal, Select, Skeleton, Textarea } from "../../components/ui";
+import { Badge, Button, ConfirmDialog, Drawer, EmptyState, InlineError, Input, Menu, Modal, Select, Skeleton, Textarea } from "../../components/ui";
 import { downloadCsv } from "../reports/api";
-import { contentApi, languageName, startDraft, storedTranslations, useLanguageSettings, useRun } from "./api";
+import { contentApi, languageName, startDraft, storedTranslations, useLanguageSettings, useRun, type DraftQuote } from "./api";
 import type { TranslationStatus, TranslationString, TranslationTarget, TranslationView } from "./types";
 
 const statusLabel: Record<TranslationStatus, { label: string; tone: "gray" | "amber" | "green" | "red" | "blue" }> = {
@@ -165,11 +165,14 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
       }
     });
 
-  const draft = (ids?: string[]) =>
+  const [quote, setQuote] = useState<{ ids?: string[]; q: DraftQuote } | null>(null);
+  const draft = (ids?: string[], confirm = false) =>
     act(async () => {
       if (!target) return;
-      const r = await startDraft(target, lang, ids);
-      setRunId(r.id);
+      const r = await startDraft(target, lang, ids, confirm);
+      // A run that costs money asks first.
+      if ("dry_run" in r) setQuote({ ids, q: r });
+      else setRunId(r.id);
     });
 
   // A finished run's drafts are added on request, into the content as it is now.
@@ -271,6 +274,20 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
         ))}
       </div>
 
+      {quote ? (
+        <ConfirmDialog
+          title="Draft with AI?"
+          body={`This sends ${quote.q.characters.toLocaleString()} characters (${quote.q.strings} ${quote.q.strings === 1 ? "text" : "texts"}) for machine translation, for $${quote.q.price_usd.toFixed(2)}.`}
+          confirmLabel="Draft them"
+          loading={busy}
+          onConfirm={() => {
+            const ids = quote.ids;
+            setQuote(null);
+            draft(ids, true);
+          }}
+          onClose={() => setQuote(null)}
+        />
+      ) : null}
       {preview ? (
         <Modal title={`Preview in ${languageName(lang)}`} onClose={() => setPreview(null)} size="xl">
           {preview.html ? (
