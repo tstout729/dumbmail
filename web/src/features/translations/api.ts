@@ -11,6 +11,21 @@ const keys = {
   report: (campaignId: string) => ["translations", "report", campaignId] as const,
 };
 
+/** The identity an exported file carries, so it can only be imported back into the same message. */
+export function messageId(t: TranslationTarget | undefined): string {
+  if (!t) return "unsaved";
+  switch (t.kind) {
+    case "campaign":
+      return t.version ? `campaign/${t.id}/${t.version}` : `campaign/${t.id}`;
+    case "flow":
+      return `flow/${t.id}/${t.step}`;
+    case "template":
+      return `template/${t.id}`;
+    case "saved_block":
+      return `saved_block/${t.id}`;
+  }
+}
+
 /** Where a stored message's translations live in the API. */
 export function targetPath(t: TranslationTarget): string {
   switch (t.kind) {
@@ -86,7 +101,8 @@ export const contentApi = {
   apply: <C>(content: C, language: string, strings: { id: string; text: string | null; status?: "reviewed" | "machine" }[]) =>
     api<ContentTranslation<C>>("POST", "/api/translations/apply", { content, language, strings }),
   removeLanguage: <C>(content: C, language: string) => api<ContentTranslation<C>>("POST", "/api/translations/apply", { content, language, remove_language: true }),
-  importFile: <C>(content: C, language: string, format: "xliff" | "csv", data: string) => api<ContentTranslation<C>>("POST", "/api/translations/import", { content, language, format, data }),
+  importFile: <C>(content: C, language: string, format: "xliff" | "csv", data: string, message: string) =>
+    api<ContentTranslation<C>>("POST", "/api/translations/import", { content, language, format, data, message }),
   preview: <C>(channel: "email" | "sms", content: C, language: string) =>
     api<{ subject?: string; html?: string; body?: string; language: string }>("POST", "/api/translations/preview", { channel, content, language }),
 };

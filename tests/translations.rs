@@ -313,7 +313,7 @@ async fn translators_work_round_trips_through_xliff_and_csv() {
 
     // CSV: a row whose default changed since the export is skipped, not applied to the new text.
     let (_, _, csv) = h.raw("GET", &format!("/api/translations/templates/{tid}/export?language=de&format=csv"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
-    assert!(csv.starts_with("id,where,source,translation,status"));
+    assert!(csv.starts_with("message,language,id,where,source,translation,status"), "{csv}");
     let mut content = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
     content["preheader"] = json!("Changed preview");
     h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": content}))).await;
@@ -705,6 +705,8 @@ async fn the_editor_works_on_unsaved_content_without_storing_anything() {
     let (s, _, csv) = h.raw("POST", "/api/translations/export", &[("cookie", h.cookie.clone().unwrap().as_str()), ("content-type", "application/json"), ("origin", "https://pl.test"), ("x-dumbmail-account", &account_id(&h).await.to_string())], &json!({"content": content, "language": "fr", "format": "csv", "name": "News"}).to_string()).await;
     assert_eq!(s, StatusCode::OK, "{csv}");
     let edited = csv.replace("subject,Subject,Hello {{ first_name|default('there') }},,missing", "subject,Subject,Hello {{ first_name|default('there') }},Bonjour {{ first_name|default('there') }},missing");
+    let (s, _) = h.req("POST", "/api/translations/import", Some(json!({"content": content, "language": "fr", "format": "csv", "data": edited, "message": "template/123"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a file for another message is refused");
     let v = h.ok("POST", "/api/translations/import", Some(json!({"content": content, "language": "fr", "format": "csv", "data": edited}))).await;
     assert_eq!(v["import"]["applied"], 2, "{v}");
     assert_eq!(v["content"]["translations"]["fields"]["fr"]["subject"]["text"], "Bonjour {{ first_name|default('there') }}");
@@ -797,7 +799,7 @@ async fn translations_change_only_words_on_every_path() {
     let x = format!("{}<target>{}{}", &x[..target_at], bad[0].1.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"), &x[end..]);
     let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "xliff", "data": x}))).await;
     assert_eq!(v["import"]["refused"][0]["id"], "b0:html", "{v}");
-    let csv = format!("id,where,source,translation,status\nsubject,Subject,\"Hello {{{{ first_name|default('there') }}}}\",\"{}\",missing\n", bad[3].1);
+    let csv = format!("message,language,id,where,source,translation,status\ncampaign/{cid},de,subject,Subject,\"Hello {{{{ first_name|default('there') }}}}\",\"{}\",missing\n", bad[3].1);
     let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "csv", "data": csv}))).await;
     assert_eq!(v["import"]["refused"][0]["id"], "subject", "{v}");
     // A machine draft that adds a link is thrown away; the others are kept.
@@ -1302,5 +1304,49 @@ async fn csv_exports_are_safe_to_open_and_still_round_trip() {
     let text = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["text"].clone();
     assert_eq!(text("subject"), "-50 % aujourd'hui");
     assert_eq!(text("b0:text"), "=Promos");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn imports_go_to_the_message_and_language_they_were_made_for() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr", "de"])).await;
+    // Two templates with the same text at the same place.
+    let mk = json!({"name": "A", "channel": "email", "content": {"subject": "Hello", "blocks": [{"type": "heading", "text": "News"}]}});
+    let a = h.ok("POST", "/api/templates", Some(mk.clone())).await["id"].as_str().unwrap().to_string();
+    let mut mk_b = mk.clone();
+    mk_b["name"] = json!("B");
+    let b = h.ok("POST", "/api/templates", Some(mk_b)).await["id"].as_str().unwrap().to_string();
+    let cookie = h.cookie.clone().unwrap();
+    for format in ["xliff", "csv"] {
+        let (_, _, file) = h.raw("GET", &format!("/api/translations/templates/{a}/export?language=fr&format={format}"), &[("cookie", cookie.as_str())], "").await;
+        let filled = if format == "csv" {
+            file.replace("subject,Subject,Hello,,missing", "subject,Subject,Hello,Bonjour,missing")
+        } else {
+            file.replacen(r#"<target state="new" xml:space="preserve"></target>"#, "<target>Bonjour</target>", 1)
+        };
+        // Into another message, or as another language: refused, and nothing changes.
+        let (s, e) = h.req("POST", &format!("/api/translations/templates/{b}/import"), Some(json!({"language": "fr", "format": format, "data": filled}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{format}: {e}");
+        let (s, e) = h.req("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "de", "format": format, "data": filled}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{format}: {e}");
+        // Into the message and language it was made for: applied.
+        let v = h.ok("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": format, "data": filled}))).await;
+        assert_eq!(v["import"]["applied"], 1, "{format}: {v}");
+    }
+    let v = h.ok("GET", &format!("/api/translations/templates/{b}?language=fr"), None).await;
+    assert_eq!(v["summary"].as_object().map(|m| m.len()), Some(0), "B was never touched: {v}");
+    // A unit whose hash doesn't match the text it claims is skipped.
+    let (_, _, x) = h.raw("GET", &format!("/api/translations/templates/{a}/export?language=fr&format=xliff"), &[("cookie", cookie.as_str())], "").await;
+    let at = x.find(r#"<trans-unit id="b0:text" resname=""#).unwrap() + r#"<trans-unit id="b0:text" resname=""#.len();
+    let tampered = format!("{}00000000{}", &x[..at], &x[at + 8..]).replacen(r#"<target state="new" xml:space="preserve"></target>"#, "<target>Nouvelles</target>", 1);
+    let v = h.ok("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": "xliff", "data": tampered}))).await;
+    assert_eq!(v["import"]["changed_since_export"], json!(["b0:text"]), "{v}");
+    // Malformed XML and DTDs are refused outright.
+    for bad in ["<xliff><file", r#"<!DOCTYPE x [<!ENTITY e "x">]><xliff/>"#] {
+        let (s, _) = h.req("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": "xliff", "data": bad}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
     h.cleanup().await;
 }

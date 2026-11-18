@@ -48,6 +48,25 @@ async fn own_hosts(state: &AppState, account_id: Uuid) -> AppResult<Vec<String>>
     Ok(super::own_hosts(state, Some(&account)))
 }
 
+/// The identity an exported file carries for a stored message: `campaign/<id>[/<version>]`,
+/// `flow/<id>/<step>`, `template/<id>`, `saved_block/<id>`.
+pub fn message_id(t: &Target) -> String {
+    format!("{}/{}{}", t.kind(), t.id(), if t.part().is_empty() { String::new() } else { format!("/{}", t.part()) })
+}
+
+/// The identity for content sent by the editor: what it says (bounded), else "unsaved".
+fn content_message(m: Option<&str>) -> String {
+    m.map(str::trim).filter(|m| !m.is_empty() && m.len() <= 200 && !m.chars().any(char::is_control)).unwrap_or("unsaved").to_string()
+}
+
+fn read_file(format: &str, data: &str) -> AppResult<exchange::Imported> {
+    match format {
+        "xliff" | "xlf" => exchange::from_xliff(data),
+        "csv" => exchange::from_csv(data),
+        o => Err(AppError::bad(format!("format must be xliff or csv (got {o:?})"))),
+    }
+}
+
 // ---------- Account languages ----------
 
 pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
@@ -269,10 +288,9 @@ pub async fn export(state: &AppState, ctx: &Ctx, t: &Target, lang: &str, format:
     match format {
         "xliff" | "xlf" | "" => {
             let g = glossary_lines(state, ctx.account_id, &lang).await?;
-            let original = format!("{}/{}{}", t.kind(), t.id(), if t.part().is_empty() { String::new() } else { format!("/{}", t.part()) });
-            Ok((format!("{base}.{lang}.xlf"), "application/x-xliff+xml; charset=utf-8", exchange::to_xliff(&l.content, &original, &default, &lang, &g)))
+            Ok((format!("{base}.{lang}.xlf"), "application/x-xliff+xml; charset=utf-8", exchange::to_xliff(&l.content, &message_id(t), &default, &lang, &g)))
         }
-        "csv" => Ok((format!("{base}.{lang}.csv"), "text/csv; charset=utf-8", exchange::to_csv(&l.content, &lang)?)),
+        "csv" => Ok((format!("{base}.{lang}.csv"), "text/csv; charset=utf-8", exchange::to_csv(&l.content, &lang, &message_id(t))?)),
         o => Err(AppError::bad(format!("format must be xliff or csv (got {o:?})"))),
     }
 }
@@ -292,15 +310,13 @@ pub struct ImportBody {
 pub async fn import(state: &AppState, ctx: &Ctx, t: &Target, b: ImportBody) -> AppResult<Value> {
     let own = own_hosts(state, ctx.account_id).await?;
     ctx.require(write_perm(t))?;
-    let units = match b.format.as_str() {
-        "xliff" | "xlf" => exchange::from_xliff(&b.data)?,
-        "csv" => exchange::from_csv(&b.data)?,
-        o => return Err(AppError::bad(format!("format must be xliff or csv (got {o:?})"))),
-    };
+    let imported = read_file(&b.format, &b.data)?;
     let s = texts::settings(&state.db, ctx.account_id).await?;
     let cur = store::load(&state.db, ctx.account_id, t).await?;
     let default = default_of(&cur.content, &s);
     let lang = check_lang(state, ctx.account_id, &b.language, &default).await?;
+    imported.check(&message_id(t), &lang)?;
+    let units = imported.units;
     let saved_block = matches!(t, Target::SavedBlock { .. });
     let summary = store::update(&state.db, ctx.account_id, t, scheduled_ok(ctx), |l| {
         let r = exchange::apply(&mut l.content, &lang, &units, &own);
@@ -845,6 +861,10 @@ pub async fn apply(state: &AppState, account_id: Uuid, b: ApplyBody) -> AppResul
 pub struct ExportBody {
     pub content: Value,
     pub language: String,
+    /// Which message this is (`campaign/<id>`, `template/<id>` …), so its file can only be
+    /// imported back into it; leave it out for a message that isn't saved yet.
+    #[serde(default)]
+    pub message: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
     /// For the file name.
@@ -857,15 +877,16 @@ pub async fn export_content(state: &AppState, account_id: Uuid, b: ExportBody) -
     let s = texts::settings(&state.db, account_id).await?;
     let default = default_of(&b.content, &s);
     let lang = locale::normalize(&b.language).ok_or_else(|| AppError::bad("language must be a language tag"))?;
+    let message = content_message(b.message.as_deref());
     let name = b.name.unwrap_or_default();
     let base: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect::<String>().split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
     let base = if base.is_empty() { "message".to_string() } else { base.chars().take(60).collect() };
     match b.format.as_deref().unwrap_or("xliff") {
         "xliff" | "xlf" => {
             let g = glossary_lines(state, account_id, &lang).await?;
-            Ok((format!("{base}.{lang}.xlf"), "application/x-xliff+xml; charset=utf-8", exchange::to_xliff(&b.content, &base, &default, &lang, &g)))
+            Ok((format!("{base}.{lang}.xlf"), "application/x-xliff+xml; charset=utf-8", exchange::to_xliff(&b.content, &message, &default, &lang, &g)))
         }
-        "csv" => Ok((format!("{base}.{lang}.csv"), "text/csv; charset=utf-8", exchange::to_csv(&b.content, &lang)?)),
+        "csv" => Ok((format!("{base}.{lang}.csv"), "text/csv; charset=utf-8", exchange::to_csv(&b.content, &lang, &message)?)),
         o => Err(AppError::bad(format!("format must be xliff or csv (got {o:?})"))),
     }
 }
@@ -875,6 +896,9 @@ pub async fn export_content(state: &AppState, account_id: Uuid, b: ExportBody) -
 pub struct ImportContentBody {
     pub content: Value,
     pub language: String,
+    /// The same `message` the file was exported with.
+    #[serde(default)]
+    pub message: Option<String>,
     pub format: String,
     pub data: String,
 }
@@ -882,15 +906,13 @@ pub struct ImportContentBody {
 pub async fn import_content(state: &AppState, account_id: Uuid, b: ImportContentBody) -> AppResult<Value> {
     let own = own_hosts(state, account_id).await?;
     check_size(&b.content)?;
-    let units = match b.format.as_str() {
-        "xliff" | "xlf" => exchange::from_xliff(&b.data)?,
-        "csv" => exchange::from_csv(&b.data)?,
-        o => return Err(AppError::bad(format!("format must be xliff or csv (got {o:?})"))),
-    };
+    let imported = read_file(&b.format, &b.data)?;
     let s = texts::settings(&state.db, account_id).await?;
     let mut content = b.content;
     let default = default_of(&content, &s);
     let lang = check_lang(state, account_id, &b.language, &default).await?;
+    imported.check(&content_message(b.message.as_deref()), &lang)?;
+    let units = imported.units;
     let summary = exchange::apply(&mut content, &lang, &units, &own);
     if is_message(&content) && summary["applied"].as_u64().unwrap_or(0) > 0 {
         fields::add_language(&mut content, &default, &lang);

@@ -6,7 +6,7 @@ import { errorMessage } from "../../api/client";
 import { toast } from "../../lib/toast";
 import { Badge, Button, ConfirmDialog, Drawer, EmptyState, InlineError, Input, Menu, Modal, Select, Skeleton, Textarea } from "../../components/ui";
 import { downloadCsv } from "../reports/api";
-import { contentApi, languageName, startDraft, storedTranslations, useLanguageSettings, useRun, type DraftQuote } from "./api";
+import { contentApi, languageName, messageId, startDraft, storedTranslations, useLanguageSettings, useRun, type DraftQuote } from "./api";
 import type { TranslationStatus, TranslationString, TranslationTarget, TranslationView } from "./types";
 
 const statusLabel: Record<TranslationStatus, { label: string; tone: "gray" | "amber" | "green" | "red" | "blue" }> = {
@@ -155,7 +155,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
     act(async () => {
       const data = await file.text();
       const format = file.name.toLowerCase().endsWith(".csv") ? "csv" : "xliff";
-      const r = await contentApi.importFile(value, lang, format, data);
+      const r = await contentApi.importFile(value, lang, format, data, messageId(target));
       onChange(r.content);
       const i = r.import;
       if (i) {
@@ -192,7 +192,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
       toast.success(`${drafts.length} machine ${drafts.length === 1 ? "draft" : "drafts"} added; review them before sending`);
     });
 
-  const exportAs = (format: "xliff" | "csv") => act(() => downloadCsv("/api/translations/export", { content: value, language: lang, format, name: name ?? "message" }, `message.${lang}.${format === "csv" ? "csv" : "xlf"}`));
+  const exportAs = (format: "xliff" | "csv") => act(() => downloadCsv("/api/translations/export", { content: value, language: lang, format, name: name ?? "message", message: messageId(target) }, `message.${lang}.${format === "csv" ? "csv" : "xlf"}`));
   const showPreview = () => act(async () => setPreview(await contentApi.preview(channel, value, lang)));
   const machineIds = view.strings.filter((s) => s.status === "machine" || s.status === "check").map((s) => s.id);
   const running = run.data && (run.data.status === "queued" || run.data.status === "running");
