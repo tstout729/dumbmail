@@ -841,8 +841,10 @@ pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Resu
     }
     crate::features::objects::flow::fire_due(state, 2000).await?;
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
-    // Event dates get half the budget; object dates (seeded below) get the rest, so neither starves.
-    let event_share = (seed_budget + 1) / 2;
+    // With live object-date flows too, event dates get half the budget and object dates (seeded
+    // below) the rest, so neither starves; otherwise event dates have all of it, as before.
+    let objects_too: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flows WHERE status = 'live' AND trigger->>'type' = 'object_date')").fetch_one(&state.db).await?;
+    let event_share = if objects_too { (seed_budget + 1) / 2 } else { seed_budget };
     let mut budget = event_share;
     for f in &flows {
         if budget <= 0 {
