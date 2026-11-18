@@ -21,21 +21,23 @@ listing or a service).
 
 ## Asking for reviews
 
-### The starter flow
+### The starter flows
 
-Reviews → **Set up the review flow** (or `create_review_flow`, `POST /api/reviews/flows`) creates a
-draft flow:
+Reviews → Settings → **After an order** or **After a stay** (or `create_review_flow` with `kind`,
+`POST /api/reviews/flows` with `{"kind": "order" | "stay"}`) creates a draft flow:
 
-- Trigger: `Placed Order`, then wait 14 days. If your account records `Fulfilled Order`, `Delivered`
-  or `Delivered Order`, the flow starts from that instead and waits 5 days.
-- Ask for a review of each item in the order (`review_request` step).
-- Wait 7 days, then remind once about the items they haven't reviewed (`review_request` with
-  `reminder: true`). Then it stops.
+- **order** (default): `Placed Order`, then wait 14 days. If your account records `Fulfilled Order`,
+  `Delivered` or `Delivered Order`, the flow starts from that instead and waits 5 days.
+- **stay**: the day after `check_out` at 11am, from the Guesty recipe's `Reservation Confirmed`
+  events (Integrations). A booking that's cancelled (`Reservation Cancelled` with the same
+  `reservation_id`) leaves the flow. The listing (`listing_id`) is what's reviewed; name it with
+  `save_review_product` so the email and widgets show its name.
+- Both ask for a review of each item (`review_request` step), wait 7 days, then remind once about
+  the items they haven't reviewed (`review_request` with `reminder: true`). Then they stop.
 
-Check the emails and turn it on in Flows. For stays, start a flow the same way from your booking
-system's check-out event (sent through the API or an integration): the step reads `listing_id`,
-`listing_name` and `reservation_id` as well as `items`. DumbMail doesn't have a built-in check-out
-metric yet, so there is no stay starter.
+Check the emails and turn it on in Flows. A booking system other than Guesty works the same way
+through the API or an integration: the step reads `listing_id`, `listing_name` and
+`reservation_id` as well as `items`.
 
 ### The `review_request` flow step
 
@@ -57,6 +59,8 @@ metric yet, so there is no stay starter.
 - A review request is marketing: it goes only to people **subscribed** on that channel, through the
   normal send path (billing, sending limits, quiet hours, smart sending and the last opt-out check).
   If the message isn't sent, its new links are dropped so the order can be asked about later.
+  People held back from marketing (`marketing_hold`, such as guests an integration added) are never
+  subscribed, so they're never asked, even in a flow marked as service messages.
 
 ### Email blocks and the tag
 

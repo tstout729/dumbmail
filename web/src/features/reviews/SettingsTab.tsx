@@ -25,15 +25,29 @@ export function SettingsTab() {
 function FlowCard() {
   const create = useCreateReviewFlow();
   const navigate = useNavigate();
+  const make = (kind: "order" | "stay") =>
+    create.mutate(kind, {
+      onSuccess: (f) => {
+        toast.success(f.note);
+        navigate(`/flows/${f.id}`);
+      },
+      onError: (e) => toast.error(e.message),
+    });
   return (
     <Card title="Ask for reviews automatically">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="space-y-3">
         <p className="max-w-2xl text-sm text-zinc-600">
-          Creates a draft flow: 14 days after an order (5 days after delivery, if you record deliveries) it emails a review link for each item, and reminds once a week later if they haven't reviewed. It goes only to people subscribed to email.
+          Creates a draft flow that emails a review link for each item, then reminds once a week later if they haven't reviewed. It goes only to people subscribed to email.
         </p>
-        <Button icon={<Workflow className="size-3.5" />} loading={create.isPending} onClick={() => create.mutate(undefined, { onSuccess: (f) => { toast.success(f.note); navigate(`/flows/${f.id}`); }, onError: (e) => toast.error(e.message) })}>
-          Set up the review flow
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button icon={<Workflow className="size-3.5" />} loading={create.isPending && create.variables === "order"} onClick={() => make("order")}>
+            After an order
+          </Button>
+          <Button icon={<Workflow className="size-3.5" />} loading={create.isPending && create.variables === "stay"} onClick={() => make("stay")}>
+            After a stay
+          </Button>
+        </div>
+        <p className="text-xs text-zinc-500">After an order: 14 days later, or 5 days after delivery if you record deliveries. After a stay: the day after check-out, from your Guesty bookings (Integrations).</p>
       </div>
     </Card>
   );

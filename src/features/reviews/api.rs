@@ -492,12 +492,25 @@ async fn export_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<store
     Ok(([(header::CONTENT_TYPE, "text/csv; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"reviews.csv\"")], Bytes::from(csv)).into_response())
 }
 
-pub async fn create_flow(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
-    let f = requests::starter_flow(&state.db, ctx.account_id).await?;
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlowBody {
+    /// `order` (default) or `stay`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+pub async fn create_flow(state: &AppState, ctx: &Ctx, b: FlowBody) -> AppResult<Value> {
+    let kind = b.kind.as_deref().unwrap_or("order");
+    if !matches!(kind, "order" | "stay") {
+        return Err(AppError::bad("kind must be order or stay"));
+    }
+    let f = requests::starter_flow(&state.db, ctx.account_id, kind).await?;
     audit(state, ctx, "flow.create", Some(&f.id.to_string()), json!({"name": f.name, "from": "reviews"})).await;
     Ok(json!({"id": f.id, "name": f.name, "status": f.status, "trigger": f.trigger, "note": "Created as a draft. Check the emails, then turn it on in Flows."}))
 }
 
-async fn flow_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    Ok(Json(create_flow(&state, &ctx).await?))
+async fn flow_h(State(state): State<AppState>, ctx: Ctx, body: Bytes) -> AppResult<Json<Value>> {
+    let b: FlowBody = if body.is_empty() { FlowBody::default() } else { serde_json::from_slice(&body).map_err(|e| AppError::bad(format!("invalid body: {e}")))? };
+    Ok(Json(create_flow(&state, &ctx, b).await?))
 }

@@ -288,7 +288,12 @@ pub async fn subject_for(db: &PgPool, account_id: Uuid, key: &str, hint: &Hint) 
     let kind = hint.kind.as_deref().filter(|k| ["product", "listing", "service"].contains(k)).unwrap_or("product");
     let (name, image, url, trusted) = match &product {
         Some((t, i, u, v)) => (Some(t.clone()), i.clone(), u.clone(), *v),
-        None => (clean(hint.name.as_deref(), 200), http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), hint.trusted),
+        // Trusted only with a real name: an id alone never becomes a public product name.
+        None => {
+            let name = clean(hint.name.as_deref(), 200);
+            let trusted = hint.trusted && name.is_some();
+            (name, http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), trusted)
+        }
     };
     let id = Uuid::now_v7();
     let q = format!(

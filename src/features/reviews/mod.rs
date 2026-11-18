@@ -168,8 +168,8 @@ fn tools() -> Vec<Value> {
                 "publish": {"type": "boolean", "description": "Publish them (default true) or hold them for moderation."}, "confirm": {"type": "boolean"}}), &["csv"]), false, true),
         tool("get_review_import", "Check a review import", "How far an import got, with the rows it skipped and why.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
         tool("export_reviews_csv", "Export reviews as CSV", "Reviews matching the filters as CSV text (at most 50,000). Reviewers' emails are included only for callers who may read profiles.", obj(filter_props(), &[]), true, false),
-        tool("create_review_flow", "Set up the review request flow", "Create the starter flow as a draft: ask for a review 14 days after Placed Order (5 days after Fulfilled Order or Delivered, when you record those), and remind once a week later if they haven't reviewed.",
-            obj(json!({}), &[]), false, false),
+        tool("create_review_flow", "Set up the review request flow", "Create the starter flow as a draft. kind=order (default): ask 14 days after Placed Order (5 days after Fulfilled Order or Delivered, when you record those). kind=stay: ask the day after check-out, from the Guesty recipe's Reservation Confirmed events (a cancelled booking leaves the flow). Both remind once a week later if they haven't reviewed.",
+            obj(json!({"kind": {"enum": ["order", "stay"]}}), &[]), false, false),
     ]
 }
 
@@ -198,7 +198,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
         "import_reviews_csv" => api::import(state, ctx, from(a.clone())?).await,
         "get_review_import" => io::get_import(state, ctx.account_id, id_arg(a, "id")?).await,
         "export_reviews_csv" => Ok(json!({"csv": api::export(state, ctx, &from(a.clone())?).await?})),
-        "create_review_flow" => api::create_flow(state, ctx).await,
+        "create_review_flow" => api::create_flow(state, ctx, from(a.clone())?).await,
         _ => Err(AppError::not_found("tool")),
     }
 }

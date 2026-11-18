@@ -187,8 +187,9 @@ pub async fn make(state: &AppState, account: &Account, profile_id: Uuid, item: &
         return Ok(Made::Existing(r));
     }
     // What this person sees: their own item's name and image, or the subject's when trusted.
+    let fallback = if subject.kind == "listing" || item.kind.as_deref() == Some("listing") { "your stay" } else { "your purchase" };
     let shown = json!({
-        "name": if subject.trusted { Some(subject.name.clone()) } else { item.name.clone().or(Some(subject.name.clone())) },
+        "name": if subject.trusted { subject.name.clone() } else { item.name.clone().unwrap_or_else(|| fallback.to_string()) },
         "image_url": if subject.trusted { subject.image_url.clone() } else { item.image_url.clone().filter(|u| u.starts_with("https://") || u.starts_with("http://")) },
         "product_id": subject.external_id,
     });
@@ -558,6 +559,12 @@ async fn reviews_block_html(state: &AppState, account: &Account, b: &Value, even
     Ok(html)
 }
 
+/// Template text with any `{% review_link %}` left in it removed, so a render that had no person
+/// to make a link for still works. Text without the tag is returned as it is.
+pub fn strip_tags(source: &str) -> Cow<'_, str> {
+    if source.contains("review_link") { TAG.replace_all(source, "") } else { Cow::Borrowed(source) }
+}
+
 fn replace_tags(v: &mut Value, links: &[(Option<String>, String)]) {
     match v {
         Value::String(s) if s.contains("review_link") => {
@@ -721,11 +728,14 @@ pub async fn send_ask(state: &AppState, account: &Account, person: &Profile, cha
 
 /// The starter flow: ask after an order (or a delivery, when the account records one), and remind
 /// once a week later if they haven't reviewed. Created as a draft.
-pub async fn starter_flow(db: &PgPool, account_id: Uuid) -> AppResult<crate::models::FlowRow> {
+/// `stay`: the day after check-out (at 11am), from the Guesty recipe's "Reservation Confirmed"
+/// events; a cancelled booking leaves the flow. `order` (default): after an order or delivery.
+pub async fn starter_flow(db: &PgPool, account_id: Uuid, kind: &str) -> AppResult<crate::models::FlowRow> {
     let delivered: Option<String> = sqlx::query_scalar("SELECT name FROM metrics WHERE account_id = $1 AND name IN ('Fulfilled Order', 'Delivered', 'Delivered Order') ORDER BY name LIMIT 1")
         .bind(account_id)
         .fetch_optional(db)
         .await?;
+    let stay = kind == "stay";
     let (metric, days) = match &delivered {
         Some(m) => (m.as_str(), 5.0),
         None => ("Placed Order", 14.0),
@@ -735,21 +745,34 @@ pub async fn starter_flow(db: &PgPool, account_id: Uuid) -> AppResult<crate::mod
             "subject": if reminder { "A quick reminder: how was it?" } else { "How did we do, {{ first_name|default('friend') }}?" },
             "preheader": "Your review takes a minute",
             "blocks": [
-                {"type": "heading", "text": if reminder { "Still happy to hear from you" } else { "How was your order?" }},
+                {"type": "heading", "text": if reminder { "Still happy to hear from you" } else if stay { "How was your stay?" } else { "How was your order?" }},
                 {"type": "text", "html": "<p>Tap the stars to tell us what you think. Your review helps other people choose.</p>"},
                 {"type": "review_request", "button_text": "Write a review"}
             ]}})
     };
-    let definition = json!({"entry": "v0", "settings": {"reentry": "always"}, "nodes": [
-        {"id": "v0", "type": "delay", "amount": days, "unit": "days", "next": "v1"},
+    let mut nodes = vec![
+        json!({"id": "v0", "type": "delay", "amount": days, "unit": "days", "next": "v1"}),
         ask("v1", "Ask for a review", false, Some("v2")),
-        {"id": "v2", "type": "delay", "amount": 7.0, "unit": "days", "next": "v3"},
-        ask("v3", "Reminder", true, None)
-    ]});
-    let trigger = json!({"type": "metric", "metric": metric});
+        json!({"id": "v2", "type": "delay", "amount": 7.0, "unit": "days", "next": "v3"}),
+        ask("v3", "Reminder", true, None),
+    ];
+    let trigger = if stay {
+        // The event-date trigger already waits until the day after check-out.
+        nodes.remove(0);
+        json!({"type": "event_date", "metric": "Reservation Confirmed", "field": "check_out", "offset_days": 1, "hour": 11, "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"]})
+    } else {
+        json!({"type": "metric", "metric": metric})
+    };
+    let definition = json!({"entry": if stay { "v1" } else { "v0" }, "settings": {"reentry": "always"}, "nodes": nodes});
     crate::flows::parse_trigger(&trigger)?;
     crate::flows::parse_definition(&definition)?;
-    let name = if delivered.is_some() { "Ask for a review after delivery" } else { "Ask for a review" };
+    let name = if stay {
+        "Ask for a review after check-out"
+    } else if delivered.is_some() {
+        "Ask for a review after delivery"
+    } else {
+        "Ask for a review"
+    };
     Ok(sqlx::query_as("INSERT INTO flows (id, account_id, name, trigger, definition) VALUES ($1, $2, $3, $4, $5) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(account_id)
@@ -786,6 +809,8 @@ mod tests {
         replace_tags(&mut v, &[(None, "https://l/1".into()), (Some("SKU-1".into()), "https://l/2".into())]);
         assert_eq!(v["blocks"][0]["html"], "<a href=\"https://l/1\">a</a> https://l/2");
         assert!(!uses_reviews(&json!({"subject": "s", "blocks": [{"type": "text", "html": "hi"}]})));
+        assert_eq!(strip_tags("Review: {% review_link 'A' %}!"), "Review: !");
+        assert!(matches!(strip_tags("{{ first_name }}"), Cow::Borrowed(_)));
     }
 
     #[test]

@@ -41,7 +41,7 @@ export const reviewsApi = {
   report: (days: number) => api<ReviewReport>("GET", withQuery("/api/reviews/report", { days })),
   importCsv: (input: ImportInput) => api<ImportPreview | ImportRun>("POST", "/api/reviews/import", input),
   getImport: (id: string) => api<ImportRun>("GET", `/api/reviews/imports/${encodeURIComponent(id)}`),
-  createFlow: () => api<{ id: string; name: string; note: string }>("POST", "/api/reviews/flows"),
+  createFlow: (kind: "order" | "stay") => api<{ id: string; name: string; note: string }>("POST", "/api/reviews/flows", { kind }),
 };
 
 export function exportReviews(q: ReviewQuery) {
