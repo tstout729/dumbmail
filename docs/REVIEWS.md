@@ -80,16 +80,50 @@ through the API or an integration: the step reads `listing_id`, `listing_name` a
 
 ### Verified reviews
 
-A review is **verified** ("Verified buyer") when its link came from a purchase DumbMail can trust:
-an event sent by your server, the API or an integration, or `create_review_request` (unless you pass
-`verified: false`). Links made from events a website sent from the browser, or from a campaign
-naming a product, still prove who wrote the review, but not the purchase, so they aren't verified.
+A review is **verified** ("Verified buyer") only when its link is tied to a purchase or stay that a
+trusted source recorded for that person and that item:
+
+- the flow's (or email's) triggering event was recorded by your server, the API or an integration
+  (never the browser), and is a purchase or stay metric: `Placed Order`, `Fulfilled Order`,
+  `Delivered`, `Delivered Order`, an integration's server-only metrics (bookings, orders), or one you
+  list in `purchase_metrics`; or
+- `create_review_request` was given your `order_id` (and not `verified: false`). Without one the
+  request is unverified.
+
+Links made from browser events, from other metrics, or from a campaign naming a product still prove
+who wrote the review, but not the purchase, so they aren't verified. When a verified request comes
+for an order line or item that has an unverified one, the verified one takes its place and the old
+link stops working. Imported reviews never get the badge (see Import).
+
+### Where product details come from
+
+Each of a product's name, image and page address is tracked separately: it's trusted only when the
+catalog, the API, an integration or a server-recorded event supplied that field. Images and
+addresses are loaded or linked (in emails, the review page, the widgets, structured data and the
+dashboard) only when trusted. A name a browser sent is shown as text, and only to the person whose
+own event carried it. A trusted source vouches only for the fields it sends.
 
 ### Links
 
-A link lasts 60 days (`request_days`, 7 to 365) and works once per item. It's a bearer link: the
-page shows only the item's name and image and the person's own review, never an address, order
-total or account details.
+A link lasts 60 days (`request_days`, 7 to 365) and writes one review per item, ever: if the review
+is deleted later (by you or its author), the link can't write another. It's a bearer link: the page
+shows only the item's name and (trusted) image, nothing about the person (no name filled in, nothing
+about their subscriptions), never an address, order total or account details. During the 24-hour
+edit window, the review's own words show only in the browser that wrote it (a cookie set when it
+was submitted); anyone else with the link sees that it was reviewed and can delete it. Every answer
+carries `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+
+### One ask, one message
+
+Each ask, reminder or API "send now" is recorded before anything is sent, and its id is the
+message's id. A step that runs again (a retry, a worker that stopped) finds the message it already
+handed over and doesn't send another; a worker that stopped before the hand-off is replaced after
+10 minutes, and the ask goes once. A request counts as sent only once its message was handed over.
+If the message is skipped or fails, its new requests are dropped, so the order line can be asked
+about later. Right before an ask goes, DumbMail checks again that the person is subscribed on that
+channel, not suppressed and not held back from marketing, with no exception for service-message
+flows, and leaves out items reviewed in the meantime; a reminder whose items were all reviewed
+isn't sent at all.
 
 ## The review page
 
@@ -97,22 +131,31 @@ total or account details.
 - Text is stored as plain text and escaped wherever it's shown. No HTML, and links in reviews aren't
   linked.
 - Photos: up to 5, PNG, JPEG, GIF or WebP, up to 10 MB each. Each is re-encoded as a JPEG of at most
-  1600 pixels a side, which drops EXIF data (including location). Photos are served at
-  `/i/rv/{id}.jpg` with an unguessable id, only while their review is published. Removing a photo or
-  unpublishing the review makes the file unreachable.
-- The default name shown is first name and last initial ("Jane D.").
+  1600 pixels a side, which drops EXIF data (including location). A photo's declared size is checked
+  (at most 40 million pixels) and the five-photo limit applied before anything is decoded, and only
+  a few decodes run at once per account and per server. Photos are served at `/i/rv/{id}.jpg` with
+  an unguessable id, only while their review is published. Removing a photo or unpublishing the
+  review stops it being served; copies already cached by browsers or proxies can still show for up
+  to five minutes.
+- Left empty, the name shown is first name and last initial ("Jane D.").
 - A review never subscribes anyone. If you pick a sign-up form (`subscribe_form_id`), the page offers
   an unticked box; ticking it signs them up through that form, with its list's double opt-in if it
   has one.
 - Rate limits: 30 writes an hour per link and 120 an hour per visitor address.
+- If you set a thank-you coupon, the page says that people who get your emails receive a code for
+  any review, whatever the rating.
 
 ### Public reviews (no link)
 
 Off by default (`public_reviews`). When on, the product widget shows "Write a review". These
 reviews are **unverified**, count only after the writer confirms their email address by tapping a
-button in a confirmation email, are always held for moderation, and are limited to 5 an hour per
-visitor, 3 a day per email address and 30 an hour per product. Unconfirmed ones are deleted after 7
-days. They can't carry photos.
+button in a confirmation email, and are always held for moderation. Limits: 5 an hour per visitor,
+30 an hour per product, one review waiting for confirmation per address per account (addresses are
+compared without case, dots in Gmail addresses or plus tags), and 3 confirmation emails per address
+a day across all accounts. The answer is the same whatever the address (a customer or not,
+suppressed or not, your sending paused or not), the email goes from a background job, and no profile
+is created or changed until the link is used. Unconfirmed reviews are deleted after 7 days. They
+can't carry photos.
 
 ## Moderation
 
@@ -120,13 +163,13 @@ Statuses: `pending`, `published`, `rejected`, `removed` (deleted by its author).
 
 - Auto-publish (`auto_publish`, `auto_publish_min_rating`): verified reviews with at least that many
   stars and nothing flagged. Everything else is held.
-- Flags: profanity, email addresses, phone numbers and links in the text, plus your own
+- Flags: profanity, email addresses, phone numbers and links in the title, text, name and answers, plus your own
   `flag_words`. A flagged review is held and shows why.
 - The queue filters by status, rating, product, verified, photos, source and date (days in your
   account's time zone). Bulk publish and reject, feature (pin), reply, remove single photos.
 - Rejecting needs a reason: `spam`, `offensive`, `personal_info`, `not_about_this`, `fake` or
   `other`. It never deletes. Deleting is separate, can't be undone and needs confirming.
-- Every moderation action is in the audit log.
+- Every moderation action is in the audit log, written in the same transaction as the change, with the ids it changed.
 
 ### Honesty rules (enforced)
 
@@ -175,8 +218,11 @@ screen. Widget traffic isn't billed.
 ### Structured data
 
 On a product page, the product widget adds Google's review snippet markup (`Product` with
-`AggregateRating` and up to 10 `Review`s) from published reviews only, when the product's name came
-from you (catalog, API or a server event) and it is a `product`. Listings and services get none:
+`AggregateRating` and up to 10 `Review`s), built from the same answer as the reviews it shows (the
+first page, default order, no filters): the marked-up reviews are the ones shown there, and the
+rating counts only published reviews collected here. Imported reviews show in the widget but are
+never marked up: Google doesn't allow marking up reviews gathered on other sites. It's added only
+when the product's name came from you (catalog, API or a server event) and it is a `product`. Listings and services get none:
 Google doesn't show stars for a business's reviews of itself. Turn it off with
 `data-structured-data="false"`, or fetch it for your own page template from
 `GET /client/reviews/jsonld?k=SITE_KEY&product_id=ID`.
@@ -185,16 +231,19 @@ Google doesn't show stars for a business's reviews of itself. Turn it off with
 
 | Method | Path | Returns |
 | --- | --- | --- |
-| GET | `/client/reviews?k&product_id&sort&rating&photos&page` | `{product, summary: {average, count, histogram}, reviews, page, pages, per_page, widget, can_write, questions}`. `sort`: `recent`, `highest`, `lowest`, `photos`. |
+| GET | `/client/reviews?k&product_id&sort&rating&photos&after` | `{product, summary: {average, count, histogram}, reviews, next, per_page, widget, can_write, questions, structured_data}`. `sort`: `recent`, `highest`, `lowest` (default: featured first, then newest). Pass `next` as `after` for the next page. |
 | GET | `/client/reviews/summary?k&ids=A,B,C` | `{data: {id: {average, count}}}` for up to 50 products. |
-| GET | `/client/reviews/all?k&page&featured=true&limit` | Every product's published reviews (or the featured ones), with each product's name. |
+| GET | `/client/reviews/all?k&after&featured=true&limit` | Every product's published reviews (or the featured ones), with each product's trusted name. |
 | GET | `/client/reviews/jsonld?k&product_id` | The structured data (404 when there's none). |
 | POST | `/client/reviews/write?k` | A public review `{product_id, email, rating, title, body, name}` (when turned on). |
 
 Only published reviews leave these endpoints, with the display name, date, rating, text, answers,
-photos and reply; never an email address, a profile id or anything unpublished. Answers carry an
-ETag and `Cache-Control: public, max-age=60`. A product's name and picture appear only when they
-came from you.
+photos and reply; never an email address, a profile id or anything unpublished. Imported reviews
+never carry the verified badge here. Answers carry an ETag and `Cache-Control: public, max-age=60`;
+a matching `If-None-Match` is answered from the product summary's version before any list is read.
+Lists are keyset pages and never count rows (counts come from the stored summary), and reads are
+limited to 300 a minute per visitor address. A product's name, picture and page address appear only
+when they came from a trusted source.
 
 ## Segments and flows
 
@@ -228,13 +277,18 @@ reported.
   a CSV export from another reviews app. Columns are matched by common names (product id or handle,
   rating, title, body, name, email, date, verified, photo URLs, reply) and you can map them yourself.
   Without `confirm` it's a dry run: the mapping, a sample and the rows it would skip. It then runs in
-  the background (`get_review_import`). Up to 20,000 rows and 10 MB. Imported reviews keep the date,
-  name and verified flag the file gives, are published (or held, with `publish: false`) and are marked
-  "Imported" in the dashboard. Photo addresses are fetched through the checked path (public addresses
-  only, timeouts, size caps) and re-encoded like uploads. A reviewer's email links the review to an
-  existing profile; it never creates one.
+  the background (`get_review_import`). Up to 20,000 rows and 10 MB. Imported reviews keep the date
+  and name the file gives, are published (or held, with `publish: false`) and are marked "Imported"
+  in the dashboard. They never get the public "Verified buyer" badge: what the file said is kept as
+  "marked verified by the source", shown in the dashboard and the export only. Photo addresses are
+  fetched through the checked path (public addresses only, timeouts, size caps) and re-encoded like
+  uploads; each row is saved together with its photos, and the next batch is queued with the
+  progress, so an import that stops picks up where it left off without skipping a photo or a row. A
+  reviewer's email links the review to an existing profile; it never creates one.
 - **Export** (`export_reviews_csv`, `GET /api/reviews/export` with the list filters): CSV of up to
-  50,000 reviews. Reviewers' emails are included only for people who may read profiles.
+  50,000 reviews. `with_people=true` adds each reviewer's email; that needs an Admin or Owner
+  (`exports.manage`) and profiles read as well as `export`. Every cell a person typed (names, text,
+  replies, emails) is guarded so a spreadsheet won't read it as a formula.
 
 ## API and MCP
 
@@ -249,10 +303,10 @@ reported.
 | GET / PATCH | `/api/reviews/settings` | `get_review_settings`, `update_review_settings` | content.read / reviews.manage |
 | GET / POST | `/api/reviews/products` | `list_review_products`, `save_review_product` | content.read / reviews.manage |
 | POST | `/api/reviews/products/rebuild` | `rebuild_review_summaries` | reviews.manage |
-| POST | `/api/reviews/requests` | `create_review_request` | reviews.manage (+ campaigns.send to send now) |
+| POST | `/api/reviews/requests` | `create_review_request` | reviews.manage and profiles.read (+ campaigns.send to send now) |
 | GET | `/api/reviews/report` | `get_review_report` | analytics.read |
 | POST | `/api/reviews/import`, GET `/api/reviews/imports/{id}` | `import_reviews_csv`, `get_review_import` | catalog.delete |
-| GET | `/api/reviews/export` | `export_reviews_csv` | export |
+| GET | `/api/reviews/export` | `export_reviews_csv` | export (+ exports.manage and profiles.read with `with_people`) |
 | POST | `/api/reviews/flows` | `create_review_flow` | flows.edit |
 
 `reviews.manage` belongs to Managers, Admins and Owners. `moderate_reviews` needs `confirm: true` to
