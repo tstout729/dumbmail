@@ -559,10 +559,29 @@ fn expand_with(state: &AppState, account: &Account, content: &Value, ctx: &Value
 /// every block is hidden for them (the recipient is skipped with [`NOTHING_TO_SHOW`]). Content that
 /// uses nothing from this module comes back as is, without being read further or copied.
 pub async fn prepare<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value) -> AppResult<Option<Cow<'c, Value>>> {
+    // Saved blocks are read first (when the email uses any), so the languages they carry count too.
+    let saved = if uses_content_features(content) { Some(load_saved(&state.db, account.id, &content_refs(content)).await?) } else { None };
+    let saved_langs = saved.as_ref().map(crate::features::translations::saved_languages).unwrap_or_default();
+    // Language versions (see features::translations): the person's language replaces the
+    // translated text, here and in saved blocks. Content without versions is passed on untouched.
+    if let Some((local, lang)) = crate::features::translations::localized(state, account, content, ctx, &saved_langs).await? {
+        let mut saved = saved;
+        if let Some(s) = saved.as_mut() {
+            crate::features::translations::localize_saved(s, &lang, &crate::features::translations::own_hosts(state, Some(account)));
+        }
+        return Ok(prepare_in(state, account, &local, ctx, saved).await?.map(|c| Cow::Owned(c.into_owned())));
+    }
+    prepare_in(state, account, content, ctx, saved).await
+}
+
+async fn prepare_in<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value, saved: Option<SavedMap>) -> AppResult<Option<Cow<'c, Value>>> {
     if !uses_content_features(content) {
         return Ok(Some(Cow::Borrowed(content)));
     }
-    let saved = load_saved(&state.db, account.id, &content_refs(content)).await?;
+    let saved = match saved {
+        Some(s) => s,
+        None => load_saved(&state.db, account.id, &content_refs(content)).await?,
+    };
     let (prepared, shows, rule_errors) = expand_with(state, account, content, ctx, &saved, false)?;
     if rule_errors > 0 {
         tracing::info!(account = %account.id, rules = rule_errors, "display rules couldn't be decided for a recipient; their blocks were hidden");
@@ -673,7 +692,7 @@ pub async fn check_sendable_now(state: &AppState, account: &Account, content: &V
 /// the person in `ctx`. With no particular person (`sample`) and every block hidden for the sample
 /// person, every block is shown; for a real person it's an error that says they'd be skipped.
 pub async fn for_preview<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value, sample: bool) -> AppResult<Cow<'c, Value>> {
-    if !uses_content_features(content) {
+    if !uses_content_features(content) && !crate::features::translations::fields::has_versions(content) {
         return Ok(Cow::Borrowed(content));
     }
     check_sendable_now(state, account, content).await?.map_err(AppError::bad)?;
@@ -769,23 +788,40 @@ pub async fn freeze_campaign(state: &AppState, db: &mut PgConnection, c: &Campai
             ids.extend(content_refs(&v["content"]));
         }
     }
-    if ids.is_empty() {
+    // Language versions (see features::translations) are fixed with the rest of the content.
+    let versioned = c.content.get("translations").is_some() || ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).is_some_and(|vs| vs.iter().any(|v| v["content"].get("translations").is_some()));
+    if ids.is_empty() && !versioned {
         return Ok(None);
     }
     ids.sort();
     ids.dedup();
-    let rows: Vec<(Uuid, String, Value)> = sqlx::query_as("SELECT id, name, blocks FROM saved_blocks WHERE account_id = $1 AND id = ANY($2)")
-        .bind(c.account_id)
-        .bind(&ids)
-        .fetch_all(&mut *db)
-        .await?;
+    let rows: Vec<(Uuid, String, Value)> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, name, blocks FROM saved_blocks WHERE account_id = $1 AND id = ANY($2)").bind(c.account_id).bind(&ids).fetch_all(&mut *db).await?
+    };
     let saved: SavedMap = rows.into_iter().map(|(id, n, b)| (id, (n, b))).collect();
-    let content = freeze_with(&c.content, &saved);
+    let mut content = freeze_with(&c.content, &saved);
     let mut ab_changed = false;
     if let Some(variants) = ab.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
         for v in variants {
             if let Some(next) = freeze_with(&v["content"], &saved) {
                 v["content"] = next;
+                ab_changed = true;
+            }
+        }
+    }
+    // The footer wording each language needs, fixed for this send, so a later edit can't change
+    // what the rest of this campaign's recipients get.
+    let mut all: Vec<&Value> = vec![content.as_ref().unwrap_or(&c.content)];
+    all.extend(ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).into_iter().flatten().map(|v| &v["content"]));
+    if let Some(sys) = crate::features::translations::system_snapshot(&mut *db, &state.cfg.secret_key, c.account_id, c.id, &all).await? {
+        let mut next = content.unwrap_or_else(|| c.content.clone());
+        next["_system"] = sys.clone();
+        content = Some(next);
+        if let Some(variants) = ab.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
+            for v in variants {
+                v["content"]["_system"] = sys.clone();
                 ab_changed = true;
             }
         }
@@ -844,6 +880,10 @@ pub fn relink(content: &Value) -> Value {
     let mut out = content.clone();
     if let Some(list) = out.get_mut("blocks").and_then(|b| b.as_array_mut()) {
         walk(list);
+    }
+    // The copy gets its own footer wording when it's sent (see features::translations).
+    if let Some(o) = out.as_object_mut() {
+        o.remove("_system");
     }
     out
 }

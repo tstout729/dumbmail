@@ -180,6 +180,21 @@ pub struct Config {
     /// PUBLIC_URL. On a different host than PUBLIC_URL, set COOKIE_DOMAIN to a domain covering both.
     #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
     pub google_redirect_base: Option<String>,
+    /// Anthropic API key for machine-translated drafts ("Draft with AI", see
+    /// `features::translations`). Unset: the button is hidden; importing and exporting still work.
+    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
+    pub anthropic_api_key: Option<String>,
+    /// A loopback stand-in for the Anthropic API, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored: the key only ever goes to https://api.anthropic.com.
+    #[arg(skip)]
+    pub anthropic_api_base: Option<String>,
+    /// Most characters one account may send for machine translation per day (its time zone).
+    #[arg(long, env = "TRANSLATION_DAILY_CHARS", default_value_t = 200_000)]
+    pub translation_daily_chars: i64,
+    /// Price per 1,000 machine-translated characters on the hosted service, in dollars (0: free).
+    #[arg(long, env = "PRICE_TRANSLATION_PER_1000_CHARS", default_value_t = 0.0)]
+    pub price_translation_per_1000_chars: f64,
 
     /// Ad audience sync (see docs/AD_AUDIENCES.md). A platform whose app credentials are unset shows
     /// as "not available on this server". Meta app for Facebook Login with the ads_management permission.
