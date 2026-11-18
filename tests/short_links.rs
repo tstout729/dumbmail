@@ -410,3 +410,21 @@ async fn a_text_with_a_link_costs_at_most_one_statement_and_a_campaign_none_per_
     assert_eq!(per_batch[0], per_batch[1], "a campaign's short links cost nothing per recipient");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_code_given_to_another_destination_never_opens_an_old_link() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 7701).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/original").await;
+    launch(&mut h, &id).await;
+    let path = short_paths(&body_to(&h, &phone))[0].clone();
+    assert!(click(&h, &path).await.0.is_redirection());
+    // Cleanup frees the code, and later the same account gets it for another destination.
+    let code = &path[..code::TARGET_LEN];
+    sqlx::query("DELETE FROM short_link_targets WHERE code = $1").bind(code).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO short_link_targets (code, account_id, url) VALUES ($1, $2, 'https://elsewhere.test/new')").bind(code).bind(acct).execute(&h.state.db).await.unwrap();
+    let (s, location, _) = click(&h, &path).await;
+    assert_eq!((s, location), (StatusCode::NOT_FOUND, None), "the old link must not open the new destination");
+    h.cleanup().await;
+}

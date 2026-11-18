@@ -47,7 +47,7 @@ The 24 characters are three parts:
 | --- | --- | --- |
 | Target | 6 | A random code for the destination. One row per destination per account (`short_link_targets`), reused by every text that links there, never one per recipient. |
 | Message | 6 | A random reference written on the text's message row (`messages.short_ref`). |
-| Tag | 12 | HMAC-SHA256 under the server's secret key over the target code and the message's full id, in base 62. |
+| Tag | 12 | HMAC-SHA256 under the server's secret key over the target code, a hash of the destination and the message's full id, in base 62. |
 
 A click on `/s/...` looks up the target and the messages in its account with that reference, keeps
 the one the tag was made for, records the click exactly as a `/t/c/` click is recorded (the
@@ -59,9 +59,10 @@ Old `/t/c/` links keep working.
 
 ### Why 12 characters of tag is enough
 
-The tag ties one destination to one message: changing any character fails, and a valid link for
-one message can't record a click for another (the tag covers the message's full id, not only its
-6-character reference). Target codes and message references aren't secret; the tag is what
+The tag ties one destination to one message: changing any character fails, a valid link for one
+message can't record a click for another (the tag covers the message's full id, not only its
+6-character reference), and a link always goes where it went when it was sent: if cleanup frees a
+code and it's later given to another destination, the old link's tag no longer matches. Target codes and message references aren't secret; the tag is what
 can't be guessed. 12 base-62 characters is 62^12, about 3.2 × 10^21 (71 bits). The click endpoint
 has no rate limit, so assume an attacker sends 100,000 guesses a second for ten years
 (3 × 10^13 guesses): each guess matches with probability at most 1 in 3.2 × 10^21 for each message

@@ -6,13 +6,14 @@
 //!     target  message tag
 //! ```
 //!
-//! The tag is HMAC-SHA256 under the server's secret key over the target code and the message's full
-//! id, so it ties one destination to one message: changing any character, or putting one message's
-//! tag on another message's reference, fails. See docs/SHORT_LINKS.md for why 12 characters is enough.
+//! The tag is HMAC-SHA256 under the server's secret key over the target code, a hash of the
+//! destination and the message's full id, so it ties one destination to one message: changing any
+//! character, putting one message's tag on another message's reference, or a code later given to
+//! another destination (after cleanup freed it) all fail. See docs/SHORT_LINKS.md for why 12 characters is enough.
 
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Letters and digits only: safe in a URL and in every phone's link detection, and one GSM-7
@@ -35,11 +36,13 @@ pub fn is_code(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// The tag for `target` in message `message_id`.
-pub fn tag(secret: &str, target: &str, message_id: Uuid) -> String {
+/// The tag for `target`, going to `url`, in message `message_id`.
+pub fn tag(secret: &str, target: &str, url: &str, message_id: Uuid) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
-    mac.update(b"short-link:v1|");
+    mac.update(b"short-link:v2|");
     mac.update(target.as_bytes());
+    mac.update(b"|");
+    mac.update(&Sha256::digest(url.as_bytes()));
     mac.update(b"|");
     mac.update(message_id.simple().to_string().as_bytes());
     let digest = mac.finalize().into_bytes();
@@ -54,9 +57,10 @@ pub fn tag(secret: &str, target: &str, message_id: Uuid) -> String {
     String::from_utf8(out.to_vec()).expect("ascii")
 }
 
-/// The path after `/s/` for `target` in the message with reference `message_ref` and id `message_id`.
-pub fn path(secret: &str, target: &str, message_ref: &str, message_id: Uuid) -> String {
-    format!("{target}{message_ref}{}", tag(secret, target, message_id))
+/// The path after `/s/` for `target` (going to `url`) in the message with reference `message_ref`
+/// and id `message_id`.
+pub fn path(secret: &str, target: &str, url: &str, message_ref: &str, message_id: Uuid) -> String {
+    format!("{target}{message_ref}{}", tag(secret, target, url, message_id))
 }
 
 /// A path split into target code, message reference and tag, if it has the right shape.
@@ -67,9 +71,10 @@ pub fn split(path: &str) -> Option<(&str, &str, &str)> {
     Some((&path[..TARGET_LEN], &path[TARGET_LEN..TARGET_LEN + REF_LEN], &path[TARGET_LEN + REF_LEN..]))
 }
 
-/// Whether `tag` is the tag for `target` in message `message_id` (compared in constant time).
-pub fn verify(secret: &str, target: &str, message_id: Uuid, tag_given: &str) -> bool {
-    let expected = tag(secret, target, message_id);
+/// Whether `tag` is the tag for `target`, going to `url`, in message `message_id` (compared in
+/// constant time).
+pub fn verify(secret: &str, target: &str, url: &str, message_id: Uuid, tag_given: &str) -> bool {
+    let expected = tag(secret, target, url, message_id);
     expected.len() == tag_given.len() && expected.bytes().zip(tag_given.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
@@ -80,15 +85,16 @@ mod tests {
     #[test]
     fn paths_are_fixed_length_and_verify() {
         let id = Uuid::new_v4();
-        let p = path("k", "Ab12Cd", "Ef34Gh", id);
+        let p = path("k", "Ab12Cd", "https://x.test/a", "Ef34Gh", id);
         assert_eq!(p.len(), PATH_LEN);
         assert!(p.bytes().all(|b| b.is_ascii_alphanumeric()));
         let (t, r, g) = split(&p).unwrap();
         assert_eq!((t, r), ("Ab12Cd", "Ef34Gh"));
-        assert!(verify("k", t, id, g));
-        assert!(!verify("other key", t, id, g));
-        assert!(!verify("k", "Ab12Ce", id, g));
-        assert!(!verify("k", t, Uuid::new_v4(), g));
+        assert!(verify("k", t, "https://x.test/a", id, g));
+        assert!(!verify("k", t, "https://x.test/b", id, g), "the destination is covered");
+        assert!(!verify("other key", t, "https://x.test/a", id, g));
+        assert!(!verify("k", "Ab12Ce", "https://x.test/a", id, g));
+        assert!(!verify("k", t, "https://x.test/a", Uuid::new_v4(), g));
         assert!(split(&p[1..]).is_none());
         assert!(split(&format!("{}-", &p[1..])).is_none());
     }

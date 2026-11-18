@@ -160,7 +160,7 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
     let base = link_base.trim_end_matches('/');
     let links: HashMap<String, String> = dests
         .into_iter()
-        .filter_map(|(l, d)| codes.get(&d).map(|c| (l, format!("{base}/s/{}", code::path(&state.cfg.secret_key, c, &message_ref, message_id)))))
+        .filter_map(|(l, d)| codes.get(&d).map(|c| (l, format!("{base}/s/{}", code::path(&state.cfg.secret_key, c, &d, &message_ref, message_id)))))
         .collect();
     if links.is_empty() {
         return Ok(None);

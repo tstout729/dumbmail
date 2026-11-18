@@ -90,7 +90,7 @@ fn not_found() -> Response {
 async fn click(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     let Some((target, message_ref, tag)) = code::split(&path) else { return not_found() };
     let Ok(rows) = sqlx::query_as::<_, (String, Uuid)>(LOOKUP_SQL).bind(target).bind(message_ref).fetch_all(&state.db).await else { return not_found() };
-    let Some((url, message_id)) = rows.into_iter().find(|(_, id)| code::verify(&state.cfg.secret_key, target, *id, tag)) else { return not_found() };
+    let Some((url, message_id)) = rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag)) else { return not_found() };
     // Only ever a destination the send path stored for this account.
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return not_found();
@@ -141,7 +141,7 @@ async fn update_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<S
 // ---------- Housekeeping ----------
 
 /// Delete targets unused for [`KEEP_DAYS`], in batches; queue another run when there's more.
-async fn cleanup(state: &AppState) -> anyhow::Result<()> {
+pub async fn cleanup(state: &AppState) -> anyhow::Result<()> {
     for _ in 0..CLEANUP_BATCHES_PER_JOB {
         let n = sqlx::query(
             "DELETE FROM short_link_targets WHERE code IN (SELECT code FROM short_link_targets WHERE last_used_at < now() - make_interval(days => $1) ORDER BY last_used_at LIMIT $2)",
