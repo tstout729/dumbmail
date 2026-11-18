@@ -590,3 +590,38 @@ async fn a_reassigned_booking_unlinks_the_old_guest_at_once() {
     assert_eq!(links(&h).await, vec!["cara@example.com"]);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn versions_order_writes_exactly_and_ignored_writes_create_nobody() {
+    let mut h = harness!();
+    h.signup().await;
+    let up = |v: Value| {
+        let mut b = json!({"type": "sub", "external_id": "S1", "fields": v.get("fields").cloned().unwrap_or(json!({})), "as_of": v["as_of"].clone()});
+        if let Some(p) = v.get("profiles") {
+            b["profiles"] = p.clone();
+        }
+        b
+    };
+    let big = "90071992547409930000";
+    let r = h.ok("POST", "/api/objects", Some(up(json!({"fields": {"plan": "pro"}, "as_of": big, "profiles": [{"email": "a@example.com"}]})))).await;
+    assert_eq!(r["result"], "created");
+    // One less than a number a float can't tell apart from it: older, ignored, and its person isn't created.
+    let r = h.ok("POST", "/api/objects", Some(up(json!({"fields": {"plan": "basic"}, "as_of": "90071992547409929999", "profiles": [{"email": "late@example.com"}]})))).await;
+    assert_eq!(r["result"], "older");
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'late@example.com'").await, 0, "an ignored write creates nobody");
+    // The same version again is a duplicate.
+    let r = h.ok("POST", "/api/objects", Some(up(json!({"fields": {"plan": "basic"}, "as_of": big})))).await;
+    assert_eq!(r["result"], "duplicate");
+    // No version: applies, but never lowers the stored one.
+    let r = h.ok("POST", "/api/objects", Some(up(json!({"fields": {"seats": 3}})))).await;
+    assert_eq!(r["result"], "updated");
+    let (plan, as_of): (Option<String>, Option<String>) = sqlx::query_as("SELECT fields->>'plan', as_of FROM objects").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((plan.as_deref(), as_of.as_deref()), (Some("pro"), Some(big)));
+    let r = h.ok("POST", "/api/objects", Some(up(json!({"fields": {"plan": "team"}, "as_of": "90071992547409930001"})))).await;
+    assert_eq!(r["result"], "updated");
+    // A type's versions are one kind: a time after numbers is refused.
+    let (s, e) = h.req("POST", "/api/objects", Some(up(json!({"fields": {"plan": "x"}, "as_of": "2026-11-17T10:00:00Z"})))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(h.req("POST", "/api/objects", Some(up(json!({"as_of": -4})))).await.0, StatusCode::BAD_REQUEST);
+    h.cleanup().await;
+}
