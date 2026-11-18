@@ -61,22 +61,7 @@ fn shortenable(link: &str, own: &HashSet<String>) -> bool {
     !own.contains(&host) && !OPT_OUT_WORDS.iter().any(|w| where_to.contains(w))
 }
 
-/// How much of what the URL pattern found is the link: trailing sentence punctuation (`.` `,` `!`
-/// `?` `;` `:`, quotes, and closing brackets that aren't balanced inside the link) is left out, so
-/// "Shop the sale: https://shop.example/sale." links to `/sale` and keeps its full stop in the text.
-pub fn link_len(found: &str) -> usize {
-    let mut end = found.len();
-    while let Some(last) = found[..end].chars().last() {
-        let link = &found[..end];
-        let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
-        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') {
-            end -= last.len_utf8();
-        } else {
-            break;
-        }
-    }
-    end
-}
+pub use crate::render::sms_link_len as link_len;
 
 /// Where in a text's template each link a send would shorten is written: the link the URL pattern
 /// found, without trailing sentence punctuation ([`link_len`]), outside template tags, at most
@@ -190,9 +175,8 @@ impl SmsLinks for TextLinks {
         replace_literals(template, &self.own, |l| self.links.get(l).cloned())
     }
 
-    fn issued(&self, found: &str) -> bool {
-        // The rendered text's URL pattern also takes the punctuation after a short link.
-        self.issued.contains(&found[..link_len(found)])
+    fn issued(&self, link: &str) -> bool {
+        self.issued.contains(link)
     }
 }
 
@@ -355,8 +339,8 @@ impl SmsLinks for Sample {
         replace_literals(template, &self.own, |_| Some(self.short.clone()))
     }
 
-    fn issued(&self, found: &str) -> bool {
-        found[..link_len(found)] == self.short
+    fn issued(&self, link: &str) -> bool {
+        link == self.short
     }
 }
 

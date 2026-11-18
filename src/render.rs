@@ -76,6 +76,24 @@ pub trait SmsLinks: Sync {
     fn issued(&self, link: &str) -> bool;
 }
 
+/// How much of what the URL pattern found in a text is the link: trailing sentence punctuation
+/// (`.` `,` `!` `?` `;` `:`, quotes, and closing brackets that aren't balanced inside the link) is
+/// left out and stays in the text after it, so "Shop the sale: https://shop.example/sale." links to
+/// `/sale`. Long tracked links and short links (`features::short_links`) end in the same place.
+pub fn sms_link_len(found: &str) -> usize {
+    let mut end = found.len();
+    while let Some(last) = found[..end].chars().last() {
+        let link = &found[..end];
+        let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
+        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -603,7 +621,10 @@ pub fn render_sms_with(account: &Account, content: &SmsContent, ctx: &Value, tra
     let words = URL.replace_all(&body, " ").to_lowercase();
     if let Some(t) = tracking {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| if links.is_some_and(|l| l.issued(&c[0])) { c[0].to_string() } else { tracked_url(t, &c[0]) })
+            .replace_all(&body, |c: &regex::Captures<'_>| {
+                let (link, rest) = c[0].split_at(sms_link_len(&c[0]));
+                if links.is_some_and(|l| l.issued(link)) { c[0].to_string() } else { format!("{}{rest}", tracked_url(t, link)) }
+            })
             .into_owned();
     }
     let lower = body.to_lowercase();
@@ -747,6 +768,24 @@ mod tests {
         let tricky: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "products", "items": [{"title": "{{{ 7*7 }}}{% if 1 %}x{% endif %}"}]}]})).unwrap();
         let out = render_email(&account(), &tricky, &json!({}), None).unwrap();
         assert!(!out.text.contains("49") && out.text.contains("7*7"), "{}", out.text);
+    }
+
+    #[test]
+    fn sms_tracked_links_leave_trailing_punctuation_in_the_text() {
+        let acct = account();
+        let t = Tracking { public_url: "https://pl.test", secret: "s", message_id: Uuid::nil(), unsubscribe_url: "https://pl.test/u/x".into() };
+        let content = SmsContent { body: "Acme: Shop the sale: https://shop.test/sale. Or go https://shop.test/go! (https://en.wikipedia.org/wiki/Foo_(bar))".into(), media_url: None };
+        let body = render_sms(&acct, &content, &json!({}), Some(&t), false).unwrap();
+        let sale = tracked_url(&t, "https://shop.test/sale");
+        let go = tracked_url(&t, "https://shop.test/go");
+        let wiki = tracked_url(&t, "https://en.wikipedia.org/wiki/Foo_(bar)");
+        assert!(body.contains(&format!("Shop the sale: {sale}. Or go {go}! ({wiki})")), "{body}");
+        // What each link records and redirects to is the link without the punctuation.
+        for (link, dest) in [(&sale, "https://shop.test/sale"), (&go, "https://shop.test/go")] {
+            let u = url::form_urlencoded::parse(link.split_once('?').unwrap().1.as_bytes()).find(|(k, _)| k == "u").unwrap().1.into_owned();
+            assert_eq!(u, dest);
+        }
+        assert_eq!(sms_link_len("https://shop.test/a?b=1"), "https://shop.test/a?b=1".len(), "a link with nothing after it is whole");
     }
 
     #[test]

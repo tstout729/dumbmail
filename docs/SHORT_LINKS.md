@@ -20,7 +20,7 @@ them off in Settings → Texting (`PATCH /api/short-links/settings`, MCP
   and closing brackets that aren't balanced inside the link) isn't part of it: it stays in the text
   after the short link. The destination is exactly the characters the short link replaced. So
   "Shop the sale: https://shop.com/sale." shows the short link followed by a full stop and goes to
-  `https://shop.com/sale`.
+  `https://shop.com/sale`. Links that keep the long tracked form end in the same place.
 - Not shortened (they keep the long tracked form, as before): anything a variable or template tag
   produces, even when it's a link written elsewhere in the message (like
   `https://shop.com/?ref={{ email }}` or a product link); links whose address or path contains
