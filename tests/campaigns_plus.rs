@@ -116,6 +116,11 @@ async fn campaign_links_get_utm_tags_and_dumbmail_links_never_do() {
     assert!(destinations(&h.state.email.sent().last().unwrap().html).contains(&"https://shop.test/c?utm_source=newsletter&utm_medium=email&utm_campaign=Custom+one".to_string()));
     send(&mut h, &custom).await;
     assert!(destinations(&h.state.email.sent().last().unwrap().html).contains(&"https://shop.test/c?utm_source=newsletter&utm_medium=email&utm_campaign=Custom+one".to_string()));
+    // A sent campaign shows the tags it went out with, whatever the settings say now.
+    h.ok("PUT", "/api/link-tags", Some(json!({"enabled": false}))).await;
+    let shown = h.ok("GET", &format!("/api/campaigns/{custom}/link-tags"), None).await;
+    assert_eq!((shown["sent"].as_bool(), shown["tagged"].as_bool()), (Some(true), Some(true)), "{shown}");
+    assert_eq!(shown["preview"], "utm_source=newsletter&utm_medium=email&utm_campaign=Custom one");
     // A sent campaign's choice can't change.
     let (st, _) = h.req("PUT", &format!("/api/campaigns/{custom}/link-tags"), Some(json!({"mode": "off"}))).await;
     assert_eq!(st, StatusCode::CONFLICT);

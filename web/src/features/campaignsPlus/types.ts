@@ -53,6 +53,8 @@ export type LinkTags = {
   preview: string | null;
   variables: LinkVariable[];
   note?: string;
+  /** True once the campaign started sending: these are the tags it went out with. */
+  sent?: boolean;
 };
 
 export type ResendTarget = "no_open" | "no_click";

@@ -14,10 +14,10 @@ export function LinkTagsLine({ tags }: { tags: LinkTags }) {
       <Link2 className="mt-0.5 size-3.5 shrink-0 text-zinc-400" />
       {tags.tagged && tags.preview ? (
         <span className="min-w-0">
-          Links will be tagged: <code className="break-all font-mono text-zinc-800">{tags.preview}</code>
+          {tags.sent ? "Links were tagged:" : "Links will be tagged:"} <code className="break-all font-mono text-zinc-800">{tags.preview}</code>
         </span>
       ) : (
-        <span>Links won't be tagged.</span>
+        <span>{tags.sent ? "Links weren't tagged." : "Links won't be tagged."}</span>
       )}
     </p>
   );

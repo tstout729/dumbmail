@@ -558,9 +558,17 @@ pub async fn campaign_tags(state: &AppState, account_id: Uuid, id: Uuid) -> AppR
     let (over, tz): (Option<Value>, String) = sqlx::query_as("SELECT c.link_tags, a.timezone FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(id).fetch_one(&mut *conn).await?;
     let defaults = load_defaults(&mut conn, account_id).await?;
     let over = parse_override(over.as_ref());
-    let version = crate::campaigns::ab_test(&c).map(|_| "a");
-    let frozen = campaign_frozen(defaults.as_ref(), &c, over.as_ref(), version, &local_date(&tz, c.sent_at.unwrap_or_else(Utc::now)));
-    Ok(tags_json(over.as_ref(), defaults.as_ref(), frozen))
+    // Once its audience is fixed, what it was sent with (on its content), not today's settings.
+    let fixed: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL FROM campaigns WHERE id = $1").bind(id).fetch_one(&mut *conn).await?;
+    let frozen = if fixed {
+        c.content.get(CONTENT_KEY).and_then(|v| serde_json::from_value::<Frozen>(v.clone()).ok())
+    } else {
+        let version = crate::campaigns::ab_test(&c).map(|_| "a");
+        campaign_frozen(defaults.as_ref(), &c, over.as_ref(), version, &local_date(&tz, c.sent_at.unwrap_or_else(Utc::now)))
+    };
+    let mut v = tags_json(over.as_ref(), defaults.as_ref(), frozen);
+    v["sent"] = json!(fixed);
+    Ok(v)
 }
 
 fn tags_json(over: Option<&Override>, defaults: Option<&Defaults>, frozen: Option<Frozen>) -> Value {

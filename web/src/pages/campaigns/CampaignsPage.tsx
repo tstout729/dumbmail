@@ -151,7 +151,7 @@ export function CampaignsPage() {
             </option>
           ))}
         </Select>
-        <Select value={channel ?? ""} onChange={(e) => setParam({ channel: e.target.value || null })} aria-label="Channel" className="w-32">
+        <Select value={channel ?? ""} onChange={(e) => setParam({ channel: e.target.value || null })} aria-label="Channel" className="w-40">
           <option value="">Email and SMS</option>
           <option value="email">Email</option>
           <option value="sms">SMS</option>
