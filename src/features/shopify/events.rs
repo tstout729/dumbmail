@@ -184,8 +184,9 @@ pub async fn close_history_now(db: &PgPool, account_id: Uuid) -> sqlx::Result<()
     tx.commit().await
 }
 
-/// Is a page of this account's Shopify history being written now? `flows::refresh_segment` asks
-/// (with `absorb_entries`), so another import's re-baseline can't let entries through early.
+/// Is a page of this account's Shopify history being written now? `flows::refresh_segment` checks
+/// the same thing in its first statement (with `absorb_entries`), so another import's re-baseline
+/// can't let entries through early.
 pub async fn history_open(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
     sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND history_open)").bind(account_id).fetch_one(db).await
 }
