@@ -208,13 +208,18 @@ fn url_key(u: &str) -> String {
 /// matter. Web addresses are found in any case, with or without `https://` (`www.example.com`,
 /// `example.com/path`).
 pub fn literals(text: &str) -> Vec<String> {
-    static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s<>"']+|\bwww\.[^\s<>"']+|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}/[^\s<>"']*"#).unwrap());
+    // Addresses with a scheme first (anywhere, user name and all, so nothing inside one can pass
+    // for an email address), then email addresses, then addresses without a scheme.
+    static SCHEMED: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)https?://[^\s<>"']+"#).unwrap());
     static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
+    static BARE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bwww\.[^\s<>"']+|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}\b(?:/[^\s<>"']*)?"#).unwrap());
     static NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:(?:[.,:/\-'’]|\s)\d+)*").unwrap());
-    let mut out: Vec<String> = EMAIL.find_iter(text).map(|m| m.as_str().to_lowercase()).collect();
-    let rest = EMAIL.replace_all(text, " ").into_owned();
-    out.extend(URL.find_iter(&rest).map(|m| url_key(m.as_str())));
-    let rest = URL.replace_all(&rest, " ").into_owned();
+    let mut out: Vec<String> = SCHEMED.find_iter(text).map(|m| url_key(m.as_str())).collect();
+    let rest = SCHEMED.replace_all(text, " ").into_owned();
+    out.extend(EMAIL.find_iter(&rest).map(|m| m.as_str().to_lowercase()));
+    let rest = EMAIL.replace_all(&rest, " ").into_owned();
+    out.extend(BARE.find_iter(&rest).map(|m| url_key(m.as_str())));
+    let rest = BARE.replace_all(&rest, " ").into_owned();
     out.extend(NUMBER.find_iter(&rest).map(|m| m.as_str().chars().map(|c| if c.is_whitespace() { ' ' } else if c == '’' { '\'' } else { c }).collect()));
     out.sort();
     out
@@ -385,6 +390,12 @@ mod tests {
         assert!(same_literals("See HTTPS://Acme.TEST/x.", "Siehe https://acme.test/x"));
         assert!(same_literals("Visit www.acme.test.", "Besuche www.acme.test!"));
         assert!(same_literals("Mail HI@ACME.TEST", "Schreib hi@acme.test"));
+        // Nothing inside a link passes for an email address, and a scheme counts wherever it starts.
+        assert!(!same_literals("Write to a@acme.test", "Schreib an https://a@acme.test"));
+        assert!(!same_literals("Hi", "Hallo xhttps://evil.test"));
+        assert!(!same_literals("Hi", "Hallo, besuche evil.test"), "a bare domain counts too");
+        assert!(!same_literals("Mail hi@acme.test", "Schreib evil@acme.test"));
+        assert!(same_literals("Sold in the U.S. e.g. today", "In den U.S. z.B. heute verkauft"));
     }
 
     #[test]
