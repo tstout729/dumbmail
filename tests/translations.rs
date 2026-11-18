@@ -786,3 +786,38 @@ async fn translations_change_only_words_on_every_path() {
     assert!(!v.to_string().contains("evil.test"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn localized_links_are_real_web_addresses_and_never_dumbmails_own() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr"])).await;
+    let content = json!({"subject": "Hi", "blocks": [
+        {"type": "button", "text": "Shop", "href": "https://acme.test/en"},
+        {"type": "button", "text": "Leave", "href": "{{ unsubscribe_url }}"},
+        {"type": "button", "text": "Write", "href": "mailto:hi@acme.test"}
+    ]});
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "Links", "channel": "email", "content": content}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    let put = |id: &str, text: &str| json!({"language": "fr", "strings": [{"id": id, "text": text}]});
+    for bad in ["https://pl.test/u/abc", "https://links.pl.test/x", "http://acme.test/fr", "https://user:pw@acme.test/fr", "https://acme.test@evil.test/", "javascript:alert(1)", "https://{{ first_name }}.test/", "mailto:fr@acme.test", "//acme.test/fr"] {
+        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b0:href", bad))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+    }
+    let (s, _) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b1:href", "https://acme.test/desabonnement"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the unsubscribe link can't be localized");
+    let (s, _) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b2:href", "https://acme.test/contact"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a mailto: link stays a mailto: link");
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b2:href", "mailto:bonjour@acme.test"))).await;
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b0:href", "https://acme.test/fr"))).await;
+
+    // A localized link stored straight in the content, pointing at DumbMail, is never sent.
+    let mut c = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
+    c["blocks"][0]["i18n"]["fr"]["href"]["text"] = json!("https://pl.test/t/c/forged");
+    h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": c.clone()}))).await;
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": c, "language": "fr"}))).await;
+    let html = p["html"].as_str().unwrap();
+    assert!(html.contains("https://acme.test/en") && !html.contains("forged"), "the default link is used: {html}");
+    assert!(html.contains("mailto:bonjour@acme.test"));
+    h.cleanup().await;
+}
