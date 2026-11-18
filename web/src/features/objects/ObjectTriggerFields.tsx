@@ -29,6 +29,16 @@ function useFields(key: string) {
   return (types.data?.data ?? []).find((t) => t.key === key)?.fields.filter((f) => !f.sensitive) ?? [];
 }
 
+/** What messages in this flow can use from the object. */
+function MessageFieldsNote() {
+  return (
+    <p className="text-xs text-zinc-500">
+      Emails and texts in this flow can use the object's fields, like <code>{"{{ object.check_in|date }}"}</code>. Sensitive fields are never filled in: there's no way to send door codes or
+      other access details from a flow yet.
+    </p>
+  );
+}
+
 function Relationship({ value, onChange }: { value?: string; onChange: (v: string | undefined) => void }) {
   return (
     <Field label="Who gets it" hint="People linked to the object. Name a relationship, e.g. guest, to send only to them.">
@@ -77,6 +87,7 @@ export function ObjectTriggerFields({ trigger: t, onChange }: { trigger: ObjectT
         </div>
       ) : null}
       <Relationship value={t.relationship} onChange={(relationship) => onChange({ ...t, relationship })} />
+      <MessageFieldsNote />
       <div className="space-y-2">
         <div className="text-xs font-medium text-zinc-700">Only objects where</div>
         <ObjectFilters filters={t.filters ?? []} onChange={(filters) => onChange({ ...t, filters })} fields={fields} listId="pl-trigger-object-fields" />
@@ -146,6 +157,7 @@ export function ObjectDateTriggerFields({ trigger: t, onChange }: { trigger: Obj
         </div>
       )}
       <Relationship value={t.relationship} onChange={(relationship) => onChange({ ...t, relationship })} />
+      <MessageFieldsNote />
       <div className="space-y-2">
         <div className="text-xs font-medium text-zinc-700">Only objects where</div>
         <ObjectFilters filters={t.filters ?? []} onChange={(filters) => onChange({ ...t, filters })} fields={fields} listId="pl-trigger-object-fields" />

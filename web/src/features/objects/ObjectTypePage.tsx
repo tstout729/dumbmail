@@ -243,7 +243,7 @@ function FieldsEditor({ ty }: { ty: ObjectType }) {
               </Field>
             ) : null}
             <div className="flex items-center gap-2 self-center pt-4">
-              <Checkbox label="Sensitive" description="Hidden in lists and from people who can't read profiles" checked={Boolean(f.sensitive)} onChange={(e) => set(i, { ...f, sensitive: e.target.checked })} />
+              <Checkbox label="Sensitive" description="Never in emails or texts, never in lists, and hidden from people who can't read profiles" checked={Boolean(f.sensitive)} onChange={(e) => set(i, { ...f, sensitive: e.target.checked })} />
               <IconButton label="Remove field" size="sm" onClick={() => setFields(fields.filter((_, j) => j !== i))}>
                 <X className="size-3.5" />
               </IconButton>

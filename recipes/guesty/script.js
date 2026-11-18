@@ -190,10 +190,10 @@ function reservationActions(r, guest, who, version, input, versioned) {
   if (historical) props.historical = true;
   props.version = version;
 
+  // Payment is part of the versioned write: an older message never overrides a newer state. If a
+  // newer message without money got there first, payment stays as it was (unknown means no
+  // pre-arrival message) until Guesty's next message that carries money.
   out.push(reservationObject(d, who, version));
-  // Payment, when this message reports it, is written without a version: a message that carries
-  // money is never dropped just because a newer one without money arrived first.
-  if (d.paid_in_full !== null) out.push({ type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: clean({ paid_in_full: d.paid_in_full, total: d.total, currency: d.currency }) });
 
   var status = String(r.status || "").toLowerCase();
   if (BOOKED.indexOf(status) >= 0) {

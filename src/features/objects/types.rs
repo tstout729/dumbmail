@@ -95,6 +95,11 @@ impl ObjectType {
         self.fields.iter().find(|f| f.key == key)
     }
 
+    /// Whether `key` is sensitive: marked so, or the name of a sensitive field taken off the type.
+    pub fn is_sensitive(&self, key: &str) -> bool {
+        self.field(key).is_some_and(|f| f.sensitive) || self.removed_sensitive.iter().any(|k| k == key)
+    }
+
     pub fn sensitive(&self) -> Vec<&str> {
         self.fields.iter().filter(|f| f.sensitive).map(|f| f.key.as_str()).collect()
     }

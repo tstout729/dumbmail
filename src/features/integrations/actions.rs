@@ -1172,7 +1172,7 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
         out.effect(i, match what {
             "created" => format!("would create {key} {external_id}{detail}{people}{unlinks}"),
             "updated" => format!("would update {key} {external_id}{detail}{people}{unlinks}"),
-            _ => format!("{key} {external_id} unchanged{people}{unlinks}"),
+            _ => format!("{key} {external_id} unchanged{detail}{people}{unlinks}"),
         });
         return Ok(());
     }

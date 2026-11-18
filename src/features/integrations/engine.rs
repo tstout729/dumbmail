@@ -250,13 +250,49 @@ pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value>
 /// masked (the list is stored, and what is stored is what is applied, now and on a retry). The
 /// script's `next_request` comes back separately, as it was: it can carry what the app put in a
 /// `Link` header, so it stays in memory (and encrypted when it must be kept).
-async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub) -> Result<(Vec<Value>, Option<NextRequest>), String> {
+async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub, redact: &[super::redact::Path]) -> Result<(Vec<Value>, Option<NextRequest>), String> {
     let raw = sandbox::run(slot, script, &input).await?;
     let parsed = actions::parse(&raw, pull)?;
     let next = parsed.into_iter().find_map(|a| if let Action::NextRequest(n) = a { Some(n) } else { None });
     let list = canonical(&raw_list(&raw), root, Utc::now());
-    let list: Vec<Value> = list.iter().map(|a| scrub.value(a)).collect();
+    // The redact list comes off object fields before the list is stored (it's applied from there).
+    let list: Vec<Value> = list.iter().map(|a| scrub.value(&redact_object_fields(a, redact))).collect();
     Ok((list, next))
+}
+
+/// An `upsert_object` action with the integration's redact paths applied to its fields.
+fn redact_object_fields(a: &Value, redact: &[super::redact::Path]) -> Value {
+    let mut a = a.clone();
+    if a["type"] == "upsert_object" && !redact.is_empty() {
+        if let Some(f) = a.get_mut("fields").filter(|f| f.is_object()) {
+            super::redact::apply(f, redact);
+        }
+    }
+    a
+}
+
+/// Actions as a test run or dry run shows them: object fields the redact list names, or the
+/// object's type marks sensitive, are hidden.
+async fn shown_actions(state: &AppState, integ: &Integration, raw: &Value) -> Value {
+    let redact = super::redact::paths(&integ.redact);
+    let Some(list) = raw.as_array() else { return raw.clone() };
+    let mut out = Vec::with_capacity(list.len());
+    for a in list {
+        let mut a = redact_object_fields(a, &redact);
+        if a["type"] == "upsert_object" {
+            let key = a["object_type"].as_str().unwrap_or("").to_string();
+            let t = crate::features::objects::types::by_key(&state.db, integ.account_id, &key).await.ok().flatten();
+            if let Some(fields) = a.get_mut("fields").and_then(Value::as_object_mut) {
+                for (k, v) in fields.iter_mut() {
+                    if t.as_ref().is_some_and(|t| t.is_sensitive(k)) {
+                        *v = json!("(hidden)");
+                    }
+                }
+            }
+        }
+        out.push(a);
+    }
+    Value::Array(out)
 }
 
 /// Job: process one stored delivery (webhook or replay). The first successful script run fixes the
@@ -300,7 +336,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 extra.insert("response".into(), resp.clone());
             }
             let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
-            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub).await;
+            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub, &super::redact::paths(&integ.redact)).await;
             drop(slot);
             match ran {
                 Ok((list, _)) => {
@@ -628,16 +664,16 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
     drop(slot);
     let acts = match actions::parse(&raw, is_pull) {
         Ok(a) => a,
-        Err(e) => return Ok(json!({"ok": false, "actions": raw, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
+        Err(e) => return Ok(json!({"ok": false, "actions": shown_actions(state, integ, &raw).await, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
     };
     let (o, err) = actions::apply(state, &source_of(integ, None, None), &acts, &raw_list(&raw), &Map::new(), &integ.state_map(), true).await;
     match err {
         None => Ok(json!({
-            "ok": true, "actions": raw, "would_write": o.counts, "effects": o.effects, "logs": o.logs,
+            "ok": true, "actions": shown_actions(state, integ, &raw).await, "would_write": o.counts, "effects": o.effects, "logs": o.logs,
             "state_after": if o.state.is_empty() { Value::Null } else { Value::Object(o.state) },
             "next_request": o.next_request, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64,
         })),
-        Some(e) => Ok(json!({"ok": false, "actions": raw, "error": e.public_message(), "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
+        Some(e) => Ok(json!({"ok": false, "actions": shown_actions(state, integ, &raw).await, "error": e.public_message(), "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
     }
 }
 
@@ -927,7 +963,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         extra.insert("backfill".into(), if backfill { json!({"since": bf["since"]}) } else { Value::Null });
         let input = Input { source: "pull".into(), content_type: ct.clone(), body: resp.body.clone(), extra, ..Default::default() };
         let delivery = store_log(state, &integ, &scrub, NewDelivery { content_type: ct.as_deref(), body, request: Some(logged_req), ..NewDelivery::log("pull", "ok", None) }).await?;
-        let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub).await;
+        let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub, &super::redact::paths(&integ.redact)).await;
         drop(slot);
         // A backfill page is applied under a lock on the integration that a replacement or a
         // cancel must wait for, and only while its run is still the current one: a replaced run

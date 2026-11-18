@@ -412,7 +412,7 @@ async fn integrations_write_objects_once_without_codes_and_hold_new_guests() {
     let (held, email_source): (bool, Option<String>) = sqlx::query_as("SELECT marketing_hold, email_source FROM profiles WHERE email = 'guest@example.com'").fetch_one(&h.state.db).await.unwrap();
     assert!(held, "a guest the integration added without an opt-in is held back from marketing");
     assert_eq!(email_source, Some(format!("integration:{iid}")));
-    let everything: String = sqlx::query_scalar("SELECT concat_ws(' ', (SELECT string_agg(fields::text, ' ') FROM objects), (SELECT string_agg(before::text || after::text, ' ') FROM object_changes), (SELECT string_agg(result::text, ' ') FROM integration_deliveries))").fetch_one(&h.state.db).await.unwrap();
+    let everything: String = sqlx::query_scalar("SELECT concat_ws(' ', (SELECT string_agg(fields::text, ' ') FROM objects), (SELECT string_agg(before::text || after::text, ' ') FROM object_changes), (SELECT string_agg(concat_ws(' ', result::text, actions::text), ' ') FROM integration_deliveries))").fetch_one(&h.state.db).await.unwrap();
     assert!(!everything.contains("8812"), "{everything}");
     let dl: Value = sqlx::query_scalar("SELECT result FROM integration_deliveries WHERE source = 'webhook'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(dl["counts"]["objects_upserted"], 1, "{dl}");
@@ -830,5 +830,32 @@ async fn guesty_pre_arrival_waits_until_the_booking_is_paid_in_full() {
     h.fast_forward().await;
     assert_eq!(sent(&h).len(), 2, "unknown payment never sends");
     assert_eq!(count(&h, "SELECT count(*) FROM objects WHERE external_id = 'R2' AND fields ? 'paid_in_full'").await, 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn sensitive_fields_never_reach_messages_or_dry_runs() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "check_in", "type": "date"}, {"key": "pin", "type": "text", "sensitive": true}]}))).await;
+    live(&mut h, json!({"name": "Codes", "trigger": {"type": "object", "object_type": "stay", "on": "created"}, "definition": {"entry": "e1", "nodes": [
+        {"id": "e1", "type": "email", "next": null, "content": {"subject": "Code [{{ object.pin }}] for {{ object.check_in }}", "blocks": [{"type": "text", "html": "<p>Your code: {{ object.pin }}</p>"}]}}]}})).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"check_in": day(3), "pin": "4417"}, "profiles": [{"email": "a@example.com"}]}))).await;
+    h.fast_forward().await;
+    let m = h.state.email.sent().into_iter().find(|m| m.subject.starts_with("Code")).expect("the flow sent");
+    assert_eq!(m.subject, format!("Code [] for {}", day(3)));
+    assert!(!m.html.contains("4417") && !m.text.contains("4417"));
+    let stored: String = sqlx::query_scalar("SELECT string_agg(concat_ws(' ', subject, to_address), ' ') FROM messages").fetch_one(&h.state.db).await.unwrap();
+    assert!(!stored.contains("4417"));
+    // An integration's test run hides the private value and never says whether it would change.
+    let script = "function handle(i) { return [{type: 'upsert_object', object_type: 'stay', external_id: 'S1', fields: {pin: i.payload.pin, check_in: i.payload.d}}] }";
+    let (iid, _) = integration(&mut h, script, json!([])).await;
+    for pin in ["4417", "9999"] {
+        let t = h.ok("POST", &format!("/api/integrations/{iid}/test"), Some(json!({"payload": {"pin": pin, "d": day(3)}}))).await;
+        let shown = t.to_string();
+        assert!(!shown.contains("4417") && !shown.contains("9999"), "{shown}");
+        assert!(shown.contains("unchanged") && shown.contains("pin (private)"), "the same answer whatever the private value: {shown}");
+    }
     h.cleanup().await;
 }

@@ -22,8 +22,13 @@ an optional title field (shown as each object's title). Field types:
 | `list` | a list of text (up to 100 items) | `["wifi", "pets"]` |
 
 Mark a field `sensitive` if it holds something private, such as a door code. Sensitive fields never
-appear in lists, and in an object's own view only people who can read profiles see them. Keep door
-codes out of objects if you can.
+appear in lists or in emails and texts (they're simply absent from `object.*`), and in an object's own
+view only people who can read profiles see them. Rules (segments, trigger filters, condition splits)
+can't test them. Integration test runs and dry runs show them as `(hidden)`, and never say whether a
+private value would change. Sending access details such as door codes needs a dedicated, separately
+authorised delivery that doesn't exist yet, so keep them out of messages (and out of objects if you
+can). A sensitive field taken off a type stays sensitive: its stored values and history are
+deleted in the background, and a later field with the same name is sensitive again.
 
 A type is also made the first time an object of it is upserted, with each field's type guessed from
 its first value (`2026-12-01` is a date, `true` a boolean, `4` a number, other text is text). A new
@@ -115,7 +120,7 @@ e.g. only `guest`), and the run remembers its object.
 deleted, the person was unlinked from it, its date moved (date triggers), or it no longer matches
 the trigger's filters (its status became `cancelled`, say).
 
-**In messages**, the object's current fields are `object.*`: `{{ object.listing_name }}`,
+**In messages**, the object's current fields (never its sensitive ones) are `object.*`: `{{ object.listing_name }}`,
 `{{ object.check_in|date }}` ("December 1, 2026"), `{{ object.check_in|date('%a %b %-d') }}`. The
 `date` filter shows a date-time in the account's time zone. `object.external_id` and `object.type`
 are there too.

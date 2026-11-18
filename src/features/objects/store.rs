@@ -635,21 +635,29 @@ pub async fn upsert_with(state: &AppState, w: &Writer, b: &UpsertInput, receipt:
     write(state, w, &req, receipt).await
 }
 
-/// What an upsert would do, writing nothing (integration test runs and dry runs).
+/// What an upsert would do, writing nothing (integration test runs and dry runs). Fields the type
+/// marks sensitive are never compared (that would tell whether a private value changed): they're
+/// listed as `name (private)` when given.
 pub async fn preview(state: &AppState, account_id: Uuid, type_key: &str, external_id: &str, fields: &Map<String, Value>, redact: &[crate::features::integrations::redact::Path]) -> AppResult<(&'static str, Vec<String>)> {
     let fields = redacted(redact, fields);
-    let _ = account_id;
     check_fields_shape(&fields)?;
     let t = types::by_key(&state.db, account_id, type_key).await?;
+    let private = |k: &str| t.as_ref().is_some_and(|t| t.is_sensitive(k));
     let mut norm = Map::new();
+    let mut hidden = Vec::new();
     for (k, v) in &fields {
+        if private(k) {
+            hidden.push(format!("{k} (private)"));
+            continue;
+        }
         let def = match t.as_ref().and_then(|t| t.field(k)).cloned() {
             Some(d) => d,
             None if v.is_null() => continue,
             None => types::inferred(k, v).map_err(AppError::bad)?,
         };
-        norm.insert(k.clone(), if v.is_null() { Value::Null } else { types::normalize(&def, v).map_err(AppError::bad)? });
+        norm.insert(k.clone(), if v.is_null() { Value::Null } else { types::normalize(&def, v).map_err(|e| AppError::bad(types::public_error(&def, e)))? });
     }
+    hidden.sort();
     let cur: Option<Value> = match &t {
         Some(t) => sqlx::query_scalar("SELECT fields FROM objects WHERE type_id = $1 AND external_id = $2").bind(t.id).bind(external_id.trim()).fetch_optional(&state.db).await?,
         None => None,
@@ -657,12 +665,15 @@ pub async fn preview(state: &AppState, account_id: Uuid, type_key: &str, externa
     let Some(cur) = cur else {
         let mut keys: Vec<String> = norm.iter().filter(|(_, v)| !v.is_null()).map(|(k, _)| k.clone()).collect();
         keys.sort();
+        keys.extend(hidden);
         return Ok(("created", keys));
     };
     let old = cur.as_object().cloned().unwrap_or_default();
     let mut changed: Vec<String> = norm.iter().filter(|(k, v)| if v.is_null() { old.contains_key(*k) } else { old.get(*k) != Some(v) }).map(|(k, _)| k.clone()).collect();
     changed.sort();
-    Ok((if changed.is_empty() { "unchanged" } else { "updated" }, changed))
+    let what = if changed.is_empty() { "unchanged" } else { "updated" };
+    changed.extend(hidden);
+    Ok((what, changed))
 }
 
 /// Delete objects by id. Returns how many went.

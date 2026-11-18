@@ -44,16 +44,6 @@
       "type": "upsert_object"
     },
     {
-      "external_id": "66f1c4a1246e7d9f0f8da88a",
-      "fields": {
-        "currency": "USD",
-        "paid_in_full": false,
-        "total": 1312.5
-      },
-      "object_type": "reservation",
-      "type": "upsert_object"
-    },
-    {
       "metric": "Reservation Booked",
       "profile": {
         "email": "dana.whitfield@example.com"
