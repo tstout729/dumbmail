@@ -209,7 +209,6 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     };
     // The signature is checked before anything is spent: a caller without the secret never uses up
     // the integration's allowance, and its failures are only logged while they are few.
-    let sig = integ.signature();
     let secret = integ.secret(&state).ok().flatten();
     // The URL as the app was given it, for apps that sign it (Square).
     let base_url = format!("{}/webhooks/in/{token}", state.cfg.public_url());
@@ -217,15 +216,23 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
         Some(q) => format!("{base_url}?{q}"),
         None => base_url,
     };
-    if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &signed_url, &bytes, Utc::now().timestamp()) {
-        if note_rejected(id) {
-            let msg = format!("signature check failed: {why}");
-            let scrub = Scrub::new(integ.secret_values(&state).await);
-            let _ = engine::store_delivery(&state, &integ, &scrub, NewDelivery::log("webhook", "error", Some(&msg))).await;
-            let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+    // Signature settings that can't be read refuse everything; they never mean "no check".
+    let checked = integ
+        .signature()
+        .map_err(|e| format!("the integration's signature settings can't be read ({e}); fix them before webhooks are accepted"))
+        .and_then(|sig| signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &signed_url, &bytes, Utc::now().timestamp()).map(|_| sig));
+    let sig = match checked {
+        Ok(sig) => sig,
+        Err(why) => {
+            if note_rejected(id) {
+                let msg = format!("signature check failed: {why}");
+                let scrub = Scrub::new(integ.secret_values(&state).await);
+                let _ = engine::store_delivery(&state, &integ, &scrub, NewDelivery::log("webhook", "error", Some(&msg))).await;
+                let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+            }
+            return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
         }
-        return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
-    }
+    };
     if !take_slot(id, integ.account_id) {
         return busy(&format!("more than {RATE_PER_MINUTE} webhooks a minute; retry later"));
     }

@@ -53,6 +53,7 @@ export type Integration = IntegrationSummary & {
   signature: Signature;
   signature_secret: { saved: boolean; hint?: string };
   signature_ready: boolean;
+  signature_error?: string | null;
   script: string;
   settings: Record<string, unknown>;
   pull: Record<string, unknown> | null;

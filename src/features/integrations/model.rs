@@ -53,8 +53,15 @@ pub struct Integration {
 pub const COLS: &str = "id, account_id, name, recipe, status, token_enc, signature, signature_secret_enc, signature_secret_hint, script, settings, pull, pull_next_at, credentials_enc, credential_hints, oauth_token_expires_at, auth_version, contacts_opted_in, message_id, metrics, redact, state, backfill, deliveries_ok, deliveries_failed, last_delivery_at, last_error, last_error_at, created_at, updated_at";
 
 impl Integration {
-    pub fn signature(&self) -> Signature {
-        Signature::parse(&self.signature).unwrap_or_default()
+    /// The saved signature check. Settings that can't be read are an error, never "no check":
+    /// every webhook is refused until they're fixed.
+    pub fn signature(&self) -> Result<Signature, String> {
+        Signature::parse(&self.signature).map_err(|e| e.public_message())
+    }
+
+    /// Whether webhooks can be accepted: the check's settings read, and its secret is saved.
+    fn signature_ready(&self) -> bool {
+        self.signature().is_ok_and(|s| !s.needs_secret() || self.signature_secret_enc.is_some())
     }
 
     pub fn pull_config(&self) -> Option<PullConfig> {
@@ -141,13 +148,13 @@ impl Integration {
 
     /// The API's view: no secrets, only hints that they're saved.
     pub fn view(&self, state: &AppState) -> Value {
-        let sig = self.signature();
         json!({
             "id": self.id, "name": self.name, "recipe": self.recipe, "status": self.status,
             "inbound_url": self.inbound_url(state),
             "signature": self.signature,
             "signature_secret": self.signature_secret_hint.as_ref().map(|h| json!({"saved": true, "hint": h})).unwrap_or(json!({"saved": false})),
-            "signature_ready": !sig.needs_secret() || self.signature_secret_enc.is_some(),
+            "signature_ready": self.signature_ready(),
+            "signature_error": self.signature().err(),
             "script": self.script, "settings": self.settings, "pull": self.pull,
             "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id,
             "metrics": self.metrics, "redact": self.redact,
@@ -182,7 +189,8 @@ impl Integration {
             "inbound_url": null, "limited": true,
             "signature": self.signature,
             "signature_secret": json!({"saved": self.signature_secret_hint.is_some()}),
-            "signature_ready": !self.signature().needs_secret() || self.signature_secret_enc.is_some(),
+            "signature_ready": self.signature_ready(),
+            "signature_error": self.signature().err(),
             "script": self.script, "settings": self.settings, "pull": self.pull,
             "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id, "metrics": self.metrics, "redact": self.redact,
             "pull_next_at": self.pull_next_at,
@@ -198,7 +206,7 @@ impl Integration {
     pub fn summary(&self) -> Value {
         json!({
             "id": self.id, "name": self.name, "recipe": self.recipe, "status": self.status,
-            "has_pull": self.pull.is_some(), "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
+            "has_pull": self.pull.is_some(), "signature_ready": self.signature_ready(), "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
             "last_delivery_at": self.last_delivery_at, "last_error": self.last_error, "last_error_at": self.last_error_at,
             "created_at": self.created_at,
         })

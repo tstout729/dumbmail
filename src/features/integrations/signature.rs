@@ -217,7 +217,7 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
             match format {
                 Format::Plain => {
                     let key = match secret_encoding.unwrap_or(Encoding::Utf8) {
-                        Encoding::Base64 => b64(secret).ok_or("the signing secret isn't valid base64")?,
+                        Encoding::Base64 => b64(secret).filter(|k| !k.is_empty()).ok_or("the signing secret isn't valid base64")?,
                         _ => secret.as_bytes().to_vec(),
                     };
                     let mut text = raw;
@@ -277,7 +277,7 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                     let id = header(&format!("{base}-id")).ok_or_else(|| format!("the {base}-id header is missing"))?;
                     let ts = header(&format!("{base}-timestamp")).ok_or_else(|| format!("the {base}-timestamp header is missing"))?;
                     fresh(ts)?;
-                    let key = b64(secret.strip_prefix("whsec_").unwrap_or(secret)).ok_or("the signing secret should look like whsec_ followed by base64")?;
+                    let key = b64(secret.strip_prefix("whsec_").unwrap_or(secret)).filter(|k| !k.is_empty()).ok_or("the signing secret should look like whsec_ followed by base64")?;
                     let signed = [id.as_bytes(), b".", ts.as_bytes(), b".", body].concat();
                     let ok = raw
                         .split_whitespace()
@@ -457,6 +457,20 @@ mod tests {
         let h = headers(&[("x-zendesk-webhook-signature", &s), ("x-zendesk-webhook-signature-timestamp", "1763402400")]);
         assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", now).is_err(), "not ISO 8601");
         assert!(Signature::parse(&json!({"type": "hmac", "header": "X", "timestamp_separator": ":"})).is_err(), "needs timestamp_header");
+    }
+
+    #[test]
+    fn empty_keys_never_verify() {
+        // "whsec_" with nothing after it decodes to an empty key; an HMAC with an empty key is
+        // something anyone can compute, so it's refused.
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "svix-signature", "format": "svix"})).unwrap();
+        let body = b"{}";
+        let mac = base64::engine::general_purpose::STANDARD.encode(hmac256(b"", &[b"msg_1.1700000000.".as_slice(), body].concat()));
+        let h = headers(&[("svix-id", "msg_1"), ("svix-timestamp", "1700000000"), ("svix-signature", &format!("v1,{mac}"))]);
+        assert!(verify(&sig, Some("whsec_"), &h, &HashMap::new(), "", body, 1700000010).is_err());
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "X-Sig", "secret_encoding": "base64"})).unwrap();
+        let h = headers(&[("x-sig", &hex::encode(hmac256(b"", body)))]);
+        assert!(verify(&sig, Some("="), &h, &HashMap::new(), "", body, 0).is_err());
     }
 
     #[test]

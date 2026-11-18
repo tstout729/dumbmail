@@ -805,3 +805,38 @@ async fn segment_identify_then_track() {
     never_stored(&mut h, &s, &sensitive("segment", &["identify.json"]), &["identify.json"]).await;
     h.cleanup().await;
 }
+
+// ---------- Framework: signature settings fail closed ----------
+
+#[tokio::test]
+async fn unreadable_signature_settings_and_empty_keys_refuse_every_webhook() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let script = "function handle(i) { return [{type: 'upsert_profile', email: i.payload.email}] }";
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "Signed app", "script": script, "signature": {"type": "hmac", "header": "X-Sig"}, "signature_secret": "a-long-enough-secret"}))).await;
+    let id = i["id"].as_str().unwrap().to_string();
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = &url[url.find("/webhooks/in/").unwrap()..];
+    // Stored settings that no longer parse (an older or hand-edited row) are not "no check".
+    sqlx::query("UPDATE integrations SET signature = '{\"type\": \"hmac\"}' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    let (s, _, _) = h.raw("POST", path, &[("content-type", "application/json")], r#"{"email": "anyone@example.com"}"#).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'anyone@example.com'").await, 0);
+    let v = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    assert_eq!(v["signature_ready"], false, "{v}");
+    assert!(v["signature_error"].is_string(), "{v}");
+    let list = h.ok("GET", "/api/integrations", None).await;
+    assert_eq!(list["data"][0]["signature_ready"], false);
+    let log = h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await;
+    assert!(log["data"][0]["error"].as_str().unwrap().contains("can't be read"), "{log}");
+    // A whsec_ secret that decodes to an empty key never verifies, even with a matching empty-key HMAC.
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "hmac", "header": "svix-signature", "format": "svix"}, "signature_secret": "whsec_"}))).await;
+    let body = r#"{"email": "anyone@example.com"}"#;
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let mac = b64(&mac256(b"", format!("msg_1.{ts}.{body}").as_bytes()));
+    let sig = format!("v1,{mac}");
+    let (s, _, _) = h.raw("POST", path, &[("svix-id", "msg_1"), ("svix-timestamp", &ts), ("svix-signature", &sig), ("content-type", "application/json")], body).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    h.cleanup().await;
+}
