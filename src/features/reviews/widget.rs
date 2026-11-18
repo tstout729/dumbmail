@@ -113,15 +113,64 @@ pub fn public_review(state: &AppState, account: &Account, r: &Review, photo_ids:
 }
 
 /// The order of a list, as a key `(k, reviewed_at, id)` read in descending order, so every sort
-/// pages by keyset.
-fn sort_key(sort: Option<&str>) -> &'static str {
+/// pages by keyset; none for newest first (`(reviewed_at, id)`). Each key has a partial index on
+/// published reviews, per subject and per account, in this order (migration 0081), so no list is
+/// sorted per request.
+fn sort_key(sort: Option<&str>) -> Option<&'static str> {
     match sort {
-        Some("highest") => "r.rating::int",
-        Some("lowest") => "-r.rating::int",
-        // An expression, not a bare number: ORDER BY 0 would mean a column position.
-        Some("recent") => "0 * r.rating::int",
-        _ => "CASE WHEN r.featured THEN 1 ELSE 0 END",
+        Some("highest") => Some("r.rating::int"),
+        Some("lowest") => Some("-r.rating::int"),
+        Some("recent") => None,
+        _ => Some("CASE WHEN r.featured THEN 1 ELSE 0 END"),
     }
+}
+
+/// The filters of one list.
+#[doc(hidden)]
+#[derive(Default, Clone, Copy)]
+pub struct ListFilter<'a> {
+    pub subject: Option<Uuid>,
+    pub rating: Option<i16>,
+    pub with_photos: bool,
+    pub featured: bool,
+    pub sort: Option<&'a str>,
+}
+
+/// The query for one keyset page of published reviews, with its values bound (`prefix`: "", or
+/// "EXPLAIN " for a test).
+#[doc(hidden)]
+pub fn list_query<'a>(prefix: &str, account_id: Uuid, f: ListFilter<'a>, after: Option<(i32, DateTime<Utc>, Uuid)>, limit: i64) -> sqlx::QueryBuilder<'a, sqlx::Postgres> {
+    let key = sort_key(f.sort);
+    let mut qb = sqlx::QueryBuilder::new(format!("{prefix}SELECT {}, {} AS sort_k FROM reviews r WHERE r.account_id = ", store::REVIEW_COLS, key.unwrap_or("0")));
+    qb.push_bind(account_id).push(" AND r.status = 'published'");
+    if let Some(s) = f.subject {
+        qb.push(" AND r.subject_id = ").push_bind(s);
+    }
+    if let Some(r) = f.rating {
+        qb.push(" AND r.rating = ").push_bind(r);
+    }
+    if f.with_photos {
+        qb.push(" AND EXISTS (SELECT 1 FROM review_photos ph WHERE ph.review_id = r.id)");
+    }
+    if f.featured {
+        qb.push(" AND r.featured");
+    }
+    if let Some((k, at, id)) = after {
+        match key {
+            Some(key) => {
+                qb.push(format!(" AND ({key}, r.reviewed_at, r.id) < (")).push_bind(k).push(", ").push_bind(at).push(", ").push_bind(id).push(")");
+            }
+            None => {
+                qb.push(" AND (r.reviewed_at, r.id) < (").push_bind(at).push(", ").push_bind(id).push(")");
+            }
+        }
+    }
+    match key {
+        Some(key) => qb.push(format!(" ORDER BY {key} DESC, r.reviewed_at DESC, r.id DESC LIMIT ")),
+        None => qb.push(" ORDER BY r.reviewed_at DESC, r.id DESC LIMIT "),
+    };
+    qb.push_bind(limit);
+    qb
 }
 
 /// A position in a list: the key of the last review shown.
@@ -146,29 +195,9 @@ struct Page {
 /// One keyset page of published reviews (for one subject, or the whole account).
 #[allow(clippy::too_many_arguments)]
 async fn published(state: &AppState, account: &Account, subject: Option<Uuid>, rating: Option<i16>, with_photos: bool, featured: bool, sort: Option<&str>, after: Option<&str>, limit: i64) -> AppResult<Page> {
-    let key = sort_key(sort);
     let after = after.filter(|a| !a.is_empty()).map(parse_cursor).transpose()?;
-    let q = format!(
-        "SELECT {}, {key} AS sort_k FROM reviews r WHERE r.account_id = $1 AND r.status = 'published'
-           AND ($2::uuid IS NULL OR r.subject_id = $2) AND ($3::smallint IS NULL OR r.rating = $3)
-           AND (NOT $4 OR EXISTS (SELECT 1 FROM review_photos ph WHERE ph.review_id = r.id)) AND (NOT $5 OR r.featured)
-           AND ($6::int IS NULL OR ({key}, r.reviewed_at, r.id) < ($6, $7, $8))
-         ORDER BY {key} DESC, r.reviewed_at DESC, r.id DESC LIMIT $9",
-        store::REVIEW_COLS
-    );
     use sqlx::Row;
-    let rows = sqlx::query(&q)
-        .bind(account.id)
-        .bind(subject)
-        .bind(rating)
-        .bind(with_photos)
-        .bind(featured)
-        .bind(after.map(|a| a.0))
-        .bind(after.map(|a| a.1))
-        .bind(after.map(|a| a.2))
-        .bind(limit + 1)
-        .fetch_all(&state.db)
-        .await?;
+    let rows = list_query("", account.id, ListFilter { subject, rating, with_photos, featured, sort }, after, limit + 1).build().fetch_all(&state.db).await?;
     let mut out = Vec::new();
     let mut keys = Vec::new();
     for row in &rows {
@@ -332,12 +361,12 @@ pub async fn all_reviews(State(state): State<AppState>, headers: HeaderMap, Quer
     let res: AppResult<Response> = async {
         throttle(&state, &headers).await?;
         let account = account(&state, &q.k).await?;
-        let (latest, count, sum): (Option<DateTime<Utc>>, i64, i64) = sqlx::query_as(
-            "SELECT max(updated_at), COALESCE(sum(review_count), 0)::bigint, COALESCE(sum(rating_sum), 0)::bigint FROM review_subjects WHERE account_id = $1",
-        )
-        .bind(account.id)
-        .fetch_one(&state.db)
-        .await?;
+        // The account's own summary row, kept with each product's (never added up per request).
+        let totals: Option<(DateTime<Utc>, i32, i64)> = sqlx::query_as("SELECT updated_at, review_count, rating_sum FROM review_totals WHERE account_id = $1").bind(account.id).fetch_optional(&state.db).await?;
+        let (latest, count, sum) = match totals {
+            Some((at, n, s)) => (Some(at), i64::from(n), s),
+            None => (None, 0, 0),
+        };
         let featured = q.featured == Some(true);
         let tag = tag_of(&[&account.id.to_string(), &latest.map(|t| t.timestamp_micros().to_string()).unwrap_or_default(), &settings_version(&state, account.id).await?,
             q.sort.as_deref().unwrap_or(""), if featured { "f" } else { "" }, q.after.as_deref().unwrap_or(""), &q.limit.unwrap_or(0).to_string()]);
@@ -371,9 +400,13 @@ pub async fn all_reviews(State(state): State<AppState>, headers: HeaderMap, Quer
 /// the same markup the product widget adds for its first page.
 pub async fn json_ld(state: &AppState, account: &Account, key: &str) -> AppResult<Option<Value>> {
     let Some(s) = store::find_subject(&state.db, account.id, key).await? else { return Ok(None) };
+    json_ld_for(state, account, &s).await
+}
+
+async fn json_ld_for(state: &AppState, account: &Account, s: &Subject) -> AppResult<Option<Value>> {
     let per = per_page(&store::settings(&state.db, account.id).await?);
     let page = published(state, account, Some(s.id), None, false, false, None, None, per).await?;
-    Ok(structured_data(&s, &page.rows, account))
+    Ok(structured_data(s, &page.rows, account))
 }
 
 #[derive(Deserialize)]
@@ -387,8 +420,14 @@ pub async fn json_ld_h(State(state): State<AppState>, headers: HeaderMap, Query(
         throttle(&state, &headers).await?;
         let account = account(&state, &q.k).await?;
         let key = store::valid_key(&q.product_id).ok_or_else(|| AppError::bad("product_id is missing"))?;
-        let v = json_ld(&state, &account, &key).await?.ok_or_else(|| AppError::not_found("reviews for this product"))?;
-        let tag = tag_of(&[&v.to_string()]);
+        let none = || AppError::not_found("reviews for this product");
+        let subject = store::find_subject(&state.db, account.id, &key).await?.ok_or_else(none)?;
+        // Known from the product's summary version and the settings, before any review is read.
+        let tag = tag_of(&["ld", &account.id.to_string(), &key, &subject.updated_at.timestamp_micros().to_string(), &settings_version(&state, account.id).await?]);
+        if matches_tag(&headers, &tag) {
+            return Ok(not_modified(&tag));
+        }
+        let v = json_ld_for(&state, &account, &subject).await?.ok_or_else(none)?;
         Ok(json_answer(&v, &tag, "application/ld+json"))
     }
     .await;

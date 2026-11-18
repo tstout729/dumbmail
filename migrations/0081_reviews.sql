@@ -49,6 +49,14 @@ CREATE TABLE review_subjects (
     UNIQUE (account_id, external_id)
 );
 
+-- The account's published summary (all its products together), kept with each product's row.
+CREATE TABLE review_totals (
+    account_id uuid PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    review_count int NOT NULL DEFAULT 0,
+    rating_sum bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- One signed link for one person and one thing they bought or booked.
 CREATE TABLE review_requests (
     id uuid PRIMARY KEY,
@@ -123,6 +131,16 @@ CREATE TABLE reviews (
     import_row int
 );
 CREATE INDEX reviews_subject ON reviews (subject_id, status, reviewed_at DESC);
+-- The public lists, one index per order (featured first, highest, lowest, newest), per product and
+-- per account, in exactly the widget's sort keys (`widget::sort_key`), so no list is sorted per request.
+CREATE INDEX reviews_list_featured ON reviews (subject_id, (CASE WHEN featured THEN 1 ELSE 0 END) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_list_highest ON reviews (subject_id, (rating::int) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_list_lowest ON reviews (subject_id, (-rating::int) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_list_recent ON reviews (subject_id, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_all_featured ON reviews (account_id, (CASE WHEN featured THEN 1 ELSE 0 END) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_all_highest ON reviews (account_id, (rating::int) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_all_lowest ON reviews (account_id, (-rating::int) DESC, reviewed_at DESC, id DESC) WHERE status = 'published';
+CREATE INDEX reviews_all_recent ON reviews (account_id, reviewed_at DESC, id DESC) WHERE status = 'published';
 CREATE INDEX reviews_account ON reviews (account_id, created_at DESC);
 CREATE INDEX reviews_profile ON reviews (profile_id);
 CREATE INDEX reviews_unconfirmed ON reviews (created_at) WHERE confirmed_at IS NULL;

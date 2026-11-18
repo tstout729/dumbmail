@@ -510,8 +510,18 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Review> {
 }
 
 /// Add `sign` (+1 or -1) reviews of `rating` stars to a subject's published summary (and to the
-/// summary of reviews collected here, for a `native` one).
+/// summary of reviews collected here, for a `native` one), and to the account's summary row.
+/// The account's row is locked before the subject's, in every path that writes both.
 async fn bump(conn: &mut PgConnection, subject_id: Uuid, rating: i16, sign: i32, native: bool) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO review_totals AS t (account_id, review_count, rating_sum) SELECT account_id, $2, $2 * $3 FROM review_subjects WHERE id = $1
+         ON CONFLICT (account_id) DO UPDATE SET review_count = t.review_count + EXCLUDED.review_count, rating_sum = t.rating_sum + EXCLUDED.rating_sum, updated_at = now()",
+    )
+    .bind(subject_id)
+    .bind(sign)
+    .bind(i32::from(rating))
+    .execute(&mut *conn)
+    .await?;
     sqlx::query(
         "UPDATE review_subjects SET review_count = review_count + $2, rating_sum = rating_sum + $2 * $3,
             rating_counts[$3] = rating_counts[$3] + $2,
@@ -530,6 +540,10 @@ async fn bump(conn: &mut PgConnection, subject_id: Uuid, rating: i16, sign: i32,
 /// Something shown about a published review changed (a reply, a photo, featuring): the product's
 /// widgets must not answer from a stale cache.
 pub async fn touch(conn: &mut PgConnection, review_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO review_totals AS t (account_id) SELECT account_id FROM reviews WHERE id = $1 ON CONFLICT (account_id) DO UPDATE SET updated_at = now()")
+        .bind(review_id)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("UPDATE review_subjects SET updated_at = now() WHERE id = (SELECT subject_id FROM reviews WHERE id = $1)").bind(review_id).execute(conn).await?;
     Ok(())
 }
@@ -656,6 +670,20 @@ pub async fn rebuild_summaries(db: &PgPool, account_id: Uuid) -> AppResult<u64> 
         .rows_affected();
         tx.commit().await?;
     }
+    // Then the account's row, from the products' rows. Its lock comes first, as everywhere: a
+    // publish still running applies its change after this, and one that finished is counted.
+    let mut tx = db.begin().await?;
+    sqlx::query("INSERT INTO review_totals (account_id) VALUES ($1) ON CONFLICT (account_id) DO NOTHING").bind(account_id).execute(&mut *tx).await?;
+    sqlx::query("SELECT 1 FROM review_totals WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE review_totals t SET review_count = x.n, rating_sum = x.total, updated_at = now()
+         FROM (SELECT COALESCE(sum(review_count), 0)::int AS n, COALESCE(sum(rating_sum), 0)::bigint AS total FROM review_subjects WHERE account_id = $1) x
+         WHERE t.account_id = $1 AND (t.review_count, t.rating_sum) IS DISTINCT FROM (x.n, x.total)",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(n)
 }
 

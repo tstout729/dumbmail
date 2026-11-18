@@ -62,14 +62,12 @@ pub fn declared_size(bytes: &[u8]) -> AppResult<(u32, u32)> {
 }
 
 /// [`reencode`] for one account: waits for a free decode slot, at most [`DECODES_PER_ACCOUNT`] for
-/// the account and [`DECODES`] on the server at once.
+/// the account and [`DECODES`] on the server at once. The slots go into the decode itself and are
+/// given back only when it ends, even if the upload that started it is cancelled meanwhile.
 pub async fn reencode_for(account_id: Uuid, bytes: Vec<u8>) -> AppResult<Encoded> {
     let mine = tokio::time::timeout(DECODE_WAIT, account_slots(account_id).acquire_owned()).await.map_err(|_| busy())?.map_err(|_| busy())?;
     let all = tokio::time::timeout(DECODE_WAIT, DECODE_SLOTS.clone().acquire_owned()).await.map_err(|_| busy())?.map_err(|_| busy())?;
-    let out = reencode(bytes).await;
-    drop(all);
-    drop(mine);
-    out
+    decode(bytes, Some((mine, all))).await
 }
 
 /// Check a PNG, JPEG, GIF or WebP upload, then decode it (its first frame), shrink it to at most
@@ -77,6 +75,12 @@ pub async fn reencode_for(account_id: Uuid, bytes: Vec<u8>) -> AppResult<Encoded
 /// [`MAX_PIXELS`] before anything is decoded. Runs off the async threads, with decode limits. Use
 /// [`reencode_for`] so decodes are bounded.
 pub async fn reencode(bytes: Vec<u8>) -> AppResult<Encoded> {
+    decode(bytes, None).await
+}
+
+type Slots = (tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit);
+
+async fn decode(bytes: Vec<u8>, slots: Option<Slots>) -> AppResult<Encoded> {
     if bytes.len() > MAX_UPLOAD {
         return Err(AppError::bad("photos can be at most 10 MB"));
     }
@@ -88,6 +92,12 @@ pub async fn reencode(bytes: Vec<u8>) -> AppResult<Encoded> {
         return Err(AppError::bad(format!("that photo is too large ({w} × {h} pixels); photos can be at most 40 million pixels")));
     }
     tokio::task::spawn_blocking(move || -> AppResult<Encoded> {
+        // Held until this decode ends, however the request that started it ends.
+        #[cfg(test)]
+        if slots.is_some() {
+            tests::gate();
+        }
+        let _slots = slots;
         let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().map_err(|_| AppError::bad("that photo couldn't be read"))?;
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(MAX_DECODE_SIDE);
@@ -160,6 +170,38 @@ pub async fn serve(State(state): State<AppState>, Path(file): Path<String>, Quer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode in a test can be held at its start: `(started, go)`.
+    static GATE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = std::sync::Mutex::new(None);
+
+    pub(super) fn gate() {
+        let taken = GATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((started, go)) = taken {
+            let _ = started.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Round 3, item 8: a cancelled upload doesn't give its decode slot back while the decode runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_upload_keeps_its_slot_until_the_decode_ends() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        *GATE.lock().unwrap() = Some((started_tx, go_rx));
+        let acct = Uuid::now_v7();
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([1, 2, 3]))).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let upload = tokio::spawn(reencode_for(acct, png));
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap()).await.unwrap();
+        assert_eq!(account_slots(acct).available_permits(), DECODES_PER_ACCOUNT - 1, "the decode holds a slot");
+        upload.abort();
+        let _ = upload.await;
+        assert_eq!(account_slots(acct).available_permits(), DECODES_PER_ACCOUNT - 1, "still held: the decode is still running");
+        go_tx.send(()).unwrap();
+        while account_slots(acct).available_permits() < DECODES_PER_ACCOUNT {
+            tokio::task::yield_now().await;
+        }
+    }
 
     #[tokio::test]
     async fn reencodes_and_drops_metadata() {

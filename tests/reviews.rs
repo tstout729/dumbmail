@@ -1611,3 +1611,81 @@ async fn no_name_from_the_profile() {
     assert!(!w.to_string().contains("Jane"), "{w}");
     h.cleanup().await;
 }
+
+/// Run one public read and return the SQL it ran.
+async fn statements_of(h: &Harness, path: &str, headers: &[(&str, &str)]) -> (StatusCode, Vec<String>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let seen = Statements::default();
+    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(seen.clone()));
+    let (s, _, _) = h.raw("GET", path, headers, "").await;
+    drop(guard);
+    let sql = seen.0.lock().unwrap().clone();
+    (s, sql)
+}
+
+/// Round 3, item 8: every public list reads an index in its own order (no sort per request), the
+/// all-reviews summary comes from the account's summary row (no adding up per request), and the
+/// standalone structured data answers a matching ETag before reading any review.
+#[tokio::test]
+async fn public_lists_read_indexes_and_summary_rows() {
+    use dumbmail::features::reviews::widget::{list_query, ListFilter};
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    product(&mut h, "CUP", "Red cup").await;
+    for (i, (key, rating)) in [("MUG", 5), ("MUG", 4), ("CUP", 3)].into_iter().enumerate() {
+        let e = format!("p{i}@x.test");
+        person(&h, acct, &e, "subscribed").await;
+        let t = api_link(&mut h, &e, key, true).await;
+        submit(&h, &t, json!({"rating": rating})).await;
+    }
+    let sid: Uuid = sqlx::query_scalar("SELECT id FROM review_subjects WHERE external_id = 'MUG'").fetch_one(&h.state.db).await.unwrap();
+
+    // Each order, for one product and for the whole account, first page and later ones.
+    for subject in [Some(sid), None] {
+        for sort in [None, Some("highest"), Some("lowest"), Some("recent")] {
+            for after in [None, Some((1, chrono::Utc::now(), Uuid::max()))] {
+                for rating in [None, Some(5i16)] {
+                    let mut tx = h.state.db.begin().await.unwrap();
+                    sqlx::query("SET LOCAL enable_seqscan = off").execute(&mut *tx).await.unwrap();
+                    sqlx::query("SET LOCAL enable_bitmapscan = off").execute(&mut *tx).await.unwrap();
+                    let mut qb = list_query("EXPLAIN ", acct, ListFilter { subject, sort, rating, ..Default::default() }, after, 6);
+                    let plan: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await.unwrap();
+                    tx.rollback().await.unwrap();
+                    let plan = plan.join("\n");
+                    assert!(!plan.contains("Sort"), "{subject:?} {sort:?} {after:?} {rating:?} is sorted per request:\n{plan}");
+                }
+            }
+        }
+    }
+
+    // The all-reviews summary: read from the account's row, and right.
+    let path = format!("/client/reviews/all?k={pk}");
+    let (s, sql) = statements_of(&h, &path, &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!sql.iter().any(|q| q.contains("sum(") || q.contains("max(") || q.contains("count(")), "{sql:#?}");
+    let all = widget(&h, &path).await;
+    // The 3-star one waits for moderation (below the auto-publish rating).
+    assert_eq!((all["summary"]["count"].as_i64(), all["summary"]["average"].as_f64()), (Some(2), Some(4.5)));
+    // Moderation keeps it right, and so does a rebuild.
+    let rid = h.ok("GET", "/api/reviews?status=published&limit=1", None).await["data"][0]["id"].as_str().unwrap().to_string();
+    h.ok("POST", "/api/reviews/moderate", Some(json!({"ids": [rid], "action": "reject", "reason": "other", "confirm": true}))).await;
+    let all = widget(&h, &path).await;
+    assert_eq!(all["summary"]["count"].as_i64(), Some(1));
+    sqlx::query("UPDATE review_totals SET review_count = 99").execute(&h.state.db).await.unwrap();
+    dumbmail::features::reviews::store::rebuild_summaries(&h.state.db, acct).await.unwrap();
+    let all = widget(&h, &path).await;
+    assert_eq!(all["summary"]["count"].as_i64(), Some(1));
+
+    // The standalone structured data: a matching ETag is answered without reading reviews.
+    let ld = format!("/client/reviews/jsonld?k={pk}&product_id=MUG");
+    let (s, hd, _) = h.raw("GET", &ld, &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let tag = hd.get("etag").unwrap().to_str().unwrap().to_string();
+    let (s, sql) = statements_of(&h, &ld, &[("if-none-match", &tag)]).await;
+    assert_eq!(s, StatusCode::NOT_MODIFIED);
+    assert!(!sql.iter().any(|q| q.contains("FROM reviews")), "{sql:#?}");
+    h.cleanup().await;
+}
