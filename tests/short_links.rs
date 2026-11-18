@@ -208,6 +208,9 @@ async fn previews_show_a_sample_link_of_the_real_length() {
     assert_eq!(settings["link_length"], sample.len());
     assert_eq!(settings["ready"], true);
     assert!(shown.contains(sample) && !shown.contains("shop.test"), "{shown}");
+    assert_eq!(r["short_links"], 1, "the editor's note says a link is shortened");
+    let optout = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": "Acme Goods: https://shop.test/unsubscribe"}}))).await;
+    assert_eq!(optout["short_links"], 0, "no link that will be shortened: {optout}");
     assert_eq!(r["characters"].as_u64().unwrap() as usize, dumbmail::providers::sms::segment_count(shown).0);
     // The real send is exactly as long as the preview said.
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "One"}))).await["id"].as_str().unwrap().to_string();
@@ -221,6 +224,7 @@ async fn previews_show_a_sample_link_of_the_real_length() {
     h.ok("PATCH", "/api/short-links/settings", Some(json!({"enabled": false}))).await;
     let r = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": body}}))).await;
     assert!(r["body"].as_str().unwrap().contains("https://shop.test/collections/"), "{r}");
+    assert_eq!(r["short_links"], 0, "the setting is off: {r}");
     h.cleanup().await;
 }
 
@@ -487,6 +491,7 @@ async fn a_freshly_started_server_sends_long_links_until_it_has_served_a_while()
     assert_eq!(h.ok("GET", "/api/short-links/settings", None).await["ready"], false);
     let r = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": "Acme Goods: https://shop.test/early"}}))).await;
     assert!(r["body"].as_str().unwrap().contains("https://shop.test/early"), "the preview matches the send: {r}");
+    assert_eq!(r["short_links"], 0, "not issuing yet: {r}");
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
     flow_text(&mut h, "Later", "Acme Goods: later https://shop.test/later", &phone).await;
     let later = body_to(&h, &phone);

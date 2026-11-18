@@ -319,6 +319,13 @@ pub struct Sample {
     short: String,
 }
 
+impl Sample {
+    /// How many links in a rendered preview are (sample) short links.
+    pub fn count_in(&self, body: &str) -> usize {
+        body.matches(self.short.as_str()).count()
+    }
+}
+
 impl SmsLinks for Sample {
     fn source<'a>(&self, template: &'a str) -> Cow<'a, str> {
         replace_literals(template, &self.own, |_| Some(self.short.clone()))

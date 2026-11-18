@@ -554,7 +554,8 @@ export type Template = {
 };
 
 export type EmailRender = { subject: string; preheader: string; html: string; text: string };
-export type SmsRender = { body: string; segments: number; characters: number };
+/** `short_links`: how many links the send will shorten (see features/shortLinks). */
+export type SmsRender = { body: string; segments: number; characters: number; short_links?: number };
 
 // ---- Forms ----
 // Mirrors docs/FORMS.md. Every config key is optional (left out = the default); `null` resets a key on update.

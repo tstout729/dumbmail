@@ -167,7 +167,8 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         let sample = crate::features::short_links::send::preview(state, &account, &content.body).await?;
         let body = render::render_sms_with(&account, &content, &ctx, None, false, sample.as_ref().map(|s| s as &dyn render::SmsLinks))?;
         let (chars, segs) = crate::providers::sms::segment_count(&body);
-        Ok(json!({"body": body, "characters": chars, "segments": segs}))
+        let short_links = sample.as_ref().map_or(0, |s| s.count_in(&body));
+        Ok(json!({"body": body, "characters": chars, "segments": segs, "short_links": short_links}))
     }
 }
 
