@@ -9,9 +9,10 @@ Nothing changes for an account that never adds a second language: the same email
 Profiles have a `locale`: a language tag such as `fr`, `fr-CA` or `pt-BR` (BCP 47). Tags are checked and tidied (`pt_br` becomes `pt-BR`); at most 35 characters.
 
 - **API, MCP and imports:** send `locale` (or `language`) with the profile, e.g. `{"email": "ana@example.com", "locale": "pt-BR"}`. An import column named `locale` or `language` works the same way. A `locale` that isn't a tag is refused; `locale: null` or `""` clears it. A `language` that isn't a tag (like "French") stays an ordinary custom property.
-- **Sign-up forms:** a field with the key `locale` or `language`, else the browser's language when the form is sent. Both only fill in a profile whose language is empty: what a form says can choose which language someone is sent, nothing else, and never overwrites a language the API, an import or a person set.
+- **Klaviyo import:** Klaviyo's `locale` field, tidied the same way.
 - **By hand:** on the profile page.
-- Personalization: `{{ person.locale }}`.
+- **A browser's language** (a sign-up form's `locale` or `language` field, the browser's language when the form is sent, the website script) is kept apart, as a hint (`locale_hint`). It's only used to choose which language version someone is sent when they have no language set another way; it fills in only when empty, never shows up in segments, templates or custom properties, and never changes `locale`.
+- Personalization: `{{ person.locale }}` (the trusted language only).
 
 ### Segments
 
@@ -46,7 +47,7 @@ Each translated field has a status:
 
 ### Which version someone gets
 
-Decided once per recipient when the message is prepared, with no extra lookup: the version with their exact tag, else their language without the region (`fr` for `fr-CA`), else the default. Another region's version is never used (someone in `pt-PT` doesn't get `pt-BR`). A campaign's versions are frozen with the campaign when its send starts, like its saved blocks. A/B tests and languages combine: each A/B version has its own translations. Saved blocks carry their own translations and follow the language the email is sent in.
+Decided once per recipient (their `locale`, else their browser's hint) when the message is prepared, with no extra lookup: the version with their exact tag, else their language without the region (`fr` for `fr-CA`), else the default. Another region's version is never used (someone in `pt-PT` doesn't get `pt-BR`). A campaign's versions are frozen with the campaign when its send starts, like its saved blocks. A/B tests and languages combine: each A/B version has its own translations. Saved blocks carry their own translations and follow the language the email is sent in.
 
 The language each message went out in is kept on the message: `GET /api/translations/report?campaign_id=...` (or `flow_id`) gives sent, opened, clicked and unsubscribed by language. MCP: `translation_report`.
 
@@ -64,8 +65,8 @@ Every endpoint exists for each kind of message:
 - `GET {path}?language=fr`: every text with its id, where it is, the default text, the translation and its status, plus a count of statuses per language.
 - `PUT {path}` `{"language": "fr", "strings": [{"id": "subject", "text": "Bonjour {{ first_name }}"}]}`: save translations (as `reviewed` unless `"status": "machine"`). An empty `text` removes one. `"remove_language": true` takes a language off the message.
 - `POST {path}/review` `{"language": "fr"}`: mark machine drafts reviewed (all, or `ids`).
-- `GET {path}/export?language=fr&format=xliff` (or `csv`): the texts for a translator. XLIFF 1.2 lists each text as a trans-unit with its id, default text, current translation and the glossary in the header. CSV columns: `id, where, source, translation, status`.
-- `POST {path}/import` `{"language": "fr", "format": "xliff", "data": "<file text>"}`: read a translator's file back (2 MB at most). Translations are saved as reviewed. A text whose default changed since the export is skipped and listed (`changed_since_export`); one that drops or adds a template tag is refused and listed.
+- `GET {path}/export?language=fr&format=xliff` (or `csv`): the texts for a translator. XLIFF 1.2 has one `file` whose `original` is the message (`campaign/<id>`, `campaign/<id>/b`, `flow/<id>/<step>`, `template/<id>`, `saved_block/<id>`) and whose `target-language` is the language; each text is a trans-unit with its id, the default text, the hash of that text (`resname`) and the current translation; the glossary is in the header. CSV columns: `message, language, id, where, source, translation, status`; cells a spreadsheet would run as a formula (starting with `=`, `+`, `-`, `@`) start with an apostrophe, which importing removes.
+- `POST {path}/import` `{"language": "fr", "format": "xliff", "data": "<file text>"}`: read a translator's file back (2 MB and 5,000 texts at most; DTDs aren't accepted). A file made for another message or language is refused. Translations are saved as reviewed. A text whose default changed since the export (by text or hash) is skipped and listed (`changed_since_export`); one that breaks the rules below is refused and listed.
 
 MCP: `get_translations`, `set_translations`, `review_translations`, `export_translations`, `import_translations`, with `target: {"kind": "campaign" | "flow" | "template" | "saved_block", "id": "...", "version": "b", "step": "..."}`.
 
@@ -73,8 +74,9 @@ Field ids: `subject`, `preheader`, `html`, `body`, and for blocks `b<n>:<field>`
 
 ### Rules a translation must follow
 
-- It keeps exactly the template tags of the default text (`{{ first_name }}`, `{% coupon_code 'WELCOME' %}`), in any order, and parses as a template. A broken tag is refused when it's saved, not at send time.
-- A localized link starts with `https://`, `http://`, `mailto:` or `tel:`. It's tracked like any other link.
+- Only words change. Output tags (`{{ first_name }}`) are the same set, expression for expression (quoted text exactly), and may move within the text but not into or out of an attribute. Control tags (`{% if %}`, `{% coupon_code 'WELCOME' %}`) stay identical, in the same order and nesting. HTML keeps the same elements in the same order and nesting, with the same attributes and values; only text and the attributes that are words for people (`alt`, `title`, `aria-label`, `placeholder`) may differ. Plain-text fields (subject, preview text, button labels, texts) can't gain markup. It must parse as a template. All of this is checked when a translation is saved (by hand, the API, MCP, an import or a machine draft), not at send time.
+- No direction marks or invisible characters (bidirectional controls, zero-width spaces and other format characters, typed or as HTML references). Zero-width joiners and non-joiners are fine.
+- A localized link is an `https://` address (or `http://` where the original was), with its host written out and no user name or password; a `mailto:` or `tel:` link only replaces one of the same kind. DumbMail's own links (unsubscribe, preferences, tracking) can't be localized, and no localized link can point at DumbMail. It's tracked and tagged (UTM) like the original.
 - Translated HTML is inserted the way the default HTML is; plain text is escaped.
 - A translation can never change who gets a message, its tracking, its unsubscribe link or its footer: only words.
 
@@ -99,7 +101,9 @@ When the server has `ANTHROPIC_API_KEY`, "Draft with AI" machine-translates a me
 - Only the texts and the glossary terms that occur in them are sent to the model (as data, apart from the instructions), never anything about people.
 - After the model answers, every number (prices, dates, percentages, phone numbers), web address and email address in the original must appear unchanged in the draft, and no new ones may appear. A draft that fails this is kept with the status `check`, the check before sending lists it as a problem that blocks sending, and the original text is sent in its place until a person marks it reviewed. Template tags, HTML tags and never-translate terms are replaced by placeholders before the request and put back after; a result that loses, repeats or reorders one is thrown away, and so is one that adds a template tag. What comes back is checked like a hand-typed translation and saved as a `machine` draft.
 - A draft is written only where the default text is still the one that was translated and nobody has saved a reviewed translation in the meantime.
-- Limits: one run per account at a time, a daily character allowance per account (`TRANSLATION_DAILY_CHARS`, 200,000 by default; days in the account's time zone), at most 12,000 characters per request and 40,000 per text. Starting a run needs content.write and the permission that changes that message; it's recorded in the audit log (who, which message, how many texts and characters, never the text).
+- Requests go only to `https://api.anthropic.com` and are at most 64 KB each (text, glossary and instructions together); a text too big for a request is skipped.
+- Limits: one run per account at a time, a daily character allowance per account (`TRANSLATION_DAILY_CHARS`, 200,000 by default; days in the account's time zone), at most 12,000 characters per request and 40,000 per text. Characters count once they're sent, whether or not what came back was usable. A run has 10 minutes in all; one worker holds it at a time. Failures that may pass (busy, a server problem, no answer) are tried again within that time; otherwise the run ends `failed`, saying how many texts weren't drafted (what was drafted so far is kept).
+- When drafting costs money (hosted, `PRICE_TRANSLATION_PER_1000_CHARS` above 0), REST and MCP both answer with a quote unless `confirm: true`. Each batch's drafts and its charge are saved together. Starting a run needs content.write and the permission that changes that message; it's recorded in the audit log (who, which message, how many texts and characters, never the text).
 - Price: free unless the hosted service sets `PRICE_TRANSLATION_PER_1000_CHARS`.
 
 ## Glossary
@@ -110,11 +114,12 @@ Terms with a fixed translation per language, and terms never translated (like yo
 
 ## DumbMail's own pages and footer lines
 
-The unsubscribe page, the email preference page, the double opt-in email and confirmation page, and the footer lines DumbMail adds to email ("You're receiving this because you subscribed.", "Unsubscribe") come in English, Spanish, French, German, Italian, Portuguese and Dutch. They're shown in the person's language: their profile's, else the browser's, else your default, among the languages you send in. You can reword any of them for any of your languages (other languages start in English until you do).
+The unsubscribe page, the email preference page, the double opt-in email and confirmation page, and the footer lines DumbMail adds to email ("You're receiving this because you subscribed.", "Unsubscribe") come in English, Spanish, French, German, Italian, Portuguese and Dutch. They're shown in the person's language: their profile's, else their browser's hint, else your default, among the languages you send in. You can reword any of them for any of your languages (other languages start in English until you do).
 
-Right-to-left languages (Arabic, Hebrew, Persian, Urdu ...) get `dir="rtl"` on pages and emails, and an email's left and right alignment swap sides.
+Right-to-left languages (Arabic, Hebrew, Persian, Urdu ...) get `dir="rtl"` on pages, on the root of full HTML emails, and on the text of block emails (not on their layout, so columns keep their order); left and right alignment swap sides, and the footer's address and links keep their own direction.
 
 - `GET /api/translations/system-texts?language=fr`: each text's key, where it appears, the English, the shipped translation and your wording.
-- `PUT /api/translations/system-texts` `{"language": "fr", "texts": {"unsub.button": "Je me désabonne"}}` (null goes back to the shipped text; keep `{name}` and `{days}`). MCP: `get_system_texts`, `set_system_texts`.
+- `PUT /api/translations/system-texts` `{"language": "fr", "texts": {"unsub.button": "Je me désabonne"}}` (null goes back to the shipped text; keep `{name}` and `{days}`; no invisible characters; the unsubscribe and preference labels must show words). MCP: `get_system_texts`, `set_system_texts`.
+- A campaign's footer wording is fixed when its send starts: changing it later doesn't change what the rest of that campaign's recipients get.
 
 Not included yet: a "view in browser" page (DumbMail has none), sign-up forms' own messages, and the "Reply STOP to opt out." line added to texts, which stays in English.
