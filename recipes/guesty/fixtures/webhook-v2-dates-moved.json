@@ -18,11 +18,13 @@
       "object_type": "reservation",
       "profiles": [
         {
-          "if_missing": "retry",
           "property": "guesty_guest_id",
           "relationship": "guest",
           "value": "69guest"
         }
+      ],
+      "replace_links": [
+        "guest"
       ],
       "type": "upsert_object"
     },

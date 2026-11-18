@@ -23,9 +23,11 @@
 //   undoes a newer reinstatement.
 // - Inquiry Received.
 // Each reservation is also kept as a `reservation` object (see dumbmail://docs/objects) with its
-// current status, dates, listing, nights, guests and channel, linked to the guest, written with
-// Guesty's own time as `as_of` so a late, older message never undoes a newer one. Object-date
-// flows (the pre-arrival flow) follow it when its dates move or it's cancelled.
+// current status, dates, listing, nights, guests and channel, written with Guesty's own time as
+// `as_of` so a late, older message never undoes a newer one. Its `guest` link is replaced by each
+// message: when Guesty moves the booking to another guest (or it has none), the old guest is
+// unlinked at once, and the new one is linked as soon as DumbMail knows them. Object-date flows
+// (the pre-arrival flow) follow it when its dates move or it's cancelled.
 // A webhook without any Guesty time can't be ordered, so it writes no events; the next pull (every
 // 15 minutes) records the change with Guesty's time. A v2 event for a guest DumbMail doesn't know
 // yet is retried until the pull has added them.
@@ -233,16 +235,29 @@ function reservationActions(r, guest, who, version, input, versioned) {
 
 // The reservation as it is now. Only what this message says is written (a v2 webhook without the
 // listing's name leaves the stored name alone); door codes and notes are never among the fields.
+// `who` may be null (no guest, or one DumbMail can't find yet): the old guest is unlinked anyway.
 function reservationObject(d, who, version) {
   var fields = clean({
     status: d.status ? d.status.toLowerCase() : null, confirmation_code: d.confirmation_code, listing_id: d.listing_id, listing_name: d.listing_name,
     check_in: d.check_in, check_out: d.check_out, nights: d.nights, guests: d.guests, total: d.total, currency: d.currency,
     source_channel: d.source_channel, guest_id: d.guest_id,
   });
-  var link = {};
-  for (var k in who) link[k] = who[k];
-  link.relationship = "guest";
-  return { type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: fields, profiles: [link], as_of: version };
+  var profiles = [];
+  if (who) {
+    var link = {};
+    for (var k in who) if (k !== "if_missing") link[k] = who[k];
+    link.relationship = "guest";
+    profiles.push(link);
+  }
+  return { type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: fields, profiles: profiles, replace_links: ["guest"], as_of: version };
+}
+
+// A reservation with no guest DumbMail can find: only its object (which unlinks any old guest).
+function objectOnly(r, version, input) {
+  var d = details(r);
+  if (!d.reservation_id || isOwnerStay(r, input.settings || {})) return [];
+  if (!version) return [];
+  return [reservationObject(d, null, version)];
 }
 
 function clean(o) {
@@ -289,7 +304,7 @@ function fromWebhook(input) {
     var gid = str(data.guestId);
     var who = whoFor(null, gid, true);
     if (!data.reservationId) return [{ type: "log", message: ev + " with no reservationId" }];
-    if (!who) return [{ type: "log", message: ev + " for " + data.reservationId + " has no guestId; the next pull picks it up" }];
+    if (!who) return objectOnly(data, str(meta.publishedAt), input).concat([{ type: "log", message: ev + " for " + data.reservationId + " has no guestId; the reservation is kept without a guest" }]);
     // v2 events carry no email: this reaches guests DumbMail already has; the pull adds new ones.
     var changed = Array.isArray(meta.changedFields) ? meta.changedFields : null;
     var versioned = ev === "reservation.created.v2" || !changed || changed.some(function (f) { return VERSION_CHANGES.indexOf(String(f)) >= 0; });
@@ -394,7 +409,8 @@ function fromGuests(input) {
     var g = gid && byId[gid] ? guestFrom(byId[gid], gid, true) : null;
     var who = whoFor(g && (g.email || g.phone) ? g : null, gid);
     if (!who) {
-      out.push({ type: "log", message: "reservation " + r.reservationId + " has no guest; skipped" });
+      objectOnly(r, updatedAt(r), input).forEach(function (a) { out.push(a); });
+      out.push({ type: "log", message: "reservation " + r.reservationId + " has no guest; kept without one" });
       return;
     }
     reservationActions(r, g && (g.email || g.phone) ? g : null, who, updatedAt(r), input).forEach(function (a) { out.push(a); });

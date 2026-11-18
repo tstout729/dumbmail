@@ -37,6 +37,9 @@
           "relationship": "guest"
         }
       ],
+      "replace_links": [
+        "guest"
+      ],
       "type": "upsert_object"
     },
     {

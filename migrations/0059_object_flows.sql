@@ -9,8 +9,11 @@ CREATE TABLE flow_object_date_fires (
     object_id  uuid NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     due_at     timestamptz NOT NULL,
-    -- pending | started | missed | filtered | not_started | not_live
+    -- pending | started | missed | filtered | obsolete (the date, time zone or trigger changed) |
+    -- not_started | not_live
     outcome    text NOT NULL DEFAULT 'pending',
+    -- The trigger the fire was computed for (a hash of it): a fire for an older trigger never starts.
+    trigger_key text NOT NULL DEFAULT '',
     run_id     uuid,
     runs       integer NOT NULL DEFAULT 0,
     fired_at   timestamptz,
@@ -18,6 +21,8 @@ CREATE TABLE flow_object_date_fires (
     PRIMARY KEY (flow_id, object_id, due_at)
 );
 CREATE INDEX flow_object_date_fires_due_idx ON flow_object_date_fires(due_at) WHERE outcome = 'pending';
+-- The claim looks up each live flow's earliest due fire here, so paused flows' fires are never read.
+CREATE INDEX flow_object_date_fires_flow_due_idx ON flow_object_date_fires(flow_id, due_at) WHERE outcome = 'pending';
 CREATE INDEX flow_object_date_fires_object_idx ON flow_object_date_fires(object_id);
 
 -- Which trigger an object-date flow's existing objects were scheduled for, and how far that got.

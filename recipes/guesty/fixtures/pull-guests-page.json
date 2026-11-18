@@ -34,6 +34,9 @@
           "relationship": "guest"
         }
       ],
+      "replace_links": [
+        "guest"
+      ],
       "type": "upsert_object"
     },
     {
@@ -111,6 +114,9 @@
           "relationship": "guest"
         }
       ],
+      "replace_links": [
+        "guest"
+      ],
       "type": "upsert_object"
     },
     {
@@ -177,6 +183,9 @@
           "relationship": "guest",
           "value": "6g0000000000000000000002"
         }
+      ],
+      "replace_links": [
+        "guest"
       ],
       "type": "upsert_object"
     },
@@ -256,6 +265,9 @@
           "email": "lee@example.org",
           "relationship": "guest"
         }
+      ],
+      "replace_links": [
+        "guest"
       ],
       "type": "upsert_object"
     },

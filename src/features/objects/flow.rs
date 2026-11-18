@@ -528,14 +528,22 @@ pub enum Check {
 /// Before each step of a run that belongs to an object. Runs without one cost nothing.
 pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uuid) -> anyhow::Result<Check> {
     let Some(object_id) = context.get("object").and_then(|o| o.get("id")).and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(Check::NotObject) };
+    let trigger = flows::parse_trigger(&f.trigger);
+    // The person must still have the relationship the trigger asks for (a guest moved off the
+    // booking leaves its flows).
+    let rel = match &trigger {
+        Ok(Trigger::ObjectDate { relationship, .. } | Trigger::Object { relationship, .. }) => relationship.as_deref().map(|r| r.trim().to_lowercase()),
+        _ => None,
+    };
     let row: Option<(String, String, Value, bool, Option<String>, Value)> = sqlx::query_as(
-        "SELECT t.key, o.external_id, o.fields, EXISTS (SELECT 1 FROM object_links l WHERE l.object_id = o.id AND l.profile_id = $3),
+        "SELECT t.key, o.external_id, o.fields, EXISTS (SELECT 1 FROM object_links l WHERE l.object_id = o.id AND l.profile_id = $3 AND ($4::text IS NULL OR l.relationship = $4)),
                 (SELECT a.timezone FROM accounts a WHERE a.id = o.account_id), t.fields
          FROM objects o JOIN object_types t ON t.id = o.type_id WHERE o.id = $1 AND o.account_id = $2",
     )
     .bind(object_id)
     .bind(f.account_id)
     .bind(profile_id)
+    .bind(&rel)
     .fetch_optional(db)
     .await?;
     let Some((key, external_id, all, is_linked, tz, defs)) = row else { return Ok(Check::Exit("object deleted")) };
@@ -547,7 +555,7 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     let defs: Vec<super::types::FieldDef> = serde_json::from_value(defs).unwrap_or_default();
     let fields: Map<String, Value> = all.iter().filter(|(k, _)| defs.iter().any(|d| &d.key == *k && !d.sensitive)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let tz = tz.and_then(|t| t.parse::<chrono_tz::Tz>().ok()).unwrap_or(chrono_tz::America::Los_Angeles).name().to_string();
-    let filters = match flows::parse_trigger(&f.trigger) {
+    let filters = match trigger {
         Ok(Trigger::ObjectDate { object_type, field, filters, .. }) if object_type.trim() == key => {
             let started = context["object"].get("date").cloned().unwrap_or(Value::Null);
             if context["object"]["date_field"].as_str() == Some(field.trim()) && all.get(field.trim()).cloned().unwrap_or(Value::Null) != started {

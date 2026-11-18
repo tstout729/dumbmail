@@ -79,11 +79,16 @@ pub struct ObjectType {
     #[sqlx(json)]
     pub fields: Vec<FieldDef>,
     pub title_field: Option<String>,
+    /// `integer` or `timestamp`: how this type's writes say how new they are (`as_of`).
+    pub version_kind: Option<String>,
+    /// Sensitive fields taken off the type: a field with one of these names is sensitive again.
+    #[serde(skip)]
+    pub removed_sensitive: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-pub const TYPE_COLS: &str = "id, account_id, key, name, plural, fields, title_field, created_at, updated_at";
+pub const TYPE_COLS: &str = "id, account_id, key, name, plural, fields, title_field, version_kind, removed_sensitive, created_at, updated_at";
 
 impl ObjectType {
     pub fn field(&self, key: &str) -> Option<&FieldDef> {
@@ -270,6 +275,23 @@ pub fn normalize(def: &FieldDef, v: &Value) -> Result<Value, String> {
             Value::Array(out)
         }
     })
+}
+
+/// The error people see for a value that doesn't fit `def`: a sensitive field's says what kind of
+/// value it takes without listing its options or echoing anything.
+pub fn public_error(def: &FieldDef, e: String) -> String {
+    if def.sensitive {
+        format!("{} doesn't take that value (it's a {} field)", def.key, match def.kind {
+            Kind::Enum => "choice",
+            Kind::Date | Kind::Datetime => "date",
+            Kind::Number | Kind::Money => "number",
+            Kind::Boolean => "yes/no",
+            Kind::List => "list",
+            Kind::Text => "text",
+        })
+    } else {
+        e
+    }
 }
 
 /// A field for a key nobody defined, typed from its first value.

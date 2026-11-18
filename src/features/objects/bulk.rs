@@ -65,7 +65,9 @@ pub async fn view(db: &sqlx::PgPool, account_id: Uuid, id: Uuid) -> AppResult<Va
     Ok(json!({"id": id, "status": status, "total": total, "done": done, "created": created, "updated": updated, "unchanged": unchanged, "failed": failed, "errors": errors, "created_at": at, "finished_at": fin}))
 }
 
-/// Job: write the next chunk of a batch, save progress, and queue the rest.
+/// Job: write the next chunk of a batch. Each object's write commits together with the batch's
+/// cursor (`done`), only while the cursor is still at it, so a job that dies part-way (or runs twice)
+/// carries on after the last object that committed and never writes one twice.
 pub async fn run(state: &AppState, bulk_id: Uuid) -> anyhow::Result<()> {
     let row: Option<(Uuid, String, Option<Value>, i32, String)> =
         sqlx::query_as("SELECT account_id, source, items, done, status FROM object_bulk_upserts WHERE id = $1").bind(bulk_id).fetch_optional(&state.db).await?;
@@ -80,50 +82,41 @@ pub async fn run(state: &AppState, bulk_id: Uuid) -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    sqlx::query("UPDATE object_bulk_upserts SET status = 'running' WHERE id = $1 AND status = 'queued'").bind(bulk_id).execute(&state.db).await?;
     let w = Writer::new(account_id, &source);
     let start = done.max(0) as usize;
     let end = (start + CHUNK).min(items.len());
-    let (mut c, mut u, mut same, mut failed) = (0, 0, 0, 0);
-    let mut errors = Vec::new();
     for (i, b) in items.iter().enumerate().take(end).skip(start) {
-        match store::upsert(state, &w, b).await {
-            Ok(r) => match r.result {
-                "created" => c += 1,
-                "updated" => u += 1,
-                _ => same += 1,
-            },
+        super::hooks::pause(account_id, "bulk_item").await;
+        let receipt = store::Receipt::Bulk { id: bulk_id, index: i as i32 };
+        match store::upsert_with(state, &w, b, receipt).await {
+            Ok(r) if r.result == "already_applied" => return Ok(()),
+            Ok(_) => {}
             Err(AppError::Internal(e)) => return Err(e),
             Err(e) => {
-                failed += 1;
-                if errors.len() < MAX_ERRORS {
-                    errors.push(json!({"index": i, "external_id": b.external_id, "error": e.public_message()}));
+                let err = json!([{"index": i, "external_id": b.external_id, "error": e.public_message()}]);
+                let n = sqlx::query(
+                    "UPDATE object_bulk_upserts SET done = $2 + 1, failed = failed + 1,
+                        errors = CASE WHEN jsonb_array_length(errors) < $3 THEN errors || $4 ELSE errors END
+                     WHERE id = $1 AND done = $2",
+                )
+                .bind(bulk_id)
+                .bind(i as i32)
+                .bind(MAX_ERRORS as i32)
+                .bind(err)
+                .execute(&state.db)
+                .await?
+                .rows_affected();
+                if n == 0 {
+                    return Ok(());
                 }
             }
         }
     }
-    let finished = end >= items.len();
     let mut tx = state.db.begin().await?;
-    // Only the run that is still at `done` saves (a duplicate job for the same chunk changes nothing).
-    let n = sqlx::query(
-        "UPDATE object_bulk_upserts SET done = $3, created = created + $4, updated = updated + $5, unchanged = unchanged + $6, failed = failed + $7,
-            errors = CASE WHEN jsonb_array_length(errors) < 50 THEN errors || $8 ELSE errors END,
-            status = CASE WHEN $9 THEN 'done' ELSE 'running' END, items = CASE WHEN $9 THEN NULL ELSE items END,
-            finished_at = CASE WHEN $9 THEN now() ELSE NULL END
-         WHERE id = $1 AND done = $2",
-    )
-    .bind(bulk_id)
-    .bind(done)
-    .bind(end as i32)
-    .bind(c)
-    .bind(u)
-    .bind(same)
-    .bind(failed)
-    .bind(Value::Array(errors))
-    .bind(finished)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if n > 0 && !finished {
+    if end >= items.len() {
+        sqlx::query("UPDATE object_bulk_upserts SET status = 'done', items = NULL, finished_at = now() WHERE id = $1 AND done >= total AND status <> 'done'").bind(bulk_id).execute(&mut *tx).await?;
+    } else {
         crate::jobs::enqueue_background(&mut *tx, JOB, json!({"bulk_id": bulk_id}), None).await?;
     }
     tx.commit().await?;

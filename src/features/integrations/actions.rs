@@ -215,7 +215,12 @@ pub struct UpsertObject {
     pub fields: Option<Map<String, Value>>,
     #[serde(default)]
     pub profiles: Vec<ObjectWho>,
-    /// The app's own time or version for this state: an older one never overwrites a newer one.
+    /// Relationships whose links `profiles` replace (e.g. `["guest"]`): people linked that way and
+    /// not named here are unlinked at once, even when the new person isn't known yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replace_links: Vec<String>,
+    /// The app's own version for this state (a whole number or an RFC 3339 time): an older or
+    /// equal one never overwrites what's stored.
     #[serde(default)]
     pub as_of: Option<Value>,
 }
@@ -451,7 +456,13 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     check_who(i, k, &w.who())?;
                     crate::features::objects::store::relationship(w.relationship.as_deref()).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
                 }
-                crate::features::objects::store::as_of_text(&a.as_of).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                for r in &a.replace_links {
+                    crate::features::objects::store::relationship(Some(r)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                }
+                if a.replace_links.len() > 10 {
+                    return Err(format!("action {i} ({k}): replace at most 10 relationships"));
+                }
+                crate::features::objects::store::Version::parse(a.as_of.as_ref().unwrap_or(&Value::Null)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
                 Action::UpsertObject(a)
             }
             "delete_object" => {
@@ -790,38 +801,8 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
 /// so a retry never finds an unheld profile it made. None when someone else created a matching
 /// profile at the same moment (the caller updates that one instead).
 async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
-    let email = input.email.as_deref().and_then(normalize_email);
-    let phone = input.phone_number.as_deref().and_then(normalize_phone);
-    let suppressed = match &email {
-        Some(e) if is_relay_address(e) => Some(REASON_RELAY),
-        Some(_) if no_marketing => Some(REASON_NO_MARKETING),
-        _ => None,
-    };
-    let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
-    let tag = src.tag();
     let mut tx = state.db.begin().await?;
-    let q = format!(
-        "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
-                                    source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'never_subscribed', 'never_subscribed', $9, $10, $11, $12,
-                 CASE WHEN $3::text IS NULL THEN NULL ELSE $9 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $9 END)
-         ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
-    );
-    let created: Option<Profile> = sqlx::query_as(&q)
-        .bind(Uuid::now_v7())
-        .bind(src.account_id)
-        .bind(&email)
-        .bind(&phone)
-        .bind(&input.external_id)
-        .bind(&input.first_name)
-        .bind(&input.last_name)
-        .bind(Value::Object(props.clone()))
-        .bind(&tag)
-        .bind(!src.contacts_opted_in)
-        .bind(&keys)
-        .bind(suppressed)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let created = insert_profile_in(&mut tx, src.account_id, &src.tag(), src.contacts_opted_in, input, props, extra_keys, no_marketing).await?;
     let Some(p) = created else { return Ok(None) };
     if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
         mark_applied(&mut *tx, d, i, print).await?;
@@ -831,8 +812,55 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
     Ok(Some(p))
 }
 
+/// The one insert that creates a profile for an integration (`tag` is `integration:<id>`), inside
+/// the caller's transaction: where it came from, the marketing hold unless the owner said its
+/// contacts opted in, its trusted keys, a relay-address or `marketing: false` suppression, and which
+/// source supplied its email and phone. None when a matching profile exists already.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_profile_in(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    tag: &str,
+    contacts_opted_in: bool,
+    input: &ProfileInput,
+    props: &Map<String, Value>,
+    extra_keys: &Map<String, Value>,
+    no_marketing: bool,
+) -> AppResult<Option<Profile>> {
+    let email = input.email.as_deref().and_then(normalize_email);
+    let phone = input.phone_number.as_deref().and_then(normalize_phone);
+    let suppressed = match &email {
+        Some(e) if is_relay_address(e) => Some(REASON_RELAY),
+        Some(_) if no_marketing => Some(REASON_NO_MARKETING),
+        _ => None,
+    };
+    let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
+    let q = format!(
+        "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
+                                    source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'never_subscribed', 'never_subscribed', $9, $10, $11, $12,
+                 CASE WHEN $3::text IS NULL THEN NULL ELSE $9 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $9 END)
+         ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
+    );
+    Ok(sqlx::query_as(&q)
+        .bind(Uuid::now_v7())
+        .bind(account_id)
+        .bind(&email)
+        .bind(&phone)
+        .bind(&input.external_id)
+        .bind(&input.first_name)
+        .bind(&input.last_name)
+        .bind(Value::Object(props.clone()))
+        .bind(tag)
+        .bind(!contacts_opted_in)
+        .bind(&keys)
+        .bind(suppressed)
+        .fetch_optional(conn)
+        .await?)
+}
+
 /// Record in the delivery's ledger that action `i` was written.
-async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<()> {
+pub(crate) async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<()> {
     sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1")
         .bind(delivery)
         .bind(i.to_string())
@@ -1035,7 +1063,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                 }
                 out.effect(i, format!("stopped all marketing to {}", who_label(&who)));
             }
-            Action::UpsertObject(o) => upsert_object(state, src, i, o, dry, out).await?,
+            Action::UpsertObject(o) => upsert_object(state, src, i, o, &print, dry, out).await?,
             Action::DeleteObject(d) => {
                 let id = crate::features::objects::store::ids_for(&state.db, src.account_id, &d.object_type, &[d.external_id.trim().to_string()]).await?;
                 if dry {
@@ -1045,8 +1073,18 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     }
                     continue;
                 }
+                // The delete and its ledger entry commit together: a retry never deletes a
+                // replacement made later under the same external id.
                 let ids: Vec<Uuid> = id.iter().map(|(id, _)| *id).collect();
-                let n = if ids.is_empty() { 0 } else { crate::features::objects::store::delete(&state.db, src.account_id, &ids).await? };
+                let receipt = match src.ledger {
+                    Some(delivery) => crate::features::objects::store::Receipt::Ledger { delivery, index: i, print: &print },
+                    None => crate::features::objects::store::Receipt::None,
+                };
+                crate::features::objects::hooks::pause(src.account_id, "before_delete").await;
+                let n = crate::features::objects::store::delete_with(&state.db, src.account_id, &ids, receipt).await?;
+                if src.ledger.is_some() {
+                    out.applied.insert(i.to_string(), json!(print));
+                }
                 out.counts.objects_deleted += n as u32;
                 out.effect(i, if n > 0 { format!("deleted {} {}", d.object_type, d.external_id) } else { format!("{} {} was already gone", d.object_type, d.external_id) });
             }
@@ -1093,7 +1131,8 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
 /// Write (or, dry, describe) an `upsert_object`: its people are found or created as for other
 /// actions (new ones held back from marketing without an opt-in), the integration's redact list is
 /// applied to its fields, and it's written with the app's `as_of` so an older state never wins.
-async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObject, dry: bool, out: &mut Outcome) -> AppResult<()> {
+async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObject, print: &str, dry: bool, out: &mut Outcome) -> AppResult<()> {
+    use crate::features::objects::store::{self, LinkReq, LinkWho, Receipt, Version, Write, Writer};
     let key = o.object_type.trim();
     let external_id = match (&o.external_id, dry) {
         (Some(e), _) => e.trim().to_string(),
@@ -1105,39 +1144,64 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
     let mut links = Vec::new();
     let mut who = Vec::new();
     for w in &o.profiles {
-        let Some(found) = resolve(state, src, &w.who(), dry, out).await? else {
-            who.push(format!("{} (nobody yet; not linked)", who_label(&w.who())));
-            continue;
+        let rel = store::relationship(w.relationship.as_deref())?;
+        let label = who_label(&w.who());
+        who.push(if rel.is_empty() { label } else { format!("{label} ({rel})") });
+        // A lookup that finds nobody yet leaves the object unlinked from them for now (the object
+        // itself is still written, and a replacement still unlinks whoever it replaces).
+        let target = match (&w.property, &w.value) {
+            (Some(p), Some(v)) => LinkWho::Property { name: p.clone(), value: key_text(v) },
+            _ => LinkWho::Ids {
+                email: w.email.as_deref().and_then(normalize_email),
+                phone_number: w.phone_number.as_deref().and_then(normalize_phone),
+                external_id: w.external_id.clone().filter(|s| !s.trim().is_empty()),
+            },
         };
-        let rel = crate::features::objects::store::relationship(w.relationship.as_deref())?;
-        who.push(if rel.is_empty() { who_label(&w.who()) } else { format!("{} ({rel})", who_label(&w.who())) });
-        links.push((found.id, rel));
+        links.push(LinkReq { who: target, relationship: rel });
     }
+    let replace = o.replace_links.iter().map(|r| store::relationship(Some(r))).collect::<AppResult<Vec<_>>>()?;
     let people = if who.is_empty() { String::new() } else { format!(" for {}", who.join(", ")) };
+    let unlinks = if replace.is_empty() { String::new() } else { format!("; replaces its {} links", replace.join(", ")) };
     if dry {
-        let (what, changed) = crate::features::objects::store::preview(state, src.account_id, key, &external_id, &fields, &redact).await?;
+        let (what, changed) = store::preview(state, src.account_id, key, &external_id, &fields, &redact).await?;
         if what != "unchanged" {
             out.counts.objects_upserted += 1;
         }
         let detail = if changed.is_empty() { String::new() } else { format!(" ({})", changed.join(", ")) };
         out.effect(i, match what {
-            "created" => format!("would create {key} {external_id}{detail}{people}"),
-            "updated" => format!("would update {key} {external_id}{detail}{people}"),
-            _ => format!("{key} {external_id} unchanged{people}"),
+            "created" => format!("would create {key} {external_id}{detail}{people}{unlinks}"),
+            "updated" => format!("would update {key} {external_id}{detail}{people}{unlinks}"),
+            _ => format!("{key} {external_id} unchanged{people}{unlinks}"),
         });
         return Ok(());
     }
-    let w = crate::features::objects::store::Writer { account_id: src.account_id, source: src.tag(), redact };
-    let as_of = crate::features::objects::store::as_of_text(&o.as_of)?;
-    let r = crate::features::objects::store::write(state, &w, key, &external_id, &fields, &links, as_of.as_deref()).await?;
+    let w = Writer { account_id: src.account_id, source: src.tag(), redact, creator: store::Creator::Integration { tag: src.tag(), opted_in: src.contacts_opted_in } };
+    let req = Write { type_key: key, external_id: &external_id, fields: &fields, links, replace, as_of: Version::parse(o.as_of.as_ref().unwrap_or(&Value::Null))? };
+    // The write and this action's ledger entry commit together: a retry resumes after it.
+    let receipt = match src.ledger {
+        Some(delivery) => Receipt::Ledger { delivery, index: i, print },
+        None => Receipt::None,
+    };
+    let r = store::write(state, &w, &req, receipt).await?;
+    if src.ledger.is_some() {
+        out.applied.insert(i.to_string(), json!(print));
+    }
+    out.counts.profiles_created += r.created_profiles.len() as u32;
+    if !src.contacts_opted_in {
+        out.counts.held += r.created_profiles.len() as u32;
+    }
     let detail = if r.changed.is_empty() { String::new() } else { format!(" ({})", r.changed.join(", ")) };
+    let links_line = match (r.linked, r.unlinked) {
+        (0, 0) => String::new(),
+        (l, u) => format!("; linked {l}, unlinked {u}"),
+    };
     match r.result {
         "created" | "updated" => {
             out.counts.objects_upserted += 1;
-            out.effect(i, format!("{} {key} {}{detail}{people}", r.result, r.external_id));
+            out.effect(i, format!("{} {key} {}{detail}{people}{links_line}", r.result, r.external_id));
         }
-        "older" => out.effect(i, format!("kept {key} {}: this state is older than the one stored", r.external_id)),
-        _ => out.effect(i, format!("{key} {} unchanged{people}", r.external_id)),
+        "older" | "duplicate" => out.effect(i, format!("kept {key} {}: this state is {} the one stored", r.external_id, if r.result == "older" { "older than" } else { "the same version as" })),
+        _ => out.effect(i, format!("{key} {} unchanged{people}{links_line}", r.external_id)),
     }
     Ok(())
 }

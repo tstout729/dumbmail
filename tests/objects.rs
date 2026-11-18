@@ -89,7 +89,8 @@ async fn upserts_merge_record_history_and_stay_in_their_account() {
     assert_eq!(o["fields"]["check_in"], day(12));
     assert!(o["fields"].get("pets").is_none());
     let hist = o["history"].as_array().unwrap();
-    assert_eq!(hist.len(), 2, "{o}");
+    assert_eq!(hist.len(), 3, "created, Ana linked, updated: {o}");
+    assert_eq!(hist[1]["kind"], "links");
     assert_eq!(hist[0]["before"]["check_in"], day(10));
     assert_eq!(hist[0]["after"]["check_in"], day(12));
     assert_eq!(o["profiles"][0]["email"], "ana@example.com");
@@ -181,7 +182,7 @@ async fn types_deletes_bulk_and_mcp() {
     // A replayed job for a finished batch writes nothing more.
     dumbmail::jobs::enqueue_background(&h.state.db, "objects_bulk", json!({"bulk_id": b["id"]}), None).await.unwrap();
     h.drain().await;
-    assert_eq!(count(&h, "SELECT count(*) FROM object_changes").await, 231);
+    assert_eq!(count(&h, "SELECT count(*) FROM object_changes WHERE kind <> 'links'").await, 231);
     let too_many: Vec<Value> = (0..1001).map(|i| json!({"type": "subscription", "external_id": format!("X{i}")})).collect();
     assert_eq!(h.req("POST", "/api/objects/bulk", Some(json!({"objects": too_many}))).await.0, StatusCode::BAD_REQUEST);
 
@@ -421,7 +422,7 @@ async fn integrations_write_objects_once_without_codes_and_hold_new_guests() {
     let older = json!({"id": "S1", "check_in": day(9), "email": "guest@example.com", "at": "2026-11-16T10:00:00Z"}).to_string();
     h.raw("POST", &path, &[("content-type", "application/json")], &older).await;
     h.drain().await;
-    assert_eq!(count(&h, "SELECT count(*) FROM object_changes").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM object_changes WHERE kind <> 'links'").await, 1);
     let (s, _, _) = h.raw("POST", &path, &[("content-type", "application/json")], &json!({"id": "S1", "gone": true}).to_string()).await;
     assert_eq!(s, StatusCode::OK);
     h.drain().await;
@@ -532,5 +533,60 @@ async fn an_integration_never_inserts_a_profile_unheld() {
     assert_eq!(inserts, vec![("guest@example.com".to_string(), false), ("guest@example.com".to_string(), true)]);
     let (held, src): (bool, Option<String>) = sqlx::query_as("SELECT marketing_hold, email_source FROM profiles WHERE email = 'guest@example.com'").fetch_one(&h.state.db).await.unwrap();
     assert!(held && src.is_some_and(|s| s.starts_with("integration:")));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_reassigned_booking_unlinks_the_old_guest_at_once() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_of(&h).await;
+    for (email, key) in [("ana@example.com", "gA"), ("ben@example.com", "gB")] {
+        sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) VALUES ($1, $2, $3, jsonb_build_object('pms_guest', $4::text))")
+            .bind(uuid::Uuid::now_v7())
+            .bind(acct)
+            .bind(email)
+            .bind(key)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    h.ok("POST", "/api/object-types", Some(json!({"key": "reservation", "fields": [{"key": "status", "type": "text"}, {"key": "nights", "type": "number"}]}))).await;
+    live(&mut h, json!({"name": "Welcome", "trigger": {"type": "object", "object_type": "reservation", "relationship": "guest"}, "definition": {"entry": "d1", "nodes": [
+        {"id": "d1", "type": "delay", "amount": 1, "unit": "days", "next": "e1"},
+        {"id": "e1", "type": "email", "next": null, "content": {"subject": "Your stay {{ object.external_id }}", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}]}})).await;
+    let script = "function handle(i) { var p = i.payload; return [{type: 'upsert_object', object_type: 'reservation', external_id: 'R1', as_of: p.v, fields: {status: 'confirmed', nights: p.nights}, replace_links: ['guest'], profiles: p.guest ? [{property: 'pms_guest', value: p.guest, relationship: 'guest'}] : []}] }";
+    let (_, path) = integration(&mut h, script, json!([])).await;
+    let send = |body: Value| {
+        let path = path.clone();
+        let h = &h;
+        async move {
+            let (s, _, r) = h.raw("POST", &path, &[("content-type", "application/json")], &body.to_string()).await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            h.drain().await;
+        }
+    };
+    send(json!({"guest": "gA", "v": 1, "nights": 2})).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs WHERE status = 'active'").await, 1, "Ana is waiting in the flow");
+    // The booking moves to a guest DumbMail doesn't know yet: Ana is unlinked now anyway.
+    send(json!({"guest": "gNew", "v": 2, "nights": 3})).await;
+    let links = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, String>("SELECT p.email FROM object_links l JOIN profiles p ON p.id = l.profile_id ORDER BY 1").fetch_all(&db).await.unwrap() }
+    };
+    assert!(links(&h).await.is_empty(), "the old guest is unlinked at once");
+    h.fast_forward().await;
+    assert!(h.state.email.sent().iter().all(|m| m.to != "ana@example.com"), "Ana's run leaves before its email");
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs WHERE status = 'exited'").await, 1);
+    // Once the new guest is known (here: Ben), they're linked.
+    sqlx::query("UPDATE profiles SET integration_keys = '{\"pms_guest\": \"gNew\"}' WHERE email = 'ben@example.com'").execute(&h.state.db).await.unwrap();
+    send(json!({"guest": "gNew", "v": 2, "nights": 3})).await;
+    assert_eq!(links(&h).await, vec!["ben@example.com"], "the same version resent links the guest now known");
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM object_changes ORDER BY created_at, id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(kinds, vec!["created", "links", "updated", "links", "links"], "links and unlinks are in the history");
+    // The API can replace a relationship's links too.
+    h.ok("POST", "/api/objects", Some(json!({"type": "reservation", "external_id": "R1", "replace_links": ["guest"], "profiles": [{"email": "cara@example.com", "relationship": "guest"}]}))).await;
+    assert_eq!(links(&h).await, vec!["cara@example.com"]);
     h.cleanup().await;
 }

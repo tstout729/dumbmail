@@ -12,6 +12,12 @@ CREATE TABLE object_types (
     -- date | datetime | enum | list | money.
     fields      jsonb NOT NULL DEFAULT '[]',
     title_field text,
+    -- How writes say how new they are (`as_of`): 'integer' or 'timestamp', set by the first write
+    -- that gives one; the two are never mixed.
+    version_kind text,
+    -- Names of sensitive fields taken off the type: a later field with one of these names is
+    -- sensitive again.
+    removed_sensitive text[] NOT NULL DEFAULT '{}',
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
     UNIQUE (account_id, key)
@@ -27,8 +33,9 @@ CREATE TABLE objects (
     -- Who last wrote it: api | mcp | integration:<id>.
     source      text,
     version     bigint NOT NULL DEFAULT 1,
-    -- The newest `as_of` (the change's time or version in the customer's system) written; an
-    -- upsert older than it is ignored, so a late, older message never undoes a newer one.
+    -- The newest `as_of` written (the change's version or time in the customer's system, in one
+    -- comparable form: an integer's digits, or a UTC time with microseconds); a write older than or
+    -- equal to it is ignored, so a late or repeated message never undoes a newer one.
     as_of       text,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -55,7 +62,7 @@ CREATE TABLE object_changes (
     id         uuid PRIMARY KEY,
     object_id  uuid NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    kind       text NOT NULL, -- created | updated
+    kind       text NOT NULL, -- created | updated | links (people linked or unlinked)
     changed    text[] NOT NULL DEFAULT '{}',
     before     jsonb NOT NULL DEFAULT '{}',
     after      jsonb NOT NULL DEFAULT '{}',
