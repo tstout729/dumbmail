@@ -713,7 +713,7 @@ pub async fn reschedule_event_dates(db: &PgPool, account_id: Uuid) -> anyhow::Re
         sqlx::query(&q)
             .bind(f.id)
             .bind(account_id)
-            .bind(&f.trigger["metric"].as_str().unwrap_or(""))
+            .bind(f.trigger["metric"].as_str().unwrap_or(""))
             .bind(json_path(&field))
             .bind(&tz)
             .bind(offset_days as i32)
