@@ -227,6 +227,10 @@ pub struct UpsertObject {
     /// the object exists and its stored version isn't newer. Never creates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only_if_as_of_at_most: Option<Value>,
+    /// Set by the engine (never by scripts in practice): fields put back from a delivery's sealed
+    /// copy, written only while the type still marks them sensitive.
+    #[serde(default, rename = "_sealed", skip_serializing_if = "Vec::is_empty")]
+    pub sealed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1195,6 +1199,7 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
         type_key: key,
         external_id: &external_id,
         fields: &fields,
+        sealed: &o.sealed,
         links,
         replace,
         as_of: Version::parse(o.as_of.as_ref().unwrap_or(&Value::Null))?,

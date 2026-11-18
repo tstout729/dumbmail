@@ -100,6 +100,17 @@ pub struct UpsertInput {
     pub only_if_as_of_at_most: Option<Value>,
 }
 
+/// A link request as stored with the version that made it (hashed: no identifiers kept here).
+fn link_target(l: &LinkReq) -> String {
+    use sha2::Digest;
+    let who = match &l.who {
+        LinkWho::Id(id) => json!(["id", id]),
+        LinkWho::Ids { email, phone_number, external_id } => json!(["ids", email, phone_number, external_id]),
+        LinkWho::Property { name, value } => json!(["property", name, value]),
+    };
+    hex::encode(sha2::Sha256::digest(json!([who, l.relationship]).to_string().as_bytes()))
+}
+
 /// Who a link is to.
 #[derive(Debug, Clone)]
 pub enum LinkWho {
@@ -132,6 +143,9 @@ pub struct Write<'a> {
     pub type_key: &'a str,
     pub external_id: &'a str,
     pub fields: &'a Map<String, Value>,
+    /// Fields from a sealed (private) copy: written only if the type, as this write reads it under
+    /// its lock, still marks them sensitive (an un-mark erased their old values).
+    pub sealed: &'a [String],
     pub links: Vec<LinkReq>,
     pub replace: Vec<String>,
     pub as_of: Option<Version>,
@@ -184,7 +198,8 @@ fn check_external_id(e: &str) -> AppResult<String> {
 }
 
 /// A write's version: a whole number (kept exactly, as its digits) or a time (kept in UTC with
-/// microseconds, so stored versions of one kind compare correctly).
+/// all nine fractional digits, so stored versions of one kind compare correctly and two writes a
+/// fraction of a microsecond apart stay in order).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Version {
     Integer(String),
@@ -203,7 +218,7 @@ impl Version {
                     let digits = s.trim_start_matches('0');
                     return Ok(Some(Version::Integer(if digits.is_empty() { "0".into() } else { digits.into() })));
                 }
-                DateTime::parse_from_rfc3339(s).map(|d| Some(Version::Time(d.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Micros, true)))).map_err(|_| bad())
+                DateTime::parse_from_rfc3339(s).map(|d| Some(Version::Time(d.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Nanos, true)))).map_err(|_| bad())
             }
             _ => Err(bad()),
         }
@@ -420,14 +435,22 @@ async fn record_receipt(conn: &mut PgConnection, r: Receipt<'_>, result: &str) -
 /// Create or update one object for `w`, with its receipt.
 pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Receipt<'_>) -> AppResult<Upserted> {
     let external_id = check_external_id(req.external_id)?;
-    let fields = redacted(&w.redact, req.fields);
+    let mut fields = redacted(&w.redact, req.fields);
     check_fields_shape(&fields)?;
     if req.links.len() > MAX_LINKS {
         return Err(AppError::bad(format!("an object can be linked to at most {MAX_LINKS} people")));
     }
     let tz = super::flow::account_tz(&state.db, w.account_id).await?;
     let mut tx = state.db.begin().await?;
+    // A sealed field the type no longer marks sensitive isn't written: checked before the type is
+    // read for the write (so it adds no field), and again on the type as locked for it.
+    if !req.sealed.is_empty() {
+        if let Some(t) = types::by_key(&mut *tx, w.account_id, req.type_key).await? {
+            fields.retain(|k, _| !req.sealed.contains(k) || t.is_sensitive(k));
+        }
+    }
     let t = types::for_upsert(&mut tx, w.account_id, req.type_key, &fields).await?;
+    fields.retain(|k, _| !req.sealed.contains(k) || t.is_sensitive(k));
     super::hooks::pause(w.account_id, "type_read").await;
     let norm = normalize_all(&t, &fields)?;
     // One kind of version per type, set by the first write that gives one.
@@ -492,8 +515,12 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
             (Map::new(), fresh.clone())
         }
         None => {
-            let (id, cur, version, stored): (Uuid, Value, i64, Option<String>) =
-                sqlx::query_as("SELECT id, fields, version, as_of FROM objects WHERE type_id = $1 AND external_id = $2 FOR UPDATE").bind(t.id).bind(&external_id).fetch_one(&mut *tx).await?;
+            let (id, cur, version, stored, targets): (Uuid, Value, i64, Option<String>, Option<Vec<String>>) =
+                sqlx::query_as("SELECT id, fields, version, as_of, link_targets FROM objects WHERE type_id = $1 AND external_id = $2 FOR UPDATE")
+                    .bind(t.id)
+                    .bind(&external_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             out.id = id;
             out.version = version;
             // Older than or the same as what's stored: ignored (a late or repeated message).
@@ -502,11 +529,14 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
                 if ord != Ordering::Greater {
                     out.result = if ord == Ordering::Equal { "duplicate" } else { "older" };
                     // The same version again (a resend, or the pull catching up with a webhook): its
-                    // fields stay as they are, but people it names who are now known are linked
-                    // (never unlinked: that belonged to the write that set this version).
-                    if ord == Ordering::Equal && !req.links.is_empty() {
+                    // fields stay as they are, but people the accepted write named who are now
+                    // known are linked (never unlinked: that belonged to the write that set this
+                    // version). A resend naming anyone else at this version links nobody.
+                    let targets = targets.unwrap_or_default();
+                    let named: Vec<&LinkReq> = req.links.iter().filter(|l| targets.contains(&link_target(l))).collect();
+                    if ord == Ordering::Equal && !named.is_empty() {
                         let mut wanted: Vec<(Uuid, String)> = Vec::new();
-                        for l in &req.links {
+                        for l in named {
                             let (pid, created) = resolve_in(&mut tx, w, &l.who).await?;
                             out.created_profiles.extend(created);
                             if let Some(pid) = pid {
@@ -579,6 +609,11 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
     let (linked, unlinked) = relink(&mut tx, w.account_id, out.id, &wanted, &req.replace).await?;
     out.linked = linked.len() as u32;
     out.unlinked = unlinked.len() as u32;
+    // Who this version named: a resend of it may link them later, and no one else.
+    if version_text.is_some() {
+        let targets: Vec<String> = req.links.iter().map(link_target).collect();
+        sqlx::query("UPDATE objects SET link_targets = $2 WHERE id = $1").bind(out.id).bind(&targets).execute(&mut *tx).await?;
+    }
     if out.result == "created" || !out.changed.is_empty() {
         let change_id = Uuid::now_v7();
         insert_change(&mut tx, change_id, out.id, w, if out.result == "created" { "created" } else { "updated" }, &out.changed, before, after, out.version).await?;
@@ -679,6 +714,7 @@ pub async fn upsert_with(state: &AppState, w: &Writer, b: &UpsertInput, receipt:
         type_key: &b.type_key,
         external_id: &b.external_id,
         fields: &b.fields,
+        sealed: &[],
         links: links_for(&b.profiles)?,
         replace,
         as_of: Version::parse(b.as_of.as_ref().unwrap_or(&Value::Null))?,

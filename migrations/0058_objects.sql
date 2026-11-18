@@ -34,9 +34,12 @@ CREATE TABLE objects (
     source      text,
     version     bigint NOT NULL DEFAULT 1,
     -- The newest `as_of` written (the change's version or time in the customer's system, in one
-    -- comparable form: an integer's digits, or a UTC time with microseconds); a write older than or
-    -- equal to it is ignored, so a late or repeated message never undoes a newer one.
+    -- comparable form: an integer's digits, or a UTC time with nine fractional digits); a write
+    -- older than or equal to it is ignored, so a late or repeated message never undoes a newer one.
     as_of       text,
+    -- The people the write that set `as_of` named (hashed): a resend of that version may link only
+    -- them (once they're known), never restore someone a later write unlinked.
+    link_targets text[],
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),
     UNIQUE (type_id, external_id)

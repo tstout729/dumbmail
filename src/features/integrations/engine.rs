@@ -304,9 +304,9 @@ async fn seal_sensitive(state: &AppState, integ: &Integration, list: Vec<Value>)
     Ok((out, sealed))
 }
 
-/// The stored list with its sealed sensitive fields put back (in memory only), each only while its
-/// type still marks it sensitive: a field un-marked since (its old values erased) never gets an
-/// old private value written into it by a late retry.
+/// The stored list with its sealed sensitive fields put back (in memory only), each marked so the
+/// write keeps it only while its type still marks it sensitive (checked under the write's lock on
+/// the type): a field un-marked since, its old values erased, never gets one back from a retry.
 async fn unsealed(state: &AppState, account_id: Uuid, list: &[Value], sealed: Option<&str>) -> Result<Vec<Value>, String> {
     let Some(s) = sealed else { return Ok(list.to_vec()) };
     let unreadable = || "the delivery's hidden fields couldn't be read".to_string();
@@ -318,9 +318,12 @@ async fn unsealed(state: &AppState, account_id: Uuid, list: &[Value], sealed: Op
         let Some(action) = out.get_mut(i) else { continue };
         let key = action["object_type"].as_str().unwrap_or("").to_string();
         let t = crate::features::objects::types::by_key(&state.db, account_id, &key).await.map_err(|e| e.public_message())?;
-        if let (Some(fields), Some(taken), Some(t)) = (action.get_mut("fields").and_then(Value::as_object_mut), taken.as_object(), t) {
-            fields.extend(taken.iter().filter(|(k, _)| t.is_sensitive(k)).map(|(k, v)| (k.clone(), v.clone())));
+        let Some(taken) = taken.as_object() else { continue };
+        let kept: Map<String, Value> = taken.iter().filter(|(k, _)| t.as_ref().is_some_and(|t| t.is_sensitive(k))).map(|(k, v)| (k.clone(), v.clone())).collect();
+        if let Some(fields) = action.get_mut("fields").and_then(Value::as_object_mut) {
+            fields.extend(kept.clone());
         }
+        action["_sealed"] = json!(kept.keys().collect::<Vec<_>>());
     }
     Ok(out)
 }

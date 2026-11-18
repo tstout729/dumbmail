@@ -1009,10 +1009,14 @@ async fn single_writes_are_audited_and_type_edits_keep_stored_values_valid() {
     let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "agent", "scopes": ["full"]}))).await["key"].as_str().unwrap().to_string();
     let (err, _, text) = mcp(&h, &key, "upsert_objects", json!({"objects": [{"type": "stay", "external_id": "E2", "fields": {"nights": "3"}}]})).await;
     assert!(!err, "{text}");
+    // A link-only write through inline MCP (fields unchanged, one person linked) is audited too.
+    let (err, sc, text) = mcp(&h, &key, "upsert_objects", json!({"objects": [{"type": "stay", "external_id": "E2", "fields": {"nights": "3"}, "profiles": [{"email": "g@example.com"}]}]})).await;
+    let v: Value = if sc.is_null() { serde_json::from_str(&text).unwrap() } else { sc };
+    assert!(!err && v["results"][0]["result"] == "unchanged" && v["results"][0]["linked"] == 1, "{text}");
     h.ok("DELETE", &format!("/api/objects/{}", r["id"].as_str().unwrap()), None).await;
     let audits: Vec<(String, Value)> = sqlx::query_as("SELECT action, details FROM audit_log WHERE action LIKE 'objects.%' ORDER BY created_at").fetch_all(&h.state.db).await.unwrap();
     let actions: Vec<&str> = audits.iter().map(|(a, _)| a.as_str()).collect();
-    assert_eq!(actions, vec!["objects.upsert", "objects.upsert", "objects.delete"], "{audits:?}");
+    assert_eq!(actions, vec!["objects.upsert", "objects.upsert", "objects.upsert", "objects.delete"], "{audits:?}");
     assert!(!format!("{audits:?}").contains("nights"), "no fields in the audit: {audits:?}");
     // nights is text now ("3"); making it a number changes what's stored: refused with a count ...
     h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "E3", "fields": {"nights": "several"}}))).await;
@@ -1309,7 +1313,7 @@ async fn an_unmark_waits_for_writes_in_flight_and_late_retries_skip_its_old_valu
     let write = tokio::spawn(async move {
         use dumbmail::features::objects::store;
         let fields = json!({"pin": "4417"}).as_object().cloned().unwrap();
-        let req = store::Write { type_key: "stay", external_id: "S1", fields: &fields, links: vec![], replace: vec![], as_of: None, at_most: None };
+        let req = store::Write { type_key: "stay", external_id: "S1", fields: &fields, sealed: &[], links: vec![], replace: vec![], as_of: None, at_most: None };
         store::write(&state, &store::Writer::new(acct, "api"), &req, store::Receipt::None).await.map(|_| ())
     });
     assert_eq!(points.recv().await, Some("type_read"));
@@ -1338,6 +1342,16 @@ async fn an_unmark_waits_for_writes_in_flight_and_late_retries_skip_its_old_valu
     h.fast_forward().await;
     let (n, code): (Option<String>, Option<String>) = sqlx::query_as("SELECT fields->>'n', fields->>'code' FROM objects WHERE external_id = 'V1'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((n.as_deref(), code), (Some("2"), None), "the rest is written; the old private value isn't");
+    // The write itself checks, on the type it locks: a sealed field that's ordinary now is dropped.
+    {
+        use dumbmail::features::objects::store;
+        let fields = json!({"n": 5, "code": "C-1"}).as_object().cloned().unwrap();
+        let sealed = vec!["code".to_string()];
+        let req = store::Write { type_key: "visit", external_id: "V1", fields: &fields, sealed: &sealed, links: vec![], replace: vec![], as_of: None, at_most: None };
+        store::write(&h.state, &store::Writer::new(acct, "api"), &req, store::Receipt::None).await.unwrap();
+    }
+    let (n, code): (Option<String>, Option<String>) = sqlx::query_as("SELECT fields->>'n', fields->>'code' FROM objects WHERE external_id = 'V1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((n.as_deref(), code), (Some("5"), None));
     h.cleanup().await;
 }
 
@@ -1382,5 +1396,36 @@ async fn a_retried_pull_page_never_deletes_a_replacement() {
     let n: Option<String> = sqlx::query_scalar("SELECT fields->>'n' FROM objects WHERE external_id = 'S1'").fetch_optional(&h.state.db).await.unwrap();
     assert_eq!(n.as_deref(), Some("2"), "the retried page saw its delete already written");
     assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE page_key IS NOT NULL").await, 0, "checkpointed: no page left open");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_equal_version_resend_links_only_whom_its_version_named() {
+    let mut h = harness!();
+    h.signup().await;
+    let guests = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move {
+            let v: Vec<String> = sqlx::query_scalar("SELECT p.email FROM object_links l JOIN profiles p ON p.id = l.profile_id ORDER BY 1").fetch_all(&db).await.unwrap();
+            v
+        }
+    };
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"n": 1}, "profiles": [{"email": "a@example.com", "relationship": "guest"}], "as_of": 1}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"n": 2}, "profiles": [{"email": "b@example.com", "relationship": "guest"}], "replace_links": ["guest"], "as_of": 2}))).await;
+    assert_eq!(guests(&h).await, vec!["b@example.com"]);
+    // A conflicting message at the same version names the former guest: nobody is linked.
+    let r = h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"n": 2}, "profiles": [{"email": "a@example.com", "relationship": "guest"}], "as_of": 2}))).await;
+    assert_eq!(r["result"], "duplicate", "{r}");
+    assert_eq!(guests(&h).await, vec!["b@example.com"], "the former guest stays unlinked");
+    // A true resend of version 2 is harmless (b is already linked).
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"n": 2}, "profiles": [{"email": "b@example.com", "relationship": "guest"}], "as_of": 2}))).await;
+    assert_eq!(guests(&h).await, vec!["b@example.com"]);
+    // Times keep every fractional digit: 100 ns apart are ordered, not equal.
+    let at = |frac: &str, n: i64| json!({"type": "visit", "external_id": "V1", "fields": {"n": n}, "as_of": format!("2026-11-17T10:00:00.{frac}Z")});
+    h.ok("POST", "/api/objects", Some(at("123456100", 1))).await;
+    assert_eq!(h.ok("POST", "/api/objects", Some(at("123456900", 2))).await["result"], "updated");
+    assert_eq!(h.ok("POST", "/api/objects", Some(at("123456500", 3))).await["result"], "older");
+    let n: String = sqlx::query_scalar("SELECT fields->>'n' FROM objects WHERE external_id = 'V1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, "2");
     h.cleanup().await;
 }

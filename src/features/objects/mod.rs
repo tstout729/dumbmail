@@ -176,7 +176,9 @@ impl Feature for Module {
                             Err(e) => out.push(json!({"index": i, "external_id": b.external_id, "error": e.public_message()})),
                         }
                     }
-                    let written = out.iter().filter(|r| r.get("id").is_some() && !matches!(r["result"].as_str(), Some("unchanged" | "older" | "duplicate"))).count();
+                    // Anything written counts, a change of who it's linked to included.
+                    let links = |r: &Value| r["linked"].as_u64().unwrap_or(0) + r["unlinked"].as_u64().unwrap_or(0);
+                    let written = out.iter().filter(|r| r.get("id").is_some() && (!matches!(r["result"].as_str(), Some("unchanged" | "older" | "duplicate")) || links(r) > 0)).count();
                     if written > 0 {
                         let mut kinds: Vec<&str> = items.iter().map(|b| b.type_key.trim()).collect();
                         kinds.sort();
