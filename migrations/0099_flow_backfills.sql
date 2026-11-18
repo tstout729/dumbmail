@@ -34,7 +34,10 @@ CREATE INDEX flow_backfill_members_todo_idx ON flow_backfill_members (backfill_i
 -- Pacing reads the people enrolled recently.
 CREATE INDEX flow_backfill_members_done_idx ON flow_backfill_members (backfill_id, done_at) WHERE done_at IS NOT NULL;
 
--- A run whose current step is reaching someone outside (a message, a notification, a webhook) is
--- marked until it moves on, so "remove from flow" and that send can't both happen. Nullable with no
--- default: adding it doesn't rewrite the table.
-ALTER TABLE flow_runs ADD COLUMN sending_until timestamptz;
+-- Who is moving a run: every write to a run swaps in a fresh claim id and is conditional on the
+-- one the writer last saw, so one worker moves a run at a time. While a step reaches someone outside
+-- (a message, a notification, a webhook), the claim also has an expiry, and "remove from flow"
+-- leaves the run alone until it ends. A parked run (waiting for its wake-up job) has waiting_until;
+-- only the wake that carries its claim id moves it on. Nullable with no default: adding them
+-- doesn't rewrite the table.
+ALTER TABLE flow_runs ADD COLUMN claim_id uuid, ADD COLUMN claim_until timestamptz, ADD COLUMN waiting_until timestamptz;

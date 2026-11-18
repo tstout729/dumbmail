@@ -1011,3 +1011,120 @@ async fn entering_a_flow_costs_what_it_did() {
     assert!(accepted_n <= 3 + 2, "an accepted entry is at most two more: {accepted_n}");
     h.cleanup().await;
 }
+
+// ---------- One worker moves a run at a time; a wait wakes once ----------
+
+async fn flow_row(h: &Harness, fid: &str) -> dumbmail::models::FlowRow {
+    sqlx::query_as("SELECT * FROM flows WHERE id = $1::uuid").bind(fid).fetch_one(&h.state.db).await.unwrap()
+}
+
+async fn new_person(h: &mut Harness, email: &str) -> Uuid {
+    h.ok("POST", "/api/profiles", Some(json!({"email": email}))).await["id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn only_the_worker_holding_a_run_sends_or_moves_it() {
+    let mut h = harness!();
+    h.signup().await;
+    let hook = hook_server().await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Claim"}), json!({"entry": "w", "nodes": [
+        {"id": "w", "type": "webhook", "url": hook.url, "next": "u"},
+        {"id": "u", "type": "update_profile", "properties": {"done": "yes"}, "next": null}]})).await;
+    let flow = flow_row(&h, &fid).await;
+
+    // A worker that loaded the run before another one sent and moved it: its claim matches nothing.
+    let pid = new_person(&mut h, "stale@x.test").await;
+    let run = dumbmail::flows::start(&h.state, &flow, pid, json!({})).await.unwrap().unwrap();
+    hook.go.add_permits(100);
+    let pause = dumbmail::flows::StepPause::hold(run);
+    let state = h.state.clone();
+    let stale = tokio::spawn(async move { dumbmail::flows::step(&state, run).await });
+    pause.arrived().await;
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(hook.hits.load(Ordering::SeqCst), 1);
+    pause.release();
+    stale.await.unwrap().unwrap();
+    assert_eq!(hook.hits.load(Ordering::SeqCst), 1, "the stale worker sent nothing");
+    assert_eq!(run_of(&h, &fid, "stale@x.test").await.1, "completed");
+
+    // A second worker while the first is mid-send: it sends nothing and tries again later.
+    hook.go.forget_permits(1000);
+    hook.arrived.forget_permits(1000);
+    let pid = new_person(&mut h, "busy2@x.test").await;
+    let run = dumbmail::flows::start(&h.state, &flow, pid, json!({})).await.unwrap().unwrap();
+    let state = h.state.clone();
+    let first = tokio::spawn(async move { dumbmail::flows::step(&state, run).await });
+    hook.arrived.acquire().await.unwrap().forget();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(hook.hits.load(Ordering::SeqCst), 2, "only the first worker's call");
+    let retry: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'flow_step' AND payload->>'run_id' = $1::text AND run_at > now()").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert!(retry >= 1, "the second worker comes back when the claim runs out");
+    hook.go.add_permits(100);
+    first.await.unwrap().unwrap();
+    assert_eq!(run_of(&h, &fid, "busy2@x.test").await.1, "completed");
+
+    // A claim left by a worker that died is taken over once it expires.
+    let pid = new_person(&mut h, "crashed@x.test").await;
+    let run = dumbmail::flows::start(&h.state, &flow, pid, json!({})).await.unwrap().unwrap();
+    sqlx::query("UPDATE flow_runs SET claim_id = $2, claim_until = now() - interval '1 minute' WHERE id = $1").bind(run).bind(Uuid::now_v7()).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(hook.hits.load(Ordering::SeqCst), 3);
+    assert_eq!(run_of(&h, &fid, "crashed@x.test").await.1, "completed");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_waiting_delay_edited_into_a_send_step_is_claimed_before_it_sends() {
+    let mut h = harness!();
+    h.signup().await;
+    let hook = hook_server().await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Edit"}), json!({"entry": "d", "nodes": [
+        {"id": "d", "type": "delay", "amount": 1, "unit": "minutes", "next": null}]})).await;
+    event(&mut h, "Edit", "edited@x.test", json!({})).await;
+    h.drain().await;
+    let (run, _, node, _) = run_of(&h, &fid, "edited@x.test").await;
+    assert_eq!(node.as_deref(), Some("d"));
+    // The waiting step becomes a webhook with the same id.
+    h.ok("PATCH", &format!("/api/flows/{fid}"), Some(json!({"definition": {"entry": "d", "nodes": [{"id": "d", "type": "webhook", "url": hook.url, "next": null}]}}))).await;
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
+    let state = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&state).await });
+    hook.arrived.acquire().await.unwrap().forget();
+    // It was claimed before the call: removal leaves it alone.
+    let r = h.ok("POST", &format!("/api/flows/{fid}/runs/remove"), Some(json!({"run_ids": [run], "confirm": true}))).await;
+    assert_eq!((r["removed"].as_i64(), r["sending_now"].clone()), (Some(0), json!([run])), "{r}");
+    hook.go.add_permits(100);
+    worker.await.unwrap().unwrap();
+    assert_eq!(hook.hits.load(Ordering::SeqCst), 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_wait_wakes_once() {
+    let mut h = harness!();
+    h.signup().await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Twice"}), json!({"entry": "d1", "nodes": [
+        {"id": "d1", "type": "delay", "amount": 1, "unit": "days", "at": "10:00", "next": "d2"},
+        {"id": "d2", "type": "delay", "amount": 1, "unit": "days", "next": "u"},
+        {"id": "u", "type": "update_profile", "properties": {"woke": "early"}, "next": null}]})).await;
+    event(&mut h, "Twice", "once@x.test", json!({})).await;
+    h.drain().await;
+    let (run, _, node, _) = run_of(&h, &fid, "once@x.test").await;
+    assert_eq!(node.as_deref(), Some("d1"));
+    // Its wake-up job twice (as after a crash before the job was acknowledged), both due now.
+    sqlx::query("UPDATE flow_runs SET context = jsonb_set(context, '{_wait_until}', to_jsonb((now() - interval '1 minute')::text)) WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO jobs (kind, payload, run_at, lane) SELECT kind, payload, now(), lane FROM jobs WHERE kind = 'flow_step' AND payload->>'run_id' = $1::text").bind(run).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'flow_step' AND payload->>'run_id' = $1::text").bind(run).execute(&h.state.db).await.unwrap();
+    h.drain().await;
+    // The first wake moved it to the next wait; the duplicate found it no longer in its wait.
+    let (_, status, node, _) = run_of(&h, &fid, "once@x.test").await;
+    assert_eq!((status.as_str(), node.as_deref()), ("active", Some("d2")));
+    assert_eq!(prop(&h, "once@x.test", "woke").await, None, "the next wait didn't end early");
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'flow_step' AND payload->>'run_id' = $1::text").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pending, 1, "one wake-up for the next wait");
+    // A job without a wake (a retry of the job that parked it) leaves a waiting run alone.
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    assert_eq!(prop(&h, "once@x.test", "woke").await, None);
+    assert_eq!(run_of(&h, &fid, "once@x.test").await.2.as_deref(), Some("d2"));
+    h.cleanup().await;
+}

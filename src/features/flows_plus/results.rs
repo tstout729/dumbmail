@@ -201,8 +201,8 @@ pub async fn remove(state: &AppState, ctx: &Ctx, flow_id: Uuid, b: RemoveBody) -
     // A run whose current step is sending right now is left alone (the send claimed it first);
     // it's reported back so it can be removed once the step is done.
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE flow_runs SET status = 'exited', finished_at = now(), current_node = NULL
-         WHERE id = ANY($1) AND flow_id = $2 AND account_id = $3 AND status = 'active' AND (sending_until IS NULL OR sending_until < now())
+        "UPDATE flow_runs SET status = 'exited', finished_at = now(), current_node = NULL, claim_id = NULL, claim_until = NULL, waiting_until = NULL
+         WHERE id = ANY($1) AND flow_id = $2 AND account_id = $3 AND status = 'active' AND (claim_until IS NULL OR claim_until < now())
          RETURNING id",
     )
     .bind(&b.run_ids)

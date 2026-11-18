@@ -124,7 +124,7 @@ async fn dispatch(state: &AppState, kind: &str, p: &Value) -> anyhow::Result<()>
             let ids: Vec<Uuid> = serde_json::from_value(p["profile_ids"].clone())?;
             crate::flows::on_list_add(state, uuid("list_id")?, &ids).await
         }
-        "flow_step" => crate::flows::step(state, uuid("run_id")?).await,
+        "flow_step" => crate::flows::step_job(state, p).await,
         "segment_refresh" => crate::flows::refresh_segment(state, uuid("segment_id")?).await,
         other => match crate::features::run_job(state, other, p).await {
             Some(r) => r,
