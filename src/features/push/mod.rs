@@ -46,7 +46,6 @@ static ROUTES: &[RouteRule] = &[
     rule("PUT", "/api/push/profiles/{id}/opt-out", Perm::AudienceWrite),
     rule("GET", "/api/push/report", Perm::MessagingRead),
     public("GET", "/push/sw.js"),
-    public("GET", "/push/handler.js"),
     public("POST", "/client/push/sign-out"),
     public("OPTIONS", "/client/push/sign-out"),
     public("POST", "/client/push/devices/sign-out"),
@@ -103,7 +102,6 @@ fn settings_schema() -> Value {
     json!({
         "web_enabled": {"type": "boolean", "description": "Turn web push on for the website snippet. The service worker file must be on the site first (see get_push_settings: web.service_worker_url and docs)."},
         "sw_path": {"type": "string", "description": "Where the service worker is on the site, e.g. /dumbmail-sw.js."},
-        "sw_scope": {"type": "string", "description": "The scope it's registered with: a folder of its own (default /dumbmail-push/), so it controls no pages. Use / only when DumbMail's handler is imported into the site's own root worker."},
         "prompt": {"type": "object", "additionalProperties": false, "description": "The in-page card shown before the browser's own prompt. Replaced whole.",
             "properties": {
                 "enabled": {"type": "boolean", "description": "Show it automatically by these rules. false: only the site's own button (dumbmail.notifications.prompt()) asks."},
@@ -451,7 +449,6 @@ impl Feature for Module {
             .route("/api/push/profiles/{id}/opt-out", put(opt_out_h))
             .route("/api/push/report", get(report_h))
             .route("/push/sw.js", get(client::service_worker))
-            .route("/push/handler.js", get(client::handler))
             .route("/client/push/sign-out", post(client::sign_out).options(client::preflight))
             .route("/client/push/devices/sign-out", post(client::device_sign_out).options(client::preflight))
             .route("/client/push.js", get(client::push_js))

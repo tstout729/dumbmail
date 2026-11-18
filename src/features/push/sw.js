@@ -1,7 +1,5 @@
-/* DumbMail push notifications. Either host this file on your site (the snippet registers it with
-   a scope of its own, so it controls no pages and never replaces your own service worker), or, if
-   your site already has a service worker at its root, add to it:
-     importScripts("https://dumbmail.ai/push/handler.js?k=YOUR_SITE_KEY");
+/* DumbMail push notifications. Host this file on your site: the snippet registers it with a scope
+   of its own (/dumbmail-push/), so it controls no pages and never replaces your own service worker.
    It only handles notifications DumbMail sent, and only opens DumbMail's signed tap links. */
 (function () {
   var BASE = __BASE__, KEY = __KEY__, LINKS = __LINKS__, VAPID = __VAPID__;

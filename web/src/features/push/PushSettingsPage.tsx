@@ -51,9 +51,8 @@ function WebPush({ settings }: { settings: PushSettings }) {
   const canWrite = useCan("settings.write");
   const update = useUpdatePushSettings();
   const [path, setPath] = useState(settings.web.sw_path);
-  const [scope, setScope] = useState(settings.web.sw_scope);
   const web = settings.web;
-  const save = (patch: { web_enabled?: boolean; sw_path?: string; sw_scope?: string }, done: string) => update.mutate(patch, { onSuccess: () => toast.success(done) });
+  const save = (patch: { web_enabled?: boolean; sw_path?: string }, done: string) => update.mutate(patch, { onSuccess: () => toast.success(done) });
   return (
     <Card
       title="Web push"
@@ -96,25 +95,21 @@ function WebPush({ settings }: { settings: PushSettings }) {
               className="mt-3 flex flex-wrap items-end gap-2"
               onSubmit={(e: FormEvent) => {
                 e.preventDefault();
-                save({ sw_path: path, sw_scope: scope }, "Saved");
+                save({ sw_path: path }, "Path saved");
               }}
             >
               <Field label="Path on your site">
                 <Input value={path} onChange={(e) => setPath(e.target.value)} className="w-56" disabled={!canWrite} />
               </Field>
-              <Field label="Scope" hint="A folder of its own, so it controls none of your pages.">
-                <Input value={scope} onChange={(e) => setScope(e.target.value)} className="w-56" disabled={!canWrite} />
-              </Field>
               {canWrite ? (
-                <Button type="submit" variant="secondary" disabled={path === web.sw_path && scope === web.sw_scope} loading={update.isPending}>
-                  Save
+                <Button type="submit" variant="secondary" disabled={path === web.sw_path} loading={update.isPending}>
+                  Save path
                 </Button>
               ) : null}
             </form>
             <p className="mt-3 text-xs">
-              Already have a service worker at your site's root? Add DumbMail's handlers to it with{" "}
-              <code className="break-all rounded bg-zinc-100 px-1">importScripts("{web.handler_url}")</code>, then set the path and scope above to your
-              worker's (for example /sw.js and /). Your own notifications keep working.
+              DumbMail's worker gets a scope of its own ({web.sw_scope}), so it controls none of your pages and never replaces a service worker your
+              site already has. Sharing one worker with your site's own push notifications isn't supported yet.
             </p>
           </li>
           <li>Turn web push on (top right). The website snippet you already have does the rest.</li>

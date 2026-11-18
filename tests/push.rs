@@ -360,15 +360,15 @@ async fn web_push_end_to_end() {
     let (s, _, sw) = h.raw("GET", &format!("/push/sw.js?k={}", a.key), &[], "").await;
     assert_eq!(s, StatusCode::OK);
     assert!(sw.contains(&format!("\"{}\"", a.key)) && sw.contains("showNotification") && !sw.contains("skipWaiting") && !sw.contains("clients.claim"), "{sw}");
-    let (s, _, handler) = h.raw("GET", &format!("/push/handler.js?k={}", a.key), &[], "").await;
-    assert_eq!((s, handler == sw), (StatusCode::OK, true));
+    let (_, _, handler) = h.raw("GET", &format!("/push/handler.js?k={}", a.key), &[], "").await;
+    assert!(!handler.contains("showNotification"), "no handler to import into a site's own worker");
     let (_, _, js) = h.raw("GET", &format!("/client/push.js?k={}", a.key), &[], "").await;
     let settings = h.ok("GET", "/api/push/settings", None).await;
     let vapid = settings["web"]["vapid_public_key"].as_str().unwrap().to_string();
     assert!(js.contains(&vapid) && js.contains("/dumbmail-push/"), "registered with a scope of its own");
     assert!(!settings.to_string().contains("vapid_private"), "the private key is never shown");
-    // The scope must be a folder under the worker's.
-    let (s, _) = h.req("PATCH", "/api/push/settings", Some(json!({"sw_path": "/js/dumbmail-sw.js", "sw_scope": "/other/"}))).await;
+    // The scope is fixed: it can't be set.
+    let (s, _) = h.req("PATCH", "/api/push/settings", Some(json!({"sw_scope": "/"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
     let l = list(&mut h, "Push people").await;

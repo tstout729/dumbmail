@@ -11,6 +11,10 @@ use super::crypto;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
+/// The one scope DumbMail's worker is registered with: a folder of its own, so it controls no
+/// pages and never touches a site's own worker.
+pub const SW_SCOPE: &str = "/dumbmail-push/";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Row {
     pub account_id: Uuid,
@@ -18,7 +22,6 @@ pub struct Row {
     pub vapid_public_key: Option<String>,
     pub vapid_private_enc: Option<String>,
     pub sw_path: String,
-    pub sw_scope: String,
     pub prompt: Value,
     pub apns_key_id: Option<String>,
     pub apns_team_id: Option<String>,
@@ -142,23 +145,6 @@ fn check_prompt(p: &Prompt) -> AppResult<()> {
     Ok(())
 }
 
-/// The scope the worker is registered with: a path of its own (it controls no pages), under the
-/// worker's folder, so it never replaces a site's own worker.
-fn check_sw_scope(path: &str, scope: &str) -> AppResult<()> {
-    let ok = scope.starts_with('/')
-        && scope.ends_with('/')
-        && !scope.starts_with("//")
-        && scope.len() <= 200
-        && !scope.contains("..")
-        && scope.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c));
-    let folder = &path[..path.rfind('/').map_or(1, |i| i + 1)];
-    if ok && scope.starts_with(folder) {
-        Ok(())
-    } else {
-        Err(AppError::bad(format!("the worker's scope must be a folder path under {folder}, like /dumbmail-push/")))
-    }
-}
-
 fn check_sw_path(p: &str) -> AppResult<()> {
     let ok = p.starts_with('/')
         && !p.starts_with("//")
@@ -203,8 +189,6 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Resul
 pub struct SettingsBody {
     pub web_enabled: Option<bool>,
     pub sw_path: Option<String>,
-    /// Use "/" only when DumbMail's handler is imported into the site's own root worker (see docs).
-    pub sw_scope: Option<String>,
     pub prompt: Option<Prompt>,
     #[serde(default, deserialize_with = "present")]
     pub apns: Option<Option<ApnsBody>>,
@@ -307,18 +291,12 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
     let mut changed = Vec::new();
     let current = ensure(state, account_id).await?;
     let mut tx = state.db.begin().await?;
-    if b.sw_path.is_some() || b.sw_scope.is_some() {
-        let path = b.sw_path.clone().unwrap_or_else(|| current.sw_path.clone());
-        let scope = b.sw_scope.clone().unwrap_or_else(|| current.sw_scope.clone());
-        check_sw_scope(&path, &scope)?;
-    }
-    if b.web_enabled.is_some() || b.sw_path.is_some() || b.sw_scope.is_some() || b.prompt.is_some() {
-        sqlx::query("UPDATE push_settings SET web_enabled = COALESCE($2, web_enabled), sw_path = COALESCE($3, sw_path), prompt = COALESCE($4, prompt), sw_scope = COALESCE($5, sw_scope), updated_at = now() WHERE account_id = $1")
+    if b.web_enabled.is_some() || b.sw_path.is_some() || b.prompt.is_some() {
+        sqlx::query("UPDATE push_settings SET web_enabled = COALESCE($2, web_enabled), sw_path = COALESCE($3, sw_path), prompt = COALESCE($4, prompt), updated_at = now() WHERE account_id = $1")
             .bind(account_id)
             .bind(b.web_enabled)
             .bind(&b.sw_path)
             .bind(b.prompt.as_ref().map(serde_json::to_value).transpose()?)
-            .bind(&b.sw_scope)
             .execute(&mut *tx)
             .await?;
         changed.push("web");
@@ -426,8 +404,7 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             "ready": row.web_ready(),
             "vapid_public_key": row.vapid_public_key,
             "sw_path": row.sw_path,
-            "sw_scope": row.sw_scope,
-            "handler_url": format!("{base}/push/handler.js?k={key}"),
+            "sw_scope": SW_SCOPE,
             "prompt": row.prompt(),
             "service_worker_url": format!("{base}/push/sw.js?k={key}"),
         },

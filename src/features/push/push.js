@@ -30,7 +30,15 @@
     for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
     return out;
   }
-  // A scope of its own: the worker controls no pages, so it never replaces the site's own worker.
+  // DumbMail's own registration: the worker at CFG.sw with DumbMail's scope, which controls no pages.
+  // Never the site's own (a root registration also "matches" our scope's URL, so look it up exactly).
+  var SCOPE_URL = location.origin + CFG.scope;
+  function ours() {
+    return navigator.serviceWorker.getRegistrations().then(function (regs) {
+      for (var i = 0; i < regs.length; i++) if (regs[i].scope === SCOPE_URL) return regs[i];
+      return null;
+    });
+  }
   function registration() {
     return navigator.serviceWorker.register(CFG.sw, { scope: CFG.scope }).then(function (reg) {
       var w = reg.installing || reg.waiting;
@@ -39,7 +47,7 @@
     });
   }
   function existing() {
-    return navigator.serviceWorker.getRegistration(CFG.scope).then(function (reg) { return reg ? reg.pushManager.getSubscription() : null; });
+    return ours().then(function (reg) { return reg ? reg.pushManager.getSubscription() : null; });
   }
   function report(sub, force) {
     var j = sub.toJSON(), id = identity();

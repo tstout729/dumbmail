@@ -8,10 +8,9 @@ CREATE TABLE push_settings (
     web_enabled         boolean NOT NULL DEFAULT false,
     vapid_public_key    text,
     vapid_private_enc   text,
-    -- Where the service worker lives on the customer's site, e.g. /dumbmail-sw.js, and the narrow
-    -- scope it's registered with (it controls no pages; it only receives pushes).
+    -- Where the service worker lives on the customer's site, e.g. /dumbmail-sw.js. It's always
+    -- registered with DumbMail's own narrow scope (/dumbmail-push/), so it controls no pages.
     sw_path             text NOT NULL DEFAULT '/dumbmail-sw.js',
-    sw_scope            text NOT NULL DEFAULT '/dumbmail-push/',
     -- The in-page card shown before the browser's own permission prompt (see push::settings::Prompt).
     prompt              jsonb NOT NULL DEFAULT '{}',
     -- Apple Push Notification service, token-based auth.
@@ -19,9 +18,9 @@ CREATE TABLE push_settings (
     apns_team_id        text,
     apns_bundle_id      text,
     apns_key_enc        text,
+    -- The APNs environment for devices whose app didn't say which one it was built for.
     apns_production     boolean NOT NULL DEFAULT true,
-    -- When APNs first accepted a notification with the current credentials and environment: until
-    -- then a BadDeviceToken may mean a wrong environment, not a dead device.
+    -- When APNs first accepted a notification with the current credentials and environment.
     apns_verified_at    timestamptz,
     -- Firebase Cloud Messaging HTTP v1: the service account JSON, encrypted.
     fcm_project_id      text,
@@ -54,7 +53,7 @@ CREATE TABLE push_devices (
     address       text NOT NULL,
     p256dh        text,
     auth_secret   text,
-    -- Bumped whenever the owner, the address or the keys change. A delivery is handed over only to
+    -- Bumped on every registration (a refresh too) and whenever the owner changes. A delivery is handed over only to
     -- the version it was made for, and provider results apply only to that version.
     version       bigint NOT NULL DEFAULT 1,
     -- The device's notification permission as last reported: only granted or (iOS) provisional is sent to.

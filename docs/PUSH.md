@@ -37,16 +37,7 @@ Browsers only show notifications from a **service worker on your site's own doma
    - **Shopify, Wix, Squarespace, Webflow, Framer**: these builders don't let you put a file at your site's root, so web push can't be added there. Email, texts and app push still work.
 3. Turn web push on. The website snippet then loads the push add-on on every page.
 
-The snippet registers the worker with a scope of its own (`/dumbmail-push/` by default, `sw_scope`). It controls none of your pages, so it never replaces a service worker your site already has, and it only handles notifications DumbMail sent and only opens DumbMail's signed tap links.
-
-**Already have a service worker at your site's root?** Add DumbMail's handlers to it instead of hosting a second file:
-
-```js
-// In your existing service worker:
-importScripts("https://dumbmail.ai/push/handler.js?k=YOUR_SITE_KEY");
-```
-
-Then set `sw_path` to your worker's path and `sw_scope` to its scope (for example `/sw.js` and `/`). DumbMail's handlers ignore pushes that aren't DumbMail's, so your own notifications keep working.
+The snippet registers the worker with DumbMail's own scope, `/dumbmail-push/`, and only ever looks up that registration. It controls none of your pages, so it never replaces or touches a service worker your site already has, and it only handles notifications DumbMail sent and only opens DumbMail's signed tap links. Sharing one worker with your site's own push notifications isn't supported yet.
 
 Check it works with **Send me a test** in Settings → Push: it adds the browser you're using to your own test devices (never part of an audience) and sends it a notification.
 
@@ -329,8 +320,8 @@ On the hosted service push is free unless the operator sets `PRICE_PUSH`. A non-
 
 | | |
 | --- | --- |
-| `GET /api/push/settings` | Settings, device counts (including anonymous ones), the service worker and handler URLs and the device registration URL. |
-| `PATCH /api/push/settings` | `web_enabled`, `sw_path`, `sw_scope`, `prompt`, `apns` (`{key_id, team_id, bundle_id, production, key_p8}` or `null`), `fcm` (`{service_account_json}` or `null`). |
+| `GET /api/push/settings` | Settings, device counts (including anonymous ones), the service worker URL and the device registration URL. |
+| `PATCH /api/push/settings` | `web_enabled`, `sw_path`, `prompt`, `apns` (`{key_id, team_id, bundle_id, production, key_p8}` or `null`), `fcm` (`{service_account_json}` or `null`). |
 | `POST /api/push/identity-secret` | A new enrollment secret (returned once). |
 | `POST /api/push/test-devices` | Add this browser's subscription as your own test device. |
 | `POST /api/push/test` | `{content?, to?: "me" or an email, profile_id?, device_id?}`. Sending to anyone but your own test devices needs permission to send campaigns; a person's push opt-out still applies. |

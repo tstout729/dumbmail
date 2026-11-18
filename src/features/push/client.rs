@@ -1,5 +1,4 @@
-//! Public push endpoints (no sign-in; the site's public key at most): the service worker and its
-//! importable handler, the snippet's push add-on, browser and app device registration and sign-out,
+//! Public push endpoints (no sign-in; the site's public key at most): the service worker, the snippet's push add-on, browser and app device registration and sign-out,
 //! delivery and open reports, and the tracked link a tap opens.
 //!
 //! Linking a device to a person needs an **enrollment grant** made by the customer's own server
@@ -76,8 +75,7 @@ fn fill(src: &str, base: &str, key: &str) -> String {
     src.replacen("__BASE__", &serde_json::to_string(base).unwrap_or_default(), 1).replacen("__KEY__", &serde_json::to_string(key).unwrap_or_default(), 1)
 }
 
-/// The service worker (or, for a site that already has a root worker, the handler it imports): it
-/// opens only DumbMail's signed tap links, on the account's link domain or DumbMail's.
+/// The service worker: it opens only DumbMail's signed tap links, on the account's link domain or DumbMail's.
 async fn worker(state: &AppState, k: &str) -> String {
     let key: String = k.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(100).collect();
     let mut links = vec![format!("{}/p/c/", state.cfg.link_url().trim_end_matches('/'))];
@@ -101,13 +99,6 @@ pub async fn service_worker(State(state): State<AppState>, Query(q): Query<KeyQu
     r
 }
 
-/// `GET /push/handler.js?k=`: the same handlers, for `importScripts` in a site's own worker.
-pub async fn handler(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
-    let mut r = js(worker(&state, &q.k).await);
-    r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().expect("static header"));
-    r
-}
-
 /// `GET /client/push.js?k=`: the snippet's push add-on with this account's settings, or a no-op
 /// when web push is off.
 pub async fn push_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -> Response {
@@ -117,7 +108,7 @@ pub async fn push_js(State(state): State<AppState>, Query(q): Query<KeyQuery>) -
         if !row.web_ready() {
             return None;
         }
-        Some(json!({"key": row.vapid_public_key, "sw": row.sw_path, "scope": row.sw_scope, "prompt": row.prompt(), "color": crate::render::safe_color(&a.brand_color, "#1f6f5c")}))
+        Some(json!({"key": row.vapid_public_key, "sw": row.sw_path, "scope": settings::SW_SCOPE, "prompt": row.prompt(), "color": crate::render::safe_color(&a.brand_color, "#1f6f5c")}))
     }
     .await;
     js(fill(PUSH_JS, state.cfg.public_url(), &q.k).replacen("__CONFIG__", &config.map(|c| c.to_string()).unwrap_or_else(|| "null".into()), 1))
@@ -629,12 +620,20 @@ var __log = [], __ls = {}, __ss = {}, __fetchOk = true, __sub = null;
 function mkStorage(o) { return { getItem: function (k) { return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : null; }, setItem: function (k, v) { o[k] = String(v); }, removeItem: function (k) { delete o[k]; } }; }
 var localStorage = mkStorage(__ls), sessionStorage = mkStorage(__ss);
 function fetch(url, init) { __log.push({ fetch: url, body: init && init.body ? JSON.parse(init.body) : null }); return __fetchOk ? Promise.resolve({ ok: true }) : Promise.reject(new Error("offline")); }
-function mkSub() { return { endpoint: "https://fcm.googleapis.com/fcm/send/abc", toJSON: function () { return { endpoint: this.endpoint, keys: { p256dh: "P", auth: "A" } }; }, unsubscribe: function () { __sub = null; __log.push({ unsubscribe: true }); return Promise.resolve(true); } }; }
+function mkSub() { __ours = true; return { endpoint: "https://fcm.googleapis.com/fcm/send/abc", toJSON: function () { return { endpoint: this.endpoint, keys: { p256dh: "P", auth: "A" } }; }, unsubscribe: function () { __sub = null; __log.push({ unsubscribe: true }); return Promise.resolve(true); } }; }
 var __reg = { active: {}, pushManager: { getSubscription: function () { return Promise.resolve(__sub); }, subscribe: function () { __log.push({ subscribe: true }); __sub = mkSub(); return Promise.resolve(__sub); } } };
-var navigator = { serviceWorker: { register: function (path, o) { __log.push({ register: path, scope: o && o.scope }); return Promise.resolve(__reg); }, getRegistration: function (scope) { return Promise.resolve(__reg); } } };
+var __rootSub = { endpoint: "https://fcm.googleapis.com/fcm/send/site-own", toJSON: function () { return { endpoint: this.endpoint, keys: { p256dh: "SP", auth: "SA" } }; }, unsubscribe: function () { __log.push({ rootUnsubscribed: true }); return Promise.resolve(true); } };
+var __root = { scope: "https://shop.test/", active: {}, pushManager: { getSubscription: function () { return Promise.resolve(__rootSub); }, subscribe: function () { __log.push({ rootSubscribe: true }); return Promise.resolve(__rootSub); } } };
+var __ours = false;
+__reg.scope = "https://shop.test/dumbmail-push/";
+var navigator = { serviceWorker: {
+  register: function (path, o) { __log.push({ register: path, scope: o && o.scope }); __ours = true; return Promise.resolve(__reg); },
+  getRegistration: function (url) { return Promise.resolve(__ours ? __reg : __root); },
+  getRegistrations: function () { return Promise.resolve(__ours ? [__root, __reg] : [__root]); }
+} };
 var Notification = { permission: "granted", requestPermission: function () { return Promise.resolve(Notification.permission); } };
 var document = { readyState: "complete", body: null, addEventListener: function () {} };
-var location = { href: "https://shop.test/" };
+var location = { href: "https://shop.test/", origin: "https://shop.test" };
 function setTimeout(f) {}
 function atob(s) { return ""; }
 function btoa(s) { return ""; }
@@ -675,6 +674,14 @@ var window = { isSecureContext: true, PushManager: function () {}, Notification:
         let v = run("__sub = mkSub();", &push_js(), &[]);
         assert!(!has(&v, "subscribe"));
         assert!(v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))), "{v}");
+    }
+
+    #[test]
+    fn the_sites_own_worker_and_subscription_are_never_touched() {
+        // The site has its own root worker with its own push subscription, and DumbMail has none yet.
+        let v = run("", &push_js(), &["window.dumbmail.notifications.unsubscribe()", "window.dumbmail.notifications.signOut()"]);
+        assert!(!has(&v, "rootUnsubscribed") && !has(&v, "rootSubscribe"), "{v}");
+        assert!(!v["log"].to_string().contains("site-own"), "the site's endpoint never reaches DumbMail: {v}");
     }
 
     #[test]
