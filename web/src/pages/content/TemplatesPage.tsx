@@ -1,11 +1,14 @@
 import { useState, type FormEvent } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { LayoutTemplate, Mail, MessageSquare, Plus } from "lucide-react";
-import type { Channel, EmailContent, SmsContent } from "../../api";
-import { useCreateTemplate, useSession, useTemplates } from "../../api";
+import { Archive, ArchiveRestore, LayoutTemplate, Mail, MessageSquare, MoreHorizontal, Plus, Tag } from "lucide-react";
+import type { Channel, EmailContent, SmsContent, Template } from "../../api";
+import { useCreateTemplate, useSession } from "../../api";
+import { useArchive, useItems } from "../../features/campaignsPlus/api";
+import { TagChips, TagsDialog } from "../../features/campaignsPlus/TagsDialog";
+import type { TagRef } from "../../features/campaignsPlus/types";
 import { starterEmail } from "../../components/email/blocks";
 import { EmailThumbnail } from "../../components/email/EmailPreview";
-import { Button, EmptyState, Field, Input, Modal, Page, PageHeader, Segmented, Skeleton, Tabs, cx } from "../../components/ui";
+import { Button, Checkbox, EmptyState, Field, IconButton, Input, Menu, Modal, Page, PageHeader, Segmented, Skeleton, Tabs, cx } from "../../components/ui";
 import { formatRelative } from "../../lib/format";
 import { useTemplateFromStarter } from "../../features/content/api";
 import { StarterGallery } from "../../features/content/StarterGallery";
@@ -13,7 +16,10 @@ import { StarterGallery } from "../../features/content/StarterGallery";
 type Tab = "all" | Channel;
 
 export function TemplatesPage() {
-  const templates = useTemplates();
+  const [showArchived, setShowArchived] = useState(false);
+  const templates = useItems<Template>("templates", showArchived);
+  const archive = useArchive("templates");
+  const [tagging, setTagging] = useState<(Template & { tags: TagRef[] }) | null>(null);
   const [params, setParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>("all");
   const creating = params.get("create") === "1";
@@ -37,15 +43,18 @@ export function TemplatesPage() {
           </Button>
         }
       />
-      <Tabs
-        value={tab}
-        onChange={setTab}
-        tabs={[
-          { value: "all", label: "All" },
-          { value: "email", label: "Email" },
-          { value: "sms", label: "SMS" },
-        ]}
-      />
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <Tabs
+          value={tab}
+          onChange={setTab}
+          tabs={[
+            { value: "all", label: "All" },
+            { value: "email", label: "Email" },
+            { value: "sms", label: "SMS" },
+          ]}
+        />
+        <Checkbox label="Archived" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} className="mt-1.5" />
+      </div>
       {templates.isPending ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {[0, 1, 2, 3].map((i) => (
@@ -56,7 +65,7 @@ export function TemplatesPage() {
         <div className="rounded-lg border border-zinc-200 bg-white">
           <EmptyState
             icon={<LayoutTemplate className="size-5" />}
-            title="No templates yet"
+            title={showArchived ? "No archived templates" : "No templates yet"}
             description="Design once, reuse everywhere. You can also save any campaign email as a template."
             action={
               <Button variant="primary" onClick={() => setCreating(true)}>
@@ -87,6 +96,29 @@ export function TemplatesPage() {
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-medium text-zinc-900 group-hover:text-accent-800">{t.name}</span>
                   <span className="block text-[11px] text-zinc-500">Edited {formatRelative(t.updated_at)}</span>
+                  <TagChips tags={t.tags} />
+                </span>
+                <span
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                >
+                  <Menu
+                    trigger={(props) => (
+                      <IconButton label="Template actions" size="sm" {...props}>
+                        <MoreHorizontal className="size-4" />
+                      </IconButton>
+                    )}
+                    items={[
+                      { label: "Tags…", icon: <Tag className="size-3.5" />, onSelect: () => setTagging(t) },
+                      {
+                        label: t.archived_at ? "Unarchive" : "Archive",
+                        icon: t.archived_at ? <ArchiveRestore className="size-3.5" /> : <Archive className="size-3.5" />,
+                        onSelect: () => archive.mutate({ ids: [t.id], archived: !t.archived_at }),
+                      },
+                    ]}
+                  />
                 </span>
               </div>
             </Link>
@@ -94,6 +126,7 @@ export function TemplatesPage() {
         </div>
       )}
       {creating ? <CreateTemplateDialog onClose={() => setCreating(false)} /> : null}
+      {tagging ? <TagsDialog kind="templates" id={tagging.id} name={tagging.name} tags={tagging.tags} onClose={() => setTagging(null)} /> : null}
     </Page>
   );
 }
