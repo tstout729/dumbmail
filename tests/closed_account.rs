@@ -2,6 +2,9 @@
 //! nothing: no texts or emails on any channel, no jobs, no rent, no renewals, and a late payment
 //! doesn't reopen it. Opt-outs still count. Needs TEST_DATABASE_URL (see tests/common).
 
+// Every test here builds its own configured harness, so the shared `harness!` goes unused.
+#![allow(unused_macros)]
+
 #[macro_use]
 mod common;
 

@@ -254,6 +254,12 @@ pub fn valid_consent(s: &str) -> bool {
     matches!(s, "subscribed" | "unsubscribed" | "never_subscribed" | "pending")
 }
 
+/// Whether an account is closed. Every place that starts work for an account asks this (or reads
+/// [`Account::closed_at`] from a row it already has) and does nothing for a closed one.
+pub async fn account_closed<'e>(db: impl sqlx::PgExecutor<'e>, account_id: uuid::Uuid) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,10 +273,4 @@ mod tests {
         assert_eq!(normalize_phone("+44 20 7946 0958").as_deref(), Some("+442079460958"));
         assert!(normalize_phone("123").is_none());
     }
-}
-
-/// Whether an account is closed. Every place that starts work for an account asks this (or reads
-/// [`Account::closed_at`] from a row it already has) and does nothing for a closed one.
-pub async fn account_closed<'e>(db: impl sqlx::PgExecutor<'e>, account_id: uuid::Uuid) -> sqlx::Result<bool> {
-    Ok(sqlx::query_scalar::<_, bool>("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(false))
 }
