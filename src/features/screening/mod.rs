@@ -39,7 +39,7 @@ use crate::auth::Ctx;
 use crate::error::AppResult;
 use crate::state::AppState;
 
-pub use content::{before_flow_edit, before_flow_live, before_launch};
+pub use content::{before_flow_edit, before_flow_live, before_launch, before_saved_block_edit};
 pub use domains::check_domain;
 pub use gate::{send_gate, stop_if_held, tests_only_to_members};
 pub use imports::check_import;

@@ -43,7 +43,8 @@ pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
         Ok(h) => h.iter().map(|h| h.trim_start_matches('\u{feff}').chars().take(80).collect()).collect(),
         Err(_) => return (Vec::new(), ImportStats::default(), Vec::new()),
     };
-    let col = headers.iter().position(|h| email_column(h));
+    // The same column the import reads: of the email columns, the last one filled in on each row.
+    let cols: Vec<usize> = headers.iter().enumerate().filter(|(_, h)| email_column(h)).map(|(i, _)| i).collect();
     let mut s = ImportStats { consent_columns: headers.iter().filter(|h| consent_column(h)).take(10).cloned().collect(), ..Default::default() };
     let mut domains: HashMap<String, u64> = HashMap::new();
     for rec in rdr.records() {
@@ -52,7 +53,7 @@ pub fn stats(csv_text: &str) -> (Vec<String>, ImportStats, Vec<String>) {
         if s.rows > MAX_ROWS {
             break;
         }
-        let email = col.and_then(|c| rec.get(c)).and_then(crate::models::normalize_email);
+        let email = cols.iter().rev().filter_map(|c| rec.get(*c)).find(|v| !v.is_empty()).and_then(crate::models::normalize_email);
         let Some(email) = email else {
             s.no_address += 1;
             continue;

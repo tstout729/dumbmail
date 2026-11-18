@@ -108,12 +108,14 @@ async fn skip(state: &AppState, spec: &SendSpec<'_>, to: &str, reason: &str) -> 
 /// A campaign batch about to send for an account that may not: stop the campaign (its queued
 /// messages skipped with the reason). Returns true when it was stopped.
 pub async fn stop_if_held(state: &AppState, account: &Account, c: &CampaignRow) -> anyhow::Result<bool> {
-    if c.channel == "push" {
+    if !super::on(state) || c.channel == "push" {
         return Ok(false);
     }
     let st = standing::of(state, account);
     if st == Standing::Approved {
-        return Ok(false);
+        // What it sends now passed a content check (it may have changed since it was scheduled).
+        // (Stopped there, with the reason, when it didn't pass.)
+        return Ok(super::content::verify_at_send(state, account, c).await?.is_some());
     }
     let reason = if st == Standing::Blocked { BLOCKED } else { NOT_APPROVED };
     standing::stop_campaign(&state.db, c.id, standing::hold_message(st), reason).await?;
