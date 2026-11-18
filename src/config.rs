@@ -101,6 +101,14 @@ pub struct Config {
     /// Phone number per month (Telnyx charges about $1.00–1.10).
     #[arg(long, env = "PRICE_NUMBER_MONTHLY", default_value_t = 2.20)]
     pub price_number_monthly: f64,
+    /// Push notification per person (all their devices). Push costs DumbMail almost nothing, so it's
+    /// free unless this is set; a non-zero price is charged like texts, from the balance.
+    #[arg(long, env = "PRICE_PUSH", default_value_t = 0.0)]
+    pub price_push: f64,
+    /// Testing only: send web push, APNs and FCM requests (and Google sign-in) to this stand-in
+    /// instead of the real services. Never set in production.
+    #[arg(long, env = "PUSH_API_BASE")]
+    pub push_api_base: Option<String>,
     /// Free emails per account each month (costs at most ~$0.18 per account).
     #[arg(long, env = "FREE_EMAILS_PER_MONTH", default_value_t = 1000)]
     pub free_emails_per_month: i64,

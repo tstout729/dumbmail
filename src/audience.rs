@@ -299,7 +299,7 @@ pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Su
 pub const BROWSER_RESERVED_METRICS: &[&str] = &[
     "Subscribed to List", "Unsubscribed from List", "Unsubscribed", "Subscribed to SMS", "Unsubscribed from SMS",
     "Received Email", "Opened Email", "Clicked Email", "Bounced Email", "Marked Email as Spam",
-    "Received SMS", "Clicked SMS", "Received SMS Reply",
+    "Received SMS", "Clicked SMS", "Received SMS Reply", "Received Push", "Clicked Push",
 ];
 
 fn named(list: &[&str], name: &str) -> bool {

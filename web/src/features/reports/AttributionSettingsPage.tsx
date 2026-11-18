@@ -162,6 +162,7 @@ function Comparison({ current, proposed, days }: { current: AttributionTotals; p
     { label: "From flows", key: "flow_revenue", money: true },
     { label: "From email", key: "email_revenue", money: true },
     { label: "From texts", key: "sms_revenue", money: true },
+    { label: "From push", key: "push_revenue", money: true },
   ];
   const fmt = (money: boolean, n: number) => (money ? formatCurrency(n) : formatNumber(n));
   return (
