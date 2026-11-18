@@ -5,6 +5,7 @@ import { Settings2, UserPlus } from "lucide-react";
 import type { Flow, FlowDefinition, FlowNode, FlowStatus, FlowTrigger } from "../../api";
 import { useFlow, useFlowReport, useLists, useSegments, useSession, useSetFlowStatus, useUpdateFlow } from "../../api";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { isEmailContent } from "../../features/reviews/StepEditor";
 import { CheckPanel } from "../../features/content/CheckPanel";
 import { BackfillDialog, ResultsRange, StepResultDetail, WaitingDrawer, useFlowResults } from "../../features/flowsPlus";
 import { useCan } from "../../features/team/api";
@@ -238,6 +239,13 @@ function FlowBuilder({ flow }: { flow: Flow }) {
             onEditEmail={() => setEmailNodeId(selectedNode.id)}
           />
         </Drawer>
+      ) : null}
+      {emailNode && emailNode.type === "review_request" && isEmailContent(emailNode.content) ? (
+        <Modal title={emailNode.name || "Ask for a review"} onClose={() => setEmailNodeId(null)} size="full">
+          <div className="h-full overflow-y-auto p-5">
+            <EmailEditor value={emailNode.content} onChange={(content) => editDef(replaceNode(def, { ...emailNode, content }))} templateName={emailNode.name} />
+          </div>
+        </Modal>
       ) : null}
       {emailNode && emailNode.type === "email" ? (
         <Modal title={emailNode.name || "Email"} onClose={() => setEmailNodeId(null)} size="full">
