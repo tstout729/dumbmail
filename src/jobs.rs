@@ -101,7 +101,50 @@ async fn on_dead(state: &AppState, kind: &str, payload: &Value, msg: &str) {
     }
 }
 
+/// Jobs that start work for an account, and how each finds that account (payload key, query).
+/// [`dispatch`] skips them when the account is closed (see `models::account_closed`), so nothing
+/// runs for a closed account, whichever feature queued the work. A job kind that starts work for
+/// an account belongs here, unless it must settle what it was holding instead (a transactional
+/// retry marks its message skipped, "account closed": see `transactional::send`).
+const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
+    ("campaign_send", "campaign_id", "SELECT account_id FROM campaigns WHERE id = $1"),
+    ("campaign_batch", "campaign_id", "SELECT account_id FROM campaigns WHERE id = $1"),
+    ("flow_event", "event_id", "SELECT account_id FROM events WHERE id = $1"),
+    ("flow_list", "list_id", "SELECT account_id FROM lists WHERE id = $1"),
+    ("flow_step", "run_id", "SELECT f.account_id FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.id = $1"),
+    ("segment_refresh", "segment_id", "SELECT account_id FROM segments WHERE id = $1"),
+    ("catalog_feed_sync", "feed_id", "SELECT account_id FROM catalog_feeds WHERE id = $1"),
+    ("catalog_verify", "product_id", "SELECT account_id FROM catalog_products WHERE id = $1"),
+    ("catalog_back_in_stock", "restock_id", "SELECT account_id FROM catalog_restocks WHERE id = $1"),
+    ("catalog_price_drop", "account_id", "SELECT $1::uuid"),
+    ("reports_scheduled_send", "report_id", "SELECT account_id FROM saved_reports WHERE id = $1"),
+    ("reports_export", "export_id", "SELECT account_id FROM exports WHERE id = $1"),
+    ("reports_mx_lookup", "account_id", "SELECT $1::uuid"),
+    ("webhooks_fanout", "account_id", "SELECT $1::uuid"),
+    ("webhooks_deliver", "endpoint_id", "SELECT account_id FROM webhook_endpoints WHERE id = $1"),
+    ("warehouse_run", "run_id", "SELECT account_id FROM warehouse_runs WHERE id = $1"),
+    ("inbox_auto_send", "id", "SELECT account_id FROM sms_auto_sends WHERE id = $1"),
+    ("inbox_digest", "account_id", "SELECT $1::uuid"),
+    ("coupons_alert", "coupon_id", "SELECT account_id FROM coupons WHERE id = $1"),
+    ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
+    ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
+    ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
+    // push_retry isn't here: its final claim settles a closed account's deliveries as skipped.
+    ("push_event", "account_id", "SELECT $1::uuid"),
+];
+
+/// Whether this job is for a closed account (one indexed lookup).
+async fn for_closed_account(state: &AppState, kind: &str, p: &Value) -> sqlx::Result<bool> {
+    let Some((_, key, owner)) = ACCOUNT_JOBS.iter().find(|(k, ..)| *k == kind) else { return Ok(false) };
+    let Some(id) = p[*key].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(false) };
+    sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM accounts a WHERE a.closed_at IS NOT NULL AND a.id = ({owner}))")).bind(id).fetch_one(&state.db).await
+}
+
 async fn dispatch(state: &AppState, kind: &str, p: &Value) -> anyhow::Result<()> {
+    if for_closed_account(state, kind, p).await? {
+        tracing::info!(kind, "job skipped: its account is closed");
+        return Ok(());
+    }
     let uuid = |k: &str| -> anyhow::Result<Uuid> {
         p[k].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("job payload missing {k}"))
     };
@@ -196,7 +239,8 @@ pub fn spawn_workers(state: AppState) {
 pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
     let due: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE campaigns SET status = 'sending', updated_at = now()
-         WHERE status = 'scheduled' AND send_at <= now() RETURNING id",
+         WHERE status = 'scheduled' AND send_at <= now()
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = campaigns.account_id AND a.closed_at IS NOT NULL) RETURNING id",
     )
     .fetch_all(&state.db)
     .await?;
@@ -222,6 +266,8 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
              WHERE (s.refreshed_at IS NULL OR s.refreshed_at < now() - interval '15 minutes'
                     OR EXISTS (SELECT 1 FROM flows f WHERE f.status = 'live' AND f.trigger->>'type' = 'segment' AND f.trigger->>'segment_id' = s.id::text))
                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'segment_refresh' AND j.payload->>'segment_id' = s.id::text AND j.run_at <> 'infinity')
+               -- Closed accounts' segments never take a place in the batch.
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.closed_at IS NOT NULL)
              ORDER BY s.refreshed_at NULLS FIRST
              LIMIT 500",
         )

@@ -567,7 +567,7 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
     }
     let due: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
         "SELECT id, stripe_customer_id, stripe_payment_method_id, auto_recharge_amount_micros FROM accounts
-         WHERE auto_recharge_enabled AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
+         WHERE auto_recharge_enabled AND closed_at IS NULL AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
            AND balance_micros < auto_recharge_threshold_micros
            AND (auto_recharge_failed_at IS NULL OR auto_recharge_failed_at < now() - interval '1 day')
          LIMIT 50",
@@ -623,7 +623,7 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
         // period are skipped so they can't crowd newly due numbers out of the batch.
         "SELECT p.id, p.account_id, p.phone_number, p.monthly_price_micros, p.past_due_since, p.next_charge_at
          FROM phone_numbers p JOIN accounts a ON a.id = p.account_id
-         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now()
+         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now() AND a.closed_at IS NULL
            AND (p.past_due_since IS NULL
                 OR a.balance_micros >= p.monthly_price_micros
                 OR (p.past_due_since <= now() - make_interval(days => $1)
@@ -635,13 +635,21 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
     .await?;
     for (id, account_id, number, price, past_due_since, due_at) in due {
         if !state.cfg.hosted || balance(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? >= price {
+            // Under the account's row lock, taken before charging: an account closed a moment ago
+            // pays nothing (closing holds the same row).
+            let mut tx = state.db.begin().await?;
+            let closed: Option<bool> = sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_optional(&mut *tx).await?;
+            if closed != Some(false) {
+                continue;
+            }
             if state.cfg.hosted {
                 // Keyed by the billing period (not today's date), so a late payment can't make the
                 // next period's charge look like a duplicate.
                 let reference = format!("{id}:{}", due_at.format("%Y-%m-%d"));
-                post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                post_entry_tx(&mut tx, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
             }
-            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
             continue;
         }
         match past_due_since {

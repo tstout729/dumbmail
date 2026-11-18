@@ -113,6 +113,12 @@ pub async fn send(state: &AppState, spec: &SendSpec<'_>) -> AppResult<Outcome> {
 async fn run(state: &AppState, spec: &SendSpec<'_>, target: Target<'_>) -> AppResult<Outcome> {
     let account = spec.account;
     let p = spec.profile;
+    if account.closed_at.is_some() {
+        if spec.is_test {
+            return Err(AppError::Conflict("this account is closed, so it can't send".into()));
+        }
+        return Ok(Outcome::Skipped("account closed"));
+    }
     let c = content::parse(spec.content)?;
     let Some(row) = settings::load(&state.db, account.id).await? else { return Ok(Outcome::Skipped("push isn't set up")) };
     let ready = row.ready_kinds();
@@ -502,7 +508,14 @@ async fn final_claim(state: &AppState, message_id: Uuid, attempt: Attempt) -> Ap
         .bind(profile_id)
         .execute(&mut *tx)
         .await?;
-    let stop = if is_test { None } else { message_stop(&mut tx, state, account_id, profile_id, message_id, campaign_id, flow_id, attempt).await? };
+    let closed: bool = sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_one(&mut *tx).await?;
+    let stop = if closed {
+        Some("account closed")
+    } else if is_test {
+        None
+    } else {
+        message_stop(&mut tx, state, account_id, profile_id, message_id, campaign_id, flow_id, attempt).await?
+    };
     let due = "(pd.status = 'queued' OR (pd.status = 'retry' AND pd.next_attempt_at <= now() + interval '5 seconds'))";
     if let Some(why) = stop {
         sqlx::query(&format!("UPDATE push_deliveries pd SET status = 'skipped', error = $2, next_attempt_at = NULL WHERE pd.message_id = $1 AND {due}"))
@@ -776,7 +789,7 @@ async fn apply(state: &AppState, row: &Row, message_id: Uuid, is_test: bool, res
 
 /// Reasons a whole message can be skipped for, as fixed words.
 const SKIP_REASONS: &[&str] = &[
-    "quiet hours", "smart sending", "campaign cancelled", "campaign stopped", "flow turned off", "flow deleted", "push turned off", "the device changed, or push is off for it",
+    "account closed", "quiet hours", "smart sending", "campaign cancelled", "campaign stopped", "flow turned off", "flow deleted", "push turned off", "the device changed, or push is off for it",
 ];
 
 /// Settle a message from its deliveries, inside the caller's transaction. Accepted by a device:

@@ -694,6 +694,19 @@ async fn the_rules_are_checked_at_every_hand_off() {
     assert!(m.hits("/webpush/p1").is_empty());
     assert_eq!(message_of(&h, p).await.2.as_deref(), Some("campaign cancelled"));
 
+    // The account closed meanwhile (a retry is settled the same way).
+    let cid = push_campaign(&mut h, &l, json!({"title": "Closing"})).await;
+    let pause = send::hook::Pause::hold(a.id);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(a.id).execute(&h.state.db).await.unwrap();
+    pause.release(a.id);
+    task.await.unwrap();
+    assert!(m.hits("/webpush/p1").is_empty());
+    assert_eq!(message_of(&h, p).await.2.as_deref(), Some("account closed"));
+    sqlx::query("UPDATE accounts SET closed_at = NULL WHERE id = $1").bind(a.id).execute(&h.state.db).await.unwrap();
+
     // The platform turned off meanwhile.
     let cid = push_campaign(&mut h, &l, json!({"title": "Two"})).await;
     let pause = send::hook::Pause::hold(a.id);
