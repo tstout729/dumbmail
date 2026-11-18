@@ -407,7 +407,14 @@ static TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)\{\{.*?\}\}|\{%.*?%\}|\{
 
 /// The template tags in a text, whitespace-normalized and sorted (a multiset).
 pub fn tags(text: &str) -> Vec<String> {
-    let mut v: Vec<String> = TAG.find_iter(text).map(|m| m.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    // `{{first_name}}` and `{{ first_name }}` are the same tag.
+    let mut v: Vec<String> = TAG
+        .find_iter(text)
+        .map(|m| {
+            let t = m.as_str();
+            format!("{} {} {}", &t[..2], t[2..t.len() - 2].split_whitespace().collect::<Vec<_>>().join(" "), &t[t.len() - 2..])
+        })
+        .collect();
     v.sort();
     v
 }
