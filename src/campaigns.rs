@@ -174,6 +174,7 @@ fn push_eligible_targeted(qb: &mut QueryBuilder<'_, Postgres>, channel: &str, pu
         ("push", Some(p)) => {
             qb.push(" AND ");
             crate::features::push::send::push_reachable(qb, Some(p));
+            crate::marketing_hold::push_campaign_filter(qb, channel);
         }
         _ => push_eligible(qb, channel),
     }

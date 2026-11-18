@@ -1010,6 +1010,10 @@ async fn the_marketing_hold_is_about_email_not_push() {
     enroll(&h, &a, &browser(&base, "held-1"), "held@x.test").await;
     let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "email", "audience": {"include": [{"type": "list", "id": l}]}}))).await;
     assert_eq!(est["count"], 0, "no marketing email");
+    for platforms in [json!(null), json!(["web"])] {
+        let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "push", "platforms": platforms, "audience": {"include": [{"type": "list", "id": l}]}}))).await;
+        assert_eq!(est["count"], 1, "push reaches them");
+    }
     let cid = push_campaign(&mut h, &l, json!({"title": "Allowed"})).await;
     h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
     h.drain().await;
