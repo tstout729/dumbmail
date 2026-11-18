@@ -141,17 +141,22 @@ async fn update_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<S
 // ---------- Housekeeping ----------
 
 /// Delete targets unused for [`KEEP_DAYS`], in batches; queue another run when there's more.
+///
+/// The rows are picked first and deleted by a statement that checks their age again, against the
+/// same cutoff: a send can refresh a picked row meanwhile (it waits for the send's lock, then sees
+/// the new `last_used_at`), and that row stays.
 pub async fn cleanup(state: &AppState) -> anyhow::Result<()> {
+    let cutoff: chrono::DateTime<chrono::Utc> = chrono::Utc::now() - chrono::Duration::days(i64::from(KEEP_DAYS));
     for _ in 0..CLEANUP_BATCHES_PER_JOB {
-        let n = sqlx::query(
-            "DELETE FROM short_link_targets WHERE code IN (SELECT code FROM short_link_targets WHERE last_used_at < now() - make_interval(days => $1) ORDER BY last_used_at LIMIT $2)",
-        )
-        .bind(KEEP_DAYS)
-        .bind(CLEANUP_BATCH)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-        if n < CLEANUP_BATCH as u64 {
+        let stale: Vec<String> = sqlx::query_scalar("SELECT code FROM short_link_targets WHERE last_used_at < $1 ORDER BY last_used_at LIMIT $2")
+            .bind(cutoff)
+            .bind(CLEANUP_BATCH)
+            .fetch_all(&state.db)
+            .await?;
+        if !stale.is_empty() {
+            sqlx::query("DELETE FROM short_link_targets WHERE code = ANY($1) AND last_used_at < $2").bind(&stale).bind(cutoff).execute(&state.db).await?;
+        }
+        if (stale.len() as i64) < CLEANUP_BATCH {
             return Ok(());
         }
     }

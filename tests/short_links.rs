@@ -428,3 +428,39 @@ async fn a_code_given_to_another_destination_never_opens_an_old_link() {
     assert_eq!((s, location), (StatusCode::NOT_FOUND, None), "the old link must not open the new destination");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn cleanup_never_deletes_a_target_a_send_is_refreshing() {
+    let mut h = harness!();
+    let (acct, _) = setup(&mut h).await;
+    let url = "https://shop.test/stale".to_string();
+    let mut conn = h.state.db.acquire().await.unwrap();
+    let code = short_links::send::ensure_targets(&mut conn, acct, std::slice::from_ref(&url)).await.unwrap()[&url].clone();
+    drop(conn);
+    sqlx::query("UPDATE short_link_targets SET last_used_at = now() - interval '401 days' WHERE code = $1").bind(&code).execute(&h.state.db).await.unwrap();
+    // A send refreshes the stale target in a transaction that hasn't committed yet...
+    let mut tx = h.state.db.begin().await.unwrap();
+    let again = short_links::send::ensure_targets(&mut tx, acct, std::slice::from_ref(&url)).await.unwrap();
+    assert_eq!(again[&url], code);
+    // ...while cleanup picks the row as stale and waits for the send's lock.
+    let st = h.state.clone();
+    let job = tokio::spawn(async move { short_links::cleanup(&st).await });
+    let mut waited = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE 'DELETE FROM short_link_targets%'")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+        if n > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(waited, "cleanup should be waiting on the send's row lock");
+    tx.commit().await.unwrap();
+    job.await.unwrap().unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM short_link_targets WHERE code = $1").bind(&code).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 1, "a target refreshed by a send survives cleanup");
+    h.cleanup().await;
+}
