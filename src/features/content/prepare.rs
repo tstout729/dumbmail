@@ -815,7 +815,7 @@ pub async fn freeze_campaign(state: &AppState, db: &mut PgConnection, c: &Campai
     // what the rest of this campaign's recipients get.
     let mut all: Vec<&Value> = vec![content.as_ref().unwrap_or(&c.content)];
     all.extend(ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).into_iter().flatten().map(|v| &v["content"]));
-    if let Some(sys) = crate::features::translations::system_snapshot(&mut *db, &state.cfg.secret_key, c.account_id, &all).await? {
+    if let Some(sys) = crate::features::translations::system_snapshot(&mut *db, &state.cfg.secret_key, c.account_id, c.id, &all).await? {
         let mut next = content.unwrap_or_else(|| c.content.clone());
         next["_system"] = sys.clone();
         content = Some(next);

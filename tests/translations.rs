@@ -927,6 +927,11 @@ async fn translations_cost_no_statements_per_recipient_and_a_campaign_keeps_one_
     assert_eq!(sent.len(), 6);
     assert!(sent.iter().all(|m| m.html.contains(">Se désabonner</a>") && !m.html.contains("Plus de messages")));
 
+    // A genuine snapshot copied into other content is ignored outside its own campaign's send.
+    let copied = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
+    assert!(copied["_system"].is_object());
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": copied, "language": "fr"}))).await;
+    assert!(p["html"].as_str().unwrap().contains("Plus de messages"), "the current wording, not the copied snapshot");
     // Content can't bring its own wording: a forged snapshot is ignored.
     let mut forged = translated.clone();
     forged["_system"] = json!({"footer": {"fr": {"reason": "FORGED", "unsubscribe": "FORGED"}}, "sig": "x"});
