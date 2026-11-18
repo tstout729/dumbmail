@@ -7,6 +7,7 @@
 //! content under [`CONTENT_KEY`]. The message's reference is written by the statement that already
 //! writes the message row (`sending::send`).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
@@ -35,23 +36,10 @@ pub const MAX_URL: usize = 2000;
 pub const SAMPLE_PATH: &str = "Ab12Cd34Ef56Gh78Jk90Lm12";
 
 static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
-
-/// A link as the URL pattern found it, split into the link and punctuation that ends the sentence
-/// after it ("Shop now: https://x.co/sale." keeps its full stop outside the link).
-pub fn trim_link(found: &str) -> (&str, &str) {
-    let mut end = found.len();
-    loop {
-        let link = &found[..end];
-        let Some(last) = link.chars().last() else { break };
-        let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
-        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') {
-            end -= last.len_utf8();
-        } else {
-            break;
-        }
-    }
-    (&found[..end], &found[end..])
-}
+/// Template tags: a link inside or touching one is built by the template, not written literally.
+static TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}").unwrap());
+/// Words in a link's host or path that mean it's about opting out: never hidden behind a short link.
+const OPT_OUT_WORDS: [&str; 5] = ["unsubscribe", "optout", "opt-out", "opt_out", "stop"];
 
 /// DumbMail's own hosts for this account: its links (unsubscribe, forms, tracking) are never shortened.
 pub fn own_hosts(state: &AppState, link_domain: Option<&str>) -> HashSet<String> {
@@ -60,26 +48,70 @@ pub fn own_hosts(state: &AppState, link_domain: Option<&str>) -> HashSet<String>
     own
 }
 
-/// The links the sender wrote in a text's template, as written, once each: web links with no
-/// template tag in them (a link built from a variable can differ per person, so it keeps the long
-/// form), not DumbMail's own, at most [`MAX_URL`] long, at most [`MAX_LINKS`].
-pub fn written_links(body: &str, own: &HashSet<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for m in URL.find_iter(body) {
-        let (link, _) = trim_link(m.as_str());
-        if out.len() >= MAX_LINKS || link.len() > MAX_URL || out.iter().any(|l| l == link) {
+/// Whether a link written in a text may be shortened: a web link of at most [`MAX_URL`] bytes, not
+/// to DumbMail's own hosts and not about opting out.
+fn shortenable(link: &str, own: &HashSet<String>) -> bool {
+    if link.len() > MAX_URL {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(link) else { return false };
+    let Some(host) = u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()) else { return false };
+    let where_to = format!("{host}{}", u.path()).to_ascii_lowercase();
+    !own.contains(&host) && !OPT_OUT_WORDS.iter().any(|w| where_to.contains(w))
+}
+
+/// Where in a text's template each link a send would shorten is written: the exact characters the
+/// URL pattern matches (nothing trimmed: they are the destination), outside template tags, at most
+/// [`MAX_LINKS`] different links.
+fn literal_spans(template: &str, own: &HashSet<String>) -> Vec<std::ops::Range<usize>> {
+    let tags: Vec<std::ops::Range<usize>> = TAG.find_iter(template).map(|m| m.range()).collect();
+    let mut distinct: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for m in URL.find_iter(template) {
+        let r = m.range();
+        if tags.iter().any(|t| t.start < r.end && r.start < t.end) || !shortenable(m.as_str(), own) {
             continue;
         }
-        if ["{{", "}}", "{%", "%}", "{#", "#}"].iter().any(|t| link.contains(t)) {
-            continue;
+        if !distinct.contains(&m.as_str()) {
+            if distinct.len() >= MAX_LINKS {
+                continue;
+            }
+            distinct.push(m.as_str());
         }
-        let Some(host) = url::Url::parse(link).ok().and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase())) else { continue };
-        if own.contains(&host) {
-            continue;
-        }
-        out.push(link.to_string());
+        out.push(r);
     }
     out
+}
+
+/// The links a send would shorten in a text's template, once each, as written.
+pub fn written_links(template: &str, own: &HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in literal_spans(template, own) {
+        let l = &template[r];
+        if !out.iter().any(|o| o == l) {
+            out.push(l.to_string());
+        }
+    }
+    out
+}
+
+/// `template` with each link a send would shorten replaced by `short(link)` (when it gives one).
+fn replace_literals<'a>(template: &'a str, own: &HashSet<String>, short: impl Fn(&str) -> Option<String>) -> Cow<'a, str> {
+    let spans = literal_spans(template, own);
+    if spans.is_empty() {
+        return Cow::Borrowed(template);
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut at = 0;
+    for r in spans {
+        if let Some(s) = short(&template[r.clone()]) {
+            out.push_str(&template[at..r.start]);
+            out.push_str(&s);
+            at = r.end;
+        }
+    }
+    out.push_str(&template[at..]);
+    Cow::Owned(out)
 }
 
 /// Each written link and where it goes: the link with the message's link tags added.
@@ -99,6 +131,8 @@ pub struct TextLinks {
     message_ref: String,
     /// Link as written → its short link.
     links: HashMap<String, String>,
+    issued: HashSet<String>,
+    own: HashSet<String>,
 }
 
 impl TextLinks {
@@ -109,9 +143,12 @@ impl TextLinks {
 }
 
 impl SmsLinks for TextLinks {
-    fn short(&self, found: &str) -> Option<String> {
-        let (link, rest) = trim_link(found);
-        self.links.get(link).map(|s| format!("{s}{rest}"))
+    fn source<'a>(&self, template: &'a str) -> Cow<'a, str> {
+        replace_literals(template, &self.own, |l| self.links.get(l).cloned())
+    }
+
+    fn issued(&self, link: &str) -> bool {
+        self.issued.contains(link)
     }
 }
 
@@ -123,7 +160,8 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
         return Ok(None);
     }
     let Some(body) = content.get("body").and_then(Value::as_str) else { return Ok(None) };
-    let links = written_links(body, &own_hosts(state, spec.account.link_domain.as_deref()));
+    let own = own_hosts(state, spec.account.link_domain.as_deref());
+    let links = written_links(body, &own);
     if links.is_empty() {
         return Ok(None);
     }
@@ -145,7 +183,8 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
     if links.is_empty() {
         return Ok(None);
     }
-    Ok(Some(TextLinks { message_ref, links }))
+    let issued = links.values().cloned().collect();
+    Ok(Some(TextLinks { message_ref, links, issued, own }))
 }
 
 /// The targets riding on a campaign's content (codes checked again: content can be typed by hand).
@@ -240,17 +279,20 @@ pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign
 }
 
 /// Sample short links for a preview: every link a real send would shorten, as a short link of the
-/// real length. None when the body has no such link, the account has short links off or short
-/// this server doesn't issue short links yet (see [`runtime::issuing`]).
+/// real length. None when the body has no such link, the account has short links off or this
+/// server doesn't issue short links yet (see [`runtime::issuing`]).
 pub struct Sample {
-    links: HashSet<String>,
+    own: HashSet<String>,
     short: String,
 }
 
 impl SmsLinks for Sample {
-    fn short(&self, found: &str) -> Option<String> {
-        let (link, rest) = trim_link(found);
-        self.links.contains(link).then(|| format!("{}{rest}", self.short))
+    fn source<'a>(&self, template: &'a str) -> Cow<'a, str> {
+        replace_literals(template, &self.own, |_| Some(self.short.clone()))
+    }
+
+    fn issued(&self, link: &str) -> bool {
+        link == self.short
     }
 }
 
@@ -260,15 +302,15 @@ pub async fn preview(state: &AppState, account: &Account, body: &str) -> AppResu
     if !runtime::issuing(state) {
         return Ok(None);
     }
-    let links = written_links(body, &own_hosts(state, account.link_domain.as_deref()));
-    if links.is_empty() {
+    let own = own_hosts(state, account.link_domain.as_deref());
+    if written_links(body, &own).is_empty() {
         return Ok(None);
     }
     let on: bool = sqlx::query_scalar("SELECT sms_short_links FROM accounts WHERE id = $1").bind(account.id).fetch_optional(&state.db).await?.unwrap_or(false);
     if !on {
         return Ok(None);
     }
-    Ok(Some(Sample { links: links.into_iter().collect(), short: sample_link(state, account) }))
+    Ok(Some(Sample { own, short: sample_link(state, account) }))
 }
 
 /// A short link of the real length on this account's link domain.
@@ -282,19 +324,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sentence_punctuation_stays_outside_the_link() {
-        assert_eq!(trim_link("https://x.co/sale."), ("https://x.co/sale", "."));
-        assert_eq!(trim_link("https://x.co/a?b=1!)"), ("https://x.co/a?b=1", "!)"));
-        assert_eq!(trim_link("https://en.wikipedia.org/wiki/Foo_(bar)"), ("https://en.wikipedia.org/wiki/Foo_(bar)", ""));
-        assert_eq!(trim_link("https://x.co/"), ("https://x.co/", ""));
-    }
-
-    #[test]
-    fn only_links_the_sender_wrote_are_shortened() {
+    fn only_links_written_literally_are_shortened_exactly_as_written() {
         let own: HashSet<String> = ["pl.test".to_string()].into_iter().collect();
-        let body = "Acme: sale https://shop.test/a. Also https://shop.test/a and https://shop.test/p?u={{ email }} and {{ product_url }} \
-                    and https://pl.test/f/abc and https://shop.test/{% if x %}b{% endif %} http://shop.test/c";
-        assert_eq!(written_links(body, &own), vec!["https://shop.test/a".to_string(), "http://shop.test/c".to_string()]);
+        let body = "Acme: sale https://shop.test/a! Also https://shop.test/a! and https://shop.test/p?u={{ email }} and {{ product_url }} \
+                    and {{ 'https://shop.test/a!' }} and https://pl.test/f/abc and https://shop.test/{% if x %}b{% endif %} http://shop.test/c. \
+                    https://shop.test/unsubscribe https://shop.test/x/STOP https://stop.shop.test/ https://shop.test/opt-out?y=1";
+        // Nothing is trimmed: the `!` and `.` are part of what's replaced, and so of the destination.
+        assert_eq!(written_links(body, &own), vec!["https://shop.test/a!".to_string(), "http://shop.test/c.".to_string()]);
+        let out = replace_literals(body, &own, |l| Some(format!("<{l}>")));
+        assert!(out.starts_with("Acme: sale <https://shop.test/a!> Also <https://shop.test/a!> and https://shop.test/p?u={{ email }}"), "{out}");
+        assert!(out.contains("{{ 'https://shop.test/a!' }}"), "a link inside a template tag is left to the template: {out}");
+        assert!(out.contains(" <http://shop.test/c.> https://shop.test/unsubscribe https://shop.test/x/STOP https://stop.shop.test/ https://shop.test/opt-out?y=1"), "{out}");
         let many: String = (0..15).map(|i| format!("https://shop.test/{i} ")).collect();
         assert_eq!(written_links(&many, &own).len(), MAX_LINKS);
         let long = format!("https://shop.test/{}", "a".repeat(MAX_URL));

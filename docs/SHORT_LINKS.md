@@ -15,13 +15,16 @@ them off in Settings → Texting (`PATCH /api/short-links/settings`, MCP
 
 ## What gets shortened
 
-- Links the sender typed into the text: `http` and `https` links with no template tag in them.
-  Punctuation that ends a sentence stays outside the link ("Shop now: https://shop.com/sale." keeps
-  its full stop).
-- Not shortened (they keep the long tracked form, as before): links built from a variable (they can
-  differ per person, like `https://shop.com/?ref={{ email }}` or a product link), DumbMail's own
-  links (unsubscribe, forms, tracking), links longer than 2,000 characters, and links past the
-  tenth in one text.
+- Links the sender typed into the text: `http` and `https` links written literally in the message,
+  outside any template tag. The short link replaces exactly the characters of the link, up to the
+  next space, and the destination is exactly those characters: nothing is trimmed (so leave a space
+  before a full stop that isn't part of the link).
+- Not shortened (they keep the long tracked form, as before): anything a variable or template tag
+  produces, even when it's a link written elsewhere in the message (like
+  `https://shop.com/?ref={{ email }}` or a product link); links whose address or path contains
+  `unsubscribe`, `optout`, `opt-out`, `opt_out` or `stop`, so where they go stays visible;
+  DumbMail's own links (unsubscribe, forms, tracking); links longer than 2,000 characters; and links
+  past the tenth in one text.
 - The brand name, the opt-out line ("Reply STOP to opt out.") and STOP handling are unchanged.
 - Campaign texts, flow texts, replies typed in the inbox, keyword answers and automatic replies all
   use short links. Email links are unchanged.

@@ -101,7 +101,7 @@ async fn campaign_texts_get_one_short_link_per_destination_and_clicks_count_like
     }
     let long = format!("https://shop.test/collections/black-friday?{}", "x=1&".repeat(40));
     let long = long.trim_end_matches('&');
-    let id = sms_campaign(&mut h, &list, &format!("Acme Goods: 40% off today: {long}. Also https://shop.test/b and {{{{ unsubscribe_url }}}} Reply STOP to opt out")).await;
+    let id = sms_campaign(&mut h, &list, &format!("Acme Goods: 40% off today: {long} - also https://shop.test/b and {{{{ unsubscribe_url }}}} Reply STOP to opt out")).await;
     launch(&mut h, &id).await;
 
     // One target per destination, not per recipient, with the campaign's link tags on it.
@@ -113,11 +113,11 @@ async fn campaign_texts_get_one_short_link_per_destination_and_clicks_count_like
     let mut paths = Vec::new();
     for (pid, phone) in &people {
         let body = body_to(&h, phone);
-        // Every link the sender wrote is the same length whatever it points to, the full stop stays
-        // outside the link, and the variable's link (DumbMail's unsubscribe link) isn't shortened.
+        // Every link the sender wrote is the same length whatever it points to, and the variable's
+        // link (DumbMail's unsubscribe link) isn't shortened.
         let p = short_paths(&body);
         assert_eq!(p.len(), 2, "{body}");
-        assert!(body.contains(&format!("https://pl.test/s/{}. Also", p[0])), "{body}");
+        assert!(body.contains(&format!("https://pl.test/s/{} - also", p[0])), "{body}");
         assert!(!body.contains("shop.test"), "{body}");
         assert!(body.contains("https://pl.test/t/c/"), "the unsubscribe link from a variable keeps the long form: {body}");
         assert!(body.ends_with("Reply STOP to opt out"), "{body}");
@@ -552,5 +552,26 @@ async fn without_its_index_a_server_answers_not_found_without_a_query() {
     // Rebuilt: links resolve again.
     short_links::ensure_index(&h.state).await.unwrap();
     assert!(click(&h, &path).await.0.is_redirection());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn shortening_changes_nothing_but_the_link() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 8001).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: wow https://shop.test/deal! and {{ 'https://shop.test/deal!' }} or https://shop.test/unsubscribe-me").await;
+    launch(&mut h, &id).await;
+    let body = body_to(&h, &phone);
+    // Only the link written literally is shortened: the same link produced by the template, and a
+    // link about unsubscribing, keep the long form that shows where they go.
+    let p = short_paths(&body);
+    assert_eq!(p.len(), 1, "{body}");
+    assert!(body.starts_with(&format!("Acme Goods: wow https://pl.test/s/{} and https://pl.test/t/c/", p[0])), "{body}");
+    assert_eq!(body.matches("/t/c/").count(), 2, "{body}");
+    // The destination is exactly what was replaced, `!` included.
+    let (s, location, _) = click(&h, &p[0]).await;
+    assert!(s.is_redirection());
+    assert_eq!(location.as_deref(), Some("https://shop.test/deal!"));
     h.cleanup().await;
 }

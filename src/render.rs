@@ -67,10 +67,13 @@ pub trait LinkHook: Sync {
     fn destination(&self, url: &str) -> Option<String>;
 }
 
-/// Replaces a link in a text with a short link (see `features::short_links`). Gets each link as the
-/// rendered body has it and returns what goes in its place, or None to keep the long tracked form.
+/// Short links in a text (see `features::short_links`). Links are replaced in the template, before
+/// it's rendered, so only links written literally are shortened, never text a variable produces.
 pub trait SmsLinks: Sync {
-    fn short(&self, link: &str) -> Option<String>;
+    /// The template with the links it shortens replaced.
+    fn source<'a>(&self, template: &'a str) -> std::borrow::Cow<'a, str>;
+    /// Whether `link`, found in the rendered text, is a short link it put there (left as it is).
+    fn issued(&self, link: &str) -> bool;
 }
 
 fn esc(s: &str) -> String {
@@ -594,16 +597,13 @@ pub fn render_sms(account: &Account, content: &SmsContent, ctx: &Value, tracking
 /// [`render_sms`], with `links` shortening the links it can (also in previews, without tracking).
 pub fn render_sms_with(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool, links: Option<&dyn SmsLinks>) -> AppResult<String> {
     static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
-    let mut body = render_str(&content.body, ctx, false)?;
+    let source = links.map_or(std::borrow::Cow::Borrowed(content.body.as_str()), |l| l.source(&content.body));
+    let mut body = render_str(&source, ctx, false)?;
     // The words the sender wrote, without links: a link that happens to contain "stop" isn't opt-out language.
     let words = URL.replace_all(&body, " ").to_lowercase();
-    if tracking.is_some() || links.is_some() {
+    if let Some(t) = tracking {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| match (links.and_then(|l| l.short(&c[0])), tracking) {
-                (Some(short), _) => short,
-                (None, Some(t)) => tracked_url(t, &c[0]),
-                (None, None) => c[0].to_string(),
-            })
+            .replace_all(&body, |c: &regex::Captures<'_>| if links.is_some_and(|l| l.issued(&c[0])) { c[0].to_string() } else { tracked_url(t, &c[0]) })
             .into_owned();
     }
     let lower = body.to_lowercase();
