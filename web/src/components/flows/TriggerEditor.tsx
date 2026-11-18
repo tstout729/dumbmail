@@ -1,8 +1,8 @@
 import { Plus, X } from "lucide-react";
-import type { FlowTrigger, List, Segment } from "../../api";
+import type { FieldFilter, FlowTrigger, List, Segment } from "../../api";
 import { useMetrics } from "../../api";
 import { FilterFields } from "../segments/ConditionBuilder";
-import { Button, Field, IconButton, Input, Select } from "../ui";
+import { Button, Field, IconButton, Input, Select, TagInput } from "../ui";
 
 type Props = { trigger: FlowTrigger; onChange: (t: FlowTrigger) => void; lists: List[]; segments: Segment[]; readOnly?: boolean };
 
@@ -16,11 +16,64 @@ const defaults = (type: FlowTrigger["type"], lists: List[], segments: Segment[])
       return { type, segment_id: segments[0]?.id ?? "" };
     case "date_property":
       return { type, field: "birthday", offset_days: 0 };
+    case "event_date":
+      return { type, metric: "", field: "", offset_days: -2, hour: 9 };
   }
 };
 
+function TriggerFilters({ filters, onChange }: { filters: FieldFilter[]; onChange: (f: FieldFilter[]) => void }) {
+  return (
+    <div className="space-y-2">
+      <div className="text-xs font-medium text-zinc-700">Trigger filters</div>
+      {filters.map((f, i) => (
+        <div key={i} className="flex flex-wrap items-center gap-1.5 rounded-md border border-zinc-200 p-2">
+          <FilterFields filter={f} fieldList={undefined} fieldPlaceholder='"value" or event property' onChange={(nf) => onChange(filters.map((x, j) => (j === i ? nf : x)))} />
+          <IconButton label="Remove filter" size="sm" onClick={() => onChange(filters.filter((_, j) => j !== i))}>
+            <X className="size-3" />
+          </IconButton>
+        </div>
+      ))}
+      <Button size="sm" variant="ghost" icon={<Plus className="size-3" />} onClick={() => onChange([...filters, { field: "value", op: "gt", value: 0 }])}>
+        Add filter
+      </Button>
+    </div>
+  );
+}
+
+/** "Stop if cancelled": a later event of these metrics with the same key value takes people out. */
+function CancelledByFields({ keyName, cancelledBy, onChange }: { keyName?: string; cancelledBy?: string[]; onChange: (key: string | undefined, cancelledBy: string[]) => void }) {
+  return (
+    <div className="space-y-3 rounded-md border border-zinc-200 p-3">
+      <div>
+        <div className="text-xs font-medium text-zinc-700">Stop if cancelled</div>
+        <p className="mt-0.5 text-xs text-zinc-500">People leave the flow before the next step if one of these events happens later with the same value, or a newer trigger event replaces this one.</p>
+      </div>
+      <Field label="Cancelling events" hint="e.g. Reservation Cancelled">
+        <TagInput value={cancelledBy ?? []} onChange={(v) => onChange(keyName, v)} placeholder="Add a metric" aria-label="Cancelling events" />
+      </Field>
+      <Field label="Matching property" hint="The event property both share, e.g. reservation_id">
+        <Input value={keyName ?? ""} onChange={(e) => onChange(e.target.value.trim() || undefined, cancelledBy ?? [])} placeholder="reservation_id" />
+      </Field>
+    </div>
+  );
+}
+
+function withCancel<T extends FlowTrigger & { key?: string; cancelled_by?: string[] }>(t: T, key: string | undefined, cancelledBy: string[]): T {
+  const next: T = { ...t, key, cancelled_by: cancelledBy };
+  if (!key) delete next.key;
+  if (cancelledBy.length === 0) delete next.cancelled_by;
+  return next;
+}
+
 export function TriggerEditor({ trigger, onChange, lists, segments, readOnly }: Props) {
   const metrics = useMetrics();
+  const metricList = (
+    <datalist id="pl-trigger-metrics">
+      {(metrics.data ?? []).map((m) => (
+        <option key={m.id} value={m.name} />
+      ))}
+    </datalist>
+  );
   return (
     <fieldset disabled={readOnly} className="min-w-0 space-y-4">
       <Field label="Trigger type">
@@ -29,37 +82,17 @@ export function TriggerEditor({ trigger, onChange, lists, segments, readOnly }: 
           <option value="list">List: when someone is added to a list</option>
           <option value="segment">Segment: when someone joins a segment</option>
           <option value="date_property">Date: yearly on a profile date (e.g. birthday)</option>
+          <option value="event_date">Event date: days before or after a date in an event (e.g. check-in)</option>
         </Select>
       </Field>
       {trigger.type === "metric" ? (
         <>
           <Field label="Metric" hint="Pick a tracked metric or type a new one.">
             <Input value={trigger.metric} onChange={(e) => onChange({ ...trigger, metric: e.target.value })} list="pl-trigger-metrics" placeholder="Started Checkout" />
-            <datalist id="pl-trigger-metrics">
-              {(metrics.data ?? []).map((m) => (
-                <option key={m.id} value={m.name} />
-              ))}
-            </datalist>
+            {metricList}
           </Field>
-          <div className="space-y-2">
-            <div className="text-xs font-medium text-zinc-700">Trigger filters</div>
-            {(trigger.filters ?? []).map((f, i) => (
-              <div key={i} className="flex flex-wrap items-center gap-1.5 rounded-md border border-zinc-200 p-2">
-                <FilterFields
-                  filter={f}
-                  fieldList={undefined}
-                  fieldPlaceholder='"value" or event property'
-                  onChange={(nf) => onChange({ ...trigger, filters: (trigger.filters ?? []).map((x, j) => (j === i ? nf : x)) })}
-                />
-                <IconButton label="Remove filter" size="sm" onClick={() => onChange({ ...trigger, filters: (trigger.filters ?? []).filter((_, j) => j !== i) })}>
-                  <X className="size-3" />
-                </IconButton>
-              </div>
-            ))}
-            <Button size="sm" variant="ghost" icon={<Plus className="size-3" />} onClick={() => onChange({ ...trigger, filters: [...(trigger.filters ?? []), { field: "value", op: "gt", value: 0 }] })}>
-              Add filter
-            </Button>
-          </div>
+          <TriggerFilters filters={trigger.filters ?? []} onChange={(filters) => onChange({ ...trigger, filters })} />
+          <CancelledByFields keyName={trigger.key} cancelledBy={trigger.cancelled_by} onChange={(k, c) => onChange(withCancel(trigger, k, c))} />
         </>
       ) : null}
       {trigger.type === "list" ? (
@@ -95,6 +128,33 @@ export function TriggerEditor({ trigger, onChange, lists, segments, readOnly }: 
             <Input type="number" value={trigger.offset_days ?? 0} onChange={(e) => onChange({ ...trigger, offset_days: Number(e.target.value) || 0 })} />
           </Field>
         </div>
+      ) : null}
+      {trigger.type === "event_date" ? (
+        <>
+          <Field label="Event" hint="Each of these events starts the flow once, so two bookings mean two runs.">
+            <Input value={trigger.metric} onChange={(e) => onChange({ ...trigger, metric: e.target.value })} list="pl-trigger-metrics" placeholder="Reservation Confirmed" />
+            {metricList}
+          </Field>
+          <Field label="Date property in the event">
+            <Input value={trigger.field} onChange={(e) => onChange({ ...trigger, field: e.target.value })} placeholder="check_in" />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Days from the date" hint="-2 = two days before">
+              <Input type="number" min={-365} max={365} value={trigger.offset_days ?? 0} onChange={(e) => onChange({ ...trigger, offset_days: Number(e.target.value) || 0 })} />
+            </Field>
+            <Field label="Hour" hint="In your account's time zone">
+              <Select value={trigger.hour ?? 9} onChange={(e) => onChange({ ...trigger, hour: Number(e.target.value) })}>
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <TriggerFilters filters={trigger.filters ?? []} onChange={(filters) => onChange({ ...trigger, filters })} />
+          <CancelledByFields keyName={trigger.key} cancelledBy={trigger.cancelled_by} onChange={(k, c) => onChange(withCancel(trigger, k, c))} />
+        </>
       ) : null}
     </fieldset>
   );
