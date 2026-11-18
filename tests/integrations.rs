@@ -2117,6 +2117,10 @@ async fn guesty_door_codes_never_reach_stored_or_shown_data() {
     }
     let everything = format!("{stored:?} {shown:?}");
     assert!(everything.contains("reservations-v3") && everything.contains("66f1c4a1246e7d9f0f8da88a"), "the deliveries are there");
+    // Times and ids DumbMail writes (`…T15:11:27.015512Z`, uuids) can contain the codes' digits by
+    // chance; take them out so only data that came from Guesty is searched.
+    let noise = regex::Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(:?\d{2})?)?|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+    let everything = noise.replace_all(&everything, "_").into_owned();
     for code in ["5512", "1234", "9876", "keyCode", "Lockbox", "guestContact"] {
         assert!(!everything.contains(code), "{code:?} survived: {everything}");
     }
