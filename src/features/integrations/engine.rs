@@ -68,6 +68,19 @@ pub const PULLS_PER_ACCOUNT: usize = 1;
 static PULL_STATE: once_cell::sync::Lazy<std::sync::Mutex<(usize, std::collections::HashMap<Uuid, usize>)>> = once_cell::sync::Lazy::new(Default::default);
 static PULL_CAP: once_cell::sync::Lazy<usize> =
     once_cell::sync::Lazy::new(|| std::env::var("INTEGRATION_PULL_SLOTS").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(4));
+static PULL_CAP_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tests: a different global cap (many test accounts pull at once in one process).
+pub fn set_pull_cap(n: usize) {
+    PULL_CAP_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pull_cap() -> usize {
+    match PULL_CAP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => *PULL_CAP,
+        n => n,
+    }
+}
 
 pub struct PullSlot {
     account: Uuid,
@@ -90,7 +103,7 @@ impl PullSlots {
     pub fn try_take(account: Uuid) -> Option<PullSlot> {
         let mut s = PULL_STATE.lock().unwrap();
         let mine = s.1.get(&account).copied().unwrap_or(0);
-        if s.0 >= *PULL_CAP || mine >= PULLS_PER_ACCOUNT {
+        if s.0 >= pull_cap() || mine >= PULLS_PER_ACCOUNT {
             return None;
         }
         s.0 += 1;

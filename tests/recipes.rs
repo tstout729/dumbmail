@@ -17,6 +17,9 @@ macro_rules! integ_harness {
     () => {{
         dumbmail::features::integrations::sandbox::set_program(env!("CARGO_BIN_EXE_dumbmail"));
         dumbmail::features::integrations::sandbox::set_global_cap(64);
+        // Every test is its own account, but pulls and fetches share a global cap: give the
+        // tests running at once room, so one test's fetch never waits on another's pull.
+        dumbmail::features::integrations::engine::set_pull_cap(64);
         harness!()
     }};
 }
