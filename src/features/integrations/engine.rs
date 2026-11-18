@@ -1210,12 +1210,14 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     }
     make_room(tx, integ.account_id, context.len() as i64).await?;
     let id = Uuid::now_v7();
-    let (got, inserted): (Uuid, bool) = sqlx::query_as(
+    // Only a waiting fetch intent takes the merge; any other row holding the id is left alone.
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
         "INSERT INTO integration_deliveries AS d (id, integration_id, account_id, source, status, body_bytes, request, message_id)
          VALUES ($1, $2, $3, 'fetch', 'pending', $4, $5, $6)
          ON CONFLICT (integration_id, message_id) WHERE message_id IS NOT NULL DO UPDATE
              SET request = jsonb_set(jsonb_set(d.request, '{lookup_enc}', EXCLUDED.request->'lookup_enc'), '{ctx_bytes}', to_jsonb($4::int)),
                  body_bytes = $4 + COALESCE((d.request->>'reserved')::int, 0)
+             WHERE d.source = 'fetch' AND d.status = 'pending' AND d.body IS NULL
          RETURNING id, (xmax = 0)",
     )
     .bind(id)
@@ -1224,9 +1226,9 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     .bind(context.len() as i32)
     .bind(json!({"fetch": {"of": parent, "hop": hop, "attempts": 0}, "lookup_enc": sealed, "ctx_bytes": context.len()}))
     .bind(format!("fetch:{key}"))
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if inserted {
+    if let Some((got, true)) = row {
         crate::jobs::enqueue_background(&mut **tx, JOB_FETCH, json!({"delivery_id": got}), None).await?;
     }
     Ok(())
@@ -1329,6 +1331,9 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => return fetch_failed(state, &integ, &scrub, id, attempts, None, &e, None, false).await,
     };
+    if !rules.within(&req.url, &vars) {
+        return fetch_failed(state, &integ, &scrub, id, attempts, None, "the lookup isn't under the integration's fetch prefix", None, false).await;
+    }
     scrub.add_request(&req);
     let origin = cfg.origin();
     let who = TokenFor { integration_id: integ.id, auth_version: integ.auth_version, origin: &origin };
@@ -1362,6 +1367,10 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     let Some(body) = body.filter(|_| !unkept) else {
         return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), "the answer isn't JSON or a form, so it can't be checked against the redact list", None, false).await;
     };
+    // What's stored never exceeds the room reserved for it.
+    if body.len() > BODY_MAX_BYTES {
+        return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &format!("{} answered with more than 1 MB", req.place()), None, false).await;
+    }
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut *tx).await?;
     // The answer joins the intent's row; the record can be asked for again from now on.
