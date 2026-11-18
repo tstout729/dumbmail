@@ -106,11 +106,16 @@ pub fn rule_fields(t: &ObjectType, fields: &Map<String, Value>) -> Map<String, V
     fields.iter().filter(|(k, _)| t.field(k).is_some_and(|f| !f.sensitive)).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-/// Refuse rules (segment conditions, trigger filters) on a type's sensitive fields.
+/// Rules (segment conditions, trigger filters and dates) may test only fields the type defines and
+/// doesn't mark sensitive; anything else, or a type that doesn't exist, is refused.
 pub async fn check_rule_fields(db: &sqlx::PgPool, account_id: Uuid, key: &str, fields: &[&str]) -> AppResult<()> {
-    let Some(t) = by_key(db, account_id, key).await? else { return Ok(()) };
-    if let Some(f) = fields.iter().find(|f| t.field(f.trim()).is_some_and(|d| d.sensitive)) {
-        return Err(AppError::bad(format!("{f:?} is a sensitive field of {}; rules can't test it", t.key)));
+    let t = require(db, account_id, key).await?;
+    for f in fields {
+        match t.field(f.trim()) {
+            Some(d) if !d.sensitive => {}
+            Some(_) => return Err(AppError::bad(format!("{f:?} is a sensitive field of {}; rules can't test it", t.key))),
+            None => return Err(AppError::bad(format!("{} has no field {f:?}", t.key))),
+        }
     }
     Ok(())
 }

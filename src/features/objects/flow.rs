@@ -114,6 +114,7 @@ pub async fn check_trigger_refs(db: &PgPool, account_id: Uuid, t: &Trigger) -> A
     let ty = super::types::require(db, account_id, key).await?;
     let mut tested: Vec<&str> = filters.iter().map(|f| f.field.as_str()).collect();
     tested.extend(changed);
+    tested.extend(date_field.map(String::as_str));
     super::types::check_rule_fields(db, account_id, &ty.key, &tested).await?;
     if let Some(f) = date_field {
         match ty.field(f.trim()) {
@@ -269,6 +270,8 @@ struct Obj {
     external_id: String,
     /// Only the fields rules may test (see `types::rule_fields`).
     fields: Map<String, Value>,
+    /// The keys of those fields in the type (defined, not sensitive).
+    rule_keys: Vec<String>,
 }
 
 async fn load_obj(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid) -> AppResult<Option<Obj>> {
@@ -280,7 +283,8 @@ async fn load_obj(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid) ->
     let Some((type_id, external_id, fields)) = row else { return Ok(None) };
     let Some(t) = super::types::by_id(&mut *conn, account_id, type_id).await? else { return Ok(None) };
     let fields = super::types::rule_fields(&t, fields.as_object().unwrap_or(&Map::new()));
-    Ok(Some(Obj { type_key: t.key, external_id, fields }))
+    let rule_keys = t.fields.iter().filter(|f| !f.sensitive).map(|f| f.key.clone()).collect();
+    Ok(Some(Obj { type_key: t.key, external_id, fields, rule_keys }))
 }
 
 async fn linked(conn: &mut PgConnection, object_id: Uuid, relationship: Option<&str>) -> sqlx::Result<Vec<Uuid>> {
@@ -317,7 +321,8 @@ async fn insert_run(conn: &mut PgConnection, f: &FlowRow, profile_id: Uuid, entr
 async fn date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, object_id: Uuid, due: DateTime<Utc>) -> anyhow::Result<Result<(Uuid, i32), &'static str>> {
     let Ok(Trigger::ObjectDate { object_type, field, filters, relationship, .. }) = flows::parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
     let Some(o) = load_obj(tx, f.account_id, object_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else { return Ok(Err("not_started")) };
-    if o.type_key != object_type.trim() {
+    // The type changed under the flow (another type, or the date field is now sensitive or gone).
+    if o.type_key != object_type.trim() || !o.rule_keys.iter().any(|k| k == field.trim()) {
         return Ok(Err("not_started"));
     }
     let tz = account_tz(&state.db, f.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -476,7 +481,7 @@ pub async fn run_change(state: &AppState, change_id: Uuid) -> anyhow::Result<()>
                 continue;
             }
             // A field rules can't test (sensitive, or no longer defined) never matches.
-            if !o.fields.contains_key(fk) && after.get(fk).is_some_and(|v| !v.is_null()) {
+            if !o.rule_keys.iter().any(|k| k == fk) {
                 continue;
             }
             if let Some(want) = &to {
