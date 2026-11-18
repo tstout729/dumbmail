@@ -58,14 +58,15 @@
   "flows": [
     {
       "name": "AfterShip: out for delivery",
-      "description": "When a shipment is out for delivery, tells the customer it arrives today, with the tracking link. Not sent if AfterShip has already reported it delivered or an exception (even when the updates arrive out of order). A service message about their own order.",
+      "description": "When a shipment is out for delivery, tells the customer it arrives today, with the tracking link. Not sent once AfterShip reports any later state (back in transit, delivered or an exception), even when the updates arrive out of order. A service message about their own order.",
       "trigger": {
         "type": "metric",
         "metric": "Out For Delivery",
         "key": "shipment_id",
         "cancelled_by": [
           "Delivered",
-          "Shipment Exception"
+          "Shipment Exception",
+          "Shipment In Transit"
         ]
       },
       "definition": {

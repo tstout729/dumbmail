@@ -96,6 +96,8 @@ function chargeEvents(topic, ch) {
   var who = ch.customer.email ? { email: ch.customer.email } : byCustomer(ch.customer.id);
   var base = "recharge:charge:" + ch.id + ":";
   if (status === "success") {
+    // The stop signal (the charge went through, free or not) is apart from the revenue event.
+    out.push({ type: "track_event", metric: "Charge Processed", profile: who, time: ch.processed_at || ch.updated_at, unique_id: base + "processed", properties: chargeProps(ch) });
     if (!(num(ch.total_price) > 0)) out.push({ type: "log", message: "charge " + ch.id + " was free, so it isn't recorded as paid" });
     else out.push({ type: "track_event", metric: "Charge Paid", profile: who, value: num(ch.total_price), time: ch.processed_at || ch.updated_at, unique_id: base + "paid", properties: chargeProps(ch) });
   } else if (status === "error") {

@@ -1,10 +1,15 @@
 {
   "description": "a webhook created without ?topic= is logged, not guessed",
   "doc": "https://developer.rechargepayments.com/2021-11/customers (the customer object example; personal data replaced)",
+  "expect": [
+    {
+      "message": "no topic: create each Recharge webhook with ?topic=<its topic> at the end of the URL",
+      "type": "log"
+    }
+  ],
   "input": {
     "payload": {
       "customer": {
-        "id": 43845860,
         "analytics_data": {
           "utm_params": []
         },
@@ -19,6 +24,7 @@
         "has_payment_method_in_dunning": false,
         "has_valid_payment_method": true,
         "hash": "7e706455cbd13e40",
+        "id": 43845860,
         "last_name": "Example",
         "phone": null,
         "subscriptions_active_count": 0,
@@ -28,11 +34,5 @@
       }
     },
     "query": {}
-  },
-  "expect": [
-    {
-      "message": "no topic: create each Recharge webhook with ?topic=<its topic> at the end of the URL",
-      "type": "log"
-    }
-  ]
+  }
 }

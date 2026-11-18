@@ -1,10 +1,22 @@
 {
   "description": "a queued charge's body posted as charge/paid: the body shows no payment, so nothing is recorded as paid",
   "doc": "https://developer.rechargepayments.com/2021-11/charges (the charge object example; personal data replaced)",
+  "expect": [
+    {
+      "email": "jamie.example@example.com",
+      "keys": {
+        "recharge_customer": "43845860"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "message": "charge 100714428 is queued; not recorded for charge/paid",
+      "type": "log"
+    }
+  ],
   "input": {
     "payload": {
       "charge": {
-        "id": 100714428,
         "address_id": 21317826,
         "analytics_data": {
           "utm_params": [
@@ -33,17 +45,17 @@
         "created_at": "2018-11-14T09:45:44+00:00",
         "currency": "USD",
         "customer": {
-          "id": 43845860,
           "email": "jamie.example@example.com",
           "external_customer_id": {
             "ecommerce": "2879413682227"
           },
-          "hash": "7e706455cbd13e40"
+          "hash": "7e706455cbd13e40",
+          "id": 43845860
         },
         "discounts": [
           {
-            "id": 12345,
             "code": "10DOLLAROFF",
+            "id": 12345,
             "value": 10,
             "value_type": "fixed_amount"
           }
@@ -57,9 +69,9 @@
           "payment_processor": "ch_XXXXXXXXXXXXXXX"
         },
         "has_uncommitted_changes": false,
+        "id": 100714428,
         "line_items": [
           {
-            "purchase_item_id": 89559201,
             "external_product_id": {
               "ecommerce": "4381728735283"
             },
@@ -69,6 +81,7 @@
             "grams": 4536,
             "original_price": "12.00",
             "properties": [],
+            "purchase_item_id": 89559201,
             "purchase_item_type": "subscription",
             "quantity": 1,
             "sku": "MILK-1",
@@ -112,18 +125,5 @@
     "query": {
       "topic": "charge/paid"
     }
-  },
-  "expect": [
-    {
-      "email": "jamie.example@example.com",
-      "keys": {
-        "recharge_customer": "43845860"
-      },
-      "type": "upsert_profile"
-    },
-    {
-      "message": "charge 100714428 is queued; not recorded for charge/paid",
-      "type": "log"
-    }
-  ]
+  }
 }

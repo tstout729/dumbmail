@@ -482,6 +482,12 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
     r.post_as(&h, &next.to_string(), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
     r.post(&h, "charge-updated-skipped.json").await;
     assert_eq!(events(&h, "Charge Skipped").await, 1);
+    // A charge that went through for nothing still stops its (late) reminder, with no revenue.
+    r.post(&h, "charge-paid-free.json").await;
+    let mut free_upcoming = fixture("recharge", "charge-upcoming.json")["input"]["payload"].clone();
+    free_upcoming["charge"]["id"] = json!(100714430);
+    r.post_as(&h, &free_upcoming.to_string(), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
+    assert_eq!(values(&h, "Charge Paid", "jamie.example@example.com").await, vec![13.14], "no revenue from the free charge");
     // Held back from marketing, but the upcoming-charge reminder (a service message) reached them.
     assert_eq!(consent(&h, "jamie.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "jamie.example@example.com").await);
@@ -1031,15 +1037,37 @@ async fn aftership_updates_reach_the_buyer_once_per_status() {
     let ofd = a.flow("out for delivery");
     h.ok("POST", &format!("/api/flows/{ofd}/status"), Some(json!({"status": "live"}))).await;
     a.refused(&h, "in-transit.json").await;
-    // Out of order: delivered first, then the earlier updates; each once.
-    for name in ["delivered.json", "in-transit.json", "out-for-delivery.json", "out-for-delivery.json", "pending.json", "exception.json"] {
+    // Out of order: delivered first, then older updates write nothing (not even the buyer's phone);
+    // a newer exception still counts.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "sky.example@example.com", "phone_number": "+15035550177", "sms_consent": "subscribed"}))).await;
+    a.post(&h, "delivered.json").await;
+    h.ok("PATCH", &format!("/api/profiles/{}", sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM profiles WHERE email = 'sky.example@example.com'").fetch_one(&h.state.db).await.unwrap()), Some(json!({"phone_number": "+15035550177", "sms_consent": "subscribed"}))).await;
+    for name in ["in-transit.json", "out-for-delivery.json", "out-for-delivery.json", "stale-out-for-delivery.json", "pending.json"] {
         a.post(&h, name).await;
     }
-    for m in ["Shipment In Transit", "Out For Delivery", "Delivered", "Shipment Exception"] {
-        assert_eq!(events(&h, m).await, 1, "{m}");
+    let (phone, sms): (Option<String>, String) = sqlx::query_as("SELECT phone_number, sms_consent FROM profiles WHERE email = 'sky.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((phone.as_deref(), sms.as_str()), (Some("+15035550177"), "subscribed"), "a stale update never rewrote the phone or its consent");
+    a.post(&h, "exception.json").await;
+    for (m, n) in [("Shipment In Transit", 0), ("Out For Delivery", 0), ("Delivered", 1), ("Shipment Exception", 1)] {
+        assert_eq!(events(&h, m).await, n, "{m}");
     }
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'shop@example.com'").await, 0, "the sender isn't the customer");
     assert!(sent_to(&h, "Your order arrives today").is_empty(), "a late 'out for delivery' after 'delivered' starts nothing");
+    // A newer "in transit" (say the van turned back) stands an older "out for delivery" down even
+    // when the stored state no longer has the shipment.
+    let mut back = fixture("aftership", "in-transit.json")["input"]["payload"].clone();
+    back["event_id"] = json!("back-in-transit");
+    back["msg"]["id"] = json!("22222222222222222222222222222222");
+    back["msg"]["updated_at"] = json!("2021-01-15T09:00:00+00:00");
+    back["msg"]["customers"][0]["email"] = json!("new.buyer@example.com");
+    back["msg"]["customers"][0]["phone_number"] = Value::Null;
+    a.post_as(&h, &back.to_string(), &json!({}), &json!({}), &a.secret).await;
+    sqlx::query("UPDATE integrations SET state = '{}' WHERE id = $1::uuid").bind(&a.id).execute(&h.state.db).await.unwrap();
+    let mut late = fixture("aftership", "out-for-delivery.json")["input"]["payload"].clone();
+    late["event_id"] = json!("late-ofd");
+    late["msg"]["id"] = json!("22222222222222222222222222222222");
+    a.post_as(&h, &late.to_string(), &json!({}), &json!({}), &a.secret).await;
+    assert!(sent_to(&h, "Your order arrives today").is_empty(), "back in transit after it: no 'arrives today'");
     // Another shipment, in order: out for delivery reaches the buyer, once.
     let mut other = fixture("aftership", "out-for-delivery.json")["input"]["payload"].clone();
     other["event_id"] = json!("f4dadd60-0000-46d0-aa52-3ced925a50ff");
@@ -1050,8 +1078,9 @@ async fn aftership_updates_reach_the_buyer_once_per_status() {
     let before = events(&h, "Out For Delivery").await;
     a.post(&h, "no-buyer.json").await;
     assert_eq!(events(&h, "Out For Delivery").await, before);
-    assert_eq!(consent(&h, "sky.example@example.com").await, (true, "never_subscribed".into()));
-    assert!(!campaign_reaches(&mut h, "sky.example@example.com").await);
+    // A buyer the integration added is held back from marketing.
+    assert_eq!(consent(&h, "new.buyer@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "new.buyer@example.com").await);
     never_stored(&mut h, &a, &sensitive("aftership", &["in-transit.json"]), &["in-transit.json"]).await;
     h.cleanup().await;
 }

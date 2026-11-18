@@ -1,84 +1,6 @@
 {
   "description": "OutForDelivery: Out For Delivery once",
   "doc": "https://www.aftership.com/docs/tracking/webhook/webhook-payload (sample webhook body, trimmed; customer details replaced)",
-  "input": {
-    "payload": {
-      "event": "tracking_update",
-      "event_id": "a4dadd60-ed26-46d0-aa52-3ced925a50ff",
-      "is_tracking_first_tag": true,
-      "msg": {
-        "active": true,
-        "aftership_estimated_delivery_date": {
-          "confidence_code": 10001,
-          "estimated_delivery_date": "2022-01-03",
-          "estimated_delivery_date_max": "2022-01-06",
-          "estimated_delivery_date_min": "2022-01-01"
-        },
-        "aftership_tracking_url": "https://track.happytrading.com/0000000000000000",
-        "aftership_tracking_order_url": "https://track.happytrading.com/order-status?order-number=1001&code=eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ==",
-        "checkpoints": [
-          {
-            "checkpoint_time": "2021-01-14T00:52:00",
-            "city": "NORTH HAVEN",
-            "coordinate": {
-              "latitude": 39.09024,
-              "longitude": -90.712891
-            },
-            "created_at": "2021-01-14T10:41:24+00:00",
-            "location": "NORTH HAVEN, CT, 06473",
-            "message": "Departed Shipping Partner Facility, USPS Awaiting Item",
-            "slug": "usps",
-            "subtag": "InTransit_001",
-            "subtag_message": "In Transit",
-            "tag": "InTransit"
-          }
-        ],
-        "created_at": "2021-01-14T10:41:23+00:00",
-        "destination_city": "New York City",
-        "destination_postal_code": "10001",
-        "destination_raw_location": "13 Test Street, New York, NY, 10011, USA",
-        "id": "00000000000000000000000000000000",
-        "latest_estimated_delivery": {
-          "datetime": null,
-          "datetime_max": "2022-01-07T12:00:00",
-          "datetime_min": "2022-01-01",
-          "source": "AfterShip EDD",
-          "type": "range"
-        },
-        "note": null,
-        "order_id": null,
-        "order_number": "1001",
-        "shipment_delivery_date": null,
-        "signed_by": null,
-        "slug": "usps",
-        "subtag": "OutForDelivery_001",
-        "subtag_message": "OutForDelivery",
-        "tag": "OutForDelivery",
-        "title": "0000000000000000",
-        "tracking_number": "0000000000000000",
-        "updated_at": "2021-01-15T08:00:00+00:00",
-        "customers": [
-          {
-            "role": "buyer",
-            "name": "Sky Example",
-            "phone_number": "+15035550133",
-            "email": "sky.example@example.com",
-            "language": "en",
-            "id": "cust_12345"
-          },
-          {
-            "role": "sender",
-            "name": "Shop Example",
-            "phone_number": "+15035550199",
-            "email": "shop@example.com",
-            "language": "en",
-            "id": "cust_2"
-          }
-        ]
-      },
-      "ts": 1712741696
-    }
-  },
   "expect": [
     {
       "email": "sky.example@example.com",
@@ -104,6 +26,90 @@
       "time": "2021-01-15T08:00:00+00:00",
       "type": "track_event",
       "unique_id": "aftership:00000000000000000000000000000000:OutForDelivery"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "v:00000000000000000000000000000000": "2021-01-15T08:00:00+00:00"
+      }
     }
-  ]
+  ],
+  "input": {
+    "payload": {
+      "event": "tracking_update",
+      "event_id": "a4dadd60-ed26-46d0-aa52-3ced925a50ff",
+      "is_tracking_first_tag": true,
+      "msg": {
+        "active": true,
+        "aftership_estimated_delivery_date": {
+          "confidence_code": 10001,
+          "estimated_delivery_date": "2022-01-03",
+          "estimated_delivery_date_max": "2022-01-06",
+          "estimated_delivery_date_min": "2022-01-01"
+        },
+        "aftership_tracking_order_url": "https://track.happytrading.com/order-status?order-number=1001&code=eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ==",
+        "aftership_tracking_url": "https://track.happytrading.com/0000000000000000",
+        "checkpoints": [
+          {
+            "checkpoint_time": "2021-01-14T00:52:00",
+            "city": "NORTH HAVEN",
+            "coordinate": {
+              "latitude": 39.09024,
+              "longitude": -90.712891
+            },
+            "created_at": "2021-01-14T10:41:24+00:00",
+            "location": "NORTH HAVEN, CT, 06473",
+            "message": "Departed Shipping Partner Facility, USPS Awaiting Item",
+            "slug": "usps",
+            "subtag": "InTransit_001",
+            "subtag_message": "In Transit",
+            "tag": "InTransit"
+          }
+        ],
+        "created_at": "2021-01-14T10:41:23+00:00",
+        "customers": [
+          {
+            "email": "sky.example@example.com",
+            "id": "cust_12345",
+            "language": "en",
+            "name": "Sky Example",
+            "phone_number": "+15035550133",
+            "role": "buyer"
+          },
+          {
+            "email": "shop@example.com",
+            "id": "cust_2",
+            "language": "en",
+            "name": "Shop Example",
+            "phone_number": "+15035550199",
+            "role": "sender"
+          }
+        ],
+        "destination_city": "New York City",
+        "destination_postal_code": "10001",
+        "destination_raw_location": "13 Test Street, New York, NY, 10011, USA",
+        "id": "00000000000000000000000000000000",
+        "latest_estimated_delivery": {
+          "datetime": null,
+          "datetime_max": "2022-01-07T12:00:00",
+          "datetime_min": "2022-01-01",
+          "source": "AfterShip EDD",
+          "type": "range"
+        },
+        "note": null,
+        "order_id": null,
+        "order_number": "1001",
+        "shipment_delivery_date": null,
+        "signed_by": null,
+        "slug": "usps",
+        "subtag": "OutForDelivery_001",
+        "subtag_message": "OutForDelivery",
+        "tag": "OutForDelivery",
+        "title": "0000000000000000",
+        "tracking_number": "0000000000000000",
+        "updated_at": "2021-01-15T08:00:00+00:00"
+      },
+      "ts": 1712741696
+    }
+  }
 }

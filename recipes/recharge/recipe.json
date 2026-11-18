@@ -8,6 +8,7 @@
     "Subscription Reactivated",
     "Subscription Cancelled",
     "Upcoming Charge",
+    "Charge Processed",
     "Charge Paid",
     "Charge Failed",
     "Charge Skipped"
@@ -58,7 +59,7 @@
         "metric": "Upcoming Charge",
         "key": "charge_id",
         "cancelled_by": [
-          "Charge Paid",
+          "Charge Processed",
           "Charge Failed",
           "Charge Skipped"
         ]
