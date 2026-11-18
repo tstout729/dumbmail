@@ -48,6 +48,30 @@ pub fn label(tag: &str) -> String {
     if super::locale::has_region(tag) { format!("{name} ({tag})") } else { name.to_string() }
 }
 
+/// Findings for the saved blocks an email uses: a machine draft waiting for a careful look in one
+/// of them blocks sending the email, as one in the email itself does.
+pub fn saved_findings(saved: &crate::features::content::prepare::SavedMap) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut list: Vec<_> = saved.values().collect();
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, blocks) in list {
+        let content = serde_json::json!({ "blocks": blocks });
+        let (_, langs) = fields::languages(&content);
+        for lang in &langs {
+            let n = fields::summary(&content, lang).get(CHECK).and_then(|v| v.as_u64()).unwrap_or(0);
+            if n > 0 {
+                out.push((
+                    "translation_needs_check",
+                    "error",
+                    format!("Saved block {name:?}, {}: {} need a careful look", label(lang), plural(n, "machine draft", "machine drafts")),
+                    "Their numbers, links or email addresses differ from the original. Until someone checks the saved block's drafts and marks them reviewed, its original text is sent in their place.".to_string(),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Findings for `content`'s language versions (none when it has none).
 pub async fn findings(state: &AppState, account: &Account, content: &Value) -> Vec<Finding> {
     let mut out = Vec::new();

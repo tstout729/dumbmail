@@ -1010,7 +1010,9 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
     }
 
     // Language versions: what's missing, out of date or unreviewed, and each language's own problems.
-    for (id, severity, title, detail) in crate::features::translations::check::findings(state, &account, &content).await {
+    let mut language_findings = crate::features::translations::check::findings(state, &account, &content).await;
+    language_findings.extend(crate::features::translations::check::saved_findings(&saved));
+    for (id, severity, title, detail) in language_findings {
         findings.push(if severity == "error" { blocking(id, title, detail) } else { finding(id, severity, title, detail) });
     }
 

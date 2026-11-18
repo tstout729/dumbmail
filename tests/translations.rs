@@ -1102,6 +1102,19 @@ async fn machine_drafts_cant_quietly_change_the_facts() {
     let saved = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
     assert!(p["html"].as_str().unwrap().contains("29.99"));
+    // A draft waiting for a careful look inside a saved block blocks every email that uses it.
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": {"subject": "x", "blocks": [{"type": "heading", "text": "Only $19.99"}]}, "language": "de", "strings": [{"id": "b0:text", "text": "Nur 29,99 $"}]}))).await;
+    let mut blocks = v["content"]["blocks"].clone();
+    blocks[0]["i18n"]["de"]["text"]["status"] = json!("check");
+    let sb = h.ok("POST", "/api/content/saved-blocks", Some(json!({"name": "Price box", "blocks": blocks}))).await;
+    let sid = sb["id"].as_str().unwrap().to_string();
+    for name in ["Uses it", "Uses it too"] {
+        let c = h.ok("POST", "/api/campaigns", Some(json!({"name": name, "content": {"subject": "Hi", "blocks": [{"type": "heading", "text": "Hello"}, {"type": "saved", "saved_block_id": sid}]}}))).await;
+        let chk = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": c["id"], "skip_links": true}))).await;
+        let f = chk["findings"].as_array().unwrap().iter().find(|f| f["id"] == "translation_needs_check").unwrap_or_else(|| panic!("listed: {chk}"));
+        assert_eq!(f["blocks_sending"], true);
+        assert!(f["title"].as_str().unwrap().contains("Price box"), "{f}");
+    }
     h.cleanup().await;
 }
 

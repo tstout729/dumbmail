@@ -190,14 +190,32 @@ fn user_content(r: &Request<'_>) -> String {
     serde_json::to_string(&json!({"strings": r.strings, "glossary": glossary})).unwrap_or_default()
 }
 
-/// Numbers (digits with their separators), web addresses and email addresses in a text, sorted.
+/// A web address found in text, compared the way a browser reads it: scheme and host in lower
+/// case, without a trailing dot, and without the sentence's punctuation after it.
+fn url_key(u: &str) -> String {
+    let u = u.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
+    let (scheme, rest) = match u.find("://") {
+        Some(i) => (u[..i + 3].to_ascii_lowercase(), &u[i + 3..]),
+        None => (String::new(), u),
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    format!("{scheme}{}{}", rest[..end].trim_end_matches('.').to_ascii_lowercase(), &rest[end..])
+}
+
+/// Numbers, web addresses and email addresses in a text, sorted. A number is its digits with
+/// whatever separates their groups (any kind of space, a comma, period, apostrophe, colon, slash
+/// or dash between digits), so `1 234` is one number; the kind of space and of apostrophe don't
+/// matter. Web addresses are found in any case, with or without `https://` (`www.example.com`,
+/// `example.com/path`).
 pub fn literals(text: &str) -> Vec<String> {
-    static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
+    static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bhttps?://[^\s<>"']+|\bwww\.[^\s<>"']+|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}/[^\s<>"']*"#).unwrap());
     static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
-    static NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:[.,:/\-]\d+)*").unwrap());
-    let mut out: Vec<String> = URL.find_iter(text).chain(EMAIL.find_iter(text)).map(|m| m.as_str().to_string()).collect();
-    let rest = EMAIL.replace_all(&URL.replace_all(text, " "), " ").into_owned();
-    out.extend(NUMBER.find_iter(&rest).map(|m| m.as_str().to_string()));
+    static NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:(?:[.,:/\-'’]|\s)\d+)*").unwrap());
+    let mut out: Vec<String> = EMAIL.find_iter(text).map(|m| m.as_str().to_lowercase()).collect();
+    let rest = EMAIL.replace_all(text, " ").into_owned();
+    out.extend(URL.find_iter(&rest).map(|m| url_key(m.as_str())));
+    let rest = URL.replace_all(&rest, " ").into_owned();
+    out.extend(NUMBER.find_iter(&rest).map(|m| m.as_str().chars().map(|c| if c.is_whitespace() { ' ' } else if c == '’' { '\'' } else { c }).collect()));
     out.sort();
     out
 }
@@ -355,6 +373,18 @@ mod tests {
         assert!(!same_literals("See https://a.test/x", "Siehe https://b.test/x"));
         assert!(!same_literals("Hi", "Hallo, ruf 555-0100 an"), "nothing new");
         assert!(same_literals("<p style=\"width:600px\">Hi</p>", "<p style=\"width:600px\">Hallo</p>"));
+        // A grouped number is one number, however its groups are separated.
+        assert!(!same_literals("Only 1 234 left", "Nur noch 234 1"));
+        assert!(!same_literals("Seulement 1\u{202F}234", "Nur 234\u{2009}1"));
+        assert!(same_literals("Seulement 1\u{202F}234 €", "Nur 1 234 €"), "the kind of space doesn't matter");
+        assert!(same_literals("CHF 1'234", "CHF 1’234"));
+        // Web addresses in any case, with or without a scheme.
+        assert!(!same_literals("Visit WWW.ACME.TEST now", "Besuche www.evil.test"));
+        assert!(!same_literals("See acme.test/sale", "Siehe evil.test/sale"));
+        assert!(!same_literals("See HTTPS://ACME.TEST/x", "Siehe"), "a dropped link counts");
+        assert!(same_literals("See HTTPS://Acme.TEST/x.", "Siehe https://acme.test/x"));
+        assert!(same_literals("Visit www.acme.test.", "Besuche www.acme.test!"));
+        assert!(same_literals("Mail HI@ACME.TEST", "Schreib hi@acme.test"));
     }
 
     #[test]
