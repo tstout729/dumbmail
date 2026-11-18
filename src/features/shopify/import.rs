@@ -138,9 +138,6 @@ pub async fn set_status(state: &AppState, account_id: Uuid, action: &str) -> App
     .ok_or_else(|| AppError::Conflict(format!("there's no import to {action}")))?;
     if to == "running" {
         super::shop::kick_now(&state.db, account_id).await?;
-    } else {
-        // Paused or cancelled: segments stop absorbing entries (see `events::close_history`).
-        super::events::close_history_now(&state.db, account_id).await?;
     }
     if to == "cancelled" {
         // Stop Shopify's side too (best effort; it ends on its own otherwise).
@@ -249,11 +246,10 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
             .bind(i.id)
             .execute(&state.db)
             .await?;
-        super::events::close_history_now(&state.db, shop.account_id).await?;
         return Ok(Step::More);
     }
     let r = step_inner(state, shop, lease, metrics, &mut i, deadline).await;
-    let out = match r {
+    match r {
         Ok(s) => {
             // A pause or cancel that came in meanwhile is kept (save only changes a running import's status).
             save(&state.db, &i, lease).await?;
@@ -271,10 +267,7 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
                 Ok(Step::Idle)
             }
         },
-    };
-    // Finished, failed, paused or cancelled meanwhile: the history window closes.
-    super::events::close_history_now(&state.db, shop.account_id).await?;
-    out
+    }
 }
 
 async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut Metrics, i: &mut ImportRow, deadline: std::time::Instant) -> Result<Step, ApiError> {
@@ -310,6 +303,12 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
             "CREATED" | "RUNNING" | "CANCELING" => return Ok(Step::Wait(Duration::seconds(10))),
             "COMPLETED" => match n["url"].as_str() {
                 None => {
+                    // No result file: nothing matched. A complete product scan of an emptied store
+                    // still finishes, so the store's old products are unpublished.
+                    if i.phase == "products" {
+                        let gone = products::finish_scan(&state.db, shop, i.id, i.started_at).await.map_err(|_| ApiError::Network("database"))?;
+                        bump(&mut i.counts, "products_removed", gone);
+                    }
                     next_phase(i);
                     return Ok(Step::More);
                 }
@@ -344,10 +343,6 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
             return Ok(Step::More);
         };
         buf.extend_from_slice(&bytes);
-        if i.kind == "history" {
-            // Segments absorb the entries this page of history causes (see `events::open_history`).
-            super::events::open_history(&state.db, i.id, shop.account_id).await.map_err(|_| ApiError::Network("database"))?;
-        }
         let consumed = process_chunk(state, shop, metrics, i, &buf, at_end).await.map_err(|_| ApiError::Network("database"))?;
         if consumed > 0 {
             i.result_offset += consumed as i64;
@@ -374,16 +369,21 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
 /// Group result lines under their parents. With `groupObjects` Shopify puts each object's children
 /// right after it, but every child is still checked: it joins the parent its `__parentId` names
 /// (looked up by id among the records in this read), never simply the record before it. A child
-/// whose parent isn't in this read is counted and left out.
-pub fn group(lines: Vec<(usize, Value)>) -> (Vec<(usize, Value, Vec<Value>)>, u64) {
+/// whose parent isn't in this read (its parent was saved from an earlier read) is returned by its
+/// parent's id: that parent is read again in full by id, so no line is lost.
+pub fn group(lines: Vec<(usize, Value)>) -> (Vec<(usize, Value, Vec<Value>)>, Vec<String>) {
     let mut groups: Vec<(usize, Value, Vec<Value>)> = Vec::new();
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut orphans = 0;
+    let mut orphans: Vec<String> = Vec::new();
     for (off, v) in lines {
         match v.get("__parentId").and_then(|p| p.as_str()).map(String::from) {
             Some(parent) => match index.get(&parent) {
                 Some(&g) => groups[g].2.push(v),
-                None => orphans += 1,
+                None => {
+                    if !orphans.contains(&parent) {
+                        orphans.push(parent);
+                    }
+                }
             },
             None => {
                 if let Some(id) = v["id"].as_str() {
@@ -420,8 +420,20 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
     // Group: a top-level line (no __parentId) and its children. The last group may continue in the
     // next chunk unless this is the end of the file.
     let (mut groups, orphans) = group(lines);
-    if orphans > 0 {
-        bump(&mut i.counts, "skipped_children", orphans);
+    if !orphans.is_empty() {
+        // Their parents were saved from an earlier read: read each again in full, by id (bounded:
+        // at most one queued read per parent).
+        bump(&mut i.counts, "reread_parents", orphans.len() as u64);
+        let kind = match i.phase.as_str() {
+            "products" => Some("product"),
+            "orders" => Some(orders::FULL_HISTORY),
+            _ => None,
+        };
+        for id in orphans.iter().filter_map(|p| super::customers::num_id(&Value::String(p.clone()))) {
+            if let Some(k) = kind {
+                products::queue_refresh(&state.db, shop.account_id, k, id).await?;
+            }
+        }
     }
     let used = if at_end {
         complete_end
@@ -431,13 +443,13 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
             None => 0,
         }
     };
-    let mut cx = orders::Ctx { state, account_id: shop.account_id, shop: &shop.shop_domain, metrics, quiet: true };
+    let mut cx = orders::Ctx { state, account_id: shop.account_id, shop: &shop.shop_domain, generation: shop.generation, metrics, quiet: true };
     match i.phase.as_str() {
         "customers" => {
             let mut n = 0;
             for (_, v, _) in &groups {
                 if let Some(c) = Customer::from_graphql(v) {
-                    customers::apply(&state.db, shop.account_id, &shop.shop_domain, &c).await?;
+                    customers::apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c, i.kind == "history").await?;
                     n += 1;
                 }
             }
@@ -477,10 +489,19 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
 }
 
 /// Products are read in full once a day, in case a webhook was missed.
+/// A closed account gets none, and an import or sync still marked running or paused for one is
+/// cancelled (its worker doesn't run, so it would otherwise stay "running").
 pub async fn queue_reconciles(db: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE shopify_imports i SET status = 'cancelled', finished_at = now(), result_url_enc = NULL, updated_at = now(), error = 'The account was closed.'
+         WHERE i.status IN ('running', 'paused') AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = i.account_id AND a.closed_at IS NOT NULL)",
+    )
+    .execute(db)
+    .await?;
     let due: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE shopify_shops s SET reconcile_after = now() + interval '1 day'
          WHERE s.status = 'connected' AND s.reconcile_after < now()
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.closed_at IS NOT NULL)
            AND NOT EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = s.account_id AND i.status IN ('running', 'paused'))
          RETURNING s.account_id",
     )

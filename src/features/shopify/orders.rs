@@ -36,7 +36,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::client::{self, ApiError};
-use super::customers::{dec, erased, gid, num_id, parse_time, profile_for, to_f64};
+use super::customers::{dec, gid, num_id, parse_time, profile_for, to_f64};
 use super::events::{self, Metrics, ServerEvent};
 use super::shop::ShopRow;
 use crate::state::AppState;
@@ -77,8 +77,12 @@ pub struct Order {
     pub id: i64,
     pub name: Option<String>,
     pub number: Option<i64>,
+    /// The order's own contact (what the buyer gave for this order).
     pub email: Option<String>,
     pub phone: Option<String>,
+    /// The nested customer record's contact: used only when the order has none of its own.
+    pub customer_email: Option<String>,
+    pub customer_phone: Option<String>,
     pub customer_id: Option<i64>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
@@ -162,8 +166,10 @@ impl Order {
             id,
             name: s(&v["name"]),
             number: v["order_number"].as_i64(),
-            email: s(&v["email"]).or_else(|| s(&v["contact_email"])).or_else(|| s(&c["email"])),
-            phone: s(&v["phone"]).or_else(|| s(&c["phone"])),
+            email: s(&v["email"]).or_else(|| s(&v["contact_email"])),
+            phone: s(&v["phone"]),
+            customer_email: s(&c["email"]),
+            customer_phone: s(&c["phone"]),
             customer_id: num_id(&c["id"]),
             first_name: s(&c["first_name"]),
             last_name: s(&c["last_name"]),
@@ -223,6 +229,8 @@ impl Order {
             name,
             email: s(&v["email"]),
             phone: s(&v["phone"]),
+            customer_email: None,
+            customer_phone: None,
             customer_id: num_id(&v["customer"]["id"]),
             first_name: s(&v["customer"]["firstName"]),
             last_name: s(&v["customer"]["lastName"]),
@@ -279,19 +287,115 @@ impl Refund {
     }
 }
 
-/// Everything about an order's refunds, read for a few orders at a time.
+/// Everything about an order's refunds, read for a few orders at a time. A refund with more
+/// transactions or lines than one page is read on (see [`complete_refund`]).
 pub const REFUNDS_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Order { id updatedAt
     refunds { id createdAt
-        transactions(first: 20) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } }
-        refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } } } } } }";
+        transactions(first: 20) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } pageInfo { hasNextPage endCursor } }
+        refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } pageInfo { hasNextPage endCursor } } } } } }";
+
+const REFUND_TX_PAGE: &str = "query($id: ID!, $after: String) { node(id: $id) { ... on Refund {
+    transactions(first: 50, after: $after) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } pageInfo { hasNextPage endCursor } } } } }";
+const REFUND_LINES_PAGE: &str = "query($id: ID!, $after: String) { node(id: $id) { ... on Refund {
+    refundLineItems(first: 100, after: $after) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } pageInfo { hasNextPage endCursor } } } } }";
+/// Most extra pages read for one refund's transactions or lines. Past this, the order's refunds are
+/// left as they were and marked "not reconciled" rather than counted wrong.
+pub const MAX_REFUND_PAGES: usize = 20;
+
+/// Read the rest of a refund's transactions and lines into it. `false`: more than
+/// [`MAX_REFUND_PAGES`] pages, so its total isn't known.
+async fn complete_refund(state: &AppState, shop: &ShopRow, r: &mut Value) -> Result<bool, ApiError> {
+    let Some(id) = r["id"].as_str().map(String::from) else { return Ok(true) };
+    for (field, query) in [("transactions", REFUND_TX_PAGE), ("refundLineItems", REFUND_LINES_PAGE)] {
+        let mut pages = 0;
+        while r[field]["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
+            if pages >= MAX_REFUND_PAGES {
+                return Ok(false);
+            }
+            pages += 1;
+            let after = r[field]["pageInfo"]["endCursor"].clone();
+            let d = client::graphql(state, shop, query, json!({"id": id, "after": after})).await?;
+            let more = &d["node"][field];
+            let extra = more["nodes"].as_array().cloned().unwrap_or_default();
+            if let Some(nodes) = r[field]["nodes"].as_array_mut() {
+                nodes.extend(extra);
+            }
+            r[field]["pageInfo"] = more["pageInfo"].clone();
+            if more["pageInfo"].is_null() {
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
 
 /// Orders read per refunds query.
 pub const REFUNDS_PER_QUERY: usize = 5;
+
+/// Refresh-queue kinds for orders: refunds read after a live webhook ("order"), refunds read for an
+/// order the history import found (quiet), and an order read again in full for the history import
+/// (a line of it arrived after the order itself was saved; quiet).
+pub const REFUNDS_LIVE: &str = "order";
+pub const REFUNDS_HISTORY: &str = "order_history";
+pub const FULL_HISTORY: &str = "order_full";
+
+/// An order read again in full, in the same shape the bulk import reads (lines included).
+pub const ORDER_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Order { id name createdAt processedAt updatedAt cancelledAt cancelReason test email phone currencyCode
+    displayFinancialStatus displayFulfillmentStatus discountCodes
+    totalPriceSet { shopMoney { amount currencyCode } } subtotalPriceSet { shopMoney { amount } } totalDiscountsSet { shopMoney { amount } }
+    totalShippingPriceSet { shopMoney { amount } } totalTaxSet { shopMoney { amount } }
+    customer { id firstName lastName }
+    refunds { id }
+    fulfillments { id createdAt status }
+    lineItems(first: 250) { nodes { id title variantTitle sku vendor quantity originalUnitPriceSet { shopMoney { amount } }
+        totalDiscountSet { shopMoney { amount } } product { id } variant { id } image { url } } } } } }";
+
+/// Read orders again in full and record them (history: quiet).
+pub async fn refresh_full(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> Result<(), ApiError> {
+    let gids: Vec<String> = ids.iter().map(|i| gid("Order", *i)).collect();
+    let data = client::graphql(cx.state, shop, ORDER_QUERY, json!({"ids": gids})).await?;
+    for n in data["nodes"].as_array().into_iter().flatten() {
+        let lines: Vec<Value> = n["lineItems"]["nodes"].as_array().cloned().unwrap_or_default();
+        if let Some(o) = Order::from_graphql(n, &lines) {
+            apply(cx, &o).await.map_err(|_| ApiError::Network("database"))?;
+        }
+    }
+    Ok(())
+}
+
+/// An email and phone, either the event's own or its nested customer record's.
+#[derive(Clone, Copy)]
+pub struct Contact<'a> {
+    pub email: Option<&'a str>,
+    pub phone: Option<&'a str>,
+}
+
+impl Contact<'_> {
+    fn any(&self) -> bool {
+        self.email.and_then(crate::models::normalize_email).is_some() || self.phone.and_then(crate::models::normalize_phone).is_some()
+    }
+}
+
+/// Who an order or checkout is for. The event's own email and phone come first (so a new phone on
+/// the order is never overridden by a stale email on the customer record). Only when the event has
+/// neither is the nested customer's contact used, and then the event counts as having no contact of
+/// its own: it's recorded, but nothing is sent because of it. With no contact anywhere, the linked
+/// customer's profile, likewise marked.
+#[allow(clippy::too_many_arguments)]
+pub async fn buyer_for(db: &sqlx::PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, own: Contact<'_>, nested: Contact<'_>, first: Option<&str>, last: Option<&str>, at: Option<DateTime<Utc>>) -> anyhow::Result<Option<super::customers::Buyer>> {
+    if own.any() {
+        return profile_for(db, account_id, shop, customer_id, own.email, own.phone, first, last, at).await;
+    }
+    let b = profile_for(db, account_id, shop, customer_id, nested.email, nested.phone, first, last, at).await?;
+    Ok(b.map(|b| super::customers::Buyer { no_contact: true, ..b }))
+}
 
 pub struct Ctx<'a> {
     pub state: &'a AppState,
     pub account_id: Uuid,
     pub shop: &'a str,
+    /// The install the work is for: every write goes through a [`super::fence`] for it.
+    pub generation: i32,
     pub metrics: &'a mut Metrics,
     /// History import: record everything quietly.
     pub quiet: bool,
@@ -430,20 +534,30 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     if o.test {
         return Ok(());
     }
-    let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, o.customer_id, Some(o.id)).await? {
-        return Ok(());
-    }
+    // Written inside the fence: not into a newer install, and not after a privacy request erased it.
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, o.customer_id, Some(o.id)).await? else { return Ok(()) };
+    apply_inner(cx, o).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     if let (Some(seen), Some(this)) = (applied_at(cx, o.id).await?, o.updated_at) {
         if this < seen {
             return Ok(());
         }
     }
     let db = &cx.state.db;
-    let Some(buyer) = profile_for(db, cx.account_id, cx.shop, o.customer_id, o.email.as_deref(), o.phone.as_deref(), o.first_name.as_deref(), o.last_name.as_deref()).await? else {
+    let own = Contact { email: o.email.as_deref(), phone: o.phone.as_deref() };
+    let nested = Contact { email: o.customer_email.as_deref(), phone: o.customer_phone.as_deref() };
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, o.customer_id, own, nested, o.first_name.as_deref(), o.last_name.as_deref(), o.updated_at).await? else {
         return Ok(());
     };
     let profile_id = buyer.profile_id;
+    if cx.quiet {
+        // History: recorded before the order is, so its segment entries never start flows.
+        super::events::touch_history(db, cx.account_id, &[profile_id]).await?;
+    }
     // No email or phone on the order: kept for the record, but nothing is sent because of it.
     let quiet = cx.quiet || buyer.no_contact;
     let pids: Vec<String> = o.lines.iter().filter_map(|l| l.product_id.map(|p| p.to_string())).collect();
@@ -454,6 +568,7 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     base.insert("tracked_by".into(), json!("shopify"));
     base.insert("order_id".into(), json!(o.id.to_string()));
     base.insert("shopify_shop".into(), json!(cx.shop));
+    base.insert("shopify_generation".into(), json!(cx.generation));
     let mut put = |k: &str, v: Value| {
         if !v.is_null() {
             base.insert(k.into(), v);
@@ -512,20 +627,34 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         (p, Some(placed_value(total, refunded, is_cancelled)))
     };
     let (props, value) = merge_order(&json!({}));
-    events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props, value, at: o.placed_at() }, quiet, Some(&merge_order)).await?;
-
     // Ordered Product, one per line. Values are settled with the order's in `recompute`.
-    for (l, item) in o.lines.iter().zip(items.iter()) {
-        let mut p = base.clone();
-        if let Some(obj) = item.as_object() {
-            for (k, v) in obj {
-                p.insert(k.clone(), v.clone());
+    let line_props: Vec<(i64, Decimal, Value)> = o
+        .lines
+        .iter()
+        .zip(items.iter())
+        .map(|(l, item)| {
+            let mut p = base.clone();
+            if let Some(obj) = item.as_object() {
+                for (k, v) in obj {
+                    p.insert(k.clone(), v.clone());
+                }
             }
-        }
-        p.insert("line_item_id".into(), json!(l.id.to_string()));
-        p.insert("shopify_state".into(), json!({"line_total": l.total().normalize().to_string()}));
+            p.insert("line_item_id".into(), json!(l.id.to_string()));
+            p.insert("shopify_state".into(), json!({"line_total": l.total().normalize().to_string()}));
+            (l.id, l.total(), Value::Object(p))
+        })
+        .collect();
+    // A new order: the order and its lines are recorded together (all or none).
+    let mut first: Vec<ServerEvent<'_>> = vec![ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props.clone(), value, at: o.placed_at() }];
+    for (lid, line_total, p) in &line_props {
+        first.push(ServerEvent { profile_id, metric: "Ordered Product", unique_id: format!("order:{}:{}", o.id, lid), properties: p.clone(), value: Some(if cancelled { 0.0 } else { to_f64(*line_total) }), at: o.placed_at() });
+    }
+    let created = events::create_together(db, cx.metrics, cx.account_id, first, quiet).await?;
+    if !created {
+        events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props, value, at: o.placed_at() }, quiet, Some(&merge_order)).await?;
+    }
+    for (l, (_, _, props)) in o.lines.iter().zip(line_props).filter(|_| !created) {
         let line_total = l.total();
-        let props = Value::Object(p);
         let merge_line = |old: &Value| -> (Value, Option<f64>) {
             // Keep what `recompute` settled last time, so a replay writes nothing.
             let mut p = props.clone();
@@ -572,7 +701,9 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Cancelled Order", unique_id: format!("order:{}", o.id), properties: Value::Object(p), value: Some(to_f64(o.total)), at }, quiet, None).await?;
     }
     if o.has_refunds {
-        super::products::queue_refresh(db, cx.account_id, "order", o.id).await?;
+        // Found by the history import: its refunds are history too (no refund flows start).
+        let kind = if cx.quiet { REFUNDS_HISTORY } else { REFUNDS_LIVE };
+        super::products::queue_refresh(db, cx.account_id, kind, o.id).await?;
     }
     redeem(db, cx.account_id, cx.shop, o).await?;
     if !cx.quiet {
@@ -585,7 +716,7 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
 /// transactions in the buyer's currency, so it isn't used for amounts).
 pub async fn apply_refund(cx: &mut Ctx<'_>, body: &Value) -> anyhow::Result<()> {
     if let Some(order_id) = num_id(&body["order_id"]) {
-        super::products::queue_refresh(&cx.state.db, cx.account_id, "order", order_id).await?;
+        super::products::queue_refresh(&cx.state.db, cx.account_id, REFUNDS_LIVE, order_id).await?;
     }
     Ok(())
 }
@@ -596,9 +727,36 @@ pub async fn refresh_refunds(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> R
     let data = client::graphql(cx.state, shop, REFUNDS_QUERY, json!({"ids": gids})).await?;
     for n in data["nodes"].as_array().into_iter().flatten() {
         let Some(order_id) = num_id(&n["id"]) else { continue };
-        let refunds: Vec<Refund> = n["refunds"].as_array().map(|a| a.iter().take(MAX_LINES).filter_map(Refund::from_graphql).collect()).unwrap_or_default();
+        let mut raw: Vec<Value> = n["refunds"].as_array().map(|a| a.iter().take(MAX_LINES).cloned().collect()).unwrap_or_default();
+        let mut complete = true;
+        for r in raw.iter_mut() {
+            complete &= complete_refund(cx.state, shop, r).await?;
+        }
+        if !complete {
+            // Too large to read in full: leave the order's refunds as they were and say so, rather
+            // than count a wrong total.
+            tracing::warn!(account = %cx.account_id, order = order_id, "a Shopify order's refunds are too large to read in full; not reconciled");
+            not_reconciled(cx, order_id).await.map_err(|_| ApiError::Network("database"))?;
+            continue;
+        }
+        let refunds: Vec<Refund> = raw.iter().filter_map(Refund::from_graphql).collect();
         set_refunds(cx, order_id, t(&n["updatedAt"]), &refunds).await.map_err(|_| ApiError::Network("database"))?;
     }
+    Ok(())
+}
+
+/// Mark the order's refunds as not reconciled (`refunds_not_reconciled` on its Placed Order).
+async fn not_reconciled(cx: &mut Ctx<'_>, order_id: i64) -> anyhow::Result<()> {
+    let db = &cx.state.db;
+    let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
+    let Some(fence) = super::fence::open(db, cx.account_id, cx.shop, cx.generation, None, Some(order_id)).await? else { return Ok(()) };
+    sqlx::query("UPDATE events SET properties = properties || '{\"refunds_not_reconciled\": true}' WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false")
+        .bind(cx.account_id)
+        .bind(placed)
+        .bind(format!("order:{order_id}"))
+        .execute(db)
+        .await?;
+    fence.done().await?;
     Ok(())
 }
 
@@ -606,10 +764,14 @@ pub async fn refresh_refunds(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> R
 /// rewrite the order's and its lines' values in the same transaction. A read older than the one
 /// applied changes nothing. Then each refund's Refunded Order event is recorded or corrected.
 pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<DateTime<Utc>>, refunds: &[Refund]) -> anyhow::Result<()> {
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, None, Some(order_id)).await? else { return Ok(()) };
+    set_refunds_inner(cx, order_id, updated_at, refunds).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn set_refunds_inner(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<DateTime<Utc>>, refunds: &[Refund]) -> anyhow::Result<()> {
     let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, None, Some(order_id)).await? {
-        return Ok(());
-    }
     let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
     let line = cx.metrics.id(db, cx.account_id, "Ordered Product").await?;
     let mut tx = db.begin().await?;
@@ -621,6 +783,9 @@ pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<Dat
         .await?;
     // Not seen yet (or only the browser's copy): the order webhook will bring it, and read refunds again.
     let Some((event_id, profile_id, mut props)) = row.filter(|r| !r.2["shopify_state"].is_null()) else { return Ok(()) };
+    if cx.quiet {
+        super::events::touch_history(db, cx.account_id, &[profile_id]).await?;
+    }
     let st = &mut props["shopify_state"];
     if let (Some(read), Some(this)) = (parse_time(st["refunds_read_at"].as_str()), updated_at) {
         if this < read {
@@ -644,13 +809,16 @@ pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<Dat
     st["refund_at"] = Value::Object(at);
     st["line_refunds"] = Value::Object(lines.iter().map(|(k, v)| (k.clone(), smap(v))).collect());
     st["refunds_read_at"] = json!(updated_at.map(|u| u.to_rfc3339()));
+    if let Some(o) = props.as_object_mut() {
+        o.remove("refunds_not_reconciled");
+    }
     sqlx::query("UPDATE events SET properties = $2 WHERE id = $1").bind(event_id).bind(&props).execute(&mut *tx).await?;
     recompute(&mut tx, cx.account_id, placed, line, order_id).await?;
     tx.commit().await?;
 
     let refunded_metric = cx.metrics.id(db, cx.account_id, "Refunded Order").await?;
     let mut base = Map::new();
-    for k in ["tracked_by", "order_name", "order_number", "currency", "shopify_shop", "shopify_customer_id", "$no_contact"] {
+    for k in ["tracked_by", "order_name", "order_number", "currency", "shopify_shop", "shopify_generation", "shopify_customer_id", "$no_contact"] {
         if let Some(v) = props.get(k) {
             base.insert(k.into(), v.clone());
         }
@@ -712,13 +880,20 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     }
     let c = &v["customer"];
     let customer_id = num_id(&c["id"]);
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, customer_id, None).await? else { return Ok(()) };
+    checkout_inner(cx, v, &token, customer_id).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn checkout_inner(cx: &mut Ctx<'_>, v: &Value, token: &str, customer_id: Option<i64>) -> anyhow::Result<()> {
+    let c = &v["customer"];
     let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, customer_id, None).await? {
-        return Ok(());
-    }
-    let email = s(&v["email"]).or_else(|| s(&c["email"]));
-    let phone = s(&v["phone"]).or_else(|| s(&c["phone"])).or_else(|| s(&v["shipping_address"]["phone"]));
-    let Some(buyer) = profile_for(db, cx.account_id, cx.shop, customer_id, email.as_deref(), phone.as_deref(), s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref()).await? else {
+    let (email, phone) = (s(&v["email"]), s(&v["phone"]).or_else(|| s(&v["shipping_address"]["phone"])));
+    let (c_email, c_phone) = (s(&c["email"]), s(&c["phone"]));
+    let own = Contact { email: email.as_deref(), phone: phone.as_deref() };
+    let nested = Contact { email: c_email.as_deref(), phone: c_phone.as_deref() };
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, customer_id, own, nested, s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref(), t(&v["updated_at"])).await? else {
         return Ok(());
     };
     let shop_currency = s(&v["currency"]);
@@ -752,6 +927,7 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     let mut p = Map::new();
     p.insert("tracked_by".into(), json!("shopify"));
     p.insert("shopify_shop".into(), json!(cx.shop));
+    p.insert("shopify_generation".into(), json!(cx.generation));
     if let Some(cid) = customer_id {
         p.insert("shopify_customer_id".into(), json!(cid.to_string()));
     }
