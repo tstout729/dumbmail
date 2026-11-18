@@ -233,14 +233,46 @@ pub fn verify_enroll_grant(secret: &str, account_id: &str, id_type: &str, value:
     if hmac_hex_matches(secret, &enroll_grant_message(account_id, id_type, value, expires), mac) { Ok(()) } else { Err("the grant doesn't match") }
 }
 
-/// Compare two strings in constant time (for MACs computed elsewhere).
+/// Compare two strings in constant time (`subtle`; only the length may show).
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// A new per-install secret for an app device: 256 random bits, base64url. Only its
+/// [`install_secret_hash`] is stored.
+pub fn new_install_secret() -> String {
+    let mut b = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    URL_SAFE_NO_PAD.encode(b)
+}
+
+/// The stored form of an install secret (SHA-256, hex).
+pub fn install_secret_hash(secret: &str) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(secret.trim().as_bytes()))
+}
+
+/// Whether `claimed` is the secret whose hash is `stored` (compared in constant time).
+pub fn install_secret_matches(stored: Option<&str>, claimed: Option<&str>) -> bool {
+    match (stored, claimed) {
+        (Some(h), Some(c)) if !c.trim().is_empty() && c.len() <= 200 => ct_eq(h, &install_secret_hash(c)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_secrets_are_long_random_and_checked_by_hash() {
+        let (a, b) = (new_install_secret(), new_install_secret());
+        assert!(a.len() >= 22 && a != b, "at least 128 bits, never repeated");
+        let h = install_secret_hash(&a);
+        assert!(install_secret_matches(Some(&h), Some(&a)));
+        assert!(!install_secret_matches(Some(&h), Some(&b)) && !install_secret_matches(Some(&h), None) && !install_secret_matches(None, Some(&a)));
+    }
 
     fn b(s: &str) -> Vec<u8> {
         unb64(&s.replace([' ', '\n'], "")).unwrap()

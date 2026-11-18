@@ -154,7 +154,17 @@ Secrets are stored encrypted and never shown again. When Apple or Google says th
  "environment": "production", "app_version": "2.4.0", "identity": {"type": "external_id", "value": "cust_123", "grant": "v1.…"}}
 ```
 
-`permission` is required: `granted`, `provisional` (iOS), `denied` or `not_determined`. On iOS, send `environment`: `sandbox` for development builds (run from Xcode) and `production` for TestFlight and App Store builds (for example from a `#if DEBUG` check, or the `aps-environment` entitlement). Without it the account's default is used, and a token Apple calls bad is kept, since it may only belong to the other environment. Only `granted` and `provisional` are sent to; provisional devices are marked as such. Call it on every launch, after asking for permission, after sign-in (with a grant), and whenever the permission changes. On sign-out, `POST {base}/client/push/devices/sign-out?k=…` with `{"platform", "token"}` (the device goes back to an anonymous profile); to forget a device entirely, `POST {base}/client/push/devices/remove?k=…`.
+`permission` is required: `granted`, `provisional` (iOS), `denied` or `not_determined`. On iOS, send `environment`: `sandbox` for development builds (run from Xcode) and `production` for TestFlight and App Store builds (for example from a `#if DEBUG` check, or the `aps-environment` entitlement). Without it the account's default is used, and a token Apple calls bad is kept, since it may only belong to the other environment. Only `granted` and `provisional` are sent to; provisional devices are marked as such. Call it on every launch, after asking for permission, after sign-in (with a grant), and whenever the permission changes. On sign-out, `POST {base}/client/push/devices/sign-out?k=…` with `{"platform", "token", "install_secret"}` (the device goes back to an anonymous profile); to forget a device entirely, `POST {base}/client/push/devices/remove?k=…` with the same.
+
+**The install secret.** A device token alone doesn't prove the app holds it (a token can leak), so the first registration of a token answers with `install_secret`: a random secret for this install, shown only that once (DumbMail keeps only a hash of it). Keep it in the Keychain (iOS) or encrypted storage (Android) and send it as `install_secret` on every later call for that device. Without it, DumbMail refuses (409) to sign the device out, remove it, give it a new owner, or refresh it anonymously; the one exception is a registration with a valid grant for the person the device already belongs to.
+
+**Lost the secret?** (A reinstall that kept the token, or storage that was cleared.) Register with a valid grant for the person the device already belongs to and without the secret: DumbMail issues a new `install_secret` in the answer, and the old one stops working. A grant for anyone else never does; an anonymous device that lost its secret can't be recovered this way, so register its new token as a new device.
+
+**A new token.** When APNs or FCM gives the app a new token, register it with `"previous_token": "<the old one>"` and the install secret: the device keeps its owner and its secret, and the old token is forgotten, in one step. If the old token isn't this install's, or the new one already belongs to another device (which then needs its own secret), it's refused and neither changes. A new token registered without `previous_token` is a new device with a new secret.
+
+Devices registered before install secrets existed: one that belongs to nobody named counts as not registered, so the app's next registration is handled as its first (a new anonymous profile unless it sends a grant, and a new install secret in the answer); a sign-out with only its token changes nothing, and a removal needs the secret. One that belongs to a named person adopts a secret on its first registration with a valid grant for that person, and the answer carries it; until then any call with only its token (a new owner, a sign-out, a removal, even a permission refresh) is refused with 409 and changes nothing.
+
+Browsers don't need this: a subscription's own auth secret proves it. A subscribe that brings new keys or a new owner for an endpoint DumbMail already has must carry that endpoint's current auth secret (the subscription's own keys, or `"proof": {"auth": "<the old auth secret>"}` when the keys changed); otherwise it's refused with 409 and nothing changes. When the browser replaces its subscription, the service worker sends the old one as `previous` (with its auth secret): that proves only the old subscription, which is moved to the new endpoint with its owner. A new endpoint that's already registered still needs its own auth secret, and a refused move changes neither. The snippet does all this itself, and if DumbMail refuses its subscription (409) it drops it and makes a fresh one.
 
 When someone opens a notification, read `dumbmail.t` (iOS) or `dumbmail_t` (Android data) and `POST {base}/client/push/opened?k=…` with `{"t": "<that value>"}`. The tap's link is `dumbmail.url` / `dumbmail_url`: opening it records the tap too.
 
@@ -186,14 +196,28 @@ enum Push {
             default: permission = "not_determined"
             }
             var body: [String: Any] = ["platform": "ios", "token": token, "permission": permission]
+            if let secret = Keychain.get("dumbmail_install_secret") { body["install_secret"] = secret }
+            // A new token for this install: say which one it replaces.
+            if let old = UserDefaults.standard.string(forKey: "dumbmail_token"), old != token { body["previous_token"] = old }
             #if DEBUG
             body["environment"] = "sandbox"      // builds run from Xcode use the APNs sandbox
             #else
             body["environment"] = "production"   // TestFlight and the App Store
             #endif
             if let grant = Session.pushGrant { body["identity"] = grant }   // {type, value, grant} from your server
-            post("/client/push/devices", body)
+            post("/client/push/devices", body) { answer in
+                guard let answer, answer["ok"] as? Bool == true else { return }
+                // Shown once, at the first registration: keep it (Keychain is your own small wrapper).
+                if let secret = answer["install_secret"] as? String { Keychain.set("dumbmail_install_secret", secret) }
+                UserDefaults.standard.set(token, forKey: "dumbmail_token")
+            }
         }
+    }
+
+    // On sign-out (or to forget the device): the install secret proves it's this app.
+    static func signOut() {
+        guard let token else { return }
+        post("/client/push/devices/sign-out", ["platform": "ios", "token": token, "install_secret": Keychain.get("dumbmail_install_secret") ?? ""])
     }
 }
 
@@ -205,12 +229,14 @@ func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive respo
     done()
 }
 
-func post(_ path: String, _ body: [String: Any]) {
+func post(_ path: String, _ body: [String: Any], done: (([String: Any]?) -> Void)? = nil) {
     var req = URLRequest(url: URL(string: "https://dumbmail.ai\(path)?k=YOUR_SITE_KEY")!)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-    URLSession.shared.dataTask(with: req).resume()
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+        done?(data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })
+    }.resume()
 }
 ```
 
@@ -222,14 +248,32 @@ val ask = registerForActivityResult(ActivityResultContracts.RequestPermission())
 if (Build.VERSION.SDK_INT >= 33) ask.launch(Manifest.permission.POST_NOTIFICATIONS) else Push.report(this)
 
 object Push {
+    // The install secret DumbMail gives at the first registration, and the last token registered.
+    // Keep them in encrypted storage (EncryptedSharedPreferences, or your own).
+    private fun prefs(context: Context) = Secure.prefs(context)
+
     // Call after asking, on every start (onResume), and from onNewToken.
     fun report(context: Context) {
         FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
             val permission = if (NotificationManagerCompat.from(context).areNotificationsEnabled()) "granted" else "denied"
             val body = JSONObject().put("platform", "android").put("token", token).put("permission", permission)
+            prefs(context).getString("dumbmail_install_secret", null)?.let { body.put("install_secret", it) }
+            prefs(context).getString("dumbmail_token", null)?.takeIf { it != token }?.let { body.put("previous_token", it) }
             Session.pushGrant?.let { body.put("identity", it) }   // {type, value, grant} from your server
-            post("/client/push/devices", body)
+            post("/client/push/devices", body) { answer ->
+                if (answer?.optBoolean("ok") != true) return@post
+                val edit = prefs(context).edit().putString("dumbmail_token", token)
+                answer.optString("install_secret").takeIf { it.isNotEmpty() }?.let { edit.putString("dumbmail_install_secret", it) }
+                edit.apply()
+            }
         }
+    }
+
+    // On sign-out (or to forget the device): the install secret proves it's this app.
+    fun signOut(context: Context) {
+        val p = prefs(context)
+        val body = JSONObject().put("platform", "android").put("token", p.getString("dumbmail_token", "")).put("install_secret", p.getString("dumbmail_install_secret", ""))
+        post("/client/push/devices/sign-out", body)
     }
 }
 
@@ -240,12 +284,13 @@ class PushService : FirebaseMessagingService() {
 // In the activity the notification opens (FCM puts the data keys in the intent's extras):
 intent.extras?.getString("dumbmail_t")?.let { post("/client/push/opened", JSONObject().put("t", it)) }
 
-fun post(path: String, body: JSONObject) = thread {
+fun post(path: String, body: JSONObject, done: ((JSONObject?) -> Unit)? = null) = thread {
     val c = URL("https://dumbmail.ai$path?k=YOUR_SITE_KEY").openConnection() as HttpURLConnection
     c.requestMethod = "POST"; c.doOutput = true
     c.setRequestProperty("Content-Type", "application/json")
     c.outputStream.use { it.write(body.toString().toByteArray()) }
-    c.responseCode
+    val ok = c.responseCode in 200..299
+    done?.invoke(if (ok) runCatching { JSONObject(c.inputStream.bufferedReader().readText()) }.getOrNull() else null)
 }
 ```
 
@@ -254,8 +299,15 @@ fun post(path: String, body: JSONObject) = thread {
 ```js
 import messaging, { AuthorizationStatus } from "@react-native-firebase/messaging";
 import { AppState, PermissionsAndroid, Platform } from "react-native";
+import * as Keychain from "react-native-keychain"; // or any secure storage
 
 const post = (path, body) => fetch(`https://dumbmail.ai${path}?k=YOUR_SITE_KEY`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+// The install secret DumbMail gives at the first registration, with the token it was for.
+async function saved() {
+  const c = await Keychain.getGenericPassword({ service: "dumbmail-push" });
+  return c ? { token: c.username, secret: c.password } : { token: null, secret: null };
+}
 
 // Android 13 (API 33) and later show notifications only after POST_NOTIFICATIONS is granted, and
 // Firebase's requestPermission() doesn't ask for it there. Declare it in AndroidManifest.xml too:
@@ -281,7 +333,22 @@ export async function registerPush(identity) {
   // the build uses); Android uses the FCM token.
   const token = Platform.OS === "ios" ? await messaging().getAPNSToken() : await messaging().getToken();
   const environment = Platform.OS === "ios" ? (__DEV__ ? "sandbox" : "production") : undefined;
-  if (token) await post("/client/push/devices", { platform: Platform.OS, token, permission, environment, identity });
+  if (!token) return;
+  const s = await saved();
+  const body = { platform: Platform.OS, token, permission, environment, identity, install_secret: s.secret ?? undefined };
+  if (s.token && s.token !== token) body.previous_token = s.token;   // a new token for this install
+  const r = await post("/client/push/devices", body);
+  if (!r.ok) return;
+  const answer = await r.json();
+  // Shown once, at the first registration: keep it.
+  const secret = answer.install_secret ?? s.secret;
+  if (secret) await Keychain.setGenericPassword(token, secret, { service: "dumbmail-push" });
+}
+
+// On sign-out (or to forget the device): the install secret proves it's this app.
+export async function signOutPush() {
+  const s = await saved();
+  if (s.token) await post("/client/push/devices/sign-out", { platform: Platform.OS, token: s.token, install_secret: s.secret });
 }
 
 // Report changes made in the phone's settings when the app comes back.
