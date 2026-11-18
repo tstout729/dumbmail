@@ -97,7 +97,9 @@ impl Limiter {
                 let mut hasher = OVERFLOW_HASH.build_hasher();
                 hasher.write(k.as_bytes());
                 k = format!("overflow:{}", hasher.finish() % OVERFLOW_BUCKETS);
-                allowance = self.unknown_per_minute;
+                // Each bucket gets one address's allowance, so the buckets together allow no more
+                // than that many addresses would.
+                allowance = self.per_minute;
             }
             let n = c.by_address.entry(k.clone()).or_insert(0);
             if *n >= allowance {
@@ -167,7 +169,7 @@ mod tests {
 
     #[test]
     fn past_the_address_cap_new_addresses_share_one_allowance() {
-        let l = Limiter::new(1, 2, 100);
+        let l = Limiter::new(2, 50, 100);
         // Counts reset each clock minute: stay clear of a minute's last seconds.
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         if secs % 60 >= 57 {
@@ -178,7 +180,7 @@ mod tests {
             c.minute = minute();
             c.by_address = (0..MAX_ADDRESSES).map(|i| (format!("10.0.{}.{}", i / 256, i % 256), 0)).collect();
         }
-        // One new address uses up its overflow bucket's allowance (2 here), not everyone's.
+        // One new address uses up its overflow bucket's allowance (one address's, 2 here), not everyone's.
         assert!(l.admit(Some("203.0.113.1")).is_ok());
         assert!(l.admit(Some("203.0.113.1")).is_ok());
         assert_eq!(l.admit(Some("203.0.113.1")).err(), Some(Refused::TooMany), "the overflow allowance is limited, not unlimited");
