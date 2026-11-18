@@ -317,37 +317,39 @@ pub fn valid_key(key: &str) -> Option<String> {
 /// The subject for `key` (the store's product id or the account's own key), created or refreshed,
 /// field by field. A published catalog product with that id supplies the name, image and address:
 /// its name is trusted once the catalog has verified it, its image and address only when they came
-/// from a trusted source (a feed, the API, a CSV or an integration), never from a browser (a product
-/// learned from browser events keeps the address and image a page said, even once verified).
+/// from a trusted source (a feed, the API, a CSV or an integration), never from a browser: the
+/// catalog marks each field a browser supplied (`url_from_browser`, `image_from_browser`), and the
+/// mark stays until a trusted source sends that field itself.
 /// Otherwise `hint` does. A field is replaced by an
 /// untrusted value only while it isn't trusted, and becomes trusted only when a trusted source
 /// supplies that field itself.
 pub async fn subject_for(db: &PgPool, account_id: Uuid, key: &str, hint: &Hint) -> AppResult<Subject> {
     let key = valid_key(key).ok_or_else(|| AppError::bad("product_id must be 1 to 255 characters"))?;
-    let product: Option<(String, Option<String>, Option<String>, bool, bool)> =
-        sqlx::query_as("SELECT title, image_url, url, verified, source <> 'events' FROM catalog_products WHERE account_id = $1 AND external_id = $2 AND published")
+    let product: Option<(String, Option<String>, Option<String>, bool, bool, bool)> = sqlx::query_as(
+        "SELECT title, image_url, url, verified, NOT image_from_browser, NOT url_from_browser FROM catalog_products WHERE account_id = $1 AND external_id = $2 AND published",
+    )
             .bind(account_id)
             .bind(&key)
             .fetch_optional(db)
             .await?;
     let kind = hint.kind.as_deref().filter(|k| ["product", "listing", "service"].contains(k)).unwrap_or("product");
-    let (name, image, url, trusted, media_trusted) = match &product {
-        Some((t, i, u, v, from_server)) => (clean(Some(t), 200), http_url(i.as_deref()), http_url(u.as_deref()), *v, *v && *from_server),
-        None => (clean(hint.name.as_deref(), 200), http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), hint.trusted, hint.trusted),
+    let (name, image, url, trusted, image_trusted, url_trusted) = match &product {
+        Some((t, i, u, v, image_ok, url_ok)) => (clean(Some(t), 200), http_url(i.as_deref()), http_url(u.as_deref()), *v, *v && *image_ok, *v && *url_ok),
+        None => (clean(hint.name.as_deref(), 200), http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), hint.trusted, hint.trusted, hint.trusted),
     };
     let id = Uuid::now_v7();
     // $5..$7: the values (NULL: not supplied). $8: whether this source's name is trusted, $10 its
-    // image and address.
+    // image, $11 its address.
     let q = format!(
         "INSERT INTO review_subjects AS s (id, account_id, external_id, kind, name, image_url, url, name_trusted, image_trusted, url_trusted)
-         VALUES ($1, $2, $3, $4, COALESCE($5, $3), $6, $7, $8 AND $5::text IS NOT NULL, $10 AND $6::text IS NOT NULL, $10 AND $7::text IS NOT NULL)
+         VALUES ($1, $2, $3, $4, COALESCE($5, $3), $6, $7, $8 AND $5::text IS NOT NULL, $10 AND $6::text IS NOT NULL, $11 AND $7::text IS NOT NULL)
          ON CONFLICT (account_id, external_id) DO UPDATE SET
             name = CASE WHEN $5::text IS NOT NULL AND ($8 OR NOT s.name_trusted) THEN $5 ELSE s.name END,
             image_url = CASE WHEN $6::text IS NOT NULL AND ($10 OR NOT s.image_trusted) THEN $6 ELSE s.image_url END,
-            url = CASE WHEN $7::text IS NOT NULL AND ($10 OR NOT s.url_trusted) THEN $7 ELSE s.url END,
+            url = CASE WHEN $7::text IS NOT NULL AND ($11 OR NOT s.url_trusted) THEN $7 ELSE s.url END,
             name_trusted = s.name_trusted OR ($8 AND $5::text IS NOT NULL),
             image_trusted = s.image_trusted OR ($10 AND $6::text IS NOT NULL),
-            url_trusted = s.url_trusted OR ($10 AND $7::text IS NOT NULL),
+            url_trusted = s.url_trusted OR ($11 AND $7::text IS NOT NULL),
             kind = CASE WHEN $9 THEN EXCLUDED.kind ELSE s.kind END,
             updated_at = now()
          RETURNING {SUBJECT_COLS}"
@@ -362,7 +364,8 @@ pub async fn subject_for(db: &PgPool, account_id: Uuid, key: &str, hint: &Hint) 
         .bind(&url)
         .bind(trusted)
         .bind(hint.kind.is_some() && hint.trusted)
-        .bind(media_trusted)
+        .bind(image_trusted)
+        .bind(url_trusted)
         .fetch_one(db)
         .await?)
 }

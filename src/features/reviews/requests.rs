@@ -314,23 +314,25 @@ pub async fn ready_event(state: &AppState, r: &Request, subject: &Subject) -> Ap
 
 /// Metrics that mean a purchase or stay wherever they're recorded by a server. Integrations'
 /// server-only metrics (bookings, orders) and the account's own `purchase_metrics` count too.
-pub const PURCHASE_METRICS: [&str; 4] = ["Placed Order", "Fulfilled Order", "Delivered", "Delivered Order"];
+pub const PURCHASE_METRICS: [&str; 3] = ["Placed Order", "Fulfilled Order", "Delivered"];
 
 /// What the event proves, for a verified review: `event:<id>` when a trusted source (the API, an
-/// integration, DumbMail) recorded it for this account and it's one of the account's purchase or
-/// stay metrics. Browser events and other metrics prove nothing.
+/// integration, DumbMail) recorded it for this account and it records a purchase or a stay: one of
+/// [`PURCHASE_METRICS`], a metric an integration recipe declares as a purchase (`metrics.purchase`),
+/// or one of the account's own `purchase_metrics`. Browser events and other metrics (a server-only
+/// inquiry, say) prove nothing.
 pub async fn proof_of_purchase(db: &PgPool, account_id: Uuid, event: Option<&Value>) -> AppResult<Option<String>> {
     let Some(id) = event.and_then(|e| e.get("id")).and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(None) };
     let row: Option<(Option<bool>, String, bool, Vec<String>)> = sqlx::query_as(
-        "SELECT e.from_browser, m.name, m.server_only, COALESCE((SELECT purchase_metrics FROM review_settings WHERE account_id = $2), '{}')
+        "SELECT e.from_browser, m.name, m.purchase, COALESCE((SELECT purchase_metrics FROM review_settings WHERE account_id = $2), '{}')
          FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1 AND e.account_id = $2",
     )
     .bind(id)
     .bind(account_id)
     .fetch_optional(db)
     .await?;
-    let Some((from_browser, metric, server_only, extra)) = row else { return Ok(None) };
-    let purchase = server_only || PURCHASE_METRICS.iter().any(|m| m.eq_ignore_ascii_case(&metric)) || extra.iter().any(|m| m.eq_ignore_ascii_case(&metric));
+    let Some((from_browser, metric, declared, extra)) = row else { return Ok(None) };
+    let purchase = declared || PURCHASE_METRICS.iter().any(|m| m.eq_ignore_ascii_case(&metric)) || extra.iter().any(|m| m.eq_ignore_ascii_case(&metric));
     Ok((from_browser == Some(false) && purchase).then(|| format!("event:{}", id.simple())))
 }
 

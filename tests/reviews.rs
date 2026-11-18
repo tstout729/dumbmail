@@ -1106,9 +1106,10 @@ async fn public_reads_and_photos_are_bounded() {
     let (s, hd, _) = h.raw("GET", &format!("/client/reviews?k={pk}&product_id=MUG"), &[("if-none-match", &tag)], "").await;
     assert_eq!(s, StatusCode::OK);
     assert_ne!(hd.get("etag").unwrap().to_str().unwrap(), tag);
-    // Reads are throttled per visitor address.
+    // Reads are throttled per visitor address (enough tries to fill a window even if one starts
+    // part-way through).
     let mut last = StatusCode::OK;
-    for _ in 0..310 {
+    for _ in 0..700 {
         last = h.raw("GET", &format!("/client/reviews/summary?k={pk}&ids=MUG"), &[("x-real-ip", "198.51.100.77")], "").await.0;
         if last == StatusCode::TOO_MANY_REQUESTS {
             break;
@@ -1508,11 +1509,26 @@ async fn catalog_links_and_images_need_a_trusted_source() {
     .await
     .unwrap();
     product(&mut h, "FED", "Fed mug").await;
-    for key in ["LEARNED", "FED"] {
+    // Learned from a browser, then updated by the store's API without an address or image: those
+    // stay the browser's.
+    sqlx::query(
+        "INSERT INTO catalog_products (id, account_id, external_id, title, url, image_url, source, verified)
+         VALUES ($1, $2, 'PATCHED', 'Patched tee', 'https://evil.test/phish', 'https://evil.test/pixel.gif', 'events', false)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(acct)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "PATCHED", "title": "Patched tee", "price": 20}))).await;
+    let (src, url): (String, Option<String>) = sqlx::query_as("SELECT source, url FROM catalog_products WHERE external_id = 'PATCHED'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((src.as_str(), url.as_deref()), ("api", Some("https://evil.test/phish")), "the partial update kept the browser's address");
+    for key in ["LEARNED", "FED", "PATCHED"] {
         h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": key, "order_id": format!("O-{key}")}))).await;
     }
+    let db = h.state.db.clone();
     let trust = |key: &'static str| {
-        let db = h.state.db.clone();
+        let db = db.clone();
         async move {
             let t: (bool, bool, bool) = sqlx::query_as("SELECT name_trusted, image_trusted, url_trusted FROM review_subjects WHERE external_id = $1").bind(key).fetch_one(&db).await.unwrap();
             t
@@ -1520,5 +1536,46 @@ async fn catalog_links_and_images_need_a_trusted_source() {
     };
     assert_eq!(trust("LEARNED").await, (true, false, false), "browser-learned: the verified name only");
     assert_eq!(trust("FED").await, (true, true, true), "from the API: all three");
+    assert_eq!(trust("PATCHED").await, (true, false, false), "a trusted update that didn't send them doesn't vouch for them");
+    // Once the store sends its own address, it's trusted.
+    h.ok("POST", "/api/catalog/products", Some(json!({"external_id": "PATCHED", "title": "Patched tee", "url": "https://acme.test/products/patched", "price": 20}))).await;
+    h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "PATCHED", "order_id": "O-PATCHED-2"}))).await;
+    assert_eq!(trust("PATCHED").await, (true, false, true));
+    h.cleanup().await;
+}
+
+/// Round 3, item 5: "verified" means a purchase or a stay: the standard order metrics, a metric an
+/// integration recipe declares as a purchase (Guesty's confirmed reservation, Stripe's paid order),
+/// or the account's own purchase metrics. A server-only metric that isn't one (an inquiry, a
+/// subscription) proves nothing.
+#[tokio::test]
+async fn verified_means_a_purchase_or_a_stay() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "guest@x.test", "subscribed").await;
+    for key in ["guesty", "stripe"] {
+        dumbmail::features::integrations::recipes::create(&h.state, acct, key, None, false).await.unwrap();
+    }
+    let mut proof = std::collections::HashMap::new();
+    for metric in ["Reservation Confirmed", "Inquiry Received", "Placed Order", "Subscription Started", "Fulfilled Order", "Delivered", "Viewed Product"] {
+        h.ok("POST", "/api/events", Some(json!({"metric": metric, "profile": {"email": "guest@x.test"}, "properties": {}, "unique_id": metric}))).await;
+        let id: Uuid = sqlx::query_scalar("SELECT e.id FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.account_id = $1 AND m.name = $2").bind(acct).bind(metric).fetch_one(&h.state.db).await.unwrap();
+        let p = dumbmail::features::reviews::requests::proof_of_purchase(&h.state.db, acct, Some(&json!({"id": id}))).await.unwrap();
+        proof.insert(metric, p.is_some());
+    }
+    for (metric, want) in [
+        ("Reservation Confirmed", true),
+        ("Placed Order", true),
+        ("Fulfilled Order", true),
+        ("Delivered", true),
+        ("Inquiry Received", false),
+        ("Subscription Started", false),
+        ("Viewed Product", false),
+    ] {
+        assert_eq!(proof[metric], want, "{metric}");
+    }
+    let server_only: bool = sqlx::query_scalar("SELECT server_only FROM metrics WHERE account_id = $1 AND name = 'Inquiry Received'").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    assert!(server_only, "the inquiry is server-only, and still not a purchase");
     h.cleanup().await;
 }
