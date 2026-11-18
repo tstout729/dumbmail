@@ -250,7 +250,7 @@ mod tests {
         let c = parse(&json!({"title": "Hi {{ first_name }}", "body": "Sale", "actions": [{"title": "Shop", "url": "https://acme.test/s"}]})).unwrap();
         let r = render(&c, &ctx, "https://acme.test", Some("https://acme.test/logo.png")).unwrap();
         assert_eq!(r.title, "Hi Ana");
-        assert_eq!(r.url, "https://acme.test/");
+        assert_eq!(r.url, "https://acme.test");
         assert_eq!(r.icon.as_deref(), Some("https://acme.test/logo.png"));
         assert_eq!(r.actions.len(), 1);
         let bad = parse(&json!({"title": "x", "url": "{{ first_name }}"})).unwrap();
