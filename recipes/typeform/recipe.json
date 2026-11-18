@@ -1,0 +1,49 @@
+{
+  "key": "typeform",
+  "name": "Typeform",
+  "category": "Forms",
+  "description": "Typeform responses become Form Submitted events on the respondent's profile, with their choice, yes/no, number and date answers (free text isn't copied). A response never subscribes anyone; a consent question you map is recorded on the event.",
+  "metrics": [
+    "Form Submitted"
+  ],
+  "docs": [
+    "https://www.typeform.com/developers/webhooks/secure-your-webhooks/",
+    "https://www.typeform.com/developers/webhooks/example-payload/",
+    "https://www.typeform.com/developers/webhooks/"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "Typeform-Signature",
+    "prefix": "sha256=",
+    "encoding": "base64"
+  },
+  "signature_secret": {
+    "label": "Typeform webhook secret",
+    "help": "A random value you choose, for example the output of: openssl rand -hex 20. Set the same value as the webhook's secret in Typeform."
+  },
+  "message_id": {
+    "field": "event_id"
+  },
+  "credentials": [],
+  "settings": {
+    "email_field": "",
+    "consent_field": ""
+  },
+  "pull": null,
+  "redact": [
+    "form_response.answers[].text",
+    "**.payment",
+    "**.file_url",
+    "**.signature",
+    "**.multi_format"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Pick a random secret and save it as the integration's signing secret.",
+    "In Typeform, open the form \u2192 Connect \u2192 Webhooks \u2192 Add a webhook. Paste the webhook URL, open Edit, turn on Secret and paste the same secret, and turn the webhook on.",
+    "If the form has more than one email question, set email_field in the integration's settings to the ref of the one to use. If it has a yes/no or legal question asking for marketing consent, set consent_field to that question's ref; the answer is recorded on each Form Submitted event as marketing_consent.",
+    "Send a test response (Typeform's View deliveries \u2192 Send test request) and check the delivery log.",
+    "People this adds are held back from marketing. A form submission isn't an opt-in, so nobody is subscribed. To add people who ticked the consent question to your marketing, send them a confirmation (double opt-in) first."
+  ],
+  "flows": []
+}
