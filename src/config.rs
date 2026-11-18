@@ -173,6 +173,27 @@ pub struct Config {
     #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
     pub google_redirect_base: Option<String>,
 
+    /// Ad audience sync (see docs/AD_AUDIENCES.md). A platform whose app credentials are unset shows
+    /// as "not available on this server". Meta app for Facebook Login with the ads_management permission.
+    #[arg(long, env = "META_APP_ID")]
+    pub meta_app_id: Option<String>,
+    #[arg(long, env = "META_APP_SECRET", hide_env_values = true)]
+    pub meta_app_secret: Option<String>,
+    /// Google OAuth web client for Google Ads Customer Match (Data Manager API).
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_ID")]
+    pub google_ads_client_id: Option<String>,
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_SECRET", hide_env_values = true)]
+    pub google_ads_client_secret: Option<String>,
+    /// TikTok API for Business app.
+    #[arg(long, env = "TIKTOK_APP_ID")]
+    pub tiktok_app_id: Option<String>,
+    #[arg(long, env = "TIKTOK_APP_SECRET", hide_env_values = true)]
+    pub tiktok_app_secret: Option<String>,
+    /// A loopback stand-in for every ad platform API host, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored.
+    #[arg(skip)]
+    pub ad_platform_api_base: Option<String>,
     /// The Shopify app (SHOPIFY_API_KEY, SHOPIFY_API_SECRET; see docs/SHOPIFY.md).
     #[command(flatten)]
     pub shopify: crate::features::shopify::Settings,

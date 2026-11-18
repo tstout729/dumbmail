@@ -528,7 +528,9 @@ async fn stop_wins_over_texts_already_queued() {
 
     // A reply (and a campaign text) already in the send path with consent loaded before the STOP:
     // the last check before the provider refuses it.
-    let e = "+15035550305";
+    // A number where it's daytime now: at night a marketing text is held for quiet hours before
+    // the claim is reached, and this test is about the claim.
+    let e = &daytime_number(305);
     telnyx(&h, "q-9", e, &ours, "question?").await;
     let acct = account_id(&h).await;
     let pid: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE phone_number = $1").bind(e).fetch_one(&h.state.db).await.unwrap();
@@ -1066,7 +1068,8 @@ async fn flows_can_wait_for_a_reply() {
 async fn inbox_replies_dont_count_for_smart_sending() {
     let mut h = signed!();
     let ours = setup(&mut h).await;
-    let them = "+15035551301";
+    // A number where it's daytime now, so the flow text isn't held for quiet hours.
+    let them = &daytime_number(1301);
     telnyx(&h, "ss-1", them, &ours, "is my order shipped?").await;
     let c = conversation_for(&mut h, them).await;
     h.ok("POST", &format!("/api/inbox/conversations/{}/reply", c["id"].as_str().unwrap()), Some(json!({"body": "Yes, today!", "confirm": true}))).await;
