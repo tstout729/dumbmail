@@ -129,6 +129,11 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
+    ("reviews_submitted", "review_id", "SELECT account_id FROM reviews WHERE id = $1"),
+    ("reviews_confirm", "review_id", "SELECT account_id FROM reviews WHERE id = $1"),
+    ("reviews_send", "intent_id", "SELECT account_id FROM review_sends WHERE id = $1"),
+    ("reviews_import", "import_id", "SELECT account_id FROM review_imports WHERE id = $1"),
+    ("reviews_rebuild", "account_id", "SELECT $1::uuid"),
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).
