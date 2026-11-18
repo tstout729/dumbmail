@@ -223,7 +223,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    pub const ALL: [Perm; 44] = [
+    pub const ALL: [Perm; 45] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
