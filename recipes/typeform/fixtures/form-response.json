@@ -1,0 +1,140 @@
+{
+  "description": "form_response with nothing mapped: Form Submitted with the form and response ids; hidden fields, the free-text answer, a typed Other choice and the payment's card details never reach an event or the stored payload",
+  "doc": "https://www.typeform.com/developers/webhooks/example-payload/ (example, trimmed to a few answers; personal data replaced)",
+  "expect": [
+    {
+      "email": "lane.example@example.com",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Form Submitted",
+      "profile": {
+        "email": "lane.example@example.com"
+      },
+      "properties": {
+        "form_id": "lT4Z3j",
+        "form_title": "Webhooks example",
+        "response_id": "a3a12ec67a1365927098a606107fac15"
+      },
+      "time": "2018-01-18T18:17:02Z",
+      "type": "track_event",
+      "unique_id": "typeform:lT4Z3j:a3a12ec67a1365927098a606107fac15"
+    }
+  ],
+  "input": {
+    "payload": {
+      "event_id": "LtWXD3crgy",
+      "event_type": "form_response",
+      "form_response": {
+        "answers": [
+          {
+            "field": {
+              "id": "DlXFaesGBpoF",
+              "ref": "readable_ref_long_text",
+              "type": "long_text"
+            },
+            "text": "My gate code is 7789, it's lovely here",
+            "type": "text"
+          },
+          {
+            "email": "lane.example@example.com",
+            "field": {
+              "id": "SMEUb7VJz92Q",
+              "ref": "readable_ref_email",
+              "type": "email"
+            },
+            "type": "email"
+          },
+          {
+            "choice": {
+              "id": "Cp4aKzvlPmVT",
+              "label": "Other",
+              "other": "OTHER-typed-by-respondent",
+              "ref": "other"
+            },
+            "field": {
+              "id": "k6TP9oLGgHjl",
+              "ref": "readable_ref_choice",
+              "type": "multiple_choice"
+            },
+            "type": "choice"
+          },
+          {
+            "boolean": true,
+            "field": {
+              "id": "gFFf3xAkJKsr",
+              "ref": "readable_ref_yes_no",
+              "type": "yes_no"
+            },
+            "type": "boolean"
+          },
+          {
+            "field": {
+              "id": "PAYfieldid01",
+              "ref": "readable_ref_payment",
+              "type": "payment"
+            },
+            "payment": {
+              "amount": "1.00",
+              "last4": "4242",
+              "name": "Card Holder Example",
+              "success": true
+            },
+            "type": "payment"
+          }
+        ],
+        "calculated": {
+          "score": 9
+        },
+        "definition": {
+          "fields": [
+            {
+              "id": "DlXFaesGBpoF",
+              "properties": {},
+              "ref": "readable_ref_long_text",
+              "title": "Thanks, {{answer_60906475}}! What's it like being a new user?",
+              "type": "long_text"
+            },
+            {
+              "id": "SMEUb7VJz92Q",
+              "properties": {},
+              "ref": "readable_ref_email",
+              "title": "What is your email address?",
+              "type": "email"
+            },
+            {
+              "id": "k6TP9oLGgHjl",
+              "properties": {},
+              "ref": "readable_ref_choice",
+              "title": "Which of these do you prefer?",
+              "type": "multiple_choice"
+            },
+            {
+              "id": "gFFf3xAkJKsr",
+              "properties": {},
+              "ref": "readable_ref_yes_no",
+              "title": "Can we send you news and offers by email?",
+              "type": "yes_no"
+            }
+          ],
+          "id": "lT4Z3j",
+          "title": "Webhooks example"
+        },
+        "form_id": "lT4Z3j",
+        "hidden": {
+          "user_id": "HIDDEN-abc123456"
+        },
+        "landed_at": "2018-01-18T18:07:02Z",
+        "submitted_at": "2018-01-18T18:17:02Z",
+        "token": "a3a12ec67a1365927098a606107fac15"
+      }
+    }
+  },
+  "sensitive": [
+    "last4",
+    "Card Holder Example",
+    "gate code is 7789",
+    "HIDDEN-abc123456",
+    "OTHER-typed-by-respondent"
+  ]
+}

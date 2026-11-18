@@ -1,0 +1,30 @@
+{
+  "description": "store/order/statusUpdated: fetch the order",
+  "doc": "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events (example payloads; store hash filled in)",
+  "expect": [
+    {
+      "type": "next_request",
+      "url": "/stores/abc123/v2/orders/218"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": 1561479335,
+      "data": {
+        "id": 218,
+        "status": {
+          "new_status_id": 11,
+          "previous_status_id": 7
+        },
+        "type": "order"
+      },
+      "hash": "7ee67cd1cf2ca60bc1aa9e5fe957d2de373be4ca",
+      "producer": "stores/abc123",
+      "scope": "store/order/statusUpdated",
+      "store_id": "1025646"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    }
+  }
+}

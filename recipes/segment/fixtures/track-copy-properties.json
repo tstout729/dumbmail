@@ -1,0 +1,53 @@
+{
+  "description": "an installer-listed property (settings.copy_properties) is copied too",
+  "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
+  "input": {
+    "payload": {
+      "version": 1,
+      "type": "track",
+      "userId": "019mr8mf4r",
+      "messageId": "ajs-track-0004",
+      "event": "Order Completed",
+      "properties": {
+        "order_id": "5031",
+        "revenue": "10",
+        "shippingMethod": "2-day"
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z"
+    },
+    "settings": {
+      "events": [
+        "Order Completed",
+        "Order Refunded",
+        "Order Cancelled",
+        "Checkout Started",
+        "Product Added",
+        "Product Viewed",
+        "Signed Up"
+      ],
+      "allow_client_sources": false,
+      "copy_properties": [
+        "shippingMethod"
+      ]
+    }
+  },
+  "expect": [
+    {
+      "metric": "Order Completed",
+      "profile": {
+        "if_missing": "retry",
+        "property": "segment_user_id",
+        "value": "019mr8mf4r"
+      },
+      "properties": {
+        "order_id": "5031",
+        "revenue": "10",
+        "shippingMethod": "2-day"
+      },
+      "time": "2012-12-02T00:30:08.276Z",
+      "type": "track_event",
+      "unique_id": "segment:ajs-track-0004",
+      "value": 10
+    }
+  ]
+}

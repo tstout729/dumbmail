@@ -58,7 +58,7 @@ pub fn can_manage(ctx: &Ctx) -> bool {
 
 /// The integration as this caller may see it.
 pub fn view_for(i: &model::Integration, state: &AppState, ctx: &Ctx) -> Value {
-    if can_manage(ctx) { i.view(state) } else { i.view_limited() }
+    if can_manage(ctx) { i.view(state) } else { i.view_limited(state) }
 }
 
 /// Audit-log a change to an integration (fixed fields only: never payloads or secret values).
@@ -209,17 +209,30 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     };
     // The signature is checked before anything is spent: a caller without the secret never uses up
     // the integration's allowance, and its failures are only logged while they are few.
-    let sig = integ.signature();
     let secret = integ.secret(&state).ok().flatten();
-    if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &bytes, Utc::now().timestamp()) {
-        if note_rejected(id) {
-            let msg = format!("signature check failed: {why}");
-            let scrub = Scrub::new(integ.secret_values(&state).await);
-            let _ = engine::store_delivery(&state, &integ, &scrub, NewDelivery::log("webhook", "error", Some(&msg))).await;
-            let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+    // The URL as the app was given it, for apps that sign it (Square).
+    let base_url = format!("{}/webhooks/in/{token}", state.cfg.public_url());
+    let signed_url = match parts.uri.query() {
+        Some(q) => format!("{base_url}?{q}"),
+        None => base_url,
+    };
+    // Signature settings that can't be read refuse everything; they never mean "no check".
+    let checked = integ
+        .signature()
+        .map_err(|e| format!("the integration's signature settings can't be read ({e}); fix them before webhooks are accepted"))
+        .and_then(|sig| signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &signed_url, &bytes, Utc::now().timestamp()).map(|_| sig));
+    let sig = match checked {
+        Ok(sig) => sig,
+        Err(why) => {
+            if note_rejected(id) {
+                let msg = format!("signature check failed: {why}");
+                let scrub = Scrub::new(integ.secret_values(&state).await);
+                let _ = engine::store_delivery(&state, &integ, &scrub, NewDelivery::log("webhook", "error", Some(&msg))).await;
+                let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
+            }
+            return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
         }
-        return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
-    }
+    };
     if !take_slot(id, integ.account_id) {
         return busy(&format!("more than {RATE_PER_MINUTE} webhooks a minute; retry later"));
     }
@@ -234,7 +247,7 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     let scrub = Scrub::new(integ.secret_values(&state).await);
     // A turned-off integration keeps only a log line: nothing of the payload is stored.
     let d = if integ.status == "enabled" {
-        NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status: "pending", error: None, replay_of: None, message_id, applied: None }
+        NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status: "pending", error: None, replay_of: None, message_id, applied: None, dedupe_minutes: integ.dedupe_minutes() }
     } else {
         NewDelivery { message_id, ..NewDelivery::log("webhook", "ignored", Some("the integration is turned off; the payload wasn't kept")) }
     };
@@ -251,7 +264,7 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
 
 pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     let rows = model::list(state, account_id).await?;
-    Ok(json!({"data": rows.iter().map(|i| i.summary()).collect::<Vec<_>>()}))
+    Ok(json!({"data": rows.iter().map(|i| i.summary(state)).collect::<Vec<_>>()}))
 }
 
 pub async fn create(state: &AppState, ctx: &Ctx, c: Changes) -> AppResult<Value> {
@@ -340,8 +353,8 @@ pub async fn test(state: &AppState, account_id: Uuid, id: Uuid, b: TestBody) -> 
             return Err(AppError::bad("the script is too long"));
         }
     }
-    if b.source.as_deref().is_some_and(|s| !matches!(s, "webhook" | "pull" | "test")) {
-        return Err(AppError::bad("source must be webhook, pull or test"));
+    if b.source.as_deref().is_some_and(|s| !matches!(s, "webhook" | "pull" | "fetch" | "test")) {
+        return Err(AppError::bad("source must be webhook, pull, fetch or test"));
     }
     let sample = if b.pull {
         TestSample::Pull

@@ -134,7 +134,13 @@ function Problems({ integration: i, onTab, canManage }: { integration: Integrati
       </Notice>,
     );
   }
-  if (canManage && !i.signature_ready) {
+  if (i.signature_error) {
+    items.push(
+      <Notice key="sigerr" tone="red" icon={<AlertTriangle />} title="The signature check's settings can't be read">
+        Every webhook is refused until they're saved again below. {i.signature_error}
+      </Notice>,
+    );
+  } else if (canManage && !i.signature_ready) {
     items.push(
       <Notice key="sig" tone="amber" icon={<AlertTriangle />} title="Add the signing secret">
         Webhooks are refused until the secret for the signature check is saved below.

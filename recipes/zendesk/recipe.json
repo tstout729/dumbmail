@@ -1,0 +1,45 @@
+{
+  "key": "zendesk",
+  "name": "Zendesk",
+  "category": "Support",
+  "description": "Zendesk tickets become events on the requester's profile: Ticket Created, Ticket Solved and Satisfaction Rated, with the ticket's subject and status only (never its conversation). Requesters are held back from marketing: a support ticket isn't consent.",
+  "metrics": [
+    "Ticket Created",
+    "Ticket Solved",
+    "Satisfaction Rated"
+  ],
+  "docs": [
+    "https://developer.zendesk.com/documentation/webhooks/verifying/",
+    "https://developer.zendesk.com/documentation/webhooks/creating-and-monitoring-webhooks/",
+    "https://support.zendesk.com/hc/en-us/articles/4408886858138-Zendesk-Support-placeholders-reference"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "X-Zendesk-Webhook-Signature",
+    "encoding": "base64",
+    "timestamp_header": "X-Zendesk-Webhook-Signature-Timestamp",
+    "timestamp_separator": "",
+    "timestamp_unit": "iso8601"
+  },
+  "signature_secret": {
+    "label": "Zendesk webhook signing secret",
+    "help": "Admin Center \u2192 Apps and integrations \u2192 Webhooks \u2192 your webhook \u2192 Reveal secret."
+  },
+  "credentials": [],
+  "settings": {},
+  "pull": null,
+  "redact": [
+    "**.comment",
+    "**.description",
+    "**.latest_comment"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Zendesk Admin Center \u2192 Apps and integrations \u2192 Webhooks \u2192 Create webhook, choose Trigger or automation, paste the webhook URL, method POST, format JSON, no authentication. Create it, then Reveal secret and save the secret as the integration's signing secret.",
+    "Create a trigger (Objects and rules \u2192 Business rules \u2192 Triggers) with the condition Ticket is Created and the action Notify active webhook \u2192 this webhook, with this JSON body: {\"event\": \"created\", \"ticket_id\": \"{{ticket.id}}\", \"subject\": \"{{ticket.title}}\", \"status\": \"{{ticket.status}}\", \"via\": \"{{ticket.via}}\", \"requester_email\": \"{{ticket.requester.email}}\", \"requester_name\": \"{{ticket.requester.name}}\", \"created_at\": \"{{ticket.created_at_with_timestamp}}\", \"updated_at\": \"{{ticket.updated_at_with_timestamp}}\"}",
+    "Create a second trigger with the condition Status is Solved (and Status changed), the same action and body, but \"event\": \"solved\".",
+    "If you use satisfaction ratings, create a third trigger with the condition Satisfaction changed, and the body with \"event\": \"satisfaction\" plus \"rating\": \"{{satisfaction.current_rating}}\".",
+    "Create a test ticket and check the delivery log. Requesters are held back from marketing; a ticket isn't consent."
+  ],
+  "flows": []
+}

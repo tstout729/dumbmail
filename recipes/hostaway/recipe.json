@@ -1,0 +1,135 @@
+{
+  "key": "hostaway",
+  "name": "Hostaway",
+  "category": "Vacation rentals",
+  "description": "Hostaway reservations become events on each guest's profile: Reservation Booked (once), Reservation Total (its value, once), Reservation Confirmed (each version, with the dates, listing, guests and whether it's paid in full), Reservation Cancelled and Inquiry Received. Read from Hostaway's API every 15 minutes. Guests are held back from marketing, and booking-site relay addresses are never sent marketing.",
+  "metrics": [
+    "Reservation Booked",
+    "Reservation Total",
+    {"name": "Reservation Confirmed", "purchase": true},
+    "Reservation Cancelled",
+    "Inquiry Received",
+    "Reservation Unconfirmed"
+  ],
+  "docs": [
+    "https://api.hostaway.com/documentation"
+  ],
+  "signature": null,
+  "signature_secret": null,
+  "credentials": [
+    {
+      "name": "account_id",
+      "label": "Hostaway account ID",
+      "help": "Hostaway \u2192 Settings \u2192 Hostaway API: the account ID shown next to your API keys."
+    },
+    {
+      "name": "api_key",
+      "label": "Hostaway API key (client secret)",
+      "help": "Hostaway \u2192 Settings \u2192 Hostaway API \u2192 Create. Shown once."
+    }
+  ],
+  "settings": {
+    "skip_owner_stays": true
+  },
+  "pull": {
+    "method": "GET",
+    "url": "https://api.hostaway.com/v1/reservations",
+    "query": {
+      "limit": 100,
+      "includePayments": 1
+    },
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://api.hostaway.com/v1/accessTokens",
+      "client_id": "{{secret.account_id}}",
+      "client_secret": "{{secret.api_key}}",
+      "scope": "general",
+      "max_tokens_per_day": 2
+    },
+    "interval_minutes": 15,
+    "max_pages": 10
+  },
+  "redact": [
+    "**.doorCode",
+    "**.doorCodeVendor",
+    "**.doorCodeInstruction",
+    "**.wifiUsername",
+    "**.wifiPassword",
+    "**.hostNote",
+    "**.guestNote",
+    "**.comment",
+    "**.guestAddress",
+    "**.guestZipCode",
+    "**.guestCity",
+    "**.guestPicture",
+    "**.guestExternalAccountId",
+    "**.stripeGuestId",
+    "**.paymentMethod",
+    "**.rentalAgreementFileUrl",
+    "**.customFieldValues",
+    "**.protectionProviders",
+    "**.guestAuthHash",
+    "**.guestPortalUrl"
+  ],
+  "setup": [
+    "Create the integration from this recipe.",
+    "In Hostaway, go to Settings \u2192 Hostaway API \u2192 Create, and copy the account ID and the API key. Save them as the credentials account_id and api_key. DumbMail asks Hostaway for an access token at most twice a day and reuses it until it expires.",
+    "Test the pull (Pull tab \u2192 Test pull) to see the newest reservations and exactly what would be written. After that it runs every 15 minutes.",
+    "To import past bookings, use Import history with a start date. Imported reservations are marked historical.",
+    "Guests are held back from marketing. The suggested pre-arrival flow is a service message about the guest's own stay, so it still reaches them. It only goes to bookings Hostaway reports as paid in full, and its email has placeholders, not access details. Never add door codes, lockbox codes or wifi passwords to it.",
+    "Review the draft pre-arrival flow, write the email in your own words, and turn it on."
+  ],
+  "flows": [
+    {
+      "name": "Hostaway: pre-arrival",
+      "description": "Two days before check-in at 10am, a short note about the stay. Only for confirmed bookings Hostaway reports as paid in full (a remaining balance of exactly zero; missing or conflicting payment details mean no send); skipped if the booking is cancelled, replaced or goes back to pending or awaiting payment. A service message. Contains no access details.",
+      "trigger": {
+        "type": "event_date",
+        "metric": "Reservation Confirmed",
+        "field": "check_in",
+        "offset_days": -2,
+        "hour": 10,
+        "key": "reservation_id",
+        "cancelled_by": [
+          "Reservation Cancelled",
+          "Reservation Unconfirmed"
+        ],
+        "filters": [
+          {
+            "field": "paid_in_full",
+            "op": "eq",
+            "value": true
+          }
+        ]
+      },
+      "definition": {
+        "entry": "p1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "p1",
+            "type": "email",
+            "name": "Pre-arrival",
+            "next": null,
+            "content": {
+              "subject": "See you soon, {{ first_name|default('there') }}",
+              "preheader": "Your stay starts {{ event.properties.check_in }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your stay is almost here"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>You check in on {{ event.properties.check_in }} and check out on {{ event.properties.check_out }}.</p><p>[Write what guests should know before they arrive: parking, check-in time, who to call. Send door codes and access details only through your secure check-in channel, never in this email.]</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

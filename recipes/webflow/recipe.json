@@ -1,0 +1,55 @@
+{
+  "key": "webflow",
+  "name": "Webflow forms",
+  "category": "Forms",
+  "description": "Webflow form submissions become Form Submitted events on the visitor's profile. A submission never subscribes anyone; a consent checkbox you map is recorded on the event, and only the fields you list are copied.",
+  "metrics": [
+    "Form Submitted"
+  ],
+  "docs": [
+    "https://developers.webflow.com/data/docs/working-with-webhooks",
+    "https://developers.webflow.com/data/reference/webhooks/events/form-submission",
+    "https://developers.webflow.com/data/reference/webhooks/create"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "x-webflow-signature",
+    "timestamp_header": "x-webflow-timestamp",
+    "timestamp_separator": ":",
+    "timestamp_unit": "milliseconds"
+  },
+  "signature_secret": {
+    "label": "Webflow webhook secret",
+    "help": "The secretKey Webflow returns when you create the webhook with a site token (or your OAuth app's client secret, for an app)."
+  },
+  "message_id": {
+    "field": "payload.id"
+  },
+  "credentials": [],
+  "settings": {
+    "email_field": "Email",
+    "consent_field": "",
+    "copy_fields": []
+  },
+  "pull": null,
+  "redact": [
+    "keep:triggerType",
+    "keep:payload.id",
+    "keep:payload.formId",
+    "keep:payload.name",
+    "keep:payload.siteId",
+    "keep:payload.submittedAt",
+    "keep:payload.data.{setting:email_field}",
+    "keep:payload.data.{setting:consent_field}",
+    "keep:payload.data.{setting:copy_fields}"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Webflow only signs webhooks created through its API. In Webflow, create a site token (Site settings \u2192 Apps & integrations \u2192 API access) with Forms read access, then: POST https://api.webflow.com/v2/sites/<site_id>/webhooks with {\"triggerType\": \"form_submission\", \"url\": \"<webhook URL>\"} and the header Authorization: Bearer <site token>.",
+    "Save the secretKey from Webflow's answer as the integration's signing secret.",
+    "In the integration's settings, set email_field to the name of the form's email field (if it isn't called Email), consent_field to the name of a marketing consent checkbox if the form has one, and copy_fields to the field names worth keeping on the event (for example [\"Interest\"]). Every other field is dropped before a submission is stored.",
+    "Submit the form on your published site and check the delivery log.",
+    "People this adds are held back from marketing. A form submission isn't an opt-in, so nobody is subscribed. To add people who ticked the consent box to your marketing, send them a confirmation (double opt-in) first."
+  ],
+  "flows": []
+}

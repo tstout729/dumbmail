@@ -1,0 +1,93 @@
+{
+  "description": "a newer awaiting-payment version with no guest email: still Reservation Unconfirmed, on the guest found by the reservation id",
+  "doc": "https://api.hostaway.com/documentation (Reservation object example and Retrieve a reservations list; personal data replaced; updatedOn as in its Sorting by updatedOn example)",
+  "expect": [
+    {
+      "metric": "Reservation Unconfirmed",
+      "profile": {
+        "property": "hostaway_reservation",
+        "value": "13"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": false,
+        "reservation_id": "13",
+        "status": "awaitingPayment"
+      },
+      "time": "2026-11-17T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:13:unconfirmed:2026-11-17T10:00:00.000Z"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "cursor": "2026-11-17T10:00:00.000Z",
+        "cursor_ids": [
+          "13"
+        ],
+        "pending": null,
+        "pending_ids": null,
+        "resume_after": null
+      }
+    }
+  ],
+  "input": {
+    "page": 1,
+    "payload": {
+      "result": [
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "HMP2KQ4B44",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 13,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": "+15125550111",
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "awaitingPayment",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 10:00:00"
+        }
+      ],
+      "status": "success"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-17T09:00:00.000Z"
+    }
+  }
+}

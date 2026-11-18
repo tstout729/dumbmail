@@ -1,0 +1,116 @@
+{
+  "key": "paddle",
+  "name": "Paddle",
+  "category": "Subscriptions",
+  "description": "Paddle Billing becomes events: Placed Order for each completed transaction, Refunded Order for each approved refund (its own amount), and Subscription Started and Cancelled. Customers who ticked Paddle Checkout's marketing box are subscribed to email; everyone else is held back from marketing.",
+  "metrics": [
+    {"name": "Placed Order", "purchase": true},
+    "Refunded Order",
+    "Subscription Started",
+    "Subscription Cancelled"
+  ],
+  "docs": [
+    "https://developer.paddle.com/webhooks/signature-verification",
+    "https://developer.paddle.com/webhooks/overview",
+    "https://developer.paddle.com/webhooks/transactions/transaction-completed",
+    "https://developer.paddle.com/webhooks/adjustments/adjustment-updated",
+    "https://developer.paddle.com/webhooks/subscriptions/subscription-created",
+    "https://developer.paddle.com/webhooks/subscriptions/subscription-canceled",
+    "https://developer.paddle.com/webhooks/customers/customer-created",
+    "https://developer.paddle.com/concepts/sell/supported-currencies"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "Paddle-Signature",
+    "format": "paddle"
+  },
+  "signature_secret": {
+    "label": "Paddle endpoint secret key",
+    "help": "Starts with pdl_ntfset_. Paddle \u2192 Developer tools \u2192 Notifications \u2192 your destination \u2192 Secret key."
+  },
+  "message_id": {
+    "field": "event_id"
+  },
+  "credentials": [],
+  "settings": {},
+  "pull": null,
+  "redact": [
+    "**.payments",
+    "**.method_details",
+    "**.card",
+    "**.address",
+    "**.business"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Paddle, go to Developer tools \u2192 Notifications \u2192 New destination. Choose Webhook, paste the webhook URL, and tick these events: transaction.completed, adjustment.created, adjustment.updated, subscription.created, subscription.activated, subscription.canceled, customer.created, customer.updated. Save.",
+    "Copy the destination's secret key (pdl_ntfset_\u2026) and save it as the integration's signing secret.",
+    "Send a test notification (or use Paddle's webhook simulator) and check the delivery log. A transaction that arrives before its customer is tried again a few minutes later.",
+    "Only customers who tick Paddle Checkout's marketing consent box are subscribed to email. Everyone else is held back from marketing.",
+    "Review the draft win-back flow and turn it on."
+  ],
+  "flows": [
+    {
+      "name": "Paddle: subscription win-back",
+      "description": "Three days after a subscription is cancelled, asks what went wrong and invites them back. Marketing: only reaches subscribed people.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Subscription Cancelled"
+      },
+      "definition": {
+        "entry": "w1",
+        "settings": {
+          "reentry": {
+            "after_days": 30
+          },
+          "exit_condition": {
+            "match": "all",
+            "conditions": [
+              {
+                "type": "event",
+                "metric": "Subscription Started",
+                "op": "at_least",
+                "count": 1,
+                "within_days": 3
+              }
+            ]
+          }
+        },
+        "nodes": [
+          {
+            "id": "w1",
+            "type": "delay",
+            "amount": 3,
+            "unit": "days",
+            "next": "w2"
+          },
+          {
+            "id": "w2",
+            "type": "email",
+            "name": "Come back",
+            "next": null,
+            "content": {
+              "subject": "We'd like you back, {{ first_name|default('friend') }}",
+              "preheader": "Tell us what we could do better",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your subscription has ended"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Thanks for subscribing. If something wasn't right, reply and tell us. We read every answer.</p>"
+                },
+                {
+                  "type": "button",
+                  "text": "Come back",
+                  "href": "{{ organization.website }}"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

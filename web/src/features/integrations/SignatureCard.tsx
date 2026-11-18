@@ -5,7 +5,7 @@ import { toast } from "../../lib/toast";
 import { useUpdateIntegration } from "./api";
 import type { Integration, Signature } from "./types";
 
-type Kind = "none" | "plain" | "stripe" | "svix" | "header" | "query";
+type Kind = "none" | "plain" | "stripe" | "svix" | "paddle" | "header" | "query";
 
 function kindOf(s: Signature): Kind {
   if (s.type === "none") return "none";
@@ -18,6 +18,7 @@ const kinds: { value: Kind; label: string; hint: string }[] = [
   { value: "plain", label: "HMAC signature in a header", hint: "An HMAC of the raw body, like GitHub's X-Hub-Signature-256 or Shopify's X-Shopify-Hmac-Sha256." },
   { value: "stripe", label: "Stripe or Calendly style (t=…,v1=…)", hint: "HMAC-SHA256 of timestamp.body, with a 5-minute tolerance." },
   { value: "svix", label: "Svix / Standard Webhooks (Guesty)", hint: "v1,<base64> signatures over id.timestamp.body, with a whsec_ secret." },
+  { value: "paddle", label: "Paddle style (ts=…;h1=…)", hint: "HMAC-SHA256 of timestamp:body, with a 5-minute tolerance." },
   { value: "header", label: "Shared secret in a header", hint: "The app sends the secret itself in a header." },
   { value: "query", label: "Shared secret in the URL", hint: "The app adds the secret as a query parameter." },
 ];
@@ -34,6 +35,11 @@ export function SignatureCard({ integration: i, secretHelp }: { integration: Int
   const [timestampHeader, setTimestampHeader] = useState(s.type === "hmac" ? (s.timestamp_header ?? "") : "");
   const [secret, setSecret] = useState("");
 
+  // Settings this form doesn't show (a recipe's tolerance, timestamp format or signed URL) are kept
+  // while the kind stays the same.
+  const kept = s.type === "hmac" && kindOf(s) === kind ? { tolerance_seconds: s.tolerance_seconds, secret_encoding: s.secret_encoding, timestamp_separator: s.timestamp_separator, timestamp_unit: s.timestamp_unit, sign_url: s.sign_url } : {};
+  const extras = Object.fromEntries(Object.entries(kept).filter(([, v]) => v !== undefined));
+
   const build = (): Signature => {
     switch (kind) {
       case "none":
@@ -43,13 +49,19 @@ export function SignatureCard({ integration: i, secretHelp }: { integration: Int
       case "query":
         return { type: "shared_secret", query: query.trim() };
       case "stripe":
-        return { type: "hmac", format: "stripe", header: header.trim() || "Stripe-Signature" };
+        return { ...extras, type: "hmac", format: "stripe", header: header.trim() || "Stripe-Signature" };
       case "svix":
-        return { type: "hmac", format: "svix", header: header.trim() || "svix-signature" };
+        return { ...extras, type: "hmac", format: "svix", header: header.trim() || "svix-signature" };
+      case "paddle":
+        return { ...extras, type: "hmac", format: "paddle", header: header.trim() || "Paddle-Signature" };
       case "plain": {
-        const sig: Signature = { type: "hmac", header: header.trim(), algorithm, encoding };
+        const sig: Signature = { ...extras, type: "hmac", header: header.trim(), algorithm, encoding };
         if (prefix.trim()) sig.prefix = prefix.trim();
         if (timestampHeader.trim()) sig.timestamp_header = timestampHeader.trim();
+        else {
+          delete sig.timestamp_separator;
+          delete sig.timestamp_unit;
+        }
         return sig;
       }
     }
@@ -82,7 +94,7 @@ export function SignatureCard({ integration: i, secretHelp }: { integration: Int
           </Field>
         ) : kind !== "none" ? (
           <Field label="Header" hint={kind === "stripe" ? "Stripe-Signature, or Calendly-Webhook-Signature" : kind === "svix" ? "svix-signature, or webhook-signature" : undefined}>
-            <Input value={header} onChange={(e) => setHeader(e.target.value)} placeholder={kind === "stripe" ? "Stripe-Signature" : kind === "svix" ? "svix-signature" : "X-Signature"} />
+            <Input value={header} onChange={(e) => setHeader(e.target.value)} placeholder={kind === "stripe" ? "Stripe-Signature" : kind === "svix" ? "svix-signature" : kind === "paddle" ? "Paddle-Signature" : "X-Signature"} />
           </Field>
         ) : null}
         {kind === "plain" ? (

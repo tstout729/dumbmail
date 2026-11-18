@@ -61,6 +61,113 @@ pub struct PullConfig {
     /// Pages one backfill run may fetch before it stops as "capped" (resume to continue). Default 5000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_max_pages: Option<u32>,
+    /// What a webhook's script may fetch (its `next_request`): without this, webhooks can't fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch: Option<FetchRules>,
+}
+
+/// The read-only lookups a webhook may ask for: always `GET`, on the pull's site and credentials,
+/// to one of `paths` (`{id}` stands for one path segment matching `id`, and `{{settings.KEY}}`
+/// placeholders are filled in), with only the `query` keys listed (values matching `id` too), and
+/// only the `context` keys listed carried to the run on the answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FetchRules {
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query: Vec<String>,
+    #[serde(default = "default_fetch_id")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// Every lookup stays under this path (it starts and ends with `/`, and may name settings,
+    /// like `/stores/{{settings.store_hash}}/`): each declared path must start with it, and a
+    /// lookup is refused unless its path, once rendered and normalised, does too. Default `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+fn default_fetch_id() -> String {
+    "^[0-9]{1,20}$".into()
+}
+
+impl FetchRules {
+    fn check(&self) -> AppResult<()> {
+        if self.paths.is_empty() || self.paths.len() > 20 || self.query.len() > 10 || self.context.len() > 10 {
+            return Err(AppError::bad("fetch takes 1 to 20 paths, up to 10 query keys and up to 10 context keys"));
+        }
+        let prefix = self.prefix.as_deref().unwrap_or("/");
+        if !prefix.starts_with('/') || !prefix.ends_with('/') || prefix.len() > 200 || prefix.contains(['?', '#', '%', '\\']) || prefix.contains("..") || prefix.contains("//") {
+            return Err(AppError::bad(format!("fetch prefix {prefix:?} must be a plain path that starts and ends with /")));
+        }
+        for p in &self.paths {
+            if !p.starts_with('/') || p.len() > 300 || p.contains('?') || p.contains('#') || p.contains("..") || p.contains("//") {
+                return Err(AppError::bad(format!("fetch path {p:?} must be a plain path starting with /")));
+            }
+            if !p.starts_with(prefix) {
+                return Err(AppError::bad(format!("fetch path {p:?} must be under the fetch prefix {prefix:?}")));
+            }
+        }
+        if self.id.len() > 100 || !self.id.starts_with('^') || !self.id.ends_with('$') || regex::Regex::new(&self.id).is_err() {
+            return Err(AppError::bad("fetch id must be an anchored pattern (^…$) of up to 100 characters"));
+        }
+        Ok(())
+    }
+
+    /// The lookup a script asked for, if these rules allow it: a `GET` of a declared path and
+    /// query, with the context cut down to the declared keys. Anything else is refused.
+    pub fn allow(&self, next: &NextRequest, vars: &Vars<'_>) -> Result<NextRequest, String> {
+        if next.method.as_deref().is_some_and(|m| !m.eq_ignore_ascii_case("GET")) || next.headers.is_some() || next.body.is_some() {
+            return Err("a webhook's fetch is a read-only lookup: GET, with only a path, query and context".into());
+        }
+        let url = next.url.as_deref().ok_or("a webhook's fetch needs a url (a path)")?;
+        let id = regex::Regex::new(&self.id).map_err(|_| "the fetch id pattern isn't valid".to_string())?;
+        let segs: Vec<&str> = url.split('/').collect();
+        if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().skip(1).any(|s| s.is_empty() || *s == "." || *s == "..") {
+            return Err(format!("fetch path {:?} isn't a plain path", url.chars().take(100).collect::<String>()));
+        }
+        // The prefix, rendered, must itself be a plain path, and the lookup must sit under it.
+        let prefix = vars.render_with(self.prefix.as_deref().unwrap_or("/"), true)?;
+        let pre: Vec<&str> = prefix.split('/').collect();
+        if !prefix.starts_with('/') || !prefix.ends_with('/') || prefix.contains(['%', '\\', '?', '#']) || pre[1..pre.len() - 1].iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+            return Err("the fetch prefix doesn't render to a plain path (check the integration's settings)".into());
+        }
+        if !url.starts_with(&prefix) {
+            return Err(format!("fetch path {:?} is outside {prefix:?}", url.chars().take(100).collect::<String>()));
+        }
+        let mut matched = false;
+        for t in &self.paths {
+            let rendered = vars.render_with(t, true)?;
+            let want: Vec<&str> = rendered.split('/').collect();
+            if want.len() == segs.len() && want.iter().zip(&segs).all(|(w, g)| if *w == "{id}" { id.is_match(g) } else { w == g }) {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Err(format!("fetch path {:?} isn't one the integration allows", url.chars().take(100).collect::<String>()));
+        }
+        let mut query = Map::new();
+        for (k, v) in next.query.iter().flatten() {
+            let text = plain(v).ok_or_else(|| format!("fetch query {k:?} must be text"))?;
+            if !self.query.iter().any(|q| q == k) || !text.split(',').all(|part| id.is_match(part)) {
+                return Err(format!("fetch query {k:?} isn't allowed (or its value isn't an id)"));
+            }
+            query.insert(k.clone(), Value::String(text));
+        }
+        let context = next.context.as_ref().and_then(Value::as_object).map(|c| {
+            Value::Object(c.iter().filter(|(k, _)| self.context.iter().any(|x| x == *k)).map(|(k, v)| (k.clone(), v.clone())).collect())
+        });
+        Ok(NextRequest { url: Some(url.to_string()), method: None, query: (!query.is_empty()).then_some(query), headers: None, body: None, context })
+    }
+}
+
+impl FetchRules {
+    /// Whether the request as built (its URL parsed and normalised) is still under the prefix.
+    pub fn within(&self, built: &str, vars: &Vars<'_>) -> bool {
+        let Ok(prefix) = vars.render_with(self.prefix.as_deref().unwrap_or("/"), true) else { return false };
+        url::Url::parse(built).is_ok_and(|u| u.path().starts_with(&prefix))
+    }
 }
 
 fn get() -> String {
@@ -182,6 +289,9 @@ impl PullConfig {
         }
         if serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) > 32 * 1024 {
             return Err(AppError::bad("pull settings are over 32 KB"));
+        }
+        if let Some(f) = &c.fetch {
+            f.check()?;
         }
         match &c.auth {
             Auth::None => {}
@@ -333,7 +443,7 @@ impl Vars<'_> {
         Ok(out)
     }
 
-    fn render_with(&self, s: &str, encode: bool) -> Result<String, String> {
+    pub(crate) fn render_with(&self, s: &str, encode: bool) -> Result<String, String> {
         let mut err = None;
         let out = PLACEHOLDER.replace_all(s, |c: &regex::Captures<'_>| {
             let expr = &c[1];
@@ -704,7 +814,7 @@ async fn read(res: reqwest::Response, place: &str) -> AppResult<Response> {
     if res.status().is_redirection() {
         return Err(AppError::bad(format!("{place} answered with a redirect (HTTP {status}); redirects aren't followed, so use the final address")));
     }
-    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining"];
+    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-rate-limit-time-reset-ms", "x-rate-limit-requests-left"];
     let headers: Map<String, Value> = res
         .headers()
         .iter()

@@ -1,0 +1,33 @@
+{
+  "description": "store/customer/created: fetch the customer",
+  "doc": "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events (example payloads; store hash filled in)",
+  "expect": [
+    {
+      "query": {
+        "id:in": "32"
+      },
+      "type": "next_request",
+      "url": "/stores/abc123/v3/customers"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": 1561479335,
+      "data": {
+        "channel_ids": [
+          1
+        ],
+        "id": 32,
+        "origin_channel_id": 1,
+        "type": "customer"
+      },
+      "hash": "8768ab15aa86c6d73c7e4c3efbaee072110ad1d2",
+      "producer": "stores/abc123",
+      "scope": "store/customer/created",
+      "store_id": "1025646"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    }
+  }
+}

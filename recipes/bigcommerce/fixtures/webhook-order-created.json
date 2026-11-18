@@ -1,0 +1,26 @@
+{
+  "description": "store/order/created: fetch the order it names",
+  "doc": "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events (example payloads; store hash filled in)",
+  "expect": [
+    {
+      "type": "next_request",
+      "url": "/stores/abc123/v2/orders/218"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": 1561479335,
+      "data": {
+        "id": 218,
+        "type": "order"
+      },
+      "hash": "dd70c0976e06b67aaf671e73f49dcb79230ebf9d",
+      "producer": "stores/abc123",
+      "scope": "store/order/created",
+      "store_id": "1025646"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    }
+  }
+}

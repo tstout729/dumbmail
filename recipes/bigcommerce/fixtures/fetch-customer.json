@@ -1,0 +1,62 @@
+{
+  "description": "the fetched customer: a held profile keyed by the BigCommerce customer id (the review and abandoned-cart flag isn't a marketing opt-in)",
+  "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/customers/v3/get-customers (response shape; values are fake)",
+  "expect": [
+    {
+      "email": "drew.example@example.com",
+      "first_name": "Drew",
+      "keys": {
+        "bigcommerce_customer": "32"
+      },
+      "last_name": "Example",
+      "phone_number": "+15125550166",
+      "type": "upsert_profile"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": [
+        {
+          "accepts_product_review_abandoned_cart_emails": true,
+          "address_count": 0,
+          "attribute_count": 0,
+          "authentication": {
+            "force_password_reset": false
+          },
+          "company": "",
+          "customer_group_id": 1,
+          "date_created": "2024-01-15T09:30:00Z",
+          "date_modified": "2024-01-15T09:30:00Z",
+          "email": "drew.example@example.com",
+          "first_name": "Drew",
+          "id": 32,
+          "last_name": "Example",
+          "notes": "",
+          "phone": "+15125550166",
+          "registration_ip_address": "198.51.100.44",
+          "tax_exempt_category": ""
+        }
+      ],
+      "meta": {
+        "pagination": {
+          "count": 1,
+          "current_page": 1,
+          "per_page": 50,
+          "total": 1,
+          "total_pages": 1
+        }
+      }
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://api.bigcommerce.com/stores/abc123/v3/customers?id%3Ain=32"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    },
+    "source": "fetch"
+  },
+  "sensitive": [
+    "198.51.100.44"
+  ]
+}

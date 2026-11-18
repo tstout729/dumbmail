@@ -1,0 +1,155 @@
+{
+  "description": "charge/upcoming (a queued charge, scheduled after today): Upcoming Charge; the browser IP in client_details is never stored",
+  "doc": "https://developer.rechargepayments.com/2021-11/charges (the charge object example; personal data replaced)",
+  "expect": [
+    {
+      "email": "jamie.example@example.com",
+      "keys": {
+        "recharge_customer": "43845860"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Upcoming Charge",
+      "profile": {
+        "email": "jamie.example@example.com"
+      },
+      "properties": {
+        "charge_id": 100714428,
+        "currency": "USD",
+        "items": [
+          {
+            "quantity": 1,
+            "sku": "MILK-1",
+            "subscription_id": 89559201,
+            "title": "Sumatra Coffee",
+            "variant_title": "Milk - a / b"
+          }
+        ],
+        "scheduled_at": "2018-12-12",
+        "status": "queued",
+        "total_price": 13.14,
+        "type": "recurring"
+      },
+      "time": "2018-11-14T09:45:44+00:00",
+      "type": "track_event",
+      "unique_id": "recharge:charge:100714428:upcoming:2018-12-12"
+    }
+  ],
+  "input": {
+    "now": "2018-12-05T18:00:00.000Z",
+    "payload": {
+      "charge": {
+        "address_id": 21317826,
+        "analytics_data": {
+          "utm_params": [
+            {
+              "utm_campaign": "spring_sale",
+              "utm_source": "newsletter"
+            }
+          ]
+        },
+        "billing_address": {
+          "address1": "1 Test Avenue",
+          "address2": null,
+          "city": "Los Angeles",
+          "company": null,
+          "country_code": "US",
+          "first_name": "Jamie",
+          "last_name": "Example",
+          "phone": "3105550123",
+          "province": "California",
+          "zip": "90404"
+        },
+        "client_details": {
+          "browser_ip": "198.51.100.23",
+          "user_agent": "safari webkit"
+        },
+        "created_at": "2018-11-14T09:45:44+00:00",
+        "currency": "USD",
+        "customer": {
+          "email": "jamie.example@example.com",
+          "external_customer_id": {
+            "ecommerce": "2879413682227"
+          },
+          "hash": "7e706455cbd13e40",
+          "id": 43845860
+        },
+        "discounts": [
+          {
+            "code": "10DOLLAROFF",
+            "id": 12345,
+            "value": 10,
+            "value_type": "fixed_amount"
+          }
+        ],
+        "error": null,
+        "error_type": null,
+        "external_order_id": {
+          "ecommerce": "2541635698739"
+        },
+        "external_transaction_id": {
+          "payment_processor": "ch_XXXXXXXXXXXXXXX"
+        },
+        "has_uncommitted_changes": false,
+        "id": 100714428,
+        "line_items": [
+          {
+            "external_product_id": {
+              "ecommerce": "4381728735283"
+            },
+            "external_variant_id": {
+              "ecommerce": "99999999999"
+            },
+            "grams": 4536,
+            "original_price": "12.00",
+            "properties": [],
+            "purchase_item_id": 89559201,
+            "purchase_item_type": "subscription",
+            "quantity": 1,
+            "sku": "MILK-1",
+            "tax_due": "1.14",
+            "taxable": true,
+            "taxable_amount": "12.00",
+            "title": "Sumatra Coffee",
+            "total_price": "13.14",
+            "unit_price": "12.00",
+            "variant_title": "Milk - a / b"
+          }
+        ],
+        "merged_at": null,
+        "note": "next order #1",
+        "order_attributes": [],
+        "original_scheduled_at": "2018-12-12",
+        "processor_name": "stripe",
+        "scheduled_at": "2018-12-12",
+        "shipping_lines": [
+          {
+            "code": "Standard Shipping",
+            "price": "0.00",
+            "title": "Standard Shipping"
+          }
+        ],
+        "status": "queued",
+        "subtotal_price": "12.00",
+        "tags": "Subscription",
+        "taxes_included": true,
+        "total_discounts": "0.00",
+        "total_duties": "0.00",
+        "total_line_items_price": "12.00",
+        "total_price": "13.14",
+        "total_refunds": null,
+        "total_tax": "1.14",
+        "total_weight_grams": 4536,
+        "type": "recurring",
+        "updated_at": "2018-11-14T09:45:44+00:00"
+      }
+    },
+    "query": {
+      "topic": "charge/upcoming"
+    }
+  },
+  "sensitive": [
+    "198.51.100.23"
+  ]
+}

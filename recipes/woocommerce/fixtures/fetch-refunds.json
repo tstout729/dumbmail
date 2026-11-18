@@ -1,0 +1,80 @@
+{
+  "description": "the fetched refund records: one Refunded Order per refund, with its own amount and date; the one recorded without a gateway refund carries gateway: false",
+  "doc": "https://woocommerce.github.io/woocommerce-rest-api-docs/#list-all-refunds (example response for an order's refunds; order ids aligned with the order fixture)",
+  "expect": [
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "email": "riley.example@example.com"
+      },
+      "properties": {
+        "currency": "USD",
+        "gateway": false,
+        "order_id": 727,
+        "order_number": "727",
+        "refund_id": 726
+      },
+      "time": "2017-03-21T20:07:11Z",
+      "type": "track_event",
+      "unique_id": "woocommerce:refund:726",
+      "value": 10
+    },
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "email": "riley.example@example.com"
+      },
+      "properties": {
+        "currency": "USD",
+        "gateway": true,
+        "order_id": 727,
+        "order_number": "727",
+        "reason": "Damaged",
+        "refund_id": 724
+      },
+      "time": "2017-03-21T19:55:37Z",
+      "type": "track_event",
+      "unique_id": "woocommerce:refund:724",
+      "value": 9
+    }
+  ],
+  "input": {
+    "context": {
+      "order": {
+        "currency": "USD",
+        "email": "riley.example@example.com",
+        "id": 727,
+        "number": "727"
+      }
+    },
+    "payload": [
+      {
+        "amount": "10.00",
+        "date_created": "2017-03-21T17:07:11",
+        "date_created_gmt": "2017-03-21T20:07:11",
+        "id": 726,
+        "line_items": [],
+        "meta_data": [],
+        "reason": "",
+        "refunded_by": 1,
+        "refunded_payment": false
+      },
+      {
+        "amount": "9.00",
+        "date_created": "2017-03-21T16:55:37",
+        "date_created_gmt": "2017-03-21T19:55:37",
+        "id": 724,
+        "line_items": [],
+        "meta_data": [],
+        "reason": "Damaged",
+        "refunded_by": 1,
+        "refunded_payment": true
+      }
+    ],
+    "request": {
+      "method": "GET",
+      "url": "https://shop.example.com/wp-json/wc/v3/orders/727/refunds"
+    },
+    "source": "fetch"
+  }
+}
