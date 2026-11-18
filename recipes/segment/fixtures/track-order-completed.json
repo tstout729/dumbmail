@@ -1,6 +1,33 @@
 {
   "description": "track Order Completed: found by the userId identify saved, valued at its revenue, recorded once by messageId; only spec properties are copied (not shippingMethod or a note)",
   "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
+  "input": {
+    "payload": {
+      "version": 1,
+      "type": "track",
+      "userId": "019mr8mf4r",
+      "messageId": "ajs-track-0001",
+      "event": "Order Completed",
+      "properties": {
+        "order_id": "50314b8e9bcf000000000000",
+        "revenue": "39.95",
+        "currency": "USD",
+        "shippingMethod": "2-day",
+        "gift_note": "NOTE-happy-birthday-Sam",
+        "products": [
+          {
+            "product_id": "507f1f77bcf86cd799439011",
+            "sku": "45790-32",
+            "name": "Monopoly",
+            "price": 19,
+            "quantity": 1,
+            "engraving": "ENGRAVE-Sam"
+          }
+        ]
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z"
+    }
+  },
   "expect": [
     {
       "metric": "Order Completed",
@@ -28,32 +55,5 @@
       "unique_id": "segment:ajs-track-0001",
       "value": 39.95
     }
-  ],
-  "input": {
-    "payload": {
-      "event": "Order Completed",
-      "messageId": "ajs-track-0001",
-      "properties": {
-        "currency": "USD",
-        "gift_note": "NOTE-happy-birthday-Sam",
-        "order_id": "50314b8e9bcf000000000000",
-        "products": [
-          {
-            "engraving": "ENGRAVE-Sam",
-            "name": "Monopoly",
-            "price": 19,
-            "product_id": "507f1f77bcf86cd799439011",
-            "quantity": 1,
-            "sku": "45790-32"
-          }
-        ],
-        "revenue": "39.95",
-        "shippingMethod": "2-day"
-      },
-      "timestamp": "2012-12-02T00:30:08.276Z",
-      "type": "track",
-      "userId": "019mr8mf4r",
-      "version": 1
-    }
-  }
+  ]
 }

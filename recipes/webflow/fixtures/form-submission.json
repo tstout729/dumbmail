@@ -1,6 +1,54 @@
 {
   "description": "form_submission with the default mapping: Form Submitted; the message the visitor typed and other unmapped fields are dropped before anything is stored",
-  "doc": "https://developers.webflow.com/data/reference/webhooks/events/form-submission (documented fields; the page shows no full example, so the values are made up)",
+  "doc": "https://developers.webflow.com/data/reference/all-events (the form_submission example, values made up)",
+  "input": {
+    "payload": {
+      "triggerType": "form_submission",
+      "payload": {
+        "name": "Contact Us",
+        "siteId": "65427cf400e02b306eaa049c",
+        "data": {
+          "Name": "Ari Example",
+          "Email": "ari.example@example.com",
+          "Message": "Call me on 503 555 0177 about the cabin",
+          "Interest": "Weekend stays",
+          "Newsletter": "true"
+        },
+        "schema": [
+          {
+            "fieldName": "Name",
+            "fieldType": "FormTextInput",
+            "fieldElementId": "f1"
+          },
+          {
+            "fieldName": "Email",
+            "fieldType": "FormTextInput",
+            "fieldElementId": "f2"
+          },
+          {
+            "fieldName": "Message",
+            "fieldType": "FormTextarea",
+            "fieldElementId": "f3"
+          },
+          {
+            "fieldName": "Interest",
+            "fieldType": "FormRadioInput",
+            "fieldElementId": "f4"
+          },
+          {
+            "fieldName": "Newsletter",
+            "fieldType": "FormCheckboxInput",
+            "fieldElementId": "f5"
+          }
+        ],
+        "submittedAt": "2026-11-17T18:00:00.000Z",
+        "id": "6543bbb2d34b0e1e8d6ad4a8",
+        "formId": "65429eadebe8a9f3a30f62d0",
+        "formElementId": "4e038d2c-6a1e-4953-7be9-a59a2b453177",
+        "localeId": null
+      }
+    }
+  },
   "expect": [
     {
       "email": "ari.example@example.com",
@@ -22,54 +70,6 @@
       "unique_id": "webflow:6543bbb2d34b0e1e8d6ad4a8"
     }
   ],
-  "input": {
-    "payload": {
-      "payload": {
-        "data": {
-          "Email": "ari.example@example.com",
-          "Interest": "Weekend stays",
-          "Message": "Call me on 503 555 0177 about the cabin",
-          "Name": "Ari Example",
-          "Newsletter": "true"
-        },
-        "formElementId": "4e038d2c-6a1e-4953-7be9-a59a2b453177",
-        "formId": "65429eadebe8a9f3a30f62d0",
-        "id": "6543bbb2d34b0e1e8d6ad4a8",
-        "localeId": null,
-        "name": "Contact Us",
-        "schema": [
-          {
-            "fieldElementId": "f1",
-            "fieldName": "Name",
-            "fieldType": "FormTextInput"
-          },
-          {
-            "fieldElementId": "f2",
-            "fieldName": "Email",
-            "fieldType": "FormTextInput"
-          },
-          {
-            "fieldElementId": "f3",
-            "fieldName": "Message",
-            "fieldType": "FormTextarea"
-          },
-          {
-            "fieldElementId": "f4",
-            "fieldName": "Interest",
-            "fieldType": "FormRadioInput"
-          },
-          {
-            "fieldElementId": "f5",
-            "fieldName": "Newsletter",
-            "fieldType": "FormCheckboxInput"
-          }
-        ],
-        "siteId": "65427cf400e02b306eaa049c",
-        "submittedAt": "2026-11-17T18:00:00.000Z"
-      },
-      "triggerType": "form_submission"
-    }
-  },
   "sensitive": [
     "503 555 0177",
     "Ari Example"

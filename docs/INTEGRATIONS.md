@@ -170,7 +170,18 @@ A note in the delivery log.
 {"type": "next_request", "url": "/stores/abc123/v2/orders/250", "context": {"refund_id": 12}}
 ```
 
-In a pull, fetch another page. In a webhook, fetch the record it names: many apps (BigCommerce, Acuity, Eventbrite) send only an id. This needs pull settings, which give the site, headers and credentials; the path and query come from the script, the pull's own query and body don't apply. The answer is stored as a delivery of its own (source `fetch`) and the script runs on it with `input.request`, `input.response` and `input.context` (whatever the webhook put in `context`, up to 16 KB), so it can tell what it fetched. That run may fetch once more (up to 3 fetches from one webhook), for example a refund, then its order. A fetch is queued in the same step that marks the webhook done, is stored once (a job that runs twice doesn't record it twice), and an answer that says "not yet" (404, 409, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes. A replay runs the current script again, which decides afresh what to fetch. `query` and `headers` merge into the previous request (`null` removes a query parameter); `url`, `method` and `body` replace it. A `url` may change only the path and query: the site (scheme, host, port) stays the pull's own, and it can't carry a user name or password. Values are used as they are (placeholders and secrets are not expanded), and the same headers as in the pull settings are refused, so a payload can't steer the request or its credentials elsewhere.
+In a pull, fetch another page. In a webhook, look up the record it names: many apps (BigCommerce, Acuity, Eventbrite) send only an id. A webhook's lookup is read-only and declared up front in the pull settings, which also give the site, headers and credentials:
+
+```json
+"fetch": {"paths": ["/stores/{{settings.store_hash}}/v2/orders/{id}"], "query": ["id:in"], "id": "^[0-9]{1,20}$", "context": ["refund"]}
+```
+
+- Always a `GET`. The script gives only `url` (a path), `query` and `context`; `method`, `headers` or `body` are refused.
+- The path must match one of `paths` exactly, where `{id}` is one path segment matching `id` (digits by default) and `{{settings.KEY}}` is filled in; query keys must be listed in `query`, with values that match `id`.
+- Only the `context` keys listed are kept; the context is put through the redact list's removals, sealed (it isn't shown in the delivery's request record), counted in the payload budget, and handed to the run on the answer as `input.context` (up to 16 KB).
+- The lookup is reserved in the same step that marks the webhook done: a delivery row (source `fetch`) that counts against the limits on work waiting to run, unique on what's fetched while it's outstanding, so a second webhook for the same record reuses it. Only the job holding it makes the request, and only once the payload budget has room for the answer.
+- An answer that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes, or after the wait the app asked for (`Retry-After`, or BigCommerce's `X-Rate-Limit-Time-Reset-Ms`, up to two hours).
+- The answer is kept on that row (redacted) and the script runs on it with `input.request`, `input.response` and `input.context`. That run may look up once more (up to 3 lookups from one webhook), for example a refund, then its order. A replay runs the current script again, which decides afresh what to look up.
 
 ## Signatures
 
@@ -195,7 +206,7 @@ Other options for `hmac`: `secret_encoding: "base64"` when the secret is base64 
 
 The signature is checked before anything else, so requests without the secret never use up the integration's allowance. Rejected requests are logged only while they're few (30 a minute per integration); the rest are refused without a log line.
 
-**Resends.** Most apps retry a webhook with the same message id. Set `message_id` to where it is, `{"header": "svix-id"}` or `{"field": "id"}` (dots reach nested keys), and a second delivery with the same id is answered 200 with `"duplicate": true` and not run again.
+**Resends.** Most apps retry a webhook with the same message id. Set `message_id` to where it is, `{"header": "svix-id"}` or `{"field": "id"}` (dots reach nested keys), and a second delivery with the same id is answered 200 with `"duplicate": true` and not run again. Add `"within_minutes": 10` when the id is a hash of the content that a later, real change can repeat (BigCommerce's callback `hash`): a copy within that window is a resend, a later one is new.
 
 ## Pulls
 
@@ -300,7 +311,7 @@ Every recipe below was checked against the vendor's documentation on 2026-11-17 
 ### Commerce and subscriptions
 
 - **woocommerce**: order and customer webhooks (`X-WC-Webhook-Signature`, base64 HMAC) → Placed Order once it's paid, Fulfilled Order, Cancelled Order (paid orders only), Refunded Order (once per refund id, its own amount). Pending, on-hold, failed and free orders aren't orders. Past orders import with a REST API key once the Pull tab has the store's address. Setup: four webhooks (Order created, Order updated, Customer created, Customer updated) under WooCommerce → Settings → Advanced → Webhooks, with one secret.
-- **bigcommerce**: BigCommerce webhooks carry only an id, so each one fetches the order, refund or customer from the store's API (see `next_request`). Placed Order once paid, Fulfilled Order, Cancelled Order, Refunded Order (once per refund, in the order's currency, unless every payment in it was declined). The checkout's email opt-in box (`is_email_opt_in`) subscribes the buyer. Setup: a store-level API account (read-only Orders, Order transactions, Customers), `store_hash` in the settings, and one webhook per scope created with the API, carrying a secret `X-Webhook-Token` header.
+- **bigcommerce**: BigCommerce webhooks carry only an id, so each one fetches the order, refund or customer from the store's API (see `next_request`). Placed Order once paid, Fulfilled Order, Cancelled Order, Refunded Order (once per refund, in the order's currency, unless every payment in it was declined). The checkout's email box (`is_email_opt_in`) subscribes the buyer only when the installer sets `checkout_opt_in_is_marketing`, confirming it's an unticked marketing opt-in. Setup: a store-level API account (read-only Orders, Order transactions, Customers), `store_hash` in the settings, and one webhook per scope created with the API, carrying a secret `X-Webhook-Token` header.
 - **recharge**: Subscription Started, Reactivated, Cancelled and Skipped, Upcoming Charge, Charge Paid, Charge Failed. Recharge's body doesn't say which topic sent it, so each webhook is created with `?topic=<topic>` on the URL, and the topic must fit the signed body. Subscriptions wait for their customer. Draft upcoming-charge reminder (service message).
 - **square**: Placed Order for completed payments, Refunded Order for completed refunds (found through the payment), customers as profiles; Square's "unsubscribed from marketing emails" suppresses the address. Square signs the webhook URL too, so paste it exactly.
 - **paddle** (Paddle Billing): Placed Order for completed transactions, Refunded Order for approved refunds, Subscription Started and Cancelled; customers who tick Paddle Checkout's marketing box (`marketing_consent`) are subscribed. Draft win-back (marketing). Picked over Chargebee, whose webhooks use basic auth instead of a signature.
@@ -311,10 +322,15 @@ Every recipe below was checked against the vendor's documentation on 2026-11-17 
 
 ### Forms, support, shipping and data
 
-- **typeform** and **webflow**: Form Submitted on the respondent's profile. A form submission never subscribes anyone and never renames an existing profile (anyone can type an address into a form); a consent question or checkbox you map in the settings is recorded on the event as `marketing_consent`. Typeform copies choice, yes/no, number and date answers (not free text); Webflow copies only the fields you list. Webflow signs only webhooks created through its API, so the setup creates it that way.
+- **typeform** and **webflow**: Form Submitted on the respondent's profile. A form submission never subscribes anyone and never renames an existing profile (anyone can type an address into a form); a consent question or checkbox you map in the settings is recorded on the event as `marketing_consent`. Only the fields you map (email, consent, `copy_fields`) and the form and submission ids are stored; everything else is dropped first. Webflow signs only webhooks created through its API, so the setup creates it that way.
 - **zendesk**: Ticket Created, Ticket Solved and Satisfaction Rated from triggers that post a JSON body the setup gives (Zendesk placeholders). Only the subject and status are kept, never the conversation, and requesters' names aren't taken.
 - **aftership**: Shipment In Transit, Out For Delivery, Delivered and Shipment Exception, once per shipment and status, for the shipment's customer (not the sender). Draft out-for-delivery email (service message).
 - **segment**: identify calls (with `traits.email`) become profiles and keep the Segment userId as a key; track calls become events for the names in `settings.events` (Segment's ecommerce events by default), found by that userId. Calls from Segment's browser and mobile libraries are refused unless `allow_client_sources` is on, because a browser source's write key is public.
+
+
+### Not yet
+
+Cloudbeds, Acuity Scheduling, Eventbrite, Jotform, Gorgias and ShipStation have no recipe yet. Acuity, Eventbrite and ShipStation send thin webhooks that a recipe can turn into lookups with `next_request`; until then, build one with the steps at the top of this page.
 
 ## Worked example: "connect my Guesty"
 
