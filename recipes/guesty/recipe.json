@@ -6,7 +6,7 @@
   "metrics": [
     "Reservation Booked",
     "Reservation Total",
-    "Reservation Confirmed",
+    { "name": "Reservation Confirmed", "purchase": true },
     "Reservation Cancelled",
     "Reservation Updated",
     "Inquiry Received"

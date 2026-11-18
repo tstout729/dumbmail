@@ -86,6 +86,7 @@ impl Role {
                         | TransactionalSend
                         | ReportsManage
                         | CatalogWrite
+                        | ReviewsManage
                         | ContentRead
                         | ContentWrite
                         | FormsWrite
@@ -180,6 +181,8 @@ pub enum Perm {
     CatalogWrite,
     /// Delete products and product feeds.
     CatalogDelete,
+    /// Moderate and reply to product reviews and change review settings. Managers and up.
+    ReviewsManage,
     AccountRead,
     SettingsWrite,
     /// Sending domains, link domain, phone numbers and SMS providers.
@@ -226,7 +229,7 @@ pub enum Perm {
 }
 
 impl Perm {
-    pub const ALL: [Perm; 46] = [
+    pub const ALL: [Perm; 47] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -253,6 +256,7 @@ impl Perm {
         Perm::ReportsManage,
         Perm::CatalogWrite,
         Perm::CatalogDelete,
+        Perm::ReviewsManage,
         Perm::AccountRead,
         Perm::SettingsWrite,
         Perm::Domains,
@@ -305,6 +309,7 @@ impl Perm {
             ReportsManage => "reports.manage",
             CatalogWrite => "catalog.write",
             CatalogDelete => "catalog.delete",
+            ReviewsManage => "reviews.manage",
             AccountRead => "account.read",
             SettingsWrite => "settings.write",
             Domains => "domains.manage",
@@ -339,7 +344,7 @@ impl Perm {
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),
-            ContentWrite | FormsWrite | CatalogWrite | CatalogDelete => (Area::Content, true),
+            ContentWrite | FormsWrite | CatalogWrite | CatalogDelete | ReviewsManage => (Area::Content, true),
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
             AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead | IntegrationsRead => (Area::Account, false),
