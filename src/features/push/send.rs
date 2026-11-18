@@ -508,7 +508,7 @@ pub async fn retry(state: &AppState, delivery_id: Uuid) -> anyhow::Result<()> {
     let claimed: Option<(Uuid, Uuid, String, Value)> = sqlx::query_as(
         "UPDATE push_deliveries pd SET status = 'sending'
          FROM messages m
-         WHERE pd.id = $1 AND pd.status = 'retry' AND pd.next_attempt_at <= now() + interval '5 seconds' AND m.id = pd.message_id
+         WHERE pd.id = $1 AND pd.status = 'retry' AND m.id = pd.message_id
            AND (m.campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = m.campaign_id AND c.status IN ('sending', 'testing', 'sent')))
          RETURNING pd.account_id, pd.message_id, pd.kind, pd.payload",
     )
@@ -517,7 +517,7 @@ pub async fn retry(state: &AppState, delivery_id: Uuid) -> anyhow::Result<()> {
     .await?;
     let Some((account_id, message_id, kind, payload)) = claimed else {
         // Cancelled meanwhile (or already handled): it won't go.
-        let skipped: Option<(Uuid, Uuid)> = sqlx::query_as("UPDATE push_deliveries SET status = 'skipped', error = 'campaign stopped', payload = NULL WHERE id = $1 AND status = 'retry' AND next_attempt_at <= now() + interval '5 seconds' RETURNING account_id, message_id")
+        let skipped: Option<(Uuid, Uuid)> = sqlx::query_as("UPDATE push_deliveries SET status = 'skipped', error = 'campaign stopped', payload = NULL WHERE id = $1 AND status = 'retry' RETURNING account_id, message_id")
             .bind(delivery_id)
             .fetch_optional(&state.db)
             .await?;
@@ -548,6 +548,14 @@ pub async fn sweep(state: &AppState) -> anyhow::Result<()> {
     )
     .fetch_all(&state.db)
     .await?;
+    // A retry whose job was lost (its time long past) is given up the same way.
+    let lost: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "UPDATE push_deliveries SET status = 'failed', error = 'retry never ran', payload = NULL
+         WHERE status = 'retry' AND next_attempt_at < now() - interval '1 hour' RETURNING account_id, message_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let stuck: Vec<(Uuid, Uuid)> = stuck.into_iter().chain(lost).collect();
     let mut seen = std::collections::HashSet::new();
     for (account_id, message_id) in stuck {
         if seen.insert(message_id) {
@@ -612,7 +620,7 @@ fn test_spec<'a>(account: &'a Account, profile: &'a Profile, content: &'a Value,
 pub async fn check_test_rate(state: &AppState, account_id: Uuid) -> AppResult<()> {
     let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'").bind(account_id).fetch_one(&state.db).await?;
     if recent >= 50 {
-        return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
+        return Err(AppError::Busy("test sends are limited to 50 an hour".into()));
     }
     Ok(())
 }

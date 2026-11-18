@@ -119,7 +119,7 @@ async fn take_registration(state: &AppState, account_id: Uuid, headers: &HeaderM
     .fetch_optional(&state.db)
     .await?;
     if ok.is_none() {
-        return Err(AppError::LimitReached("too many push registrations from here; try again later".into()));
+        return Err(AppError::Busy("too many push registrations from here; try again later".into()));
     }
     Ok(())
 }
@@ -166,7 +166,7 @@ async fn save_device(state: &AppState, account_id: Uuid, kind: &str, address: &s
     if profile_id.is_none() {
         let unlinked: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND profile_id IS NULL AND test_user_id IS NULL").bind(account_id).fetch_one(&mut *tx).await?;
         if unlinked >= MAX_UNLINKED {
-            return Err(AppError::LimitReached("this account has too many unlinked push devices".into()));
+            return Err(AppError::Busy("this account has too many unlinked push devices; they are removed after 180 days unused".into()));
         }
     }
     let (id, linked): (Uuid, Option<Uuid>) = sqlx::query_as(
