@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { Archive, ArchiveRestore, BellRing, CalendarDays, Copy, Mail, MessageSquare, MoreHorizontal, Plus, Search, Tag, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, BellRing, CalendarDays, Copy, Mail, MessageCircle, MessageSquare, MoreHorizontal, Plus, Search, Tag, Trash2 } from "lucide-react";
 import type { CampaignStatus, Channel } from "../../api";
 import { useCreateCampaign, useDeleteCampaign, useDuplicateCampaign, useSession } from "../../api";
 import { starterEmail } from "../../components/email/blocks";
@@ -45,6 +45,7 @@ const PAGE = 50;
 
 export function ChannelIcon({ channel }: { channel: Channel }) {
   if (channel === "push") return <BellRing className="size-4 shrink-0 text-zinc-400" aria-label="Push" />;
+  if (channel === "whatsapp") return <MessageCircle className="size-4 shrink-0 text-zinc-400" aria-label="WhatsApp" />;
   return channel === "email" ? (
     <Mail className="size-4 shrink-0 text-zinc-400" aria-label="Email" />
   ) : (
@@ -407,7 +408,8 @@ function CreateCampaignDialog({ onClose }: { onClose: () => void }) {
         name,
         channel,
         audience: { include: [], exclude: [] },
-        content: channel === "email" ? starterEmail(account.brand_color) : channel === "push" ? { title: "", body: "" } : { body: "" },
+        content:
+          channel === "email" ? starterEmail(account.brand_color) : channel === "push" ? { title: "", body: "" } : channel === "whatsapp" ? { template_id: null, body: {} } : { body: "" },
       },
       { onSuccess: (c) => navigate(`/campaigns/${c.id}`) },
     );
@@ -418,12 +420,13 @@ function CreateCampaignDialog({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Create campaign" onClose={onClose} size="md">
       <form onSubmit={onSubmit} className="space-y-4">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {(
             [
               ["email", Mail, "Email", "Newsletters, promos, launches"],
               ["sms", MessageSquare, "SMS", "Short, urgent, high-intent"],
               ["push", BellRing, "Push", "Browser and app notifications"],
+              ["whatsapp", MessageCircle, "WhatsApp", "Approved templates to people who opted in"],
             ] as const
           ).map(([value, Icon, label, detail]) => (
             <button

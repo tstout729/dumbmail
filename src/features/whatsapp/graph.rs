@@ -92,6 +92,14 @@ impl GraphError {
         if self.unclear {
             return Class::Unclear;
         }
+        // No code: no readable error object (code 0 from Meta itself is an auth problem, sent with a 401).
+        if self.code == 0 {
+            return match self.status {
+                401 | 403 => Class::Auth,
+                0 | 500.. => Class::Transient,
+                _ => Class::Refused,
+            };
+        }
         match self.code {
             131026 => Class::NotOnWhatsApp,
             131050 => Class::MarketingOptOut,
@@ -100,7 +108,7 @@ impl GraphError {
             132001 => Class::TemplateMissing,
             131047 => Class::WindowClosed,
             131049 => Class::Ecosystem,
-            0 | 3 | 10 | 190 | 131005 => Class::Auth,
+            3 | 10 | 190 | 131005 => Class::Auth,
             200..=299 => Class::Auth,
             131048 | 368 | 131031 | 130497 | 131042 => Class::Restricted,
             1 | 2 | 131000 | 131016 | 133004 | 131057 => Class::Transient,

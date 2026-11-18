@@ -41,6 +41,8 @@ export function newNode(type: FlowNodeType, brandColor?: string, firstListId?: s
       return { id, type, name: "SMS", content: { body: "" }, next: null };
     case "push":
       return { id, type, name: "Push", content: { title: "", body: "" }, next: null };
+    case "whatsapp":
+      return { id, type, name: "WhatsApp", content: { template_id: null, body: {} }, next: null };
     case "condition":
       return { id, type, condition: { match: "all", conditions: [] }, yes: null, no: null };
     case "random_split":
@@ -113,6 +115,7 @@ export const nodeLabels: Record<FlowNodeType, string> = {
   email: "Email",
   sms: "SMS",
   push: "Push notification",
+  whatsapp: "WhatsApp",
   condition: "Conditional split",
   random_split: "Random split",
   wait_for_reply: "Wait for a reply",
@@ -124,7 +127,7 @@ export const nodeLabels: Record<FlowNodeType, string> = {
   review_request: "Ask for a review",
 };
 
-export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "push", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook", "notify", "review_request"];
+export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "push", "whatsapp", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook", "notify", "review_request"];
 
 export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Segment[] = []): string {
   switch (t.type) {
