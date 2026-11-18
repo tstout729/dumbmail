@@ -194,8 +194,8 @@ fn user_content(r: &Request<'_>) -> String {
 /// case, without a trailing dot, and without the sentence's punctuation after it.
 fn url_key(u: &str) -> String {
     let u = u.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
-    // Full-width dots are dots, and a browser drops joiners from a host.
-    let u = u.replace(['．', '｡'], ".").replace(['\u{200C}', '\u{200D}'], "");
+    // Full-width dots are dots. Joiners stay: one the original doesn't have changes the address.
+    let u = u.replace(['．', '｡'], ".");
     let u = u.as_str();
     let (scheme, rest) = match u.find("://") {
         Some(i) => (u[..i + 3].to_ascii_lowercase(), &u[i + 3..]),
@@ -217,15 +217,29 @@ pub fn literals(text: &str) -> Vec<String> {
     static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
     // Hosts in any script, with the dots a browser reads as dots in a host (but not the ideographic
     // full stop, which is ordinary punctuation in Chinese and Japanese text).
-    // Labels take combining marks and the joiners a host may carry (a browser drops the joiners).
-    static BARE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bwww[.．｡][^\s<>"']+|(?:[\p{L}\p{M}\p{N}\u{200C}\u{200D}-]+[.．｡])+\p{L}[\p{L}\p{M}]{1,62}(?:/[^\s<>"']*)?"#).unwrap());
+    // A host is taken whole: labels of any character a host may hold (letters and digits in any
+    // script, marks, joiners, `-` and `_`), starting at the text's start or after a character
+    // that can't be in one, the last label two characters or more with a letter in it.
+    static BARE: Lazy<Regex> = Lazy::new(|| {
+        let c = r"[\p{L}\p{M}\p{N}_\u{200C}\u{200D}-]";
+        Regex::new(&format!(r#"(?i)(?:^|[^\p{{L}}\p{{M}}\p{{N}}_\u{{200C}}\u{{200D}}.．｡-])(?P<h>www[.．｡][^\s<>"']+|(?:{c}+[.．｡])+(?:\p{{L}}{c}+|{c}+\p{{L}}{c}*)(?:/[^\s<>"']*)?)"#)).unwrap()
+    });
     static NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:(?:[.,:/\-'’]|\s)\d+)*").unwrap());
     let mut out: Vec<String> = SCHEMED.find_iter(text).map(|m| url_key(m.as_str())).collect();
     let rest = SCHEMED.replace_all(text, " ").into_owned();
     out.extend(EMAIL.find_iter(&rest).map(|m| m.as_str().to_lowercase()));
     let rest = EMAIL.replace_all(&rest, " ").into_owned();
-    out.extend(BARE.find_iter(&rest).map(|m| url_key(m.as_str())));
-    let rest = BARE.replace_all(&rest, " ").into_owned();
+    let mut left = String::new();
+    let mut at = 0;
+    for c in BARE.captures_iter(&rest) {
+        let m = c.name("h").expect("host");
+        out.push(url_key(m.as_str()));
+        left.push_str(&rest[at..m.start()]);
+        left.push(' ');
+        at = m.end();
+    }
+    left.push_str(&rest[at..]);
+    let rest = left;
     out.extend(NUMBER.find_iter(&rest).map(|m| m.as_str().chars().map(|c| if c.is_whitespace() { ' ' } else if c == '’' { '\'' } else { c }).collect()));
     out.sort();
     out
@@ -410,7 +424,11 @@ mod tests {
         // Marks and joiners don't split a host into a shorter one that matches the original's.
         assert!(!same_literals("Visit il.test", "Besuche ev\u{200D}il.test"));
         assert!(!same_literals("Visit vil.test", "Besuche e\u{0301}vil.test"));
-        assert!(same_literals("Visit evil.test", "Besuche ev\u{200D}il.test"), "the same host as a browser reads it");
+        assert!(!same_literals("Visit evil.test", "Besuche ev\u{200D}il.test"), "a joiner the original doesn't have counts");
+        // A host is read whole, `_` and all.
+        assert!(!same_literals("Visit il.test", "Besuche ev_il.test"));
+        assert!(!same_literals("Visit il.test", "Besuche il.test_x"));
+        assert!(same_literals("Visit acme.test and shop.acme.test/sale.", "Besuche acme.test und shop.acme.test/sale"));
     }
 
     #[test]
