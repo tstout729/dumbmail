@@ -187,6 +187,15 @@ mod tests {
         let mut crc_in = b"IHDR".to_vec();
         crc_in.extend_from_slice(&ihdr);
         out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
+        // A tiny data chunk, so a reader gets as far as the size without real pixels behind it.
+        for (kind, data) in [(&b"IDAT"[..], &[0x78u8, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01][..]), (&b"IEND"[..], &[][..])] {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let mut c = kind.to_vec();
+            c.extend_from_slice(data);
+            out.extend_from_slice(&crc32(&c).to_be_bytes());
+        }
         out
     }
 
