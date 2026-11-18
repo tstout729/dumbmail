@@ -211,13 +211,43 @@ pub struct Registration<'a> {
     pub app_version: Option<&'a str>,
     /// iOS: the APNs environment the app says it was built for (kept when a registration doesn't say).
     pub apns_environment: Option<&'a str>,
+    /// Proof of holding an existing device: for web, its current auth secret (the subscription's
+    /// own keys count too); for apps, the install secret it was given.
+    pub proof: Option<&'a str>,
+    /// Apps moving to a new token (`previous_token`, proven): the install secret's hash carried over.
+    pub carried_secret_hash: Option<&'a str>,
+}
+
+/// A saved registration.
+pub struct Saved {
+    pub id: Uuid,
+    /// Linked to a known person (not an anonymous profile).
+    pub linked: bool,
+    /// Apps: a new install secret for the app to keep (at its first registration, or when a device
+    /// registered before install secrets adopts one). Shown only this once.
+    pub install_secret: Option<String>,
+}
+
+/// Why a change to an existing device is refused: the caller didn't show it holds the device.
+fn not_holder(kind: &str) -> AppError {
+    AppError::Conflict(if kind == "web" {
+        "this browser is already registered; changing its keys or owner needs its current auth secret".into()
+    } else {
+        "this device is already registered; changing it needs the install_secret it was given at its first registration".into()
+    })
 }
 
 /// Save a registration in one transaction, taking its locks in the push module's one order: the
 /// people (the device's current owner and its new one), then the device, then the account's push
 /// settings row (so the caps hold under concurrent registrations). Every registration, a refresh with
-/// the same keys too, bumps the version, so a provider's answer to an earlier one can't touch it. Returns (device id, linked to a known person).
-pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<(Uuid, bool)> {
+/// the same keys too, bumps the version, so a provider's answer to an earlier one can't touch it.
+///
+/// Changing an existing device needs proof of holding it, checked under its lock (constant time):
+/// a browser shows its current auth secret (or comes through the `previous` flow, [`Owner::Carry`]);
+/// an app shows its install secret, except that a valid grant for the owner it already has may
+/// refresh it. A device registered before install secrets adopts one on its first call that keeps
+/// its owner; until then its owner can't change. Otherwise 409 and nothing changes.
+pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Saved> {
     // The owner read before its lock can change under us; then start over (rarely more than once).
     for _ in 0..5 {
         if let Some(out) = try_save_device(state, account_id, r, owner).await? {
@@ -227,7 +257,7 @@ pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     Err(AppError::Busy("this device is being registered elsewhere at the same time; try again".into()))
 }
 
-async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<(Uuid, bool)>> {
+async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Saved>> {
     let mut tx = state.db.begin().await?;
     let seen: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as("SELECT profile_id, test_user_id, anonymous FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3")
         .bind(account_id)
@@ -258,8 +288,10 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         sqlx::query("INSERT INTO profiles (id, account_id, properties) VALUES ($1, $2, '{\"anonymous_push_subscriber\": true}')").bind(profile_id).bind(account_id).execute(&mut *tx).await?;
     }
     // 2. The device, and it must still be as read.
-    type Existing = (Uuid, Option<Uuid>, Option<String>, Option<String>, Option<Uuid>, bool);
-    let existing: Option<Existing> = sqlx::query_as("SELECT id, profile_id, p256dh, auth_secret, test_user_id, anonymous FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE")
+    type Existing = (Uuid, Option<Uuid>, Option<String>, Option<String>, Option<Uuid>, bool, Option<String>);
+    let existing: Option<Existing> = sqlx::query_as(
+        "SELECT id, profile_id, p256dh, auth_secret, test_user_id, anonymous, install_secret_hash FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE",
+    )
         .bind(account_id)
         .bind(r.kind)
         .bind(r.address)
@@ -268,6 +300,38 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     if existing.as_ref().map(|e| (e.1, e.4, e.5)) != seen {
         return Ok(None);
     }
+    // Proof of holding it, before anything about it changes.
+    let mut issue_secret = false;
+    if let Some((_, current_owner, p256dh, auth, _, _, secret_hash)) = &existing {
+        let owner_changes = *current_owner != Some(profile_id);
+        if r.kind == "web" {
+            let current = auth.as_deref();
+            let shown = |claimed: Option<&str>| matches!((current, claimed), (Some(c), Some(x)) if crypto::ct_eq(c, x));
+            let proven = matches!(owner, Owner::Carry(..)) || shown(r.keys.map(|k| k.1)) || shown(r.proof);
+            let rekeys = r.keys.is_some_and(|(p, a)| Some(p) != p256dh.as_deref() || Some(a) != current);
+            if (owner_changes || rekeys) && !proven {
+                return Err(not_holder(r.kind));
+            }
+        } else {
+            let holds = crypto::install_secret_matches(secret_hash.as_deref(), r.proof);
+            let same_owner_grant = matches!(owner, Owner::Person(p) if Some(p) == *current_owner);
+            match secret_hash {
+                Some(_) if !holds && !same_owner_grant => return Err(not_holder(r.kind)),
+                Some(_) => {}
+                // Registered before install secrets: its first call that keeps its owner adopts one.
+                None if owner_changes => {
+                    return Err(AppError::Conflict(
+                        "this device was registered before install secrets: register it once with its current owner (no sign-in change) to get its install_secret first".into(),
+                    ))
+                }
+                None => issue_secret = true,
+            }
+        }
+    } else if r.kind != "web" {
+        issue_secret = r.carried_secret_hash.is_none();
+    }
+    let install_secret = issue_secret.then(crypto::new_install_secret);
+    let secret_hash = install_secret.as_deref().map(crypto::install_secret_hash).or(r.carried_secret_hash.map(str::to_string));
     // 3. The settings row.
     sqlx::query("SELECT 1 FROM push_settings WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     // The caps, before anything is stored: a new device must fit the account's (all devices, and
@@ -297,7 +361,8 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             sqlx::query(
                 "UPDATE push_devices SET profile_id = $2, anonymous = $3, p256dh = COALESCE($4, p256dh), auth_secret = COALESCE($5, auth_secret), permission = $6,
                         status = 'active', failures = 0, disabled_at = NULL, last_seen_at = now(), version = version + 1,
-                        user_agent = COALESCE($7, user_agent), app_version = COALESCE($8, app_version), apns_environment = COALESCE($9, apns_environment)
+                        user_agent = COALESCE($7, user_agent), app_version = COALESCE($8, app_version), apns_environment = COALESCE($9, apns_environment),
+                        install_secret_hash = COALESCE($10, install_secret_hash)
                  WHERE id = $1",
             )
             .bind(id)
@@ -309,6 +374,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
             .bind(r.apns_environment)
+            .bind(&secret_hash)
             .execute(&mut *tx)
             .await?;
             *id
@@ -316,8 +382,8 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         None => {
             let id = Uuid::now_v7();
             sqlx::query(
-                "INSERT INTO push_devices (id, account_id, profile_id, anonymous, kind, address, p256dh, auth_secret, permission, user_agent, app_version, apns_environment)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                "INSERT INTO push_devices (id, account_id, profile_id, anonymous, kind, address, p256dh, auth_secret, permission, user_agent, app_version, apns_environment, install_secret_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(id)
             .bind(account_id)
@@ -331,6 +397,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
             .bind(r.apns_environment)
+            .bind(&secret_hash)
             .execute(&mut *tx)
             .await?;
             id
@@ -341,7 +408,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         forget_nameless_in(&mut tx, &[old]).await?;
     }
     tx.commit().await?;
-    Ok(Some((id, !anonymous)))
+    Ok(Some(Saved { id, linked: !anonymous, install_secret }))
 }
 
 /// Nameless push profiles (made for a device without a grant) that nothing else is on any more (no
@@ -416,9 +483,20 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                     owner = Owner::Carry(p, anon);
                 }
             }
-            let reg = Registration { kind: "web", address: endpoint, keys: Some((p256dh, auth)), permission: "granted", user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()), app_version: None, apns_environment: None };
-            let (_, linked) = save_device(&state, a.id, &reg, owner).await?;
-            Ok(json!({"ok": true, "linked": linked}))
+            let reg = Registration {
+                kind: "web",
+                address: endpoint,
+                keys: Some((p256dh, auth)),
+                permission: "granted",
+                user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
+                app_version: None,
+                apns_environment: None,
+                // The auth secret this browser had for the endpoint, when its keys changed.
+                proof: b["proof"]["auth"].as_str(),
+                carried_secret_hash: None,
+            };
+            let saved = save_device(&state, a.id, &reg, owner).await?;
+            Ok(json!({"ok": true, "linked": saved.linked}))
         }
         .await,
     )
@@ -455,7 +533,7 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
                 .fetch_optional(&state.db)
                 .await?;
             let Some((_, permission)) = found else { return Ok(json!({"ok": true})) };
-            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None };
+            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None, proof: Some(auth), carried_secret_hash: None };
             save_device(&state, a.id, &reg, Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
@@ -463,22 +541,54 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
     )
 }
 
-/// Forget a device (for web, only with its secret); an anonymous one's nameless profile goes too
-/// when nothing else is on it, so subscribing and unsubscribing can't pile up profiles.
-async fn remove(state: &AppState, account_id: Uuid, kind: &str, address: &str, auth: Option<&str>) -> AppResult<bool> {
-    let gone: Option<(Option<Uuid>, bool)> = sqlx::query_as(
-        "DELETE FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 AND ($4::text IS NULL OR auth_secret = $4) RETURNING profile_id, anonymous",
-    )
-    .bind(account_id)
-    .bind(kind)
-    .bind(address)
-    .bind(auth)
-    .fetch_optional(&state.db)
-    .await?;
-    if let Some((Some(p), true)) = gone {
+/// Forget a device, only for whoever holds it (web: its auth secret; apps: its install secret,
+/// compared in constant time under the device's lock). An anonymous one's nameless profile goes too
+/// when nothing else is on it, so subscribing and unsubscribing can't pile up profiles. A browser
+/// without the right secret is told nothing was removed; an app gets 409.
+async fn remove(state: &AppState, account_id: Uuid, kind: &str, address: &str, proof: Option<&str>) -> AppResult<bool> {
+    let mut tx = state.db.begin().await?;
+    type Found = (Uuid, Option<Uuid>, bool, Option<String>, Option<String>);
+    let found: Option<Found> = sqlx::query_as("SELECT id, profile_id, anonymous, auth_secret, install_secret_hash FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE")
+        .bind(account_id)
+        .bind(kind)
+        .bind(address)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((id, profile_id, anonymous, auth, secret_hash)) = found else { return Ok(false) };
+    let holds = if kind == "web" { matches!((auth.as_deref(), proof), (Some(a), Some(p)) if crypto::ct_eq(a, p)) } else { crypto::install_secret_matches(secret_hash.as_deref(), proof) };
+    if !holds {
+        return if kind == "web" { Ok(false) } else { Err(not_holder(kind)) };
+    }
+    sqlx::query("DELETE FROM push_devices WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    if let (Some(p), true) = (profile_id, anonymous) {
         forget_nameless(&state.db, &[p]).await?;
     }
-    Ok(gone.is_some())
+    Ok(true)
+}
+
+/// An app's old token, shown with its install secret: deleted, returning its owner (and whether that
+/// was anonymous) and its install secret's hash for the new token. None: not that install's.
+async fn take_over(state: &AppState, account_id: Uuid, kind: &str, address: &str, secret: Option<&str>) -> AppResult<Option<(Option<Uuid>, bool, Option<String>)>> {
+    let mut tx = state.db.begin().await?;
+    let found: Option<(Uuid, Option<Uuid>, bool, Option<String>)> =
+        sqlx::query_as("SELECT id, profile_id, anonymous, install_secret_hash FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE")
+            .bind(account_id)
+            .bind(kind)
+            .bind(address)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((id, profile_id, anonymous, hash)) = found.filter(|f| crypto::install_secret_matches(f.3.as_deref(), secret)) else { return Ok(None) };
+    sqlx::query("DELETE FROM push_devices WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Some((profile_id, anonymous, hash)))
+}
+
+/// An app's token as stored (APNs tokens lowercased).
+fn stored_token(platform: &str, token: &str) -> AppResult<String> {
+    let token = token.trim();
+    check_token(platform, token)?;
+    Ok(if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() })
 }
 
 fn check_token(platform: &str, token: &str) -> AppResult<()> {
@@ -520,11 +630,28 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 return Err(AppError::bad(format!("add your {} credentials in Settings → Push first", if platform == "ios" { "Apple (APNs)" } else { "Firebase" })));
             }
             take_registration(&state, a.id, &headers).await?;
-            let owner = match resolve_grant(&state, a.id, &row, &b["identity"]).await? {
+            let mut owner = match resolve_grant(&state, a.id, &row, &b["identity"]).await? {
                 Some(p) => Owner::Person(p),
                 None => Owner::Keep,
             };
             let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
+            let secret = b["install_secret"].as_str();
+            // A new token for the same install (the old one shown with its install secret): it takes
+            // over the old device's owner and secret.
+            let mut carried: Option<String> = None;
+            let mut left_anonymous: Option<Uuid> = None;
+            if let Some(prev) = b["previous_token"].as_str() {
+                let prev = stored_token(platform, prev)?;
+                if prev != token {
+                    let Some((p, anon, hash)) = take_over(&state, a.id, platform, &prev, secret).await? else { return Err(not_holder(platform)) };
+                    match (owner, p) {
+                        (Owner::Keep, Some(p)) => owner = Owner::Carry(p, anon),
+                        (_, Some(p)) if anon => left_anonymous = Some(p),
+                        _ => {}
+                    }
+                    carried = hash;
+                }
+            }
             // iOS: which APNs environment the build uses (development builds: sandbox; TestFlight and
             // the App Store: production).
             let environment = match (platform, b.get("environment").and_then(Value::as_str)) {
@@ -532,9 +659,26 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 ("ios", Some(_)) => return Err(AppError::bad("environment must be sandbox or production")),
                 _ => None,
             };
-            let reg = Registration { kind: platform, address: &token, keys: None, permission, user_agent: None, app_version: b["app_version"].as_str(), apns_environment: environment };
-            let (id, linked) = save_device(&state, a.id, &reg, owner).await?;
-            Ok(json!({"ok": true, "device_id": id, "linked": linked, "sendable": permission != "denied"}))
+            let reg = Registration {
+                kind: platform,
+                address: &token,
+                keys: None,
+                permission,
+                user_agent: None,
+                app_version: b["app_version"].as_str(),
+                apns_environment: environment,
+                proof: secret,
+                carried_secret_hash: carried.as_deref(),
+            };
+            let saved = save_device(&state, a.id, &reg, owner).await?;
+            if let Some(p) = left_anonymous {
+                forget_nameless(&state.db, &[p]).await?;
+            }
+            let mut out = json!({"ok": true, "device_id": saved.id, "linked": saved.linked, "sendable": permission != "denied"});
+            if let Some(s) = saved.install_secret {
+                out["install_secret"] = json!(s);
+            }
+            Ok(out)
         }
         .await,
     )
@@ -548,9 +692,7 @@ pub async fn device_sign_out(State(state): State<AppState>, Query(q): Query<KeyQ
             let a = account_by_key(&state, &q.k).await?;
             let b = body_json(&body)?;
             let platform = b["platform"].as_str().unwrap_or_default();
-            let token = b["token"].as_str().unwrap_or_default().trim();
-            check_token(platform, token)?;
-            let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
+            let token = stored_token(platform, b["token"].as_str().unwrap_or_default())?;
             let permission: Option<String> = sqlx::query_scalar("SELECT permission FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3")
                 .bind(a.id)
                 .bind(platform)
@@ -558,7 +700,17 @@ pub async fn device_sign_out(State(state): State<AppState>, Query(q): Query<KeyQ
                 .fetch_optional(&state.db)
                 .await?;
             let Some(permission) = permission else { return Ok(json!({"ok": true})) };
-            let reg = Registration { kind: platform, address: &token, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None };
+            let reg = Registration {
+                kind: platform,
+                address: &token,
+                keys: None,
+                permission: &permission,
+                user_agent: None,
+                app_version: None,
+                apns_environment: None,
+                proof: b["install_secret"].as_str(),
+                carried_secret_hash: None,
+            };
             save_device(&state, a.id, &reg, Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
@@ -572,10 +724,8 @@ pub async fn remove_device(State(state): State<AppState>, Query(q): Query<KeyQue
             let a = account_by_key(&state, &q.k).await?;
             let b = body_json(&body)?;
             let platform = b["platform"].as_str().unwrap_or_default();
-            let token = b["token"].as_str().unwrap_or_default().trim();
-            check_token(platform, token)?;
-            let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
-            remove(&state, a.id, platform, &token, None).await?;
+            let token = stored_token(platform, b["token"].as_str().unwrap_or_default())?;
+            remove(&state, a.id, platform, &token, b["install_secret"].as_str()).await?;
             Ok(json!({"ok": true}))
         }
         .await,
@@ -836,6 +986,21 @@ var window = { isSecureContext: true, PushManager: function () {}, Notification:
         // A server that answers but refuses counts as not confirmed too.
         let v = run("__sub = mkSub(); fetch = function (u, i) { __log.push({ fetch: u }); return Promise.resolve({ ok: false }); };", &push_js(), &["window.dumbmail.notifications.signOut()"]);
         assert!(has(&v, "unsubscribe") && v["ls"]["pl_push_removal"].as_str().is_some(), "{v}");
+    }
+
+    #[test]
+    fn new_keys_for_the_same_endpoint_carry_the_old_auth_secret() {
+        let v = run(
+            r#"__sub = mkSub(); __ls["pl_push_sub"] = JSON.stringify({ endpoint: "https://fcm.googleapis.com/fcm/send/abc", auth: "OLD" });"#,
+            &push_js(),
+            &[],
+        );
+        let sent = v["log"].as_array().unwrap().iter().find(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).cloned().unwrap();
+        assert_eq!(sent["body"]["proof"]["auth"], "OLD", "{v}");
+        // Unchanged keys need no proof.
+        let v = run(r#"__sub = mkSub(); __ls["pl_push_sub"] = JSON.stringify({ endpoint: "https://fcm.googleapis.com/fcm/send/abc", auth: "A" });"#, &push_js(), &[]);
+        let sent = v["log"].as_array().unwrap().iter().find(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).cloned().unwrap();
+        assert!(sent["body"].get("proof").is_none(), "{v}");
     }
 
     const WORKER: &str = r#"

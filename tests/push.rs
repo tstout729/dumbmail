@@ -589,7 +589,14 @@ async fn a_push_goes_only_to_the_person_and_registration_it_was_made_for() {
     gate.wait(1).await;
     // The browser renews its keys while the push service is answering.
     let renewed = Browser { endpoint: gone.endpoint.clone(), ..browser(&base, "gone-z") };
-    enroll(&h, &a, &renewed, "dan@x.test").await;
+    let (st, v) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": renewed.endpoint, "keys": {"p256dh": renewed.p256dh, "auth": renewed.auth}}, "identity": a.grant("email", "dan@x.test"), "proof": {"auth": gone.auth}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
     gate.open();
     task.await.unwrap();
     assert_eq!(count(&h, &format!("SELECT count(*) FROM push_devices WHERE profile_id = '{dan}'")).await, 1, "the renewed registration stays");
@@ -1425,5 +1432,164 @@ async fn nameless_profiles_dont_pile_up_and_device_caps_hold_before_anything_is_
     assert_ne!(s, StatusCode::OK, "the account cap counts identified devices too");
     assert_eq!(count(&h, "SELECT count(*) FROM push_devices").await, 2);
     enroll(&h, &a, &c3, "ana@x.test").await;
+    h.cleanup().await;
+}
+
+/// A web device as stored: (p256dh, auth secret, owner, version).
+async fn web_device(h: &Harness, endpoint: &str) -> Option<(String, String, Option<Uuid>, i64)> {
+    sqlx::query_as("SELECT p256dh, auth_secret, profile_id, version FROM push_devices WHERE kind = 'web' AND address = $1").bind(endpoint).fetch_optional(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_browser_device_changes_only_for_the_browser_holding_it() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    let ana = person(&mut h, &l, "ana@x.test", "Ana").await;
+    let bob = person(&mut h, &l, "bob@x.test", "Bob").await;
+    person(&mut h, &l, "mal@x.test", "Mal").await;
+    let real = browser(&base, "a1");
+    enroll(&h, &a, &real, "ana@x.test").await;
+    let before = web_device(&h, &real.endpoint).await.unwrap();
+
+    // A stranger who learned only the endpoint can neither re-key it nor pull it onto someone else.
+    let stranger = Browser { endpoint: real.endpoint.clone(), ..browser(&base, "a1") };
+    assert_eq!(subscribe(&h, &a, &stranger, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(subscribe(&h, &a, &stranger, a.grant("email", "mal@x.test")).await.0, StatusCode::CONFLICT);
+    let (st, _) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": stranger.endpoint, "keys": {"p256dh": stranger.p256dh, "auth": stranger.auth}}, "proof": {"auth": stranger.auth}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "a made-up proof");
+    assert_eq!(web_device(&h, &real.endpoint).await.unwrap(), before, "nothing changed");
+
+    // The same keys and owner again: a quiet success.
+    let (st, v) = subscribe(&h, &a, &real, json!({})).await;
+    assert_eq!((st, v["linked"].as_bool()), (StatusCode::OK, Some(true)));
+    assert_eq!(web_device(&h, &real.endpoint).await.unwrap().2, Some(ana));
+
+    // The browser itself (it holds the auth secret): a new owner, then new keys with its old secret.
+    enroll(&h, &a, &real, "bob@x.test").await;
+    assert_eq!(web_device(&h, &real.endpoint).await.unwrap().2, Some(bob));
+    let rekeyed = Browser { endpoint: real.endpoint.clone(), ..browser(&base, "a1") };
+    let (st, v) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": rekeyed.endpoint, "keys": {"p256dh": rekeyed.p256dh, "auth": rekeyed.auth}}, "proof": {"auth": real.auth}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let now = web_device(&h, &real.endpoint).await.unwrap();
+    assert_eq!((now.0.as_str(), now.1.as_str(), now.2), (rekeyed.p256dh.as_str(), rekeyed.auth.as_str(), Some(bob)));
+
+    // The worker's pushsubscriptionchange (`previous`) still moves it to a new endpoint, owner and all.
+    let moved = browser(&base, "a2");
+    let (st, v) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": moved.endpoint, "keys": {"p256dh": moved.p256dh, "auth": moved.auth}}, "previous": {"endpoint": rekeyed.endpoint, "auth": rekeyed.auth}}),
+    )
+    .await;
+    assert_eq!((st, v["linked"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
+    assert!(web_device(&h, &real.endpoint).await.is_none());
+    assert_eq!(web_device(&h, &moved.endpoint).await.unwrap().2, Some(bob));
+    // And a stranger can't sign it out or remove it with only the endpoint.
+    public_post(&h, "/client/push/sign-out", &a.key, json!({"endpoint": moved.endpoint, "auth": "x".repeat(22)})).await;
+    public_post(&h, "/client/push/unsubscribe", &a.key, json!({"endpoint": moved.endpoint, "auth": "x".repeat(22)})).await;
+    assert_eq!(web_device(&h, &moved.endpoint).await.unwrap().2, Some(bob));
+    h.cleanup().await;
+}
+
+/// An app's call to a device endpoint, with extra fields.
+async fn app_call(h: &Harness, a: &Acct, path: &str, platform: &str, token: &str, extra: Value) -> (StatusCode, Value) {
+    let mut body = json!({"platform": platform, "token": token, "permission": "granted"});
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    public_post(h, path, &a.key, body).await
+}
+
+async fn app_owner(h: &Harness, token: &str) -> Option<Option<Uuid>> {
+    sqlx::query_scalar("SELECT profile_id FROM push_devices WHERE address = $1").bind(token).fetch_optional(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_app_device_changes_only_with_its_install_secret() {
+    let (mut h, _m, _base) = push_harness!(0.0);
+    let a = mobile_setup(&mut h).await;
+    let l = list(&mut h, "App").await;
+    let ivy = person(&mut h, &l, "ivy@x.test", "Ivy").await;
+    let dan = person(&mut h, &l, "dan@x.test", "Dan").await;
+    let tok = "a".repeat(64);
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    assert_eq!(st, StatusCode::OK);
+    let secret = v["install_secret"].as_str().expect("issued at the first registration").to_string();
+    assert!(secret.len() >= 22);
+    let stored: Option<String> = sqlx::query_scalar("SELECT install_secret_hash FROM push_devices WHERE address = $1").bind(&tok).fetch_one(&h.state.db).await.unwrap();
+    assert!(stored.is_some_and(|h| h != secret), "only its hash is stored");
+
+    // Refreshing with a grant for the same person needs no secret (and gets none).
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    assert_eq!((st, v.get("install_secret")), (StatusCode::OK, None));
+    // Without it: no anonymous refresh, no new owner, no sign-out, no removal.
+    let wrong = json!({"install_secret": "x".repeat(43)});
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "dan@x.test")})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "dan@x.test"), "install_secret": "x".repeat(43)})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "ios", &tok, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "ios", &tok, wrong.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "ios", &tok, wrong).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_owner(&h, &tok).await, Some(Some(ivy)), "still Ivy's");
+
+    // With it: a new owner, a sign-out, a new token for the same install, a removal.
+    let s = json!(secret);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "dan@x.test"), "install_secret": s})).await.0, StatusCode::OK);
+    assert_eq!(app_owner(&h, &tok).await, Some(Some(dan)));
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "ios", &tok, json!({"install_secret": s})).await.0, StatusCode::OK);
+    let anon = app_owner(&h, &tok).await.flatten().unwrap();
+    assert!(anon != dan && anon != ivy);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"install_secret": s})).await.0, StatusCode::OK, "an anonymous refresh with it");
+    let tok2 = "b".repeat(64);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok2, json!({"previous_token": tok, "install_secret": "x".repeat(43)})).await.0, StatusCode::CONFLICT);
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "ios", &tok2, json!({"previous_token": tok, "install_secret": s})).await;
+    assert_eq!((st, v.get("install_secret")), (StatusCode::OK, None), "the install keeps its secret: {v}");
+    assert_eq!((app_owner(&h, &tok).await, app_owner(&h, &tok2).await), (None, Some(Some(anon))));
+    assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "ios", &tok2, json!({"install_secret": s})).await.0, StatusCode::OK);
+    assert_eq!(app_owner(&h, &tok2).await, None);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_device_registered_before_install_secrets_adopts_one_on_its_first_call() {
+    let (mut h, _m, _base) = push_harness!(0.0);
+    let a = mobile_setup(&mut h).await;
+    let l = list(&mut h, "App").await;
+    let ivy = person(&mut h, &l, "ivy@x.test", "Ivy").await;
+    let dan = person(&mut h, &l, "dan@x.test", "Dan").await;
+    let tok = format!("f{}", "x".repeat(40));
+    app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    // As it was before this change.
+    sqlx::query("UPDATE push_devices SET install_secret_hash = NULL").execute(&h.state.db).await.unwrap();
+
+    // Until it has one, its owner can't change.
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "dan@x.test")})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "android", &tok, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "android", &tok, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_owner(&h, &tok).await, Some(Some(ivy)));
+
+    // Its first call with the same owner and token adopts one and returns it, once.
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    assert_eq!(st, StatusCode::OK);
+    let secret = v["install_secret"].as_str().expect("adopted").to_string();
+    let (_, v) = app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    assert!(v.get("install_secret").is_none(), "not handed out again");
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "dan@x.test")})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "dan@x.test"), "install_secret": secret})).await.0, StatusCode::OK);
+    assert_eq!(app_owner(&h, &tok).await, Some(Some(dan)));
     h.cleanup().await;
 }

@@ -54,7 +54,10 @@
     var sig = j.endpoint + "|" + (id.type || "") + "|" + (id.value || ""), last = store.get("pl_push_sent");
     // Once a day, or when the subscription or who the site says is signed in changes.
     if (!force && last && last.sig === sig && now() - last.at < 86400000) return Promise.resolve("granted");
-    return post("/client/push/subscribe", { subscription: j, identity: id, url: location.href }).then(function (r) {
+    var body = { subscription: j, identity: id, url: location.href }, had = store.get("pl_push_sub");
+    // New keys for the same endpoint: show DumbMail the auth secret this browser had for it.
+    if (had && had.endpoint === j.endpoint && had.auth && had.auth !== (j.keys && j.keys.auth)) body.proof = { auth: had.auth };
+    return post("/client/push/subscribe", body).then(function (r) {
       if (r && r.ok) { store.set("pl_push_sent", { sig: sig, at: now() }); store.set("pl_push_sub", { endpoint: j.endpoint, auth: j.keys && j.keys.auth }); }
       return "granted";
     });
