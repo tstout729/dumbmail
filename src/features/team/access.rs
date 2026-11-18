@@ -220,10 +220,13 @@ pub enum Perm {
     /// Connect and disconnect ad platforms, and create, change, run and delete ad audience syncs
     /// (they send customer data to Meta, Google and TikTok). Admins and owners.
     AdAudiencesManage,
+    /// Connect or disconnect the Shopify store, start, pause or cancel its history import, resync its
+    /// products and download privacy-request exports (personal data). Admins and owners.
+    ShopifyManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 45] = [
+    pub const ALL: [Perm; 46] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -269,6 +272,7 @@ impl Perm {
         Perm::IntegrationsRead,
         Perm::IntegrationsManage,
         Perm::AdAudiencesManage,
+        Perm::ShopifyManage,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -320,6 +324,7 @@ impl Perm {
             IntegrationsRead => "integrations.read",
             IntegrationsManage => "integrations.manage",
             AdAudiencesManage => "ad_audiences.manage",
+            ShopifyManage => "shopify.manage",
         }
     }
 
@@ -338,7 +343,7 @@ impl Perm {
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
             AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead | IntegrationsRead => (Area::Account, false),
-            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage | AdAudiencesManage => (Area::Account, true),
+            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage | AdAudiencesManage | ShopifyManage => (Area::Account, true),
         })
     }
 

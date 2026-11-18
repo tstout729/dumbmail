@@ -19,13 +19,18 @@
 
   var store = {
     get: function (k, s) { try { return JSON.parse((s ? sessionStorage : localStorage).getItem(k)); } catch (e) { return null; } },
-    set: function (k, v, s) { try { (s ? sessionStorage : localStorage).setItem(k, JSON.stringify(v)); } catch (e) {} },
+    set: function (k, v, s) { if (STOPPED && TRACKING_KEYS.indexOf(k) >= 0) return; try { (s ? sessionStorage : localStorage).setItem(k, JSON.stringify(v)); } catch (e) {} },
     del: function (k, s) { try { (s ? sessionStorage : localStorage).removeItem(k); } catch (e) {} }
   };
   var PROFILE = "pl_profile";
   function profile() { return store.get(PROFILE) || {}; }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
+  // Set by dumbmail.stop(): nothing more is sent from this page, and nothing about the visitor's
+  // activity is written to the browser's storage either.
+  var STOPPED = false;
+  var TRACKING_KEYS = ["pl_profile", "pl_buffer", "pl_last_product", "pl_cart", "pl_sc", "pl_orders", "pl_active", "pl_page_views", "pl_first_seen"];
   function post(path, body) {
+    if (STOPPED && path !== "/client/subscribe") return Promise.resolve({ json: function () { return Promise.resolve({}); } });
     try {
       return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), keepalive: true, credentials: "omit"
@@ -78,7 +83,7 @@
   var EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i;
   var api = {
     identify: function (props, how) {
-      if (!props || typeof props !== "object") return api;
+      if (STOPPED || !props || typeof props !== "object") return api;
       var p = profile(), before = identified(p);
       var em = props.email && String(props.email).trim().toLowerCase();
       // A different email is a different person: start a fresh profile instead of merging into theirs.
@@ -101,17 +106,29 @@
     addedToCart: function (p, cart) { addToCart(item(p), "manual", cart ? cartFrom(cart) : null); flushAdd(); return api; },
     startedCheckout: function (cart) { startCheckout(cartFrom(cart || {}), "manual", true); return api; },
     placedOrder: function (order) { placeOrder(order || {}, "manual"); return api; },
+    // The visitor withdrew consent (a cookie banner, Shopify's Customer Privacy API): from now on
+    // this page sends no events, pings or identification, and events waiting for the visitor to be
+    // recognised are deleted along with who the script thought they were. A sign-up form the visitor
+    // submits themselves still goes through.
+    stop: function () {
+      STOPPED = true;
+      store.del(BUFFER);
+      store.del(PROFILE);
+      return api;
+    },
     version: VERSION
   };
 
   // Events from visitors the browser doesn't know yet wait here (for up to 3 days) and are sent once they're recognized.
   var BUFFER = "pl_buffer";
   function buffer(ev) {
+    if (STOPPED) return;
     var b = (store.get(BUFFER) || []).filter(function (e) { return e && now() - e.time < 3 * 86400000; });
     b.push(ev);
     store.set(BUFFER, b.slice(-25));
   }
   function flushBuffer() {
+    if (STOPPED) return;
     var b = store.get(BUFFER) || [];
     store.del(BUFFER);
     var p = profile();
@@ -120,6 +137,7 @@
     });
   }
   function send(metric, properties, value, uniqueId) {
+    if (STOPPED) return;
     if (TEST) { test.event(metric, properties, value); return; }
     var ev = { metric: metric, properties: properties || {}, value: typeof value === "number" && isFinite(value) ? value : undefined, unique_id: uniqueId, time: now() };
     if (!identified()) { buffer(ev); return; }
@@ -925,7 +943,7 @@
   }
 
   // Test-mode views aren't counted, so testing doesn't skew A/B results.
-  function view(f) { if (TEST) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
+  function view(f) { if (TEST || STOPPED) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
 
   function renderEmbeds(f) {
     var slots = document.querySelectorAll('[data-dumbmail-form="' + f.id + '"], [data-postlark-form="' + f.id + '"]');
