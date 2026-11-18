@@ -3,6 +3,7 @@ import { Pencil, Plus, Trash2, X } from "lucide-react";
 import type { DelayUnit, FlowNode, List } from "../../api";
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
+import { PushEditor } from "../../features/push/PushEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 
@@ -54,6 +55,15 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
             <Input value={node.name ?? ""} onChange={(e) => onChange({ ...node, name: e.target.value || undefined })} disabled={readOnly} placeholder="SMS" />
           </Field>
           <SmsEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} templateName={node.name} />
+        </div>
+      );
+    case "push":
+      return (
+        <div className="space-y-4">
+          <Field label="Step name">
+            <Input value={node.name ?? ""} onChange={(e) => onChange({ ...node, name: e.target.value || undefined })} disabled={readOnly} placeholder="Push" />
+          </Field>
+          <PushEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} />
         </div>
       );
     case "condition":

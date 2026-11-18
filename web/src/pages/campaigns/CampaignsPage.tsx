@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { Copy, Mail, MessageSquare, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
+import { Copy, Mail, MessageSquare, MoreHorizontal, Plus, Search, Trash2, BellRing } from "lucide-react";
 import type { Campaign, CampaignStatus, Channel } from "../../api";
 import { useCampaigns, useCreateCampaign, useDeleteCampaign, useDuplicateCampaign, useSession } from "../../api";
 import { starterEmail } from "../../components/email/blocks";
@@ -38,6 +38,7 @@ const tabStatuses: Record<Tab, CampaignStatus[] | null> = {
 };
 
 export function ChannelIcon({ channel }: { channel: Channel }) {
+  if (channel === "push") return <BellRing className="size-4 shrink-0 text-zinc-400" aria-label="Push" />;
   return channel === "email" ? (
     <Mail className="size-4 shrink-0 text-zinc-400" aria-label="Email" />
   ) : (
@@ -217,7 +218,7 @@ function CreateCampaignDialog({ onClose }: { onClose: () => void }) {
         name,
         channel,
         audience: { include: [], exclude: [] },
-        content: channel === "email" ? starterEmail(account.brand_color) : { body: "" },
+        content: channel === "email" ? starterEmail(account.brand_color) : channel === "push" ? { title: "", body: "" } : { body: "" },
       },
       { onSuccess: (c) => navigate(`/campaigns/${c.id}`) },
     );
@@ -228,11 +229,12 @@ function CreateCampaignDialog({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Create campaign" onClose={onClose} size="md">
       <form onSubmit={onSubmit} className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           {(
             [
               ["email", Mail, "Email", "Newsletters, promos, launches"],
               ["sms", MessageSquare, "SMS", "Short, urgent, high-intent"],
+              ["push", BellRing, "Push", "Browser and app notifications"],
             ] as const
           ).map(([value, Icon, label, detail]) => (
             <button
