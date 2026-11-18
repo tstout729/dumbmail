@@ -75,7 +75,8 @@
     "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
     "Guests are held back from marketing: the suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
     "Review the draft flows (booking confirmation, pre-arrival, review request, and a pre-arrival that follows the reservation object; use one of the two pre-arrival flows), edit the emails, and turn them on.",
-    "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile."
+    "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile.",
+    "Pre-arrival messages wait for payment: they go only to bookings Guesty reports as paid in full. Guesty reports money only in its legacy reservation webhooks (until 1 March 2027), so subscribe to those too; without them no pre-arrival message is sent."
   ],
   "flows": [
     {
@@ -135,7 +136,7 @@
     },
     {
       "name": "Guesty: pre-arrival",
-      "description": "Two days before check-in at 10am, sends arrival details. Skipped if the booking was cancelled; follows the newest dates if they changed. A service message.",
+      "description": "Two days before check-in at 10am, sends arrival details. Skipped if the booking was cancelled; follows the newest dates if they changed. A service message. Only for bookings Guesty reports paid in full (nothing due on a total above zero); a booking whose payment Guesty hasn't reported never gets it.",
       "trigger": {
         "type": "event_date",
         "metric": "Reservation Confirmed",
@@ -145,6 +146,13 @@
         "key": "reservation_id",
         "cancelled_by": [
           "Reservation Cancelled"
+        ],
+        "filters": [
+          {
+            "field": "paid_in_full",
+            "op": "eq",
+            "value": true
+          }
         ]
       },
       "definition": {
@@ -221,7 +229,7 @@
     },
     {
       "name": "Guesty: pre-arrival from the reservation",
-      "description": "Two days before check-in at 10am, sends arrival details, from the reservation object: it follows the newest dates and skips cancelled bookings and inquiries without any event keys. A service message. Turn on this one or the event-based pre-arrival flow, not both.",
+      "description": "Two days before check-in at 10am, sends arrival details, from the reservation object: it follows the newest dates and skips cancelled bookings and inquiries without any event keys. A service message. Turn on this one or the event-based pre-arrival flow, not both. Only for bookings Guesty reports paid in full (nothing due on a total above zero); a booking whose payment Guesty hasn't reported never gets it.",
       "trigger": {
         "type": "object_date",
         "object_type": "reservation",
@@ -238,6 +246,11 @@
               "checked_in",
               "alteration"
             ]
+          },
+          {
+            "field": "paid_in_full",
+            "op": "eq",
+            "value": true
           }
         ]
       },
@@ -351,6 +364,11 @@
           "key": "guest_id",
           "label": "Guesty guest ID",
           "type": "text"
+        },
+        {
+          "key": "paid_in_full",
+          "label": "Paid in full",
+          "type": "boolean"
         }
       ]
     }

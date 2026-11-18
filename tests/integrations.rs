@@ -1313,6 +1313,9 @@ async fn guesty_reminders_follow_the_newest_version_and_stop_on_cancellation() {
     let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
     let mut trigger = f["trigger"].clone();
     trigger["hour"] = json!(0);
+    // This test is about ordering versions; v2 webhooks carry no payment, so the payment rule (tested
+    // in tests/objects.rs) is taken off here.
+    trigger["filters"] = json!([]);
     h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
     assert_eq!(f["definition"]["settings"]["service_messages"], true, "booking messages reach guests who haven't agreed to marketing");
     h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
@@ -2141,6 +2144,9 @@ async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
     let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
     let mut trigger = f["trigger"].clone();
     trigger["hour"] = json!(0);
+    // This test is about ordering versions; v2 webhooks carry no payment, so the payment rule (tested
+    // in tests/objects.rs) is taken off here.
+    trigger["filters"] = json!([]);
     h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
     h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
     h.ok("POST", "/api/profiles", Some(json!({"email": "ana@example.com"}))).await;

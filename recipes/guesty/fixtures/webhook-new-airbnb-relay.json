@@ -26,6 +26,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": true,
         "source_channel": "airbnb2",
         "status": "confirmed",
         "total": 980
@@ -43,6 +44,16 @@
       "type": "upsert_object"
     },
     {
+      "external_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+      "fields": {
+        "currency": "USD",
+        "paid_in_full": true,
+        "total": 980
+      },
+      "object_type": "reservation",
+      "type": "upsert_object"
+    },
+    {
       "metric": "Reservation Booked",
       "profile": {
         "email": "sam-abc123xyz@guest.airbnb.com"
@@ -56,6 +67,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": true,
         "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
         "source_channel": "airbnb2",
         "status": "confirmed"
@@ -96,6 +108,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": true,
         "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
         "source_channel": "airbnb2",
         "status": "confirmed",

@@ -26,6 +26,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": false,
         "source_channel": "manual",
         "status": "confirmed",
         "total": 1312.5
@@ -43,6 +44,16 @@
       "type": "upsert_object"
     },
     {
+      "external_id": "66f1c4a1246e7d9f0f8da88a",
+      "fields": {
+        "currency": "USD",
+        "paid_in_full": false,
+        "total": 1312.5
+      },
+      "object_type": "reservation",
+      "type": "upsert_object"
+    },
+    {
       "metric": "Reservation Booked",
       "profile": {
         "email": "dana.whitfield@example.com"
@@ -56,6 +67,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": false,
         "reservation_id": "66f1c4a1246e7d9f0f8da88a",
         "source_channel": "manual",
         "status": "confirmed"
@@ -96,6 +108,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_in_full": false,
         "reservation_id": "66f1c4a1246e7d9f0f8da88a",
         "source_channel": "manual",
         "status": "confirmed",

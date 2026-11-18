@@ -542,10 +542,8 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
     if out.result == "created" || !out.changed.is_empty() {
         let change_id = Uuid::now_v7();
         insert_change(&mut tx, change_id, out.id, w, if out.result == "created" { "created" } else { "updated" }, &out.changed, before, after, out.version).await?;
-        let dates = t.date_fields();
-        if out.result == "created" || out.changed.iter().any(|c| dates.contains(&c.as_str())) {
-            super::flow::schedule_object(&mut tx, w.account_id, &t.key, out.id, &tz).await?;
-        }
+        // Any change: a date may have moved, and a fire its filters stopped may now match (paid).
+        super::flow::schedule_object(&mut tx, w.account_id, &t.key, out.id, &tz).await?;
         super::flow::queue_change(&mut tx, w.account_id, &t.key, change_id).await?;
     }
     if !linked.is_empty() || !unlinked.is_empty() {

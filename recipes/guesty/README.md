@@ -19,6 +19,9 @@ What the script assumes, and the Guesty page each assumption comes from (read 20
 
 ## Money
 
+Pre-arrival flows send only for bookings Guesty reports as **paid in full**: `paid_in_full` is true when the reservation's `money.balanceDue` is 0 and its total (`money.totalPaid` + `money.balanceDue`, or `money.hostPayout`) is above 0, false when something is still due, and missing (unknown) when a message carries no money. Unknown never sends. It's recorded on the `reservation` object and on the Reservation Booked and Reservation Confirmed events, and a change in it makes a new Reservation Confirmed version. Payment is written to the object without a version, so a message that carries money is never dropped because a newer one without money arrived first.
+
+
 The current reservation API and the v2 webhooks carry no totals. Guesty moved pricing to the guest folio (`GET /guest-folio/overview`) and payments to `GET /payments`; see the 5 November 2026 changelog. A booking's value is recorded as `Reservation Total` only when a legacy webhook delivers the reservation's `money`, once per reservation, whether it arrives before or after the messages without a total. **After 1 March 2027 bookings are recorded without a total** until the recipe reads the folio API.
 
 ## Events

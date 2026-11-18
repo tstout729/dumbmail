@@ -768,3 +768,67 @@ async fn a_time_zone_change_never_leaves_a_fire_at_its_old_moment() {
     assert_eq!(rows, vec![(ny, "started".to_string()), (la, "obsolete".to_string())]);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn guesty_pre_arrival_waits_until_the_booking_is_paid_in_full() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
+    let id = created["integration"]["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "none"}}))).await;
+    let i = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    // Both suggested pre-arrival flows (event-based and object-based), firing at midnight.
+    for f in created["flows"].as_array().unwrap().iter().filter(|f| f["name"].as_str().unwrap().contains("pre-arrival")) {
+        let fid = f["id"].as_str().unwrap();
+        let mut trigger = h.ok("GET", &format!("/api/flows/{fid}"), None).await["trigger"].clone();
+        trigger["hour"] = json!(0);
+        h.ok("PATCH", &format!("/api/flows/{fid}"), Some(json!({"trigger": trigger}))).await;
+        h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    }
+    let legacy = |ev: &str, due: f64, at: &str, msg: &str| {
+        let r = json!({"_id": "R1", "status": "confirmed", "guestId": "gA", "lastUpdatedAt": at, "confirmedAt": "2026-11-17T09:00:00.000Z",
+            "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "listing": {"nickname": "Dune Cottage"},
+            "guest": {"_id": "gA", "email": "ana@example.com", "firstName": "Ana"},
+            "money": {"totalPaid": 600.0 - due, "balanceDue": due, "currency": "USD"}});
+        (json!({"event": ev, "reservation": r}).to_string(), msg.to_string())
+    };
+    let post = |(body, msg): (String, String)| {
+        let path = path.clone();
+        let h = &h;
+        async move {
+            let (s, _, r) = h.raw("POST", &path, &[("content-type", "application/json"), ("svix-id", &msg)], &body).await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            h.drain().await;
+        }
+    };
+    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).map(|m| m.to).collect::<Vec<_>>();
+    // Confirmed, money still due: nothing.
+    post(legacy("reservation.new", 120.0, "2026-11-17T10:00:00.000Z", "m1")).await;
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert!(sent(&h).is_empty(), "confirmed but not paid: no pre-arrival");
+    let paid: Option<bool> = sqlx::query_scalar("SELECT (fields->>'paid_in_full')::boolean FROM objects WHERE external_id = 'R1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(paid, Some(false));
+    // Paid in full later: each pre-arrival flow sends once.
+    post(legacy("reservation.updated", 0.0, "2026-11-17T11:00:00.000Z", "m2")).await;
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent(&h), vec!["ana@example.com", "ana@example.com"], "the event-based and the object-based flow");
+    // A booking whose payment Guesty never reported (v2 webhooks carry no money): never.
+    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) SELECT $1, account_id, 'ben@example.com', '{\"guesty_guest_id\": \"gB\"}' FROM integrations")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let v2 = json!({"event": "reservation.created.v2", "meta": {"eventId": "m3", "publishedAt": "2026-11-17T12:00:00.000Z"},
+        "data": {"reservationId": "R2", "guestId": "gB", "status": "confirmed", "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "guestsCount": 2}});
+    post((v2.to_string(), "m3".into())).await;
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent(&h).len(), 2, "unknown payment never sends");
+    assert_eq!(count(&h, "SELECT count(*) FROM objects WHERE external_id = 'R2' AND fields ? 'paid_in_full'").await, 0);
+    h.cleanup().await;
+}

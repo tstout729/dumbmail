@@ -45,7 +45,7 @@ var GUEST_COLUMNS = "id firstName lastName fullName guestEmail guestPhone";
 // What makes a new booking version: a change to any of these (Guesty's field names in
 // meta.changedFields, and ours when comparing a legacy webhook's before and after).
 var VERSION_CHANGES = ["status", "checkIn", "checkOut", "checkInDateLocalized", "checkOutDateLocalized", "listingId", "unitId", "listing", "guestId", "guest"];
-var VERSION_FIELDS = ["status", "check_in", "check_out", "listing_id", "guest_id"];
+var VERSION_FIELDS = ["status", "check_in", "check_out", "listing_id", "guest_id", "paid_in_full"];
 
 function str(v) {
   return v === undefined || v === null || v === "" ? null : String(v);
@@ -124,10 +124,14 @@ function details(r) {
   var checkIn = day(r.checkInDateLocalized || stay.checkInDateLocalized || r.checkIn || stay.checkIn);
   var checkOut = day(r.checkOutDateLocalized || stay.checkOutDateLocalized || r.checkOut || stay.checkOut);
   var total = null;
+  // Paid in full, as Guesty reports it: nothing left to pay on a booking worth something. Unknown
+  // (null) when the message carries no money (v2 webhooks and the current reservation API don't).
+  var paidInFull = null;
   if (m) {
     var paid = num(m.totalPaid);
     var due = num(m.balanceDue);
     total = paid !== null || due !== null ? (paid || 0) + (due || 0) : num(m.hostPayout);
+    if (due !== null && total !== null) paidInFull = due === 0 && total > 0;
   }
   return {
     reservation_id: str(r.reservationId || r._id || r.id),
@@ -141,6 +145,7 @@ function details(r) {
     guests: num(r.guestsCount !== undefined ? r.guestsCount : stay.guestsCount),
     total: total,
     currency: m ? str(m.currency) : null,
+    paid_in_full: paidInFull,
     source_channel: str(integration.platform || r.channel || r.platform || r.source),
     guest_id: str(r.guestId || (r.guest && (r.guest._id || r.guest.id))),
   };
@@ -186,6 +191,9 @@ function reservationActions(r, guest, who, version, input, versioned) {
   props.version = version;
 
   out.push(reservationObject(d, who, version));
+  // Payment, when this message reports it, is written without a version: a message that carries
+  // money is never dropped just because a newer one without money arrived first.
+  if (d.paid_in_full !== null) out.push({ type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: clean({ paid_in_full: d.paid_in_full, total: d.total, currency: d.currency }) });
 
   var status = String(r.status || "").toLowerCase();
   if (BOOKED.indexOf(status) >= 0) {
@@ -240,7 +248,7 @@ function reservationObject(d, who, version) {
   var fields = clean({
     status: d.status ? d.status.toLowerCase() : null, confirmation_code: d.confirmation_code, listing_id: d.listing_id, listing_name: d.listing_name,
     check_in: d.check_in, check_out: d.check_out, nights: d.nights, guests: d.guests, total: d.total, currency: d.currency,
-    source_channel: d.source_channel, guest_id: d.guest_id,
+    source_channel: d.source_channel, guest_id: d.guest_id, paid_in_full: d.paid_in_full,
   });
   var profiles = [];
   if (who) {
@@ -270,7 +278,7 @@ function changedFields(r, before) {
   if (!before) return [];
   var a = details(r);
   var b = details(before);
-  return ["status", "check_in", "check_out", "guests", "total", "listing_id", "guest_id"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
+  return ["status", "check_in", "check_out", "guests", "total", "listing_id", "guest_id", "paid_in_full"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
 }
 
 // "Reservation Updated", once per change (webhooks only: they say what changed).
