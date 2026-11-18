@@ -1,4 +1,5 @@
 import type { FlowSettings, Reentry, SegmentDefinition } from "../../api";
+import { NotifyCapField } from "../../features/flowsPlus";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { Checkbox, Field, Input, Select } from "../ui";
 
@@ -43,6 +44,7 @@ export function FlowSettingsEditor({ settings, onChange, readOnly }: Props) {
           className="w-28"
         />
       </Field>
+      <NotifyCapField value={settings.notify_daily_cap} onChange={(notify_daily_cap) => onChange({ ...settings, notify_daily_cap })} />
       <Checkbox
         checked={settings.service_messages === true}
         onChange={(e) => onChange({ ...settings, service_messages: e.target.checked ? true : undefined })}
