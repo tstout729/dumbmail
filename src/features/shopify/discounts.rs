@@ -164,7 +164,8 @@ pub async fn create_discount_code(state: &AppState, account_id: Uuid, template: 
     if !owned {
         return Err(AppError::not_found("profile"));
     }
-    let code = code_for(&state.cfg.secret_key, account_id, &s.shop_domain, template, profile_id, grant_key);
+    // The store and its install: a reinstall (or another store) never gets an earlier install's code.
+    let code = code_for(&state.cfg.secret_key, account_id, &format!("{}#{}", s.shop_domain, s.generation), template, profile_id, grant_key);
     // A saved code counts only if it was made for this store, template, person and grant.
     let known: Option<(Option<String>, String, Option<Uuid>, Option<String>)> =
         sqlx::query_as("SELECT shop_domain, template_key, profile_id, grant_key FROM shopify_discount_codes WHERE account_id = $1 AND code = $2")
@@ -214,10 +215,11 @@ pub async fn create_discount_code(state: &AppState, account_id: Uuid, template: 
         (None, None) => return Err(AppError::Internal(anyhow::anyhow!("Shopify returned no discount"))),
     };
     let saved: Option<String> = sqlx::query_scalar(
-        "INSERT INTO shopify_discount_codes (account_id, code, template_key, profile_id, discount_id, expires_at, shop_domain, grant_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "INSERT INTO shopify_discount_codes (account_id, code, template_key, profile_id, discount_id, expires_at, shop_domain, grant_key, generation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (account_id, code) DO UPDATE SET discount_id = COALESCE(shopify_discount_codes.discount_id, EXCLUDED.discount_id)
             WHERE shopify_discount_codes.shop_domain = EXCLUDED.shop_domain AND shopify_discount_codes.template_key = EXCLUDED.template_key
               AND shopify_discount_codes.profile_id = EXCLUDED.profile_id AND shopify_discount_codes.grant_key = EXCLUDED.grant_key
+              AND shopify_discount_codes.generation IS NOT DISTINCT FROM EXCLUDED.generation
          RETURNING code",
     )
     .bind(account_id)
@@ -228,6 +230,7 @@ pub async fn create_discount_code(state: &AppState, account_id: Uuid, template: 
     .bind(template.ends(now))
     .bind(&s.shop_domain)
     .bind(grant_key)
+    .bind(s.generation)
     .fetch_optional(&state.db)
     .await?;
     saved.map(|_| code).ok_or_else(|| AppError::Conflict("that discount code belongs to another grant".into()))

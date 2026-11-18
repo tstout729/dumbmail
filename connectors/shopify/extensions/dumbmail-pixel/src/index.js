@@ -8,10 +8,18 @@
 // script who checked out.
 import { register } from "@shopify/web-pixels-extension";
 
-register(({ analytics, browser, settings }) => {
+register(({ analytics, browser, settings, init, customerPrivacy }) => {
   const BASE = String(settings.base || "").replace(/\/+$/, "");
   const KEY = String(settings.key || "");
   if (!/^https:\/\//.test(BASE) || !KEY) return;
+  // The visitor's consent (Shopify's Customer Privacy API), kept current. Without analytics and
+  // marketing consent the pixel sends nothing and passes no identity or held browsing activity to
+  // the storefront script.
+  let consent = (init && init.customerPrivacy) || {};
+  if (customerPrivacy && typeof customerPrivacy.subscribe === "function") {
+    customerPrivacy.subscribe("visitorConsentCollected", (event) => { consent = (event && event.customerPrivacy) || {}; });
+  }
+  const allowed = () => consent.analyticsProcessingAllowed === true && consent.marketingAllowed === true;
 
   async function read(store, key) {
     try { return JSON.parse(await browser[store].getItem(key)); } catch (e) { return null; }
@@ -45,6 +53,7 @@ register(({ analytics, browser, settings }) => {
     // Without an order id or checkout token the event can't be matched to Shopify's own copy, so it
     // would be counted twice: send nothing.
     if (!uniqueId) return false;
+    if (!allowed()) return false;
     const checkout = event.data.checkout || {};
     const origin = event.context && event.context.document && event.context.document.location ? event.context.document.location.origin : undefined;
     const list = items(checkout, origin);
