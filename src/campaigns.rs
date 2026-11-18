@@ -116,6 +116,8 @@ pub fn version_content<'a>(c: &'a CampaignRow, ab: Option<&'a AbTest>, version: 
 enum Resolved {
     List(Uuid),
     Segment(Definition),
+    /// A resend's own recipients (see `features::campaigns_plus::resend`).
+    Resend(crate::features::campaigns_plus::resend::ResendAudience),
 }
 
 async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResult<Vec<Resolved>> {
@@ -135,6 +137,7 @@ async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResu
                 let def = def.ok_or_else(|| AppError::not_found("segment"))?;
                 out.push(Resolved::Segment(segments::load(db, account_id, &def, Some(r.id)).await?));
             }
+            "resend" => out.push(Resolved::Resend(crate::features::campaigns_plus::resend::resolve(db, account_id, r.id).await?)),
             other => return Err(AppError::bad(format!("audience type must be list or segment, got {other:?}"))),
         }
     }
@@ -152,6 +155,7 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
                 qb.push("EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = ").push_bind(*id).push(" AND lm.profile_id = p.id)");
             }
             Resolved::Segment(def) => segments::push_definition(qb, def),
+            Resolved::Resend(r) => r.push(qb),
         }
     }
     qb.push(")");
@@ -239,6 +243,7 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
     if aud.include.is_empty() {
         problems.push("Pick at least one list or segment".to_string());
     }
+    problems.extend(crate::features::campaigns_plus::resend::audience_problems(c, &aud));
     problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
     if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
         match parse_ab_test(&c.channel, v) {
@@ -326,6 +331,8 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         tx.commit().await?;
         return Ok(());
     }
+    // Link tags (UTM) are worked out once here, onto the content every recipient gets.
+    crate::features::campaigns_plus::utm::freeze_campaign(&mut tx, c.id).await?;
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
             tx.commit().await?;
@@ -816,6 +823,7 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
     }
     let ab = ab_test(c);
     let content = version_content(c, ab.as_ref(), version).ok_or_else(|| AppError::bad("this campaign has no such version"))?;
+    let content = &crate::features::campaigns_plus::utm::for_test(state, c, version, content).await?;
     let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'")
         .bind(account.id)
         .fetch_one(&state.db)

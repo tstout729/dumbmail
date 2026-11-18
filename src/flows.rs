@@ -545,7 +545,8 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     if run.status != "active" {
         return Ok(());
     }
-    let flow: FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1").bind(run.flow_id).fetch_one(&state.db).await?;
+    // With the account's link tag settings, so its messages get their tags without another query.
+    let flow: FlowRow = sqlx::query_as(crate::features::campaigns_plus::utm::FLOW_WITH_DEFAULTS_SQL).bind(run.flow_id).fetch_one(&state.db).await?;
     match flow.status.as_str() {
         "live" => {}
         // Paused flows hold people in place and pick up when turned back on.
@@ -622,6 +623,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 if !recent {
                     let event = context.get("event").cloned();
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
+                    let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
                     let out = sending::send(
                         state,
                         SendSpec {

@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audiences;
+pub mod campaigns_plus;
 pub mod catalog;
 pub mod content;
 pub mod coupons;
@@ -109,6 +110,7 @@ pub trait Feature: Send + Sync {
 pub static ALL: &[&dyn Feature] = &[
     &agent::Module,
     &audiences::Module,
+    &campaigns_plus::Module,
     &catalog::Module,
     &content::Module,
     &coupons::Module,

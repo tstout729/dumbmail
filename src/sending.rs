@@ -315,6 +315,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         message_id,
         unsubscribe_url: unsub.clone(),
     };
+    // Link tagging (UTM): resolved tags ride on the content; none renders as before (features::campaigns_plus::utm).
+    let link_tags = crate::features::campaigns_plus::utm::Tagger::from_content(state, spec.account, spec.content);
+    let link_hook = link_tags.as_ref().map(|t| t as &dyn render::LinkHook);
 
     // Render first so template errors never leave a half-sent message.
     enum Rendered {
@@ -331,7 +334,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .or_else(|| spec.account.from_email.clone())
             .ok_or_else(|| AppError::bad("set a sender email in Settings → Sending before sending email"))?;
         check_sender_domain(state, spec.account, &from_email)?;
-        let r = render::render_email(spec.account, &content, &ctx, Some(&tracking))?;
+        let r = render::render_email_hooked(spec.account, &content, &ctx, Some(&tracking), render::EmailOptions::default(), link_hook)?;
         let subject = if spec.is_test { format!("[Test] {}", r.subject) } else { r.subject.clone() };
         let email = OutgoingEmail {
             message_id,
@@ -355,7 +358,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(p.id)
             .fetch_one(&state.db)
             .await?;
-        let body = render::render_sms(spec.account, &content, &ctx, Some(&tracking), !prior_sms)?;
+        let body = render::render_sms_hooked(spec.account, &content, &ctx, Some(&tracking), !prior_sms, link_hook)?;
         (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider))
     };
 

@@ -52,13 +52,9 @@ pub struct ChannelQuery {
     pub status: Option<String>,
 }
 
-async fn templates_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ChannelQuery>) -> AppResult<Json<Value>> {
-    let rows: Vec<Template> = sqlx::query_as("SELECT id, name, channel, content, created_at, updated_at FROM templates WHERE account_id = $1 AND ($2::text IS NULL OR channel = $2) ORDER BY updated_at DESC")
-        .bind(ctx.account_id)
-        .bind(&q.channel)
-        .fetch_all(&state.db)
-        .await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn templates_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::templates(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -192,23 +188,15 @@ pub async fn campaign_json(state: &AppState, c: &CampaignRow) -> AppResult<Value
     Ok(v)
 }
 
+/// The newest 500 campaigns that aren't archived (see `features::campaigns_plus::tags::campaigns`).
 pub async fn list_campaigns(state: &AppState, account_id: Uuid, q: &ChannelQuery) -> AppResult<Vec<Value>> {
-    let rows: Vec<CampaignRow> = sqlx::query_as("SELECT * FROM campaigns WHERE account_id = $1 AND ($2::text IS NULL OR channel = $2) AND ($3::text IS NULL OR status = $3) ORDER BY COALESCE(sent_at, send_at, created_at) DESC LIMIT 500")
-        .bind(account_id)
-        .bind(&q.channel)
-        .bind(&q.status)
-        .fetch_all(&state.db)
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for c in &rows {
-        out.push(campaign_json(state, c).await?);
-    }
-    Ok(out)
+    let q = crate::features::campaigns_plus::tags::ListQuery { channel: q.channel.clone(), status: q.status.clone(), ..Default::default() };
+    Ok(crate::features::campaigns_plus::tags::campaigns(state, account_id, &q).await?.0)
 }
 
-async fn campaigns_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ChannelQuery>) -> AppResult<Json<Value>> {
-    let rows = list_campaigns(&state, ctx.account_id, &q).await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, dates, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn campaigns_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::campaigns(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -443,6 +431,7 @@ async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, A
 /// they're saved only if it launches, and checked as they will be used.
 pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Option<DateTime<Utc>>, send_options: Option<&Value>) -> AppResult<CampaignRow> {
     let mut c = campaigns::load(&state.db, account_id, id).await?;
+    crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id).await?;
     if !matches!(c.status.as_str(), "draft" | "scheduled") {
         return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
     }
@@ -503,7 +492,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
         Some(t) => sqlx::query_as(
             "UPDATE campaigns SET status = 'scheduled', send_at = $2, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
-             WHERE id = $1 AND status = $3 AND updated_at = $6 RETURNING *",
+             WHERE id = $1 AND status = $3 AND updated_at = $6 AND archived_at IS NULL RETURNING *",
         )
         .bind(id)
         .bind(t)
@@ -517,7 +506,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         None => {
             let r: CampaignRow = sqlx::query_as(
                 "UPDATE campaigns SET status = 'sending', send_at = now(), send_options = CASE WHEN $3 THEN $4 ELSE send_options END, updated_at = now()
-                 WHERE id = $1 AND status = $2 AND updated_at = $5 RETURNING *",
+                 WHERE id = $1 AND status = $2 AND updated_at = $5 AND archived_at IS NULL RETURNING *",
             )
             .bind(id)
             .bind(&c.status)
@@ -702,18 +691,14 @@ pub async fn load_flow(state: &AppState, account_id: Uuid, id: Uuid) -> AppResul
         .ok_or_else(|| AppError::not_found("flow"))
 }
 
+/// Flows that aren't archived, live first (see `features::campaigns_plus::tags::flows`).
 pub async fn list_flows(state: &AppState, account_id: Uuid) -> AppResult<Vec<Value>> {
-    let rows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 ORDER BY (status = 'live') DESC, updated_at DESC").bind(account_id).fetch_all(&state.db).await?;
-    let mut out = Vec::new();
-    for f in &rows {
-        out.push(flow_json(state, f).await?);
-    }
-    Ok(out)
+    Ok(crate::features::campaigns_plus::tags::flows(state, account_id, &Default::default()).await?.0)
 }
 
-async fn flows_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let rows = list_flows(&state, ctx.account_id).await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, status, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn flows_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::flows(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -829,6 +814,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
     }
     let f = load_flow(state, account_id, id).await?;
     if status == "live" {
+        crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Flow, account_id, id).await?;
         let def = flows::parse_definition(&f.definition)?;
         if def.entry.is_none() {
             return Err(AppError::bad("add at least one step before turning the flow on"));
@@ -863,7 +849,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         }
     }
     // Turning live was checked against this version of the flow; an edit meanwhile means check again.
-    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 RETURNING *")
+    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
         .bind(id)
         .bind(status)
         .bind(account_id)

@@ -141,6 +141,14 @@ pub struct FlowRow {
     pub definition: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Link tagging choice and, where messages are sent, the account's settings (see
+    /// `features::campaigns_plus::utm`). Not part of the flow the API returns.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tags: Option<Value>,
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tag_defaults: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

@@ -61,6 +61,12 @@ pub struct Tracking<'a> {
     pub unsubscribe_url: String,
 }
 
+/// Changes a link's destination before click tracking wraps it (link tagging, see
+/// `features::campaigns_plus::utm`). None leaves the link as it is.
+pub trait LinkHook: Sync {
+    fn destination(&self, url: &str) -> Option<String>;
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -440,6 +446,18 @@ pub fn render_email_with(
     tracking: Option<&Tracking<'_>>,
     opts: EmailOptions,
 ) -> AppResult<RenderedEmail> {
+    render_email_hooked(account, content, ctx, tracking, opts, None)
+}
+
+/// [`render_email_with`], with `links` changing each tracked link's destination first.
+pub fn render_email_hooked(
+    account: &Account,
+    content: &EmailContent,
+    ctx: &Value,
+    tracking: Option<&Tracking<'_>>,
+    opts: EmailOptions,
+    links: Option<&dyn LinkHook>,
+) -> AppResult<RenderedEmail> {
     let theme = content.theme.clone().unwrap_or_default();
     let brand = safe_color(theme.brand_color.as_deref().unwrap_or(&account.brand_color), "#1f6f5c");
     let font = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
@@ -515,7 +533,7 @@ pub fn render_email_with(
     }
 
     if let Some(t) = tracking.filter(|_| opts.track_clicks) {
-        html = rewrite_links(&html, t);
+        html = rewrite_links(&html, t, links);
     }
     if let Some(t) = tracking.filter(|_| opts.track_opens) {
         let pixel = format!(
@@ -546,7 +564,7 @@ fn decode_entities(s: &str) -> String {
         .replace("&quot;", "\"").replace("&#x27;", "'").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
-fn rewrite_links(html: &str, t: &Tracking<'_>) -> String {
+fn rewrite_links(html: &str, t: &Tracking<'_>, links: Option<&dyn LinkHook>) -> String {
     static HREF: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<a\s([^>]*?)href="([^"]+)"([^>]*)>"#).unwrap());
     HREF.replace_all(html, |caps: &regex::Captures<'_>| {
         let whole = &caps[0];
@@ -556,18 +574,24 @@ fn rewrite_links(html: &str, t: &Tracking<'_>) -> String {
         if !is_web || whole.contains("data-pl-skip") || raw == t.unsubscribe_url || raw.starts_with(t.public_url) {
             return whole.to_string();
         }
-        format!(r#"<a {}href="{}"{}>"#, &caps[1], esc(&tracked_url(t, &raw)), &caps[3])
+        let dest = links.and_then(|h| h.destination(&raw)).unwrap_or(raw);
+        format!(r#"<a {}href="{}"{}>"#, &caps[1], esc(&tracked_url(t, &dest)), &caps[3])
     })
     .into_owned()
 }
 
 /// SMS: render the body, shorten links through click tracking and add opt-out language when needed.
 pub fn render_sms(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool) -> AppResult<String> {
+    render_sms_hooked(account, content, ctx, tracking, first_message, None)
+}
+
+/// [`render_sms`], with `links` changing each tracked link's destination first (the text keeps its length).
+pub fn render_sms_hooked(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool, links: Option<&dyn LinkHook>) -> AppResult<String> {
     static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
     let mut body = render_str(&content.body, ctx, false)?;
     if let Some(t) = tracking {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &c[0]))
+            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &links.and_then(|h| h.destination(&c[0])).unwrap_or_else(|| c[0].to_string())))
             .into_owned();
     }
     let lower = body.to_lowercase();

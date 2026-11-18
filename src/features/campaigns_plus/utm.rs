@@ -320,8 +320,17 @@ fn campaign_frozen(defaults: Option<&Defaults>, c: &CampaignRow, over: Option<&O
 /// At send start, on the connection that holds the campaign lock: write the campaign's resolved tags
 /// onto its content and each A/B version's (or take stale ones off). Reads the content as it is now,
 /// after other steps of the same transaction changed it. No settings and no stale key: no write.
+/// Only the first time a send is prepared: a retry, or the winner send after an A/B test, keeps the
+/// tags the first recipients got.
 pub async fn freeze_campaign(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::Result<()> {
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1").bind(campaign_id).fetch_one(&mut *db).await?;
+    let started: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL OR EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test) FROM campaigns WHERE id = $1")
+        .bind(campaign_id)
+        .fetch_one(&mut *db)
+        .await?;
+    if started {
+        return Ok(());
+    }
     let (over, tz): (Option<Value>, String) = sqlx::query_as("SELECT c.link_tags, a.timezone FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1").bind(campaign_id).fetch_one(&mut *db).await?;
     let defaults = load_defaults(db, c.account_id).await?;
     let over = parse_override(over.as_ref());
