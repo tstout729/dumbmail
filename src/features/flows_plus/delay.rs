@@ -182,7 +182,7 @@ fn parse_when_any(v: &Value, tz: Tz) -> Option<DateTime<Utc>> {
     }
     for f in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(n) = NaiveDateTime::parse_from_str(s, f).map_err(|_| ()).and_then(|n| if (MIN_YEAR..MAX_YEAR).contains(&n.year()) { Ok(n) } else { Err(()) }) {
-            return Some(clock::local_instant(tz, n.date(), (n.time().num_seconds_from_midnight() / 60) as u32));
+            return Some(clock::local_instant(tz, n.date(), n.time().num_seconds_from_midnight() / 60));
         }
     }
     let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok())?;
