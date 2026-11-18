@@ -653,7 +653,7 @@ async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     if !created {
         events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props, value, at: o.placed_at() }, quiet, Some(&merge_order)).await?;
     }
-    for (l, (_, _, props)) in o.lines.iter().zip(line_props.into_iter()).filter(|_| !created) {
+    for (l, (_, _, props)) in o.lines.iter().zip(line_props).filter(|_| !created) {
         let line_total = l.total();
         let merge_line = |old: &Value| -> (Value, Option<f64>) {
             // Keep what `recompute` settled last time, so a replay writes nothing.

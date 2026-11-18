@@ -249,7 +249,7 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
         return Ok(Step::More);
     }
     let r = step_inner(state, shop, lease, metrics, &mut i, deadline).await;
-    let out = match r {
+    match r {
         Ok(s) => {
             // A pause or cancel that came in meanwhile is kept (save only changes a running import's status).
             save(&state.db, &i, lease).await?;
@@ -267,8 +267,7 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
                 Ok(Step::Idle)
             }
         },
-    };
-    out
+    }
 }
 
 async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut Metrics, i: &mut ImportRow, deadline: std::time::Instant) -> Result<Step, ApiError> {
