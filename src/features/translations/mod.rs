@@ -155,12 +155,14 @@ pub async fn system_snapshot(conn: &mut sqlx::PgConnection, secret: &str, accoun
     if !any {
         return Ok(None);
     }
-    let s = texts::load(conn, account_id).await?;
-    for l in s.all() {
+    let base = texts::load(conn, account_id, &[]).await?;
+    for l in base.all() {
         if !langs.contains(&l) {
             langs.push(l);
         }
     }
+    // The account's wording in exactly these languages.
+    let s = texts::load(conn, account_id, &langs).await?;
     let footer: Map<String, Value> = langs.iter().map(|l| (l.clone(), texts::footer_in(&s, l))).collect();
     let footer = Value::Object(footer);
     let sig = snapshot_sig(secret, account_id, campaign_id, &footer);

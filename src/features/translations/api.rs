@@ -491,7 +491,7 @@ pub async fn delete_term(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Val
 
 pub async fn system_texts(state: &AppState, account_id: Uuid, lang: &str) -> AppResult<Value> {
     let l = locale::normalize(lang).ok_or_else(|| AppError::bad("language must be a language tag"))?;
-    let s = texts::settings(&state.db, account_id).await?;
+    let s = texts::settings_for(&state.db, account_id, &[l.clone()]).await?;
     let items: Vec<Value> = texts::KEYS
         .iter()
         .map(|(k, what, en)| {

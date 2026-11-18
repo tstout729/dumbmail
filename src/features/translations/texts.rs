@@ -298,58 +298,73 @@ impl Settings {
     }
 }
 
-static CACHE: Lazy<Mutex<HashMap<Uuid, (Instant, Settings)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Cached settings by account and the languages whose wording was read ("" for none).
+static CACHE: Lazy<Mutex<HashMap<(Uuid, String), (Instant, Settings)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static REFRESHING: Lazy<Mutex<std::collections::HashSet<(Uuid, String)>>> = Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
 /// Forget an account's cached settings (after a change on this server).
 pub fn forget(account_id: Uuid) {
     if let Ok(mut c) = CACHE.lock() {
-        c.remove(&account_id);
+        c.retain(|(a, _), _| *a != account_id);
     }
 }
 
-static REFRESHING: Lazy<Mutex<std::collections::HashSet<Uuid>>> = Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
-
-/// Read an account's settings (two statements) on `conn`.
-pub async fn load(conn: &mut sqlx::PgConnection, account_id: Uuid) -> sqlx::Result<Settings> {
+/// Read an account's languages and its own wording in exactly `langs` (none: no wording) on `conn`.
+pub async fn load(conn: &mut sqlx::PgConnection, account_id: Uuid, langs: &[String]) -> sqlx::Result<Settings> {
     let row: Option<(String, Vec<String>)> = sqlx::query_as("SELECT default_language, languages FROM account_languages WHERE account_id = $1").bind(account_id).fetch_optional(&mut *conn).await?;
-    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT language, key, text FROM system_texts WHERE account_id = $1 LIMIT 2000").bind(account_id).fetch_all(&mut *conn).await?;
+    let rows: Vec<(String, String, String)> = if langs.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT language, key, text FROM system_texts WHERE account_id = $1 AND language = ANY($2) ORDER BY language, key")
+            .bind(account_id)
+            .bind(langs)
+            .fetch_all(&mut *conn)
+            .await?
+    };
     let (default_language, languages) = row.unwrap_or_else(|| ("en".into(), Vec::new()));
     Ok(Settings { default_language, languages, texts: rows.into_iter().map(|(l, k, t)| ((l, k), t)).collect() })
 }
 
-async fn load_and_cache(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
+async fn load_and_cache(db: &PgPool, account_id: Uuid, langs: &[String]) -> sqlx::Result<Settings> {
     let mut conn = db.acquire().await?;
-    let s = load(&mut conn, account_id).await?;
+    let s = load(&mut conn, account_id, langs).await?;
     if let Ok(mut c) = CACHE.lock() {
         if c.len() > 10_000 {
             c.clear();
         }
-        c.insert(account_id, (Instant::now(), s.clone()));
+        c.insert((account_id, langs.join(",")), (Instant::now(), s.clone()));
     }
     Ok(s)
 }
 
-/// The account's settings from the cache. An entry older than [`CACHE_SECS`] is still used and
-/// refreshed in the background, so sends never wait on it; only the first use on a server reads
-/// it in line.
+/// The account's languages (without wording), from the cache.
 pub async fn settings(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
-    let cached = CACHE.lock().ok().and_then(|c| c.get(&account_id).cloned());
+    settings_for(db, account_id, &[]).await
+}
+
+/// The account's languages and its own wording in exactly `langs`, from the cache. An entry
+/// older than [`CACHE_SECS`] is still used and refreshed in the background, so sends never wait
+/// on it; only the first use on a server reads it in line.
+pub async fn settings_for(db: &PgPool, account_id: Uuid, langs: &[String]) -> sqlx::Result<Settings> {
+    let key = (account_id, langs.join(","));
+    let cached = CACHE.lock().ok().and_then(|c| c.get(&key).cloned());
     match cached {
         Some((at, s)) => {
-            if at.elapsed() >= Duration::from_secs(CACHE_SECS) && REFRESHING.lock().is_ok_and(|mut r| r.insert(account_id)) {
+            if at.elapsed() >= Duration::from_secs(CACHE_SECS) && REFRESHING.lock().is_ok_and(|mut r| r.insert(key.clone())) {
                 let db = db.clone();
+                let langs = langs.to_vec();
                 tokio::spawn(async move {
-                    if let Err(e) = load_and_cache(&db, account_id).await {
+                    if let Err(e) = load_and_cache(&db, account_id, &langs).await {
                         tracing::warn!(account = %account_id, error = %e, "couldn't refresh language settings");
                     }
                     if let Ok(mut r) = REFRESHING.lock() {
-                        r.remove(&account_id);
+                        r.remove(&key);
                     }
                 });
             }
             Ok(s)
         }
-        None => load_and_cache(db, account_id).await,
+        None => load_and_cache(db, account_id, langs).await,
     }
 }
 
@@ -436,13 +451,16 @@ pub fn pick(s: &Settings, profile_locale: Option<&str>, accept: Option<&str>) ->
 /// The texts for a page shown to the person behind `profile_id` (when known) in this browser.
 /// Never fails: problems give English.
 pub async fn for_page(db: &PgPool, account_id: Uuid, profile_id: Option<Uuid>, headers: &HeaderMap) -> Texts {
-    let Ok(s) = settings(db, account_id).await else { return Texts::english() };
+    let Ok(base) = settings(db, account_id).await else { return Texts::english() };
     let loc: Option<String> = match profile_id {
-        Some(p) if !s.languages.is_empty() => sqlx::query_scalar("SELECT COALESCE(locale, locale_hint) FROM profiles WHERE id = $1 AND account_id = $2").bind(p).bind(account_id).fetch_optional(db).await.ok().flatten().flatten(),
+        Some(p) if !base.languages.is_empty() => sqlx::query_scalar("SELECT COALESCE(locale, locale_hint) FROM profiles WHERE id = $1 AND account_id = $2").bind(p).bind(account_id).fetch_optional(db).await.ok().flatten().flatten(),
         _ => None,
     };
     let accept = headers.get(axum::http::header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok());
-    Texts::for_lang(&s, &pick(&s, loc.as_deref(), accept))
+    let lang = pick(&base, loc.as_deref(), accept);
+    // The account's wording in exactly that language.
+    let s = settings_for(db, account_id, std::slice::from_ref(&lang)).await.unwrap_or(base);
+    Texts::for_lang(&s, &lang)
 }
 
 /// The texts for an email to the person behind `profile_id` (the double opt-in email).
@@ -452,7 +470,7 @@ pub async fn for_profile(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> Tex
 
 /// The footer lines for an email sent in `lang`, as the content prepare step stores them (`_footer`).
 pub async fn footer(db: &PgPool, account_id: Uuid, lang: &str) -> Value {
-    let s = settings(db, account_id).await.unwrap_or_default();
+    let s = settings_for(db, account_id, &[lang.to_string()]).await.unwrap_or_default();
     footer_in(&s, lang)
 }
 

@@ -346,9 +346,34 @@ fn layout(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer
     match lang {
         None => doc,
         Some((l, rtl)) => {
-            let dir = if *rtl { r#" dir="rtl""# } else { "" };
-            doc.replacen(r#"<html lang="en">"#, &format!(r#"<html lang="{l}"{dir}>"#), 1).replacen("<body style=", &format!("<body{dir} style="), 1)
+            let doc = doc.replacen(r#"<html lang="en">"#, &format!(r#"<html lang="{l}">"#), 1);
+            // Right to left goes on the text, not on the layout: a direction on the document or a
+            // layout table would swap the order of columns.
+            if *rtl { text_dir(&doc) } else { doc }
         }
+    }
+}
+
+/// `dir="rtl"` on every text cell (a cell whose style sets `text-align`); layout tables and column
+/// cells are left alone, so columns keep their order.
+fn text_dir(html: &str) -> String {
+    static TEXT_CELL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<td style="([^"]*text-align:[^"]*)""#).unwrap());
+    TEXT_CELL.replace_all(html, r#"<td dir="rtl" style="$1""#).into_owned()
+}
+
+/// A full HTML document in a language version: `lang` (and `dir="rtl"`) on its root element, in
+/// place of any it had.
+fn root_lang(html: &str, lang: &str, rtl: bool) -> String {
+    static ROOT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<html\b([^>]*)>").unwrap());
+    static ATTR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\s(lang|dir)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
+    match ROOT.captures(html) {
+        Some(c) => {
+            let whole = c.get(0).expect("match");
+            let kept = ATTR.replace_all(&c[1], "");
+            let dir = if rtl { r#" dir="rtl""# } else { "" };
+            format!("{}<html{} lang=\"{lang}\"{dir}>{}", &html[..whole.start()], kept.trim_end(), &html[whole.end()..])
+        }
+        None => html.to_string(),
     }
 }
 
@@ -561,13 +586,18 @@ pub fn render_email_hooked(
             let doc = if html.to_lowercase().contains("<body") {
                 // Custom full HTML: make sure an unsubscribe link exists (and any footer is added).
                 let own_unsubscribe = content.own_unsubscribe.filter(|_| lang.is_some()).unwrap_or_else(|| html.contains("unsubscribe_url"));
-                if own_unsubscribe || footer.is_empty() {
+                let doc = if own_unsubscribe || footer.is_empty() {
                     html.clone()
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
+                };
+                match &lang {
+                    Some((l, rtl)) => root_lang(&doc, l, *rtl),
+                    None => doc,
                 }
             } else {
-                layout(&format!("<tr><td style=\"padding:8px 24px;\">{html}</td></tr>"), content.preheader.as_deref().unwrap_or(""), account, &theme, &footer, lang.as_ref())
+                let dir = if rtl { r#" dir="rtl""# } else { "" };
+                layout(&format!("<tr><td{dir} style=\"padding:8px 24px;\">{html}</td></tr>"), content.preheader.as_deref().unwrap_or(""), account, &theme, &footer, lang.as_ref())
             };
             (doc, text)
         }

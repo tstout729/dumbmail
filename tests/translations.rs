@@ -653,7 +653,8 @@ async fn arabic_and_hebrew_emails_render_right_to_left_without_breaking_the_layo
     for (lang, word) in [("ar", "تخفيضات كبيرة"), ("he", "מבצע גדול")] {
         let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": content, "language": lang}))).await;
         let html = p["html"].as_str().unwrap();
-        assert!(html.contains(&format!(r#"<html lang="{lang}" dir="rtl">"#)) && html.contains(r#"<body dir="rtl" style="#), "{html}");
+        assert!(html.contains(&format!(r#"<html lang="{lang}">"#)) && !html.contains("<body dir"), "{html}");
+        assert!(html.contains(r#"<td dir="rtl" style="#), "text cells are right to left: {html}");
         assert!(html.contains(word));
         assert!(html.contains("text-align:right;") && html.contains(r#"align="left""#), "alignment is mirrored");
         let tables = html.matches(r#"width="600""#).count();
@@ -1348,5 +1349,63 @@ async fn imports_go_to_the_message_and_language_they_were_made_for() {
         let (s, _) = h.req("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": "xliff", "data": bad}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
     }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn right_to_left_keeps_column_order_and_full_documents_get_a_root_direction() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["ar", "pt-BR"])).await;
+    // Two columns in Arabic: the first column stays first (left), its text runs right to left.
+    let content = json!({"subject": "Hi", "blocks": [{"type": "columns", "columns": [[{"type": "text", "html": "<p>FIRST</p>"}], [{"type": "text", "html": "<p>SECOND</p>"}]]}]});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": content, "language": "ar", "strings": [{"id": "b0.c0.0:html", "text": "<p>الأول FIRST</p>"}, {"id": "b0.c1.0:html", "text": "<p>الثاني SECOND</p>"}]}))).await;
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": v["content"], "language": "ar"}))).await;
+    let html = p["html"].as_str().unwrap();
+    assert!(html.find("FIRST").unwrap() < html.find("SECOND").unwrap());
+    // Nothing that holds the columns has a direction: only text cells do.
+    let before_first = &html[..html.find("FIRST").unwrap()];
+    for tag in before_first.split('<').filter(|t| t.starts_with("table") || t.starts_with("html") || t.starts_with("body") || t.starts_with("td class=\"pl-col\"")) {
+        assert!(!tag.contains("dir=\"rtl\""), "a layout element has a direction: <{tag}");
+    }
+    assert!(html.contains(r#"<td dir="rtl" style="padding:8px 24px;text-align:"#), "{html}");
+    // A full HTML document gets lang and dir on its root.
+    let doc = json!({"subject": "Hi", "html": "<html lang=\"en\"><body><p>Hello</p></body></html>"});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": doc, "language": "ar", "strings": [{"id": "html", "text": "<html lang=\"en\"><body><p>مرحبا</p></body></html>"}]}))).await;
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": v["content"], "language": "ar"}))).await;
+    assert!(p["html"].as_str().unwrap().starts_with(r#"<html lang="ar" dir="rtl"><body>"#), "{}", p["html"]);
+    // pt-PT doesn't get the pt-BR version: exact, then the language, then the default.
+    let pt = h.ok("POST", "/api/translations/apply", Some(json!({"content": {"subject": "Hello", "blocks": [{"type": "heading", "text": "Hi"}]}, "language": "pt-BR", "strings": [{"id": "subject", "text": "Olá"}]}))).await;
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": pt["content"], "language": "pt-PT"}))).await;
+    assert_eq!(p["subject"], "Hello");
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": pt["content"], "language": "pt-BR"}))).await;
+    assert_eq!(p["subject"], "Olá");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn system_texts_are_read_for_exactly_the_language_needed() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    set_languages(&mut h, json!(["fr"])).await;
+    let acct = account_id(&h).await;
+    // Many other languages' wording stored first (more than the old 2,000-row read), French last.
+    sqlx::query("INSERT INTO system_texts (account_id, language, key, text) SELECT $1, 'x' || g, k, 'Other' FROM generate_series(1, 100) g, unnest($2::text[]) k")
+        .bind(acct)
+        .bind(dumbmail::features::translations::texts::KEYS.iter().map(|(k, _, _)| k.to_string()).collect::<Vec<_>>())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO system_texts (account_id, language, key, text) VALUES ($1, 'fr', 'unsub.button', 'Ciao les mails')").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::features::translations::texts::forget(acct);
+    let ann = person(&mut h, "ann@x.test", Some("fr")).await;
+    let list = list_of(&mut h, &[ann]).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "P", "audience": {"include": [{"type": "list", "id": list}]}, "content": {"subject": "Hi", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let m = h.state.email.sent().into_iter().find(|m| m.to == "ann@x.test").unwrap();
+    let (_, _, page) = h.raw("GET", m.unsubscribe_url.unwrap().trim_start_matches("https://pl.test"), &[], "").await;
+    assert!(page.contains("Ciao les mails"), "{page}");
     h.cleanup().await;
 }

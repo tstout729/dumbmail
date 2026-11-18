@@ -889,7 +889,7 @@ mod tests {
         add_language(&mut c, "en", "fr");
         add_language(&mut c, "en", "pt-BR");
         assert_eq!(choose(&c, &[], "en", Some("fr-CA"), None).as_deref(), Some("fr"));
-        assert_eq!(choose(&c, &[], "en", Some("pt-PT"), None).as_deref(), Some("pt-BR"));
+        assert_eq!(choose(&c, &[], "en", Some("pt-PT"), None).as_deref(), Some("en"), "never another region's version");
         assert_eq!(choose(&c, &[], "en", Some("en-GB"), None).as_deref(), Some("en"));
         assert_eq!(choose(&c, &[], "en", Some("de"), None).as_deref(), Some("en"));
         assert_eq!(choose(&c, &[], "en", None, None).as_deref(), Some("en"));

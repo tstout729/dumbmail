@@ -46,7 +46,7 @@ Each translated field has a status:
 
 ### Which version someone gets
 
-Decided once per recipient when the message is prepared, with no extra lookup: the version with their exact tag, else their language without the region (`fr` for `fr-CA`), else another region of the same language, else the default. A campaign's versions are frozen with the campaign when its send starts, like its saved blocks. A/B tests and languages combine: each A/B version has its own translations. Saved blocks carry their own translations and follow the language the email is sent in.
+Decided once per recipient when the message is prepared, with no extra lookup: the version with their exact tag, else their language without the region (`fr` for `fr-CA`), else the default. Another region's version is never used (someone in `pt-PT` doesn't get `pt-BR`). A campaign's versions are frozen with the campaign when its send starts, like its saved blocks. A/B tests and languages combine: each A/B version has its own translations. Saved blocks carry their own translations and follow the language the email is sent in.
 
 The language each message went out in is kept on the message: `GET /api/translations/report?campaign_id=...` (or `flow_id`) gives sent, opened, clicked and unsubscribed by language. MCP: `translation_report`.
 

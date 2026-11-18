@@ -65,14 +65,15 @@ pub fn is_rtl(tag: &str) -> bool {
 }
 
 /// The version of `available` that suits someone whose language is `wanted`: the same tag, else the
-/// bare language (`fr` for `fr-CA`), else another region of the same language. None: the default.
+/// bare language (`fr` for `fr-CA`). Never another region's version (`pt-PT` doesn't get
+/// `pt-BR`): None, and they get the default.
 pub fn best_match<'a>(wanted: &str, available: &'a [String]) -> Option<&'a String> {
     let w = normalize(wanted)?;
     if let Some(a) = available.iter().find(|a| a.eq_ignore_ascii_case(&w)) {
         return Some(a);
     }
     let p = primary(&w);
-    available.iter().find(|a| a.eq_ignore_ascii_case(p)).or_else(|| available.iter().find(|a| primary(a).eq_ignore_ascii_case(p)))
+    available.iter().find(|a| a.eq_ignore_ascii_case(p))
 }
 
 /// The languages in an `Accept-Language` header, most preferred first (at most 10; `*` and bad tags left out).
@@ -113,8 +114,8 @@ mod tests {
         let v = vec!["fr".to_string(), "pt-BR".to_string(), "es-MX".to_string()];
         assert_eq!(best_match("fr-CA", &v).map(String::as_str), Some("fr"));
         assert_eq!(best_match("pt-BR", &v).map(String::as_str), Some("pt-BR"));
-        assert_eq!(best_match("pt-PT", &v).map(String::as_str), Some("pt-BR"));
-        assert_eq!(best_match("es", &v).map(String::as_str), Some("es-MX"));
+        assert_eq!(best_match("pt-PT", &v), None, "another region's version isn't used");
+        assert_eq!(best_match("es", &v), None);
         assert_eq!(best_match("de", &v), None);
         let both = vec!["fr-CA".to_string(), "fr".to_string()];
         assert_eq!(best_match("fr-CA", &both).map(String::as_str), Some("fr-CA"));
