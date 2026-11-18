@@ -692,3 +692,79 @@ async fn a_retried_delete_never_removes_a_replacement() {
     assert_eq!(n.as_deref(), Some("2"), "the retry saw its delete already applied and left the replacement");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_date_fire_is_checked_again_at_the_moment_it_is_claimed() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_of(&h).await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "reservation", "fields": [{"key": "status", "type": "text"}, {"key": "check_in", "type": "date"}]}))).await;
+    let trigger = json!({"type": "object_date", "object_type": "reservation", "field": "check_in", "offset_days": -2, "hour": 0, "relationship": "guest"});
+    let fid = live(&mut h, email_flow("Pre-arrival", trigger.clone(), "See you {{ object.external_id }}")).await;
+    // Three reservations due now; in the gap after each is claimed, something changes.
+    for (id, who) in [("T", "t@example.com"), ("U", "u@example.com"), ("D", "d@example.com")] {
+        h.ok("POST", "/api/objects", Some(reservation(id, who, json!({"status": "confirmed", "check_in": day(2)})))).await;
+    }
+    let stored: Value = sqlx::query_scalar("SELECT trigger FROM flows WHERE id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let state = h.state.clone();
+    let tick = tokio::spawn(async move { dumbmail::flows::event_date_tick(&state, 0).await });
+    for _ in 0..3 {
+        assert_eq!(points.recv().await, Some("fire_claimed"));
+        // Each fire is judged on its own change: the trigger is back to normal before the next.
+        sqlx::query("UPDATE flows SET trigger = $2 WHERE id = $1::uuid").bind(&fid).bind(&stored).execute(&h.state.db).await.unwrap();
+        // Which fire was claimed: the pending one that is locked now.
+        let q = "SELECT o.external_id FROM flow_object_date_fires f JOIN objects o ON o.id = f.object_id WHERE f.outcome = 'pending'";
+        let pending: Vec<String> = sqlx::query_scalar(q).fetch_all(&h.state.db).await.unwrap();
+        let free: Vec<String> = sqlx::query_scalar(&format!("{q} FOR UPDATE OF f SKIP LOCKED")).fetch_all(&h.state.db).await.unwrap();
+        let claimed = pending.into_iter().find(|e| !free.contains(e)).unwrap();
+        match claimed.as_str() {
+            // The flow's trigger changes (a fire made for the old one never starts).
+            "T" => {
+                let mut t = stored.clone();
+                t["hour"] = json!(1);
+                sqlx::query("UPDATE flows SET trigger = $2 WHERE id = $1::uuid").bind(&fid).bind(&t).execute(&h.state.db).await.unwrap();
+            }
+            // The guest is unlinked.
+            "U" => {
+                sqlx::query("DELETE FROM object_links l USING objects o WHERE o.id = l.object_id AND o.external_id = 'U'").execute(&h.state.db).await.unwrap();
+            }
+            // The date changes without the scheduler hearing about it.
+            _ => {
+                sqlx::query("UPDATE objects SET fields = jsonb_set(fields, '{check_in}', to_jsonb($1::text)) WHERE external_id = 'D'").bind(day(9)).execute(&h.state.db).await.unwrap();
+            }
+        }
+        go.notify_one();
+    }
+    tick.await.unwrap().unwrap();
+    dumbmail::features::objects::hooks::remove(acct);
+    let outcomes: Vec<(String, String)> = sqlx::query_as("SELECT o.external_id, f.outcome FROM flow_object_date_fires f JOIN objects o ON o.id = f.object_id ORDER BY 1").fetch_all(&h.state.db).await.unwrap();
+    let get = |e: &str| outcomes.iter().find(|(x, _)| x == e).map(|(_, o)| o.clone()).unwrap();
+    assert_eq!(get("T"), "obsolete", "made for another trigger: {outcomes:?}");
+    assert_eq!(get("U"), "not_started", "nobody has the guest relationship any more: {outcomes:?}");
+    assert_eq!(get("D"), "obsolete", "its date moved: {outcomes:?}");
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_time_zone_change_never_leaves_a_fire_at_its_old_moment() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "reservation", "fields": [{"key": "check_in", "type": "date"}]}))).await;
+    h.ok("POST", "/api/flows", Some(email_flow("Pre", json!({"type": "object_date", "object_type": "reservation", "field": "check_in", "offset_days": -2, "hour": 10}), "x"))).await;
+    h.ok("POST", "/api/objects", Some(reservation("R1", "a@example.com", json!({"check_in": day(20)})))).await;
+    let la: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT due_at FROM flow_object_date_fires").fetch_one(&h.state.db).await.unwrap();
+    // The New York moment already has a fire (it ran): the Los Angeles one must not stay pending.
+    let ny = la - chrono::Duration::hours(3);
+    sqlx::query("INSERT INTO flow_object_date_fires (flow_id, object_id, account_id, due_at, trigger_key, outcome) SELECT flow_id, object_id, account_id, $1, trigger_key, 'started' FROM flow_object_date_fires")
+        .bind(ny)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    h.ok("PATCH", "/api/account", Some(json!({"timezone": "America/New_York"}))).await;
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as("SELECT due_at, outcome FROM flow_object_date_fires ORDER BY due_at").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows, vec![(ny, "started".to_string()), (la, "obsolete".to_string())]);
+    h.cleanup().await;
+}

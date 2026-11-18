@@ -747,7 +747,7 @@ fn event_date_insert() -> String {
 const EVENT_DATE_SEED_BUDGET: i64 = 20_000;
 
 /// Catch-up window: a fire due within this long ago still starts; older ones are marked missed.
-const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
+pub const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
 
 async fn event_date_tz(db: &PgPool, account_id: Uuid) -> anyhow::Result<String> {
     let tz: Option<String> = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?;
@@ -1207,7 +1207,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
         let object = match crate::features::objects::flow::check_run(&state.db, &flow, &context, run.profile_id).await? {
             crate::features::objects::flow::Check::NotObject => None,
             crate::features::objects::flow::Check::Exit(_) => return finish(&state.db, &hold, "exited").await,
-            crate::features::objects::flow::Check::Live { view, fields, tz } => Some((view, fields, tz)),
+            crate::features::objects::flow::Check::Live { view, rules } => Some((view, rules)),
         };
         let waited = context.get("_waited").and_then(|v| v.as_str()) == Some(node_id.as_str());
         // A step that reaches people outside (a message, a notification, a webhook), decided as it
@@ -1282,7 +1282,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 let recent: bool = hours > 0 && crate::features::sendtime::recently_messaged(&state.db, run.profile_id, &node.kind, hours).await?;
                 if !recent {
                     let event = match &object {
-                        Some((view, _, _)) => Some(json!({"object": view})),
+                        Some((view, _)) => Some(json!({"object": view})),
                         None => context.get("event").cloned(),
                     };
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
@@ -1322,7 +1322,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 // and object rules test the run's object (see features::objects).
                 let mut yes = crate::features::flows_plus::split::event_matches(&node, &context)
                     && segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-                if let Some(ok) = crate::features::objects::flow::condition(&node, object.as_ref().map(|(_, f, tz)| (f, tz.as_str()))) {
+                if let Some(ok) = crate::features::objects::flow::condition(&node, object.as_ref().map(|(_, r)| r)) {
                     yes = yes && ok;
                 }
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);

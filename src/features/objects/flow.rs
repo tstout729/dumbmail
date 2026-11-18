@@ -138,13 +138,35 @@ const DUE: &str = "CROSS JOIN LATERAL (SELECT o.fields->>$4::text AS raw) r
                                      ELSE x.moment + make_interval(hours => $8::int) END AS due) d";
 
 /// Fires first found more than a day after they were due are recorded as missed (the event-date rule).
-const INSERT: &str = "INSERT INTO flow_object_date_fires (flow_id, object_id, account_id, due_at, outcome, fired_at)
-     SELECT $1, o.id, o.account_id, d.due,
+const INSERT: &str = "INSERT INTO flow_object_date_fires (flow_id, object_id, account_id, due_at, trigger_key, outcome, fired_at)
+     SELECT $1, o.id, o.account_id, d.due, $10::text,
             CASE WHEN d.due > now() - interval '24 hours' THEN 'pending' ELSE 'missed' END,
             CASE WHEN d.due > now() - interval '24 hours' THEN NULL ELSE now() END
      FROM objects o JOIN object_types t ON t.id = o.type_id AND t.account_id = o.account_id AND t.key = $3::text
      {DUE}
      WHERE o.account_id = $2 AND x.day IS NOT NULL AND d.due IS NOT NULL";
+
+/// A short fingerprint of a flow's trigger: a fire made for another trigger never starts.
+pub fn trigger_key(trigger: &Value) -> String {
+    crate::auth::sha256_hex(&trigger.to_string())[..16].to_string()
+}
+
+/// The moment `object_id` is due now (from its current date, the trigger and the time zone).
+async fn due_now(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid, key: &str, a: &DateArgs, tz: &str) -> sqlx::Result<Option<DateTime<Utc>>> {
+    let q = format!("SELECT d.due FROM objects o {DUE} WHERE o.id = $1 AND o.account_id = $2 AND $3::text IS NOT NULL AND x.day IS NOT NULL");
+    let due: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(&q)
+        .bind(object_id)
+        .bind(account_id)
+        .bind(key)
+        .bind(&a.field)
+        .bind(tz)
+        .bind(a.offset_days)
+        .bind(a.hour)
+        .bind(a.offset_hours)
+        .fetch_optional(conn)
+        .await?;
+    Ok(due.flatten())
+}
 
 struct DateArgs {
     field: String,
@@ -175,12 +197,19 @@ pub async fn schedule_object(conn: &mut PgConnection, account_id: Uuid, key: &st
     for f in date_flows(conn, account_id, key).await? {
         let Ok(t) = flows::parse_trigger(&f.trigger) else { continue };
         let Some((key, a)) = date_args(&t) else { continue };
+        // A pending fire for another moment (or another trigger) goes; a filtered one still to come is
+        // armed again (the object changed: it may match now, e.g. it's been paid).
         let drop = format!(
             "DELETE FROM flow_object_date_fires f WHERE f.flow_id = $1 AND f.object_id = $9 AND f.outcome = 'pending' AND $3::text IS NOT NULL
-               AND f.due_at IS DISTINCT FROM (SELECT d.due FROM objects o {DUE} WHERE o.id = $9 AND o.account_id = $2 AND x.day IS NOT NULL)"
+               AND (f.trigger_key <> $10::text OR f.due_at IS DISTINCT FROM (SELECT d.due FROM objects o {DUE} WHERE o.id = $9 AND o.account_id = $2 AND x.day IS NOT NULL))"
         );
+        let rearm = "UPDATE flow_object_date_fires SET outcome = 'pending', fired_at = NULL
+                     WHERE flow_id = $1 AND object_id = $9 AND account_id = $2 AND outcome = 'filtered' AND trigger_key = $10::text
+                       AND due_at > now() - interval '24 hours' AND $3::text IS NOT NULL AND $4::text IS NOT NULL AND $5::text IS NOT NULL
+                       AND $6::int IS NOT NULL AND $7::int IS NOT NULL AND ($8::int IS NULL OR TRUE)".to_string();
         let add = format!("{} AND o.id = $9 ON CONFLICT DO NOTHING", INSERT.replace("{DUE}", DUE));
-        for q in [drop, add] {
+        let tk = trigger_key(&f.trigger);
+        for q in [drop, rearm, add] {
             sqlx::query(&q)
                 .bind(f.id)
                 .bind(account_id)
@@ -191,6 +220,7 @@ pub async fn schedule_object(conn: &mut PgConnection, account_id: Uuid, key: &st
                 .bind(a.hour)
                 .bind(a.offset_hours)
                 .bind(object_id)
+                .bind(&tk)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -205,12 +235,18 @@ pub async fn reschedule(db: &PgPool, account_id: Uuid) -> anyhow::Result<()> {
     for f in flows {
         let Ok(t) = flows::parse_trigger(&f.trigger) else { continue };
         let Some((key, a)) = date_args(&t) else { continue };
-        let q = format!(
-            "UPDATE flow_object_date_fires f SET due_at = d.due FROM objects o JOIN object_types t ON t.id = o.type_id AND t.key = $3::text {DUE}
-             WHERE f.flow_id = $1 AND f.account_id = $2 AND f.outcome = 'pending' AND o.id = f.object_id AND o.account_id = $2 AND x.day IS NOT NULL AND d.due IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM flow_object_date_fires g WHERE g.flow_id = f.flow_id AND g.object_id = f.object_id AND g.due_at = d.due)"
-        );
-        sqlx::query(&q).bind(f.id).bind(account_id).bind(&key).bind(&a.field).bind(&tz).bind(a.offset_days).bind(a.hour).bind(a.offset_hours).execute(db).await?;
+        // A pending fire whose new moment already has a fire (it ran, or is waiting) is obsolete;
+        // the others move to their new moment.
+        let moved = |set: &str, cond: &str| {
+            format!(
+                "UPDATE flow_object_date_fires f SET {set} FROM objects o JOIN object_types t ON t.id = o.type_id AND t.key = $3::text {DUE}
+                 WHERE f.flow_id = $1 AND f.account_id = $2 AND f.outcome = 'pending' AND o.id = f.object_id AND o.account_id = $2 AND x.day IS NOT NULL AND d.due IS NOT NULL
+                   AND d.due <> f.due_at AND {cond} EXISTS (SELECT 1 FROM flow_object_date_fires g WHERE g.flow_id = f.flow_id AND g.object_id = f.object_id AND g.due_at = d.due)"
+            )
+        };
+        for q in [moved("outcome = 'obsolete', fired_at = now()", ""), moved("due_at = d.due", "NOT")] {
+            sqlx::query(&q).bind(f.id).bind(account_id).bind(&key).bind(&a.field).bind(&tz).bind(a.offset_days).bind(a.hour).bind(a.offset_hours).execute(db).await?;
+        }
     }
     Ok(())
 }
@@ -240,17 +276,24 @@ pub async fn fire_due(state: &AppState, max: usize) -> anyhow::Result<()> {
 /// Claim one due fire and start its runs, in one transaction (the event-date claim).
 async fn fire_one(state: &AppState) -> anyhow::Result<bool> {
     let mut tx = state.db.begin().await?;
-    let claimed: Option<(Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT x.flow_id, x.object_id, x.due_at FROM flow_object_date_fires x JOIN flows fl ON fl.id = x.flow_id AND fl.status = 'live'
-         WHERE x.outcome = 'pending' AND x.due_at <= now()
-           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = x.account_id AND a.closed_at IS NOT NULL)
-         ORDER BY x.due_at LIMIT 1 FOR UPDATE OF x SKIP LOCKED",
+    // Each live flow's earliest due fire, from the (flow, due) index: paused flows' fires are never
+    // read. Inside the catch-up window only (older ones are missed).
+    let claimed: Option<(Uuid, Uuid, DateTime<Utc>, String, Uuid)> = sqlx::query_as(
+        "SELECT x.flow_id, x.object_id, x.due_at, x.trigger_key, fl.account_id FROM flows fl
+         CROSS JOIN LATERAL (SELECT f.flow_id, f.object_id, f.due_at, f.trigger_key FROM flow_object_date_fires f
+                             WHERE f.flow_id = fl.id AND f.outcome = 'pending' AND f.due_at <= now() AND f.due_at > now() - make_interval(hours => $1)
+                             ORDER BY f.due_at LIMIT 1 FOR UPDATE SKIP LOCKED) x
+         WHERE fl.status = 'live' AND fl.trigger->>'type' = 'object_date'
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = fl.account_id AND a.closed_at IS NOT NULL)
+         ORDER BY x.due_at LIMIT 1",
     )
+    .bind(flows::EVENT_DATE_CATCH_UP_HOURS as i32)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((flow_id, object_id, due)) = claimed else { return Ok(false) };
+    let Some((flow_id, object_id, due, key, account_id)) = claimed else { return Ok(false) };
+    super::hooks::pause(account_id, "fire_claimed").await;
     let f: FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1").bind(flow_id).fetch_one(&mut *tx).await?;
-    let (label, run, n) = match date_start(state, &mut tx, &f, object_id, due).await? {
+    let (label, run, n) = match date_start(state, &mut tx, &f, object_id, due, &key).await? {
         Ok((run, n)) => ("started", Some(run), n),
         Err(why) => (why, None, 0),
     };
@@ -306,20 +349,32 @@ async fn passes_profile_filter(state: &AppState, f: &FlowRow, def: &flows::FlowD
 
 /// Checks and starts for one object-date fire, inside the claiming transaction: one run per linked
 /// person (re-entry doesn't apply: each object's date starts the flow once).
-async fn date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, object_id: Uuid, due: DateTime<Utc>) -> anyhow::Result<Result<(Uuid, i32), &'static str>> {
-    let Ok(Trigger::ObjectDate { object_type, field, filters, relationship, .. }) = flows::parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
+/// Everything about a fire is checked again at claim, in the claim's transaction: the trigger is
+/// the one it was made for, the due moment recomputed from the object's current date (and the
+/// account's time zone) is this fire's, the object matches the filters, and each person still has
+/// the relationship the trigger asks for.
+async fn date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, object_id: Uuid, due: DateTime<Utc>, key: &str) -> anyhow::Result<Result<(Uuid, i32), &'static str>> {
+    let Ok(t) = flows::parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
+    if key != trigger_key(&f.trigger) {
+        return Ok(Err("obsolete"));
+    }
+    let Some((type_key, args)) = date_args(&t) else { return Ok(Err("not_started")) };
+    let Trigger::ObjectDate { field, filters, relationship, .. } = t else { return Ok(Err("not_started")) };
     let Some(o) = load_obj(tx, f.account_id, object_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else { return Ok(Err("not_started")) };
     // The type changed under the flow (another type, or the date field is now sensitive or gone).
-    if o.type_key != object_type.trim() || !o.rule_keys.iter().any(|k| k == field.trim()) {
+    if o.type_key != type_key || !o.rule_keys.iter().any(|k| k == field.trim()) {
         return Ok(Err("not_started"));
     }
     let tz = account_tz(&state.db, f.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    if !filters.iter().all(|flt| filter_matches(&o.fields, flt, &tz, Utc::now())) {
+    if due_now(tx, f.account_id, object_id, &type_key, &args, &tz).await? != Some(due) {
+        return Ok(Err("obsolete"));
+    }
+    if !filters.iter().all(|flt| rule_matches(&o.fields, &o.rule_keys, flt, &tz, Utc::now())) {
         return Ok(Err("filtered"));
     }
     let def = flows::parse_definition(&f.definition).map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let Some(entry) = def.entry.clone() else { return Ok(Err("not_started")) };
-    let ctx = json!({"object": {"id": object_id, "type": o.type_key, "external_id": o.external_id, "date_field": field, "date": o.fields.get(field.trim()), "due_at": due}});
+    let ctx = json!({"object": {"id": object_id, "type": o.type_key, "external_id": o.external_id, "date_field": field, "date": o.fields.get(field.trim()), "due_at": due, "trigger_key": key}});
     let mut first = None;
     let mut n = 0;
     for pid in linked(tx, object_id, relationship.as_deref()).await? {
@@ -388,6 +443,7 @@ pub async fn seed(state: &AppState, mut budget: i64) -> anyhow::Result<()> {
                     .bind(a.hour)
                     .bind(a.offset_hours)
                     .bind(&batch)
+                    .bind(trigger_key(&f.trigger))
                     .execute(&state.db)
                     .await?;
                 last = Some(*max);
@@ -478,7 +534,7 @@ pub async fn run_change(state: &AppState, change_id: Uuid) -> anyhow::Result<()>
                 }
             }
         }
-        if !filters.iter().all(|flt| filter_matches(&o.fields, flt, &tz, Utc::now())) {
+        if !filters.iter().all(|flt| rule_matches(&o.fields, &o.rule_keys, flt, &tz, Utc::now())) {
             continue;
         }
         change_start(state, &f, change_id, object_id, &o, &kind, &changed, relationship.as_deref()).await?;
@@ -515,22 +571,31 @@ async fn change_start(state: &AppState, f: &FlowRow, change_id: Uuid, object_id:
 
 // ---------- Runs ----------
 
+/// What rules (trigger filters, condition splits) may test about a run's object: the fields the
+/// type defines and doesn't mark sensitive, and the account's time zone.
+pub struct RuleCtx {
+    pub fields: Map<String, Value>,
+    pub keys: Vec<String>,
+    pub tz: String,
+}
+
 /// What [`check_run`] found.
 pub enum Check {
     /// Not an object run: nothing was read.
     NotObject,
     /// The person leaves the flow.
     Exit(&'static str),
-    /// The object as templates see it (`object.*`) and its fields (for condition splits).
-    Live { view: Value, fields: Map<String, Value>, tz: String },
+    /// The object as templates see it (`object.*`: never its sensitive fields) and what rules see.
+    Live { view: Value, rules: RuleCtx },
 }
 
-/// Before each step of a run that belongs to an object. Runs without one cost nothing.
+/// Before each step of a run that belongs to an object (the claim's rules again): the object still
+/// exists, the person still has the relationship the trigger asks for, the trigger is the one the
+/// run started under, a date run's due moment recomputed now is the one it started for, and the
+/// object matches the trigger's filters. Runs without an object cost nothing.
 pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uuid) -> anyhow::Result<Check> {
     let Some(object_id) = context.get("object").and_then(|o| o.get("id")).and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(Check::NotObject) };
     let trigger = flows::parse_trigger(&f.trigger);
-    // The person must still have the relationship the trigger asks for (a guest moved off the
-    // booking leaves its flows).
     let rel = match &trigger {
         Ok(Trigger::ObjectDate { relationship, .. } | Trigger::Object { relationship, .. }) => relationship.as_deref().map(|r| r.trim().to_lowercase()),
         _ => None,
@@ -548,39 +613,47 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     .await?;
     let Some((key, external_id, all, is_linked, tz, defs)) = row else { return Ok(Check::Exit("object deleted")) };
     if !is_linked {
-        return Ok(Check::Exit("no longer linked to the object"));
+        return Ok(Check::Exit("no longer linked to the object that way"));
     }
     let all = all.as_object().cloned().unwrap_or_default();
-    // Rules see only the fields they may test; messages see them all.
     let defs: Vec<super::types::FieldDef> = serde_json::from_value(defs).unwrap_or_default();
-    let fields: Map<String, Value> = all.iter().filter(|(k, _)| defs.iter().any(|d| &d.key == *k && !d.sensitive)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let keys: Vec<String> = defs.iter().filter(|d| !d.sensitive).map(|d| d.key.clone()).collect();
+    let fields: Map<String, Value> = all.iter().filter(|(k, _)| keys.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
     let tz = tz.and_then(|t| t.parse::<chrono_tz::Tz>().ok()).unwrap_or(chrono_tz::America::Los_Angeles).name().to_string();
+    let started_under = context["object"].get("trigger_key").and_then(Value::as_str);
     let filters = match trigger {
-        Ok(Trigger::ObjectDate { object_type, field, filters, .. }) if object_type.trim() == key => {
-            let started = context["object"].get("date").cloned().unwrap_or(Value::Null);
-            if context["object"]["date_field"].as_str() == Some(field.trim()) && all.get(field.trim()).cloned().unwrap_or(Value::Null) != started {
+        Ok(t @ Trigger::ObjectDate { .. }) => {
+            let Some((type_key, args)) = date_args(&t) else { return Ok(Check::Exit("trigger changed")) };
+            let Trigger::ObjectDate { filters, .. } = t else { return Ok(Check::Exit("trigger changed")) };
+            if type_key != key || started_under.is_some_and(|k| k != trigger_key(&f.trigger)) || !keys.contains(&args.field) {
+                return Ok(Check::Exit("trigger changed"));
+            }
+            let started: Option<DateTime<Utc>> = context["object"].get("due_at").and_then(|v| serde_json::from_value(v.clone()).ok());
+            let mut conn = db.acquire().await?;
+            if started.is_none() || due_now(&mut conn, f.account_id, object_id, &type_key, &args, &tz).await? != started {
                 return Ok(Check::Exit("date moved"));
             }
             filters
         }
         Ok(Trigger::Object { object_type, filters, .. }) if object_type.trim() == key => filters,
-        _ => Vec::new(),
+        _ => return Ok(Check::Exit("trigger changed")),
     };
-    if !filters.iter().all(|flt| filter_matches(&fields, flt, &tz, Utc::now())) {
+    if !filters.iter().all(|flt| rule_matches(&fields, &keys, flt, &tz, Utc::now())) {
         return Ok(Check::Exit("no longer matches the trigger"));
     }
-    let mut view = all;
+    let mut view = fields.clone();
     view.entry("external_id").or_insert(json!(external_id));
     view.entry("type").or_insert(json!(key));
-    Ok(Check::Live { view: Value::Object(view), fields, tz })
+    Ok(Check::Live { view: Value::Object(view), rules: RuleCtx { fields, keys, tz } })
 }
 
-/// A flow condition split's `object_filters` (all must hold) against the run's object.
-pub fn condition(node: &flows::Node, object: Option<(&Map<String, Value>, &str)>) -> Option<bool> {
+/// A flow condition split's `object_filters` (all must hold) against the run's object; a rule on a
+/// field rules can't test never holds.
+pub fn condition(node: &flows::Node, object: Option<&RuleCtx>) -> Option<bool> {
     let raw = node.data.get("object_filters")?;
     let filters: Vec<Filter> = serde_json::from_value(raw.clone()).unwrap_or_default();
     Some(match object {
-        Some((fields, tz)) => filters.iter().all(|f| filter_matches(fields, f, tz, Utc::now())),
+        Some(r) => filters.iter().all(|f| rule_matches(&r.fields, &r.keys, f, &r.tz, Utc::now())),
         None => false,
     })
 }
@@ -613,6 +686,12 @@ fn when(v: &Value) -> Option<When> {
 
 fn days(v: &Option<Value>) -> f64 {
     v.as_ref().and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0.0)
+}
+
+/// [`filter_matches`] that fails closed: a rule on a field the type doesn't define, or marks
+/// sensitive, never holds (whatever its operator, `not_exists` and `neq` included).
+pub fn rule_matches(fields: &Map<String, Value>, keys: &[String], f: &Filter, tz: &str, now: DateTime<Utc>) -> bool {
+    keys.iter().any(|k| k == f.field.trim()) && filter_matches(fields, f, tz, now)
 }
 
 /// One field rule on an object's fields. Dates are compared as dates: a plain date by calendar day
