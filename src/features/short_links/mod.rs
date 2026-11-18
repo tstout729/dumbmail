@@ -97,18 +97,18 @@ async fn click(State(state): State<AppState>, headers: HeaderMap, Path(path): Pa
         return not_found();
     }
     let ip = crate::public::client_ip(&headers);
-    let slot = match limit::LIMITER.admit(ip.as_deref()) {
-        Ok(slot) => slot,
+    let admitted = match limit::LIMITER.admit(ip.as_deref()) {
+        Ok(admitted) => admitted,
         Err(limit::Refused::TooMany) => return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response(),
         Err(limit::Refused::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "busy, try again").into_response(),
     };
     let rows = sqlx::query_as::<_, (String, Uuid)>(LOOKUP_SQL).bind(target).bind(message_ref).fetch_all(&state.db).await;
-    drop(slot);
     let found = rows.ok().and_then(|rows| rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag)));
     let Some((url, message_id)) = found else {
-        limit::LIMITER.missed(ip.as_deref());
+        // The miss keeps its count against the address.
         return not_found();
     };
+    admitted.valid(&limit::LIMITER);
     // Only ever a destination the send path stored for this account.
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return not_found();
