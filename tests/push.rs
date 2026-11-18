@@ -209,10 +209,12 @@ macro_rules! push_harness {
     };
 }
 
-const ZONES: &[&str] = &["America/Los_Angeles", "America/New_York", "Europe/London", "Europe/Berlin", "Asia/Dubai", "Asia/Kolkata", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney", "Pacific/Auckland", "Pacific/Honolulu", "America/Anchorage"];
-
-/// A time zone where the local hour is in `hours` now.
+/// A time zone where the local hour is in `hours` now (the fixed-offset zones cover every hour).
 fn zone_where(hours: std::ops::Range<u32>) -> &'static str {
+    const ZONES: &[&str] = &[
+        "Etc/GMT+12", "Etc/GMT+11", "Etc/GMT+10", "Etc/GMT+9", "Etc/GMT+8", "Etc/GMT+7", "Etc/GMT+6", "Etc/GMT+5", "Etc/GMT+4", "Etc/GMT+3", "Etc/GMT+2", "Etc/GMT+1",
+        "Etc/GMT", "Etc/GMT-1", "Etc/GMT-2", "Etc/GMT-3", "Etc/GMT-4", "Etc/GMT-5", "Etc/GMT-6", "Etc/GMT-7", "Etc/GMT-8", "Etc/GMT-9", "Etc/GMT-10", "Etc/GMT-11", "Etc/GMT-12",
+    ];
     ZONES
         .iter()
         .copied()
