@@ -1,0 +1,208 @@
+{
+  "description": "a paid order cancelled: Cancelled Order once",
+  "doc": "https://woocommerce.github.io/woocommerce-rest-api-docs/#retrieve-an-order (example response, personal data replaced)",
+  "expect": [
+    {
+      "email": "riley.example@example.com",
+      "first_name": "Riley",
+      "last_name": "Example",
+      "phone_number": "+14155550142",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Placed Order",
+      "profile": {
+        "email": "riley.example@example.com"
+      },
+      "properties": {
+        "currency": "USD",
+        "item_count": 3,
+        "items": [
+          {
+            "name": "Woo Single #1",
+            "product_id": 93,
+            "quantity": 2,
+            "total": 6
+          },
+          {
+            "name": "Ship Your Idea &ndash; Color: Black, Size: M Test",
+            "product_id": 22,
+            "quantity": 1,
+            "sku": "Bar3",
+            "total": 12,
+            "variation_id": 23
+          }
+        ],
+        "order_id": 727,
+        "order_number": "727",
+        "status": "cancelled"
+      },
+      "time": "2017-03-22T19:28:08Z",
+      "type": "track_event",
+      "unique_id": "woocommerce:order:727:placed",
+      "value": 29.35
+    },
+    {
+      "metric": "Cancelled Order",
+      "profile": {
+        "email": "riley.example@example.com"
+      },
+      "properties": {
+        "currency": "USD",
+        "order_id": 727,
+        "order_number": "727",
+        "status": "cancelled"
+      },
+      "time": "2017-03-22T20:00:00Z",
+      "type": "track_event",
+      "unique_id": "woocommerce:order:727:cancelled",
+      "value": 29.35
+    }
+  ],
+  "input": {
+    "headers": {
+      "x-wc-webhook-event": "updated",
+      "x-wc-webhook-id": "142",
+      "x-wc-webhook-resource": "order",
+      "x-wc-webhook-source": "https://shop.example.com/",
+      "x-wc-webhook-topic": "order.updated"
+    },
+    "payload": {
+      "billing": {
+        "address_1": "1 Test Street",
+        "address_2": "",
+        "city": "San Francisco",
+        "company": "",
+        "country": "US",
+        "email": "riley.example@example.com",
+        "first_name": "Riley",
+        "last_name": "Example",
+        "phone": "(415) 555-0142",
+        "postcode": "94103",
+        "state": "CA"
+      },
+      "cart_hash": "",
+      "cart_tax": "1.35",
+      "coupon_lines": [],
+      "created_via": "rest-api",
+      "currency": "USD",
+      "customer_id": 0,
+      "customer_ip_address": "203.0.113.77",
+      "customer_note": "",
+      "customer_user_agent": "Mozilla/5.0 (test)",
+      "date_completed": null,
+      "date_completed_gmt": null,
+      "date_created": "2017-03-22T16:28:02",
+      "date_created_gmt": "2017-03-22T19:28:02",
+      "date_modified": "2017-03-22T16:28:08",
+      "date_modified_gmt": "2017-03-22T20:00:00",
+      "date_paid": "2017-03-22T16:28:08",
+      "date_paid_gmt": "2017-03-22T19:28:08",
+      "discount_tax": "0.00",
+      "discount_total": "0.00",
+      "fee_lines": [],
+      "id": 727,
+      "line_items": [
+        {
+          "id": 315,
+          "meta_data": [],
+          "name": "Woo Single #1",
+          "price": 3,
+          "product_id": 93,
+          "quantity": 2,
+          "sku": "",
+          "subtotal": "6.00",
+          "subtotal_tax": "0.45",
+          "tax_class": "",
+          "taxes": [
+            {
+              "id": 75,
+              "subtotal": "0.45",
+              "total": "0.45"
+            }
+          ],
+          "total": "6.00",
+          "total_tax": "0.45",
+          "variation_id": 0
+        },
+        {
+          "id": 316,
+          "meta_data": [
+            {
+              "id": 2095,
+              "key": "pa_color",
+              "value": "black"
+            }
+          ],
+          "name": "Ship Your Idea &ndash; Color: Black, Size: M Test",
+          "price": 12,
+          "product_id": 22,
+          "quantity": 1,
+          "sku": "Bar3",
+          "subtotal": "12.00",
+          "subtotal_tax": "0.90",
+          "tax_class": "",
+          "taxes": [
+            {
+              "id": 75,
+              "subtotal": "0.9",
+              "total": "0.9"
+            }
+          ],
+          "total": "12.00",
+          "total_tax": "0.90",
+          "variation_id": 23
+        }
+      ],
+      "meta_data": [
+        {
+          "id": 13106,
+          "key": "_download_permissions_granted",
+          "value": "yes"
+        },
+        {
+          "id": 13107,
+          "key": "_gateway_token",
+          "value": "SECRET-TOKEN-WC-0001"
+        }
+      ],
+      "number": "727",
+      "order_key": "wc_order_58d2d042d1d",
+      "parent_id": 0,
+      "payment_method": "bacs",
+      "payment_method_title": "Direct Bank Transfer",
+      "prices_include_tax": false,
+      "refunds": [],
+      "shipping": {
+        "address_1": "1 Test Street",
+        "address_2": "",
+        "city": "San Francisco",
+        "company": "",
+        "country": "US",
+        "first_name": "Riley",
+        "last_name": "Example",
+        "postcode": "94103",
+        "state": "CA"
+      },
+      "shipping_lines": [
+        {
+          "id": 317,
+          "meta_data": [],
+          "method_id": "flat_rate",
+          "method_title": "Flat Rate",
+          "taxes": [],
+          "total": "10.00",
+          "total_tax": "0.00"
+        }
+      ],
+      "shipping_tax": "0.00",
+      "shipping_total": "10.00",
+      "status": "cancelled",
+      "tax_lines": [],
+      "total": "29.35",
+      "total_tax": "1.35",
+      "transaction_id": "",
+      "version": "3.0.0"
+    }
+  }
+}

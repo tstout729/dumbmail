@@ -1,0 +1,55 @@
+{
+  "description": "adjustment.created: a refund pending approval isn't counted",
+  "doc": "https://developer.paddle.com/webhooks/adjustments/adjustment-updated (example; status set to approved, as the event fires when a refund is approved)",
+  "expect": [
+    {
+      "message": "refund adj_01hvgf2s84dr6reszzg29zbvcm is pending_approval; it's recorded when Paddle approves it",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "action": "refund",
+        "created_at": "2024-04-15T08:48:20.239695Z",
+        "credit_applied_to_balance": null,
+        "currency_code": "USD",
+        "customer_id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
+        "id": "adj_01hvgf2s84dr6reszzg29zbvcm",
+        "items": [
+          {
+            "amount": "100",
+            "id": "adjitm_01hvgf2s84dr6reszzg2gx70gj",
+            "item_id": "txnitm_01hvcc94b7qgz60qmrqmbm19zw",
+            "proration": null,
+            "totals": {
+              "subtotal": "92",
+              "tax": "8",
+              "total": "100"
+            },
+            "type": "partial"
+          }
+        ],
+        "payout_totals": null,
+        "reason": "error",
+        "status": "pending_approval",
+        "subscription_id": "sub_01hv8x29kz0t586xy6zn1a62ny",
+        "totals": {
+          "currency_code": "USD",
+          "earnings": "87",
+          "fee": "5",
+          "retained_fee": "5",
+          "subtotal": "92",
+          "tax": "8",
+          "total": "100"
+        },
+        "transaction_id": "txn_01hv8wptq8987qeep44cyrewp9",
+        "updated_at": "2024-04-15T08:48:20.239695Z"
+      },
+      "event_id": "evt_01hvgf2s9pending000000000",
+      "event_type": "adjustment.created",
+      "notification_id": "ntf_01hvgfdfhwncqrrjz1nz5eky9a",
+      "occurred_at": "2024-04-15T08:54:10.646377Z"
+    }
+  }
+}

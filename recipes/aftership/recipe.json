@@ -1,0 +1,108 @@
+{
+  "key": "aftership",
+  "name": "AfterShip",
+  "category": "Shipping",
+  "description": "AfterShip tracking updates become events on the shipment's customer: Shipment In Transit, Out For Delivery, Delivered and Shipment Exception, once per shipment and status, with the courier, tracking link and expected delivery date. Customers are held back from marketing: a shipment isn't consent.",
+  "metrics": [
+    "Shipment In Transit",
+    "Out For Delivery",
+    "Delivered",
+    "Shipment Exception"
+  ],
+  "docs": [
+    "https://www.aftership.com/docs/tracking/webhook/webhook-signature",
+    "https://www.aftership.com/docs/tracking/webhook/webhook-payload",
+    "https://www.aftership.com/docs/tracking/enum/delivery-statuses"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "aftership-hmac-sha256",
+    "encoding": "base64"
+  },
+  "signature_secret": {
+    "label": "AfterShip webhook secret",
+    "help": "AfterShip \u2192 Tracking \u2192 Settings \u2192 Webhooks \u2192 Webhook secret."
+  },
+  "message_id": {
+    "field": "event_id"
+  },
+  "credentials": [],
+  "settings": {
+    "recipient_role": "buyer"
+  },
+  "pull": null,
+  "redact": [
+    "**.destination_raw_location",
+    "**.origin_raw_location",
+    "**.destination_postal_code",
+    "**.coordinate",
+    "**.proof_of_delivery",
+    "**.signed_by",
+    "**.pickup_note",
+    "**.note",
+    "msg.customers[].name",
+    "**.emails",
+    "**.smses",
+    "**.subscribed_emails",
+    "**.subscribed_smses",
+    "**.aftership_tracking_order_url"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In AfterShip, go to Tracking \u2192 Settings \u2192 Webhooks, add the webhook URL, and tick the In transit, Out for delivery, Delivered, Exception and Failed attempt updates. Save.",
+    "Copy the webhook secret shown on the same page and save it as the integration's signing secret.",
+    "Events go to the shipment's customer whose role is recipient_role in the settings: buyer by default, or set it to receiver. Customers with other roles get nothing.",
+    "Add a shipment with a customer email (or use AfterShip's test webhook) and check the delivery log.",
+    "Review the draft out-for-delivery flow and turn it on. It's a service message about the customer's own order, so it reaches people held back from marketing."
+  ],
+  "flows": [
+    {
+      "name": "AfterShip: out for delivery",
+      "description": "When a shipment is out for delivery, tells the customer it arrives today, with the tracking link. Not sent once AfterShip reports any later state (back in transit, delivered or an exception), even when the updates arrive out of order. A service message about their own order.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Out For Delivery",
+        "key": "shipment_id",
+        "cancelled_by": [
+          "Delivered",
+          "Shipment Exception",
+          "Shipment In Transit"
+        ]
+      },
+      "definition": {
+        "entry": "o1",
+        "settings": {
+          "service_messages": true,
+          "reentry": "always"
+        },
+        "nodes": [
+          {
+            "id": "o1",
+            "type": "email",
+            "name": "Out for delivery",
+            "next": null,
+            "content": {
+              "subject": "Your order arrives today",
+              "preheader": "Track it with {{ event.properties.courier|default('the courier') }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "It's on the way to you"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, your package is out for delivery today.</p>"
+                },
+                {
+                  "type": "button",
+                  "text": "Track my package",
+                  "href": "{{ event.properties.tracking_url }}"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

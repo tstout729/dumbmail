@@ -1,0 +1,85 @@
+{
+  "key": "square",
+  "name": "Square",
+  "category": "Payments",
+  "description": "Square orders become Placed Order once they're fully paid (counted once, in full, even when paid in several parts), and refunds Refunded Order (once per refund, its own amount, when completed). Square customers become profiles held back from marketing, and customers who unsubscribed from Square's marketing emails are never sent marketing here.",
+  "metrics": [
+    {"name": "Placed Order", "purchase": true},
+    "Refunded Order"
+  ],
+  "docs": [
+    "https://developer.squareup.com/docs/webhooks/step3validate",
+    "https://developer.squareup.com/docs/webhooks/overview",
+    "https://developer.squareup.com/reference/square/payments-api/webhooks/payment.updated",
+    "https://developer.squareup.com/reference/square/refunds-api/webhooks/refund.updated",
+    "https://developer.squareup.com/reference/square/customers-api/webhooks/customer.created",
+    "https://developer.squareup.com/reference/square/objects/Payment",
+    "https://developer.squareup.com/docs/build-basics/common-data-types/working-with-monetary-amounts",
+    "https://developer.squareup.com/reference/square/orders-api/retrieve-order",
+    "https://developer.squareup.com/reference/square/objects/Order"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "x-square-hmacsha256-signature",
+    "encoding": "base64",
+    "sign_url": true
+  },
+  "signature_secret": {
+    "label": "Square signature key",
+    "help": "In the Square Developer Console: your application \u2192 Webhooks \u2192 Subscriptions \u2192 your subscription \u2192 Signature key."
+  },
+  "message_id": {
+    "field": "event_id"
+  },
+  "credentials": [
+    {
+      "name": "access_token",
+      "label": "Square access token",
+      "help": "Square Developer Console \u2192 your application \u2192 Credentials \u2192 Production access token (it needs ORDERS_READ). Used only to read the order a payment belongs to."
+    }
+  ],
+  "settings": {},
+  "pull": {
+    "method": "GET",
+    "url": "https://connect.squareup.com/v2/locations",
+    "headers": {
+      "Square-Version": "2026-09-16"
+    },
+    "auth": {
+      "type": "bearer",
+      "token": "{{secret.access_token}}"
+    },
+    "fetch": {
+      "prefix": "/v2/",
+      "paths": [
+        "/v2/orders/{id}"
+      ],
+      "id": "^[A-Za-z0-9_-]{1,64}$",
+      "context": [
+        "who"
+      ]
+    }
+  },
+  "redact": [
+    "**.card_details",
+    "**.card",
+    "**.bank_account_details",
+    "**.wallet_details",
+    "**.buy_now_pay_later_details",
+    "**.fingerprint",
+    "**.birthday",
+    "**.address",
+    "**.billing_address",
+    "**.shipping_address"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In the Square Developer Console, open your application \u2192 Webhooks \u2192 Subscriptions \u2192 Add subscription. Paste the webhook URL exactly as shown (Square signs the URL too, so it must match character for character).",
+    "Tick these events: payment.created, payment.updated, refund.created, refund.updated, customer.created, customer.updated. Save.",
+    "Copy the subscription's Signature key and save it as the integration's signing secret.",
+    "Save your application's production access token (Credentials page, with ORDERS_READ) as the credential access_token. DumbMail uses it only to read the order each completed payment belongs to, so an order paid in several parts counts once, in full.",
+    "Send a test event from the subscription and check the delivery log. Square's resends of an event are recognized by its event_id.",
+    "Buyers are held back from marketing (Square doesn't record a marketing opt-in). People who unsubscribed from Square's marketing emails are suppressed here too."
+  ],
+  "flows": []
+}

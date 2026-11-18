@@ -1,0 +1,32 @@
+{
+  "description": "store/order/refund/created: fetch the refund",
+  "doc": "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events (example payloads; store hash filled in)",
+  "expect": [
+    {
+      "context": {
+        "webhook_order_id": "218"
+      },
+      "type": "next_request",
+      "url": "/stores/abc123/v3/orders/218/payment_actions/refunds/12"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": 1561479335,
+      "data": {
+        "id": 218,
+        "refund": {
+          "refund_id": 12
+        },
+        "type": "order"
+      },
+      "hash": "cb07cdbdda8b1965e812693d5988154807eeed02",
+      "producer": "stores/abc123",
+      "scope": "store/order/refund/created",
+      "store_id": "1025646"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    }
+  }
+}

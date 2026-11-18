@@ -1,0 +1,87 @@
+{
+  "description": "a response without an email answer is logged",
+  "doc": "https://www.typeform.com/developers/webhooks/example-payload/ (example, trimmed to a few answers; personal data replaced)",
+  "expect": [
+    {
+      "message": "response b0000000000000000000000000000000 has no email answer",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "event_id": "noemail0001",
+      "event_type": "form_response",
+      "form_response": {
+        "answers": [
+          {
+            "choice": {
+              "id": "Cp4aKzvlPmVT",
+              "label": "Other",
+              "other": "OTHER-typed-by-respondent",
+              "ref": "other"
+            },
+            "field": {
+              "id": "k6TP9oLGgHjl",
+              "ref": "readable_ref_choice",
+              "type": "multiple_choice"
+            },
+            "type": "choice"
+          },
+          {
+            "boolean": true,
+            "field": {
+              "id": "gFFf3xAkJKsr",
+              "ref": "readable_ref_yes_no",
+              "type": "yes_no"
+            },
+            "type": "boolean"
+          }
+        ],
+        "calculated": {
+          "score": 9
+        },
+        "definition": {
+          "fields": [
+            {
+              "id": "DlXFaesGBpoF",
+              "properties": {},
+              "ref": "readable_ref_long_text",
+              "title": "Thanks, {{answer_60906475}}! What's it like being a new user?",
+              "type": "long_text"
+            },
+            {
+              "id": "SMEUb7VJz92Q",
+              "properties": {},
+              "ref": "readable_ref_email",
+              "title": "What is your email address?",
+              "type": "email"
+            },
+            {
+              "id": "k6TP9oLGgHjl",
+              "properties": {},
+              "ref": "readable_ref_choice",
+              "title": "Which of these do you prefer?",
+              "type": "multiple_choice"
+            },
+            {
+              "id": "gFFf3xAkJKsr",
+              "properties": {},
+              "ref": "readable_ref_yes_no",
+              "title": "Can we send you news and offers by email?",
+              "type": "yes_no"
+            }
+          ],
+          "id": "lT4Z3j",
+          "title": "Webhooks example"
+        },
+        "form_id": "lT4Z3j",
+        "hidden": {
+          "user_id": "HIDDEN-abc123456"
+        },
+        "landed_at": "2018-01-18T18:07:02Z",
+        "submitted_at": "2018-01-18T18:17:02Z",
+        "token": "b0000000000000000000000000000000"
+      }
+    }
+  }
+}

@@ -168,13 +168,26 @@ async fn get_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
     Ok(Json(profile_detail(&state, ctx.account_id, id).await?))
 }
 
+/// A profile as an identity write saved it, with the consent that write replaced.
+#[derive(sqlx::FromRow)]
+struct IdentitySaved {
+    #[sqlx(flatten)]
+    profile: Profile,
+    old_email_consent: String,
+    old_sms_consent: String,
+}
+
 pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut body: Value) -> AppResult<Profile> {
-    load_profile(state, account_id, id).await?;
+    let before = load_profile(state, account_id, id).await?;
     body["id"] = json!(id);
     let input: ProfileInput = serde_json::from_value(body)?;
-    // Updating by id: identity fields in the body change this profile rather than selecting another.
-    let up = core::upsert_profile(&state.db, account_id, &ProfileInput { email: None, phone_number: None, external_id: None, ..input.clone() }).await?;
-    let p = up.profile;
+    // Everything is checked before anything is written: the consent values, the new email and
+    // number, and that no other profile already uses them.
+    for c in [&input.email_consent, &input.sms_consent].into_iter().flatten() {
+        if !crate::models::valid_consent(c) {
+            return Err(AppError::bad("consent must be subscribed, unsubscribed or never_subscribed"));
+        }
+    }
     let email = match input.email.as_deref() {
         Some("") => Some(None),
         Some(e) => Some(Some(crate::models::normalize_email(e).ok_or_else(|| AppError::bad("invalid email"))?)),
@@ -185,31 +198,55 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         Some(ph) => Some(Some(crate::models::normalize_phone(ph).ok_or_else(|| AppError::bad("invalid phone number"))?)),
         None => None,
     };
-    if email.is_some() || phone.is_some() || input.external_id.is_some() {
+    let taken = || AppError::Conflict("another profile already uses that email, phone number or external id".into());
+    let identity = email.is_some() || phone.is_some() || input.external_id.is_some();
+    if identity {
+        let used: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND id <> $2 AND (email = $3 OR phone_number = $4 OR external_id = $5))")
+            .bind(account_id)
+            .bind(id)
+            .bind(email.clone().flatten())
+            .bind(phone.clone().flatten())
+            .bind(&input.external_id)
+            .fetch_one(&state.db)
+            .await?;
+        if used {
+            return Err(taken());
+        }
+        // The identity, and the SMS consent that goes with the number, in one statement: a
+        // different number (or a first one) hasn't agreed to texts, so a subscription doesn't carry
+        // over to it unless this request sets the SMS consent itself.
         let q = format!(
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
-               external_id = COALESCE($6, p.external_id), updated_at = now() WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+               sms_consent = CASE WHEN $7::text IS NOT NULL THEN $7
+                                  WHEN $4 AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed'
+                                  ELSE p.sms_consent END,
+               external_id = COALESCE($6, p.external_id), updated_at = now()
+             FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 AND account_id = $8 FOR UPDATE) old
+             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
         );
-        let saved = sqlx::query_as::<_, Profile>(&q)
+        let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
             .bind(email.is_some())
             .bind(email.flatten())
             .bind(phone.is_some())
             .bind(phone.flatten())
             .bind(&input.external_id)
+            .bind(&input.sms_consent)
+            .bind(account_id)
             .fetch_one(&state.db)
             .await
             .map_err(|e| match AppError::from(e) {
-                AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
+                AppError::Conflict(_) => taken(),
                 other => other,
             })?;
-        // This statement doesn't touch consent (the save above reported any consent change), so
-        // it reports none.
-        let consent = (saved.email_consent.as_str(), saved.sms_consent.as_str());
-        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), Some(consent), &saved, core::EventSource::Api).await;
-        return Ok(saved);
+        // The consent this write replaced, as the write itself read it.
+        let consent = (saved.old_email_consent.as_str(), saved.old_sms_consent.as_str());
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&before), Some(consent), &saved.profile, core::EventSource::Api).await;
     }
-    Ok(p)
+    // The rest (names, properties, email consent, and the SMS consent when no identity changed).
+    // Updating by id: identity fields in the body change this profile rather than selecting another.
+    let rest = ProfileInput { email: None, phone_number: None, external_id: None, sms_consent: if identity { None } else { input.sms_consent.clone() }, ..input };
+    Ok(core::upsert_profile(&state.db, account_id, &rest).await?.profile)
 }
 
 async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {

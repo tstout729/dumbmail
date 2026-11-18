@@ -64,6 +64,14 @@ pub struct Consent {
     pub subscribed: bool,
     /// Where the opt-in (or opt-out) happened, e.g. "Stripe Checkout marketing checkbox".
     pub source: String,
+    /// The app's own time for this preference. A change older than the last one this integration
+    /// applied for the person is ignored, so preferences apply in the app's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// With `subscribed: false`: withdraw only a subscription this integration made (the person's
+    /// latest opt-in came from it); consent from anywhere else is left alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_own: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -91,6 +99,21 @@ pub struct UpsertProfile {
     /// action finds them with `profile: {property: <key>, value: <id>}`. Not shown as properties.
     #[serde(default)]
     pub keys: Option<Map<String, Value>>,
+    /// One of `keys`: the person who already holds that value (one profile only) is the one
+    /// updated, when nobody has the `external_id` yet (profiles keyed before an external id was used).
+    #[serde(default)]
+    pub match_key: Option<String>,
+    /// `true`: an existing profile that has an email keeps it; a call naming another address
+    /// doesn't change it (the delivery's log says so).
+    #[serde(default)]
+    pub keep_email: bool,
+}
+
+/// Key names DumbMail keeps its own consent bookkeeping under: a script can't write them.
+pub const RESERVED_KEY_PREFIX: &str = "consent_";
+
+fn reserved_key(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(RESERVED_KEY_PREFIX)
 }
 
 /// Most values kept per key in an `upsert_profile`'s `keys`.
@@ -156,6 +179,15 @@ pub struct Suppress {
     pub email: Option<String>,
     #[serde(default, alias = "phone")]
     pub phone_number: Option<String>,
+}
+
+/// Add ids to the `keys` of a person found another way (by a key or property, say), so later
+/// actions find them by these ids too: a payment that names only its customer, say.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddKeys {
+    pub profile: Who,
+    pub keys: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -240,7 +272,9 @@ pub struct DeleteObject {
     pub external_id: String,
 }
 
-/// Pull runs only: fetch another page. Fields given replace the previous request's; `query` merges.
+/// Fetch another page (pulls), or fetch the record a webhook names (webhooks of an integration with
+/// pull settings, which give the site and the credentials). Fields given replace the previous
+/// request's; `query` merges. `context` is handed to the script run on the answer, as `input.context`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NextRequest {
@@ -254,7 +288,12 @@ pub struct NextRequest {
     pub headers: Option<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
 }
+
+/// Largest `context` a `next_request` may carry to the next run.
+pub const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -264,14 +303,21 @@ pub enum Action {
     RemoveFromList(ListAction),
     Unsubscribe(Unsubscribe),
     Suppress(Suppress),
+    AddKeys(AddKeys),
     SetState(SetState),
     Log(Log),
     NextRequest(NextRequest),
+    /// A lookup of a record (same shape as `next_request`, checked against the integration's fetch
+    /// rules): unlike `next_request` there can be several, in a pull as well as a webhook.
+    Lookup(NextRequest),
     UpsertObject(UpsertObject),
     DeleteObject(DeleteObject),
 }
 
-pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "set_state", "log", "next_request", "upsert_object", "delete_object"];
+/// Most lookups one run may ask for.
+pub const MAX_LOOKUPS: usize = 100;
+
+pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request", "lookup", "upsert_object", "delete_object"];
 
 fn part<T: DeserializeOwned>(i: usize, kind: &str, v: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(v)).map_err(|e| format!("action {i} ({kind}): {e}"))
@@ -328,6 +374,9 @@ fn check_who(i: usize, kind: &str, w: &Who) -> Result<(), String> {
             if p.is_empty() || p.len() > 100 {
                 return Err(format!("action {i} ({kind}): profile.property must be 1-100 characters"));
             }
+            if reserved_key(p) {
+                return Err(format!("action {i} ({kind}): profile.property can't be one of DumbMail's own keys ({RESERVED_KEY_PREFIX}…)"));
+            }
             if w.value.as_ref().is_none_or(|v| v.is_null() || v.is_object() || v.is_array()) {
                 return Err(format!("action {i} ({kind}): profile.property needs a plain `value` to match"));
             }
@@ -340,7 +389,8 @@ fn check_who(i: usize, kind: &str, w: &Who) -> Result<(), String> {
     }
 }
 
-/// Parse and validate a script's result. `pull` allows `next_request`.
+/// Parse and validate a script's result. `pull` allows `next_request` (pulls, and webhooks of an
+/// integration that can fetch).
 pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
     let items = match result {
         Value::Null => return Ok(Vec::new()),
@@ -372,6 +422,12 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     return Err(format!("action {i} ({k}): needs an email, phone_number or external_id"));
                 }
                 for c in &a.consent {
+                    if c.as_of.as_deref().is_some_and(|t| parse_time(t).is_none()) {
+                        return Err(format!("action {i} ({k}): consent as_of must be an ISO 8601 date-time"));
+                    }
+                    if c.only_own && c.subscribed {
+                        return Err(format!("action {i} ({k}): consent only_own goes with subscribed: false"));
+                    }
                     if c.source.trim().is_empty() || c.source.len() > 200 {
                         return Err(format!("action {i} ({k}): each consent needs a `source` (1-200 characters) saying where they opted in"));
                     }
@@ -400,6 +456,14 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                         if name.is_empty() || name.len() > 100 || !ok {
                             return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
                         }
+                        if reserved_key(name) {
+                            return Err(format!("action {i} ({k}): key names starting with {RESERVED_KEY_PREFIX} are DumbMail's own"));
+                        }
+                    }
+                }
+                if let Some(m) = &a.match_key {
+                    if !a.keys.as_ref().is_some_and(|keys| keys.contains_key(m)) {
+                        return Err(format!("action {i} ({k}): match_key must name one of the action's keys"));
                     }
                 }
                 Action::UpsertProfile(a)
@@ -447,6 +511,23 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     return Err(format!("action {i} ({k}): needs an email or phone_number"));
                 }
                 Action::Suppress(a)
+            }
+            "add_keys" => {
+                let a: AddKeys = part(i, k, obj)?;
+                check_who(i, k, &a.profile)?;
+                if a.keys.is_empty() || a.keys.len() > 20 {
+                    return Err(format!("action {i} ({k}): give 1 to 20 keys"));
+                }
+                for (name, v) in &a.keys {
+                    let ok = v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200);
+                    if name.is_empty() || name.len() > 100 || !ok {
+                        return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
+                    }
+                    if reserved_key(name) {
+                        return Err(format!("action {i} ({k}): key names starting with {RESERVED_KEY_PREFIX} are DumbMail's own"));
+                    }
+                }
+                Action::AddKeys(a)
             }
             "upsert_object" => {
                 let a: UpsertObject = part(i, k, obj)?;
@@ -498,9 +579,12 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
             }
             "next_request" => {
                 if !pull {
-                    return Err(format!("action {i} (next_request): only pulls can fetch another page"));
+                    return Err(format!("action {i} (next_request): only pulls, and webhooks of an integration with pull settings, can fetch"));
                 }
                 let a: NextRequest = part(i, k, obj)?;
+                if a.context.as_ref().is_some_and(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0) > MAX_CONTEXT_BYTES) {
+                    return Err(format!("action {i} (next_request): context is over 16 KB"));
+                }
                 if let Some(m) = &a.method {
                     if !matches!(m.to_ascii_uppercase().as_str(), "GET" | "POST") {
                         return Err(format!("action {i} (next_request): method must be GET or POST"));
@@ -508,9 +592,22 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 }
                 Action::NextRequest(a)
             }
+            "lookup" => {
+                if !pull {
+                    return Err(format!("action {i} (lookup): only an integration with pull settings can look records up"));
+                }
+                let a: NextRequest = part(i, k, obj)?;
+                if a.context.as_ref().is_some_and(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0) > MAX_CONTEXT_BYTES) {
+                    return Err(format!("action {i} (lookup): context is over 16 KB"));
+                }
+                Action::Lookup(a)
+            }
             other => return Err(format!("action {i}: unknown type {other:?} (use one of {})", ACTION_TYPES.join(", "))),
         };
         out.push(a);
+    }
+    if out.iter().filter(|a| matches!(a, Action::Lookup(_))).count() > MAX_LOOKUPS {
+        return Err(format!("return at most {MAX_LOOKUPS} lookups"));
     }
     if out.iter().filter(|a| matches!(a, Action::NextRequest(_))).count() > 1 {
         return Err("return at most one next_request".into());
@@ -679,6 +776,7 @@ fn key_text(v: &Value) -> String {
 fn trusted_keys(props: &Map<String, Value>) -> Map<String, Value> {
     props
         .iter()
+        .filter(|(k, _)| !reserved_key(k))
         .filter(|(_, v)| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)))
         .map(|(k, v)| (k.clone(), Value::String(key_text(v))))
         .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200))
@@ -704,18 +802,58 @@ fn merge_keys(current: &Map<String, Value>, add: &Map<String, Value>) -> Map<Str
     out
 }
 
-/// Add an action's `keys` to an existing profile (under a row lock, so two deliveries can't lose
-/// each other's values).
-async fn add_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<()> {
+/// Take each key value for this account (in a fixed order, so two deliveries never wait on each
+/// other), for the rest of the transaction: while it's held, no other delivery can give the same
+/// value to another profile.
+async fn lock_key_values(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid, keys: &Map<String, Value>) -> AppResult<()> {
+    let mut names: Vec<String> = keys.iter().map(|(k, v)| format!("{account_id}\n{k}\n{}", key_text(v))).collect();
+    names.sort();
+    for n in names {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7031))").bind(n).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// The keys of `add` whose value another profile in the account already holds.
+async fn keys_held_elsewhere(db: &mut sqlx::PgConnection, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<Vec<String>> {
+    let mut taken = Vec::new();
+    for (k, v) in add {
+        let Some(v) = v.as_str() else { continue };
+        let other: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM profiles WHERE account_id = $1 AND id <> $2 AND integration_keys <> '{}' AND (integration_keys @> $3 OR integration_keys @> $4) LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(profile_id)
+        .bind(json!({k: v}))
+        .bind(json!({k: [v]}))
+        .fetch_optional(&mut *db)
+        .await?;
+        if other.is_some() {
+            taken.push(k.clone());
+        }
+    }
+    Ok(taken)
+}
+
+/// Add an action's `keys` to an existing profile, each value for one profile only: a value another
+/// profile already holds is refused (and returned), never shared. The values are taken under an
+/// account-wide lock and the profile's row lock, so two deliveries can't both claim a value or
+/// lose each other's.
+async fn add_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<Vec<String>> {
     if add.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = state.db.begin().await?;
+    lock_key_values(&mut tx, account_id, add).await?;
     let cur: Value = sqlx::query_scalar("SELECT integration_keys FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_one(&mut *tx).await?;
-    let merged = merge_keys(cur.as_object().unwrap_or(&Map::new()), add);
-    sqlx::query("UPDATE profiles SET integration_keys = $3 WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).bind(Value::Object(merged)).execute(&mut *tx).await?;
+    let taken = keys_held_elsewhere(&mut tx, account_id, profile_id, add).await?;
+    let kept: Map<String, Value> = add.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    if !kept.is_empty() {
+        let merged = merge_keys(cur.as_object().unwrap_or(&Map::new()), &kept);
+        sqlx::query("UPDATE profiles SET integration_keys = $3 WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).bind(Value::Object(merged)).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(taken)
 }
 
 /// Remember the plain property values an integration wrote, so later lookups by them can trust them.
@@ -724,12 +862,16 @@ async fn save_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, props: 
     if keys.is_empty() {
         return Ok(());
     }
+    // Under the same per-value locks as `add_keys`, so its check for another holder sees this write.
+    let mut tx = state.db.begin().await?;
+    lock_key_values(&mut tx, account_id, &keys).await?;
     sqlx::query("UPDATE profiles SET integration_keys = integration_keys || $3 WHERE id = $1 AND account_id = $2")
         .bind(profile_id)
         .bind(account_id)
         .bind(Value::Object(keys))
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -786,7 +928,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
     for _ in 0..3 {
         if existing.is_none() {
             crate::features::objects::hooks::pause(src.account_id, "before_create").await;
-            if let Some(p) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
+            if let Some((p, _)) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
                 out.counts.profiles_created += 1;
                 if !src.contacts_opted_in {
                     out.counts.held += 1;
@@ -812,9 +954,13 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
 /// and (`ledger`) the action's entry in its delivery's ledger. A failure part-way leaves nothing,
 /// so a retry never finds an unheld profile it made. None when someone else created a matching
 /// profile at the same moment (the caller updates that one instead).
-async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
+async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<(Profile, Vec<String>)>> {
     let mut tx = state.db.begin().await?;
-    let created = insert_profile_in(&mut tx, src.account_id, &src.tag(), src.contacts_opted_in, input, props, extra_keys, no_marketing).await?;
+    // Each key value belongs to one profile: one another profile holds isn't given to this one.
+    lock_key_values(&mut tx, src.account_id, extra_keys).await?;
+    let taken = keys_held_elsewhere(&mut tx, src.account_id, Uuid::nil(), extra_keys).await?;
+    let extra: Map<String, Value> = extra_keys.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let created = insert_profile_in(&mut tx, src.account_id, &src.tag(), src.contacts_opted_in, input, props, &extra, no_marketing).await?;
     let Some(p) = created else { return Ok(None) };
     if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
         // Another attempt of this delivery got there first: its profile is the one to update.
@@ -824,7 +970,7 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
     }
     tx.commit().await?;
     crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
-    Ok(Some(p))
+    Ok(Some((p, taken)))
 }
 
 /// The one insert that creates a profile for an integration (`tag` is `integration:<id>`), inside
@@ -958,7 +1104,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
     let list_for = |i: usize| lists.iter().find(|(j, _)| *j == i).map(|(_, l)| l.clone());
     let mut new_state = current_state.clone();
     for (i, a) in actions.iter().enumerate() {
-        let writes = !matches!(a, Action::SetState(_) | Action::Log(_) | Action::NextRequest(_));
+        let writes = !matches!(a, Action::SetState(_) | Action::Log(_) | Action::NextRequest(_) | Action::Lookup(_));
         let print = raw.get(i).map(fingerprint).unwrap_or_default();
         if writes && !dry && skip.get(&i.to_string()).and_then(|v| v.as_str()) == Some(print.as_str()) {
             out.counts.already_written += 1;
@@ -1050,6 +1196,23 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                 }
                 out.effect(i, format!("{} {} {} {list_name:?}", if adding { "added" } else { "removed" }, who_label(&l.profile), if adding { "to" } else { "from" }));
             }
+            Action::AddKeys(k) => {
+                let Some(found) = resolve(state, src, &k.profile, dry, out).await? else {
+                    out.counts.skipped += 1;
+                    out.effect(i, format!("skipped adding keys: no profile has {}", who_label(&k.profile)));
+                    continue;
+                };
+                let taken = if dry { keys_held_elsewhere(&mut *state.db.acquire().await?, src.account_id, found.id, &k.keys).await? } else { add_keys(state, src.account_id, found.id, &k.keys).await? };
+                let names: Vec<&str> = k.keys.keys().map(String::as_str).filter(|n| !taken.iter().any(|t| t == n)).collect();
+                if !taken.is_empty() {
+                    out.effect(i, format!("{} {} to {}: another profile already has that value", if dry { "wouldn't add" } else { "didn't add" }, taken.join(", "), who_label(&k.profile)));
+                }
+                if names.is_empty() {
+                    out.counts.skipped += 1;
+                    continue;
+                }
+                out.effect(i, format!("{} {} to {}", if dry { "would add" } else { "added" }, names.join(", "), who_label(&k.profile)));
+            }
             Action::Unsubscribe(u) => {
                 let Some(found) = resolve(state, src, &u.profile, dry, out).await? else {
                     out.counts.skipped += 1;
@@ -1062,7 +1225,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     out.effect(i, format!("would unsubscribe {} from {ch}", who_label(&u.profile)));
                     continue;
                 }
-                unsubscribe(state, src, found.id, u.channel).await?;
+                unsubscribe(state, src, found.id, u.channel, None).await?;
                 out.effect(i, format!("unsubscribed {} from {ch}", who_label(&u.profile)));
             }
             Action::Suppress(s) => {
@@ -1077,7 +1240,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     after_write(state, src, found.id, false, s.email.as_deref(), true, out).await?;
                 }
                 if s.phone_number.is_some() {
-                    unsubscribe(state, src, found.id, Channel::Sms).await?;
+                    unsubscribe(state, src, found.id, Channel::Sms, None).await?;
                 }
                 out.effect(i, format!("stopped all marketing to {}", who_label(&who)));
             }
@@ -1126,6 +1289,9 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             Action::NextRequest(n) => {
                 out.next_request = Some(n.clone());
                 out.effect(i, "fetch the next page".into());
+            }
+            Action::Lookup(n) => {
+                out.effect(i, format!("look up {}", n.url.as_deref().unwrap_or("").split('?').next().unwrap_or("")));
             }
         }
         if writes && !dry {
@@ -1243,7 +1409,7 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
 }
 
 async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, print: &str, dry: bool, out: &mut Outcome) -> AppResult<()> {
-    let input = ProfileInput {
+    let mut input = ProfileInput {
         email: p.email.clone().filter(|s| !s.trim().is_empty()),
         phone_number: p.phone_number.clone().filter(|s| !s.trim().is_empty()),
         external_id: p.external_id.clone().filter(|s| !s.trim().is_empty()),
@@ -1253,6 +1419,30 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         ..Default::default()
     };
     let label = who_label(&Who { email: input.email.clone(), phone_number: input.phone_number.clone(), external_id: input.external_id.clone(), ..Default::default() });
+    // The one person already holding the match key's value, when nobody has the external id yet.
+    if let Some(v) = p.match_key.as_ref().and_then(|k| Some((k, p.keys.as_ref()?.get(k)?.clone()))) {
+        let by_external: Option<Uuid> = match &input.external_id {
+            Some(x) => sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND external_id = $2").bind(src.account_id).bind(x).fetch_optional(&state.db).await?,
+            None => None,
+        };
+        if by_external.is_none() {
+            if let Lookup::Found(id) = find_by_property(state, src.account_id, v.0, &v.1).await? {
+                input.id = Some(id);
+            }
+        }
+    }
+    // An existing profile's email stays, when the action asks: the other address isn't used.
+    let mut kept_email = false;
+    if p.keep_email && input.email.is_some() {
+        if let Some(found) = audience::find_profile(&state.db, src.account_id, &input).await? {
+            let asked = input.email.as_deref().and_then(crate::models::normalize_email);
+            if found.email.is_some() && found.email != asked {
+                input.email = None;
+                kept_email = true;
+            }
+        }
+    }
+    let kept_note = if kept_email { " (it keeps its email; the call named another address, which wasn't used)" } else { "" };
     let relay = input.email.as_deref().is_some_and(is_relay_address);
     let no_marketing = p.marketing == Some(false);
     if dry {
@@ -1260,7 +1450,7 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         let mut line = match &existing {
             Some(_) => {
                 out.counts.profiles_updated += 1;
-                format!("would update profile {label}")
+                format!("would update profile {label}{kept_note}")
             }
             None => {
                 out.counts.profiles_created += 1;
@@ -1280,6 +1470,10 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
             line.push_str(" held back from marketing (no opt-in)");
         }
         for c in &p.consent {
+            if kept_email && c.channel == Channel::Email {
+                line.push_str("; would skip the email consent: it was given for the address the call named, which wasn't used");
+                continue;
+            }
             out.counts.consents += 1;
             line.push_str(&format!("; {} {} consent (source: {})", if c.subscribed { "record" } else { "remove" }, if c.channel == Channel::Email { "email" } else { "SMS" }, c.source));
         }
@@ -1308,12 +1502,15 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         let last = p.consent.is_empty();
         let props = p.properties.clone().unwrap_or_default();
         let keys = p.keys.clone().unwrap_or_default();
-        if let Some(created) = create_profile(state, src, &input, &props, &keys, no_marketing, last.then_some((i, print))).await? {
+        if let Some((created, taken)) = create_profile(state, src, &input, &props, &keys, no_marketing, last.then_some((i, print))).await? {
             if last {
                 out.applied.insert(i.to_string(), json!(print));
             }
             out.counts.profiles_created += 1;
             let mut line = format!("created profile {label}");
+            if !taken.is_empty() {
+                line.push_str(&format!(" (didn't add {}: another profile already has that value)", taken.join(", ")));
+            }
             if relay {
                 out.counts.suppressed += 1;
                 line.push_str(" and suppressed it from email (booking-site relay address)");
@@ -1337,11 +1534,15 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;
     }
-    if let Some(keys) = &p.keys {
-        add_keys(state, src.account_id, up.profile.id, keys).await?;
-    }
+    let taken = match &p.keys {
+        Some(keys) => add_keys(state, src.account_id, up.profile.id, keys).await?,
+        None => Vec::new(),
+    };
     mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
-    let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });
+    let mut line = format!("{} profile {label}{kept_note}", if up.created { "created" } else { "updated" });
+    if !taken.is_empty() {
+        line.push_str(&format!(" (didn't add {}: another profile already has that value)", taken.join(", ")));
+    }
     let held_before = out.counts.held;
     if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing, out).await? {
         out.counts.suppressed += 1;
@@ -1353,6 +1554,11 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         out.counts.held -= 1;
     }
     for c in &p.consent {
+        // An opt-in belongs to the address it was given for, never to the one the profile kept.
+        if kept_email && c.channel == Channel::Email {
+            line.push_str("; skipped the email consent: it was given for the address the call named, which wasn't used");
+            continue;
+        }
         line.push_str(&consent(state, src, up.profile.id, c).await?);
         out.counts.consents += 1;
     }
@@ -1362,37 +1568,83 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
 
 /// Record a consent change the script vouches for. Subscribing never overrides an earlier unsubscribe.
 async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) -> AppResult<String> {
-    let (col, label) = if c.channel == Channel::Email { ("email_consent", "email") } else { ("sms_consent", "SMS") };
-    if !c.subscribed {
-        unsubscribe(state, src, profile_id, c.channel).await?;
-        return Ok(format!("; unsubscribed from {label}"));
+    let (col, addr_col, label) = if c.channel == Channel::Email { ("email_consent", "email", "email") } else { ("sms_consent", "phone_number", "SMS") };
+    let (sub_metric, unsub_metric) = if c.channel == Channel::Email { ("Subscribed to Email Marketing", "Unsubscribed") } else { ("Subscribed to SMS Marketing", "Unsubscribed from SMS") };
+    let ch = if c.channel == Channel::Email { "email" } else { "sms" };
+    let as_of = c.as_of.as_deref().and_then(parse_time);
+    let iid = src.integration_id.to_string();
+    // Kept in the profile's integration keys (not shown as properties):
+    // - `consent_as_of:<integration>:<channel>`: "<address>|<time>", the newest preference time this
+    //   integration sent for that address, whether or not it changed anything;
+    // - `consent_by:<channel>`: "<integration>|<address>|<time>", who made the current subscription.
+    let vkey = format!("consent_as_of:{iid}:{ch}");
+    let pkey = format!("consent_by:{ch}");
+    // One statement, under a row lock: whether this preference is fresh, whether the current
+    // subscription is this integration's own (same address, still subscribed, and no unsubscribe,
+    // list sign-up or other source's opt-in recorded since), and the change itself.
+    let q = format!(
+        "WITH cur AS (
+            SELECT p.id, p.{col} AS c, p.{addr_col} AS addr, p.integration_keys AS k,
+                   COALESCE($3::timestamptz IS NULL OR NOT (split_part(p.integration_keys->'{vkey}'->>0, '|', 1) = p.{addr_col}
+                        AND NULLIF(split_part(p.integration_keys->'{vkey}'->>0, '|', 2), '')::timestamptz >= $3::timestamptz), true) AS fresh,
+                   COALESCE(p.{col} = 'subscribed' AND split_part(p.integration_keys->'{pkey}'->>0, '|', 1) = $4 AND split_part(p.integration_keys->'{pkey}'->>0, '|', 2) = p.{addr_col}
+                        AND NOT EXISTS (SELECT 1 FROM events e JOIN metrics m ON m.id = e.metric_id
+                             WHERE e.profile_id = p.id AND e.account_id = p.account_id
+                               AND e.occurred_at > NULLIF(split_part(p.integration_keys->'{pkey}'->>0, '|', 3), '')::timestamptz
+                               AND (m.name = ANY($6) OR (m.name = $7 AND COALESCE(e.properties->>'integration_id', '') <> $4))), false) AS own
+            FROM profiles p WHERE p.id = $1 AND p.account_id = $2 FOR UPDATE
+         ), next AS (
+            SELECT id, c, fresh, own, addr, k,
+                   CASE WHEN NOT fresh OR addr IS NULL THEN c
+                        WHEN $5 AND c IN ('never_subscribed', 'pending') THEN 'subscribed'
+                        WHEN NOT $5 AND (NOT $8 OR own) AND c <> 'unsubscribed' THEN 'unsubscribed'
+                        ELSE c END AS n
+            FROM cur
+         )
+         UPDATE profiles p SET {col} = next.n, updated_at = CASE WHEN next.n <> next.c THEN now() ELSE p.updated_at END,
+             integration_keys = CASE WHEN NOT next.fresh OR next.addr IS NULL THEN p.integration_keys ELSE
+                 (p.integration_keys - '{pkey}' - '{vkey}')
+                 || CASE WHEN $3::timestamptz IS NULL THEN '{{}}'::jsonb ELSE jsonb_build_object('{vkey}', jsonb_build_array(next.addr || '|' || to_char($3::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))) END
+                 || CASE WHEN next.n = 'subscribed' AND next.c <> 'subscribed' THEN jsonb_build_object('{pkey}', jsonb_build_array($4 || '|' || next.addr || '|' || to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')))
+                         WHEN next.n = 'subscribed' AND p.integration_keys ? '{pkey}' THEN jsonb_build_object('{pkey}', p.integration_keys->'{pkey}')
+                         ELSE '{{}}'::jsonb END
+             END
+         FROM next WHERE p.id = next.id
+         RETURNING next.c, next.n, next.fresh, next.own"
+    );
+    let row: Option<(String, String, bool, bool)> = sqlx::query_as(&q)
+        .bind(profile_id)
+        .bind(src.account_id)
+        .bind(as_of)
+        .bind(&iid)
+        .bind(c.subscribed)
+        .bind(vec![unsub_metric, "Subscribed to List"])
+        .bind(sub_metric)
+        .bind(c.only_own)
+        .fetch_optional(&state.db)
+        .await?;
+    let Some((before, after, fresh, own)) = row else { return Ok(String::new()) };
+    if !fresh {
+        return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
     }
-    // Only people who never subscribed (or are waiting to confirm) become subscribed.
-    let q = format!("UPDATE profiles SET {col} = 'subscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND {col} IN ('never_subscribed', 'pending')");
-    let n = sqlx::query(&q).bind(profile_id).bind(src.account_id).execute(&state.db).await?.rows_affected();
-    if n == 0 {
-        let now: String = sqlx::query_scalar(&format!("SELECT {col} FROM profiles WHERE id = $1")).bind(profile_id).fetch_one(&state.db).await?;
-        return Ok(if now == "unsubscribed" { format!("; kept {label} unsubscribed (they unsubscribed before)") } else { format!("; already subscribed to {label}") });
+    if before == after {
+        return Ok(match (c.subscribed, before.as_str()) {
+            (true, "unsubscribed") => format!("; kept {label} unsubscribed (they unsubscribed before)"),
+            (true, _) => format!("; already subscribed to {label}"),
+            (false, "subscribed") if c.only_own && !own => format!("; {label} consent left alone (it didn't come from this app)"),
+            (false, _) => format!("; {label} not subscribed"),
+        });
     }
-    let metric = if c.channel == Channel::Email { "Subscribed to Email Marketing" } else { "Subscribed to SMS Marketing" };
-    audience::record_event(
-        &state.db,
-        NewEvent {
-            account_id: src.account_id,
-            profile_id,
-            metric,
-            properties: json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id}),
-            value: None,
-            occurred_at: None,
-            unique_id: None,
-            message_id: None,
-        },
-    )
-    .await?;
-    Ok(format!("; subscribed to {label} (source: {})", c.source))
+    let (metric, props) = if after == "subscribed" {
+        (sub_metric, json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}))
+    } else {
+        (unsub_metric, json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}))
+    };
+    audience::record_event(&state.db, NewEvent { account_id: src.account_id, profile_id, metric, properties: props, value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
+    Ok(if after == "subscribed" { format!("; subscribed to {label} (source: {})", c.source) } else { format!("; unsubscribed from {label}") })
 }
 
-async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel) -> AppResult<()> {
+async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel, as_of: Option<DateTime<Utc>>) -> AppResult<()> {
     let (col, metric) = if channel == Channel::Email { ("email_consent", "Unsubscribed") } else { ("sms_consent", "Unsubscribed from SMS") };
     let q = format!("UPDATE profiles SET {col} = 'unsubscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND {col} <> 'unsubscribed'");
     let n = sqlx::query(&q).bind(profile_id).bind(src.account_id).execute(&state.db).await?.rows_affected();
@@ -1403,7 +1655,7 @@ async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: 
                 account_id: src.account_id,
                 profile_id,
                 metric,
-                properties: json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id}),
+                properties: json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}),
                 value: None,
                 occurred_at: None,
                 unique_id: None,

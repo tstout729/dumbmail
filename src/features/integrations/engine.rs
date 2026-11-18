@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::actions::{self, Action, NextRequest, Outcome, Source};
 use super::model::{self, Integration};
-use super::pull::{self, Scrub, TokenFor, Vars};
+use super::pull::{self, PullConfig, Scrub, TokenFor, Vars};
 use super::sandbox::{self, Slot, Slots};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -42,6 +42,10 @@ pub const RETENTION_DAYS: i64 = 30;
 
 pub const JOB_DELIVERY: &str = "integrations_delivery";
 pub const JOB_PULL: &str = "integrations_pull";
+pub const JOB_FETCH: &str = "integrations_fetch";
+/// Fetches one webhook may chain: its script asks for one, the script run on that answer may ask
+/// for another, and so on, up to this many.
+pub const MAX_FETCH_HOPS: u64 = 3;
 
 fn source_of(i: &Integration, delivery: Option<Uuid>, ledger: Option<Uuid>) -> Source {
     Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger, redact: i.redact.clone() }
@@ -64,6 +68,19 @@ pub const PULLS_PER_ACCOUNT: usize = 1;
 static PULL_STATE: once_cell::sync::Lazy<std::sync::Mutex<(usize, std::collections::HashMap<Uuid, usize>)>> = once_cell::sync::Lazy::new(Default::default);
 static PULL_CAP: once_cell::sync::Lazy<usize> =
     once_cell::sync::Lazy::new(|| std::env::var("INTEGRATION_PULL_SLOTS").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(4));
+static PULL_CAP_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Tests: a different global cap (many test accounts pull at once in one process).
+pub fn set_pull_cap(n: usize) {
+    PULL_CAP_OVERRIDE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pull_cap() -> usize {
+    match PULL_CAP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => *PULL_CAP,
+        n => n,
+    }
+}
 
 pub struct PullSlot {
     account: Uuid,
@@ -86,7 +103,7 @@ impl PullSlots {
     pub fn try_take(account: Uuid) -> Option<PullSlot> {
         let mut s = PULL_STATE.lock().unwrap();
         let mine = s.1.get(&account).copied().unwrap_or(0);
-        if s.0 >= *PULL_CAP || mine >= PULLS_PER_ACCOUNT {
+        if s.0 >= pull_cap() || mine >= PULLS_PER_ACCOUNT {
             return None;
         }
         s.0 += 1;
@@ -384,6 +401,12 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let replay = source == "replay";
     let shown_source = if replay { original.clone().unwrap_or_else(|| "webhook".into()) } else { source.clone() };
     let root = replay_of.unwrap_or(delivery_id);
+    // A webhook (or the answer to a fetch it asked for) may ask to look up the record it names,
+    // when the integration's pull settings declare which lookups are allowed (`fetch`).
+    let hop = request.as_ref().and_then(|r| r["fetch"]["hop"].as_u64()).unwrap_or(0);
+    let rules = integ.pull_config().and_then(|c| c.fetch);
+    let can_fetch = rules.is_some() && matches!(shown_source.as_str(), "webhook" | "fetch") && hop < MAX_FETCH_HOPS;
+    let mut fetch_next = request.as_ref().map(|r| r["fetch_enc"].clone()).unwrap_or(Value::Null);
     let list: Result<Vec<Value>, String> = match stored.as_ref().and_then(|v| v.as_array()) {
         Some(a) => Ok(a.clone()),
         None => {
@@ -391,27 +414,56 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 return requeue(state, JOB_DELIVERY, json!({"delivery_id": delivery_id})).await;
             };
             let mut extra = Map::new();
-            if let Some(resp) = request.as_ref().and_then(|r| r.get("response")) {
-                extra.insert("response".into(), resp.clone());
+            if let Some(r) = request.as_ref() {
+                if shown_source == "fetch" {
+                    // A lookup's run sees the request made, the answer's status and headers, and the
+                    // (declared, redacted, sealed) context the webhook carried.
+                    let mut made = r["made"].clone();
+                    extra.insert("response".into(), made["response"].clone());
+                    if let Some(o) = made.as_object_mut() {
+                        o.remove("response");
+                    }
+                    extra.insert("request".into(), made);
+                    extra.insert("context".into(), open_next(state, &r["lookup_enc"]).context.unwrap_or(Value::Null));
+                } else if let Some(resp) = r.get("response") {
+                    extra.insert("response".into(), resp.clone());
+                }
             }
             let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
-            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub, &super::redact::paths(&integ.redact)).await;
+            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull" || can_fetch, root, &scrub, &super::redact::paths(&integ.redact)).await;
             drop(slot);
             match ran {
-                Ok((list, _)) => {
+                Ok((list, next)) => {
                     let list: Vec<Value> = list.into_iter().filter(|a| a["type"] != "next_request").collect();
+                    // Pull deliveries (replayed pages) never fetch more; a webhook's fetch is kept
+                    // encrypted with its action list (it can carry what the app sent).
                     let (list, seal) = seal_sensitive(state, &integ, list).await?;
-                    // Whoever stored a list first wins; this run applies that one.
-                    let (kept, kept_seal): (Value, Option<String>) = sqlx::query_as(
-                        "UPDATE integration_deliveries SET sealed_fields = CASE WHEN actions IS NULL THEN $3 ELSE sealed_fields END, actions = COALESCE(actions, $2)
-                         WHERE id = $1 RETURNING actions, sealed_fields",
+                    let lookup = match (next.filter(|_| can_fetch), &rules) {
+                        (Some(n), Some(r)) => Some(checked_lookup(&integ, r, &n)),
+                        _ => None,
+                    };
+                    let sealed_next = match lookup {
+                        Some(Ok(n)) => seal_next(state, &n).map_err(|e| anyhow::anyhow!(e.public_message()))?,
+                        Some(Err(e)) => return delivery_failed(state, &integ, &scrub, delivery_id, attempts, started.elapsed().as_millis() as i32, &e).await,
+                        None => Value::Null,
+                    };
+                    // Whoever stored a list first wins; this run applies that one (its sealed fields
+                    // and its fetch).
+                    let (kept, kept_seal, kept_fetch): (Value, Option<String>, Option<Value>) = sqlx::query_as(
+                        "UPDATE integration_deliveries
+                         SET request = CASE WHEN actions IS NULL THEN jsonb_strip_nulls((COALESCE(request, '{}'::jsonb) - 'fetch_enc') || jsonb_build_object('fetch_enc', $3::jsonb)) ELSE request END,
+                             sealed_fields = CASE WHEN actions IS NULL THEN $4 ELSE sealed_fields END,
+                             actions = COALESCE(actions, $2)
+                         WHERE id = $1 RETURNING actions, sealed_fields, request->'fetch_enc'",
                     )
                     .bind(delivery_id)
                     .bind(Value::Array(list))
+                    .bind(sealed_next)
                     .bind(seal)
                     .fetch_one(&state.db)
                     .await?;
                     sealed = kept_seal;
+                    fetch_next = kept_fetch.unwrap_or(Value::Null);
                     Ok(kept.as_array().cloned().unwrap_or_default())
                 }
                 Err(e) => Err(e),
@@ -430,7 +482,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 match err {
                     None => {
                         save_live_state(&state.db, integ.id, &acts).await?;
-                        Ok((o, acts.len()))
+                        Ok((o, acts))
                     }
                     Some(e) => Err(e.public_message()),
                 }
@@ -441,44 +493,121 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     };
     let ms = started.elapsed().as_millis() as i32;
     match res {
-        Ok((o, n)) => {
+        Ok((o, acts)) => {
+            let n = acts.len();
+            // The fetch it asked for is queued in the same transaction that marks it done.
+            let fetch = can_fetch && fetch_next.is_string();
+            let mut result = result_json(&o);
+            if fetch {
+                result["fetch"] = json!("queued");
+            }
+            let mut tx = state.db.begin().await?;
             sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, error = NULL, duration_ms = $4, attempts = attempts + 1, next_attempt_at = NULL, processed_at = now(), sealed_fields = NULL WHERE id = $1")
                 .bind(delivery_id)
-                .bind(status_for(n))
-                .bind(scrub.value(&result_json(&o)))
+                .bind(if fetch { "ok" } else { status_for(n) })
+                .bind(scrub.value(&result))
                 .bind(ms)
-                .execute(&state.db)
-                .await?;
-            sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&state.db).await?;
-        }
-        Err(msg) => {
-            let msg = scrub.text(&msg);
-            let tries = attempts + 1;
-            let retry_at: Option<DateTime<Utc>> = (tries < MAX_ATTEMPTS).then(|| Utc::now() + chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)]));
-            let mut tx = state.db.begin().await?;
-            // Sealed fields stay only while a retry may need them.
-            sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = $4, next_attempt_at = $5, processed_at = now(),
-                            sealed_fields = CASE WHEN $5::timestamptz IS NULL THEN NULL ELSE sealed_fields END WHERE id = $1")
-                .bind(delivery_id)
-                .bind(&msg)
-                .bind(ms)
-                .bind(tries)
-                .bind(retry_at)
                 .execute(&mut *tx)
                 .await?;
-            let failed_for_good = retry_at.is_none();
-            sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + $2, last_delivery_at = now(), last_error = $3, last_error_at = now() WHERE id = $1")
-                .bind(integ.id)
-                .bind(i64::from(failed_for_good))
-                .bind(&msg)
-                .execute(&mut *tx)
-                .await?;
-            if let Some(at) = retry_at {
-                crate::jobs::enqueue_background(&mut *tx, JOB_DELIVERY, json!({"delivery_id": delivery_id}), Some(at)).await?;
+            sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *tx).await?;
+            if can_fetch {
+                match queue_lookups(&mut tx, state, &integ, delivery_id, hop + 1, &acts).await {
+                    Ok(_) | Err(Refused::Duplicate(_)) => {}
+                    Err(Refused::Busy(m) | Refused::OverBudget(m)) => {
+                        tx.rollback().await?;
+                        return delivery_failed(state, &integ, &scrub, delivery_id, attempts, ms, &m).await;
+                    }
+                    Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+                }
+            }
+            if fetch {
+                match queue_fetch(&mut tx, state, &integ, delivery_id, hop + 1, &fetch_next).await {
+                    Ok(()) | Err(Refused::Duplicate(_)) => {}
+                    // The fetch can't be reserved now: the delivery is tried again later (what it
+                    // already wrote is skipped then).
+                    Err(Refused::Busy(m) | Refused::OverBudget(m)) => {
+                        tx.rollback().await?;
+                        return delivery_failed(state, &integ, &scrub, delivery_id, attempts, ms, &m).await;
+                    }
+                    Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+                }
             }
             tx.commit().await?;
         }
+        Err(msg) => return delivery_failed(state, &integ, &scrub, delivery_id, attempts, ms, &msg).await,
     }
+    Ok(())
+}
+
+/// Reserve every `lookup` a run asked for (inside the transaction that settles the run), checked
+/// like a webhook's fetch. Returns how many were reserved and how many the fetch rules refused.
+async fn queue_lookups(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &AppState, integ: &Integration, parent: Uuid, hop: u64, acts: &[Action]) -> Result<(usize, usize), Refused> {
+    let Some(rules) = integ.pull_config().and_then(|c| c.fetch) else { return Ok((0, acts.iter().filter(|a| matches!(a, Action::Lookup(_))).count())) };
+    let (mut queued, mut refused) = (0, 0);
+    for a in acts {
+        let Action::Lookup(n) = a else { continue };
+        match checked_lookup(integ, &rules, n) {
+            Ok(ok) => {
+                let sealed = seal_next(state, &ok).map_err(Refused::Error)?;
+                queue_fetch(tx, state, integ, parent, hop, &sealed).await?;
+                queued += 1;
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    Ok((queued, refused))
+}
+
+/// A lookup a webhook's script asked for, made safe to keep: allowed by the integration's fetch
+/// rules (a GET of a declared path and query), its context cut to the declared keys, put through
+/// the integration's redact list and capped at 16 KB.
+fn checked_lookup(integ: &Integration, rules: &pull::FetchRules, n: &NextRequest) -> Result<NextRequest, String> {
+    let settings = integ.settings_map();
+    let st = integ.state_map();
+    let none = Map::new();
+    let now = Utc::now();
+    let vars = Vars { secrets: &none, state: &st, settings: &settings, now, since: now, redact: true };
+    let mut ok = rules.allow(n, &vars)?;
+    if let Some(c) = ok.context.take() {
+        // The redact list's removals apply to the context (a keep list describes the payload).
+        let removals: Vec<_> = super::redact::paths_with(&integ.redact, &settings).into_iter().filter(|p| !p.is_keep()).collect();
+        let kept = super::redact::body(Some("application/json"), &c.to_string(), &removals).and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        if kept.as_ref().is_some_and(|k| k.to_string().len() > actions::MAX_CONTEXT_BYTES) {
+            return Err("the fetch's context is over 16 KB".into());
+        }
+        ok.context = kept.filter(|k| k.as_object().is_some_and(|o| !o.is_empty()));
+    }
+    Ok(ok)
+}
+
+/// A delivery whose script or writes failed (or whose fetch couldn't be reserved): noted, and
+/// tried again after 1, 5, 30 and 120 minutes.
+async fn delivery_failed(state: &AppState, integ: &Integration, scrub: &Scrub, delivery_id: Uuid, attempts: i32, ms: i32, msg: &str) -> anyhow::Result<()> {
+    let msg = scrub.text(msg);
+    let tries = attempts + 1;
+    let retry_at: Option<DateTime<Utc>> = (tries < MAX_ATTEMPTS).then(|| Utc::now() + chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)]));
+    let mut tx = state.db.begin().await?;
+    // Sealed fields stay only while a retry may need them.
+    sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = $4, next_attempt_at = $5, processed_at = now(),
+                    sealed_fields = CASE WHEN $5::timestamptz IS NULL THEN NULL ELSE sealed_fields END WHERE id = $1")
+        .bind(delivery_id)
+        .bind(&msg)
+        .bind(ms)
+        .bind(tries)
+        .bind(retry_at)
+        .execute(&mut *tx)
+        .await?;
+    let failed_for_good = retry_at.is_none();
+    sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + $2, last_delivery_at = now(), last_error = $3, last_error_at = now() WHERE id = $1")
+        .bind(integ.id)
+        .bind(i64::from(failed_for_good))
+        .bind(&msg)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(at) = retry_at {
+        crate::jobs::enqueue_background(&mut *tx, JOB_DELIVERY, json!({"delivery_id": delivery_id}), Some(at)).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -495,12 +624,15 @@ pub struct NewDelivery<'a> {
     pub replay_of: Option<Uuid>,
     pub message_id: Option<String>,
     pub applied: Option<Value>,
+    /// With a message id: a resend counts as one only within this many minutes (for apps whose id
+    /// is a hash of the content, which a later, real change can repeat).
+    pub dedupe_minutes: Option<i64>,
 }
 
 impl<'a> NewDelivery<'a> {
     pub fn log(source: &'a str, status: &'a str, error: Option<&'a str>) -> Self {
         static EMPTY: once_cell::sync::Lazy<Value> = once_cell::sync::Lazy::new(|| json!({}));
-        NewDelivery { source, content_type: None, headers: &EMPTY, query: &EMPTY, body: None, request: None, status, error, replay_of: None, message_id: None, applied: None }
+        NewDelivery { source, content_type: None, headers: &EMPTY, query: &EMPTY, body: None, request: None, status, error, replay_of: None, message_id: None, applied: None, dedupe_minutes: None }
     }
 }
 
@@ -527,7 +659,7 @@ impl From<sqlx::Error> for Refused {
 /// against it isn't kept at all), then every secret masked.
 fn kept_body(integ: &Integration, scrub: &Scrub, content_type: Option<&str>, body: Option<&str>) -> (Option<String>, bool) {
     let Some(b) = body else { return (None, false) };
-    match super::redact::body(content_type, b, &super::redact::paths(&integ.redact)) {
+    match super::redact::body(content_type, b, &super::redact::paths_with(&integ.redact, &integ.settings_map())) {
         Some(kept) => (Some(scrub.text(&kept)), false),
         None => (None, true),
     }
@@ -563,6 +695,21 @@ pub async fn store_delivery(state: &AppState, integ: &Integration, scrub: &Scrub
             return Err(Refused::Busy("too many deliveries are waiting to be processed; retry later".into()));
         }
     }
+    // A windowed message id: a copy within the window is a resend; after it, the same id is new.
+    let mut message_id = d.message_id.clone();
+    if let (Some(mid), Some(minutes)) = (&d.message_id, d.dedupe_minutes) {
+        let like = format!("{}@%", mid.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let seen: Option<Uuid> = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE integration_id = $1 AND message_id LIKE $2 AND created_at > now() - make_interval(mins => $3::int) ORDER BY created_at LIMIT 1")
+            .bind(integ.id)
+            .bind(&like)
+            .bind(minutes as i32)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(first) = seen {
+            return Err(Refused::Duplicate(first));
+        }
+        message_id = Some(format!("{mid}@{id}"));
+    }
     if let Some(b) = &body {
         make_room(&mut tx, integ.account_id, b.len() as i64).await?;
     }
@@ -583,12 +730,12 @@ pub async fn store_delivery(state: &AppState, integ: &Integration, scrub: &Scrub
     .bind(&request)
     .bind(&error)
     .bind(d.replay_of)
-    .bind(&d.message_id)
+    .bind(&message_id)
     .bind(d.applied)
     .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_none() {
-        let first: Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE integration_id = $1 AND message_id = $2").bind(integ.id).bind(&d.message_id).fetch_one(&mut *tx).await?;
+        let first: Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE integration_id = $1 AND message_id = $2").bind(integ.id).bind(&message_id).fetch_one(&mut *tx).await?;
         return Err(Refused::Duplicate(first));
     }
     if d.status == "pending" {
@@ -609,7 +756,8 @@ async fn make_room(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account: Uuid
     }
     let open: i64 = sqlx::query_scalar(
         "SELECT COALESCE(sum(body_bytes), 0)::bigint FROM integration_deliveries
-         WHERE account_id = $1 AND body IS NOT NULL AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
+         WHERE account_id = $1 AND ((body IS NOT NULL AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL)))
+             OR (source = 'fetch' AND body IS NULL AND status = 'pending'))",
     )
     .bind(account)
     .fetch_one(&mut **tx)
@@ -685,6 +833,11 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
                 other => other.to_string(),
             };
             let ct = if payload.is_string() { None } else { Some("application/json".to_string()) };
+            // A dry run gives the script what a real delivery's run would get: the payload as it
+            // would be stored (redacted, or projected by a keep list), so its actions and logs can't
+            // show more than a live run.
+            let (kept, _) = kept_body(integ, scrub, ct.as_deref(), Some(&body));
+            let body = kept.unwrap_or_default();
             (Input { source: source.unwrap_or_else(|| "test".into()), content_type: ct, body, headers: headers.unwrap_or(json!({})), query: query.unwrap_or(json!({})), ..Default::default() }, None)
         }
         TestSample::Pull => {
@@ -725,7 +878,8 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
             (Input { source: "pull".into(), content_type: resp.headers.get("content-type").and_then(|v| v.as_str()).map(String::from), body: resp.body, extra, ..Default::default() }, Some(meta))
         }
     };
-    let is_pull = input.source == "pull";
+    // With pull settings, a webhook's script may ask to fetch the record it names (shown, not run).
+    let is_pull = input.source == "pull" || integ.pull_config().is_some_and(|c| c.fetch.is_some());
     let script_in = script_input(integ, &input, &integ.state_map());
     let raw = match sandbox::run(&slot, script, &script_in).await {
         Ok(x) => x,
@@ -788,6 +942,10 @@ pub async fn replay(state: &AppState, integ: &Integration, ids: &[Uuid], all_fai
         let orig = if source == "replay" { request.as_ref().and_then(|r| r["original_source"].as_str()).unwrap_or("webhook").to_string() } else { source };
         let mut req = request.unwrap_or(json!({}));
         req["original_source"] = json!(orig);
+        // A replay runs the current script again, which decides afresh what to fetch.
+        if let Some(o) = req.as_object_mut() {
+            o.remove("fetch_enc");
+        }
         // Point at the original delivery, and carry over what it (and earlier replays) wrote.
         let root = replay_of.unwrap_or(id);
         let written: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_object_agg(k, v), '{}') FROM integration_deliveries d, jsonb_each(d.applied) AS e(k, v) WHERE d.integration_id = $1 AND (d.id = $2 OR d.replay_of = $2)")
@@ -799,7 +957,7 @@ pub async fn replay(state: &AppState, integ: &Integration, ids: &[Uuid], all_fai
         if let Some(o) = written.as_object() {
             all.extend(o.clone());
         }
-        let d = NewDelivery { source: "replay", content_type: ct.as_deref(), headers: &headers, query: &query, body: body.as_deref(), request: Some(req), status: "pending", error: None, replay_of: Some(root), message_id: None, applied: Some(Value::Object(all)) };
+        let d = NewDelivery { source: "replay", content_type: ct.as_deref(), headers: &headers, query: &query, body: body.as_deref(), request: Some(req), status: "pending", error: None, replay_of: Some(root), message_id: None, applied: Some(Value::Object(all)), dedupe_minutes: None };
         match store_delivery(state, integ, &scrub, d).await {
             Ok(nid) => new_ids.push(nid),
             Err(Refused::Busy(msg) | Refused::OverBudget(msg)) => {
@@ -836,6 +994,7 @@ fn merge_next(acc: &mut NextRequest, n: NextRequest) {
     if n.body.is_some() {
         acc.body = n.body;
     }
+    acc.context = n.context;
 }
 
 /// Queue a live pull unless one for this integration is already waiting or running. The check and
@@ -1116,6 +1275,15 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                     .execute(&mut *guard)
                     .await?;
                 sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *guard).await?;
+                // Lookups the page asked for (a record's details, say) are reserved with the page.
+                match queue_lookups(&mut guard, state, &integ, delivery, 1, &acts).await {
+                    Ok(_) | Err(Refused::Duplicate(_)) => {}
+                    Err(Refused::Busy(_) | Refused::OverBudget(_)) => {
+                        // No room for more work now: the page stands, its lookups are skipped and noted.
+                        sqlx::query("UPDATE integration_deliveries SET error = 'its lookups were skipped: too much work is waiting' WHERE id = $1").bind(delivery).execute(&mut *guard).await?;
+                    }
+                    Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+                }
                 // The page asked for: as the script wrote it (the stored list has it masked).
                 let more = raw_next.clone().filter(|_| o.next_request.is_some());
                 let mut upcoming = next.clone();
@@ -1166,6 +1334,258 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         }
     }
     crate::jobs::enqueue_background(&state.db, JOB_PULL, continue_with(&next, pages)?, None).await?;
+    Ok(())
+}
+
+/// Record that a webhook wants a lookup (its `next_request`, already checked against the
+/// integration's fetch rules and sealed), inside the transaction that marks the webhook done. The
+/// intent is a delivery row (source `fetch`, no body yet) that counts against the account's limits
+/// on work still to run, unique on the integration and what's being fetched (path, query and
+/// context) while it's outstanding, so a second webhook for the same record reuses it. Its job is
+/// queued in the same transaction; only that job makes the request.
+async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &AppState, integ: &Integration, parent: Uuid, hop: u64, sealed: &Value) -> Result<(), Refused> {
+    let next = open_next(state, sealed);
+    let context = next.context.as_ref().map(Value::to_string).unwrap_or_default();
+    let mut query: Vec<String> = next.query.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect();
+    query.sort();
+    // The record alone (its path and query) is the intent's identity; a second callback for it
+    // while it waits merges its context in (the latest wins).
+    let key = crate::auth::sha256_hex(&format!("{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&")));
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut **tx).await?;
+    let (mine, all): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE integration_id = $1), count(*) FROM integration_deliveries
+         WHERE account_id = $2 AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
+    )
+    .bind(integ.id)
+    .bind(integ.account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if mine >= MAX_OPEN_PER_INTEGRATION || all >= MAX_OPEN_PER_ACCOUNT {
+        return Err(Refused::Busy("too many deliveries and fetches are waiting; the fetch will be asked for again".into()));
+    }
+    make_room(tx, integ.account_id, context.len() as i64).await?;
+    let id = Uuid::now_v7();
+    // Only a waiting fetch intent takes the merge; any other row holding the id is left alone.
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
+        "INSERT INTO integration_deliveries AS d (id, integration_id, account_id, source, status, body_bytes, request, message_id)
+         VALUES ($1, $2, $3, 'fetch', 'pending', $4, $5, $6)
+         ON CONFLICT (integration_id, message_id) WHERE message_id IS NOT NULL DO UPDATE
+             SET request = jsonb_set(jsonb_set(d.request, '{lookup_enc}', EXCLUDED.request->'lookup_enc'), '{ctx_bytes}', to_jsonb($4::int)),
+                 body_bytes = $4 + COALESCE((d.request->>'reserved')::int, 0)
+             WHERE d.source = 'fetch' AND d.status = 'pending' AND d.body IS NULL
+         RETURNING id, (xmax = 0)",
+    )
+    .bind(id)
+    .bind(integ.id)
+    .bind(integ.account_id)
+    .bind(context.len() as i32)
+    .bind(json!({"fetch": {"of": parent, "hop": hop, "attempts": 0}, "lookup_enc": sealed, "ctx_bytes": context.len()}))
+    .bind(format!("fetch:{key}"))
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((got, true)) = row {
+        crate::jobs::enqueue_background(&mut **tx, JOB_FETCH, json!({"delivery_id": got}), None).await?;
+    }
+    Ok(())
+}
+
+/// How long the app asked us to wait: `Retry-After` (seconds or an HTTP date) or BigCommerce's
+/// `X-Rate-Limit-Time-Reset-Ms`. At most two hours.
+fn cooldown(headers: &Map<String, Value>) -> Option<chrono::Duration> {
+    let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, v)| v.as_str()).map(str::trim);
+    // Values are clamped before a duration is built, so an absurd header can't overflow it.
+    let ms: i64 = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
+        ms
+    } else {
+        let v = get("retry-after")?;
+        match v.parse::<i64>() {
+            Ok(s) => s.clamp(0, 7200) * 1000,
+            Err(_) => (DateTime::parse_from_rfc2822(v).ok()?.timestamp() - Utc::now().timestamp()).clamp(0, 7200) * 1000,
+        }
+    };
+    Some(chrono::Duration::milliseconds(ms.clamp(1000, 7_200_000)))
+}
+
+/// Job: make the lookup a fetch intent holds, then keep the answer on that same row and queue its
+/// script run. The job first claims the intent (so only one request is ever in flight for it),
+/// makes room for the answer in the account's payload budget, and only then sends the request: a
+/// `GET` of the checked path and query, with the pull's site, headers and credentials. An answer
+/// that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again
+/// after 1, 5, 30 and 120 minutes, or after the wait the app asked for.
+pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
+    let Some(id) = p["delivery_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM integration_deliveries WHERE id = $1 AND source = 'fetch' AND status = 'pending' AND body IS NULL").bind(id).fetch_optional(&state.db).await?;
+    let Some(account) = owner else { return Ok(()) };
+    let Some(_pull_slot) = PullSlots::try_take(account) else {
+        return requeue(state, JOB_FETCH, p.clone()).await;
+    };
+    // Claim it, only once it's due (a vendor's cooldown or the retry wait has passed), and reserve
+    // room for a whole answer in the account's payload budget, in one transaction: the room is held
+    // until the answer is stored (or the attempt fails), so nothing else can take it meanwhile.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(account.to_string()).execute(&mut *tx).await?;
+    let row: Option<(Uuid, Value)> = sqlx::query_as(
+        "SELECT integration_id, request FROM integration_deliveries
+         WHERE id = $1 AND source = 'fetch' AND status = 'pending' AND body IS NULL
+           AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= now()
+           AND COALESCE((request->>'claimed_until')::timestamptz, '-infinity'::timestamptz) < now()
+         FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((integration_id, request)) = row else { return Ok(()) };
+    let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
+    let mut scrub = scrub_for(state, &integ).await;
+    let attempts = request["fetch"]["attempts"].as_i64().unwrap_or(0) as i32;
+    let reserve = BODY_MAX_BYTES as i64;
+    match make_room(&mut tx, account, reserve).await {
+        Ok(()) => {}
+        Err(Refused::OverBudget(msg)) => {
+            tx.rollback().await?;
+            return fetch_failed(state, &integ, &scrub, id, attempts, None, &msg, None, true).await;
+        }
+        Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+        Err(other) => return Err(anyhow::anyhow!("{other:?}")),
+    }
+    sqlx::query(
+        "UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes', 'reserved', $2::int),
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes) + $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(reserve as i32)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if integ.status != "enabled" {
+        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', message_id = NULL, processed_at = now(),
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes - COALESCE((request->>'reserved')::int, 0)), request = request - 'claimed_until' - 'reserved' WHERE id = $1").bind(id).execute(&state.db).await?;
+        return Ok(());
+    }
+    let Some((cfg, rules)) = integ.pull_config().and_then(|c| c.fetch.clone().map(|r| (c, r))) else {
+        return fetch_failed(state, &integ, &scrub, id, attempts, None, "the integration no longer allows fetches", None, false).await;
+    };
+    if !integ.missing_credentials().is_empty() {
+        return fetch_failed(state, &integ, &scrub, id, attempts, None, "the integration's credentials aren't saved yet", None, true).await;
+    }
+    let creds = integ.credentials(state).map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let settings = integ.settings_map();
+    let st = integ.state_map();
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(1);
+    let vars = Vars { secrets: &creds, state: &st, settings: &settings, now, since, redact: false };
+    let shown = Vars { secrets: &creds, state: &st, settings: &settings, now, since, redact: true };
+    // Checked again against the current rules: only a GET of an allowed path and query.
+    let next = match rules.allow(&open_next(state, &request["lookup_enc"]), &vars) {
+        Ok(n) => n,
+        Err(e) => return fetch_failed(state, &integ, &scrub, id, attempts, None, &e, None, false).await,
+    };
+    let base = PullConfig { method: "GET".into(), query: Map::new(), body: None, body_format: None, ..cfg.clone() };
+    let (req, logged) = match (pull::build(&base, &next, &vars), pull::build(&base, &next, &shown)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return fetch_failed(state, &integ, &scrub, id, attempts, None, &e, None, false).await,
+    };
+    if !rules.within(&req.url, &vars) {
+        return fetch_failed(state, &integ, &scrub, id, attempts, None, "the lookup isn't under the integration's fetch prefix", None, false).await;
+    }
+    scrub.add_request(&req);
+    let origin = cfg.origin();
+    let who = TokenFor { integration_id: integ.id, auth_version: integ.auth_version, origin: &origin };
+    let token = match pull::oauth_token(state, &who, &cfg.auth, &vars).await {
+        Ok(t) => t,
+        Err(e) => return fetch_failed(state, &integ, &scrub, id, attempts, Some(logged.log_json()), &format!("couldn't get an access token: {}", e.public_message()), None, true).await,
+    };
+    if let Some(t) = &token {
+        scrub.add(t);
+    }
+    let resp = match pull::send(&req, token.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => return fetch_failed(state, &integ, &scrub, id, attempts, Some(logged.log_json()), &e.public_message(), None, true).await,
+    };
+    let mut made = logged.log_json();
+    made["response"] = json!({"status": resp.status, "headers": resp.headers});
+    if !(200..300).contains(&resp.status) {
+        if token.is_some() && matches!(resp.status, 401 | 403) {
+            pull::drop_token(state, integ.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        }
+        let again = matches!(resp.status, 401 | 403 | 404 | 408 | 409 | 425 | 429) || resp.status >= 500;
+        let wait = if matches!(resp.status, 429 | 503) { cooldown(&resp.headers) } else { None };
+        let msg = format!("{} answered HTTP {} ({})", req.place(), resp.status, pull::status_class(resp.status));
+        return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &msg, wait, again).await;
+    }
+    if resp.body.len() > BODY_MAX_BYTES {
+        return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &format!("{} answered with more than 1 MB", req.place()), None, false).await;
+    }
+    let ct = resp.headers.get("content-type").and_then(|v| v.as_str()).map(String::from);
+    let (body, unkept) = kept_body(&integ, &scrub, ct.as_deref(), Some(&resp.body));
+    let Some(body) = body.filter(|_| !unkept) else {
+        return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), "the answer isn't JSON or a form, so it can't be checked against the redact list", None, false).await;
+    };
+    // What's stored never exceeds the room reserved for it.
+    if body.len() > BODY_MAX_BYTES {
+        return fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &format!("{} answered with more than 1 MB", req.place()), None, false).await;
+    }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut *tx).await?;
+    // The answer joins the intent's row; the record can be asked for again from now on.
+    let stored = sqlx::query(
+        "UPDATE integration_deliveries SET body = $2, body_bytes = octet_length($2) + COALESCE((request->>'ctx_bytes')::int, 0), content_type = $3, error = NULL, next_attempt_at = NULL, message_id = NULL,
+             request = (request - 'claimed_until' - 'reserved') || jsonb_build_object('made', $4::jsonb)
+         WHERE id = $1 AND status = 'pending' AND body IS NULL",
+    )
+    .bind(id)
+    .bind(&body)
+    .bind(&ct)
+    .bind(scrub.value(&made))
+    .execute(&mut *tx)
+    .await?;
+    if stored.rows_affected() == 1 {
+        crate::jobs::enqueue_background(&mut *tx, JOB_DELIVERY, json!({"delivery_id": id}), None).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A fetch that didn't work: noted on its row, and tried again later (after the app's own wait
+/// when it gave one) while it may still work; otherwise it fails for good and the record can be
+/// asked for again.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_failed(state: &AppState, integ: &Integration, scrub: &Scrub, id: Uuid, attempts: i32, made: Option<Value>, msg: &str, wait: Option<chrono::Duration>, retry: bool) -> anyhow::Result<()> {
+    let tries = attempts + 1;
+    let retry_at = (retry && tries < MAX_ATTEMPTS).then(|| Utc::now() + wait.unwrap_or_else(|| chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)])));
+    let msg = scrub.text(&match retry_at {
+        Some(_) => format!("fetch failed: {msg}; it will be tried again"),
+        None => format!("fetch failed: {msg}"),
+    });
+    let patch = json!({"made": made.map(|m| scrub.value(&m))});
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE integration_deliveries SET error = $2, next_attempt_at = $3,
+             status = CASE WHEN $3::timestamptz IS NULL THEN 'error' ELSE status END,
+             message_id = CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE message_id END,
+             processed_at = CASE WHEN $3::timestamptz IS NULL THEN now() ELSE processed_at END,
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes - COALESCE((request->>'reserved')::int, 0)),
+             request = jsonb_set((request - 'claimed_until' - 'reserved') || jsonb_strip_nulls($4::jsonb), '{fetch,attempts}', to_jsonb($5::int))
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&msg)
+    .bind(retry_at)
+    .bind(patch)
+    .bind(tries)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + $2, last_delivery_at = now(), last_error = $3, last_error_at = now() WHERE id = $1")
+        .bind(integ.id)
+        .bind(i64::from(retry_at.is_none()))
+        .bind(&msg)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(at) = retry_at {
+        crate::jobs::enqueue_background(&mut *tx, JOB_FETCH, json!({"delivery_id": id}), Some(at)).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

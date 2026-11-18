@@ -84,7 +84,7 @@ fn schema_fields() -> Value {
     json!({
         "name": {"type": "string", "maxLength": 100},
         "script": {"type": "string", "description": "JavaScript defining function handle(input) that returns a list of actions. See dumbmail://docs/integrations."},
-        "signature": {"type": "object", "description": "How to check webhooks: {type:'none'} | {type:'hmac', header, algorithm?:'sha256'|'sha1', format?:'plain'|'stripe'|'svix', encoding?:'hex'|'base64', prefix?, timestamp_header?, tolerance_seconds?, secret_encoding?} | {type:'shared_secret', header} | {type:'shared_secret', query}."},
+        "signature": {"type": "object", "description": "How to check webhooks: {type:'none'} | {type:'hmac', header, algorithm?:'sha256'|'sha1', format?:'plain'|'stripe'|'svix'|'paddle', encoding?:'hex'|'base64', prefix?, timestamp_header?, timestamp_separator? (default '.'), timestamp_unit?:'seconds'|'milliseconds'|'iso8601', sign_url? (sign the webhook URL + body, as Square does), tolerance_seconds?, secret_encoding?} | {type:'shared_secret', header} | {type:'shared_secret', query}."},
         "signature_secret": {"type": "string", "description": "The signing secret (write-only; never returned). Empty string removes it."},
         "settings": {"type": "object", "description": "Non-secret settings the script reads as input.settings (e.g. a list name)."},
         "pull": {"type": ["object", "null"], "description": "Scheduled fetch: {method?, url, headers?, query?, body?, body_format?, auth?, interval_minutes? (>=5), max_pages?}. The URL's site (https, host, port) is fixed text; placeholders {{secret.NAME}}, {{state.KEY}}, {{settings.KEY}}, {{now}}, {{since}} (with | fallbacks) go in the path, query, headers and body. Auth credential fields must be {{secret.NAME}} references. null removes it."},
@@ -132,8 +132,8 @@ impl Feature for Module {
             tool("create_integration", "Create an integration", "Create a custom integration for any app. Returns its secret inbound URL (POST webhooks there). Read dumbmail://docs/integrations first; test the script with test_integration before pointing the app at the URL.", obj(create_props, &["name"]), false, false),
             tool("update_integration", "Update an integration", "Change the name, script, signature settings or secret, settings, pull settings, credentials (write-only; null removes one) or saved state. Changing credentials or the pull's auth drops a cached access token.", obj(update_props, &["id"]), false, false),
             tool("test_integration", "Test an integration's script", "Run the script on a sample payload (or, with pull: true, on the first page fetched from the app now) and return exactly what would be written: the actions, a line per action and counts. Writes nothing. Pass `script` to try changes before saving. A pull test reuses the cached access token and asks for one only if none is cached.",
-                obj(json!({"id": id, "payload": {"description": "Sample body: JSON value, or a string for raw/form bodies"}, "headers": {"type": "object"}, "query": {"type": "object"}, "source": {"enum": ["webhook", "pull", "test"]}, "pull": {"type": "boolean"}, "script": {"type": "string"}}), &["id"]), true, false),
-            tool("list_integration_deliveries", "List an integration's deliveries", "The delivery log, newest first: source (webhook, pull, test, replay), status (pending, ok, error, ignored), error, counts of what was written, attempts and the next retry. Kept 30 days.",
+                obj(json!({"id": id, "payload": {"description": "Sample body: JSON value, or a string for raw/form bodies"}, "headers": {"type": "object"}, "query": {"type": "object"}, "source": {"enum": ["webhook", "pull", "fetch", "test"]}, "pull": {"type": "boolean"}, "script": {"type": "string"}}), &["id"]), true, false),
+            tool("list_integration_deliveries", "List an integration's deliveries", "The delivery log, newest first: source (webhook, pull, fetch, test, replay; fetch is a record a webhook asked to fetch), status (pending, ok, error, ignored), error, counts of what was written, attempts and the next retry. Kept 30 days.",
                 obj(json!({"id": id, "status": {"enum": ["pending", "ok", "error", "ignored"]}, "source": {"enum": ["webhook", "pull", "replay"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}, "offset": {"type": "integer", "minimum": 0}}), &["id"]), true, false),
             tool("get_integration_delivery", "Get one delivery", "A delivery's payload (after the integration's redact list), headers, query, the pull request made (secrets hidden), the result (counts, a line per action, logs) and any error. Without integrations.manage (admins and the owner), only the log line: status, error and counts.", obj(json!({"id": id, "delivery_id": {"type": "string"}}), &["id", "delivery_id"]), true, false),
             tool("replay_integration_deliveries", "Replay deliveries", "Run stored deliveries again with the current script: chosen ones (delivery_ids) or every delivery that failed for good (all_failed). Writes profiles and events and can start flows, so it needs confirm=true; without it you get a dry run with the count.",
@@ -205,7 +205,7 @@ impl Feature for Module {
                     let id = uuid_arg(a, "id")?;
                     let i = model::load(state, acct, id).await?;
                     if !confirmed(a) {
-                        return Ok(json!({"dry_run": true, "integration": i.summary(), "note": "Nothing deleted. This removes the integration and its delivery log (profiles and events it wrote stay). Call again with confirm=true once the user approves."}));
+                        return Ok(json!({"dry_run": true, "integration": i.summary(state), "note": "Nothing deleted. This removes the integration and its delivery log (profiles and events it wrote stay). Call again with confirm=true once the user approves."}));
                     }
                     api::remove(state, ctx, id).await?;
                     Ok(json!({"deleted": true}))
@@ -235,6 +235,7 @@ impl Feature for Module {
                 })
             }
             engine::JOB_PULL => Some(engine::run_pull(state, payload).await),
+            engine::JOB_FETCH => Some(engine::run_fetch(state, payload).await),
             _ => None,
         }
     }

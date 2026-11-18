@@ -9,7 +9,7 @@ import { useDeliveries, useDelivery, useReplay } from "./api";
 import { DeliveryStatusBadge, JsonBlock, countsSummary } from "./parts";
 import type { DeliveryStatus, Integration } from "./types";
 
-const sources = { webhook: "Webhook", pull: "Pull", test: "Test", replay: "Replay" } as const;
+const sources = { webhook: "Webhook", pull: "Pull", fetch: "Fetch", test: "Test", replay: "Replay" } as const;
 
 export function DeliveriesTab({ integration: i, canManage }: { integration: Integration; canManage: boolean }) {
   const { account } = useSession();

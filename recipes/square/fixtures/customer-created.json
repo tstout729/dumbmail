@@ -1,0 +1,57 @@
+{
+  "description": "customer.created: a held profile keyed by the Square customer id; the birthday and address are never stored",
+  "doc": "https://developer.squareup.com/reference/square/customers-api/webhooks/customer.created (example; personal data replaced)",
+  "expect": [
+    {
+      "email": "avery.example@example.com",
+      "first_name": "Avery",
+      "keys": {
+        "square_customer": "QPTXM8PQNX3Q726ZYHPMNP46XC"
+      },
+      "last_name": "Example",
+      "phone_number": "+12125550129",
+      "type": "upsert_profile"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": "2022-11-09T21:23:25Z",
+      "data": {
+        "id": "QPTXM8PQNX3Q726ZYHPMNP46XC",
+        "object": {
+          "customer": {
+            "address": {
+              "address_line_1": "1 Test Street",
+              "administrative_district_level_1": "CA",
+              "locality": "Oakland",
+              "postal_code": "94608"
+            },
+            "birthday": "1962-03-04",
+            "created_at": "2022-11-09T21:23:25.519Z",
+            "creation_source": "DIRECTORY",
+            "email_address": "avery.example@example.com",
+            "family_name": "Example",
+            "given_name": "Avery",
+            "group_ids": [
+              "JGJCW9S0G68NE.APPOINTMENTS"
+            ],
+            "id": "QPTXM8PQNX3Q726ZYHPMNP46XC",
+            "phone_number": "+12125550129",
+            "preferences": {
+              "email_unsubscribed": false
+            },
+            "updated_at": "2022-11-09T21:23:25Z",
+            "version": 0
+          }
+        },
+        "type": "customer"
+      },
+      "event_id": "e12b5591-e0b6-4967-810a-307c7efcb1a7",
+      "merchant_id": "6SSW7HV8K2ST5",
+      "type": "customer.created"
+    }
+  },
+  "sensitive": [
+    "1962-03-04"
+  ]
+}

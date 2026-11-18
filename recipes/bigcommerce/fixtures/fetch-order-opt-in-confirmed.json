@@ -1,0 +1,126 @@
+{
+  "description": "the same order once the installer confirms the checkout box is an unticked marketing opt-in: subscribed to email",
+  "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order (example response, trimmed; personal data replaced)",
+  "expect": [
+    {
+      "consent": [
+        {
+          "channel": "email",
+          "source": "BigCommerce checkout email opt-in",
+          "subscribed": true
+        }
+      ],
+      "email": "casey.example@example.com",
+      "first_name": "Casey",
+      "keys": {
+        "bigcommerce_customer": "11"
+      },
+      "last_name": "Example",
+      "phone_number": "+15125550188",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Placed Order",
+      "profile": {
+        "email": "casey.example@example.com"
+      },
+      "properties": {
+        "channel_id": 1,
+        "currency": "USD",
+        "item_count": 4,
+        "order_id": 218,
+        "status": "Shipped"
+      },
+      "time": "2019-03-05T21:40:11.000Z",
+      "type": "track_event",
+      "unique_id": "bigcommerce:order:218:placed",
+      "value": 69.84
+    },
+    {
+      "metric": "Fulfilled Order",
+      "profile": {
+        "email": "casey.example@example.com"
+      },
+      "properties": {
+        "channel_id": 1,
+        "currency": "USD",
+        "order_id": 218,
+        "status": "Shipped"
+      },
+      "time": "2019-03-13T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "bigcommerce:order:218:fulfilled"
+    }
+  ],
+  "input": {
+    "payload": {
+      "billing_address": {
+        "city": "Austin",
+        "company": "",
+        "country": "United States",
+        "country_iso2": "US",
+        "email": "casey.example@example.com",
+        "first_name": "Casey",
+        "form_fields": [
+          {
+            "name": "Delivery Instructions",
+            "value": "Gate code 4455"
+          }
+        ],
+        "last_name": "Example",
+        "phone": "5125550188",
+        "state": "Texas",
+        "street_1": "1 Test Street",
+        "street_2": "",
+        "zip": "78108"
+      },
+      "cart_id": "7e48f7ef-2e88-4817-aea4-b0ed01490114",
+      "channel_id": 1,
+      "coupon_discount": "5.0000",
+      "currency_code": "USD",
+      "currency_exchange_rate": "1.0000000000",
+      "currency_id": 1,
+      "customer_id": 11,
+      "customer_locale": "en",
+      "customer_message": "",
+      "date_created": "Tue, 05 Mar 2019 21:40:11 +0000",
+      "date_modified": "Wed, 13 Mar 2019 10:00:00 +0000",
+      "date_shipped": "Wed, 13 Mar 2019 10:00:00 +0000",
+      "default_currency_code": "USD",
+      "default_currency_id": 1,
+      "discount_amount": "5.0000",
+      "id": 218,
+      "ip_address": "203.0.113.9",
+      "ip_address_v6": "",
+      "is_deleted": false,
+      "is_email_opt_in": true,
+      "is_tax_inclusive_pricing": false,
+      "items_shipped": 0,
+      "items_total": 4,
+      "order_is_digital": false,
+      "order_source": "external",
+      "payment_method": "Cash",
+      "payment_provider_id": "",
+      "payment_status": "captured",
+      "refunded_amount": "0.0000",
+      "staff_notes": "",
+      "status": "Shipped",
+      "status_id": 2,
+      "subtotal_ex_tax": "62.6793",
+      "subtotal_inc_tax": "67.8400",
+      "subtotal_tax": "4.4000",
+      "total_ex_tax": "64.5300",
+      "total_inc_tax": "69.8400",
+      "total_tax": "5.3100"
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://api.bigcommerce.com/stores/abc123/v2/orders/218"
+    },
+    "settings": {
+      "checkout_opt_in_is_marketing": true,
+      "store_hash": "abc123"
+    },
+    "source": "fetch"
+  }
+}

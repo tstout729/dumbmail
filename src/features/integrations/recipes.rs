@@ -158,6 +158,10 @@ mod tests {
             }
             if !m["pull"].is_null() {
                 super::super::pull::PullConfig::parse(&m["pull"]).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
+                // A recipe's lookups name the part of the vendor's API they stay in.
+                if !m["pull"]["fetch"].is_null() {
+                    assert!(m["pull"]["fetch"]["prefix"].as_str().is_some_and(|p| p.len() > 1), "{}: fetch needs a prefix narrower than /", r.key);
+                }
             }
             for t in m["object_types"].as_array().into_iter().flatten() {
                 let t: crate::features::objects::types::TypeInput = serde_json::from_value(t.clone()).unwrap_or_else(|e| panic!("{} object type: {e}", r.key));
@@ -170,6 +174,29 @@ mod tests {
             assert!(!fixtures(&r.key).is_empty(), "{} has no fixtures", r.key);
             assert!(Files::get(&format!("{}/README.md", r.key)).is_some(), "{} has no README.md saying which docs each assumption comes from", r.key);
         }
+    }
+
+    /// Only real purchases and stays are marked as such (a review asked about one is verified):
+    /// paid orders and charges and confirmed reservations, never inquiries, carts, forms or calls
+    /// anyone with a write key could send.
+    #[test]
+    fn purchase_metrics_are_paid_orders_and_confirmed_stays() {
+        let marked: std::collections::BTreeMap<String, Vec<String>> =
+            all().iter().map(|r| (r.key.clone(), metric_names(&r.manifest["metrics"], true))).filter(|(_, m)| !m.is_empty()).collect();
+        let want: std::collections::BTreeMap<String, Vec<String>> = [
+            ("bigcommerce", "Placed Order"),
+            ("guesty", "Reservation Confirmed"),
+            ("hostaway", "Reservation Confirmed"),
+            ("paddle", "Placed Order"),
+            ("recharge", "Charge Paid"),
+            ("square", "Placed Order"),
+            ("stripe", "Placed Order"),
+            ("woocommerce", "Placed Order"),
+        ]
+        .into_iter()
+        .map(|(k, m)| (k.to_string(), vec![m.to_string()]))
+        .collect();
+        assert_eq!(marked, want);
     }
 
     /// The script input a fixture describes, filled in the way the engine fills it.
@@ -204,7 +231,7 @@ mod tests {
                 let out: Value = super::super::sandbox::run_engine(&r.script, &input.to_string(), std::time::Duration::from_secs(5))
                     .map(|t| serde_json::from_str(&t).unwrap())
                     .unwrap_or_else(|e| panic!("{}/{name}: {e}", r.key));
-                super::super::actions::parse(&out, pull).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
+                super::super::actions::parse(&out, pull || !r.manifest["pull"].is_null()).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
                 // Long outputs are checked by their action counts and last two actions.
                 let summary_only = f["summary_only"] == true;
                 let got = if summary_only {
@@ -217,7 +244,7 @@ mod tests {
                     }
                     json!({"types": types, "tail": arr[arr.len().saturating_sub(2)..]})
                 } else {
-                    out
+                    out.clone()
                 };
                 if write {
                     let mut f = f.clone();
@@ -227,6 +254,21 @@ mod tests {
                     continue;
                 }
                 assert_eq!(got, f["expect"], "{}/{name}: script output differs from the fixture's expect", r.key);
+                // A webhook's (or fetch's) script runs on the stored payload, which has the redact
+                // list applied: removing those fields must not change what the script does.
+                if !pull {
+                    let paths = super::super::redact::paths_with(&strings(&r.manifest["redact"]), input["settings"].as_object().unwrap_or(&serde_json::Map::new()));
+                    let body = input["payload"].to_string();
+                    if let Some(kept) = super::super::redact::body(Some("application/json"), &body, &paths) {
+                        let mut redacted = input.clone();
+                        redacted["payload"] = serde_json::from_str(&kept).unwrap();
+                        redacted["body"] = json!(kept);
+                        let again: Value = super::super::sandbox::run_engine(&r.script, &redacted.to_string(), std::time::Duration::from_secs(5))
+                            .map(|t| serde_json::from_str(&t).unwrap())
+                            .unwrap_or_else(|e| panic!("{}/{name} (redacted): {e}", r.key));
+                        assert_eq!(again, out, "{}/{name}: the redact list removes something the script reads", r.key);
+                    }
+                }
             }
         }
     }

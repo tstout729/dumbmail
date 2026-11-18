@@ -1,0 +1,558 @@
+{
+  "description": "the first page, newest change first: new and modified bookings, a cancellation, an inquiry and an owner stay (skipped), stopping at the change the last run read; door codes, lockbox instructions and guest notes never reach events or profiles",
+  "doc": "https://api.hostaway.com/documentation (Reservation object example and Retrieve a reservations list; personal data replaced; updatedOn as in its Sorting by updatedOn example)",
+  "expect": [
+    {
+      "email": "robin.example@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "13"
+      },
+      "last_name": "Example",
+      "phone_number": "+15125550111",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "robin.example@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "13",
+        "status": "new"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:13:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "robin.example@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "currency": "USD",
+        "reservation_id": "13"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:13:total",
+      "value": 867
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "robin.example@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "13",
+        "status": "new"
+      },
+      "time": "2026-11-17T09:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:13:confirmed:2026-11-17T09:00:00.000Z:paid"
+    },
+    {
+      "email": "guest20@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "20"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "guest20@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "C20",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": false,
+        "reservation_id": "20",
+        "status": "modified"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:20:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "guest20@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "currency": "USD",
+        "reservation_id": "20"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:20:total",
+      "value": 867
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "guest20@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "C20",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": false,
+        "reservation_id": "20",
+        "status": "modified"
+      },
+      "time": "2026-11-17T08:30:00.001Z",
+      "type": "track_event",
+      "unique_id": "hostaway:20:confirmed:2026-11-17T08:30:00.000Z:unpaid"
+    },
+    {
+      "email": "guest21@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "21"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Cancelled",
+      "profile": {
+        "email": "guest21@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "C21",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": false,
+        "reservation_id": "21",
+        "status": "cancelled"
+      },
+      "time": "2026-11-17T08:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:21:cancelled:2026-11-17T08:00:00.000Z"
+    },
+    {
+      "email": "guest22@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "22"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Inquiry Received",
+      "profile": {
+        "email": "guest22@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "C22",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": false,
+        "reservation_id": "22",
+        "status": "inquiry"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:22:inquiry"
+    },
+    {
+      "message": "skipped owner stay 23",
+      "type": "log"
+    },
+    {
+      "email": "old@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "9"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "9",
+        "status": "new"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "currency": "USD",
+        "reservation_id": "9"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:total",
+      "value": 867
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "9",
+        "status": "new"
+      },
+      "time": "2026-11-16T23:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:confirmed:2026-11-16T23:00:00.000Z:paid"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "cursor": "2026-11-17T09:00:00.000Z",
+        "cursor_ids": [
+          "13"
+        ],
+        "pending": null,
+        "pending_ids": null,
+        "resume_after": null
+      }
+    }
+  ],
+  "input": {
+    "page": 1,
+    "payload": {
+      "count": 6,
+      "limit": 100,
+      "offset": null,
+      "result": [
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "HMP2KQ4B44",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "robin.example@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 13,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": "+15125550111",
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "new",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 09:00:00"
+        },
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "C20",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "guest20@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 20,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": null,
+          "protectionProviders": [],
+          "remainingBalance": 100,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "modified",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 08:30:00"
+        },
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "C21",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "guest21@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 21,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": null,
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "cancelled",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 08:00:00"
+        },
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "C22",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "guest22@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 22,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": null,
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "inquiry",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 07:30:00"
+        },
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "C23",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "guest23@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 23,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": null,
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "ownerStay",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-17 07:00:00"
+        },
+        {
+          "adults": 2,
+          "arrivalDate": "2026-12-15",
+          "channelId": 2001,
+          "channelName": "airbnb",
+          "confirmationCode": "HMP2KQ4B44",
+          "currency": "USD",
+          "departureDate": "2026-12-18",
+          "doorCode": "4821",
+          "doorCodeInstruction": "Lockbox by the side gate, code 9012",
+          "doorCodeVendor": "vendor",
+          "guestAddress": "1 Test St",
+          "guestAuthHash": "AUTHHASH-0f1e2d3c4b5a",
+          "guestCity": "Austin",
+          "guestCountry": "US",
+          "guestEmail": "old@example.com",
+          "guestExternalAccountId": "84497323",
+          "guestFirstName": "Robin",
+          "guestLastName": "Example",
+          "guestName": "Robin Example",
+          "guestNote": "Arriving late",
+          "guestPicture": "https://example.com/p.jpg",
+          "guestPortalUrl": "https://portal.example.com/r/PORTAL-0f1e2d3c",
+          "guestZipCode": "TX 78705",
+          "hostNote": null,
+          "hostawayReservationId": 13,
+          "id": 9,
+          "isPaid": null,
+          "listingMapId": 40160,
+          "nights": 3,
+          "numberOfGuests": 2,
+          "paymentMethod": null,
+          "phone": null,
+          "protectionProviders": [],
+          "remainingBalance": 0,
+          "reservationDate": "2026-11-10 10:41:10",
+          "reservationId": "10450-40160-thread313906227-9586017324",
+          "source": "homeawayApi",
+          "status": "new",
+          "totalPrice": 867,
+          "updatedOn": "2026-11-16 23:00:00"
+        }
+      ],
+      "status": "success"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-16T23:00:00.000Z"
+    }
+  },
+  "sensitive": [
+    "4821",
+    "Lockbox by the side gate",
+    "Arriving late",
+    "AUTHHASH-0f1e2d3c4b5a",
+    "PORTAL-0f1e2d3c"
+  ]
+}

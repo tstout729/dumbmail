@@ -328,8 +328,9 @@ async fn replies_follow_the_window_of_the_number_that_texted() {
     sqlx::query("UPDATE profiles SET sms_consent = 'subscribed' WHERE id = $1::uuid").bind(&pid).execute(&h.state.db).await.unwrap();
     let (s, _) = h.req("POST", &format!("/api/inbox/conversations/{id}/reply"), Some(json!({"body": "Still there?", "confirm": true}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
-    // Subscribed on the number that texted: texted as usual.
-    h.ok("PATCH", &format!("/api/profiles/{pid}"), Some(json!({"phone_number": them}))).await;
+    // Subscribed on the number that texted: texted as usual. (Moving a subscription to another
+    // number doesn't carry it over, so the consent is set for that number in the same request.)
+    h.ok("PATCH", &format!("/api/profiles/{pid}"), Some(json!({"phone_number": them, "sms_consent": "subscribed"}))).await;
     h.ok("POST", &format!("/api/inbox/conversations/{id}/reply"), Some(json!({"body": "Still there?", "confirm": true}))).await;
 
     // A webhook delivered late opens its window from when the provider got it, not when we did.
