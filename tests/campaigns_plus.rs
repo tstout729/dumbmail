@@ -1052,7 +1052,7 @@ async fn roles_content_and_analyst_stay_within_their_lines() {
     }
     let ckey = key_for(&mut h, content_id, "content key").await;
     let (err, v) = mcp(&h, &ckey, "create_resend", json!({"campaign_id": orig})).await;
-    assert!(!err || v["_text"].as_str().unwrap_or("").contains("resends"), "drafting is allowed for Content: {v}");
+    assert!(!err, "drafting a resend is allowed for Content: {v}");
     for (tool, args) in [
         ("archive_campaigns", json!({"ids": [draft]})),
         ("archive_campaigns", json!({"ids": [draft], "archived": false})),
