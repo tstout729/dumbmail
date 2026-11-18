@@ -435,6 +435,24 @@ pub mod hook {
         }
     }
 
+    static FAIL_EVENTS: Lazy<Mutex<HashMap<Uuid, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Make an account's next `n` push event recordings fail, as if the database had refused them.
+    pub fn fail_events(account_id: Uuid, n: usize) {
+        FAIL_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).insert(account_id, n);
+    }
+
+    pub(super) fn event_fails(account_id: Uuid) -> bool {
+        let mut m = FAIL_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get_mut(&account_id) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) async fn wait(account_id: Uuid, point: Point) {
         let p = PAUSES.lock().unwrap_or_else(|e| e.into_inner()).get(&(account_id, point)).cloned();
         if let Some(p) = p {
@@ -992,6 +1010,9 @@ pub async fn record_message_event(state: &AppState, message_id: Uuid, metric: &s
     let Some((account_id, profile_id, campaign_id, flow_id, subject, is_test)) = m else { return Ok(()) };
     if is_test {
         return Ok(());
+    }
+    if hook::event_fails(account_id) {
+        anyhow::bail!("event recording failed (test)");
     }
     let (unique, props) = match metric {
         "Clicked Push" => {

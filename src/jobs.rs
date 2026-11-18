@@ -138,7 +138,7 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("flows_plus_backfill", "backfill_id", "SELECT account_id FROM flow_backfills WHERE id = $1"),
     ("flows_plus_confirm_address", "account_id", "SELECT $1::uuid"),
     // push_retry isn't here: its final claim settles a closed account's deliveries as skipped.
-    ("push_event", "account_id", "SELECT $1::uuid"),
+    // push_event isn't either: it records what already happened (a push the device accepted).
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).

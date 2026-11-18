@@ -520,13 +520,23 @@ impl Feature for Module {
                 send::hand_off(state, id, send::Attempt::Later).await.map(|_| ()).map_err(|e| anyhow::anyhow!(e.public_message()))
             }
             .await),
+            // Tried until the event is written (it stops only when the message is gone): a failure
+            // queues the next try itself, with a growing wait, rather than running out of attempts.
             "push_event" => Some(async {
                 let id: Uuid = payload["message_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("push_event needs message_id"))?;
                 let metric = match payload["metric"].as_str() {
                     Some("Clicked Push") => "Clicked Push",
                     _ => "Received Push",
                 };
-                send::record_message_event(state, id, metric).await
+                if let Err(e) = send::record_message_event(state, id, metric).await {
+                    let tries = payload["tries"].as_i64().unwrap_or(0) + 1;
+                    let wait = (30i64 << tries.min(7)).min(3600);
+                    tracing::warn!(message = %id, metric, tries, error = %e, "push event not recorded yet; trying again");
+                    let mut next = payload.clone();
+                    next["tries"] = json!(tries);
+                    crate::jobs::enqueue_background(&state.db, "push_event", next, Some(chrono::Utc::now() + chrono::Duration::seconds(wait))).await?;
+                }
+                Ok(())
             }
             .await),
             "push_cleanup" => Some(send::cleanup(state).await),

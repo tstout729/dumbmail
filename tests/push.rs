@@ -1305,3 +1305,24 @@ async fn registering_while_a_send_is_accepted_neither_deadlocks_nor_loses_either
     assert!(v1 > v0 && owner == Some(bob), "and the browser is Bob's now");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn received_push_is_recorded_however_often_it_fails_first() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    let p = person(&mut h, &l, "p@x.test", "P").await;
+    enroll(&h, &a, &browser(&base, "p1"), "p@x.test").await;
+    // More failures than any job's own attempts.
+    send::hook::fail_events(a.id, 8);
+    let cid = push_campaign(&mut h, &l, json!({"title": "Hi"})).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    assert_eq!(message_of(&h, p).await.1, "sent");
+    assert_eq!(events(&h, "Received Push").await, 0);
+    for _ in 0..10 {
+        h.fast_forward().await;
+    }
+    assert_eq!(events(&h, "Received Push").await, 1, "written in the end, once");
+    h.cleanup().await;
+}
