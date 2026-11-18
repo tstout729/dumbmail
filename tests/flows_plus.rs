@@ -1032,9 +1032,14 @@ async fn only_the_worker_holding_a_run_sends_or_moves_it() {
         {"id": "u", "type": "update_profile", "properties": {"done": "yes"}, "next": null}]})).await;
     let flow = flow_row(&h, &fid).await;
 
-    // A worker that loaded the run before another one sent and moved it: its claim matches nothing.
+    // A worker that loaded the run before another one sent and parked it (still active): its
+    // claim matches nothing, so it neither sends nor moves the run.
+    let parks = live_flow(&mut h, json!({"type": "metric", "metric": "Parks"}), json!({"entry": "w", "nodes": [
+        {"id": "w", "type": "webhook", "url": hook.url, "next": "d"},
+        {"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]})).await;
+    let parks_flow = flow_row(&h, &parks).await;
     let pid = new_person(&mut h, "stale@x.test").await;
-    let run = dumbmail::flows::start(&h.state, &flow, pid, json!({})).await.unwrap().unwrap();
+    let run = dumbmail::flows::start(&h.state, &parks_flow, pid, json!({})).await.unwrap().unwrap();
     hook.go.add_permits(100);
     let pause = dumbmail::flows::StepPause::hold(run);
     let state = h.state.clone();
@@ -1045,7 +1050,10 @@ async fn only_the_worker_holding_a_run_sends_or_moves_it() {
     pause.release();
     stale.await.unwrap().unwrap();
     assert_eq!(hook.hits.load(Ordering::SeqCst), 1, "the stale worker sent nothing");
-    assert_eq!(run_of(&h, &fid, "stale@x.test").await.1, "completed");
+    let (_, status, node, _) = run_of(&h, &parks, "stale@x.test").await;
+    assert_eq!((status.as_str(), node.as_deref()), ("active", Some("d")));
+    let wakes: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'flow_step' AND payload->>'run_id' = $1::text AND payload ? 'wake'").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(wakes, 1, "parked once");
 
     // A second worker while the first is mid-send: it sends nothing and tries again later.
     hook.go.forget_permits(1000);
