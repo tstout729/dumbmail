@@ -610,7 +610,7 @@ async fn mock_hostaway() -> (std::sync::Arc<MockHostaway>, String) {
                 let after = q.get("afterId").cloned().unwrap_or_default();
                 m.pages.lock().unwrap().push(after.clone());
                 let rows = m.rows.lock().unwrap().clone();
-                let start = if after.is_empty() { 0 } else { rows.iter().position(|r| r["id"].to_string() == after).map(|i| i + 1).unwrap_or(rows.len()) };
+                let start = if after.is_empty() { 0 } else { rows.iter().position(|r| r["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(after.as_str())).map(|i| i + 1).unwrap_or(rows.len()) };
                 let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
                 let page: Vec<Value> = rows.into_iter().skip(start).take(limit).collect();
                 axum::Json(json!({"status": "success", "result": page, "count": null, "limit": limit, "offset": null}))
