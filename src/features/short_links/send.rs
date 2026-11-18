@@ -260,7 +260,8 @@ pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign
 }
 
 /// Sample short links for a preview: every link a real send would shorten, as a short link of the
-/// real length. None when the body has no such link or the account has short links off.
+/// real length. None when the body has no such link, the account has short links off or short
+/// links aren't in use yet (see [`index_ready`]).
 pub struct Sample {
     links: HashSet<String>,
     short: String,
@@ -275,6 +276,10 @@ impl SmsLinks for Sample {
 
 /// See [`Sample`]. One statement, only when the body has a link the sender wrote.
 pub async fn preview(state: &AppState, account: &Account, body: &str) -> AppResult<Option<Sample>> {
+    // Until the index is in place, sends use the long form, so the preview does too.
+    if !index_ready() {
+        return Ok(None);
+    }
     let links = written_links(body, &own_hosts(state, account.link_domain.as_deref()));
     if links.is_empty() {
         return Ok(None);
