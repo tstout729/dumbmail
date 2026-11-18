@@ -1,0 +1,80 @@
+{
+  "key": "woocommerce",
+  "name": "WooCommerce",
+  "category": "Ecommerce",
+  "description": "WooCommerce orders become events on each buyer's profile: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount), with the order's items and currency. Customers become profiles held back from marketing, because WooCommerce has no marketing opt-in field. Past orders import through the REST API.",
+  "metrics": [
+    "Placed Order",
+    "Fulfilled Order",
+    "Cancelled Order",
+    "Refunded Order"
+  ],
+  "docs": [
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#webhooks",
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#order-properties",
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#list-all-orders",
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#customer-properties",
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#authentication-over-https",
+    "https://woocommerce.github.io/woocommerce-rest-api-docs/#pagination"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "X-WC-Webhook-Signature",
+    "encoding": "base64"
+  },
+  "signature_secret": {
+    "label": "WooCommerce webhook secret",
+    "help": "The Secret you type when you add each webhook (WooCommerce \u2192 Settings \u2192 Advanced \u2192 Webhooks). Use the same secret for all of this integration's webhooks."
+  },
+  "message_id": {
+    "header": "X-WC-Webhook-Delivery-ID"
+  },
+  "credentials": [
+    {
+      "name": "consumer_key",
+      "label": "REST API consumer key",
+      "help": "Only needed to import past orders. WooCommerce \u2192 Settings \u2192 Advanced \u2192 REST API \u2192 Add key, with Read permission. Starts with ck_."
+    },
+    {
+      "name": "consumer_secret",
+      "label": "REST API consumer secret",
+      "help": "Shown once next to the consumer key. Starts with cs_."
+    }
+  ],
+  "settings": {},
+  "pull": {
+    "method": "GET",
+    "url": "https://your-store.example.com/wp-json/wc/v3/orders",
+    "query": {
+      "per_page": 50,
+      "orderby": "modified",
+      "order": "asc",
+      "dates_are_gmt": "true",
+      "modified_after": "{{state.after|since}}",
+      "offset": "{{state.skip|'0'}}"
+    },
+    "auth": {
+      "type": "basic",
+      "username": "{{secret.consumer_key}}",
+      "password": "{{secret.consumer_secret}}"
+    },
+    "max_pages": 20
+  },
+  "redact": [
+    "**.customer_ip_address",
+    "**.customer_user_agent",
+    "**.meta_data",
+    "**.payment_url",
+    "**.transaction_id"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Pick a long random secret and save it as the integration's signing secret.",
+    "In WordPress, go to WooCommerce \u2192 Settings \u2192 Advanced \u2192 Webhooks \u2192 Add webhook. Name it DumbMail orders, set Status to Active, Topic to Order created, Delivery URL to the webhook URL, and Secret to the same secret. Save.",
+    "Add three more webhooks the same way, with the topics Order updated, Customer created and Customer updated.",
+    "Place a test order (or open a webhook's Logs) and check the delivery log. A paid order shows up as Placed Order on the buyer's profile.",
+    "To import past orders: in the Pull tab, change your-store.example.com to your store's address, save a REST API key with Read permission as the credentials consumer_key and consumer_secret, then Import history from a start date. Imported orders are marked historical.",
+    "Buyers are held back from marketing (WooCommerce doesn't record a marketing opt-in). Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every customer."
+  ],
+  "flows": []
+}
