@@ -457,6 +457,65 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     Ok(Some(event_id))
 }
 
+/// One past event brought in from another platform (see [`record_history`]).
+pub struct HistoryEvent {
+    pub profile_id: Uuid,
+    pub metric_id: Uuid,
+    pub properties: Value,
+    pub value: Option<f64>,
+    pub occurred_at: DateTime<Utc>,
+    /// Required: history is deduplicated on it, so importing twice adds nothing.
+    pub unique_id: String,
+}
+
+/// Record past events quietly: no flows start and nothing is sent or billed. Profiles' `last_event_at`
+/// moves only as far as the events' own times. Returns how many were new. One statement, so replaying a
+/// batch after a crash (its events already there) still brings `last_event_at` up to date.
+pub async fn record_history<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid, events: &[HistoryEvent]) -> AppResult<u64> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut ids = Vec::with_capacity(events.len());
+    let (mut profiles, mut metrics, mut props, mut values, mut times, mut uniques) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for e in events {
+        ids.push(Uuid::now_v7());
+        profiles.push(e.profile_id);
+        metrics.push(e.metric_id);
+        props.push(e.properties.clone());
+        values.push(e.value.or_else(|| e.properties.get("$value").and_then(|v| v.as_f64())));
+        times.push(e.occurred_at);
+        uniques.push(e.unique_id.clone());
+    }
+    let inserted: i64 = sqlx::query_scalar(
+        "WITH x AS (SELECT * FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::jsonb[], $6::float8[], $7::timestamptz[], $8::text[])
+                    AS x(id, profile_id, metric_id, properties, value, occurred_at, unique_id)),
+         ins AS (
+            INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id)
+            SELECT x.id, $1, x.profile_id, x.metric_id, x.properties, x.value, x.occurred_at, x.unique_id FROM x
+            JOIN profiles p ON p.id = x.profile_id AND p.account_id = $1
+            JOIN metrics m ON m.id = x.metric_id AND m.account_id = $1
+            ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+            RETURNING 1),
+         latest AS (
+            UPDATE profiles p SET last_event_at = GREATEST(COALESCE(p.last_event_at, 'epoch'), l.t)
+            FROM (SELECT profile_id, max(occurred_at) AS t FROM x GROUP BY 1) l
+            WHERE p.id = l.profile_id AND p.account_id = $1 AND (p.last_event_at IS NULL OR p.last_event_at < l.t)
+            RETURNING 1)
+         SELECT (SELECT count(*) FROM ins) + 0 * (SELECT count(*) FROM latest)",
+    )
+    .bind(account_id)
+    .bind(&ids)
+    .bind(&profiles)
+    .bind(&metrics)
+    .bind(&props)
+    .bind(&values)
+    .bind(&times)
+    .bind(&uniques)
+    .fetch_one(db)
+    .await?;
+    Ok(inserted as u64)
+}
+
 /// Add profiles to a list and wake list-triggered flows for newly added members.
 pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
     let added: Vec<Uuid> = sqlx::query_scalar(
@@ -479,12 +538,13 @@ pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_i
 
 /// Remove profiles from a list (the caller has checked the list is the account's).
 pub async fn remove_from_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
-    const REMOVE: &str = "DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)";
-    if !crate::features::webhooks::wants_list_changes(db, account_id, false) {
-        return Ok(sqlx::query(REMOVE).bind(list_id).bind(profile_ids).execute(db).await?.rows_affected());
+    // For a list imported from Klaviyo the leave is recorded with the removal, so a later import
+    // never adds the person back (see `klaviyo_import::remove_members`). For any other list this
+    // is just the removal.
+    let removed = crate::features::klaviyo_import::remove_members(db, account_id, list_id, profile_ids).await?;
+    if crate::features::webhooks::wants_list_changes(db, account_id, false) {
+        crate::features::webhooks::list_changed(db, account_id, list_id, &removed, false).await;
     }
-    let removed: Vec<Uuid> = sqlx::query_scalar(&format!("{REMOVE} RETURNING profile_id")).bind(list_id).bind(profile_ids).fetch_all(db).await?;
-    crate::features::webhooks::list_changed(db, account_id, list_id, &removed, false).await;
     Ok(removed.len() as u64)
 }
 
