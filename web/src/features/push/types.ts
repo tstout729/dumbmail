@@ -45,13 +45,14 @@ export type PushPrompt = {
 };
 
 export type PushSettings = {
-  web: { enabled: boolean; ready: boolean; vapid_public_key: string | null; sw_path: string; prompt: PushPrompt; service_worker_url: string };
-  apns: { configured: boolean; key_id: string | null; team_id: string | null; bundle_id: string | null; production: boolean; error: string | null };
+  web: { enabled: boolean; ready: boolean; vapid_public_key: string | null; sw_path: string; sw_scope: string; prompt: PushPrompt; service_worker_url: string; handler_url: string };
+  apns: { configured: boolean; key_id: string | null; team_id: string | null; bundle_id: string | null; production: boolean; verified: boolean; error: string | null };
   fcm: { configured: boolean; project_id: string | null; client_email: string | null; error: string | null };
   identity: { configured: boolean; hint: string | null };
+  account_id: string;
   public_key: string;
   register_url: string;
-  devices: { web: number; ios: number; android: number; not_linked: number };
+  devices: { web: number; ios: number; android: number; anonymous: number; permission_denied: number };
   reachable_people: number;
   opted_out: number;
 };
@@ -61,6 +62,7 @@ export type ApnsInput = { key_id: string; team_id: string; bundle_id: string; pr
 export type PushSettingsPatch = {
   web_enabled?: boolean;
   sw_path?: string;
+  sw_scope?: string;
   prompt?: PushPrompt;
   apns?: ApnsInput | null;
   fcm?: { service_account_json: string } | null;
@@ -69,6 +71,6 @@ export type PushSettingsPatch = {
 export type PushTestResult = { message_id: string; devices: { kind: PushPlatform; status: string; error: string | null }[] };
 
 export type PushReport = {
-  people: { sent: number; clicked: number; failed: number; skipped: number };
-  platforms: { platform: PushPlatform; sent: number; delivered: number | null; clicked: number; failed: number; removed: number; retrying: number }[];
+  people: { sent: number; clicked: number; failed: number; skipped: number; retrying: number; unconfirmed: number };
+  platforms: { platform: PushPlatform; sent: number; delivered: number | null; clicked: number; failed: number; removed: number; retrying: number; unconfirmed: number }[];
 };

@@ -21,7 +21,7 @@ export function PushSettingsPage() {
         <Stat label="Browsers" value={formatNumber(s.devices.web)} />
         <Stat label="iOS devices" value={formatNumber(s.devices.ios)} />
         <Stat label="Android devices" value={formatNumber(s.devices.android)} />
-        <Stat label="Not linked yet" value={formatNumber(s.devices.not_linked)} sub="Waiting to know who they are" />
+        <Stat label="Anonymous" value={formatNumber(s.devices.anonymous)} sub="Not signed in on your site or app" />
       </div>
       <WebPush settings={s} />
       <PromptCard key={JSON.stringify(s.web.prompt)} prompt={s.web.prompt} />
@@ -51,8 +51,9 @@ function WebPush({ settings }: { settings: PushSettings }) {
   const canWrite = useCan("settings.write");
   const update = useUpdatePushSettings();
   const [path, setPath] = useState(settings.web.sw_path);
+  const [scope, setScope] = useState(settings.web.sw_scope);
   const web = settings.web;
-  const save = (patch: { web_enabled?: boolean; sw_path?: string }, done: string) => update.mutate(patch, { onSuccess: () => toast.success(done) });
+  const save = (patch: { web_enabled?: boolean; sw_path?: string; sw_scope?: string }, done: string) => update.mutate(patch, { onSuccess: () => toast.success(done) });
   return (
     <Card
       title="Web push"
@@ -95,18 +96,26 @@ function WebPush({ settings }: { settings: PushSettings }) {
               className="mt-3 flex flex-wrap items-end gap-2"
               onSubmit={(e: FormEvent) => {
                 e.preventDefault();
-                save({ sw_path: path }, "Path saved");
+                save({ sw_path: path, sw_scope: scope }, "Saved");
               }}
             >
               <Field label="Path on your site">
                 <Input value={path} onChange={(e) => setPath(e.target.value)} className="w-56" disabled={!canWrite} />
               </Field>
+              <Field label="Scope" hint="A folder of its own, so it controls none of your pages.">
+                <Input value={scope} onChange={(e) => setScope(e.target.value)} className="w-56" disabled={!canWrite} />
+              </Field>
               {canWrite ? (
-                <Button type="submit" variant="secondary" disabled={path === web.sw_path} loading={update.isPending}>
-                  Save path
+                <Button type="submit" variant="secondary" disabled={path === web.sw_path && scope === web.sw_scope} loading={update.isPending}>
+                  Save
                 </Button>
               ) : null}
             </form>
+            <p className="mt-3 text-xs">
+              Already have a service worker at your site's root? Add DumbMail's handlers to it with{" "}
+              <code className="break-all rounded bg-zinc-100 px-1">importScripts("{web.handler_url}")</code>, then set the path and scope above to your
+              worker's (for example /sw.js and /). Your own notifications keep working.
+            </p>
           </li>
           <li>Turn web push on (top right). The website snippet you already have does the rest.</li>
         </ol>
@@ -465,18 +474,24 @@ function Identity({ settings }: { settings: PushSettings }) {
     <Card title="Linking devices to people" actions={settings.identity.configured ? <Badge tone="green">Secret {settings.identity.hint}</Badge> : null}>
       <div className="space-y-3 text-sm text-zinc-600">
         <p>
-          Anyone can copy your site key, so a browser or app can't just say who it belongs to. A device is linked to a person when they arrive from a link in
-          one of your emails, texts or notifications, or when your own server vouches for who's signed in.
+          Anyone can copy your site key, and email links get forwarded, so neither can say who a device belongs to. A device is linked to a person only with an
+          enrollment grant your own server makes for whoever is signed in, valid for at most a day. Until then it gets an anonymous profile of its own.
         </p>
-        <p>
-          To vouch from your server, make a secret here and send <code className="rounded bg-zinc-100 px-1 text-xs">user_hash</code> along with the
-          customer's id: the HMAC-SHA256 of their id with the secret, in hex.
-        </p>
+        <Field label="Your account id (part of every grant)">
+          <CopyField value={settings.account_id} />
+        </Field>
         <CodeBlock
-          label="On your server (Node.js)"
-          code={`const user_hash = require("crypto").createHmac("sha256", process.env.DUMBMAIL_PUSH_SECRET).update(customer.id).digest("hex");`}
+          label="On your server (Node.js; Python, PHP and Ruby are in the push guide)"
+          code={`const expires = Math.floor(Date.now() / 1000) + 3600;
+const mac = require("crypto").createHmac("sha256", process.env.DUMBMAIL_PUSH_SECRET)
+  .update(\`v1|push-enroll|${settings.account_id}|external_id|\${customer.id}|\${expires}\`).digest("hex");
+const grant = \`v1.\${expires}.\${mac}\`;`}
         />
-        <CodeBlock label="On your site, after sign-in" code={`dumbmail.notifications.identify({ external_id: "${"{customer id}"}", user_hash: "${"{user_hash}"}" });`} />
+        <CodeBlock
+          label="On your site, after sign-in (and on sign-out)"
+          code={`dumbmail.notifications.identify({ type: "external_id", value: customerId, grant });
+dumbmail.notifications.signOut();`}
+        />
         {secret ? (
           <Notice tone="amber" icon={<KeyRound />} title="Copy this secret now. It won't be shown again.">
             <div className="mt-2">
@@ -494,7 +509,7 @@ function Identity({ settings }: { settings: PushSettings }) {
       {confirm ? (
         <ConfirmDialog
           title={settings.identity.configured ? "Replace the secret?" : "Make a secret?"}
-          body={settings.identity.configured ? "Your server must switch to the new one: user_hash values made with the old secret stop working right away." : "You'll see it once. Keep it on your server only."}
+          body={settings.identity.configured ? "Your server must switch to the new one: grants made with the old secret stop working right away." : "You'll see it once. Keep it on your server only."}
           confirmLabel="Make secret"
           loading={rotate.isPending}
           onConfirm={() =>
@@ -517,15 +532,17 @@ function Mobile({ settings }: { settings: PushSettings }) {
     <Card title="Your app's code">
       <div className="space-y-3 text-sm text-zinc-600">
         <p>
-          There's no DumbMail app SDK to install. Your app sends its device token to this address on every launch and after sign-in, and reports when someone
-          opens a notification. The full Swift, Kotlin and React Native code is in the push guide (the MCP resource dumbmail://docs/push, or docs/PUSH.md).
+          There's no DumbMail app SDK to install. Your app asks for permission, then sends its device token and the permission it got to this address on every
+          launch, after sign-in and whenever the permission changes, and reports when someone opens a notification. Only devices that allowed notifications
+          are sent to. The full Swift, Kotlin and React Native code is in the push guide (the MCP resource dumbmail://docs/push, or docs/PUSH.md).
         </p>
         <Field label="Register a device (POST, JSON)">
           <CopyField value={settings.register_url} />
         </Field>
         <CodeBlock
           label="Body"
-          code={`{"platform": "ios" | "android", "token": "<device token>", "identity": {"external_id": "<customer id>", "user_hash": "<from your server>"}}`}
+          code={`{"platform": "ios" | "android", "token": "<device token>", "permission": "granted" | "provisional" | "denied" | "not_determined",
+ "identity": {"type": "external_id", "value": "<customer id>", "grant": "<from your server>"}}`}
         />
       </div>
     </Card>

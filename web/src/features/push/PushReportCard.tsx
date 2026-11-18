@@ -26,6 +26,7 @@ export function PushReportCard({ campaignId, flowId }: { campaignId?: string; fl
                 <Th className="text-right">Sent</Th>
                 <Th className="text-right">Delivered</Th>
                 <Th className="text-right">Clicked</Th>
+                <Th className="text-right">Unconfirmed</Th>
                 <Th className="text-right">Failed</Th>
                 <Th className="text-right">Removed</Th>
               </tr>
@@ -39,6 +40,9 @@ export function PushReportCard({ campaignId, flowId }: { campaignId?: string; fl
                     {p.delivered === null ? "—" : formatNumber(p.delivered)}
                   </Td>
                   <Td className="text-right tabular-nums">{formatNumber(p.clicked)}</Td>
+                  <Td className="text-right tabular-nums" title="Sent, but the push service never answered; not sent again">
+                    {formatNumber(p.unconfirmed)}
+                  </Td>
                   <Td className="text-right tabular-nums">{formatNumber(p.failed + p.retrying)}</Td>
                   <Td className="text-right tabular-nums">{formatNumber(p.removed)}</Td>
                 </tr>
@@ -46,7 +50,8 @@ export function PushReportCard({ campaignId, flowId }: { campaignId?: string; fl
             </tbody>
           </Table>
           <p className="border-t border-zinc-100 px-4 py-2 text-xs text-zinc-500">
-            Delivered counts browsers that showed it; apps don't report that. Removed devices had turned notifications off or uninstalled.
+            Delivered counts browsers that showed it; apps don't report that. Unconfirmed: the push service never answered, so it isn't sent again. Removed
+            devices had turned notifications off or uninstalled.
           </p>
         </div>
       )}

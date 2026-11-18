@@ -111,7 +111,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const blocker = useBlocker(({ currentLocation, nextLocation }) => dirty && currentLocation.pathname !== nextLocation.pathname);
 
   const edit = (patch: Partial<Draft>) => setDraft({ ...current, ...patch });
-  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience });
+  // Push: only devices on the platforms this campaign targets (across its versions).
+  const pushPlatforms =
+    campaign.channel === "push"
+      ? [...new Set(versionIds(current.ab_test).flatMap((v) => (versionContent(current, v) as PushContent).platforms ?? ["web", "ios", "android"]))]
+      : undefined;
+  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience, platforms: pushPlatforms });
 
   const save = async () => {
     if (!draft) return true;

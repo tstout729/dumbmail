@@ -30,7 +30,7 @@ export const campaignsApi = {
   create: (input: CampaignInput) => api<Campaign>("POST", "/api/campaigns", input),
   update: (id: string, patch: CampaignPatch) => api<Campaign>("PATCH", `/api/campaigns/${id}`, patch),
   remove: (id: string) => api<Campaign>("DELETE", `/api/campaigns/${id}`),
-  estimate: (input: { channel: Channel; audience: Audience }) =>
+  estimate: (input: { channel: Channel; audience: Audience; platforms?: string[] }) =>
     api<{ count: number }>("POST", "/api/campaigns/estimate", input),
   /** `version` picks which A/B test version to send; omitted sends A. */
   test: (id: string, to: string[], version?: VersionId) =>
@@ -74,10 +74,10 @@ export function useCampaignReport(id: string, enabled: boolean, status?: Campaig
   });
 }
 
-export function useEstimate(input: { channel: Channel; audience: Audience } | null) {
+export function useEstimate(input: { channel: Channel; audience: Audience; platforms?: string[] } | null) {
   return useQuery({
     queryKey: keys.estimate(input),
-    queryFn: () => campaignsApi.estimate(input as { channel: Channel; audience: Audience }),
+    queryFn: () => campaignsApi.estimate(input as { channel: Channel; audience: Audience; platforms?: string[] }),
     enabled: input !== null && input.audience.include.length > 0,
     placeholderData: keepPreviousData,
     staleTime: 15_000,
