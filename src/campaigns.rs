@@ -116,6 +116,8 @@ pub fn version_content<'a>(c: &'a CampaignRow, ab: Option<&'a AbTest>, version: 
 enum Resolved {
     List(Uuid),
     Segment(Definition),
+    /// A resend's own recipients (see `features::campaigns_plus::resend`).
+    Resend(crate::features::campaigns_plus::resend::ResendAudience),
 }
 
 async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResult<Vec<Resolved>> {
@@ -135,6 +137,7 @@ async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResu
                 let def = def.ok_or_else(|| AppError::not_found("segment"))?;
                 out.push(Resolved::Segment(segments::load(db, account_id, &def, Some(r.id)).await?));
             }
+            "resend" => out.push(Resolved::Resend(crate::features::campaigns_plus::resend::resolve(db, account_id, r.id).await?)),
             other => return Err(AppError::bad(format!("audience type must be list or segment, got {other:?}"))),
         }
     }
@@ -152,6 +155,7 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
                 qb.push("EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = ").push_bind(*id).push(" AND lm.profile_id = p.id)");
             }
             Resolved::Segment(def) => segments::push_definition(qb, def),
+            Resolved::Resend(r) => r.push(qb),
         }
     }
     qb.push(")");
@@ -289,6 +293,7 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
     if aud.include.is_empty() {
         problems.push("Pick at least one list or segment".to_string());
     }
+    problems.extend(crate::features::campaigns_plus::resend::audience_problems(c, &aud));
     problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
     problems.extend(crate::import_review::campaign_problem(c));
     if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
@@ -354,13 +359,20 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
     // Look up the audience's lists and segments first: everything below runs on the one connection
     // that holds the campaign lock, so busy workers can't each hold a lock while waiting for another.
-    let pre: Option<(Value, String, Uuid, String, Value, Option<Value>)> =
-        sqlx::query_as("SELECT audience, status, account_id, channel, content, ab_test FROM campaigns WHERE id = $1").bind(campaign_id).fetch_optional(&state.db).await?;
-    let Some((pre_audience, pre_status, account_id, channel, pre_content, pre_ab)) = pre else { return Ok(()) };
+    // With whether it's a resend and whether link tags need working out (see `features::campaigns_plus`),
+    // and (push) the content's targeted platforms.
+    let pre: Option<(Value, String, Uuid, String, bool, bool, Value, Option<Value>)> =
+        sqlx::query_as(&format!("SELECT audience, status, account_id, channel, {}, content, ab_test FROM campaigns c WHERE id = $1", crate::features::campaigns_plus::PREPARE_COLUMNS))
+            .bind(campaign_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((pre_audience, pre_status, account_id, channel, is_resend, link_tags, pre_content, pre_ab)) = pre else { return Ok(()) };
     if pre_status != "sending" {
         return Ok(());
     }
     let audience: Audience = serde_json::from_value(pre_audience.clone())?;
+    // A resend always goes to its own audience, whatever the editable one says.
+    let audience = crate::features::campaigns_plus::resend::send_audience(campaign_id, is_resend, audience);
     // Only needed when this run adds recipients; a retry of a fixed audience mustn't fail on a list deleted since.
     let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await.map(|r| r.with_push_platforms(push_platforms(&channel, &pre_content, pre_ab.as_ref())));
 
@@ -387,6 +399,17 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(());
+    }
+    // A resend's limits (original fully sent, 30-day window, two per original) are checked again here,
+    // and its slot is kept from now on.
+    if let Some(problem) = crate::features::campaigns_plus::resend::check_at_send(&mut tx, &c, is_resend).await? {
+        sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    // Link tags (UTM) are worked out once here, onto the content every recipient gets.
+    if link_tags {
+        crate::features::campaigns_plus::utm::freeze_campaign(&mut tx, c.id).await?;
     }
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
@@ -504,6 +527,7 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
         "UPDATE campaigns SET
            status = CASE WHEN awaiting_winner THEN 'testing' ELSE 'sent' END,
            ab_test_ends_at = CASE WHEN awaiting_winner THEN now() + make_interval(hours => (ab_test->>'wait_hours')::int) ELSE ab_test_ends_at END,
+           finished_at = CASE WHEN awaiting_winner THEN finished_at ELSE now() END,
            updated_at = now()
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'
@@ -891,10 +915,16 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
     }
     let ab = ab_test(c);
     let content = version_content(c, ab.as_ref(), version).ok_or_else(|| AppError::bad("this campaign has no such version"))?;
-    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'")
-        .bind(account.id)
-        .fetch_one(&state.db)
-        .await?;
+    // With the campaign's link tag choice and the account's settings (see `features::campaigns_plus::utm`).
+    let (recent, link_override, link_defaults): (i64, Option<Value>, Option<Value>) = sqlx::query_as(&format!(
+        "SELECT count(*), (SELECT c.link_tags FROM campaigns c WHERE c.id = $2), {} FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'",
+        crate::features::campaigns_plus::utm::DEFAULTS_FOR_ACCOUNT_1
+    ))
+    .bind(account.id)
+    .bind(c.id)
+    .fetch_one(&state.db)
+    .await?;
+    let content = &crate::features::campaigns_plus::utm::for_test(account, c, version, content, link_override.as_ref(), link_defaults.as_ref());
     if recent + to.len() as i64 > 50 {
         return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
     }

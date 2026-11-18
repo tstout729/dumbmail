@@ -540,14 +540,20 @@ pub fn classify(url: &str, own: &HashSet<String>) -> Target {
     }
 }
 
-/// DumbMail's own hostnames among `hosts`: the configured ones, and any account's link domain.
-async fn own_hosts(state: &AppState, hosts: &HashSet<String>) -> AppResult<HashSet<String>> {
-    let cfg = &state.cfg;
+/// DumbMail's configured hostnames: the app, the marketing site, the shared link host and retired
+/// hosts that still answer old email links (also used by link tagging, `campaigns_plus::utm`).
+pub fn configured_own_hosts(cfg: &crate::config::Config) -> HashSet<String> {
     let mut own: HashSet<String> = [cfg.public_host(), cfg.site_host(), cfg.shared_link_host(), exact_host(cfg.link_url())].into_iter().flatten().collect();
     own.extend(cfg.redirect_hosts.iter().map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase()).filter(|h| !h.is_empty()));
     if let Some(site) = cfg.site_host() {
         own.insert(format!("www.{site}"));
     }
+    own
+}
+
+/// DumbMail's own hostnames among `hosts`: the configured ones, and any account's link domain.
+async fn own_hosts(state: &AppState, hosts: &HashSet<String>) -> AppResult<HashSet<String>> {
+    let mut own = configured_own_hosts(&state.cfg);
     let unknown: Vec<String> = hosts.iter().filter(|h| !own.contains(*h)).cloned().collect();
     if !unknown.is_empty() {
         let found: Vec<String> = sqlx::query_scalar("SELECT DISTINCT lower(link_domain) FROM accounts WHERE lower(link_domain) = ANY($1)").bind(&unknown).fetch_all(&state.db).await?;

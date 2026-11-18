@@ -27,6 +27,8 @@ import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
 import { CouponSendCheck } from "../../features/coupons/CouponSendCheck";
+import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
+import { ResendAudience, isResendAudience } from "../../features/campaignsPlus/ResendPanel";
 import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
 import {
   addVersion,
@@ -192,6 +194,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
     .filter(Boolean)
     .join(" · ");
   const count = estimate.data?.count;
+  const resend = isResendAudience(campaign);
 
   return (
     <Page wide>
@@ -244,13 +247,15 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           open={open === 1}
           onToggle={() => setOpen(open === 1 ? null : 1)}
           summary={
-            current.audience.include.length > 0
+            resend
+              ? `People who didn't engage with the original · ${estimate.data ? pluralize(estimate.data.count, "reachable recipient") : "estimating…"}`
+              : current.audience.include.length > 0
               ? `${current.audience.include.length} included, ${current.audience.exclude.length} excluded · ${estimate.data ? pluralize(estimate.data.count, "reachable recipient") : "estimating…"}`
               : "Choose lists or segments"
           }
         >
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
-            <AudiencePicker value={current.audience} onChange={(audience: Audience) => edit({ audience })} disabled={!editable} />
+            {resend ? <ResendAudience campaignId={campaign.id} /> : <AudiencePicker value={current.audience} onChange={(audience: Audience) => edit({ audience })} disabled={!editable} />}
             <div className="rounded-lg bg-zinc-50 p-4">
               <div className="flex items-center gap-2 text-xs font-medium text-zinc-500">
                 <Users className="size-3.5" /> Reachable recipients
@@ -339,6 +344,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              <LinkTagsPanel kind="campaign" id={campaign.id} disabled={!editable} />
               {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend

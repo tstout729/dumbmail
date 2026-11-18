@@ -25,6 +25,8 @@ pub async fn test_send(state: &AppState, ctx: &Ctx, campaign_id: Uuid, to: &[Str
         return Err(AppError::bad("send tests to 1-10 addresses"));
     }
     let c = campaigns::load(&state.db, ctx.account_id, campaign_id).await?;
+    // An archived campaign sends nothing, tests included (see `campaigns_plus::tags`).
+    crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, ctx.account_id, campaign_id).await?;
     let account = campaigns::load_account(&state.db, ctx.account_id).await?;
     let restricted = !ctx.can(Perm::CampaignSend);
     let mut to: Vec<String> = to.to_vec();

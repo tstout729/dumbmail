@@ -24,7 +24,7 @@ export type CampaignInput = {
 export type CampaignPatch = Partial<Pick<Campaign, "name" | "audience" | "content" | "ab_test">>;
 
 export const campaignsApi = {
-  list: (params?: { status?: CampaignStatus; channel?: Channel }) =>
+  list: (params?: { status?: CampaignStatus; channel?: Channel; archived?: "false" | "true" | "all" }) =>
     api<ListResponse<Campaign>>("GET", withQuery("/api/campaigns", params)),
   get: (id: string) => api<Campaign>("GET", `/api/campaigns/${id}`),
   create: (input: CampaignInput) => api<Campaign>("POST", "/api/campaigns", input),
@@ -51,8 +51,9 @@ function livePoll(status: CampaignStatus | undefined): number | false {
   return false;
 }
 
+/** Every campaign, archived ones too (pickers and reports still show those). */
 export function useCampaigns() {
-  return useQuery({ queryKey: keys.campaigns, queryFn: () => campaignsApi.list(), select: (r) => r.data });
+  return useQuery({ queryKey: keys.campaigns, queryFn: () => campaignsApi.list({ archived: "all" }), select: (r) => r.data });
 }
 
 export function useCampaign(id: string) {
