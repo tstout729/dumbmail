@@ -358,6 +358,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // Link tagging (UTM, email only): resolved tags ride on the content; none renders as before (features::campaigns_plus::utm).
     let link_tags = crate::features::campaigns_plus::utm::Tagger::from_content(state, spec.account, spec.content);
     let link_hook = link_tags.as_ref().map(|t| t as &dyn render::LinkHook);
+    // Short links in texts (features::short_links): at most one statement, none for a text without
+    // links or a campaign text (its links were set up when its audience was fixed).
+    let short_links = crate::features::short_links::for_send(state, &spec, &content, link_hook, message_id, &link_base).await?;
 
     // Render first so template errors never leave a half-sent message.
     enum Rendered {
@@ -365,7 +368,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         /// Message, provider, and whether that provider is the customer's own account (not billed).
         Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool),
     }
-    let (subject, rendered) = if spec.channel == "email" {
+    let (subject, mut rendered) = if spec.channel == "email" {
         let content: EmailContent = serde_json::from_value(content.into_owned())?;
         let from_email = content
             .from_email
@@ -398,7 +401,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(p.id)
             .fetch_one(&state.db)
             .await?;
-        let body = render::render_sms(spec.account, &content, &ctx, Some(&tracking), !prior_sms)?;
+        let body = render::render_sms_with(spec.account, &content, &ctx, Some(&tracking), !prior_sms, short_links.as_ref().map(|s| s as &dyn render::SmsLinks))?;
         (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider))
     };
 
@@ -427,34 +430,65 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
     }
 
-    if spec.message_id.is_none() {
-        sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-        )
-        .bind(message_id)
-        .bind(spec.account.id)
-        .bind(p.id)
-        .bind(spec.channel)
-        .bind(spec.campaign_id)
-        .bind(spec.flow_id)
-        .bind(spec.flow_node_id)
-        .bind(&to)
-        .bind(&subject)
-        .bind(spec.is_test)
-        .bind(&send_note)
-        .bind(&language)
-        .execute(&state.db)
-        .await?;
-    } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language) WHERE id = $1")
+    // A text with short links takes the first of its references not already used in the account
+    // (features::short_links); the text is written with the one it got. Another text taking the same
+    // one at the same moment makes the write fail on the unique index: the next try takes the next.
+    let mut clashes = 0;
+    // None: a campaign message's row is gone (its person was deleted while the batch ran).
+    let written_row: Option<Option<String>> = loop {
+        let written: sqlx::Result<Option<Option<String>>> = if spec.message_id.is_none() {
+            sqlx::query_scalar(
+                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (SELECT c.r FROM unnest($13::text[]) WITH ORDINALITY AS c(r, i)
+                     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
+                 RETURNING short_ref",
+            )
+            .bind(message_id)
+            .bind(spec.account.id)
+            .bind(p.id)
+            .bind(spec.channel)
+            .bind(spec.campaign_id)
+            .bind(spec.flow_id)
+            .bind(spec.flow_node_id)
+            .bind(&to)
+            .bind(&subject)
+            .bind(spec.is_test)
+            .bind(&send_note)
+            .bind(&language)
+            .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+            .fetch_one(&state.db)
+            .await
+            .map(Some)
+        } else {
+            sqlx::query_scalar(
+                "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language),
+                    short_ref = (SELECT c.r FROM unnest($6::text[]) WITH ORDINALITY AS c(r, i)
+                        WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
+                 WHERE u.id = $1 RETURNING u.short_ref",
+            )
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
             .bind(&send_note)
             .bind(&language)
-            .execute(&state.db)
-            .await?;
+            .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+            .fetch_optional(&state.db)
+            .await
+        };
+        match written {
+            Err(e) if clashes < 3 && crate::features::short_links::is_ref_clash(&e) => clashes += 1,
+            written => break written?,
+        }
+    };
+    let Some(short_ref) = written_row else {
+        if limited {
+            crate::deliverability::return_daily_slot(state, spec.account.id);
+        }
+        return Ok(Outcome::Skipped("profile deleted"));
+    };
+    if let (Some(links), Rendered::Sms(s, _, _)) = (&short_links, &mut rendered) {
+        let chosen = short_ref.ok_or_else(|| AppError::Internal(anyhow::anyhow!("no free short link reference for this text")))?;
+        s.body = links.with_ref(&s.body, &chosen);
     }
 
     match &rendered {

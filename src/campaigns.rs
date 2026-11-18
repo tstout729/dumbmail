@@ -458,6 +458,10 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             fix = true;
         }
     }
+    // A text campaign's short links are set up with its audience, at every launch (see features::short_links).
+    if c.channel == "sms" && !fixed {
+        crate::features::short_links::freeze_campaign(state, &mut tx, c.id).await?;
+    }
     sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), audience_fixed_at = CASE WHEN $2 THEN COALESCE(audience_fixed_at, now()) ELSE audience_fixed_at END, updated_at = now() WHERE id = $1")
         .bind(c.id)
         .bind(fix)
@@ -564,6 +568,8 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     let ab = ab_test(&c);
+    // A text campaign's short links: the targets its launch set up (features::short_links).
+    let short_link_targets = if c.channel == "sms" { crate::features::short_links::send::campaign_targets(&state.db, c.id).await? } else { None };
     let smart_hours = crate::features::sendtime::options::of(c.send_options.as_ref()).and_then(|o| o.smart_hours());
     // One read against one cutoff: each queued message in the batch is either due now (sent below) or
     // waits for a batch of its own at its release time, so none can fall between two reads.
@@ -601,6 +607,7 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         };
         // Test-slice messages carry their version; everyone after the test gets the winner.
         let content = version_content(&c, ab.as_ref(), variant.as_deref().or(c.ab_winner.as_deref())).unwrap_or(&c.content);
+        let content = crate::features::short_links::send::campaign_content(content, short_link_targets.as_ref());
         // Inside this campaign's own send, the footer wording fixed at its start applies (see features::translations).
         let outcome = crate::features::translations::in_campaign(c.id, sending::send(
             state,
@@ -608,7 +615,7 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
                 account: &account,
                 profile: &profile,
                 channel: &c.channel,
-                content,
+                content: &content,
                 campaign_id: Some(c.id),
                 flow_id: None,
                 flow_node_id: None,

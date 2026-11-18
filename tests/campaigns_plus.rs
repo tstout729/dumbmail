@@ -162,22 +162,27 @@ async fn flow_messages_are_tagged_from_the_flow_row() {
 }
 
 #[tokio::test]
-async fn texts_are_never_tagged() {
+async fn texts_are_tagged_only_when_their_links_are_shortened() {
     let mut h = harness!();
     let (_acct, list) = setup(&mut h).await;
     h.claim_number().await;
     h.ok("PUT", "/api/link-tags", Some(json!({"enabled": true}))).await;
     let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Text", "channel": "sms", "audience": {"include": [{"type": "list", "id": list}]}, "content": {"body": "Sale! https://shop.test/s?a=1 Reply STOP to opt out"}}))).await;
     let id = c["id"].as_str().unwrap().to_string();
+    // Short links are on by default, and a short link's destination is tagged (tests/short_links.rs).
     let tags = h.ok("GET", &format!("/api/campaigns/{id}/link-tags"), None).await;
-    assert_eq!(tags["tagged"], false, "{tags}");
-    // A test text goes out at any hour: its tracked link goes to the plain destination.
+    assert_eq!(tags["tagged"], true, "{tags}");
+    // A link that keeps the long form isn't tagged: here the short link index isn't built, so a
+    // test text (it goes out at any hour) has a long tracked link to the plain destination.
     h.ok("POST", &format!("/api/campaigns/{id}/test"), Some(json!({"to": ["+15035550100"]}))).await;
     let body = h.state.sms.sent().last().unwrap().body.clone();
     let link = body.split_whitespace().find(|w| w.contains("/t/c/")).unwrap().to_string();
     let dest = url::form_urlencoded::parse(link.split_once('?').unwrap().1.as_bytes()).find(|(k, _)| k == "u").unwrap().1.into_owned();
     assert_eq!(dest, "https://shop.test/s?a=1");
-    // Nothing is frozen onto a text campaign's content when it starts.
+    // With short links off, texts aren't tagged and nothing is frozen onto the content when it starts.
+    h.ok("PATCH", "/api/short-links/settings", Some(json!({"enabled": false}))).await;
+    let tags = h.ok("GET", &format!("/api/campaigns/{id}/link-tags"), None).await;
+    assert_eq!(tags["tagged"], false, "{tags}");
     h.ok("POST", "/api/profiles", Some(json!({"phone_number": "+15035550111", "sms_consent": "subscribed", "list_ids": [list]}))).await;
     h.ok("POST", &format!("/api/campaigns/{id}/send"), None).await;
     h.drain().await;

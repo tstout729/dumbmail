@@ -23,6 +23,7 @@ pub mod reports;
 pub mod reviews;
 pub mod sendtime;
 pub mod shopify;
+pub mod short_links;
 pub mod team;
 pub mod transactional;
 pub mod translations;
@@ -127,6 +128,7 @@ pub static ALL: &[&dyn Feature] = &[
     &reviews::Module,
     &sendtime::Module,
     &shopify::Module,
+    &short_links::Module,
     &team::Module,
     &transactional::Module,
     &translations::Module,
