@@ -1,0 +1,112 @@
+{
+  "description": "a new booking",
+  "expect": [
+    {
+      "email": "riley.morgan@example.com",
+      "first_name": "Riley",
+      "last_name": "Morgan",
+      "properties": {
+        "calendly_text_reminder_number": "+15035550177",
+        "timezone": "America/Los_Angeles"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Meeting Scheduled",
+      "profile": {
+        "email": "riley.morgan@example.com"
+      },
+      "properties": {
+        "answers": {
+          "What would you like to discuss?": "Moving our newsletter off Klaviyo"
+        },
+        "cancel_url": "https://calendly.com/cancellations/AAAAAAAAAAAAAAAA",
+        "end_time": "2026-11-20T18:30:00.000000Z",
+        "event_name": "30 Minute Meeting",
+        "event_uri": "https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2",
+        "invitee_uri": "https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2/invitees/AAAAAAAAAAAAAAAA",
+        "join_url": "https://calendly.zoom.us/j/1234567890",
+        "location": "https://calendly.zoom.us/j/1234567890",
+        "reschedule_url": "https://calendly.com/reschedulings/AAAAAAAAAAAAAAAA",
+        "start_time": "2026-11-20T18:00:00.000000Z",
+        "timezone": "America/Los_Angeles",
+        "utm_campaign": "winter",
+        "utm_source": "newsletter"
+      },
+      "time": "2026-11-17T17:02:11.123456Z",
+      "type": "track_event",
+      "unique_id": "calendly:https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2/invitees/AAAAAAAAAAAAAAAA:created"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": "2026-11-17T17:02:12.000000Z",
+      "created_by": "https://api.calendly.com/users/AAAAAAAAAAAAAAAA",
+      "event": "invitee.created",
+      "payload": {
+        "cancel_url": "https://calendly.com/cancellations/AAAAAAAAAAAAAAAA",
+        "cancellation": null,
+        "created_at": "2026-11-17T17:02:11.123456Z",
+        "email": "riley.morgan@example.com",
+        "event": "https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2",
+        "first_name": null,
+        "last_name": null,
+        "name": "Riley Morgan",
+        "new_invitee": null,
+        "no_show": null,
+        "old_invitee": null,
+        "payment": null,
+        "questions_and_answers": [
+          {
+            "answer": "Moving our newsletter off Klaviyo",
+            "position": 0,
+            "question": "What would you like to discuss?"
+          }
+        ],
+        "reconfirmation": null,
+        "reschedule_url": "https://calendly.com/reschedulings/AAAAAAAAAAAAAAAA",
+        "rescheduled": false,
+        "routing_form_submission": null,
+        "scheduled_event": {
+          "created_at": "2026-11-17T17:02:10.000000Z",
+          "end_time": "2026-11-20T18:30:00.000000Z",
+          "event_guests": [],
+          "event_memberships": [
+            {
+              "user": "https://api.calendly.com/users/AAAAAAAAAAAAAAAA"
+            }
+          ],
+          "event_type": "https://api.calendly.com/event_types/GBGBDCAADAEDCRZ2",
+          "invitees_counter": {
+            "active": 1,
+            "limit": 1,
+            "total": 1
+          },
+          "location": {
+            "join_url": "https://calendly.zoom.us/j/1234567890",
+            "status": "pushed",
+            "type": "zoom"
+          },
+          "name": "30 Minute Meeting",
+          "start_time": "2026-11-20T18:00:00.000000Z",
+          "status": "active",
+          "updated_at": "2026-11-17T17:02:11.000000Z",
+          "uri": "https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2"
+        },
+        "status": "active",
+        "text_reminder_number": "+1 503-555-0177",
+        "timezone": "America/Los_Angeles",
+        "tracking": {
+          "salesforce_uuid": null,
+          "utm_campaign": "winter",
+          "utm_content": null,
+          "utm_medium": null,
+          "utm_source": "newsletter",
+          "utm_term": null
+        },
+        "updated_at": "2026-11-17T17:02:11.123456Z",
+        "uri": "https://api.calendly.com/scheduled_events/GBGBDCAADAEDCRZ2/invitees/AAAAAAAAAAAAAAAA"
+      }
+    }
+  }
+}

@@ -21,6 +21,13 @@ pub enum Trigger {
         metric: String,
         #[serde(default)]
         filters: Vec<Filter>,
+        /// With `cancelled_by`: the event property that identifies the thing (e.g. `reservation_id`).
+        /// People leave the flow when a cancelling event with the same value comes later, or a newer
+        /// event of this metric replaces this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cancelled_by: Vec<String>,
     },
     List {
         list_id: Uuid,
@@ -32,6 +39,28 @@ pub enum Trigger {
         field: String,
         #[serde(default)]
         offset_days: i64,
+    },
+    /// N days before or after a date inside each event, e.g. 2 days before `check_in` on
+    /// "Reservation Confirmed". Each event starts the flow at most once.
+    EventDate {
+        metric: String,
+        /// The event property holding the date (dots reach nested keys).
+        field: String,
+        /// Days after the date (negative: before).
+        #[serde(default)]
+        offset_days: i64,
+        /// Hour of the day to start, in the account's time zone. Default 9.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hour: Option<u32>,
+        #[serde(default)]
+        filters: Vec<Filter>,
+        /// The event property that identifies the thing (e.g. `reservation_id`). A newer event of the
+        /// same metric with the same value replaces the older one, and `cancelled_by` matches on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Metrics that cancel it when they happen later with the same `key` value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cancelled_by: Vec<String>,
     },
 }
 
@@ -63,6 +92,10 @@ pub struct Settings {
     pub profile_filter: Option<Value>,
     #[serde(default)]
     pub smart_sending_hours: Option<i64>,
+    /// Also send to people who haven't agreed to marketing (`marketing_hold`). Only for messages
+    /// about the person's own booking or order. Unsubscribed and suppressed people still get nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_messages: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -82,7 +115,86 @@ impl FlowDef {
 }
 
 pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
-    serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))
+    let t: Trigger = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid trigger: {e}")))?;
+    let name_ok = |s: &str| !s.trim().is_empty() && s.len() <= 128;
+    if let Trigger::EventDate { metric, field, offset_days, hour, .. } = &t {
+        if !name_ok(metric) || !name_ok(field) {
+            return Err(AppError::bad("an event date trigger needs a metric and the event property holding the date"));
+        }
+        if !(-365..=365).contains(offset_days) {
+            return Err(AppError::bad("offset_days must be -365 to 365"));
+        }
+        if hour.is_some_and(|h| h > 23) {
+            return Err(AppError::bad("hour must be 0-23"));
+        }
+    }
+    // Event-date triggers are new, so their filters are capped; metric triggers keep no cap, as before.
+    if let Trigger::EventDate { filters, .. } = &t {
+        if filters.len() > 20 {
+            return Err(AppError::bad("an event date trigger takes at most 20 filters"));
+        }
+    }
+    if let Trigger::EventDate { key, cancelled_by, .. } | Trigger::Metric { key, cancelled_by, .. } = &t {
+        if cancelled_by.len() > 5 || !cancelled_by.iter().all(|m| name_ok(m)) {
+            return Err(AppError::bad("at most 5 cancelling metrics, each 1-128 characters"));
+        }
+        if key.as_deref().is_some_and(|k| !name_ok(k)) {
+            return Err(AppError::bad("key must be an event property name"));
+        }
+        if !cancelled_by.is_empty() && key.is_none() {
+            return Err(AppError::bad("cancelled_by needs a key (the property both events share, e.g. reservation_id)"));
+        }
+    }
+    Ok(t)
+}
+
+fn json_path(field: &str) -> Vec<String> {
+    field.split('.').map(str::to_string).collect()
+}
+
+/// Whether an event-date trigger's event no longer stands: a newer event of the same metric with
+/// the same key replaced it, or a cancelling event with the same key came after it.
+async fn event_date_stale(db: &PgPool, account_id: Uuid, event_id: Uuid, key: Option<&str>, cancelled_by: &[String]) -> sqlx::Result<Option<&'static str>> {
+    let row: Option<(Uuid, Option<String>, chrono::DateTime<Utc>)> = sqlx::query_as("SELECT metric_id, properties #>> $3, occurred_at FROM events WHERE id = $1 AND account_id = $2")
+        .bind(event_id)
+        .bind(account_id)
+        .bind(json_path(key.unwrap_or("")))
+        .fetch_optional(db)
+        .await?;
+    let Some((metric_id, value, at)) = row else { return Ok(Some("event deleted")) };
+    let (Some(key), Some(value)) = (key, value) else { return Ok(None) };
+    let superseded: bool = sqlx::query_scalar(
+        // A browser event of a server-only metric (recorded before it became one) never counts.
+        "SELECT EXISTS (SELECT 1 FROM events n JOIN metrics nm ON nm.id = n.metric_id WHERE n.account_id = $1 AND n.metric_id = $2 AND n.properties #>> $3 = $4 AND (n.occurred_at, n.id) > ($5, $6)
+           AND NOT (n.from_browser IS TRUE AND nm.server_only))",
+    )
+    .bind(account_id)
+    .bind(metric_id)
+    .bind(json_path(key))
+    .bind(&value)
+    .bind(at)
+    .bind(event_id)
+    .fetch_one(db)
+    .await?;
+    if superseded {
+        return Ok(Some("superseded"));
+    }
+    if cancelled_by.is_empty() {
+        return Ok(None);
+    }
+    let cancelled: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events c JOIN metrics m ON m.id = c.metric_id
+          WHERE c.account_id = $1 AND m.account_id = $1 AND m.name = ANY($2) AND c.properties #>> $3 = $4 AND c.occurred_at >= $5
+            AND NOT (c.from_browser IS TRUE AND m.server_only))",
+    )
+    .bind(account_id)
+    .bind(cancelled_by)
+    .bind(json_path(key))
+    .bind(&value)
+    .bind(at)
+    .fetch_one(db)
+    .await?;
+    Ok(cancelled.then_some("cancelled"))
 }
 
 /// A random split's share of people sent down path A (`yes`); the rest take path B (`no`).
@@ -283,6 +395,7 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("Mozilla/5.0 (compatible; DumbMail/0.3; +https://dumbmail.ai)")
+            .no_proxy()
             .build()
             .map_err(|e| AppError::Internal(e.into()))?;
         let res = client
@@ -350,7 +463,9 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
     let def = parse_definition(&flow.definition)?;
     let Some(entry) = def.entry.clone() else { return Ok(None) };
     // The cheap rejection first, with no lock or transaction: most repeat triggers stop here.
-    let (blocked, days) = reentry_rule(&def, 3);
+    // Event-date flows start once per event (a guest with two bookings gets both), so re-entry
+    // doesn't apply to them.
+    let (blocked, days) = reentry_rule(flow, &def, 3);
     let sql = format!("SELECT {blocked}");
     let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(flow.id).bind(profile_id);
     if let Some(d) = days {
@@ -371,8 +486,12 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
 }
 
 /// The re-entry rule as an SQL condition that is true when person $2 may not enter flow $1 now,
-/// and the seconds to bind as `$window` when the rule has a window (then bind it last).
-fn reentry_rule(def: &FlowDef, window: usize) -> (String, Option<f64>) {
+/// and the seconds to bind as `$window` when the rule has a window (then bind it last). Event-date
+/// flows have none: they start once per event.
+fn reentry_rule(flow: &FlowRow, def: &FlowDef, window: usize) -> (String, Option<f64>) {
+    if matches!(parse_trigger(&flow.trigger), Ok(Trigger::EventDate { .. })) {
+        return ("FALSE".into(), None);
+    }
     let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
     match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
         (Value::String(s), _) if s == "always" => ("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')".into(), None),
@@ -397,7 +516,7 @@ pub async fn enter(
     run_at: Option<chrono::DateTime<Utc>>,
 ) -> AppResult<Option<Uuid>> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(profile_id).execute(&mut *tx).await?;
-    let (blocked, days) = reentry_rule(def, 9);
+    let (blocked, days) = reentry_rule(flow, def, 9);
     let sql = format!(
         "WITH r AS (
             INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context)
@@ -431,9 +550,11 @@ pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
     .await?;
     let Some((account_id, profile_id, metric, props, value, at, from_browser)) = row else { return Ok(()) };
     // Message, consent and alert metrics start flows only when DumbMail recorded them itself.
-    if from_browser == Some(true) && crate::audience::is_reserved_metric(&metric) {
+    // The same for an account's server-only metrics (an integration's bookings and orders).
+    if from_browser == Some(true) && (crate::audience::is_reserved_metric(&metric) || crate::audience::is_account_server_only_metric(&state.db, account_id, &metric).await.map_err(|e| anyhow::anyhow!(e.public_message()))?) {
         return Ok(());
     }
+    schedule_event_dates(&state.db, event_id).await?;
     let flows: Vec<FlowRow> = sqlx::query_as(
         "SELECT * FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2",
     )
@@ -475,11 +596,11 @@ pub async fn on_list_add(state: &AppState, list_id: Uuid, profile_ids: &[Uuid]) 
 
 /// Job: refresh a segment's membership and start segment-triggered flows for new members.
 pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Result<()> {
-    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>)> = sqlx::query_as("SELECT account_id, definition, refreshed_at FROM segments WHERE id = $1")
+    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as("SELECT account_id, definition, refreshed_at, absorb_entries FROM segments WHERE id = $1")
         .bind(segment_id)
         .fetch_optional(&state.db)
         .await?;
-    let Some((account_id, def, refreshed_at)) = row else { return Ok(()) };
+    let Some((account_id, def, refreshed_at, absorb)) = row else { return Ok(()) };
     // Rules that can't load (e.g. they include a segment that was since deleted) won't fix themselves
     // on a retry: log it and try again on the next scheduled refresh.
     let def = match segments::load(&state.db, account_id, &def, Some(segment_id)).await {
@@ -490,8 +611,9 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
         }
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    // The first refresh only records who is already in the segment; it does not trigger anyone.
-    if refreshed_at.is_none() {
+    // The first refresh only records who is already in the segment; it does not trigger anyone. Neither
+    // does one while past activity is being imported into the account (`absorb_entries`).
+    if refreshed_at.is_none() || absorb {
         return Ok(());
     }
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $2 AND status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")
@@ -538,7 +660,311 @@ pub async fn date_triggers(state: &AppState) -> anyhow::Result<()> {
             start(state, &f, pid, json!({"date_field": field})).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
         }
     }
+    event_date_triggers(state).await
+}
+
+/// The moment an event is due for an event-date flow: the date in property `field` ($4: a plain
+/// `YYYY-MM-DD` as written, a date-time read in the account's time zone $5), plus `offset_days`
+/// ($6), at `hour` ($7) local time. `e` is the event.
+const EVENT_DATE_DUE: &str = "CROSS JOIN LATERAL (SELECT CASE WHEN (e.properties #>> $4) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                                     THEN pl_ts(e.properties #>> $4)::date
+                                     ELSE (pl_ts(e.properties #>> $4) AT TIME ZONE $5)::date END AS day) x
+     CROSS JOIN LATERAL (SELECT ((x.day + $6::int) + make_time($7, 0, 0)) AT TIME ZONE $5 AS due) d";
+
+/// How each event is scheduled for an event-date flow (see [`EVENT_DATE_DUE`]). A fire first found
+/// more than a day after it was due (old history, or an event recorded late) is recorded as missed,
+/// so the flow's results show it, instead of sending a stale reminder or dropping it silently.
+const EVENT_DATE_INSERT: &str = "INSERT INTO flow_event_date_fires (flow_id, event_id, account_id, due_at, outcome, fired_at)
+     SELECT $1, e.id, e.account_id, d.due,
+            CASE WHEN d.due > now() - interval '24 hours' THEN 'pending' ELSE 'missed' END,
+            CASE WHEN d.due > now() - interval '24 hours' THEN NULL ELSE now() END
+     FROM events e
+     JOIN metrics m ON m.id = e.metric_id AND m.account_id = e.account_id AND m.name = $3
+     {DUE}
+     WHERE e.account_id = $2 AND x.day IS NOT NULL";
+
+fn event_date_insert() -> String {
+    EVENT_DATE_INSERT.replace("{DUE}", EVENT_DATE_DUE)
+}
+
+/// Events one scheduler tick may schedule for event-date flows that went live (or changed trigger)
+/// with history, across all flows. The rest wait for the next tick.
+const EVENT_DATE_SEED_BUDGET: i64 = 20_000;
+
+/// Catch-up window: a fire due within this long ago still starts; older ones are marked missed.
+const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
+
+async fn event_date_tz(db: &PgPool, account_id: Uuid) -> anyhow::Result<String> {
+    let tz: Option<String> = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?;
+    Ok(tz.and_then(|t| t.parse::<chrono_tz::Tz>().ok()).unwrap_or(chrono_tz::America::Los_Angeles).name().to_string())
+}
+
+/// Schedule one event for the account's event-date flows on its metric (any status: a flow
+/// turned on later still has its upcoming dates). Called when the event is recorded.
+pub async fn schedule_event_dates(db: &PgPool, event_id: Uuid) -> anyhow::Result<()> {
+    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT e.account_id, m.name FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1").bind(event_id).fetch_optional(db).await?;
+    let Some((account_id, metric)) = row else { return Ok(()) };
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 AND trigger->>'type' = 'event_date' AND trigger->>'metric' = $2").bind(account_id).bind(&metric).fetch_all(db).await?;
+    if flows.is_empty() {
+        return Ok(());
+    }
+    let tz = event_date_tz(db, account_id).await?;
+    for f in flows {
+        let Ok(Trigger::EventDate { field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
+        let q = format!("{} AND e.id = $8 ON CONFLICT DO NOTHING", event_date_insert());
+        sqlx::query(&q)
+            .bind(f.id)
+            .bind(account_id)
+            .bind(&metric)
+            .bind(json_path(&field))
+            .bind(&tz)
+            .bind(offset_days as i32)
+            .bind(hour.unwrap_or(9) as i32)
+            .bind(event_id)
+            .execute(db)
+            .await?;
+    }
     Ok(())
+}
+
+/// The account's time zone changed: due times computed in the old one move to the new one (a
+/// date-only check-in is "2 days before, at 10:00" wherever the account now is).
+pub async fn reschedule_event_dates(db: &PgPool, account_id: Uuid) -> anyhow::Result<()> {
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 AND trigger->>'type' = 'event_date'").bind(account_id).fetch_all(db).await?;
+    if flows.is_empty() {
+        return Ok(());
+    }
+    let tz = event_date_tz(db, account_id).await?;
+    for f in flows {
+        let Ok(Trigger::EventDate { field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
+        let q = format!(
+            "UPDATE flow_event_date_fires f SET due_at = d.due FROM events e {EVENT_DATE_DUE}
+             WHERE f.flow_id = $1 AND f.account_id = $2 AND f.outcome = 'pending' AND e.id = f.event_id AND e.account_id = $2
+               AND e.metric_id = (SELECT id FROM metrics WHERE account_id = $2 AND name = $3) AND x.day IS NOT NULL"
+        );
+        sqlx::query(&q)
+            .bind(f.id)
+            .bind(account_id)
+            .bind(f.trigger["metric"].as_str().unwrap_or(""))
+            .bind(json_path(&field))
+            .bind(&tz)
+            .bind(offset_days as i32)
+            .bind(hour.unwrap_or(9) as i32)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Scheduler: start every fire that is due first (each claimed and started in one transaction;
+/// fires more than a day late are marked missed instead of sending late), then, within one work
+/// budget for the tick across all flows, schedule the events that existed before a live flow (or
+/// its current trigger), a batch at a time.
+async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
+    event_date_tick(state, EVENT_DATE_SEED_BUDGET).await
+}
+
+/// One event-date tick with an explicit seeding budget (events across all flows); tests use it.
+pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Result<()> {
+    // Too late to be useful: say so in the flow report rather than send a stale reminder.
+    sqlx::query(
+        "UPDATE flow_event_date_fires x SET outcome = CASE WHEN fl.status = 'live' THEN 'missed' ELSE 'not_live' END, fired_at = now()
+         FROM flows fl WHERE fl.id = x.flow_id AND x.outcome = 'pending' AND x.due_at <= now() - make_interval(hours => $1)",
+    )
+    .bind(EVENT_DATE_CATCH_UP_HOURS as i32)
+    .execute(&state.db)
+    .await?;
+    for _ in 0..2000 {
+        if !fire_one_event_date(state).await? {
+            break;
+        }
+    }
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
+    let mut budget = seed_budget;
+    for f in &flows {
+        if budget <= 0 {
+            break;
+        }
+        let Ok(Trigger::EventDate { metric, field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
+        let seed: Option<(Value, Option<Uuid>, bool)> = sqlx::query_as("SELECT trigger, last_event_id, done FROM flow_event_date_seeds WHERE flow_id = $1").bind(f.id).fetch_optional(&state.db).await?;
+        let (mut last, done) = match seed {
+            Some((t, last, done)) if t == f.trigger => (last, done),
+            other => {
+                // A new flow, or a changed trigger: schedule its events from scratch (a changed
+                // trigger first drops the fires computed for the old one).
+                let mut tx = state.db.begin().await?;
+                if other.is_some() {
+                    sqlx::query("DELETE FROM flow_event_date_fires WHERE flow_id = $1 AND outcome = 'pending'").bind(f.id).execute(&mut *tx).await?;
+                }
+                sqlx::query("INSERT INTO flow_event_date_seeds (flow_id, trigger, last_event_id, done) VALUES ($1, $2, NULL, false) ON CONFLICT (flow_id) DO UPDATE SET trigger = $2, last_event_id = NULL, done = false")
+                    .bind(f.id)
+                    .bind(&f.trigger)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                (None, false)
+            }
+        };
+        if done {
+            continue;
+        }
+        let tz = event_date_tz(&state.db, f.account_id).await?;
+        while budget > 0 {
+            let size = budget.min(5000);
+            let batch: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT e.id FROM events e JOIN metrics m ON m.id = e.metric_id AND m.account_id = e.account_id
+                 WHERE e.account_id = $1 AND m.name = $2 AND ($3::uuid IS NULL OR e.id > $3) ORDER BY e.id LIMIT $4",
+            )
+            .bind(f.account_id)
+            .bind(&metric)
+            .bind(last)
+            .bind(size)
+            .fetch_all(&state.db)
+            .await?;
+            budget -= batch.len().max(1) as i64;
+            if let Some(max) = batch.last() {
+                let q = format!("{} AND e.id = ANY($8) ON CONFLICT DO NOTHING", event_date_insert());
+                sqlx::query(&q)
+                    .bind(f.id)
+                    .bind(f.account_id)
+                    .bind(&metric)
+                    .bind(json_path(&field))
+                    .bind(&tz)
+                    .bind(offset_days as i32)
+                    .bind(hour.unwrap_or(9) as i32)
+                    .bind(&batch)
+                    .execute(&state.db)
+                    .await?;
+                last = Some(*max);
+            }
+            let finished = (batch.len() as i64) < size;
+            sqlx::query("UPDATE flow_event_date_seeds SET last_event_id = $2, done = $3 WHERE flow_id = $1").bind(f.id).bind(last).bind(finished).execute(&state.db).await?;
+            if finished {
+                break;
+            }
+        }
+    }
+    // Fires the seeding just found due start now (fires due later wait for their tick).
+    for _ in 0..2000 {
+        if !fire_one_event_date(state).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Claim one due fire and start its flow, in one transaction: either the run exists and the fire
+/// says so, or neither happened. Returns false when nothing is due.
+async fn fire_one_event_date(state: &AppState) -> anyhow::Result<bool> {
+    let mut tx = state.db.begin().await?;
+    let claimed: Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT x.flow_id, x.event_id FROM flow_event_date_fires x JOIN flows fl ON fl.id = x.flow_id AND fl.status = 'live'
+         WHERE x.outcome = 'pending' AND x.due_at <= now() ORDER BY x.due_at LIMIT 1 FOR UPDATE OF x SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((flow_id, event_id)) = claimed else { return Ok(false) };
+    let f: FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1").bind(flow_id).fetch_one(&mut *tx).await?;
+    let outcome = event_date_start(state, &mut tx, &f, event_id).await?;
+    let (label, run) = match outcome {
+        Ok(run) => ("started", Some(run)),
+        Err(why) => (why, None),
+    };
+    sqlx::query("UPDATE flow_event_date_fires SET outcome = $3, run_id = $4, fired_at = now() WHERE flow_id = $1 AND event_id = $2")
+        .bind(flow_id)
+        .bind(event_id)
+        .bind(label)
+        .bind(run)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Checks and start for one event-date fire, inside the claiming transaction.
+async fn event_date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, f: &FlowRow, event_id: Uuid) -> anyhow::Result<Result<Uuid, &'static str>> {
+    let Ok(Trigger::EventDate { metric, field, filters, key, cancelled_by, .. }) = parse_trigger(&f.trigger) else { return Ok(Err("not_started")) };
+    let row: Option<(Uuid, Value, Option<f64>, chrono::DateTime<Utc>, bool)> = sqlx::query_as(
+        "SELECT e.profile_id, e.properties, e.value, e.occurred_at, (e.from_browser IS TRUE AND m.server_only) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1 AND e.account_id = $2",
+    )
+    .bind(event_id)
+    .bind(f.account_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((profile_id, props, value, at, forged)) = row else { return Ok(Err("not_started")) };
+    // A browser event of a server-only metric (recorded before it became one) never starts it.
+    if forged {
+        return Ok(Err("not_started"));
+    }
+    let mut obj = props.clone();
+    if let (Some(v), Some(o)) = (value, obj.as_object_mut()) {
+        o.entry("value").or_insert(json!(v));
+    }
+    if !filters.iter().all(|flt| segments::json_filter_matches(&obj, flt)) {
+        return Ok(Err("filtered"));
+    }
+    if let Some(why) = event_date_stale(&state.db, f.account_id, event_id, key.as_deref(), &cancelled_by).await? {
+        return Ok(Err(if why == "cancelled" { "cancelled" } else { "superseded" }));
+    }
+    // A newer version of the same booking (same key) that didn't move its date (only its notes
+    // changed, say) doesn't send the reminder a second time: one start per key and due time.
+    if let Some(k) = key.as_deref() {
+        let kv = obj.pointer(&format!("/{}", k.replace('.', "/"))).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        if let Some(kv) = kv {
+            let again: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM flow_event_date_fires x JOIN events e ON e.id = x.event_id
+                   WHERE x.flow_id = $1 AND x.outcome = 'started' AND e.profile_id = $2 AND e.properties #>> $3 = $4
+                     AND x.due_at = (SELECT due_at FROM flow_event_date_fires WHERE flow_id = $1 AND event_id = $5))",
+            )
+            .bind(f.id)
+            .bind(profile_id)
+            .bind(json_path(k))
+            .bind(&kv)
+            .bind(event_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if again {
+                return Ok(Err("already_sent"));
+            }
+        }
+    }
+    let def = parse_definition(&f.definition).map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let Some(entry) = def.entry.clone() else { return Ok(Err("not_started")) };
+    if let Some(pf) = &def.settings.profile_filter {
+        let seg = segments::load(&state.db, f.account_id, pf, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        if !segments::profile_matches(&state.db, profile_id, &seg).await.map_err(|e| anyhow::anyhow!(e.public_message()))? {
+            return Ok(Err("not_started"));
+        }
+    }
+    let day = obj.pointer(&format!("/{}", field.replace('.', "/"))).cloned().unwrap_or(Value::Null);
+    let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at}, "event_date": {"field": field, "date": day}});
+    let id = Uuid::now_v7();
+    sqlx::query("INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context) VALUES ($1, $2, $3, $4, $5, $6)")
+        .bind(id)
+        .bind(f.id)
+        .bind(f.account_id)
+        .bind(profile_id)
+        .bind(&entry)
+        .bind(&ctx)
+        .execute(&mut **tx)
+        .await?;
+    crate::jobs::enqueue(&mut **tx, "flow_step", json!({"run_id": id}), None).await?;
+    Ok(Ok(id))
+}
+
+/// Event-date flows: how many fires are waiting, started, skipped (filtered, cancelled, replaced by
+/// a newer booking) and missed (due while the scheduler couldn't run, more than a day late).
+pub async fn event_date_report(db: &PgPool, flow_id: Uuid) -> AppResult<Value> {
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT outcome, count(*) FROM flow_event_date_fires WHERE flow_id = $1 GROUP BY outcome").bind(flow_id).fetch_all(db).await?;
+    let next: Option<chrono::DateTime<Utc>> = sqlx::query_scalar("SELECT min(due_at) FROM flow_event_date_fires WHERE flow_id = $1 AND outcome = 'pending'").bind(flow_id).fetch_one(db).await?;
+    let mut m = serde_json::Map::new();
+    for (k, n) in rows {
+        m.insert(k, json!(n));
+    }
+    Ok(json!({"counts": m, "next_due_at": next}))
 }
 
 #[derive(sqlx::FromRow)]
@@ -594,6 +1020,13 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     };
     let mut context = run.context.clone();
     let mut current = run.current_node.clone();
+    // Flows keyed to an event (event-date flows, and metric flows with a key): stop when the thing
+    // was cancelled or a newer event replaced it (e.g. the booking's dates changed).
+    let event_date = match parse_trigger(&flow.trigger) {
+        Ok(Trigger::EventDate { key, cancelled_by, .. }) => context["event"]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).map(|id| (id, key, cancelled_by)),
+        Ok(Trigger::Metric { key: Some(key), cancelled_by, .. }) => context["event"]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).map(|id| (id, Some(key), cancelled_by)),
+        _ => None,
+    };
 
     for _ in 0..100 {
         let Some(node_id) = current.clone() else {
@@ -605,6 +1038,11 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
         };
         if let Some(exit) = &exit {
             if segments::profile_matches(&state.db, run.profile_id, exit).await.map_err(|e| anyhow::anyhow!(e.public_message()))? {
+                return finish(&state.db, run.id, "exited").await;
+            }
+        }
+        if let Some((event_id, key, cancelled_by)) = &event_date {
+            if event_date_stale(&state.db, flow.account_id, *event_id, key.as_deref(), cancelled_by).await?.is_some() {
                 return finish(&state.db, run.id, "exited").await;
             }
         }

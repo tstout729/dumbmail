@@ -1,0 +1,49 @@
+{
+  "description": "Second partial refund of $20: its own amount, not the charge's running total",
+  "expect": [
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "if_missing": "retry",
+        "property": "stripe_payment_intent",
+        "value": "pi_3QabCdEfGh1234"
+      },
+      "properties": {
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "payment_intent": "pi_3QabCdEfGh1234",
+        "reason": "requested_by_customer",
+        "refund_id": "re_1B"
+      },
+      "time": "2025-11-17T18:20:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:re_1B",
+      "value": 20
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2026-09-30.clover",
+      "created": 1763403600,
+      "data": {
+        "object": {
+          "amount": 2000,
+          "charge": "ch_3QabCdEfGh1234",
+          "created": 1763403600,
+          "currency": "usd",
+          "id": "re_1B",
+          "metadata": {},
+          "object": "refund",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "reason": "requested_by_customer",
+          "status": "succeeded"
+        }
+      },
+      "id": "evt_re_1B",
+      "livemode": false,
+      "object": "event",
+      "type": "refund.created"
+    },
+    "source": "webhook"
+  }
+}

@@ -94,6 +94,7 @@ impl Role {
                         | SettingsWrite
                         | TeamRead
                         | WebhooksRead
+                        | IntegrationsRead
                 ),
                 Role::Analyst => matches!(perm, AudienceRead | ProfilesRead | Export | MessagingRead | ContentRead | AnalyticsRead | AccountRead | TeamRead),
                 // Content may send test emails, but only to team members (see `super::sends`).
@@ -195,6 +196,9 @@ pub enum Perm {
     /// The account's two-factor requirement. Browser sessions only.
     Security,
     AuditRead,
+    /// Bring in a whole customer list and its consent from another platform (connect it, start, pause,
+    /// resume or cancel an import, choose how people who never subscribed are treated). Admins and owners.
+    Import,
     /// Owners only, in a browser: single sign-on settings. Ownership changes also need a fresh
     /// password or code (see [`require_fresh_sign_in`]).
     Ownership,
@@ -206,10 +210,17 @@ pub enum Perm {
     /// Everything about data export destinations and runs (they copy every profile out). Admins
     /// and owners.
     ExportsManage,
+    /// See custom integrations, their status and their delivery log, without payloads or script
+    /// output. Managers and up.
+    IntegrationsRead,
+    /// Create, change and delete custom integrations, their secrets and credentials, run, test,
+    /// replay and backfill them, install recipes, and read stored payloads and script output
+    /// (personal data). Admins and owners.
+    IntegrationsManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 41] = [
+    pub const ALL: [Perm; 44] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -247,10 +258,13 @@ impl Perm {
         Perm::ApiKeys,
         Perm::Security,
         Perm::AuditRead,
+        Perm::Import,
         Perm::Ownership,
         Perm::WebhooksRead,
         Perm::WebhooksManage,
         Perm::ExportsManage,
+        Perm::IntegrationsRead,
+        Perm::IntegrationsManage,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -294,10 +308,13 @@ impl Perm {
             ApiKeys => "api_keys.manage",
             Security => "security.manage",
             AuditRead => "audit.read",
+            Import => "imports.manage",
             Ownership => "ownership.transfer",
             WebhooksRead => "webhooks.read",
             WebhooksManage => "webhooks.manage",
             ExportsManage => "exports.manage",
+            IntegrationsRead => "integrations.read",
+            IntegrationsManage => "integrations.manage",
         }
     }
 
@@ -308,15 +325,15 @@ impl Perm {
             Public | Me | Mcp | OwnLogin | TwoFactorStep | SwitchAccount | ConfirmIdentity | Security | Ownership | TransactionalSend => return None,
             AudienceRead | ProfilesRead => (Area::Audience, false),
             // An export copies people's data out, so a read-only key can't start or fetch one.
-            AudienceWrite | Export => (Area::Audience, true),
+            AudienceWrite | Export | Import => (Area::Audience, true),
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),
             ContentWrite | FormsWrite | CatalogWrite | CatalogDelete => (Area::Content, true),
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
-            AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead => (Area::Account, false),
-            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage => (Area::Account, true),
+            AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead | IntegrationsRead => (Area::Account, false),
+            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage => (Area::Account, true),
         })
     }
 
@@ -405,9 +422,10 @@ pub fn scopes_allow(scopes: &[String], perm: Perm) -> bool {
         return scopes.iter().any(|s| s == TRANSACTIONAL_SCOPE);
     }
     let Some((area, write)) = perm.area() else { return true };
-    // The team and the audit log are about people, not marketing data, and webhook URLs can
-    // themselves be credentials: plain `read` doesn't include them; they need the account scope.
-    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::TeamSecurityRead | Perm::AuditRead | Perm::WebhooksRead);
+    // The team and the audit log are about people, not marketing data, and webhook URLs (an
+    // integration's inbound URL too) can themselves be credentials: plain `read` doesn't include
+    // them; they need the account scope.
+    let broad_read_ok = !matches!(perm, Perm::TeamRead | Perm::TeamSecurityRead | Perm::AuditRead | Perm::WebhooksRead | Perm::IntegrationsRead);
     scopes.iter().any(|s| {
         let s = s.as_str();
         s == area.as_str() || (!write && (s.strip_suffix(":read") == Some(area.as_str()) || (broad_read_ok && s == "read")))
@@ -848,6 +866,8 @@ mod tests {
         assert!(!Role::Analyst.has(ReportsManage) && !Role::Content.has(CatalogWrite) && Role::Content.has(ContentRead));
         assert!(Role::Owner.has(TeamSecurityRead) && Role::Admin.has(TeamSecurityRead));
         assert!(Role::Manager.has(TeamRead) && !Role::Manager.has(TeamSecurityRead) && !Role::Analyst.has(TeamSecurityRead) && !Role::Content.has(TeamSecurityRead));
+        assert!(Role::Manager.has(IntegrationsRead) && !Role::Manager.has(IntegrationsManage) && Role::Admin.has(IntegrationsManage) && Role::Owner.has(IntegrationsManage));
+        assert!(!Role::Analyst.has(IntegrationsRead) && !Role::Content.has(IntegrationsRead));
     }
 
     #[test]
@@ -875,6 +895,8 @@ mod tests {
         // The team and audit log need the account scope; `read` alone isn't enough.
         assert!(!scopes_allow(&s(&["read"]), TeamRead) && !scopes_allow(&s(&["read"]), AuditRead));
         assert!(scopes_allow(&s(&["account:read"]), TeamRead) && scopes_allow(&s(&["account"]), AuditRead));
+        assert!(!scopes_allow(&s(&["read"]), IntegrationsRead) && scopes_allow(&s(&["account:read"]), IntegrationsRead));
+        assert!(!scopes_allow(&s(&["account:read"]), IntegrationsManage) && !scopes_allow(&s(&["audience"]), IntegrationsManage) && scopes_allow(&s(&["account"]), IntegrationsManage));
         assert!(scopes_allow(&s(&["read"]), AccountRead));
         // Transactional sending has its own scope.
         assert!(scopes_allow(&s(&["transactional.send"]), TransactionalSend) && scopes_allow(&s(&["full"]), TransactionalSend));
