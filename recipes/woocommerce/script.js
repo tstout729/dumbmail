@@ -113,7 +113,9 @@ function customerActions(c) {
 // changing. A full page means the window was too wide: it's halved and read again (orders already
 // read are recorded once, by their ids). A window of a second or two that's still full is paged
 // through. Each next window starts a second before the last one ended, so an order changed at the
-// boundary is never missed. Within a page, an order is read once (by id).
+// boundary is never missed. Within a page, an order is read once (by id). The window and page in
+// progress are saved (state.after, state.before, state.page), so a run that stops at its page limit
+// inside a busy window carries on from that page next time instead of starting the window again.
 var PER_PAGE = 100;
 
 function queryOf(input) {
@@ -143,21 +145,33 @@ function pullActions(input) {
   var before = q.modified_before ? Date.parse(q.modified_before) : null;
   var now = Date.parse(input.now);
   var page = parseInt(q.page || "1", 10) || 1;
+  var st = input.state || {};
+  var place = function (after, before, page) {
+    return { after: after, before: before, page: page };
+  };
+  // A run's first request (the configured one) while a window was left part-read: carry on there.
+  if (!q.modified_before && page === 1 && st.before && !isNaN(Date.parse(st.before)) && !isNaN(Date.parse(st.after))) {
+    var resume = String(parseInt(st.page || "1", 10) || 1);
+    out.push({ type: "log", message: "carrying on with the orders changed from " + st.after + " to " + st.before + ", page " + resume });
+    out.push({ type: "next_request", query: { modified_after: st.after, modified_before: st.before, page: resume } });
+    return out;
+  }
   if (rows.length >= PER_PAGE) {
     var end = before || now;
     if (end - after > 2000) {
       var mid = after + Math.floor((end - after) / 2);
       out.push({ type: "next_request", query: { modified_after: iso(after), modified_before: iso(mid), page: "1" } });
+      out.push({ type: "set_state", values: place(iso(after), iso(mid), "1") });
     } else {
-      out.push({ type: "next_request", query: { modified_after: iso(after), modified_before: before ? iso(before) : null, page: String(page + 1) } });
+      out.push({ type: "next_request", query: { modified_after: iso(after), modified_before: iso(end), page: String(page + 1) } });
+      out.push({ type: "set_state", values: place(iso(after), iso(end), String(page + 1)) });
     }
-    out.push({ type: "set_state", values: { after: iso(after) } });
     return out;
   }
   if (before === null || before >= now) {
     // Caught up: the next run starts a second before the newest change read.
     var next = newest ? Math.max(after, newest - 1000) : after;
-    out.push({ type: "set_state", values: { after: iso(next) } });
+    out.push({ type: "set_state", values: place(iso(next), null, null) });
     if (!rows.length) out.push({ type: "log", message: "no changed orders" });
     return out;
   }
@@ -165,7 +179,7 @@ function pullActions(input) {
   var start = before - 1000;
   var span = (before - after) * 2;
   var nextBefore = start + span < now ? iso(start + span) : null;
-  out.push({ type: "set_state", values: { after: iso(start) } });
+  out.push({ type: "set_state", values: place(iso(start), nextBefore, nextBefore ? "1" : null) });
   out.push({ type: "next_request", query: { modified_after: iso(start), modified_before: nextBefore, page: "1" } });
   return out;
 }

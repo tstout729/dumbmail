@@ -438,6 +438,44 @@ async fn woocommerce_history_reads_time_windows_without_offsets() {
     h.cleanup().await;
 }
 
+#[tokio::test]
+async fn woocommerce_carries_on_a_busy_window_where_its_last_run_stopped() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (api, base) = mock_woo().await;
+    let w = install(&mut h, "woocommerce", Sign::Base64("X-WC-Webhook-Signature"), "wc-webhook-secret-0001", false).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", w.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/wp-json/wc/v3/orders"));
+    // Few pages per run: one run can't page through the busy second.
+    pull["max_pages"] = json!(6);
+    h.ok("PATCH", &format!("/api/integrations/{}", w.id), Some(json!({"pull": pull, "credentials": {"consumer_key": "ck_test", "consumer_secret": "cs_test"}}))).await;
+    let busy = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let base_order = fixture("woocommerce", "order-created-paid.json")["input"]["payload"].clone();
+    let orders: Vec<Value> = (0..450)
+        .map(|k| {
+            let mut o = base_order.clone();
+            o["id"] = json!(5000 + k);
+            o["number"] = json!((5000 + k).to_string());
+            o["billing"]["email"] = json!(format!("rush{k}@example.com"));
+            o["billing"]["phone"] = json!("");
+            o["date_modified_gmt"] = json!(busy.format("%Y-%m-%dT%H:%M:%S").to_string());
+            o
+        })
+        .collect();
+    *api.orders.lock().unwrap() = orders;
+    let start = (busy - chrono::Duration::seconds(10)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    sqlx::query("UPDATE integrations SET state = jsonb_build_object('after', $2::text) WHERE id = $1::uuid").bind(&w.id).bind(&start).execute(&h.state.db).await.unwrap();
+    for _ in 0..6 {
+        h.ok("POST", &format!("/api/integrations/{}/pull", w.id), Some(json!({}))).await;
+        for _ in 0..3 {
+            retry_now(&h).await;
+        }
+    }
+    assert_eq!(events(&h, "Placed Order").await, 450, "every order in the busy second, over several runs: {:?}", api.seen.lock().unwrap());
+    h.cleanup().await;
+}
+
 // ---------- Recharge ----------
 
 #[tokio::test]
