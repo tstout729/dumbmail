@@ -161,7 +161,7 @@ pub enum Made {
 enum LineState {
     /// A message carried it and didn't go (or never got recorded): it doesn't hold the line.
     NeverReached,
-    /// Never sent and not carried by any message: ask with it (one send intent per request).
+    /// Never sent, never used and not carried by any message: ask with it (one send intent per request).
     Unsent,
     /// Sent, used, or on its way.
     Asked,
@@ -175,7 +175,7 @@ async fn line_state(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<Lin
             AND q.message_id IS NOT NULL
             AND (EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id AND m.sent_at IS NULL AND m.status IN ('skipped', 'failed'))
                  OR (NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id) AND q.created_at < now() - interval '30 minutes'))),
-            q.sent_at IS NULL AND q.message_id IS NULL
+            q.sent_at IS NULL AND q.message_id IS NULL AND q.submitted_at IS NULL AND q.review_id IS NULL
          FROM review_requests q WHERE q.id = $1",
     )
     .bind(id)
@@ -535,6 +535,20 @@ async fn finish(state: &AppState, intent: &Intent, status: &str, why: &str) -> A
     Ok(())
 }
 
+/// Why a review reminder was stopped at the last check: one of its requests was answered.
+pub const ANSWERED: &str = "already reviewed";
+
+/// For the sender's last check under the strict marketing rules (`sending::send_strict_marketing`):
+/// whether the message (its id at `message_param`) is a review reminder one of whose requests has
+/// been answered since. A column of that check's own statement, so it adds no query; false for any
+/// other send (`strict_param` false, or no review intent with this id).
+pub fn answered_sql(strict_param: &str, message_param: &str) -> String {
+    format!(
+        "({strict_param} AND EXISTS (SELECT 1 FROM review_sends rs JOIN review_requests q ON q.id = ANY(rs.request_ids)
+          WHERE rs.id = {message_param} AND rs.kind = 'reminder' AND (q.review_id IS NOT NULL OR q.submitted_at IS NOT NULL)))"
+    )
+}
+
 /// What a dispatch came to.
 pub enum Dispatch {
     /// Settled: sent, skipped or failed.
@@ -587,7 +601,9 @@ pub async fn dispatch(state: &AppState, account: &Account, intent: &Intent, cont
     super::hooks::point("review_send", account.id).await.map_err(AppError::Internal)?;
     let mut ev = event.cloned().unwrap_or(json!({}));
     ev["_review_requests"] = json!(open);
-    let out = sending::send(
+    // The sender's last check applies the strict marketing rules again right before the hand-off
+    // (an opt-out, a hold or, for a reminder, a review landing after the checks above).
+    let out = sending::send_strict_marketing(
         state,
         SendSpec {
             account,

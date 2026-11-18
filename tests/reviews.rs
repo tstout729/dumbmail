@@ -1331,3 +1331,104 @@ async fn one_intent_per_ask_and_always_dispatched() {
     assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "once");
     h.cleanup().await;
 }
+
+/// A phone number whose time zone is in the middle of the day now (texts' quiet hours never apply).
+fn daytime_number(n: u32) -> String {
+    let candidates = [
+        format!("+1808555{:04}", n), format!("+1503555{:04}", n), format!("+1303555{:04}", n), format!("+1312555{:04}", n), format!("+1212555{:04}", n),
+        format!("+4420794{:05}", n), format!("+9198123{:05}", n), format!("+97798123{:04}", n), format!("+8190123{:05}", n),
+    ];
+    candidates
+        .into_iter()
+        .find(|c| dumbmail::features::sendtime::zone::phone_zone(c).is_some_and(|tz| (11..17).contains(&chrono::Timelike::hour(&chrono::Utc::now().with_timezone(&tz)))))
+        .expect("some zone is in the middle of the day")
+}
+
+async fn texter(h: &Harness, acct: Uuid, phone: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, phone_number, sms_consent) VALUES ($1, $2, $3, 'subscribed')").bind(id).bind(acct).bind(phone).execute(&h.state.db).await.unwrap();
+    id
+}
+
+fn texts_to(h: &Harness, to: &str) -> Vec<String> {
+    h.state.sms.sent().into_iter().filter(|m| m.to == to).map(|m| m.body).collect()
+}
+
+/// Round 3, item 2: the strict marketing rules hold at the hand-off itself, in the sender's last
+/// check: a change that lands after the reviews module's own checks (and, for texts, after the
+/// message was rendered) still stops the ask, and a reminder stops once its request is answered.
+#[tokio::test]
+async fn strict_rules_hold_at_the_hand_off() {
+    use dumbmail::features::reviews::hooks;
+    use dumbmail::sending::LimiterPause;
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    h.claim_number().await;
+
+    // An email ask: the person stops being subscribed (never asked) after the module's checks.
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    live_review_flow(&mut h).await;
+    order(&mut h, "jane@x.test", "1", json!([{"product_id": "MUG", "name": "Mug"}]), "o1").await;
+    h.drain().await;
+    let pause = hooks::hold("review_send", acct);
+    let db = h.state.db.clone();
+    tokio::join!(h.fast_forward(), async {
+        pause.arrived().await;
+        sqlx::query("UPDATE profiles SET email_consent = 'never_subscribed' WHERE email = 'jane@x.test'").execute(&db).await.unwrap();
+        pause.release("review_send", acct);
+    });
+    assert!(mails_to(&h, "jane@x.test").is_empty(), "an email ask needs the person subscribed at the hand-off");
+    let (status, err): (String, Option<String>) = sqlx::query_as("SELECT m.status, m.error FROM messages m JOIN profiles p ON p.id = m.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), err.as_deref()), ("skipped", Some("no marketing consent")));
+
+    // Texts: an ask, then a reminder a day later.
+    let flow = json!({"name": "Text asks", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "a", "nodes": [
+        {"id": "a", "type": "review_request", "channel": "sms", "next": "d", "content": {"body": "How was it? {% review_link %}"}},
+        {"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": "r"},
+        {"id": "r", "type": "review_request", "channel": "sms", "reminder": true, "next": null, "content": {"body": "Still keen to hear: {% review_link %}"}}]}});
+    let f = h.ok("POST", "/api/flows", Some(flow)).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+
+    // A marketing hold lands after the text was rendered: held back, no exception.
+    let held = daytime_number(1);
+    texter(&h, acct, &held).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"phone_number": held}, "properties": {"order_id": "2", "items": [{"product_id": "MUG", "name": "Mug"}]}, "unique_id": "o2"}))).await;
+    let pause = LimiterPause::hold(acct);
+    let st = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    pause.arrived().await;
+    sqlx::query("UPDATE profiles SET marketing_hold = true WHERE phone_number = $1").bind(&held).execute(&h.state.db).await.unwrap();
+    pause.release(acct);
+    worker.await.unwrap();
+    assert!(texts_to(&h, &held).is_empty(), "{:?}", texts_to(&h, &held));
+    let (status, err): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM messages WHERE channel = 'sms' AND to_address = $1").bind(&held).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), err.as_deref()), ("skipped", Some("no marketing consent")));
+
+    // A review lands after the reminder was rendered: the reminder doesn't go.
+    let tom = daytime_number(2);
+    texter(&h, acct, &tom).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"phone_number": tom}, "properties": {"order_id": "3", "items": [{"product_id": "MUG", "name": "Mug"}]}, "unique_id": "o3"}))).await;
+    h.drain().await;
+    let asks = texts_to(&h, &tom);
+    assert_eq!(asks.len(), 1, "the ask went");
+    let t = asks[0].split("%2Fe%2Freview%2F").nth(1).unwrap_or_else(|| panic!("{}", asks[0])).split('&').next().unwrap().to_string();
+    let pause = LimiterPause::hold(acct);
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE run_at <> 'infinity'").execute(&h.state.db).await.unwrap();
+    let st = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&st).await.unwrap() });
+    pause.arrived().await;
+    let (s, v) = submit(&h, &t, json!({"rating": 5})).await;
+    assert!(s.is_success(), "{v}");
+    pause.release(acct);
+    worker.await.unwrap();
+    assert_eq!(texts_to(&h, &tom).len(), 1, "no reminder after the review: {:?}", texts_to(&h, &tom));
+    let (status, err): (String, Option<String>) = sqlx::query_as("SELECT m.status, m.error FROM messages m JOIN review_sends rs ON rs.id = m.id WHERE rs.kind = 'reminder' AND m.to_address = $1")
+        .bind(&tom)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!((status.as_str(), err.as_deref()), ("skipped", Some("already reviewed")));
+    h.cleanup().await;
+}
