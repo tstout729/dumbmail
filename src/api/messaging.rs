@@ -446,7 +446,6 @@ async fn test_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, A
 /// they're saved only if it launches, and checked as they will be used.
 pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Option<DateTime<Utc>>, send_options: Option<&Value>) -> AppResult<CampaignRow> {
     let mut c = campaigns::load(&state.db, account_id, id).await?;
-    crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id).await?;
     if !matches!(c.status.as_str(), "draft" | "scheduled") {
         return Err(AppError::Conflict(format!("this campaign is already {}", c.status)));
     }
@@ -505,7 +504,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let changed = || AppError::Conflict("this campaign changed while you were sending it; open it again".into());
     let mut tx = state.db.begin().await?;
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
-        Some(t) => sqlx::query_as(
+        Some(t) => match sqlx::query_as(
             "UPDATE campaigns SET status = 'scheduled', send_at = $2, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
              WHERE id = $1 AND status = $3 AND updated_at = $6 AND archived_at IS NULL RETURNING *",
         )
@@ -517,9 +516,15 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         .bind(c.updated_at)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(changed)?,
+        {
+            Some(r) => r,
+            None => {
+                drop(tx);
+                return Err(crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id, changed()).await);
+            }
+        },
         None => {
-            let r: CampaignRow = sqlx::query_as(
+            let r: Option<CampaignRow> = sqlx::query_as(
                 "UPDATE campaigns SET status = 'sending', send_at = now(), send_options = CASE WHEN $3 THEN $4 ELSE send_options END, updated_at = now()
                  WHERE id = $1 AND status = $2 AND updated_at = $5 AND archived_at IS NULL RETURNING *",
             )
@@ -529,8 +534,11 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
             .bind(&c.send_options)
             .bind(c.updated_at)
             .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(changed)?;
+            .await?;
+            let Some(r) = r else {
+                drop(tx);
+                return Err(crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id, changed()).await);
+            };
             crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": id}), None).await?;
             r
         }
@@ -848,7 +856,6 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
     }
     let f = load_flow(state, account_id, id).await?;
     if status == "live" {
-        crate::features::campaigns_plus::tags::refuse_if_archived(&state.db, crate::features::campaigns_plus::tags::Kind::Flow, account_id, id).await?;
         if let Some(why) = crate::import_review::flow_problem(&f) {
             return Err(AppError::bad(format!("{why} before it can go live.")));
         }
@@ -886,14 +893,17 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         }
     }
     // Turning live was checked against this version of the flow (review included); an edit meanwhile means check again.
-    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
+    let row: Option<FlowRow> = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
         .bind(id)
         .bind(status)
         .bind(account_id)
         .bind(f.updated_at)
         .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::Conflict("this flow changed while you were turning it on; open it again".into()))?;
+        .await?;
+    let Some(row) = row else {
+        let changed = AppError::Conflict("this flow changed while you were turning it on; open it again".into());
+        return Err(if status == "live" { crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Flow, account_id, id, changed).await } else { changed });
+    };
     crate::features::webhooks::flow_status_changed(&state.db, account_id, id, &row.name, &f.status, status, &row.trigger).await;
     if status == "live" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"first_flow\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;

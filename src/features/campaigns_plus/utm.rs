@@ -360,17 +360,18 @@ pub async fn freeze_campaign(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::
 }
 
 /// A test send's content with the tags the real send would use (today's date).
-pub async fn for_test(state: &AppState, c: &CampaignRow, version: Option<&str>, content: &Value) -> AppResult<Value> {
-    let mut conn = state.db.acquire().await?;
-    let over: Option<Value> = sqlx::query_scalar("SELECT link_tags FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut *conn).await?;
-    let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(c.account_id).fetch_one(&mut *conn).await?;
-    let defaults = load_defaults(&mut conn, c.account_id).await?;
+/// `over` and `defaults` come with a statement the test send already runs (see
+/// [`DEFAULTS_FOR_ACCOUNT_1`]): no query here.
+pub fn for_test(account: &Account, c: &CampaignRow, version: Option<&str>, content: &Value, over: Option<&Value>, defaults: Option<&Value>) -> Value {
     let version = crate::campaigns::ab_test(c).map(|_| version.unwrap_or("a"));
-    let frozen = campaign_frozen(defaults.as_ref(), c, parse_override(over.as_ref()).as_ref(), version, &local_date(&tz, Utc::now()));
+    let frozen = campaign_frozen(parse_defaults(defaults).as_ref(), c, parse_override(over).as_ref(), version, &local_date(&account.timezone, Utc::now()));
     let mut out = content.clone();
     set_on(&mut out, frozen.as_ref());
-    Ok(out)
+    out
 }
+
+/// A scalar subquery for the settings of account `$1` as one JSON value (or NULL).
+pub const DEFAULTS_FOR_ACCOUNT_1: &str = "(SELECT jsonb_build_object('enabled', s.enabled, 'params', s.params, 'skip_domains', to_jsonb(s.skip_domains)) FROM link_tag_settings s WHERE s.account_id = $1)";
 
 /// A flow step's content with its tags, from the settings loaded with the flow row: no query.
 pub fn for_flow_step(account: &Account, flow: &FlowRow, node_name: Option<&str>, channel: &str, mut content: Value) -> Value {

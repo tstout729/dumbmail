@@ -133,16 +133,23 @@ pub async fn resolve(db: &PgPool, account_id: Uuid, campaign_id: Uuid) -> AppRes
 
 /// For sending: a resend's own audience in place of whatever its editable audience says; any other
 /// campaign's audience as it is.
-pub async fn send_audience(db: &PgPool, campaign_id: Uuid, audience: Audience) -> AppResult<Audience> {
-    let resend: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign_resends WHERE campaign_id = $1)").bind(campaign_id).fetch_one(db).await?;
-    Ok(if resend { Audience { include: vec![AudienceRef { kind: "resend".into(), id: campaign_id }], exclude: vec![] } } else { audience })
+/// `is_resend` comes with the campaign row the send already reads (`campaigns_plus::PREPARE_COLUMNS`).
+pub fn send_audience(campaign_id: Uuid, is_resend: bool, audience: Audience) -> Audience {
+    if is_resend {
+        Audience { include: vec![AudienceRef { kind: "resend".into(), id: campaign_id }], exclude: vec![] }
+    } else {
+        audience
+    }
 }
 
 /// In the transaction that fixes a campaign's audience, on the connection holding its lock: for a
 /// resend whose audience isn't fixed yet, check its original is still fully sent and within 30 days and that
 /// it holds one of the two slots, then mark the slot started (kept for good). Returns why it can't
 /// go, or None (also for any campaign that isn't a resend).
-pub async fn check_at_send(db: &mut PgConnection, c: &CampaignRow) -> sqlx::Result<Option<String>> {
+pub async fn check_at_send(db: &mut PgConnection, c: &CampaignRow, is_resend: bool) -> sqlx::Result<Option<String>> {
+    if !is_resend {
+        return Ok(None);
+    }
     let slot: Option<Uuid> = sqlx::query_scalar("SELECT original_id FROM campaign_resends WHERE campaign_id = $1 FOR UPDATE").bind(c.id).fetch_optional(&mut *db).await?;
     let Some(original_id) = slot else { return Ok(None) };
     // Already fixed (a retried job, or the winner send after an A/B test): nobody is added.

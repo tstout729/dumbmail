@@ -38,6 +38,13 @@ use tags::Kind;
 
 pub struct Module;
 
+/// Columns added to the campaign row a send reads first (`campaigns::prepare_send`, alias `c`):
+/// whether it's a resend, and whether link tags need working out (an override, tags already on its
+/// content, or tagging on for the account). Without either, the send runs no extra statement.
+pub const PREPARE_COLUMNS: &str = "EXISTS (SELECT 1 FROM campaign_resends r WHERE r.campaign_id = c.id),
+    (c.link_tags IS NOT NULL OR c.content ? 'link_tags' OR COALESCE(c.ab_test::text LIKE '%\"link_tags\"%', false)
+     OR EXISTS (SELECT 1 FROM link_tag_settings s WHERE s.account_id = c.account_id AND s.enabled))";
+
 /// Reading is messaging read; tags, archive and moving a campaign are campaign management (flows:
 /// flow editing; templates: content writing); a resend draft is a campaign draft and sending it is
 /// an ordinary send; the account's link tag defaults are a setting.

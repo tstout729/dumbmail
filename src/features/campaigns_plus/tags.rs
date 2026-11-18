@@ -267,6 +267,16 @@ pub async fn archive(state: &AppState, account_id: Uuid, kind: Kind, b: ArchiveB
     }))
 }
 
+/// After a send, schedule or turn-on whose write refused an archived item: the archived reason if
+/// that's why, else `otherwise`. Costs a query only on that refusal, so the paths that succeed run
+/// the statements they always did.
+pub async fn archived_or(db: &sqlx::PgPool, kind: Kind, account_id: Uuid, id: Uuid, otherwise: AppError) -> AppError {
+    match refuse_if_archived(db, kind, account_id, id).await {
+        Err(e) => e,
+        Ok(()) => otherwise,
+    }
+}
+
 /// Refuse to send, schedule or turn on an archived item, with a clear reason. (The write that does
 /// it checks again, so an archive at the same moment can't slip past.)
 pub async fn refuse_if_archived(db: &sqlx::PgPool, kind: Kind, account_id: Uuid, id: Uuid) -> AppResult<()> {
