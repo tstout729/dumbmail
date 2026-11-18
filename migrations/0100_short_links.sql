@@ -23,3 +23,11 @@ CREATE TABLE short_link_targets (
     UNIQUE (account_id, url)
 );
 CREATE INDEX short_link_targets_last_used_idx ON short_link_targets (last_used_at);
+
+-- A text campaign's targets ({destination: code}), set when its audience is fixed and again at every
+-- relaunch, kept out of the campaign's editable content.
+CREATE TABLE short_link_campaigns (
+    campaign_id uuid PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE,
+    targets     jsonb NOT NULL,
+    frozen_at   timestamptz NOT NULL DEFAULT now()
+);

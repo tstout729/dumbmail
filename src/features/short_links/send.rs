@@ -3,8 +3,8 @@
 //!
 //! Cost: a text without a link costs nothing. A flow text, a reply, a keyword answer or a test with
 //! links runs one statement ([`ensure_targets`]) for all of its links. A campaign text runs none: its
-//! targets were set up once, when its audience was fixed ([`freeze_campaign`]), and ride on its
-//! content under [`CONTENT_KEY`]. The message's reference is written by the statement that already
+//! targets were set up once, when its audience was fixed ([`freeze_campaign`]), and are read once per
+//! batch of recipients ([`campaign_targets`]). The message's reference is written by the statement that already
 //! writes the message row (`sending::send`).
 
 use std::borrow::Cow;
@@ -24,9 +24,10 @@ use crate::render::{LinkHook, SmsLinks};
 use crate::sending::SendSpec;
 use crate::state::AppState;
 
-/// Where a campaign's targets ride on its content: `{"targets": {destination: code}}`. Only a real
-/// campaign send reads it, and `freeze_campaign` always sets or removes it when the send starts, so
-/// a value typed into content by hand never decides what's sent.
+/// Where a campaign's targets ride on the content the send sees: `{"targets": {destination: code}}`.
+/// Only a real campaign send reads it, and the campaign sender always sets or removes it from the
+/// launch's targets ([`campaign_content`]), so a value typed into content by hand never decides
+/// what's sent.
 pub const CONTENT_KEY: &str = "short_links";
 /// At most this many different links in one text are shortened; the rest keep the long form.
 pub const MAX_LINKS: usize = 10;
@@ -233,11 +234,12 @@ pub async fn ensure_targets(conn: &mut PgConnection, account_id: Uuid, urls: &[S
     Ok(out)
 }
 
-/// When a text campaign starts, on the connection that holds the campaign lock: create its targets
-/// (every version's links, with their link tags) and write them onto its content, or take stale
-/// ones off. Called only the first time its audience is fixed.
+/// When a text campaign's audience is fixed (its first launch, and again at every relaunch), on the
+/// connection that holds the campaign lock: create its targets (every version's links, with their
+/// link tags) and keep them in `short_link_campaigns`, out of the content anyone can edit. A launch
+/// with nothing to shorten removes the row.
 pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign_id: Uuid) -> sqlx::Result<()> {
-    let (account_id, mut content, mut ab_test, link_domain): (Uuid, Value, Option<Value>, Option<String>) =
+    let (account_id, content, ab_test, link_domain): (Uuid, Value, Option<Value>, Option<String>) =
         sqlx::query_as("SELECT c.account_id, c.content, c.ab_test, a.link_domain FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1")
             .bind(campaign_id)
             .fetch_one(&mut *conn)
@@ -248,36 +250,47 @@ pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign
         let tagger = crate::features::campaigns_plus::utm::Tagger::from_content_with(state, link_domain.as_deref(), c);
         destinations(links, tagger.as_ref().map(|t| t as &dyn LinkHook)).into_iter().map(|(_, d)| d).collect()
     };
-    let mut per: Vec<Vec<String>> = vec![dests_of(&content)];
-    let variants = ab_test.as_mut().and_then(|t| t.get_mut("variants")).and_then(Value::as_array_mut);
-    if let Some(vs) = &variants {
-        per.extend(vs.iter().map(|v| v.get("content").map(dests_of).unwrap_or_default()));
+    let mut all: HashSet<String> = dests_of(&content).into_iter().collect();
+    if let Some(vs) = ab_test.as_ref().and_then(|t| t.get("variants")).and_then(Value::as_array) {
+        all.extend(vs.iter().filter_map(|v| v.get("content")).flat_map(dests_of));
     }
-    let all: Vec<String> = per.iter().flatten().cloned().collect::<HashSet<_>>().into_iter().collect();
+    let all: Vec<String> = all.into_iter().collect();
     let codes = if all.is_empty() || !runtime::issuing(state) { HashMap::new() } else { ensure_targets(conn, account_id, &all).await? };
-    let set = |c: &mut Value, dests: &[String]| -> bool {
-        let Some(o) = c.as_object_mut() else { return false };
-        let targets: Map<String, Value> = dests.iter().filter_map(|d| codes.get(d).map(|code| (d.clone(), json!(code)))).collect();
-        let before = o.get(CONTENT_KEY).cloned();
-        if targets.is_empty() {
-            o.remove(CONTENT_KEY);
-        } else {
-            o.insert(CONTENT_KEY.into(), json!({"targets": targets}));
-        }
-        o.get(CONTENT_KEY).cloned() != before
-    };
-    let mut changed = set(&mut content, &per[0]);
-    if let Some(vs) = variants {
-        for (v, dests) in vs.iter_mut().zip(per.iter().skip(1)) {
-            if let Some(vc) = v.get_mut("content") {
-                changed |= set(vc, dests);
-            }
-        }
-    }
-    if changed {
-        sqlx::query("UPDATE campaigns SET content = $2, ab_test = $3 WHERE id = $1").bind(campaign_id).bind(&content).bind(&ab_test).execute(&mut *conn).await?;
+    if codes.is_empty() {
+        sqlx::query("DELETE FROM short_link_campaigns WHERE campaign_id = $1").bind(campaign_id).execute(&mut *conn).await?;
+    } else {
+        let targets: Map<String, Value> = codes.into_iter().map(|(d, c)| (d, json!(c))).collect();
+        sqlx::query(
+            "INSERT INTO short_link_campaigns (campaign_id, targets) VALUES ($1, $2)
+             ON CONFLICT (campaign_id) DO UPDATE SET targets = EXCLUDED.targets, frozen_at = now()",
+        )
+        .bind(campaign_id)
+        .bind(Value::Object(targets))
+        .execute(&mut *conn)
+        .await?;
     }
     Ok(())
+}
+
+/// A text campaign's targets from its last launch (one read per batch of recipients).
+pub async fn campaign_targets(db: &sqlx::PgPool, campaign_id: Uuid) -> sqlx::Result<Option<Value>> {
+    sqlx::query_scalar("SELECT targets FROM short_link_campaigns WHERE campaign_id = $1").bind(campaign_id).fetch_optional(db).await
+}
+
+/// A campaign version's content as the send sees it: with the launch's targets under
+/// [`CONTENT_KEY`], and never a value typed into the content by hand.
+pub fn campaign_content<'a>(content: &'a Value, targets: Option<&Value>) -> Cow<'a, Value> {
+    if targets.is_none() && content.get(CONTENT_KEY).is_none() {
+        return Cow::Borrowed(content);
+    }
+    let mut out = content.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.remove(CONTENT_KEY);
+        if let Some(t) = targets {
+            o.insert(CONTENT_KEY.into(), json!({"targets": t}));
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Sample short links for a preview: every link a real send would shorten, as a short link of the

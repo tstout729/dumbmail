@@ -397,12 +397,13 @@ async fn a_text_with_a_link_costs_at_most_one_statement_and_a_campaign_none_per_
         let cid: Uuid = id.parse().unwrap();
         sqlx::query("UPDATE campaigns SET status = 'sending', name = $2 WHERE id = $1").bind(cid).bind(name).execute(&h.state.db).await.unwrap();
         dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
-        // A retried send job keeps the targets the first run set up.
-        let frozen: Value = sqlx::query_scalar("SELECT content FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+        // A retried send job keeps the targets the first run set up, outside the campaign's content.
+        let frozen = short_links::send::campaign_targets(&h.state.db, cid).await.unwrap();
         dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
-        let again: Value = sqlx::query_scalar("SELECT content FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
-        assert_eq!(frozen, again);
-        assert_eq!(frozen.get(short_links::send::CONTENT_KEY).is_some(), name == "Link", "{frozen}");
+        assert_eq!(short_links::send::campaign_targets(&h.state.db, cid).await.unwrap(), frozen);
+        assert_eq!(frozen.is_some(), name == "Link", "{frozen:?}");
+        let content: Value = sqlx::query_scalar("SELECT content FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+        assert!(content.get(short_links::send::CONTENT_KEY).is_none(), "{content}");
         let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 ORDER BY id").bind(cid).fetch_all(&h.state.db).await.unwrap();
         assert_eq!(ids.len(), 2);
         let (r, n) = counted(dumbmail::campaigns::send_batch(&h.state, cid, &ids)).await;
@@ -608,5 +609,31 @@ async fn the_send_and_every_estimate_decide_the_same_way() {
     sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(one_segment_each).execute(&h.state.db).await.unwrap();
     let (s, v) = h.req("POST", &format!("/api/campaigns/{id}/send"), None).await;
     assert!(s.is_success(), "{s}: {v}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_relaunched_campaign_builds_its_links_afresh() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, first) = texter(&mut h, &list, 8201).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/old-offer").await;
+    launch(&mut h, &id).await;
+    let old_path = short_paths(&body_to(&h, &first))[0].clone();
+    let old_code = old_path[..code::TARGET_LEN].to_string();
+    // It fails after the first text went out; it's edited and relaunched. The edit even carries a
+    // map typed by hand that points the new link at the old destination's code.
+    sqlx::query("UPDATE campaigns SET status = 'failed' WHERE id = $1").bind(id.parse::<Uuid>().unwrap()).execute(&h.state.db).await.unwrap();
+    let forged = json!({"body": "Acme Goods: https://shop.test/new-offer", short_links::send::CONTENT_KEY: {"targets": {"https://shop.test/new-offer": old_code}}});
+    h.ok("PATCH", &format!("/api/campaigns/{id}"), Some(json!({"content": forged}))).await;
+    let (_, second) = texter(&mut h, &list, 8202).await;
+    launch(&mut h, &id).await;
+    let body = body_to(&h, &second);
+    let p = short_paths(&body);
+    assert_eq!(p.len(), 1, "the relaunch shortens its new link: {body}");
+    assert_ne!(&p[0][..code::TARGET_LEN], old_code);
+    assert_eq!(click(&h, &p[0]).await.1.as_deref(), Some("https://shop.test/new-offer"));
+    // The first text's link still goes where it went.
+    assert_eq!(click(&h, &old_path).await.1.as_deref(), Some("https://shop.test/old-offer"));
     h.cleanup().await;
 }

@@ -81,8 +81,10 @@ fails a send or misattributes a click.
 - A text without a link: nothing extra.
 - A flow text, reply, keyword answer or test with links: one statement for all of its links (it
   creates or reuses their targets and checks the setting).
-- A campaign text: none per recipient. A text campaign's targets are created once, when its
-  audience is fixed, and ride on its content. A campaign keeps the setting it started with.
+- A campaign text: none per recipient. A text campaign's targets are created when its audience is
+  fixed, at every launch (a failed or cancelled campaign that's edited and relaunched gets them
+  afresh), and kept apart from its editable content (`short_link_campaigns`); the sender reads
+  them once per batch of recipients. A campaign keeps the setting it was launched with.
 - The message's reference is written by the statement that already writes the message row.
 
 ## Housekeeping
