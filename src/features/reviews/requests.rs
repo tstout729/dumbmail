@@ -500,7 +500,6 @@ pub async fn dispatch(state: &AppState, account: &Account, intent: &Intent, cont
             _ => Dispatch::Done("settled"),
         });
     }
-    super::hooks::point("review_send", account.id).await.map_err(AppError::Internal)?;
     let handed: Option<bool> = sqlx::query_scalar("SELECT sent_at IS NOT NULL FROM messages WHERE id = $1").bind(intent.id).fetch_optional(db).await?;
     if handed == Some(true) {
         finish(state, intent, "sent", "").await?;
@@ -520,6 +519,8 @@ pub async fn dispatch(state: &AppState, account: &Account, intent: &Intent, cont
         finish(state, intent, "skipped", "already reviewed").await?;
         return Ok(Dispatch::Done("skipped"));
     }
+    // Tests hold or stop a worker here, between its checks and the hand-off to the sender.
+    super::hooks::point("review_send", account.id).await.map_err(AppError::Internal)?;
     let mut ev = event.cloned().unwrap_or(json!({}));
     ev["_review_requests"] = json!(open);
     let out = sending::send(

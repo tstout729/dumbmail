@@ -118,7 +118,8 @@ fn sort_key(sort: Option<&str>) -> &'static str {
     match sort {
         Some("highest") => "r.rating::int",
         Some("lowest") => "-r.rating::int",
-        Some("recent") => "0",
+        // An expression, not a bare number: ORDER BY 0 would mean a column position.
+        Some("recent") => "0 * r.rating::int",
         _ => "CASE WHEN r.featured THEN 1 ELSE 0 END",
     }
 }

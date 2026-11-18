@@ -145,7 +145,8 @@ fn tools() -> Vec<Value> {
                 "request_days": {"type": "integer", "minimum": 7, "maximum": 365, "description": "How long a review link works (default 60)."},
                 "thank_you_coupon": {"type": ["string", "null"], "description": "A coupon's name: its code is emailed as a thank-you for any review, whatever the rating, and those reviews say so."},
                 "subscribe_form_id": {"type": ["string", "null"], "description": "A sign-up form: reviewers may tick a box to join its list (through the form's own consent rules)."},
-                "widget": {"type": "object", "description": "heading, star_color, text_color, accent_color, per_page."}
+                "widget": {"type": "object", "description": "heading, star_color, text_color, accent_color, per_page."},
+                "purchase_metrics": {"type": "array", "items": {"type": "string"}, "maxItems": 20, "description": "More metrics that mean a real purchase or stay (besides Placed Order, Fulfilled Order, Delivered and integrations' server-only metrics). Only these, recorded by a server, make a flow's ask verified."}
             }), &[]), false, false),
         tool("list_review_products", "List reviewed products", "Products, listings and services with their published star summary and how many reviews wait for moderation.",
             obj(json!({"q": {"type": "string"}, "limit": {"type": "integer", "maximum": 200}, "offset": {"type": "integer"}}), &[]), true, false),

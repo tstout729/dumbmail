@@ -304,6 +304,7 @@ pub async fn update_settings(state: &AppState, ctx: &Ctx, p: store::SettingsPatc
         ("thank_you_coupon", p.thank_you_coupon.is_some()),
         ("subscribe_form_id", p.subscribe_form_id.is_some()),
         ("widget", p.widget.is_some()),
+        ("purchase_metrics", p.purchase_metrics.is_some()),
     ]
     .into_iter()
     .filter_map(|(k, set)| set.then_some(k))

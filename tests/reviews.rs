@@ -64,8 +64,19 @@ async fn live_review_flow(h: &mut Harness) -> String {
 }
 
 async fn submit(h: &Harness, token: &str, body: Value) -> (StatusCode, Value) {
-    let (s, _, b) = h.raw("POST", &format!("/e/review/{token}"), &[("content-type", "application/json"), ("x-real-ip", "203.0.113.9")], &body.to_string()).await;
-    (s, serde_json::from_str(&b).unwrap_or(json!({"_raw": b})))
+    let (s, v, _) = submit_as(h, token, body, None).await;
+    (s, v)
+}
+
+/// Submit with this browser's edit cookie (if any); returns the cookie the answer sets.
+async fn submit_as(h: &Harness, token: &str, body: Value, cookie: Option<&str>) -> (StatusCode, Value, Option<String>) {
+    let mut hd = vec![("content-type", "application/json"), ("x-real-ip", "203.0.113.9")];
+    if let Some(c) = cookie {
+        hd.push(("cookie", c));
+    }
+    let (s, headers, b) = h.raw("POST", &format!("/e/review/{token}"), &hd, &body.to_string()).await;
+    let set = headers.get("set-cookie").and_then(|v| v.to_str().ok()).map(|v| v.split(';').next().unwrap_or("").to_string());
+    (s, serde_json::from_str(&b).unwrap_or(json!({"_raw": b})), set)
 }
 
 async fn widget(h: &Harness, path: &str) -> Value {
@@ -78,9 +89,10 @@ async fn summary_row(h: &Harness, acct: Uuid, key: &str) -> (i32, i64, Vec<i32>)
     sqlx::query_as("SELECT review_count, rating_sum, rating_counts FROM review_subjects WHERE account_id = $1 AND external_id = $2").bind(acct).bind(key).fetch_one(&h.state.db).await.unwrap()
 }
 
-/// A review link for `email` and `product` through the API.
+/// A review link for `email` and `product` through the API: verified with an order reference.
 async fn api_link(h: &mut Harness, email: &str, product: &str, verified: bool) -> String {
-    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": email, "product_id": product, "verified": verified}))).await;
+    let order = verified.then(|| format!("O-{}", Uuid::now_v7().simple()));
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": email, "product_id": product, "order_id": order}))).await;
     let url = v["requests"][0]["url"].as_str().unwrap_or_else(|| panic!("no link: {v}")).to_string();
     url.rsplit('/').next().unwrap().to_string()
 }
@@ -260,38 +272,68 @@ async fn moderation_keeps_summaries_right_and_follows_the_honesty_rules() {
 }
 
 #[tokio::test]
-async fn edits_deletes_and_expired_links() {
+async fn the_link_shows_nothing_about_the_person_and_edits_need_the_writers_browser() {
     let mut h = harness!();
     h.signup().await;
     let acct = account_id(&h).await;
     product(&mut h, "MUG", "Blue mug").await;
     person(&h, acct, "a@x.test", "subscribed").await;
     let t = api_link(&mut h, "a@x.test", "MUG", true).await;
-    submit(&h, &t, json!({"rating": 5, "body": "Great"})).await;
+    // The page names the item only: no name prefilled from the profile, nothing about consent.
+    let (s, hd, page) = h.raw("GET", &format!("/e/review/{t}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(hd.get("cache-control").unwrap(), "no-store");
+    assert_eq!(hd.get("referrer-policy").unwrap(), "no-referrer");
+    assert!(page.contains("Blue mug"));
+    assert!(!page.contains("Jane") && !page.contains("a@x.test"), "nothing about the person");
+    let (s, v, cookie) = submit_as(&h, &t, json!({"rating": 5, "body": "Great secret thoughts"}), None).await;
+    assert!(s.is_success(), "{v}");
+    let cookie = cookie.expect("the writer's browser gets an edit cookie");
     assert_eq!(summary_row(&h, acct, "MUG").await, (1, 5, vec![0, 0, 0, 0, 1]));
-    // An edit within a day re-runs the rules: a 2-star edit goes back to the queue.
-    let (s, v) = submit(&h, &t, json!({"rating": 2, "body": "Broke after a week"})).await;
+    // Someone else holding the link sees that it was reviewed, not what was written.
+    let (_, hd, other) = h.raw("GET", &format!("/e/review/{t}"), &[], "").await;
+    assert!(!other.contains("Great secret thoughts"), "the review's words only to the browser that wrote it");
+    assert_eq!(hd.get("cache-control").unwrap(), "no-store");
+    let (_, _, mine) = h.raw("GET", &format!("/e/review/{t}"), &[("cookie", &cookie)], "").await;
+    assert!(mine.contains("Great secret thoughts"));
+    // ... and can't change it.
+    let (s, _, _) = submit_as(&h, &t, json!({"rating": 1, "body": "hijacked"}), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // The writer can, within a day: a 2-star edit goes back to the queue.
+    let (s, v, _) = submit_as(&h, &t, json!({"rating": 2, "body": "Broke after a week"}), Some(&cookie)).await;
     assert!(s.is_success(), "{v}");
     assert_eq!(summary_row(&h, acct, "MUG").await.0, 0, "the edited review waits for moderation");
     // After a day it can't be changed any more.
     sqlx::query("UPDATE reviews SET created_at = now() - interval '2 days'").execute(&h.state.db).await.unwrap();
-    let (s, _) = submit(&h, &t, json!({"rating": 5})).await;
+    let (s, _, _) = submit_as(&h, &t, json!({"rating": 5}), Some(&cookie)).await;
     assert_eq!(s, StatusCode::CONFLICT);
-    // The author can still delete it: words and photos are erased, the business sees "removed".
-    let (s, _, _) = h.raw("POST", &format!("/e/review/{t}/delete"), &[], "").await;
+    // Deleted by the business: the link is still used up for good.
+    let rid: Uuid = sqlx::query_scalar("SELECT id FROM reviews").fetch_one(&h.state.db).await.unwrap();
+    h.ok("DELETE", &format!("/api/reviews/{rid}?confirm=true"), None).await;
+    let (s, v) = submit(&h, &t, json!({"rating": 5, "body": "again"})).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM reviews").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 0);
+    // The author's own delete erases the words; the link can't write another either.
+    person(&h, acct, "c@x.test", "subscribed").await;
+    let t3 = api_link(&mut h, "c@x.test", "MUG", true).await;
+    submit(&h, &t3, json!({"rating": 4, "body": "Fine"})).await;
+    let (s, hd, _) = h.raw("POST", &format!("/e/review/{t3}/delete"), &[], "").await;
     assert_eq!(s, StatusCode::OK);
+    assert_eq!(hd.get("referrer-policy").unwrap(), "no-referrer");
     let (status, body): (String, String) = sqlx::query_as("SELECT status, body FROM reviews").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((status.as_str(), body.as_str()), ("removed", ""));
+    assert_eq!(submit(&h, &t3, json!({"rating": 5})).await.0, StatusCode::CONFLICT);
     // Expired links take nothing; forged tokens find nothing.
     person(&h, acct, "b@x.test", "subscribed").await;
     let t2 = api_link(&mut h, "b@x.test", "MUG", true).await;
-    sqlx::query("UPDATE review_requests SET expires_at = now() - interval '1 minute' WHERE review_id IS NULL").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE review_requests SET expires_at = now() - interval '1 minute' WHERE review_id IS NULL AND submitted_at IS NULL").execute(&h.state.db).await.unwrap();
     let (s, _) = submit(&h, &t2, json!({"rating": 5})).await;
     assert_eq!(s, StatusCode::CONFLICT);
     let (s, _) = submit(&h, "not-a-token", json!({"rating": 5})).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     // Someone who reviewed it in the last year isn't asked again.
-    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "a@x.test", "product_id": "MUG"}))).await;
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "c@x.test", "product_id": "MUG"}))).await;
     assert_eq!(v["requests"][0]["skipped"], "reviewed");
     h.cleanup().await;
 }
@@ -428,24 +470,29 @@ async fn public_reviews_are_off_by_default_confirmed_by_email_and_always_held() 
     let acct = account_id(&h).await;
     let pk = site_key(&h, acct).await;
     product(&mut h, "MUG", "Blue mug").await;
-    let write = |n: u8| json!({"product_id": "MUG", "email": format!("v{n}@x.test"), "rating": 5, "body": "Ok"}).to_string();
-    let (s, _, _) = post(&h, &pk, write(1), "198.51.100.1").await;
+    let write = |email: &str| json!({"product_id": "MUG", "email": email, "rating": 5, "body": "Ok"}).to_string();
+    let (s, _, _) = post(&h, &pk, write("v1@x.test"), "198.51.100.1").await;
     assert_eq!(s, StatusCode::FORBIDDEN, "off by default");
     h.ok("PATCH", "/api/reviews/settings", Some(json!({"public_reviews": true}))).await;
     let (s, _, b) = post(&h, &pk, json!({"product_id": "NOPE", "email": "v1@x.test", "rating": 5}).to_string(), "198.51.100.1").await;
     assert_eq!(s, StatusCode::NOT_FOUND, "only products the store has: {b}");
-    let (s, _, b) = post(&h, &pk, write(1), "198.51.100.1").await;
-    assert_eq!(s, StatusCode::OK, "{b}");
+    let profiles = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM profiles").fetch_one(&db).await.unwrap() }
+    };
+    let before = profiles(&h).await;
+    let (s, _, first) = post(&h, &pk, write("v1@x.test"), "198.51.100.1").await;
+    assert_eq!(s, StatusCode::OK, "{first}");
+    h.drain().await;
+    assert_eq!(profiles(&h).await, before, "no profile is made before the address is confirmed");
     let mail = mails_to(&h, "v1@x.test");
-    assert_eq!(mail.len(), 1, "a confirmation email");
+    assert_eq!(mail.len(), 1, "a confirmation email, from a job");
     let link = find_link(&mail[0].html, "https://pl.test/e/review-confirm/").trim_start_matches("https://pl.test").to_string();
-    let (n, attached): (i64, Option<Uuid>) = sqlx::query_as("SELECT count(*), max(profile_id::text)::uuid FROM reviews").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!((n, attached), (1, None), "not attached to anyone until confirmed");
     assert_eq!(h.ok("GET", "/api/reviews?unconfirmed=true", None).await["total"], 1);
-    let (s, _, page) = h.raw("GET", &link, &[], "").await;
+    let (s, hd, page) = h.raw("GET", &link, &[], "").await;
     assert_eq!(s, StatusCode::OK);
+    assert_eq!(hd.get("cache-control").unwrap(), "no-store");
     assert!(page.contains("<form method=\"post\""), "opening the link confirms nothing");
-    assert!(sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>("SELECT confirmed_at FROM reviews").fetch_one(&h.state.db).await.unwrap().is_none());
     let (s, _, _) = h.raw("POST", &link, &[], "").await;
     assert_eq!(s, StatusCode::OK);
     h.drain().await;
@@ -455,20 +502,68 @@ async fn public_reviews_are_off_by_default_confirmed_by_email_and_always_held() 
     assert_eq!(summary_row(&h, acct, "MUG").await.0, 0, "unverified reviews are always held");
     let consent: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE email = 'v1@x.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(consent, "never_subscribed", "a review never subscribes anyone");
-    // Limits: 5 an hour from one visitor.
+    // Limit: 5 an hour from one visitor.
     for n in 2..=5 {
-        let (s, _, b) = post(&h, &pk, write(n), "198.51.100.1").await;
+        let (s, _, b) = post(&h, &pk, write(&format!("v{n}@x.test")), "198.51.100.1").await;
         assert_eq!(s, StatusCode::OK, "{n}: {b}");
     }
-    let (s, _, _) = post(&h, &pk, write(6), "198.51.100.1").await;
+    let (s, _, _) = post(&h, &pk, write("v6@x.test"), "198.51.100.1").await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-    // ... and 3 a day for one address, from anywhere.
-    for ip in ["198.51.100.2", "198.51.100.3"] {
-        let (s, _, _) = post(&h, &pk, write(1), ip).await;
-        assert_eq!(s, StatusCode::OK);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_public_entry_cant_be_used_to_pester_or_probe() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    h.ok("PATCH", "/api/reviews/settings", Some(json!({"public_reviews": true}))).await;
+    let write = |email: &str| json!({"product_id": "MUG", "email": email, "rating": 4}).to_string();
+    let mut ip = 0u8;
+    let mut next_ip = || {
+        ip += 1;
+        Box::leak(format!("203.0.113.{ip}").into_boxed_str()) as &'static str
+    };
+    // The same answer whatever the address: unknown, a suppressed customer, or with sending paused.
+    sqlx::query("INSERT INTO profiles (id, account_id, email, email_consent, email_suppressed_reason) VALUES ($1, $2, 'gone@x.test', 'subscribed', 'hard_bounce')")
+        .bind(Uuid::now_v7())
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let a = post(&h, &pk, write("new@x.test"), next_ip()).await;
+    let b = post(&h, &pk, write("gone@x.test"), next_ip()).await;
+    sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let c = post(&h, &pk, write("paused@x.test"), next_ip()).await;
+    assert_eq!((a.0, &a.2), (b.0, &b.2));
+    assert_eq!((a.0, &a.2), (c.0, &c.2));
+    h.drain().await;
+    assert!(mails_to(&h, "gone@x.test").is_empty() && mails_to(&h, "paused@x.test").is_empty(), "nothing to a suppressed address or from a paused account");
+    sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    // One review waiting per address (dots and plus tags don't make a new one).
+    let first = post(&h, &pk, write("Jane.Doe+promo@gmail.com"), next_ip()).await;
+    let again = post(&h, &pk, write("janedoe@googlemail.com"), next_ip()).await;
+    assert_eq!((first.0, &first.2), (again.0, &again.2), "the same answer");
+    h.drain().await;
+    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM reviews WHERE email_key = 'janedoe@gmail.com' AND confirmed_at IS NULL").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(waiting, 1);
+    let sent = h.state.email.sent().into_iter().filter(|m| m.to.to_lowercase().contains("doe")).count();
+    assert_eq!(sent, 1, "one confirmation, not one per spelling");
+    // A daily cap per address across accounts: confirming frees the address here, but the 4th
+    // confirmation in a day doesn't go.
+    for _ in 0..4 {
+        let mail: Vec<_> = h.state.email.sent().into_iter().filter(|m| m.to == "repeat@x.test").collect();
+        if let Some(m) = mail.last() {
+            let link = find_link(&m.html, "https://pl.test/e/review-confirm/").trim_start_matches("https://pl.test").to_string();
+            h.raw("POST", &link, &[], "").await;
+        }
+        let (s, _, body) = post(&h, &pk, write("repeat@x.test"), next_ip()).await;
+        assert_eq!((s, body), (a.0, a.2.clone()), "the same answer every time");
+        h.drain().await;
     }
-    let (s, _, _) = post(&h, &pk, write(1), "198.51.100.4").await;
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(mails_to(&h, "repeat@x.test").len(), 3, "at most 3 confirmations a day for one address");
     h.cleanup().await;
 }
 
@@ -550,14 +645,18 @@ async fn import_export_segments_and_profile_deletion() {
     assert!(list["data"].as_array().unwrap().iter().all(|r| r["imported"] == true && r["status"] == "published" && r["product"]["product_id"] == "777"));
     let w = widget(&h, &format!("/client/reviews?k={pk}&product_id=777")).await;
     assert_eq!(w["summary"]["count"], 2);
-    assert_eq!(w["reviews"].as_array().unwrap().iter().filter(|r| r["verified"] == true).count(), 1, "verified as the file says");
-    let ld = widget(&h, &format!("/client/reviews/jsonld?k={pk}&product_id=777")).await;
-    assert_eq!(ld["@type"], "Product");
-    assert_eq!(ld["aggregateRating"]["reviewCount"], 2);
+    // Imported reviews never carry the public badge; the dashboard says what the source claimed.
+    assert!(w["reviews"].as_array().unwrap().iter().all(|r| r["verified"] == false), "{w}");
+    assert_eq!(list["data"].as_array().unwrap().iter().filter(|r| r["verified_by_source"] == true).count(), 1, "the source's claim is kept");
+    assert!(list["data"].as_array().unwrap().iter().all(|r| r["verified"] == false));
+    // Reviews gathered elsewhere are never marked up for Google.
+    assert!(w["structured_data"].is_null(), "{w}");
+    let (s, _, _) = h.raw("GET", &format!("/client/reviews/jsonld?k={pk}&product_id=777"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 
     // Export: CSV with formulas made harmless, and emails for people who may read profiles.
     let (s, _, csv_out) = {
-        let b = h.page_headers("GET", axum::http::Request::builder().uri("/api/reviews/export")).await;
+        let b = h.page_headers("GET", axum::http::Request::builder().uri("/api/reviews/export?with_people=true")).await;
         let res = tower::ServiceExt::oneshot(h.router.clone(), b.body(axum::body::Body::empty()).unwrap()).await.unwrap();
         let st = res.status();
         let hd = res.headers().clone();
@@ -590,6 +689,8 @@ async fn the_stay_flow_asks_after_check_out_about_the_listing() {
     person(&h, acct, "guest@x.test", "subscribed").await;
     person(&h, acct, "held@x.test", "never_subscribed").await;
     sqlx::query("UPDATE profiles SET marketing_hold = true WHERE email = 'held@x.test'").execute(&h.state.db).await.unwrap();
+    // Bookings are the account's own stay metric here.
+    h.ok("PATCH", "/api/reviews/settings", Some(json!({"purchase_metrics": ["Reservation Confirmed"]}))).await;
     let f = h.ok("POST", "/api/reviews/flows", Some(json!({"kind": "stay"}))).await;
     assert_eq!(f["trigger"]["type"], "event_date");
     assert_eq!(f["trigger"]["field"], "check_out");
@@ -615,5 +716,553 @@ async fn the_stay_flow_asks_after_check_out_about_the_listing() {
     let pk = site_key(&h, acct).await;
     let (s, _, _) = h.raw("GET", &format!("/client/reviews/jsonld?k={pk}&product_id=L1"), &[], "").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+    h.cleanup().await;
+}
+
+// ---------- Fix round: one test (or more) per review finding ----------
+
+async fn browser_event(h: &Harness, pk: &str, email: &str, metric: &str, props: Value) {
+    let body = json!({"metric": metric, "profile": {"email": email}, "properties": props}).to_string();
+    let (s, _, b) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+}
+
+/// Item 1 and 2: nothing a browser supplied is loaded or linked; a browser order proves nothing, and
+/// a trusted order for the same line replaces its request.
+#[tokio::test]
+async fn browser_details_are_never_loaded_and_a_trusted_order_takes_over_the_line() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    live_review_flow(&mut h).await;
+    browser_event(&h, &pk, "jane@x.test", "Placed Order", json!({"order_id": "77", "items": [{"product_id": "TEE", "name": "Comfy tee", "image_url": "https://evil.test/pixel.gif", "url": "https://evil.test/phish"}]})).await;
+    h.drain().await;
+    h.fast_forward().await;
+    let ask = mails_to(&h, "jane@x.test");
+    assert_eq!(ask.len(), 1);
+    assert!(!ask[0].html.contains("evil.test"), "a browser's image or link never reaches an email");
+    assert!(ask[0].html.contains("Comfy tee"), "its name shows as text, to the person who supplied it");
+    let old = tokens(&ask[0].html)[0].clone();
+    let (_, _, page) = h.raw("GET", &format!("/e/review/{old}"), &[], "").await;
+    assert!(!page.contains("evil.test"));
+    let (verified,): (bool,) = sqlx::query_as("SELECT verified FROM review_requests").fetch_one(&h.state.db).await.unwrap();
+    assert!(!verified, "a browser-recorded order proves no purchase");
+    // A trusted source names the product but sends no image: the name becomes public, the browser's image never does.
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "jane@x.test"}, "properties": {"order_id": "77", "items": [{"product_id": "TEE", "name": "Comfy tee"}]}, "unique_id": "srv-77"}))).await;
+    h.drain().await;
+    h.fast_forward().await;
+    let asks = mails_to(&h, "jane@x.test");
+    let new_links: Vec<String> = asks.iter().flat_map(|m| tokens(&m.html)).filter(|t| *t != old).collect();
+    assert_eq!(new_links.len(), 1, "the verified order asks again: {}", asks.len());
+    let (s, _, _) = h.raw("GET", &format!("/e/review/{old}"), &[], "").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "the old link stops working");
+    let (verified,): (bool,) = sqlx::query_as("SELECT verified FROM review_requests").fetch_one(&h.state.db).await.unwrap();
+    assert!(verified);
+    let (name_t, image_t, url_t, image): (bool, bool, bool, Option<String>) =
+        sqlx::query_as("SELECT name_trusted, image_trusted, url_trusted, image_url FROM review_subjects WHERE external_id = 'TEE'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((name_t, image_t, url_t), (true, false, false), "a trusted upsert only vouches for the fields it supplied");
+    assert_eq!(image.as_deref(), Some("https://evil.test/pixel.gif"), "kept, but never shown");
+    submit(&h, &new_links[0], json!({"rating": 5, "body": "Soft"})).await;
+    let all = widget(&h, &format!("/client/reviews/all?k={pk}")).await;
+    let card = &all["reviews"][0]["product"];
+    assert_eq!(card["name"], "Comfy tee");
+    assert!(card["image_url"].is_null() && card["url"].is_null(), "{card}");
+    assert!(!all.to_string().contains("evil.test"));
+    let ld = widget(&h, &format!("/client/reviews/jsonld?k={pk}&product_id=TEE")).await;
+    assert!(ld.get("image").is_none() && ld.get("url").is_none(), "{ld}");
+    let dash = h.ok("GET", "/api/reviews", None).await;
+    assert!(dash["data"][0]["product"]["image_url"].is_null(), "the dashboard doesn't load it either");
+    h.cleanup().await;
+}
+
+/// Item 2: verified needs a purchase or stay a trusted source recorded for that person and item.
+#[tokio::test]
+async fn verified_needs_a_recorded_purchase() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    person(&h, acct, "a@x.test", "subscribed").await;
+    person(&h, acct, "b@x.test", "subscribed").await;
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "a@x.test", "product_id": "MUG"}))).await;
+    assert_eq!(v["requests"][0]["verified"], false, "no order reference: unverified");
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "b@x.test", "product_id": "MUG", "order_id": "A-1"}))).await;
+    assert_eq!(v["requests"][0]["verified"], true);
+    // A server event of a metric that isn't a purchase proves nothing until the account lists it.
+    let flow = json!({"name": "Visit", "trigger": {"type": "metric", "metric": "Visited Store"}, "definition": {"entry": "a", "nodes": [
+        {"id": "a", "type": "review_request", "channel": "email", "next": null, "content": {"subject": "How was it?", "blocks": [{"type": "review_request"}]}}]}});
+    let f = h.ok("POST", "/api/flows", Some(flow)).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    person(&h, acct, "c@x.test", "subscribed").await;
+    person(&h, acct, "d@x.test", "subscribed").await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Visited Store", "profile": {"email": "c@x.test"}, "properties": {"product_id": "MUG"}}))).await;
+    h.drain().await;
+    h.ok("PATCH", "/api/reviews/settings", Some(json!({"purchase_metrics": ["Visited Store"]}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Visited Store", "profile": {"email": "d@x.test"}, "properties": {"product_id": "MUG"}}))).await;
+    h.drain().await;
+    let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as("SELECT p.email, q.verified, q.verified_ref FROM review_requests q JOIN profiles p ON p.id = q.profile_id WHERE p.email IN ('c@x.test', 'd@x.test') ORDER BY p.email")
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(!rows[0].1 && rows[0].2.is_none(), "not a purchase metric");
+    assert!(rows[1].1 && rows[1].2.as_deref().is_some_and(|r| r.starts_with("event:")), "{rows:?}");
+    h.cleanup().await;
+}
+
+/// Item 3: one ask, one message, even when the step runs again after the send, or a worker stops
+/// between its claim and the hand-off.
+#[tokio::test]
+async fn one_ask_one_message_across_retries_and_crashes() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    person(&h, acct, "sam@x.test", "subscribed").await;
+    live_review_flow(&mut h).await;
+    order(&mut h, "jane@x.test", "1", json!([{"product_id": "MUG", "name": "Mug"}]), "o1").await;
+    h.drain().await;
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
+    // The run is put back on the ask (as if its worker died after the send, before moving on).
+    let run: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active' WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue(&h.state.db, "flow_step", json!({"run_id": run}), None).await.unwrap();
+    h.drain().await;
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1, "the step finds the message it already sent");
+    let flow_msgs: i64 = sqlx::query_scalar("SELECT count(*) FROM messages m JOIN profiles p ON p.id = m.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(flow_msgs, 1);
+    // A worker that stops between claiming the ask and handing it over: sent once, later.
+    dumbmail::features::reviews::hooks::fail("review_send", acct, 0);
+    order(&mut h, "sam@x.test", "2", json!([{"product_id": "MUG", "name": "Mug"}]), "o2").await;
+    h.drain().await;
+    h.fast_forward().await;
+    assert!(mails_to(&h, "sam@x.test").is_empty(), "the worker stopped before the hand-off");
+    let (status, claimed): (String, bool) = sqlx::query_as("SELECT rs.status, rs.claimed_at IS NOT NULL FROM review_sends rs JOIN profiles p ON p.id = rs.profile_id WHERE p.email = 'sam@x.test'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!((status.as_str(), claimed), ("pending", true));
+    h.fast_forward().await;
+    assert!(mails_to(&h, "sam@x.test").is_empty(), "nobody else takes over while the claim is fresh");
+    sqlx::query("UPDATE review_sends SET claimed_at = now() - interval '1 hour'").execute(&h.state.db).await.unwrap();
+    h.fast_forward().await;
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "taken over once the claim lapsed, and sent once");
+    h.cleanup().await;
+}
+
+/// Item 3: a block or tag doesn't use up the order line when its message never went.
+#[tokio::test]
+async fn an_ask_that_never_went_leaves_the_order_line_free() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    // An ordinary flow email with a Review request block, while sending is paused.
+    let flow = json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "a", "nodes": [
+        {"id": "a", "type": "email", "next": null, "content": {"subject": "Thanks", "blocks": [{"type": "review_request"}]}}]}});
+    let f = h.ok("POST", "/api/flows", Some(flow)).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    order(&mut h, "jane@x.test", "55", json!([{"product_id": "MUG", "name": "Mug"}]), "o55").await;
+    h.drain().await;
+    assert!(mails_to(&h, "jane@x.test").is_empty());
+    let sent: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT sent_at FROM review_requests").fetch_one(&h.state.db).await.unwrap();
+    assert!(sent.is_none(), "a request isn't sent until its message is");
+    sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "MUG", "order_id": "55"}))).await;
+    assert!(v["requests"][0]["url"].is_string(), "the order line is free again: {v}");
+    h.cleanup().await;
+}
+
+/// Item 4: an ask needs marketing consent at dispatch, with no exception for service-message flows;
+/// the API's send-now path applies smart sending.
+#[tokio::test]
+async fn asks_are_marketing_strictly() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    h.claim_number().await;
+    // Subscribed to texts but held back from marketing (an integration's guest), in a service-message flow.
+    let held = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, phone_number, sms_consent, marketing_hold) VALUES ($1, $2, 'held@x.test', '+15035550111', 'subscribed', true)")
+        .bind(held)
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let flow = json!({"name": "Service", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "a", "settings": {"service_messages": true}, "nodes": [
+        {"id": "a", "type": "review_request", "channel": "sms", "next": null, "content": {"body": "How was it? {% review_link %}"}}]}});
+    let f = h.ok("POST", "/api/flows", Some(flow)).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    order(&mut h, "held@x.test", "9", json!([{"product_id": "MUG", "name": "Mug"}]), "o9").await;
+    h.drain().await;
+    assert!(h.state.sms.sent().into_iter().all(|m| m.to != "+15035550111"), "no ask to someone held back from marketing");
+    let asked: i64 = sqlx::query_scalar("SELECT count(*) FROM review_requests WHERE profile_id = $1").bind(held).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(asked, 0);
+    // Send now through the API: smart sending applies.
+    person(&h, acct, "recent@x.test", "subscribed").await;
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, sent_at) SELECT $1, $2, id, 'email', email, 'sent', now() FROM profiles WHERE email = 'recent@x.test'")
+        .bind(Uuid::now_v7())
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "recent@x.test", "product_id": "MUG", "order_id": "R1", "send": "email", "confirm": true}))).await;
+    assert_eq!(v["sent"], "smart sending", "{v}");
+    assert!(mails_to(&h, "recent@x.test").is_empty());
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "recent@x.test", "product_id": "MUG", "order_id": "R1", "send": "email", "confirm": true, "smart_sending_hours": 0}))).await;
+    assert_eq!(v["sent"], "sent", "{v}");
+    assert_eq!(mails_to(&h, "recent@x.test").len(), 1);
+    h.cleanup().await;
+}
+
+/// Item 5: a review that arrives after the reminder was claimed (between its checks and the
+/// hand-off) stops it entirely.
+#[tokio::test]
+async fn no_reminder_after_a_review() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    live_review_flow(&mut h).await;
+    order(&mut h, "jane@x.test", "3", json!([{"product_id": "MUG", "name": "Mug"}]), "o3").await;
+    h.drain().await;
+    h.fast_forward().await;
+    let t = tokens(&mails_to(&h, "jane@x.test")[0].html)[0].clone();
+    let pause = dumbmail::features::reviews::hooks::hold("review_send", acct);
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE run_at <> 'infinity'").execute(&h.state.db).await.unwrap();
+    let (_, review) = tokio::join!(h.drain(), async {
+        pause.arrived().await;
+        let out = submit(&h, &t, json!({"rating": 4})).await;
+        pause.release("review_send", acct);
+        out
+    });
+    assert!(review.0.is_success(), "{review:?}");
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1, "no reminder at all, not one without its link");
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM review_sends WHERE kind = 'reminder'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "skipped");
+    let (m_status, err): (String, Option<String>) = sqlx::query_as("SELECT m.status, m.error FROM messages m JOIN review_sends rs ON rs.id = m.id WHERE rs.kind = 'reminder'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((m_status.as_str(), err.as_deref()), ("skipped", Some("already reviewed")));
+    h.cleanup().await;
+}
+
+/// Item 8: a review published while the person is being deleted can't leave the summary wrong.
+#[tokio::test]
+async fn deleting_a_person_keeps_ratings_right() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    let p = person(&h, acct, "a@x.test", "subscribed").await;
+    let first = api_link(&mut h, "a@x.test", "MUG", true).await;
+    submit(&h, &first, json!({"rating": 5})).await;
+    let second = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "a@x.test", "product_id": "CUP", "order_id": "Z"}))).await["requests"][0]["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let pause = dumbmail::features::reviews::hooks::hold("delete_person", acct);
+    let db = h.state.db.clone();
+    let (gone, late) = tokio::join!(dumbmail::features::reviews::store::delete_person(&db, acct, p), async {
+        pause.arrived().await;
+        // A new review lands while the delete holds the profile: it waits, then can't attach.
+        let fut = submit(&h, &second, json!({"rating": 5}));
+        let out = tokio::time::timeout(std::time::Duration::from_millis(400), fut).await;
+        pause.release("delete_person", acct);
+        out
+    });
+    assert!(gone.unwrap().is_some());
+    let late = match late {
+        Ok(r) => r,
+        Err(_) => submit(&h, &second, json!({"rating": 5})).await,
+    };
+    assert!(!late.0.is_success(), "{late:?}");
+    for key in ["MUG", "CUP"] {
+        let published: i64 = sqlx::query_scalar("SELECT count(*) FROM reviews r JOIN review_subjects s ON s.id = r.subject_id WHERE s.external_id = $1 AND r.status = 'published'")
+            .bind(key)
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+        let row: Option<(i32,)> = sqlx::query_as("SELECT review_count FROM review_subjects WHERE external_id = $1").bind(key).fetch_optional(&h.state.db).await.unwrap();
+        assert_eq!(row.map(|r| i64::from(r.0)).unwrap_or(0), published, "{key}");
+    }
+    assert_eq!(summary_row(&h, acct, "MUG").await.0, 0);
+    h.cleanup().await;
+}
+
+/// Item 9: every typed cell is safe to open in a spreadsheet, the reviewer's email included.
+#[tokio::test]
+async fn exports_are_safe_to_open() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    sqlx::query("INSERT INTO profiles (id, account_id, email, email_consent) VALUES ($1, $2, '=cmd@x.test', 'subscribed')").bind(Uuid::now_v7()).bind(acct).execute(&h.state.db).await.unwrap();
+    let t = api_link(&mut h, "=cmd@x.test", "MUG", true).await;
+    submit(&h, &t, json!({"rating": 5, "name": "@SUM(1)", "body": "+1"})).await;
+    let b = h.page_headers("GET", axum::http::Request::builder().uri("/api/reviews/export?with_people=true")).await;
+    let res = tower::ServiceExt::oneshot(h.router.clone(), b.body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    let csv = String::from_utf8(http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(csv.contains("'=cmd@x.test") && csv.contains("'@SUM(1)") && csv.contains("'+1"), "{csv}");
+    assert!(!csv.contains(",=cmd@x.test"));
+    h.cleanup().await;
+}
+
+#[derive(Clone, Default)]
+struct Statements(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statements {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct F<'a>(&'a mut String);
+        impl tracing::field::Visit for F<'_> {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{value:?} "));
+            }
+            fn record_str(&mut self, _: &tracing::field::Field, value: &str) {
+                self.0.push_str(value);
+                self.0.push(' ');
+            }
+        }
+        if event.metadata().target() == "sqlx::query" {
+            let mut s = String::new();
+            event.record(&mut F(&mut s));
+            self.0.lock().unwrap().push(s);
+        }
+    }
+}
+
+/// Item 10: photo caps before decoding, keyset pages, a matching ETag answered without the list
+/// query, and reads throttled per address.
+#[tokio::test]
+async fn public_reads_and_photos_are_bounded() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    for i in 0..7 {
+        let e = format!("p{i}@x.test");
+        person(&h, acct, &e, "subscribed").await;
+        let t = api_link(&mut h, &e, "MUG", true).await;
+        if i == 0 {
+            for _ in 0..5 {
+                assert_eq!(h.bytes("POST", &format!("/e/review/{t}/photos"), "image/png", png(40, 30)).await.0, StatusCode::OK);
+            }
+            let (s, _, b) = h.bytes("POST", &format!("/e/review/{t}/photos"), "image/png", b"not even an image".to_vec()).await;
+            assert_eq!(s, StatusCode::CONFLICT, "the cap is checked before decoding: {}", String::from_utf8_lossy(&b));
+        }
+        submit(&h, &t, json!({"rating": 5 - (i % 2), "body": format!("review {i}")})).await;
+    }
+    // Keyset pages: 5, then the remaining 2, with no repeats.
+    let first = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG")).await;
+    assert_eq!(first["reviews"].as_array().unwrap().len(), 5);
+    let next = first["next"].as_str().unwrap().to_string();
+    let second = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG&after={next}")).await;
+    assert_eq!(second["reviews"].as_array().unwrap().len(), 2);
+    assert!(second["next"].is_null());
+    let ids: std::collections::HashSet<String> = first["reviews"].as_array().unwrap().iter().chain(second["reviews"].as_array().unwrap()).map(|r| r["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids.len(), 7);
+    let lowest = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG&sort=lowest")).await;
+    assert_eq!(lowest["reviews"][0]["rating"], 4);
+    // A matching ETag is answered from the summary's version, without the list query.
+    let (_, hd, _) = h.raw("GET", &format!("/client/reviews?k={pk}&product_id=MUG"), &[], "").await;
+    let tag = hd.get("etag").unwrap().to_str().unwrap().to_string();
+    let seen = Statements::default();
+    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(seen.clone()));
+    let (s, _, _) = h.raw("GET", &format!("/client/reviews?k={pk}&product_id=MUG"), &[("if-none-match", &tag)], "").await;
+    drop(guard);
+    assert_eq!(s, StatusCode::NOT_MODIFIED);
+    let sql = seen.0.lock().unwrap().clone();
+    assert!(!sql.iter().any(|q| q.contains("FROM reviews r")), "no list query for a cached answer: {sql:#?}");
+    assert!(!sql.iter().any(|q| q.contains("count(")), "no row counts: {sql:#?}");
+    // A reply changes what's shown: the ETag changes.
+    let rid = h.ok("GET", "/api/reviews?status=published&limit=1", None).await["data"][0]["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/reviews/{rid}/reply"), Some(json!({"text": "Thanks!"}))).await;
+    let (s, hd, _) = h.raw("GET", &format!("/client/reviews?k={pk}&product_id=MUG"), &[("if-none-match", &tag)], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_ne!(hd.get("etag").unwrap().to_str().unwrap(), tag);
+    // Reads are throttled per visitor address.
+    let mut last = StatusCode::OK;
+    for _ in 0..310 {
+        last = h.raw("GET", &format!("/client/reviews/summary?k={pk}&ids=MUG"), &[("x-real-ip", "198.51.100.77")], "").await.0;
+        if last == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.raw("GET", &format!("/client/reviews/summary?k={pk}&ids=MUG"), &[("x-real-ip", "198.51.100.78")], "").await.0, StatusCode::OK);
+    h.cleanup().await;
+}
+
+/// Item 11: answers and names are scanned too, and moderation is on the record with the ids changed.
+#[tokio::test]
+async fn answers_are_flagged_and_moderation_is_audited_with_its_ids() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    h.ok("PATCH", "/api/reviews/settings", Some(json!({"questions": [{"id": "why", "label": "Why?", "kind": "text"}]}))).await;
+    person(&h, acct, "a@x.test", "subscribed").await;
+    person(&h, acct, "b@x.test", "subscribed").await;
+    let t = api_link(&mut h, "a@x.test", "MUG", true).await;
+    let (_, v) = submit(&h, &t, json!({"rating": 5, "body": "Nice", "answers": {"why": "cheaper at www.spam.test"}})).await;
+    assert_eq!(v["status"], "pending", "a link in an answer holds it: {v}");
+    let t2 = api_link(&mut h, "b@x.test", "MUG", true).await;
+    let (_, v2) = submit(&h, &t2, json!({"rating": 5, "body": "Nice", "name": "call 503 555 0100 now"})).await;
+    assert_eq!(v2["status"], "pending", "so does a phone number in the name");
+    let ids = vec![v["review_id"].clone(), v2["review_id"].clone()];
+    h.ok("POST", "/api/reviews/moderate", Some(json!({"ids": ids, "action": "publish", "confirm": true}))).await;
+    let details: Value = sqlx::query_scalar("SELECT details FROM audit_log WHERE account_id = $1 AND action = 'review.publish'").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    let mut got: Vec<String> = details["changed_ids"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    let mut want: Vec<String> = ids.iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+    h.cleanup().await;
+}
+
+/// Item 12: a link for a named person needs profiles read; exporting reviewers' emails needs an
+/// Admin-or-Owner permission on top of export.
+#[tokio::test]
+async fn who_can_make_links_and_export_people() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    person(&h, acct, "a@x.test", "subscribed").await;
+    let content_only = h.ok("POST", "/api/api-keys", Some(json!({"name": "c", "scopes": ["content"]}))).await["key"].as_str().unwrap().to_string();
+    let exporter = h.ok("POST", "/api/api-keys", Some(json!({"name": "e", "scopes": ["audience", "content:read"]}))).await["key"].as_str().unwrap().to_string();
+    let call = |key: String, method: &'static str, path: &'static str, body: Option<Value>| {
+        let router = h.router.clone();
+        async move {
+            let b = axum::http::Request::builder().method(method).uri(path).header("authorization", format!("Bearer {key}"));
+            let req = match body {
+                Some(v) => b.header("content-type", "application/json").body(axum::body::Body::from(v.to_string())).unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = tower::ServiceExt::oneshot(router, req).await.unwrap();
+            let s = res.status();
+            (s, String::from_utf8(http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes().to_vec()).unwrap())
+        }
+    };
+    let (s, b) = call(content_only.clone(), "POST", "/api/reviews/requests", Some(json!({"email": "a@x.test", "product_id": "MUG"}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    let (s, b) = call(exporter.clone(), "GET", "/api/reviews/export?with_people=true", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    let (s, b) = call(exporter, "GET", "/api/reviews/export", None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(!b.lines().next().unwrap().contains("email"), "no reviewer details without the stronger permission");
+    h.cleanup().await;
+}
+
+/// Item 13: the structured data marks up the reviews the widget shows there, without imported ones,
+/// and its rating counts only reviews collected here.
+#[tokio::test]
+async fn structured_data_matches_the_page() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    for (i, r) in [5, 3].iter().enumerate() {
+        let e = format!("n{i}@x.test");
+        person(&h, acct, &e, "subscribed").await;
+        let t = api_link(&mut h, &e, "MUG", true).await;
+        let (_, v) = submit(&h, &t, json!({"rating": r, "body": "here"})).await;
+        h.ok("POST", "/api/reviews/moderate", Some(json!({"ids": [v["review_id"]], "action": "publish"}))).await;
+    }
+    let csv = "product_id,rating,review_content,reviewer_name\nMUG,1,elsewhere,Old\n";
+    h.ok("POST", "/api/reviews/import", Some(json!({"csv": csv, "confirm": true}))).await;
+    h.drain().await;
+    let w = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG")).await;
+    assert_eq!(w["summary"]["count"], 3, "the widget shows all three");
+    let ld = &w["structured_data"];
+    assert_eq!(ld["aggregateRating"]["reviewCount"], 2, "{ld}");
+    assert_eq!(ld["aggregateRating"]["ratingValue"], 4.0);
+    let shown: Vec<&str> = w["reviews"].as_array().unwrap().iter().map(|r| r["body"].as_str().unwrap()).collect();
+    let marked: Vec<&str> = ld["review"].as_array().unwrap().iter().map(|r| r["reviewBody"].as_str().unwrap()).collect();
+    assert_eq!(marked.len(), 2);
+    assert!(marked.iter().all(|b| shown.contains(b) && *b != "elsewhere"));
+    let same = widget(&h, &format!("/client/reviews/jsonld?k={pk}&product_id=MUG")).await;
+    assert_eq!(&same, ld);
+    let filtered = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG&rating=5")).await;
+    assert!(filtered["structured_data"].is_null(), "only the first page with the default order carries it");
+    h.cleanup().await;
+}
+
+/// Item 14: an import that stops mid-batch finishes each row together with its photos when it runs again.
+#[tokio::test]
+async fn imports_resume_without_losing_photos() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    dumbmail::features::webhooks::net::allow_localhost_for_tests();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let img = png(30, 20);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let img = img.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", img.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&img).await;
+            });
+        }
+    });
+    let csv = format!("product_id,rating,review_content,reviewer_name,photo_urls\nMUG,5,one,A,http://127.0.0.1:{port}/a.png\nMUG,4,two,B,http://127.0.0.1:{port}/b.png\nMUG,3,three,C,http://127.0.0.1:{port}/c.png\n");
+    // The worker stops after the first row is saved.
+    dumbmail::features::reviews::hooks::fail("import_row", acct, 1);
+    h.ok("POST", "/api/reviews/import", Some(json!({"csv": csv, "confirm": true}))).await;
+    h.drain().await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM reviews").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 1, "one row in before the stop");
+    h.fast_forward().await;
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT r.body, (SELECT count(*) FROM review_photos ph WHERE ph.review_id = r.id) FROM reviews r ORDER BY r.import_row").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows, vec![("one".to_string(), 1), ("two".to_string(), 1), ("three".to_string(), 1)], "every row once, each with its photo");
+    let (status, imported): (String, i32) = sqlx::query_as("SELECT status, imported FROM review_imports").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), imported), ("done", 3));
+    h.cleanup().await;
+}
+
+/// Item 15: a text ask without the tag still carries its link.
+#[tokio::test]
+async fn a_text_ask_always_has_its_link() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pid = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, phone_number, sms_consent) VALUES ($1, $2, 't@x.test', '+15035550122', 'subscribed')")
+        .bind(pid)
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "t@x.test", "product_id": "MUG", "order_id": "4"}))).await;
+    let rid = v["requests"][0]["request_id"].as_str().unwrap().to_string();
+    let link = v["requests"][0]["url"].as_str().unwrap().to_string();
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
+    let q = format!("SELECT {} FROM profiles p WHERE p.id = $1", dumbmail::models::PROFILE_COLS);
+    let profile: dumbmail::models::Profile = sqlx::query_as(&q).bind(pid).fetch_one(&h.state.db).await.unwrap();
+    // What the review step hands the sender: a text with no tag, and its requests.
+    let content = json!({"body": "Thanks for your order! Tell us how it went."});
+    let event = json!({"_review_requests": [rid]});
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &content, false, None).await.unwrap();
+    assert_eq!(out["body"], format!("Thanks for your order! Tell us how it went. {link}"));
+    // A text that has the tag gets the link in its place, once.
+    let tagged = json!({"body": "How was it? {% review_link %} Thanks!"});
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &tagged, false, None).await.unwrap();
+    assert_eq!(out["body"], format!("How was it? {link} Thanks!"));
     h.cleanup().await;
 }

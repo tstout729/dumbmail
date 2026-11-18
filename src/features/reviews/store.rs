@@ -41,12 +41,14 @@ pub struct Settings {
     pub thank_you_coupon: Option<String>,
     pub subscribe_form_id: Option<Uuid>,
     pub widget: Value,
+    /// More metrics that mean a real purchase or stay, for verified reviews.
+    pub purchase_metrics: Vec<String>,
 }
 
 pub async fn settings(db: &PgPool, account_id: Uuid) -> AppResult<Settings> {
     sqlx::query("INSERT INTO review_settings (account_id) VALUES ($1) ON CONFLICT DO NOTHING").bind(account_id).execute(db).await?;
     Ok(sqlx::query_as(
-        "SELECT auto_publish, auto_publish_min_rating, flag_words, questions, public_reviews, request_days, thank_you_coupon, subscribe_form_id, widget
+        "SELECT auto_publish, auto_publish_min_rating, flag_words, questions, public_reviews, request_days, thank_you_coupon, subscribe_form_id, widget, purchase_metrics
          FROM review_settings WHERE account_id = $1",
     )
     .bind(account_id)
@@ -73,6 +75,7 @@ pub struct SettingsPatch {
     #[serde(default, deserialize_with = "nullable")]
     pub subscribe_form_id: Option<Option<Uuid>>,
     pub widget: Option<Value>,
+    pub purchase_metrics: Option<Vec<String>>,
 }
 
 /// Questions: at most 3, each `{id, label, kind: "choice"|"text", options}` (2 to 6 options for a choice).
@@ -191,9 +194,21 @@ pub async fn update_settings(db: &PgPool, account_id: Uuid, p: SettingsPatch) ->
         Some(w) => check_widget(w)?,
         None => cur.widget.clone(),
     };
+    let metrics = match p.purchase_metrics {
+        Some(m) => {
+            let mut out: Vec<String> = m.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            out.sort();
+            out.dedup();
+            if out.len() > 20 || out.iter().any(|x| x.chars().count() > 100) {
+                return Err(AppError::bad("list at most 20 purchase metrics of up to 100 characters"));
+            }
+            out
+        }
+        None => cur.purchase_metrics.clone(),
+    };
     sqlx::query(
         "UPDATE review_settings SET auto_publish = $2, auto_publish_min_rating = $3, flag_words = $4, questions = $5, public_reviews = $6,
-            request_days = $7, thank_you_coupon = $8, subscribe_form_id = $9, widget = $10, updated_at = now() WHERE account_id = $1",
+            request_days = $7, thank_you_coupon = $8, subscribe_form_id = $9, widget = $10, purchase_metrics = $11, updated_at = now() WHERE account_id = $1",
     )
     .bind(account_id)
     .bind(p.auto_publish.unwrap_or(cur.auto_publish))
@@ -205,6 +220,7 @@ pub async fn update_settings(db: &PgPool, account_id: Uuid, p: SettingsPatch) ->
     .bind(&coupon)
     .bind(form)
     .bind(&widget)
+    .bind(&metrics)
     .execute(db)
     .await?;
     settings(db, account_id).await
@@ -770,7 +786,7 @@ mod tests {
 
     #[test]
     fn auto_publish_needs_verified_stars_and_no_flags() {
-        let s = Settings { auto_publish: true, auto_publish_min_rating: 4, flag_words: vec![], questions: json!([]), public_reviews: false, request_days: 60, thank_you_coupon: None, subscribe_form_id: None, widget: json!({}) };
+        let s = Settings { auto_publish: true, auto_publish_min_rating: 4, flag_words: vec![], questions: json!([]), public_reviews: false, request_days: 60, thank_you_coupon: None, subscribe_form_id: None, widget: json!({}), purchase_metrics: vec![] };
         assert!(auto_publishes(&s, true, 4, &[]));
         assert!(!auto_publishes(&s, false, 5, &[]));
         assert!(!auto_publishes(&s, true, 3, &[]));
