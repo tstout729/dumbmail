@@ -186,11 +186,11 @@ mod tests {
         assert!(x.contains("<source xml:space=\"preserve\">Hi &amp; &lt;welcome&gt; {{ first_name }}</source>"));
         let mut units = from_xliff(&x).unwrap();
         assert_eq!(units.len(), 2);
-        units[0].2 = "Salut & bienvenue {{ first_name }}".into();
+        units[0].2 = "Salut & <welcome> {{ first_name }}".into();
         units[1].2 = "<p>Achetez « maintenant »</p>".into();
         let r = apply(&mut c, "fr", &units);
         assert_eq!(r["applied"], 2, "{r}");
-        assert_eq!(fields::entry(&c, "subject", "fr").unwrap()["text"], "Salut & bienvenue {{ first_name }}");
+        assert_eq!(fields::entry(&c, "subject", "fr").unwrap()["text"], "Salut & <welcome> {{ first_name }}");
         let csv = to_csv(&c, "fr").unwrap();
         let rows = from_csv(&csv).unwrap();
         assert_eq!(rows[1].2, "<p>Achetez « maintenant »</p>");

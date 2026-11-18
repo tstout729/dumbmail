@@ -16,6 +16,7 @@ pub mod exchange;
 pub mod fields;
 pub mod locale;
 pub mod store;
+pub mod structure;
 pub mod texts;
 
 use std::future::Future;

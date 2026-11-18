@@ -348,7 +348,14 @@ async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
                     .into_iter()
                     .map(|(k, v)| {
                         let s = v.as_str().unwrap();
-                        let t = if s.contains("MANGLE") { "kaputt".to_string() } else { format!("DE:{s}") };
+                        let t = if s.contains("MANGLE") {
+                            "kaputt".to_string()
+                        } else if s.contains("LINKIFY") {
+                            // A model that adds a link of its own.
+                            r#"<a href="https://evil.test">DE</a>"#.to_string()
+                        } else {
+                            format!("DE:{s}")
+                        };
                         (k, json!(t))
                     })
                     .collect();
@@ -702,5 +709,80 @@ async fn a_translation_cant_remove_the_unsubscribe_footer() {
     let own = r#"<html><body><p>Hi</p><a href="{{ unsubscribe_url }}">Leave</a></body></html>"#;
     let out = preview_fr(&mut h, own, r#"<html><body><p>Salut</p><a href="{{ unsubscribe_url }}">Partir</a></body></html>"#).await;
     assert!(out.contains(">Partir</a>") && !out.contains("Vous recevez cet e-mail"), "{out}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn translations_change_only_words_on_every_path() {
+    let (calls, url) = mock_anthropic().await;
+    let Some(mut h) = Harness::with(|c| {
+        c.anthropic_api_key = Some("sk-ant-test".into());
+        c.anthropic_api_url = url.clone();
+    })
+    .await
+    else {
+        return;
+    };
+    h.signup().await;
+    set_languages(&mut h, json!(["de"])).await;
+    let content = json!({"subject": "Hello {{ first_name|default('there') }}", "blocks": [
+        {"type": "text", "html": "<p>Hi <a href=\"https://acme.test/shop\">shop now</a>, {{ first_name }}.</p>"},
+        {"type": "heading", "text": "LINKIFY this"}
+    ]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "S", "content": content}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let bad = [
+        // A new link.
+        ("b0:html", "<p>Hallo <a href=\"https://acme.test/shop\">jetzt kaufen</a>, {{ first_name }}. <a href=\"https://evil.test\">x</a></p>"),
+        // A changed destination.
+        ("b0:html", "<p>Hallo <a href=\"https://evil.test\">jetzt kaufen</a>, {{ first_name }}.</p>"),
+        // A variable moved from the text into the link.
+        ("b0:html", "<p>Hallo <a href=\"https://acme.test/shop?n={{ first_name }}\">jetzt kaufen</a>.</p>"),
+        // Markup in a plain-text field.
+        ("subject", "Hallo <b>{{ first_name|default('there') }}</b>"),
+        // A changed filter argument.
+        ("subject", "Hallo {{ first_name|default('du') }}"),
+    ];
+    for (id, text) in bad {
+        let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": id, "text": text}]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "API {id} {text}: {e}");
+        let (s, _) = h.req("POST", "/api/translations/apply", Some(json!({"content": content, "language": "de", "strings": [{"id": id, "text": text}]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "editor {id} {text}");
+    }
+    // MCP.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await["key"].as_str().unwrap().to_string();
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "set_translations", "arguments": {"target": {"kind": "campaign", "id": cid}, "language": "de", "strings": [{"id": "b0:html", "text": bad[1].1}]}}});
+    let (_, v) = bearer(&h, &key, "POST", "/mcp", Some(call)).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    // Content saved directly, with a translation whose source hash is current.
+    let mut raw = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
+    let src = raw["blocks"][0]["html"].as_str().unwrap().to_string();
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": raw, "language": "de", "strings": [{"id": "b0:html", "text": "<p>Hallo <a href=\"https://acme.test/shop\">jetzt kaufen</a>, {{ first_name }}.</p>"}]}))).await;
+    raw = v["content"].clone();
+    assert_eq!(raw["blocks"][0]["i18n"]["de"]["html"]["source"].as_str().unwrap().len(), 8, "{src}");
+    raw["blocks"][0]["i18n"]["de"]["html"]["text"] = json!(bad[1].1);
+    let (s, e) = h.req("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"content": raw}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    // XLIFF and CSV imports refuse it (and say why).
+    let (_, _, x) = h.raw("GET", &format!("/api/translations/campaigns/{cid}/export?language=de&format=xliff"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
+    let marker = r#"<trans-unit id="b0:html""#;
+    let at = x.find(marker).unwrap();
+    let target_at = at + x[at..].find("<target").unwrap();
+    let end = target_at + x[target_at..].find("</target>").unwrap();
+    let x = format!("{}<target>{}{}", &x[..target_at], bad[0].1.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"), &x[end..]);
+    let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "xliff", "data": x}))).await;
+    assert_eq!(v["import"]["refused"][0]["id"], "b0:html", "{v}");
+    let csv = format!("id,where,source,translation,status\nsubject,Subject,\"Hello {{{{ first_name|default('there') }}}}\",\"{}\",missing\n", bad[3].1);
+    let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "csv", "data": csv}))).await;
+    assert_eq!(v["import"]["refused"][0]["id"], "subject", "{v}");
+    // A machine draft that adds a link is thrown away; the others are kept.
+    h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de"}))).await;
+    h.drain().await;
+    assert_eq!(calls.lock().unwrap().requests.len(), 1);
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    let st = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["status"].clone();
+    assert_eq!(st("b1:text"), "missing", "{v}");
+    assert_eq!(st("subject"), "machine");
+    assert!(!v.to_string().contains("evil.test"));
     h.cleanup().await;
 }

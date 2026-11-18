@@ -19,8 +19,6 @@
 
 use std::collections::BTreeSet;
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use super::locale;
@@ -403,24 +401,9 @@ pub fn remove_language(content: &mut Value, lang: &str) {
 
 // ---------- Template tags ----------
 
-static TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}").unwrap());
-
-/// The template tags in a text, whitespace-normalized and sorted (a multiset).
-pub fn tags(text: &str) -> Vec<String> {
-    // `{{first_name}}` and `{{ first_name }}` are the same tag.
-    let mut v: Vec<String> = TAG
-        .find_iter(text)
-        .map(|m| {
-            let t = m.as_str();
-            format!("{} {} {}", &t[..2], t[2..t.len() - 2].split_whitespace().collect::<Vec<_>>().join(" "), &t[t.len() - 2..])
-        })
-        .collect();
-    v.sort();
-    v
-}
-
-/// Why a translation can't be used for a field with this default text, if it can't: its template
-/// tags must be exactly the default's, and it must parse as a template.
+/// Why a translation can't be used for a field with this default text, if it can't: it may change
+/// only words (template tags and markup as in the default, see `structure`), and it must parse as a
+/// template.
 pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
     if text.len() > MAX_TEXT {
         return Err(format!("a translation can be at most {MAX_TEXT} characters"));
@@ -428,9 +411,8 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
     if text.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
         return Err("a translation can't contain control characters".into());
     }
-    if tags(text) != tags(source) {
-        return Err("it must keep exactly the template tags of the original (like {{ first_name }}), no more and no fewer".into());
-    }
+    // Only words change: the same template tags in the same places, the same markup (see `structure`).
+    super::structure::compare(source, text)?;
     if text.contains("{{") || text.contains("{%") {
         let (hidden, _) = crate::features::coupons::template::hide_tags(text);
         if let Err(e) = minijinja::Environment::new().template_from_str(&hidden) {
