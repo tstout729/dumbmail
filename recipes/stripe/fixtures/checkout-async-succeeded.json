@@ -11,6 +11,9 @@
       ],
       "email": "jordan@example.com",
       "first_name": "Jordan",
+      "keys": {
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
       "last_name": "Lee Park",
       "phone_number": "+15035550199",
       "properties": {

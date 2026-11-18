@@ -4,6 +4,10 @@
     {
       "email": "jordan@example.com",
       "first_name": "Jordan",
+      "keys": {
+        "stripe_charge": "ch_3QabCdEfGh1234",
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
       "last_name": "Lee Park",
       "properties": {
         "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
@@ -11,7 +15,7 @@
       "type": "upsert_profile"
     },
     {
-      "message": "charge ch_3QabCdEfGh1234 doesn't list its refunds; each refund is recorded from refund.created",
+      "message": "charge ch_3QabCdEfGh1234 doesn't list its refunds; each refund is recorded from refund.created or refund.updated",
       "type": "log"
     }
   ],

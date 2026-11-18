@@ -5,13 +5,13 @@
       "metric": "Refunded Order",
       "profile": {
         "if_missing": "retry",
-        "property": "stripe_customer_id",
-        "value": "cus_Qa1B2c3D4e5F6g"
+        "property": "stripe_payment_intent",
+        "value": "pi_3QabCdEfGh1234"
       },
       "properties": {
         "charge_id": "ch_3QabCdEfGh1234",
         "currency": "usd",
-        "payment_intent": "pi_3Qa1",
+        "payment_intent": "pi_3QabCdEfGh1234",
         "reason": "requested_by_customer",
         "refund_id": "re_1B"
       },
@@ -31,11 +31,10 @@
           "charge": "ch_3QabCdEfGh1234",
           "created": 1763403600,
           "currency": "usd",
-          "customer": "cus_Qa1B2c3D4e5F6g",
           "id": "re_1B",
           "metadata": {},
           "object": "refund",
-          "payment_intent": "pi_3Qa1",
+          "payment_intent": "pi_3QabCdEfGh1234",
           "reason": "requested_by_customer",
           "status": "succeeded"
         }

@@ -4,6 +4,9 @@
     {
       "email": "casey@example.net",
       "first_name": "Casey",
+      "keys": {
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
       "type": "upsert_profile"
     },
     {

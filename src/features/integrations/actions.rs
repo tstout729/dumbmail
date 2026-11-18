@@ -86,7 +86,15 @@ pub struct UpsertProfile {
     /// `false`: never send marketing email to this address.
     #[serde(default)]
     pub marketing: Option<bool>,
+    /// Ids that identify this person in the app and can be many (payment ids, booking ids): each
+    /// value is added to the person's list for that key (the newest 100 are kept), so a later
+    /// action finds them with `profile: {property: <key>, value: <id>}`. Not shown as properties.
+    #[serde(default)]
+    pub keys: Option<Map<String, Value>>,
 }
+
+/// Most values kept per key in an `upsert_profile`'s `keys`.
+pub const MAX_KEY_VALUES: usize = 100;
 
 /// Who an action is about: identifiers (the profile is created if missing) or a lookup by a custom
 /// property (never creates; the action is skipped when nobody matches).
@@ -311,6 +319,17 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 if a.marketing == Some(true) {
                     return Err(format!("action {i} ({k}): marketing only takes false; to subscribe someone, add a consent block"));
                 }
+                if let Some(keys) = &a.keys {
+                    if keys.len() > 20 {
+                        return Err(format!("action {i} ({k}): at most 20 keys"));
+                    }
+                    for (name, v) in keys {
+                        let ok = v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200);
+                        if name.is_empty() || name.len() > 100 || !ok {
+                            return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
+                        }
+                    }
+                }
                 Action::UpsertProfile(a)
             }
             "track_event" => {
@@ -510,11 +529,12 @@ fn input_for(w: &Who) -> ProfileInput {
 /// count (not ordinary properties, which a browser can set too), and two profiles with the same
 /// value match neither.
 async fn find_by_property(state: &AppState, account_id: Uuid, prop: &str, value: &Value) -> AppResult<Lookup> {
-    let mut m = Map::new();
-    m.insert(prop.to_string(), Value::String(key_text(value)));
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND integration_keys <> '{}' AND integration_keys @> $2 LIMIT 2")
+    let one = json!({prop: key_text(value)});
+    let listed = json!({prop: [key_text(value)]});
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND integration_keys <> '{}' AND (integration_keys @> $2 OR integration_keys @> $3) LIMIT 2")
         .bind(account_id)
-        .bind(Value::Object(m))
+        .bind(one)
+        .bind(listed)
         .fetch_all(&state.db)
         .await?;
     Ok(match ids.as_slice() {
@@ -545,6 +565,39 @@ fn trusted_keys(props: &Map<String, Value>) -> Map<String, Value> {
         .map(|(k, v)| (k.clone(), Value::String(key_text(v))))
         .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200))
         .collect()
+}
+
+/// Add an action's `keys` to a profile's integration keys: each key holds a list of values (the
+/// newest [`MAX_KEY_VALUES`]); a plain value already there becomes the list's first.
+fn merge_keys(current: &Map<String, Value>, add: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = current.clone();
+    for (k, v) in add {
+        let Some(v) = v.as_str() else { continue };
+        let mut list: Vec<Value> = match out.get(k) {
+            Some(Value::Array(a)) => a.clone(),
+            Some(Value::String(s)) => vec![json!(s)],
+            _ => Vec::new(),
+        };
+        list.retain(|x| x.as_str() != Some(v));
+        list.push(json!(v));
+        let skip = list.len().saturating_sub(MAX_KEY_VALUES);
+        out.insert(k.clone(), Value::Array(list.into_iter().skip(skip).collect()));
+    }
+    out
+}
+
+/// Add an action's `keys` to an existing profile (under a row lock, so two deliveries can't lose
+/// each other's values).
+async fn add_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<()> {
+    if add.is_empty() {
+        return Ok(());
+    }
+    let mut tx = state.db.begin().await?;
+    let cur: Value = sqlx::query_scalar("SELECT integration_keys FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_one(&mut *tx).await?;
+    let merged = merge_keys(cur.as_object().unwrap_or(&Map::new()), add);
+    sqlx::query("UPDATE profiles SET integration_keys = $3 WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).bind(Value::Object(merged)).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Remember the plain property values an integration wrote, so later lookups by them can trust them.
@@ -610,7 +663,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
         return Ok(Some(Found { id: existing.as_ref().map(|p| p.id).unwrap_or_else(Uuid::nil), created: existing.is_none() }));
     }
     if existing.is_none() {
-        if let Some(p) = create_profile(state, src, &input, &Map::new(), false, None).await? {
+        if let Some(p) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
             out.counts.profiles_created += 1;
             if !src.contacts_opted_in {
                 out.counts.held += 1;
@@ -633,7 +686,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
 /// and (`ledger`) the action's entry in its delivery's ledger. A failure part-way leaves nothing,
 /// so a retry never finds an unheld profile it made. None when someone else created a matching
 /// profile at the same moment (the caller updates that one instead).
-async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
+async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
     let email = input.email.as_deref().and_then(normalize_email);
     let phone = input.phone_number.as_deref().and_then(normalize_phone);
     let suppressed = match &email {
@@ -641,7 +694,7 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
         Some(_) if no_marketing => Some(REASON_NO_MARKETING),
         _ => None,
     };
-    let keys = Value::Object(trusted_keys(props));
+    let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
     let tag = src.tag();
     let mut tx = state.db.begin().await?;
     let q = format!(
@@ -969,7 +1022,8 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     if audience::find_profile(&state.db, src.account_id, &input).await?.is_none() {
         let last = p.consent.is_empty();
         let props = p.properties.clone().unwrap_or_default();
-        if let Some(created) = create_profile(state, src, &input, &props, no_marketing, last.then_some((i, print))).await? {
+        let keys = p.keys.clone().unwrap_or_default();
+        if let Some(created) = create_profile(state, src, &input, &props, &keys, no_marketing, last.then_some((i, print))).await? {
             if last {
                 out.applied.insert(i.to_string(), json!(print));
             }
@@ -998,6 +1052,9 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;
+    }
+    if let Some(keys) = &p.keys {
+        add_keys(state, src.account_id, up.profile.id, keys).await?;
     }
     mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
     let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });

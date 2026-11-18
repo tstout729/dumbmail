@@ -631,17 +631,33 @@ pub async fn date_triggers(state: &AppState) -> anyhow::Result<()> {
     event_date_triggers(state).await
 }
 
-/// How each event is scheduled for an event-date flow: the date in property `field` (a plain
-/// `YYYY-MM-DD` as written, a date-time read in the account's time zone), plus `offset_days`, at
-/// `hour` local time. Rows already due more than a day ago aren't scheduled (old history).
-const EVENT_DATE_INSERT: &str = "INSERT INTO flow_event_date_fires (flow_id, event_id, account_id, due_at)
-     SELECT $1, e.id, e.account_id, d.due FROM events e
-     JOIN metrics m ON m.id = e.metric_id AND m.account_id = e.account_id AND m.name = $3
-     CROSS JOIN LATERAL (SELECT CASE WHEN (e.properties #>> $4) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+/// The moment an event is due for an event-date flow: the date in property `field` ($4: a plain
+/// `YYYY-MM-DD` as written, a date-time read in the account's time zone $5), plus `offset_days`
+/// ($6), at `hour` ($7) local time. `e` is the event.
+const EVENT_DATE_DUE: &str = "CROSS JOIN LATERAL (SELECT CASE WHEN (e.properties #>> $4) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
                                      THEN pl_ts(e.properties #>> $4)::date
                                      ELSE (pl_ts(e.properties #>> $4) AT TIME ZONE $5)::date END AS day) x
-     CROSS JOIN LATERAL (SELECT ((x.day + $6::int) + make_time($7, 0, 0)) AT TIME ZONE $5 AS due) d
-     WHERE e.account_id = $2 AND x.day IS NOT NULL AND d.due > now() - interval '24 hours'";
+     CROSS JOIN LATERAL (SELECT ((x.day + $6::int) + make_time($7, 0, 0)) AT TIME ZONE $5 AS due) d";
+
+/// How each event is scheduled for an event-date flow (see [`EVENT_DATE_DUE`]). A fire first found
+/// more than a day after it was due (old history, or an event recorded late) is recorded as missed,
+/// so the flow's results show it, instead of sending a stale reminder or dropping it silently.
+const EVENT_DATE_INSERT: &str = "INSERT INTO flow_event_date_fires (flow_id, event_id, account_id, due_at, outcome, fired_at)
+     SELECT $1, e.id, e.account_id, d.due,
+            CASE WHEN d.due > now() - interval '24 hours' THEN 'pending' ELSE 'missed' END,
+            CASE WHEN d.due > now() - interval '24 hours' THEN NULL ELSE now() END
+     FROM events e
+     JOIN metrics m ON m.id = e.metric_id AND m.account_id = e.account_id AND m.name = $3
+     {DUE}
+     WHERE e.account_id = $2 AND x.day IS NOT NULL";
+
+fn event_date_insert() -> String {
+    EVENT_DATE_INSERT.replace("{DUE}", EVENT_DATE_DUE)
+}
+
+/// Events one scheduler tick may schedule for event-date flows that went live (or changed trigger)
+/// with history, across all flows. The rest wait for the next tick.
+const EVENT_DATE_SEED_BUDGET: i64 = 20_000;
 
 /// Catch-up window: a fire due within this long ago still starts; older ones are marked missed.
 const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
@@ -663,7 +679,7 @@ pub async fn schedule_event_dates(db: &PgPool, event_id: Uuid) -> anyhow::Result
     let tz = event_date_tz(db, account_id).await?;
     for f in flows {
         let Ok(Trigger::EventDate { field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
-        let q = format!("{EVENT_DATE_INSERT} AND e.id = $8 ON CONFLICT DO NOTHING");
+        let q = format!("{} AND e.id = $8 ON CONFLICT DO NOTHING", event_date_insert());
         sqlx::query(&q)
             .bind(f.id)
             .bind(account_id)
@@ -679,12 +695,59 @@ pub async fn schedule_event_dates(db: &PgPool, event_id: Uuid) -> anyhow::Result
     Ok(())
 }
 
-/// Scheduler: for live event-date flows, schedule the events that existed before the flow (or its
-/// current trigger), a batch at a time; then start every fire that is due, each claimed and started
-/// in one transaction; fires due more than a day ago are marked missed instead of sending late.
+/// The account's time zone changed: due times computed in the old one move to the new one (a
+/// date-only check-in is "2 days before, at 10:00" wherever the account now is).
+pub async fn reschedule_event_dates(db: &PgPool, account_id: Uuid) -> anyhow::Result<()> {
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 AND trigger->>'type' = 'event_date'").bind(account_id).fetch_all(db).await?;
+    if flows.is_empty() {
+        return Ok(());
+    }
+    let tz = event_date_tz(db, account_id).await?;
+    for f in flows {
+        let Ok(Trigger::EventDate { field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
+        let q = format!(
+            "UPDATE flow_event_date_fires f SET due_at = d.due FROM events e {EVENT_DATE_DUE}
+             WHERE f.flow_id = $1 AND f.account_id = $2 AND f.outcome = 'pending' AND e.id = f.event_id AND e.account_id = $2
+               AND e.metric_id = (SELECT id FROM metrics WHERE account_id = $2 AND name = $3) AND x.day IS NOT NULL"
+        );
+        sqlx::query(&q)
+            .bind(f.id)
+            .bind(account_id)
+            .bind(&f.trigger["metric"].as_str().unwrap_or(""))
+            .bind(json_path(&field))
+            .bind(&tz)
+            .bind(offset_days as i32)
+            .bind(hour.unwrap_or(9) as i32)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Scheduler: start every fire that is due first (each claimed and started in one transaction;
+/// fires more than a day late are marked missed instead of sending late), then, within one work
+/// budget for the tick across all flows, schedule the events that existed before a live flow (or
+/// its current trigger), a batch at a time.
 async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
-    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date'").fetch_all(&state.db).await?;
+    // Too late to be useful: say so in the flow report rather than send a stale reminder.
+    sqlx::query(
+        "UPDATE flow_event_date_fires x SET outcome = CASE WHEN fl.status = 'live' THEN 'missed' ELSE 'not_live' END, fired_at = now()
+         FROM flows fl WHERE fl.id = x.flow_id AND x.outcome = 'pending' AND x.due_at <= now() - make_interval(hours => $1)",
+    )
+    .bind(EVENT_DATE_CATCH_UP_HOURS as i32)
+    .execute(&state.db)
+    .await?;
+    for _ in 0..2000 {
+        if !fire_one_event_date(state).await? {
+            break;
+        }
+    }
+    let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
+    let mut budget = EVENT_DATE_SEED_BUDGET;
     for f in &flows {
+        if budget <= 0 {
+            break;
+        }
         let Ok(Trigger::EventDate { metric, field, offset_days, hour, .. }) = parse_trigger(&f.trigger) else { continue };
         let seed: Option<(Value, Option<Uuid>, bool)> = sqlx::query_as("SELECT trigger, last_event_id, done FROM flow_event_date_seeds WHERE flow_id = $1").bind(f.id).fetch_optional(&state.db).await?;
         let (mut last, done) = match seed {
@@ -709,18 +772,21 @@ async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         let tz = event_date_tz(&state.db, f.account_id).await?;
-        for _ in 0..10 {
+        while budget > 0 {
+            let size = budget.min(5000);
             let batch: Vec<Uuid> = sqlx::query_scalar(
                 "SELECT e.id FROM events e JOIN metrics m ON m.id = e.metric_id AND m.account_id = e.account_id
-                 WHERE e.account_id = $1 AND m.name = $2 AND ($3::uuid IS NULL OR e.id > $3) ORDER BY e.id LIMIT 5000",
+                 WHERE e.account_id = $1 AND m.name = $2 AND ($3::uuid IS NULL OR e.id > $3) ORDER BY e.id LIMIT $4",
             )
             .bind(f.account_id)
             .bind(&metric)
             .bind(last)
+            .bind(size)
             .fetch_all(&state.db)
             .await?;
+            budget -= batch.len().max(1) as i64;
             if let Some(max) = batch.last() {
-                let q = format!("{EVENT_DATE_INSERT} AND e.id = ANY($8) ON CONFLICT DO NOTHING");
+                let q = format!("{} AND e.id = ANY($8) ON CONFLICT DO NOTHING", event_date_insert());
                 sqlx::query(&q)
                     .bind(f.id)
                     .bind(f.account_id)
@@ -734,21 +800,14 @@ async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
                     .await?;
                 last = Some(*max);
             }
-            let finished = batch.len() < 5000;
+            let finished = (batch.len() as i64) < size;
             sqlx::query("UPDATE flow_event_date_seeds SET last_event_id = $2, done = $3 WHERE flow_id = $1").bind(f.id).bind(last).bind(finished).execute(&state.db).await?;
             if finished {
                 break;
             }
         }
     }
-    // Too late to be useful: say so in the flow report rather than send a stale reminder.
-    sqlx::query(
-        "UPDATE flow_event_date_fires x SET outcome = CASE WHEN fl.status = 'live' THEN 'missed' ELSE 'not_live' END, fired_at = now()
-         FROM flows fl WHERE fl.id = x.flow_id AND x.outcome = 'pending' AND x.due_at <= now() - make_interval(hours => $1)",
-    )
-    .bind(EVENT_DATE_CATCH_UP_HOURS as i32)
-    .execute(&state.db)
-    .await?;
+    // Fires the seeding just found due start now (fires due later wait for their tick).
     for _ in 0..2000 {
         if !fire_one_event_date(state).await? {
             break;

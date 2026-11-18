@@ -4,6 +4,10 @@
     {
       "email": "jordan@example.com",
       "first_name": "Jordan",
+      "keys": {
+        "stripe_charge": "ch_3QabCdEfGh1234",
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
       "last_name": "Lee Park",
       "properties": {
         "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
@@ -18,7 +22,7 @@
       "properties": {
         "charge_id": "ch_3QabCdEfGh1234",
         "currency": "usd",
-        "payment_intent": "pi_3Qa1",
+        "payment_intent": "pi_3QabCdEfGh1234",
         "reason": "requested_by_customer",
         "refund_id": "re_1A"
       },
@@ -35,7 +39,7 @@
       "properties": {
         "charge_id": "ch_3QabCdEfGh1234",
         "currency": "usd",
-        "payment_intent": "pi_3Qa1",
+        "payment_intent": "pi_3QabCdEfGh1234",
         "reason": "requested_by_customer",
         "refund_id": "re_1B"
       },
@@ -78,7 +82,7 @@
                 "id": "re_1A",
                 "metadata": {},
                 "object": "refund",
-                "payment_intent": "pi_3Qa1",
+                "payment_intent": "pi_3QabCdEfGh1234",
                 "reason": "requested_by_customer",
                 "status": "succeeded"
               },
@@ -91,7 +95,7 @@
                 "id": "re_1B",
                 "metadata": {},
                 "object": "refund",
-                "payment_intent": "pi_3Qa1",
+                "payment_intent": "pi_3QabCdEfGh1234",
                 "reason": "requested_by_customer",
                 "status": "succeeded"
               }

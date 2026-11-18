@@ -1508,13 +1508,41 @@ async fn stripe_orders_refunds_and_late_customers() {
     sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'integrations_delivery'").execute(&h.state.db).await.unwrap();
     h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Subscription Cancelled'").await, 1);
-    // Two partial refunds record their own amounts, once each, however they arrive.
-    sqlx::query("UPDATE profiles SET integration_keys = integration_keys || '{\"stripe_customer_id\": \"cus_Qa1B2c3D4e5F6g\"}' WHERE email = 'jordan@example.com'").execute(&h.state.db).await.unwrap();
+    // Two partial refunds record their own amounts, once each, however they arrive. A Refund names
+    // no customer: it finds the buyer through the PaymentIntent the checkout saved.
+    let refunds = "SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE m.name = 'Refunded Order' AND p.email = 'jordan@example.com' ORDER BY e.value";
     for name in ["refund-created-10.json", "refund-created-20.json", "charge-refunded-with-list.json", "charge-partially-refunded.json"] {
         let (s, r) = stripe_post(&mut h, &path, name).await;
         assert_eq!(s, StatusCode::OK, "{name}: {r}");
     }
-    let values: Vec<f64> = sqlx::query_scalar("SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Refunded Order' ORDER BY e.value").fetch_all(&h.state.db).await.unwrap();
+    let values: Vec<f64> = sqlx::query_scalar(refunds).fetch_all(&h.state.db).await.unwrap();
     assert_eq!(values, vec![10.0, 20.0]);
+    // A pending refund isn't counted; refund.updated counts it when it succeeds, once.
+    stripe_post(&mut h, &path, "refund-created-pending.json").await;
+    assert_eq!(sqlx::query_scalar::<_, f64>(refunds).fetch_all(&h.state.db).await.unwrap().len(), 2, "pending: not yet");
+    stripe_post(&mut h, &path, "refund-updated-succeeded.json").await;
+    let mut again = fixture("stripe", "refund-updated-succeeded.json");
+    again["id"] = json!("evt_re_2P_u_again");
+    let body = again.to_string();
+    let t = chrono::Utc::now().timestamp();
+    let sig = format!("t={t},v1={}", hmac_hex("whsec_stripe_recipe_test", &format!("{t}.{body}")));
+    h.raw("POST", &path, &[("content-type", "application/json"), ("stripe-signature", &sig)], &body).await;
+    h.drain().await;
+    // A refund naming only its charge finds the buyer through the charge id charge.refunded saved.
+    stripe_post(&mut h, &path, "refund-updated-charge-only.json").await;
+    let values: Vec<f64> = sqlx::query_scalar(refunds).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(values, vec![10.0, 10.0, 10.0, 20.0], "re_1A, re_2P (once, though updated twice), re_3C, re_1B");
+    // A checkout that needed no payment isn't an order.
+    let before = count(&h, orders).await;
+    stripe_post(&mut h, &path, "checkout-no-payment-required.json").await;
+    assert_eq!(count(&h, orders).await, before);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'casey@example.net'").await, 1);
+    // An incomplete subscription hasn't started; it starts when it becomes active, once.
+    let started = "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Subscription Started' AND e.properties->>'subscription_id' = 'sub_incomplete1'";
+    stripe_post(&mut h, &path, "subscription-created-incomplete.json").await;
+    assert_eq!(count(&h, started).await, 0);
+    stripe_post(&mut h, &path, "subscription-updated-activated.json").await;
+    stripe_post(&mut h, &path, "subscription-updated-still-active.json").await;
+    assert_eq!(count(&h, started).await, 1);
     h.cleanup().await;
 }
