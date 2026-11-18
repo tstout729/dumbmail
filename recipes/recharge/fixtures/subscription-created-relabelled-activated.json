@@ -24,6 +24,16 @@
       "time": "2021-02-25T21:27:19+00:00",
       "type": "track_event",
       "unique_id": "recharge:subscription:89559201:started"
+    },
+    {
+      "message": "no cancellation of subscription 89559201 has been seen before this, so it's recorded as started, not reactivated",
+      "type": "log"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "a:89559201": "2021-02-25T21:27:30+00:00"
+      }
     }
   ],
   "input": {

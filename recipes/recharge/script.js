@@ -67,29 +67,61 @@ function customerUpsert(c) {
 // relabelled with another topic records only what that body itself shows.
 var SKIP_HINT = "a skip is recorded from its charge (charge/updated with status skipped)";
 
-function subscriptionEvents(topic, s) {
+// What signed bodies have shown about each subscription, kept in the integration's state: the
+// newest cancellation (x:<id>) and the newest time it was seen active (a:<id>). A reactivation is
+// recorded only when they show one: active at a time after a cancellation, whichever arrives first.
+var KEEP = 300;
+
+function remember(state, key, when) {
+  var values = {};
+  var old = state[key];
+  if (old && Date.parse(old) >= Date.parse(when)) return values;
+  values[key] = when;
+  var kind = key.slice(0, 2);
+  var keys = Object.keys(state).filter(function (k) { return k.slice(0, 2) === kind && k !== key; });
+  if (keys.length >= KEEP) {
+    keys.sort(function (a, b) { return Date.parse(state[a]) - Date.parse(state[b]); });
+    for (var i = 0; i <= keys.length - KEEP; i++) values[keys[i]] = null;
+  }
+  return values;
+}
+
+function subscriptionEvents(topic, s, state) {
   var who = byCustomer(s.customer_id);
   var status = String(s.status || "").toLowerCase();
   var base = "recharge:subscription:" + s.id + ":";
+  var reactivated = function (when) {
+    var props = subProps(s);
+    props.status = "active";
+    delete props.cancellation_reason;
+    return { type: "track_event", metric: "Subscription Reactivated", profile: who, time: when, unique_id: base + "activated:" + when, properties: props };
+  };
   if (status === "cancelled") {
     var when = s.cancelled_at || s.updated_at;
-    if (!when) return [{ type: "log", message: "subscription " + s.id + " has no time from Recharge, so it can't be put in order" }];
-    return [{ type: "track_event", metric: "Subscription Cancelled", profile: who, time: when, unique_id: base + "cancelled:" + when, properties: subProps(s) }];
+    if (!when || isNaN(Date.parse(when))) return [{ type: "log", message: "subscription " + s.id + " has no time from Recharge, so it can't be put in order" }];
+    var out = [{ type: "track_event", metric: "Subscription Cancelled", profile: who, time: when, unique_id: base + "cancelled:" + when, properties: subProps(s) }];
+    // Seen active after this cancellation already (the bodies arrived out of order): that was a reactivation.
+    var active = state["a:" + s.id];
+    if (active && Date.parse(active) > Date.parse(when)) out.push(reactivated(active));
+    out.push({ type: "set_state", values: remember(state, "x:" + s.id, when) });
+    return out;
   }
   if (status !== "active") return [{ type: "log", message: "subscription " + s.id + " is " + status + "; not recorded" }];
   if (!s.created_at) return [{ type: "log", message: "subscription " + s.id + " has no creation time" }];
   var out = [{ type: "track_event", metric: "Subscription Started", profile: who, time: s.created_at, unique_id: base + "started", properties: subProps(s) }];
-  // A reactivation: the topic says so, and the body shows an active subscription changed well after
-  // it was created (a new subscription's body can't be passed off as one).
-  var changedLater = s.updated_at && Date.parse(s.updated_at) - Date.parse(s.created_at) > 60000;
-  if (topic === "subscription/activated" && changedLater && !s.cancelled_at) {
-    out.push({ type: "track_event", metric: "Subscription Reactivated", profile: who, time: s.updated_at, unique_id: base + "activated:" + s.updated_at, properties: subProps(s) });
+  var seen = s.updated_at && !isNaN(Date.parse(s.updated_at)) ? s.updated_at : null;
+  if (seen && !s.cancelled_at) {
+    var cancelled = state["x:" + s.id];
+    // A cancellation from before this body's creation time isn't this subscription's to undo.
+    if (cancelled && Date.parse(seen) > Date.parse(cancelled) && Date.parse(cancelled) > Date.parse(s.created_at)) out.push(reactivated(seen));
+    else if (topic === "subscription/activated") out.push({ type: "log", message: "no cancellation of subscription " + s.id + " has been seen before this, so it's recorded as started, not reactivated" });
+    out.push({ type: "set_state", values: remember(state, "a:" + s.id, seen) });
   }
   if (topic === "subscription/skipped") out.push({ type: "log", message: SKIP_HINT });
   return out;
 }
 
-function chargeEvents(topic, ch) {
+function chargeEvents(topic, ch, now) {
   var status = String(ch.status || "").toLowerCase();
   var out = [];
   if (ch.customer.email) out.push(customerUpsert(ch.customer));
@@ -105,7 +137,13 @@ function chargeEvents(topic, ch) {
   } else if (status === "skipped") {
     out.push({ type: "track_event", metric: "Charge Skipped", profile: who, time: ch.updated_at, unique_id: base + "skipped", properties: chargeProps(ch) });
   } else if (status === "queued" && topic === "charge/upcoming") {
-    out.push({ type: "track_event", metric: "Upcoming Charge", profile: who, time: ch.updated_at, unique_id: base + "upcoming:" + ch.scheduled_at, properties: chargeProps(ch) });
+    // Only a charge the body shows still scheduled (today or later) is coming up.
+    var day = String(ch.scheduled_at || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < String(now || "").slice(0, 10)) {
+      out.push({ type: "log", message: "charge " + ch.id + " isn't scheduled for today or later (" + (day || "no date") + "); not an upcoming charge" });
+    } else {
+      out.push({ type: "track_event", metric: "Upcoming Charge", profile: who, time: ch.updated_at, unique_id: base + "upcoming:" + day, properties: chargeProps(ch) });
+    }
   } else {
     out.push({ type: "log", message: "charge " + ch.id + " is " + status + "; not recorded for " + topic });
   }
@@ -124,12 +162,12 @@ function handle(input) {
   if (topic.indexOf("subscription/") === 0) {
     var s = p.subscription;
     if (!s || !s.customer_id) return [{ type: "log", message: topic + " without a subscription or customer" }];
-    return subscriptionEvents(topic, s);
+    return subscriptionEvents(topic, s, input.state || {});
   }
   if (topic.indexOf("charge/") === 0) {
     var ch = p.charge;
     if (!ch || !ch.customer) return [{ type: "log", message: topic + " without a charge or customer" }];
-    return chargeEvents(topic, ch);
+    return chargeEvents(topic, ch, input.now);
   }
   return [{ type: "log", message: "ignored Recharge topic " + topic }];
 }

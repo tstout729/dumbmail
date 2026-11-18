@@ -483,8 +483,22 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
     assert_eq!(events(&h, "Subscription Cancelled").await, 1);
     assert_eq!(events(&h, "Subscription Reactivated").await, 1);
     assert_eq!(events(&h, "Charge Paid").await, 0);
+    // An upcoming notice counts only for a charge its body shows still scheduled.
+    let upcoming = |id: u64| {
+        let mut c = fixture("recharge", "charge-upcoming.json")["input"]["payload"].clone();
+        c["charge"]["id"] = json!(id);
+        c["charge"]["scheduled_at"] = json!((chrono::Utc::now() + chrono::Duration::days(5)).format("%Y-%m-%d").to_string());
+        c.to_string()
+    };
+    r.post(&h, "charge-upcoming-date-passed.json").await;
+    assert_eq!(events(&h, "Upcoming Charge").await, 0, "its scheduled date has passed");
     // The charge is paid before its (late) upcoming notice: the reminder stands down.
-    for name in ["subscription-skipped.json", "charge-paid.json", "charge-upcoming.json", "charge-paid.json", "charge-failed.json", "no-topic.json"] {
+    for name in ["subscription-skipped.json", "charge-paid.json"] {
+        r.post(&h, name).await;
+    }
+    r.post_as(&h, &upcoming(100714428), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
+    assert_eq!(events(&h, "Upcoming Charge").await, 1);
+    for name in ["charge-paid.json", "charge-failed.json", "no-topic.json"] {
         r.post(&h, name).await;
     }
     assert_eq!(values(&h, "Charge Paid", "jamie.example@example.com").await, vec![13.14]);
@@ -492,16 +506,12 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
     assert_eq!(events(&h, "Charge Failed").await, 1);
     assert!(sent_to(&h, "Your next order is coming up").is_empty(), "the charge it announces was already paid");
     // A charge that's still coming up gets its reminder; once skipped, a late notice doesn't.
-    let mut next = fixture("recharge", "charge-upcoming.json")["input"]["payload"].clone();
-    next["charge"]["id"] = json!(100714429);
-    r.post_as(&h, &next.to_string(), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
+    r.post_as(&h, &upcoming(100714429), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
     r.post(&h, "charge-updated-skipped.json").await;
     assert_eq!(events(&h, "Charge Skipped").await, 1);
     // A charge that went through for nothing still stops its (late) reminder, with no revenue.
     r.post(&h, "charge-paid-free.json").await;
-    let mut free_upcoming = fixture("recharge", "charge-upcoming.json")["input"]["payload"].clone();
-    free_upcoming["charge"]["id"] = json!(100714430);
-    r.post_as(&h, &free_upcoming.to_string(), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
+    r.post_as(&h, &upcoming(100714430), &json!({}), &json!({"topic": "charge/upcoming"}), &r.secret).await;
     assert_eq!(values(&h, "Charge Paid", "jamie.example@example.com").await, vec![13.14], "no revenue from the free charge");
     // Held back from marketing, but the upcoming-charge reminder (a service message) reached them.
     assert_eq!(consent(&h, "jamie.example@example.com").await, (true, "never_subscribed".into()));

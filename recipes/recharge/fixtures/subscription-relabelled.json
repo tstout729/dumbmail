@@ -24,6 +24,12 @@
       "time": "2021-02-25T21:27:19+00:00",
       "type": "track_event",
       "unique_id": "recharge:subscription:89559201:started"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "a:89559201": "2020-07-10T10:30:51+00:00"
+      }
     }
   ],
   "input": {

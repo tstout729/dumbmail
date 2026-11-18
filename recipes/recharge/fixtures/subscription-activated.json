@@ -1,5 +1,5 @@
 {
-  "description": "subscription/activated after a cancellation: Subscription Reactivated with Recharge's update time",
+  "description": "an active body after a signed cancellation was seen (kept in state): Subscription Reactivated with Recharge's update time",
   "doc": "https://developer.rechargepayments.com/2021-11/subscriptions (the subscription object example; personal data replaced)",
   "expect": [
     {
@@ -47,6 +47,12 @@
       "time": "2020-07-25T09:00:00+00:00",
       "type": "track_event",
       "unique_id": "recharge:subscription:89559201:activated:2020-07-25T09:00:00+00:00"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "a:89559201": "2020-07-25T09:00:00+00:00"
+      }
     }
   ],
   "input": {
@@ -94,6 +100,9 @@
     },
     "query": {
       "topic": "subscription/activated"
+    },
+    "state": {
+      "x:89559201": "2020-07-20T09:00:00+00:00"
     }
   }
 }

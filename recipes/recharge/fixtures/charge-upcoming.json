@@ -1,5 +1,5 @@
 {
-  "description": "charge/upcoming (a queued charge): Upcoming Charge; the browser IP in client_details is never stored",
+  "description": "charge/upcoming (a queued charge, scheduled after today): Upcoming Charge; the browser IP in client_details is never stored",
   "doc": "https://developer.rechargepayments.com/2021-11/charges (the charge object example; personal data replaced)",
   "expect": [
     {
@@ -37,6 +37,7 @@
     }
   ],
   "input": {
+    "now": "2018-12-05T18:00:00.000Z",
     "payload": {
       "charge": {
         "address_id": 21317826,
