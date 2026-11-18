@@ -1798,7 +1798,7 @@ async fn work_belongs_to_one_install() {
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_installs").await, 1);
 
     // A worker run for this install holds the lease; then the app is reinstalled.
-    let lease = dumbmail::features::shopify::shop::acquire(&h.state, acct).await.unwrap().unwrap();
+    let lease = dumbmail::features::shopify::shop::acquire(&h.state, acct, gen1).await.unwrap().unwrap();
     assert!(dumbmail::features::shopify::shop::still_mine(&h.state.db, &lease).await.unwrap());
     sqlx::query("UPDATE shopify_shops SET lease_until = NULL, lease_token = NULL").execute(&h.state.db).await.unwrap();
     h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
@@ -2509,5 +2509,85 @@ async fn opt_out_survives_a_crash_and_relinks_stick() {
     let (linked, email): (Uuid, String) = sqlx::query_as("SELECT profile_id, email FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(linked, new, "the older snapshot didn't move the link back");
     assert_eq!(email, "ann.new@example.com", "the link's contact moved with it");
+    h.cleanup().await;
+}
+
+/// Item 3: a data request exports only the named customer's orders, a profile another customer of
+/// the store still uses isn't deleted, and an old install's shop redaction leaves the current
+/// install's data.
+#[tokio::test]
+async fn privacy_requests_touch_exactly_the_named_customer() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    // Two customers of the store used the same address: one profile.
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "shared@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    mock.lock().unwrap().customers.insert(2, customer(2, Some("shared@example.com"), "NOT_SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c2", &json!({"id": 2})).await;
+    hook(&h, "orders/create", "o2", &order_body(5002, 2, "shared@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    let shared = profile_id_of(&h, "shared@example.com").await.unwrap();
+    // Customer 1's export has customer 1's order only.
+    hook(&h, "customers/data_request", "d1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1}, "orders_requested": [5001], "data_request": {"id": 1}})).await;
+    h.drain().await;
+    let export: Value = sqlx::query_scalar("SELECT export FROM shopify_data_requests").fetch_one(&h.state.db).await.unwrap();
+    let orders: HashSet<String> = export["events"].as_array().unwrap().iter().filter_map(|e| e["properties"]["order_id"].as_str().map(String::from)).collect();
+    assert_eq!(orders, HashSet::from(["5001".to_string()]), "{export}");
+    // Erasing customer 1 keeps the profile customer 2 still uses (even once 5002 is gone too).
+    hook(&h, "customers/redact", "r2", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 2}, "orders_to_redact": [5002]})).await;
+    h.drain().await;
+    // Customer 2's link was removed; now customer 1 is the only one left. Re-link 2 without events.
+    mock.lock().unwrap().customers.insert(3, customer(3, Some("shared@example.com"), "NOT_SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c3", &json!({"id": 3})).await;
+    h.drain().await;
+    hook(&h, "customers/redact", "r1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1}, "orders_to_redact": [5001]})).await;
+    h.drain().await;
+    assert_eq!(profile_id_of(&h, "shared@example.com").await, Some(shared), "customer 3 of the same store still uses it");
+
+    // An old install's shop redaction after the store connected again: only the old install's data goes.
+    hook(&h, "orders/create", "o4", &order_body(5004, 4, "old@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect(&mut h).await;
+    hook(&h, "orders/create", "o5", &order_body(5005, 5, "new@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    hook(&h, "shop/redact", "s1", &json!({"shop_id": 1, "shop_domain": SHOP})).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5004").await.is_none(), "the old install's order is erased");
+    assert!(event(&h, "Placed Order", "order:5005").await.is_some(), "the current install's order stays");
+    // And the current install keeps working.
+    hook(&h, "orders/create", "o6", &order_body(5006, 6, "newer@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5006").await.is_some());
+    h.cleanup().await;
+}
+
+/// Item 3: the erasure marker and an import's write can't interleave: a privacy request waits for
+/// a write already inside its fence, then erases what it wrote.
+#[tokio::test]
+async fn erasure_waits_for_a_write_in_flight() {
+    let (_mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    let generation: i32 = sqlx::query_scalar("SELECT generation FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    // An importer is between its erasure check and its write for customer 7.
+    let fence = dumbmail::features::shopify::fence::open(&h.state.db, acct, SHOP, generation, Some(7), None).await.unwrap().expect("not erased yet");
+    // The privacy request arrives now.
+    hook(&h, "customers/redact", "r7", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 7}, "orders_to_redact": []})).await;
+    let state = h.state.clone();
+    let privacy = tokio::spawn(async move { dumbmail::features::shopify::privacy::run(&state, acct).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!privacy.is_finished(), "the request waits for the write in flight");
+    // The importer writes customer 7's link, then leaves its fence.
+    sqlx::query("INSERT INTO shopify_customers (account_id, customer_id, shop_domain, email) VALUES ($1, 7, $2, 'seven@example.com')").bind(acct).bind(SHOP).execute(&h.state.db).await.unwrap();
+    fence.done().await.unwrap();
+    privacy.await.unwrap();
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers WHERE customer_id = 7").await, 0, "erased after the write landed");
+    // A later write for that customer gets no fence.
+    assert!(dumbmail::features::shopify::fence::open(&h.state.db, acct, SHOP, generation, Some(7), None).await.unwrap().is_none());
     h.cleanup().await;
 }

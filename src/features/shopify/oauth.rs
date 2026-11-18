@@ -605,6 +605,9 @@ pub async fn disconnect(state: &AppState, account_id: Uuid) -> AppResult<Value> 
 /// whether anything changed.
 pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generation: Option<i32>) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
+    // Waits for writes in flight inside a fence (`fence::open` holds the row FOR KEY SHARE); later
+    // ones find the install gone.
+    sqlx::query("SELECT 1 FROM shopify_shops WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     let changed: Option<i32> = sqlx::query_scalar(
         "UPDATE shopify_shops SET status = $2, access_token_enc = NULL, refresh_token_enc = NULL, token_expires_at = NULL, refresh_expires_at = NULL,
             webhook_ids = '{}', web_pixel_id = NULL, disconnected_at = now(), work_queued_at = NULL, lease_until = NULL, lease_token = NULL, updated_at = now()

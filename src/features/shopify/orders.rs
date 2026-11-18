@@ -36,7 +36,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::client::{self, ApiError};
-use super::customers::{dec, erased, gid, num_id, parse_time, profile_for, to_f64};
+use super::customers::{dec, gid, num_id, parse_time, profile_for, to_f64};
 use super::events::{self, Metrics, ServerEvent};
 use super::shop::ShopRow;
 use crate::state::AppState;
@@ -327,6 +327,8 @@ pub struct Ctx<'a> {
     pub state: &'a AppState,
     pub account_id: Uuid,
     pub shop: &'a str,
+    /// The install the work is for: every write goes through a [`super::fence`] for it.
+    pub generation: i32,
     pub metrics: &'a mut Metrics,
     /// History import: record everything quietly.
     pub quiet: bool,
@@ -465,10 +467,14 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     if o.test {
         return Ok(());
     }
-    let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, o.customer_id, Some(o.id)).await? {
-        return Ok(());
-    }
+    // Written inside the fence: not into a newer install, and not after a privacy request erased it.
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, o.customer_id, Some(o.id)).await? else { return Ok(()) };
+    apply_inner(cx, o).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     if let (Some(seen), Some(this)) = (applied_at(cx, o.id).await?, o.updated_at) {
         if this < seen {
             return Ok(());
@@ -491,6 +497,7 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     base.insert("tracked_by".into(), json!("shopify"));
     base.insert("order_id".into(), json!(o.id.to_string()));
     base.insert("shopify_shop".into(), json!(cx.shop));
+    base.insert("shopify_generation".into(), json!(cx.generation));
     let mut put = |k: &str, v: Value| {
         if !v.is_null() {
             base.insert(k.into(), v);
@@ -643,10 +650,14 @@ pub async fn refresh_refunds(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> R
 /// rewrite the order's and its lines' values in the same transaction. A read older than the one
 /// applied changes nothing. Then each refund's Refunded Order event is recorded or corrected.
 pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<DateTime<Utc>>, refunds: &[Refund]) -> anyhow::Result<()> {
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, None, Some(order_id)).await? else { return Ok(()) };
+    set_refunds_inner(cx, order_id, updated_at, refunds).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn set_refunds_inner(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<DateTime<Utc>>, refunds: &[Refund]) -> anyhow::Result<()> {
     let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, None, Some(order_id)).await? {
-        return Ok(());
-    }
     let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
     let line = cx.metrics.id(db, cx.account_id, "Ordered Product").await?;
     let mut tx = db.begin().await?;
@@ -687,7 +698,7 @@ pub async fn set_refunds(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<Dat
 
     let refunded_metric = cx.metrics.id(db, cx.account_id, "Refunded Order").await?;
     let mut base = Map::new();
-    for k in ["tracked_by", "order_name", "order_number", "currency", "shopify_shop", "shopify_customer_id", "$no_contact"] {
+    for k in ["tracked_by", "order_name", "order_number", "currency", "shopify_shop", "shopify_generation", "shopify_customer_id", "$no_contact"] {
         if let Some(v) = props.get(k) {
             base.insert(k.into(), v.clone());
         }
@@ -749,10 +760,15 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     }
     let c = &v["customer"];
     let customer_id = num_id(&c["id"]);
+    let Some(fence) = super::fence::open(&cx.state.db, cx.account_id, cx.shop, cx.generation, customer_id, None).await? else { return Ok(()) };
+    checkout_inner(cx, v, &token, customer_id).await?;
+    fence.done().await?;
+    Ok(())
+}
+
+async fn checkout_inner(cx: &mut Ctx<'_>, v: &Value, token: &str, customer_id: Option<i64>) -> anyhow::Result<()> {
+    let c = &v["customer"];
     let db = &cx.state.db;
-    if erased(db, cx.account_id, cx.shop, customer_id, None).await? {
-        return Ok(());
-    }
     let (email, phone) = (s(&v["email"]), s(&v["phone"]).or_else(|| s(&v["shipping_address"]["phone"])));
     let (c_email, c_phone) = (s(&c["email"]), s(&c["phone"]));
     let own = Contact { email: email.as_deref(), phone: phone.as_deref() };
@@ -791,6 +807,7 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     let mut p = Map::new();
     p.insert("tracked_by".into(), json!("shopify"));
     p.insert("shopify_shop".into(), json!(cx.shop));
+    p.insert("shopify_generation".into(), json!(cx.generation));
     if let Some(cid) = customer_id {
         p.insert("shopify_customer_id".into(), json!(cid.to_string()));
     }

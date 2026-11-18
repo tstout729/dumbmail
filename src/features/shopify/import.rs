@@ -431,13 +431,13 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
             None => 0,
         }
     };
-    let mut cx = orders::Ctx { state, account_id: shop.account_id, shop: &shop.shop_domain, metrics, quiet: true };
+    let mut cx = orders::Ctx { state, account_id: shop.account_id, shop: &shop.shop_domain, generation: shop.generation, metrics, quiet: true };
     match i.phase.as_str() {
         "customers" => {
             let mut n = 0;
             for (_, v, _) in &groups {
                 if let Some(c) = Customer::from_graphql(v) {
-                    customers::apply(&state.db, shop.account_id, &shop.shop_domain, &c).await?;
+                    customers::apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c).await?;
                     n += 1;
                 }
             }

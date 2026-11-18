@@ -162,23 +162,10 @@ async fn by_id(db: &PgPool, account_id: Uuid, id: Uuid) -> sqlx::Result<Option<P
     sqlx::query_as("SELECT id, email, phone_number FROM profiles WHERE account_id = $1 AND id = $2").bind(account_id).bind(id).fetch_optional(db).await
 }
 
-/// Was this customer, order or the whole store erased by a privacy request?
-pub async fn erased(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, order_id: Option<i64>) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM shopify_erasures WHERE account_id = $1 AND shop_domain = $2 AND (
-            kind = 'shop' OR (kind = 'customer' AND shopify_id = $3) OR (kind = 'order' AND shopify_id = $4)))",
-    )
-    .bind(account_id)
-    .bind(shop)
-    .bind(customer_id)
-    .bind(order_id)
-    .fetch_one(db)
-    .await
-}
-
 /// Remember that this store's customer (0 for a guest order or checkout) touched this profile.
 pub async fn note_profile(db: &PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, profile_id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO shopify_customer_profiles (account_id, shop_domain, customer_id, profile_id) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO shopify_customer_profiles (account_id, shop_domain, customer_id, profile_id, generation) VALUES ($1, $2, $3, $4, (SELECT generation FROM shopify_shops WHERE account_id = $1))
+         ON CONFLICT (account_id, shop_domain, customer_id, profile_id) DO UPDATE SET generation = EXCLUDED.generation")
         .bind(account_id)
         .bind(shop)
         .bind(customer_id.unwrap_or(0))
@@ -222,7 +209,7 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         .await;
         match r {
             Ok(p) => {
-                sqlx::query("INSERT INTO shopify_created_profiles (account_id, shop_domain, profile_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                sqlx::query("INSERT INTO shopify_created_profiles (account_id, shop_domain, profile_id, generation) VALUES ($1, $2, $3, (SELECT generation FROM shopify_shops WHERE account_id = $1)) ON CONFLICT DO NOTHING")
                     .bind(account_id)
                     .bind(shop)
                     .bind(p.id)
@@ -314,10 +301,15 @@ async fn apply_sms_state(db: &mut sqlx::PgConnection, id: Uuid, phone: &str, sta
 /// Save a Shopify customer: find or make the right profile, apply consent for its exact address and
 /// number, fill in details, and remember the link. Returns the profile it's linked to. A customer
 /// erased by a privacy request, or a snapshot older than the one already saved, changes nothing.
-pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> anyhow::Result<Option<Uuid>> {
-    if erased(db, account_id, shop, Some(c.id), None).await? {
-        return Ok(None);
-    }
+pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, c: &Customer) -> anyhow::Result<Option<Uuid>> {
+    // Written inside the fence: not into a newer install, and not after a privacy request erased it.
+    let Some(fence) = super::fence::open(db, account_id, shop, generation, Some(c.id), None).await? else { return Ok(None) };
+    let r = apply_inner(db, account_id, shop, c).await?;
+    fence.done().await?;
+    Ok(r)
+}
+
+async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> anyhow::Result<Option<Uuid>> {
     let email = c.email.as_deref().and_then(normalize_email);
     let phone = c.phone.as_deref().and_then(normalize_phone);
     let saved: Option<(Option<Uuid>, Option<DateTime<Utc>>)> = sqlx::query_as("SELECT profile_id, shopify_updated_at FROM shopify_customers WHERE account_id = $1 AND customer_id = $2")
@@ -421,9 +413,9 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
     .await?;
     // The link, unless a newer snapshot got there first (checked in the same statement).
     sqlx::query(
-        "INSERT INTO shopify_customers (account_id, customer_id, profile_id, email, phone, email_state, sms_state, shop_domain, shopify_updated_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-         ON CONFLICT (account_id, customer_id) DO UPDATE SET
+        "INSERT INTO shopify_customers (account_id, customer_id, profile_id, email, phone, email_state, sms_state, shop_domain, shopify_updated_at, updated_at, generation)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), (SELECT generation FROM shopify_shops WHERE account_id = $1))
+         ON CONFLICT (account_id, customer_id) DO UPDATE SET generation = EXCLUDED.generation,
             -- An order moved the link after this snapshot was taken: the link (and its contact) stay.
             profile_id = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.profile_id ELSE shopify_customers.profile_id END,
             email = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.email ELSE shopify_customers.email END,
@@ -493,8 +485,8 @@ pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id:
         // alongside) can't move it back. The snapshot time (`shopify_updated_at`) isn't touched, so
         // the customer's own later updates (and their consent) still apply.
         let new: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain, email, phone, linked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id,
+            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain, email, phone, linked_at, generation) VALUES ($1, $2, $3, $4, $5, $6, $7, (SELECT generation FROM shopify_shops WHERE account_id = $1))
+             ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id, generation = EXCLUDED.generation,
                 email = COALESCE(EXCLUDED.email, shopify_customers.email), phone = COALESCE(EXCLUDED.phone, shopify_customers.phone),
                 linked_at = GREATEST(shopify_customers.linked_at, EXCLUDED.linked_at), updated_at = now()
                 WHERE shopify_customers.profile_id IS DISTINCT FROM EXCLUDED.profile_id
@@ -524,7 +516,7 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
     // Ids Shopify doesn't return (null) were deleted: nothing to read.
     for n in data["nodes"].as_array().into_iter().flatten() {
         if let Some(c) = Customer::from_graphql(n) {
-            apply(&state.db, shop.account_id, &shop.shop_domain, &c).await.map_err(|_| ApiError::Network("database"))?;
+            apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c).await.map_err(|_| ApiError::Network("database"))?;
         }
     }
     Ok(())

@@ -19,6 +19,7 @@ pub mod coupons;
 pub mod customers;
 pub mod discounts;
 pub mod events;
+pub mod fence;
 pub mod import;
 pub mod oauth;
 pub mod orders;
@@ -82,8 +83,10 @@ pub struct Module;
 /// most urgent first, so one busy queue can't starve the others: privacy requests, then
 /// unsubscribes to write back, then webhook deliveries (and the items they ask to read again), then
 /// the import. Then it hands back to the queue.
-async fn work(state: &AppState, account_id: Uuid) -> anyhow::Result<()> {
-    let Some(lease) = shop::acquire(state, account_id).await? else { return Ok(()) };
+async fn work(state: &AppState, account_id: Uuid, generation: Option<i32>) -> anyhow::Result<()> {
+    // A job without an install (queued before jobs carried one) or for an earlier install does nothing.
+    let Some(generation) = generation else { return Ok(()) };
+    let Some(lease) = shop::acquire(state, account_id, generation).await? else { return Ok(()) };
     let (more, delay) = match work_inner(state, account_id, &lease).await {
         Ok(x) => x,
         Err(e) => {
@@ -143,7 +146,7 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
 
     // 3. Webhook deliveries, then the items they asked to read again.
     let hooks_until = until(WEBHOOK_SECS);
-    let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, metrics: &mut metrics, quiet: false };
+    let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, generation: lease.generation, metrics: &mut metrics, quiet: false };
     more |= webhooks::drain(state, &mut cx, lease, hooks_until).await?;
     while wait.is_none() && std::time::Instant::now() < hooks_until.max(until(2)) {
         if !shop::renew(state, lease).await? {
@@ -249,7 +252,7 @@ impl Feature for Module {
         let account = || payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()).ok_or_else(|| anyhow::anyhow!("job payload missing account_id"));
         Some(match kind {
             "shopify_work" => match account() {
-                Ok(a) => work(state, a).await,
+                Ok(a) => work(state, a, payload["generation"].as_i64().map(|g| g as i32)).await,
                 Err(e) => Err(e),
             },
             "shopify_setup" => match account() {
