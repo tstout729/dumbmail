@@ -978,6 +978,24 @@ async fn hostile_scripts_are_cut_off_and_leave_nothing_behind() {
 }
 
 #[tokio::test]
+async fn the_script_process_inherits_no_descriptors() {
+    use dumbmail::features::integrations::sandbox;
+    // A descriptor the server holds without close-on-exec (as a socket or file another thread
+    // opened could be): the child must not have it.
+    let path = std::ffi::CString::new("/proc/self/status").unwrap();
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+    assert!(fd > 2);
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, 0, "the test descriptor is inheritable");
+    let probe = format!("cat >/dev/null; n=$(ls /proc/$$/fd | wc -l); if [ -e /proc/$$/fd/{fd} ]; then o=yes; else o=no; fi; printf '{{\"ok\": [\"%s\", %s]}}' $o $n");
+    let r = sandbox::run_program(std::path::Path::new("/bin/sh"), &["-c", &probe], "function handle() {}", &json!({}), sandbox::TIME_LIMIT).await;
+    unsafe { libc::close(fd) };
+    let v = r.result.unwrap();
+    assert_eq!(v[0], "no", "the server's descriptor {fd} reached the script's process");
+    assert!(v[1].as_u64().unwrap() <= 4, "only stdin, stdout, stderr (and ls's own) are open: {v}");
+}
+
+#[tokio::test]
 async fn scripts_are_admitted_fairly() {
     use dumbmail::features::integrations::sandbox::Slots;
     let a = uuid::Uuid::now_v7();

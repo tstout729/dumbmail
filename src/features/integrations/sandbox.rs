@@ -184,14 +184,18 @@ pub async fn run_program(program: &std::path::Path, args: &[&str], script: &str,
         cmd.pre_exec(move || {
             let lim = |soft: u64, hard: u64| libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
             let check = |rc: libc::c_int| if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+            // Close every descriptor the server had open above stdin, stdout and stderr (database
+            // sockets, listeners, files another thread opened without close-on-exec), so the
+            // script's process holds nothing but its three pipes.
+            close_inherited_fds()?;
             check(libc::setrlimit(libc::RLIMIT_AS, &lim(CHILD_ADDRESS_SPACE, CHILD_ADDRESS_SPACE)))?;
             check(libc::setrlimit(libc::RLIMIT_CPU, &lim(cpu_secs, cpu_secs + 1)))?;
             check(libc::setrlimit(libc::RLIMIT_CORE, &lim(0, 0)))?;
             check(libc::setrlimit(libc::RLIMIT_FSIZE, &lim(0, 0)))?;
             check(libc::setrlimit(libc::RLIMIT_NOFILE, &lim(16, 16)))?;
             // Die with the server, and never gain privileges.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
-            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0))?;
+            check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
             Ok(())
         });
     }
@@ -256,6 +260,29 @@ pub async fn run_program(program: &std::path::Path, args: &[&str], script: &str,
     let _ = child.start_kill();
     let _ = child.wait().await;
     Report { result, pid, elapsed: started.elapsed() }
+}
+
+/// Close every file descriptor above 2. Called between fork and exec, so only async-signal-safe
+/// calls: `close_range(2)` where the kernel has it (Linux 5.9+), otherwise `close(2)` on each
+/// descriptor up to the current limit. Fails (and the child never starts) if any stays open.
+fn close_inherited_fds() -> std::io::Result<()> {
+    // SAFETY: plain system calls on this (forked, single-threaded) process's own descriptors.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) == 0 {
+            return Ok(());
+        }
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let top = if lim.rlim_cur == libc::RLIM_INFINITY { 65_536 } else { lim.rlim_cur.min(1 << 20) as libc::c_int };
+        for fd in 3..top {
+            if libc::close(fd) != 0 && *libc::__errno_location() != libc::EBADF {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn kill_group(pid: Option<u32>) {
