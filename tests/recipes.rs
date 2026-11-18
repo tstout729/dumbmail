@@ -1085,9 +1085,9 @@ async fn zendesk_tickets_keep_only_subject_and_status() {
         z.post(&h, name).await;
     }
     assert_eq!(events(&h, "Ticket Created").await, 1);
-    assert_eq!(events(&h, "Ticket Solved").await, 1, "the resent solve (same invocation) counts once");
+    assert_eq!(events(&h, "Ticket Solved").await, 1, "the resent solve counts once");
     z.post(&h, "ticket-solved-again.json").await;
-    assert_eq!(events(&h, "Ticket Solved").await, 2, "solved again in the same minute: a new invocation, a second event");
+    assert_eq!(events(&h, "Ticket Solved").await, 1, "another invocation id (unsigned) on the same signed body changes nothing");
     assert_eq!(prop(&h, "Satisfaction Rated", "rating").await, vec!["Good, I'm satisfied"]);
     assert_eq!(consent(&h, "kai.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "kai.example@example.com").await);

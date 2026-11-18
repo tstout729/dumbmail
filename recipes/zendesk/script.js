@@ -24,11 +24,10 @@ function handle(input) {
   var up = { type: "upsert_profile", email: p.requester_email, keys: { zendesk_ticket: String(p.ticket_id) } };
   // Anyone can email support under any name, so the requester's name never changes a profile.
   var props = { ticket_id: String(p.ticket_id), subject: p.subject, status: p.status, via: p.via };
-  // Zendesk's times are to the minute, so the event id also takes the trigger's invocation id
-  // (the same on every retry of one notification, different for each new one) and the status or
-  // rating: two solves or ratings in one minute stay apart, a retry stays the same.
-  var invocation = String((input.headers || {})["x-zendesk-webhook-invocation-id"] || "");
-  var version = when + ":" + (p.status || "") + ":" + (p.rating || "") + (invocation ? ":" + invocation : "");
+  // The event id comes only from the signed body (the ticket, its status or rating, and Zendesk's
+  // update time, which is to the minute): a retry is the same event, and so are two identical
+  // solves or ratings within one minute. The invocation id header isn't signed, so it's not used.
+  var version = when + ":" + (p.status || "") + ":" + (p.rating || "");
   for (var k in props) if (props[k] === undefined || props[k] === null || props[k] === "") delete props[k];
   var ev = String(p.event || "");
   if (ev === "created") return [up, { type: "track_event", metric: "Ticket Created", profile: who, time: iso(p.created_at) || when, unique_id: "zendesk:" + p.ticket_id + ":created", properties: props }];
