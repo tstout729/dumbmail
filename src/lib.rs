@@ -121,9 +121,10 @@ pub fn app_with(state: AppState, extra: Router<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), legacy_host_redirect))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))
         .layer(CompressionLayer::new())
-        // Request spans carry the path only: query strings can hold OAuth codes and states.
+        // Request spans carry the path only: query strings can hold OAuth codes and states. Short
+        // links' codes are left out too (features::short_links::log_path).
         .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
-            tracing::debug_span!("request", method = %req.method(), path = %req.uri().path(), version = ?req.version())
+            tracing::debug_span!("request", method = %req.method(), path = %features::short_links::log_path(req.uri().path()), version = ?req.version())
         }))
         .with_state(state)
 }

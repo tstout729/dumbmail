@@ -676,3 +676,77 @@ async fn a_reference_already_used_in_the_account_is_never_written_twice() {
     assert_eq!(clicks_of(&h, older).await, (0, 0, false));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_closed_accounts_targets_are_deleted_by_the_cleanup_job() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 8401).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/closing").await;
+    launch(&mut h, &id).await;
+    let path = short_paths(&body_to(&h, &phone))[0].clone();
+    let count = |sql: &'static str| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).bind(acct).fetch_one(&db).await.unwrap() }
+    };
+    const TARGETS: &str = "SELECT count(*) FROM short_link_targets WHERE account_id = $1";
+    const MAPS: &str = "SELECT count(*) FROM short_link_campaigns s JOIN campaigns c ON c.id = s.campaign_id WHERE c.account_id = $1";
+    assert_eq!((count(TARGETS).await, count(MAPS).await), (1, 1));
+    // Another account's targets stay.
+    let other: Uuid = Uuid::now_v7();
+    sqlx::query("INSERT INTO accounts (id, public_key, name) VALUES ($1, $2, 'Other')").bind(other).bind(format!("pk_{}", other.simple())).execute(&h.state.db).await.unwrap();
+    let mut conn = h.state.db.acquire().await.unwrap();
+    short_links::send::ensure_targets(&mut conn, other, &["https://shop.test/other".to_string()]).await.unwrap();
+    drop(conn);
+    sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue_background(&h.state.db, short_links::JOB_CLEANUP, json!({}), None).await.unwrap();
+    h.drain().await;
+    assert_eq!((count(TARGETS).await, count(MAPS).await), (0, 0));
+    let theirs: i64 = sqlx::query_scalar("SELECT count(*) FROM short_link_targets WHERE account_id = $1").bind(other).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(theirs, 1);
+    assert_eq!(click(&h, &path).await.0, StatusCode::NOT_FOUND);
+    h.cleanup().await;
+}
+
+/// Records the `path` of every request span.
+#[derive(Clone, Default)]
+struct SpanPaths(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct PathField<'a>(&'a mut Option<String>);
+impl tracing::field::Visit for PathField<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "path" {
+            *self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for SpanPaths {
+    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id, _: Context<'_, S>) {
+        let mut path = None;
+        attrs.record(&mut PathField(&mut path));
+        if let Some(p) = path {
+            self.0.lock().unwrap().push(p);
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_logs_never_show_a_short_links_code() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 8501).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/logged").await;
+    launch(&mut h, &id).await;
+    let path = short_paths(&body_to(&h, &phone))[0].clone();
+    let seen = SpanPaths::default();
+    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(seen.clone()));
+    assert!(click(&h, &path).await.0.is_redirection());
+    h.raw("GET", "/healthz", &[], "").await;
+    drop(guard);
+    let paths = seen.0.lock().unwrap().clone();
+    assert!(paths.iter().any(|p| p == "/s/…"), "{paths:?}");
+    assert!(paths.iter().any(|p| p == "/healthz"), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains(&path[..10])), "{paths:?}");
+    h.cleanup().await;
+}

@@ -91,7 +91,9 @@ fails a send or misattributes a click.
 
 - Targets not put in a text for 400 days are deleted by a background job, in batches. A click on a
   deleted target shows the "link not found" page.
-- A closed account's short links stop redirecting.
+- A closed account's short links stop redirecting at once, and the same background job deletes its
+  targets and campaign link maps.
+- Request logs show short links as `/s/…`, without their 24 characters.
 - Lookups use an index on `messages (account_id, short_ref)`, built in the background after the
   server starts.
 - A server puts short links in texts only once that index is in place and it has been accepting

@@ -159,7 +159,8 @@ async fn update_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<S
 
 // ---------- Housekeeping ----------
 
-/// Delete targets unused for [`KEEP_DAYS`], in batches; queue another run when there's more.
+/// Delete targets unused for [`KEEP_DAYS`], and closed accounts' targets and campaign link maps, in
+/// batches; queue another run when there's more.
 ///
 /// The rows are picked first and deleted by a statement that checks their age again, against the
 /// same cutoff: a send can refresh a picked row meanwhile (it waits for the send's lock, then sees
@@ -175,12 +176,40 @@ pub async fn cleanup(state: &AppState) -> anyhow::Result<()> {
         if !stale.is_empty() {
             sqlx::query("DELETE FROM short_link_targets WHERE code = ANY($1) AND last_used_at < $2").bind(&stale).bind(cutoff).execute(&state.db).await?;
         }
-        if (stale.len() as i64) < CLEANUP_BATCH {
+        // A closed account's links already show not found; its destinations go too.
+        let closed: Vec<String> = sqlx::query_scalar(
+            "SELECT t.code FROM short_link_targets t JOIN accounts a ON a.id = t.account_id WHERE a.closed_at IS NOT NULL LIMIT $1",
+        )
+        .bind(CLEANUP_BATCH)
+        .fetch_all(&state.db)
+        .await?;
+        if !closed.is_empty() {
+            sqlx::query("DELETE FROM short_link_targets WHERE code = ANY($1)").bind(&closed).execute(&state.db).await?;
+        }
+        let maps = sqlx::query(
+            "DELETE FROM short_link_campaigns WHERE campaign_id IN (SELECT s.campaign_id FROM short_link_campaigns s JOIN campaigns c ON c.id = s.campaign_id
+                 JOIN accounts a ON a.id = c.account_id WHERE a.closed_at IS NOT NULL LIMIT $1)",
+        )
+        .bind(CLEANUP_BATCH)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+        if (stale.len() as i64) < CLEANUP_BATCH && (closed.len() as i64) < CLEANUP_BATCH && (maps as i64) < CLEANUP_BATCH {
             return Ok(());
         }
     }
     crate::jobs::enqueue_background(&state.db, JOB_CLEANUP, json!({}), None).await?;
     Ok(())
+}
+
+/// A request path as logs show it: a short link's 24 characters are left out (`/s/…`), so logs
+/// can't be used to open or replay links.
+pub fn log_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with("/s/") {
+        std::borrow::Cow::Borrowed("/s/…")
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
 }
 
 #[async_trait]
