@@ -315,11 +315,11 @@ impl Contact<'_> {
 /// its own: it's recorded, but nothing is sent because of it. With no contact anywhere, the linked
 /// customer's profile, likewise marked.
 #[allow(clippy::too_many_arguments)]
-pub async fn buyer_for(db: &sqlx::PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, own: Contact<'_>, nested: Contact<'_>, first: Option<&str>, last: Option<&str>) -> anyhow::Result<Option<super::customers::Buyer>> {
+pub async fn buyer_for(db: &sqlx::PgPool, account_id: Uuid, shop: &str, customer_id: Option<i64>, own: Contact<'_>, nested: Contact<'_>, first: Option<&str>, last: Option<&str>, at: Option<DateTime<Utc>>) -> anyhow::Result<Option<super::customers::Buyer>> {
     if own.any() {
-        return profile_for(db, account_id, shop, customer_id, own.email, own.phone, first, last).await;
+        return profile_for(db, account_id, shop, customer_id, own.email, own.phone, first, last, at).await;
     }
-    let b = profile_for(db, account_id, shop, customer_id, nested.email, nested.phone, first, last).await?;
+    let b = profile_for(db, account_id, shop, customer_id, nested.email, nested.phone, first, last, at).await?;
     Ok(b.map(|b| super::customers::Buyer { no_contact: true, ..b }))
 }
 
@@ -477,7 +477,7 @@ pub async fn apply(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
     let db = &cx.state.db;
     let own = Contact { email: o.email.as_deref(), phone: o.phone.as_deref() };
     let nested = Contact { email: o.customer_email.as_deref(), phone: o.customer_phone.as_deref() };
-    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, o.customer_id, own, nested, o.first_name.as_deref(), o.last_name.as_deref()).await? else {
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, o.customer_id, own, nested, o.first_name.as_deref(), o.last_name.as_deref(), o.updated_at).await? else {
         return Ok(());
     };
     let profile_id = buyer.profile_id;
@@ -757,7 +757,7 @@ pub async fn apply_checkout(cx: &mut Ctx<'_>, v: &Value) -> anyhow::Result<()> {
     let (c_email, c_phone) = (s(&c["email"]), s(&c["phone"]));
     let own = Contact { email: email.as_deref(), phone: phone.as_deref() };
     let nested = Contact { email: c_email.as_deref(), phone: c_phone.as_deref() };
-    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, customer_id, own, nested, s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref()).await? else {
+    let Some(buyer) = buyer_for(db, cx.account_id, cx.shop, customer_id, own, nested, s(&c["first_name"]).as_deref(), s(&c["last_name"]).as_deref(), t(&v["updated_at"])).await? else {
         return Ok(());
     };
     let shop_currency = s(&v["currency"]);

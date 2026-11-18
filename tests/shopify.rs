@@ -2463,3 +2463,51 @@ async fn own_contact_before_the_customer_record() {
     assert_eq!(flow_runs(&h).await, 1, "an order without its own contact starts nothing");
     h.cleanup().await;
 }
+
+/// Item 2: an opt-out survives a crash between recording Shopify's consent time and changing the
+/// profile; an order's re-link isn't undone by a snapshot no newer than the order.
+#[tokio::test]
+async fn opt_out_survives_a_crash_and_relinks_stick() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    mock.lock().unwrap().customers.insert(1, customer_at(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    h.drain().await;
+    assert_eq!(consent(&h, "ann@example.com").await.0, "subscribed");
+    // The next write that unsubscribes a profile fails once (the crash in the gap).
+    sqlx::query("CREATE TABLE crash_once (n int)").execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO crash_once VALUES (1)").execute(&h.state.db).await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION crash_unsub() RETURNS trigger AS $$ BEGIN
+           IF NEW.email_consent = 'unsubscribed' AND OLD.email_consent <> 'unsubscribed' AND EXISTS (SELECT 1 FROM crash_once) THEN
+             DELETE FROM crash_once; RAISE EXCEPTION 'crash'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER crash_unsub BEFORE UPDATE ON profiles FOR EACH ROW EXECUTE FUNCTION crash_unsub()").execute(&h.state.db).await.unwrap();
+    mock.lock().unwrap().customers.insert(1, customer_at(1, Some("ann@example.com"), "UNSUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-02-01T00:00:00Z", "2025-02-01T00:00:00Z"));
+    hook(&h, "customers/update", "c2", &json!({"id": 1})).await;
+    h.drain().await;
+    // The crash rolled back the delete of crash_once too, so drop the guard row now and retry.
+    sqlx::query("DELETE FROM crash_once").execute(&h.state.db).await.unwrap();
+    for _ in 0..3 {
+        h.fast_forward().await;
+    }
+    assert_eq!(consent(&h, "ann@example.com").await.0, "unsubscribed", "the replay applies the opt-out");
+
+    // Re-linking by an order sticks against a snapshot no newer than the order.
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann.new@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    let new = profile_id_of(&h, "ann.new@example.com").await.unwrap();
+    let snapshot = customer_at(1, Some("ann@example.com"), "UNSUBSCRIBED", None, "NOT_SUBSCRIBED", "2025-02-01T00:00:00Z", "2025-02-01T00:00:00Z");
+    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[snapshot]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    let (linked, email): (Uuid, String) = sqlx::query_as("SELECT profile_id, email FROM shopify_customers WHERE customer_id = 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, new, "the older snapshot didn't move the link back");
+    assert_eq!(email, "ann.new@example.com", "the link's contact moved with it");
+    h.cleanup().await;
+}
