@@ -211,7 +211,13 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     // the integration's allowance, and its failures are only logged while they are few.
     let sig = integ.signature();
     let secret = integ.secret(&state).ok().flatten();
-    if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &bytes, Utc::now().timestamp()) {
+    // The URL as the app was given it, for apps that sign it (Square).
+    let base_url = format!("{}/webhooks/in/{token}", state.cfg.public_url());
+    let signed_url = match parts.uri.query() {
+        Some(q) => format!("{base_url}?{q}"),
+        None => base_url,
+    };
+    if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &signed_url, &bytes, Utc::now().timestamp()) {
         if note_rejected(id) {
             let msg = format!("signature check failed: {why}");
             let scrub = Scrub::new(integ.secret_values(&state).await);

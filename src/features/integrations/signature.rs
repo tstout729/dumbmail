@@ -39,6 +39,18 @@ pub enum Signature {
         /// `plain` format only: `utf8` (default) uses the secret's text as the key; `base64` decodes it first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret_encoding: Option<Encoding>,
+        /// `plain` format with `timestamp_header` only: what joins the timestamp and the body. Default
+        /// `.`; Webflow uses `:` and Zendesk nothing (`""`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_separator: Option<String>,
+        /// `plain` format with `timestamp_header` only: how the timestamp is written. Default `seconds`
+        /// (Unix); Webflow sends `milliseconds`; `iso8601` for a date-time like `2026-11-17T18:00:00Z`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp_unit: Option<TimestampUnit>,
+        /// `plain` format only: sign the webhook URL (as given to the app) followed by the body, as
+        /// Square does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sign_url: Option<bool>,
     },
     /// The secret itself, sent in a header or a query parameter.
     SharedSecret {
@@ -67,6 +79,17 @@ pub enum Format {
     Stripe,
     /// Svix / Standard Webhooks: `v1,<base64>` over `id.timestamp.body` with a `whsec_` secret, as Guesty sends.
     Svix,
+    /// `ts=<unix>;h1=<hex>` over `ts:body`, as Paddle sends.
+    Paddle,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampUnit {
+    #[default]
+    Seconds,
+    Milliseconds,
+    Iso8601,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -82,7 +105,7 @@ impl Signature {
     pub fn parse(v: &serde_json::Value) -> AppResult<Self> {
         let s: Signature = serde_json::from_value(v.clone()).map_err(|e| AppError::bad(format!("invalid signature settings: {e}")))?;
         match &s {
-            Signature::Hmac { header, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding, algorithm } => {
+            Signature::Hmac { header, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding, algorithm, timestamp_separator, timestamp_unit, sign_url } => {
                 check_header_name(header)?;
                 if let Some(h) = timestamp_header {
                     check_header_name(h)?;
@@ -90,11 +113,21 @@ impl Signature {
                 if *encoding == Encoding::Utf8 {
                     return Err(AppError::bad("signature encoding must be hex or base64"));
                 }
-                if matches!(format, Format::Stripe | Format::Svix) && (prefix.is_some() || timestamp_header.is_some() || secret_encoding.is_some()) {
-                    return Err(AppError::bad("prefix, timestamp_header and secret_encoding only apply to the plain format"));
+                let plain_only = prefix.is_some() || timestamp_header.is_some() || secret_encoding.is_some() || sign_url.is_some();
+                if *format != Format::Plain && plain_only {
+                    return Err(AppError::bad("prefix, timestamp_header, secret_encoding and sign_url only apply to the plain format"));
                 }
-                if *format == Format::Svix && *algorithm != Algorithm::Sha256 {
-                    return Err(AppError::bad("the svix format always uses sha256"));
+                if (timestamp_separator.is_some() || timestamp_unit.is_some()) && timestamp_header.is_none() {
+                    return Err(AppError::bad("timestamp_separator and timestamp_unit go with timestamp_header"));
+                }
+                if timestamp_separator.as_ref().is_some_and(|s| s.len() > 4) {
+                    return Err(AppError::bad("timestamp_separator is at most 4 characters"));
+                }
+                if *sign_url == Some(true) && timestamp_header.is_some() {
+                    return Err(AppError::bad("sign_url and timestamp_header can't be combined"));
+                }
+                if matches!(format, Format::Svix | Format::Paddle) && *algorithm != Algorithm::Sha256 {
+                    return Err(AppError::bad("the svix and paddle formats always use sha256"));
                 }
                 if prefix.as_ref().is_some_and(|p| p.len() > 40) {
                     return Err(AppError::bad("signature prefix is too long"));
@@ -140,8 +173,9 @@ fn check_header_name(h: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Check a request. `now` is Unix seconds.
-pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query: &HashMap<String, String>, body: &[u8], now: i64) -> Result<(), String> {
+/// Check a request. `url` is the webhook URL as the app was given it (for `sign_url`); `now` is
+/// Unix seconds.
+pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query: &HashMap<String, String>, url: &str, body: &[u8], now: i64) -> Result<(), String> {
     let secret = match (sig, secret) {
         (Signature::None, _) => return Ok(()),
         (_, Some(s)) if !s.is_empty() => s,
@@ -164,11 +198,16 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                 Err("the shared secret doesn't match".into())
             }
         }
-        Signature::Hmac { algorithm, header: name, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding } => {
+        Signature::Hmac { algorithm, header: name, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding, timestamp_separator, timestamp_unit, sign_url } => {
             let raw = header(name).ok_or_else(|| format!("the {name} header is missing"))?;
             let tolerance = tolerance_seconds.unwrap_or(300);
+            let unit = timestamp_unit.unwrap_or_default();
             let fresh = |ts: &str| -> Result<(), String> {
-                let t: i64 = ts.trim().parse().map_err(|_| "the signature timestamp isn't a number".to_string())?;
+                let t: i64 = match unit {
+                    TimestampUnit::Seconds => ts.trim().parse().map_err(|_| "the signature timestamp isn't a number".to_string())?,
+                    TimestampUnit::Milliseconds => ts.trim().parse::<i64>().map_err(|_| "the signature timestamp isn't a number".to_string())?.div_euclid(1000),
+                    TimestampUnit::Iso8601 => chrono::DateTime::parse_from_rfc3339(ts.trim()).map_err(|_| "the signature timestamp isn't an ISO 8601 date-time".to_string())?.timestamp(),
+                };
                 // Overflow-safe: an extreme timestamp is simply too old (or too new).
                 if now.checked_sub(t).and_then(i64::checked_abs).is_none_or(|d| d > tolerance) {
                     return Err(format!("the signature timestamp is more than {tolerance} seconds old (or in the future)"));
@@ -194,8 +233,9 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                         Some(th) => {
                             let ts = header(th).ok_or_else(|| format!("the {th} header is missing"))?;
                             fresh(ts)?;
-                            [ts.as_bytes(), b".", body].concat()
+                            [ts.as_bytes(), timestamp_separator.as_deref().unwrap_or(".").as_bytes(), body].concat()
                         }
+                        None if *sign_url == Some(true) => [url.as_bytes(), body].concat(),
                         None => body.to_vec(),
                     };
                     if mac_matches(*algorithm, &key, &signed, &given) { Ok(()) } else { Err("the signature doesn't match".into()) }
@@ -214,6 +254,22 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                     fresh(ts)?;
                     let signed = [ts.as_bytes(), b".", body].concat();
                     let ok = sigs.iter().filter_map(|s| hex::decode(s).ok()).any(|given| mac_matches(*algorithm, secret.as_bytes(), &signed, &given));
+                    if ok { Ok(()) } else { Err("the signature doesn't match".into()) }
+                }
+                Format::Paddle => {
+                    let mut ts = None;
+                    let mut sigs = Vec::new();
+                    for part in raw.split(';') {
+                        match part.trim().split_once('=') {
+                            Some(("ts", v)) => ts = Some(v),
+                            Some(("h1", v)) => sigs.push(v),
+                            _ => {}
+                        }
+                    }
+                    let ts = ts.ok_or("the signature header has no ts= timestamp")?;
+                    fresh(ts)?;
+                    let signed = [ts.as_bytes(), b":", body].concat();
+                    let ok = sigs.iter().filter_map(|s| hex::decode(s).ok()).any(|given| mac_matches(Algorithm::Sha256, secret.as_bytes(), &signed, &given));
                     if ok { Ok(()) } else { Err("the signature doesn't match".into()) }
                 }
                 Format::Svix => {
@@ -300,11 +356,11 @@ mod tests {
         let body = br#"{"a":1}"#;
         let good = format!("sha256={}", hex::encode(hmac256(b"s3cret", body)));
         let q = HashMap::new();
-        assert!(verify(&sig, Some("s3cret"), &headers(&[("x-hub-signature-256", &good)]), &q, body, 0).is_ok());
-        assert!(verify(&sig, Some("other"), &headers(&[("x-hub-signature-256", &good)]), &q, body, 0).is_err());
-        assert!(verify(&sig, Some("s3cret"), &headers(&[("x-hub-signature-256", &good)]), &q, b"{\"a\":2}", 0).is_err());
-        assert!(verify(&sig, Some("s3cret"), &headers(&[]), &q, body, 0).unwrap_err().contains("missing"));
-        assert!(verify(&sig, None, &headers(&[("x-hub-signature-256", &good)]), &q, body, 0).unwrap_err().contains("no signing secret"));
+        assert!(verify(&sig, Some("s3cret"), &headers(&[("x-hub-signature-256", &good)]), &q, "", body, 0).is_ok());
+        assert!(verify(&sig, Some("other"), &headers(&[("x-hub-signature-256", &good)]), &q, "", body, 0).is_err());
+        assert!(verify(&sig, Some("s3cret"), &headers(&[("x-hub-signature-256", &good)]), &q, "", b"{\"a\":2}", 0).is_err());
+        assert!(verify(&sig, Some("s3cret"), &headers(&[]), &q, "", body, 0).unwrap_err().contains("missing"));
+        assert!(verify(&sig, None, &headers(&[("x-hub-signature-256", &good)]), &q, "", body, 0).unwrap_err().contains("no signing secret"));
     }
 
     #[test]
@@ -313,22 +369,22 @@ mod tests {
         let mut m = Hmac::<sha1::Sha1>::new_from_slice(b"k").unwrap();
         m.update(b"body");
         let s = base64::engine::general_purpose::STANDARD.encode(m.finalize().into_bytes());
-        assert!(verify(&sig, Some("k"), &headers(&[("x-sig", &s)]), &HashMap::new(), b"body", 0).is_ok());
+        assert!(verify(&sig, Some("k"), &headers(&[("x-sig", &s)]), &HashMap::new(), "", b"body", 0).is_ok());
 
         let sig = Signature::parse(&json!({"type": "hmac", "header": "X-Sig", "timestamp_header": "X-Ts", "tolerance_seconds": 60})).unwrap();
         let s = hex::encode(hmac256(b"k", b"1000.body"));
         let h = headers(&[("x-sig", &s), ("x-ts", "1000")]);
-        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1030).is_ok());
-        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1100).unwrap_err().contains("seconds"));
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1030).is_ok());
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1100).unwrap_err().contains("seconds"));
         // Extreme timestamps fail cleanly instead of overflowing.
         for ts in [i64::MIN.to_string(), i64::MAX.to_string()] {
             let s = hex::encode(hmac256(b"k", format!("{ts}.body").as_bytes()));
             let h = headers(&[("x-sig", &s), ("x-ts", &ts)]);
-            assert!(verify(&sig, Some("k"), &h, &HashMap::new(), b"body", 1030).unwrap_err().contains("seconds"));
+            assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1030).unwrap_err().contains("seconds"));
         }
         let ts = i64::MIN.to_string();
         let s = hex::encode(hmac256(b"k", format!("{ts}.body").as_bytes()));
-        assert!(verify(&sig, Some("k"), &headers(&[("x-sig", &s), ("x-ts", &ts)]), &HashMap::new(), b"body", i64::MAX).is_err());
+        assert!(verify(&sig, Some("k"), &headers(&[("x-sig", &s), ("x-ts", &ts)]), &HashMap::new(), "", b"body", i64::MAX).is_err());
     }
 
     #[test]
@@ -337,9 +393,9 @@ mod tests {
         let body = b"{\"id\":\"evt_1\"}";
         let v1 = hex::encode(hmac256(b"whsec_abc", &[b"1700000000.".as_slice(), body].concat()));
         let h = headers(&[("stripe-signature", &format!("t=1700000000,v1=deadbeef,v1={v1}"))]);
-        assert!(verify(&sig, Some("whsec_abc"), &h, &HashMap::new(), body, 1700000100).is_ok());
-        assert!(verify(&sig, Some("whsec_abc"), &h, &HashMap::new(), body, 1700001000).is_err(), "too old");
-        assert!(verify(&sig, Some("whsec_xyz"), &h, &HashMap::new(), body, 1700000100).is_err());
+        assert!(verify(&sig, Some("whsec_abc"), &h, &HashMap::new(), "", body, 1700000100).is_ok());
+        assert!(verify(&sig, Some("whsec_abc"), &h, &HashMap::new(), "", body, 1700001000).is_err(), "too old");
+        assert!(verify(&sig, Some("whsec_xyz"), &h, &HashMap::new(), "", body, 1700000100).is_err());
     }
 
     #[test]
@@ -350,19 +406,67 @@ mod tests {
         let body = b"{\"event\":\"reservation.new\"}";
         let mac = base64::engine::general_purpose::STANDARD.encode(hmac256(key, &[b"msg_1.1700000000.".as_slice(), body].concat()));
         let h = headers(&[("svix-id", "msg_1"), ("svix-timestamp", "1700000000"), ("svix-signature", &format!("v1,bm9wZQ== v1,{mac}"))]);
-        assert!(verify(&sig, Some(&secret), &h, &HashMap::new(), body, 1700000010).is_ok());
+        assert!(verify(&sig, Some(&secret), &h, &HashMap::new(), "", body, 1700000010).is_ok());
         let h2 = headers(&[("svix-id", "msg_2"), ("svix-timestamp", "1700000000"), ("svix-signature", &format!("v1,{mac}"))]);
-        assert!(verify(&sig, Some(&secret), &h2, &HashMap::new(), body, 1700000010).is_err(), "id is signed");
+        assert!(verify(&sig, Some(&secret), &h2, &HashMap::new(), "", body, 1700000010).is_err(), "id is signed");
+    }
+
+    #[test]
+    fn paddle_format() {
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "Paddle-Signature", "format": "paddle"})).unwrap();
+        let body = b"{\"event_type\":\"transaction.completed\"}";
+        let h1 = hex::encode(hmac256(b"pdl_ntfset_abc", &[b"1671552777:".as_slice(), body].concat()));
+        let h = headers(&[("paddle-signature", &format!("ts=1671552777;h1=00ff;h1={h1}"))]);
+        assert!(verify(&sig, Some("pdl_ntfset_abc"), &h, &HashMap::new(), "", body, 1671552800).is_ok());
+        assert!(verify(&sig, Some("pdl_ntfset_abc"), &h, &HashMap::new(), "", body, 1671553800).is_err(), "too old");
+        assert!(verify(&sig, Some("pdl_ntfset_xyz"), &h, &HashMap::new(), "", body, 1671552800).is_err());
+        // Stripe's separators don't pass for Paddle's.
+        let h = headers(&[("paddle-signature", &format!("ts=1671552777,h1={h1}"))]);
+        assert!(verify(&sig, Some("pdl_ntfset_abc"), &h, &HashMap::new(), "", body, 1671552800).is_err());
+    }
+
+    #[test]
+    fn square_signs_the_url() {
+        // Square's own example: key asdf1234, URL https://example.com/webhook, body {"hello":"world"}.
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "x-square-hmacsha256-signature", "encoding": "base64", "sign_url": true})).unwrap();
+        let h = headers(&[("x-square-hmacsha256-signature", "2kRE5qRU2tR+tBGlDwMEw2avJ7QM4ikPYD/PJ3bd9Og=")]);
+        let body = br#"{"hello":"world"}"#;
+        assert!(verify(&sig, Some("asdf1234"), &h, &HashMap::new(), "https://example.com/webhook", body, 0).is_ok());
+        assert!(verify(&sig, Some("asdf1234"), &h, &HashMap::new(), "https://example.com/other", body, 0).is_err(), "the URL is signed");
+        assert!(Signature::parse(&json!({"type": "hmac", "header": "X", "sign_url": true, "timestamp_header": "T"})).is_err());
+    }
+
+    #[test]
+    fn timestamp_separator_and_units() {
+        // Webflow: hex HMAC of "<ms>:<body>", 5 minutes.
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "x-webflow-signature", "timestamp_header": "x-webflow-timestamp", "timestamp_separator": ":", "timestamp_unit": "milliseconds"})).unwrap();
+        let s = hex::encode(hmac256(b"k", b"1722370035277:body"));
+        let h = headers(&[("x-webflow-signature", &s), ("x-webflow-timestamp", "1722370035277")]);
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1722370100).is_ok());
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1722370035 + 400).is_err(), "too old");
+        let s = hex::encode(hmac256(b"k", b"1722370035277.body"));
+        let h = headers(&[("x-webflow-signature", &s), ("x-webflow-timestamp", "1722370035277")]);
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", 1722370100).is_err(), "separator is signed");
+        // Zendesk: base64 HMAC of timestamp + body, no separator, ISO 8601 timestamp.
+        let sig = Signature::parse(&json!({"type": "hmac", "header": "X-Zendesk-Webhook-Signature", "encoding": "base64", "timestamp_header": "X-Zendesk-Webhook-Signature-Timestamp", "timestamp_separator": "", "timestamp_unit": "iso8601"})).unwrap();
+        let s = base64::engine::general_purpose::STANDARD.encode(hmac256(b"k", b"2026-11-17T18:00:00Zbody"));
+        let h = headers(&[("x-zendesk-webhook-signature", &s), ("x-zendesk-webhook-signature-timestamp", "2026-11-17T18:00:00Z")]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-17T18:01:00Z").unwrap().timestamp();
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", now).is_ok());
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", now + 3600).is_err(), "too old");
+        let h = headers(&[("x-zendesk-webhook-signature", &s), ("x-zendesk-webhook-signature-timestamp", "1763402400")]);
+        assert!(verify(&sig, Some("k"), &h, &HashMap::new(), "", b"body", now).is_err(), "not ISO 8601");
+        assert!(Signature::parse(&json!({"type": "hmac", "header": "X", "timestamp_separator": ":"})).is_err(), "needs timestamp_header");
     }
 
     #[test]
     fn shared_secret_header_or_query() {
         let sig = Signature::parse(&json!({"type": "shared_secret", "header": "X-Token"})).unwrap();
-        assert!(verify(&sig, Some("tok"), &headers(&[("x-token", "tok")]), &HashMap::new(), b"", 0).is_ok());
-        assert!(verify(&sig, Some("tok"), &headers(&[("x-token", "tok2")]), &HashMap::new(), b"", 0).is_err());
+        assert!(verify(&sig, Some("tok"), &headers(&[("x-token", "tok")]), &HashMap::new(), "", b"", 0).is_ok());
+        assert!(verify(&sig, Some("tok"), &headers(&[("x-token", "tok2")]), &HashMap::new(), "", b"", 0).is_err());
         let sig = Signature::parse(&json!({"type": "shared_secret", "query": "key"})).unwrap();
         let q = HashMap::from([("key".to_string(), "tok".to_string())]);
-        assert!(verify(&sig, Some("tok"), &HeaderMap::new(), &q, b"", 0).is_ok());
+        assert!(verify(&sig, Some("tok"), &HeaderMap::new(), &q, "", b"", 0).is_ok());
         assert_eq!(sig.secret_query(), Some("key"));
     }
 
