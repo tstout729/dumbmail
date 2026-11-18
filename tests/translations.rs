@@ -1616,3 +1616,44 @@ async fn imports_go_to_the_right_field_when_blocks_move() {
     assert_eq!(saved["blocks"][0]["i18n"]["fr"]["text"]["text"], "Ancien");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_campaign_keeps_its_default_language_and_reads_only_its_languages() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    set_languages(&mut h, json!(["fr", "es"])).await;
+    // The only translations are in a saved block.
+    let (_, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Sign-off", "blocks": [{"type": "text", "html": "<p>See you soon</p>"}]}))).await;
+    let sbid = sb["id"].as_str().unwrap().to_string();
+    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "fr", "strings": [{"id": field_id(&sb, "b0:html"), "text": "<p>À bientôt</p>"}]}))).await;
+    let ann = person(&mut h, "ann@x.test", Some("fr")).await;
+    let bob = person(&mut h, "bob@x.test", None).await;
+    let list = list_of(&mut h, &[ann, bob]).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Frozen", "audience": {"include": [{"type": "list", "id": list}]}, "content": {"subject": "Hi", "blocks": [{"type": "heading", "text": "News"}, {"type": "saved", "saved_block_id": sbid}]}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    // Until the send has started (the content is frozen), one job at a time.
+    let mut frozen = Value::Null;
+    for _ in 0..20 {
+        frozen = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"]["_system"].clone();
+        if !frozen.is_null() || !dumbmail::jobs::run_one(&h.state).await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(frozen["default"], "en", "{frozen}");
+    let mut langs: Vec<&String> = frozen["footer"].as_object().unwrap().keys().collect();
+    langs.sort();
+    assert_eq!(langs, ["en", "fr"], "only the campaign's languages are read, not Spanish: {frozen}");
+    // Halfway through, the account's default becomes Spanish, with its own wording.
+    h.ok("PUT", "/api/translations/settings", Some(json!({"default_language": "es", "languages": ["fr", "en"]}))).await;
+    h.ok("PUT", "/api/translations/system-texts", Some(json!({"language": "es", "texts": {"footer.unsubscribe": "Darse de baja YA"}}))).await;
+    h.drain().await;
+    let sent = h.state.email.sent();
+    let to = |a: &str| sent.iter().find(|m| m.to == a).cloned().unwrap();
+    let (a, b) = (to("ann@x.test"), to("bob@x.test"));
+    assert!(a.html.contains("À bientôt") && a.html.contains(r#"<html lang="fr">"#));
+    assert!(b.html.contains(r#"<html lang="en">"#) && b.html.contains(">Unsubscribe</a>"), "the default stays English for this campaign: {}", b.html);
+    assert!(!b.html.contains("Darse de baja YA"));
+    h.cleanup().await;
+}

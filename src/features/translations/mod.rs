@@ -86,14 +86,20 @@ pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx
             extra.push(l);
         }
     }
-    let account_default = if extra.is_empty() || content.get("translations").is_some() { "en".to_string() } else { texts::settings(&state.db, account.id).await?.default_language };
+    // A campaign's default language and wording were fixed when its send started (and nothing
+    // live is read for it); anything else uses the account's current ones (cached, refreshed off
+    // the send path).
+    let frozen = CAMPAIGN.try_with(|c| *c).ok().and_then(|campaign| snapshot(&state.cfg.secret_key, account.id, campaign, content));
+    let account_default = match &frozen {
+        Some((default, _)) => default.clone(),
+        None if extra.is_empty() || content.get("translations").is_some() => "en".to_string(),
+        None => texts::settings(&state.db, account.id).await?.default_language,
+    };
     let Some(lang) = fields::choose(content, &extra, &account_default, person, pin().as_deref()) else { return Ok(None) };
     let mut out = fields::localize(content, &lang, &own_hosts(state, Some(account)));
     if !lang.is_empty() {
-        // A campaign's wording was fixed when its send started; anything else uses the account's
-        // current wording (cached, refreshed off the send path).
-        out["_footer"] = match CAMPAIGN.try_with(|c| *c).ok().and_then(|campaign| snapshot_footer(&state.cfg.secret_key, account.id, campaign, content, &lang)) {
-            Some(f) => f,
+        out["_footer"] = match &frozen {
+            Some((_, footer)) => footer.get(&lang).cloned().unwrap_or_else(|| texts::footer_in(&texts::Settings::default(), &lang)),
             None => texts::footer(&state.db, account.id, &lang).await,
         };
     }
@@ -116,9 +122,9 @@ fn content_languages(content: &Value, out: &mut Vec<String>) -> bool {
     true
 }
 
-/// The signature over a campaign's footer snapshot: the account, the campaign and the wording
-/// (as sorted JSON triples, so no text can be read as another field).
-fn snapshot_sig(secret: &str, account_id: Uuid, campaign_id: Uuid, footer: &Value) -> String {
+/// The signature over a campaign's snapshot: the account, the campaign, its default language and
+/// the wording (as sorted JSON triples, so no text can be read as another field).
+fn snapshot_sig(secret: &str, account_id: Uuid, campaign_id: Uuid, default: &str, footer: &Value) -> String {
     let mut triples: Vec<(String, String, String)> = footer
         .as_object()
         .into_iter()
@@ -126,25 +132,27 @@ fn snapshot_sig(secret: &str, account_id: Uuid, campaign_id: Uuid, footer: &Valu
         .map(|(l, f)| (l.clone(), f["reason"].as_str().unwrap_or("").to_string(), f["unsubscribe"].as_str().unwrap_or("").to_string()))
         .collect();
     triples.sort();
-    let payload = serde_json::to_string(&json!(["system", account_id, campaign_id, triples])).unwrap_or_default();
+    let payload = serde_json::to_string(&json!(["system", account_id, campaign_id, default, triples])).unwrap_or_default();
     let signed = crate::auth::sign(secret, &payload);
     signed.rsplit('.').next().unwrap_or_default().to_string()
 }
 
-/// The footer lines in `lang` from campaign `campaign_id`'s snapshot, when the content carries a
-/// genuine one issued for that campaign (and it's that campaign being sent).
-fn snapshot_footer(secret: &str, account_id: Uuid, campaign_id: Uuid, content: &Value, lang: &str) -> Option<Value> {
+/// Campaign `campaign_id`'s snapshot (its default language and footer lines by language), when the
+/// content carries a genuine one issued for that campaign (and it's that campaign being sent).
+fn snapshot(secret: &str, account_id: Uuid, campaign_id: Uuid, content: &Value) -> Option<(String, Value)> {
     let sys = content.get("_system")?;
     let footer = sys.get("footer")?;
-    if sys.get("campaign").and_then(|c| c.as_str()) != Some(campaign_id.to_string().as_str()) || sys.get("sig").and_then(|s| s.as_str()) != Some(snapshot_sig(secret, account_id, campaign_id, footer).as_str()) {
+    let default = sys.get("default")?.as_str()?;
+    if sys.get("campaign").and_then(|c| c.as_str()) != Some(campaign_id.to_string().as_str()) || sys.get("sig").and_then(|s| s.as_str()) != Some(snapshot_sig(secret, account_id, campaign_id, default, footer).as_str()) {
         return None;
     }
-    footer.get(lang).cloned()
+    Some((default.to_string(), footer.clone()))
 }
 
 /// When a campaign's send starts (inside the transaction that locks it, on its connection): the
-/// footer wording each language the campaign can go out in needs, fixed for the rest of this send,
-/// as `_system` for each version's content. None when no version has language versions (then
+/// account's default language and the footer wording in exactly the languages the campaign can go
+/// out in (its versions' languages and that default), fixed for the rest of this send, as
+/// `_system` for each version's content. None when no version has language versions (then
 /// nothing is read).
 pub async fn system_snapshot(conn: &mut sqlx::PgConnection, secret: &str, account_id: Uuid, campaign_id: Uuid, contents: &[&Value]) -> sqlx::Result<Option<Value>> {
     let mut langs = Vec::new();
@@ -155,18 +163,16 @@ pub async fn system_snapshot(conn: &mut sqlx::PgConnection, secret: &str, accoun
     if !any {
         return Ok(None);
     }
-    let base = texts::load(conn, account_id, &[]).await?;
-    for l in base.all() {
-        if !langs.contains(&l) {
-            langs.push(l);
-        }
+    let default = texts::load(conn, account_id, &[]).await?.default_language;
+    if !langs.contains(&default) {
+        langs.push(default.clone());
     }
     // The account's wording in exactly these languages.
     let s = texts::load(conn, account_id, &langs).await?;
     let footer: Map<String, Value> = langs.iter().map(|l| (l.clone(), texts::footer_in(&s, l))).collect();
     let footer = Value::Object(footer);
-    let sig = snapshot_sig(secret, account_id, campaign_id, &footer);
-    Ok(Some(json!({"footer": footer, "campaign": campaign_id, "sig": sig})))
+    let sig = snapshot_sig(secret, account_id, campaign_id, &default, &footer);
+    Ok(Some(json!({"footer": footer, "default": default, "campaign": campaign_id, "sig": sig})))
 }
 
 /// The languages the saved blocks an email points at carry.

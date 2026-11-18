@@ -120,6 +120,6 @@ Right-to-left languages (Arabic, Hebrew, Persian, Urdu ...) get `dir="rtl"` on p
 
 - `GET /api/translations/system-texts?language=fr`: each text's key, where it appears, the English, the shipped translation and your wording.
 - `PUT /api/translations/system-texts` `{"language": "fr", "texts": {"unsub.button": "Je me désabonne"}}` (null goes back to the shipped text; keep `{name}` and `{days}`; no invisible characters; the unsubscribe and preference labels must show words). MCP: `get_system_texts`, `set_system_texts`.
-- A campaign's footer wording is fixed when its send starts: changing it later doesn't change what the rest of that campaign's recipients get.
+- A campaign's footer wording and your default language are fixed when its send starts, for the languages that campaign can go out in: changing them later doesn't change what the rest of that campaign's recipients get.
 
 Not included yet: a "view in browser" page (DumbMail has none), sign-up forms' own messages, and the "Reply STOP to opt out." line added to texts, which stays in English.
