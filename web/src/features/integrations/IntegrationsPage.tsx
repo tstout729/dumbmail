@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Plug, Plus, Sparkles } from "lucide-react";
 import { errorMessage } from "../../api/client";
-import { Button, Checkbox, EmptyRow, EmptyState, Field, InlineError, Input, Modal, Notice, Page, PageHeader, RowLink, SkeletonRows, Table, Td, Th } from "../../components/ui";
+import { Button, Checkbox, EmptyRow, EmptyState, Field, InlineError, Input, Modal, Notice, Page, PageHeader, RowLink, Select, SkeletonRows, Table, Td, Th } from "../../components/ui";
 import { formatNumber, formatRelative } from "../../lib/format";
 import { useCreateFromRecipe, useCreateIntegration, useIntegrations, useRecipes } from "./api";
 import { useCan } from "../team/api";
@@ -121,13 +121,33 @@ function IntegrationsList() {
 function AddIntegration({ onClose }: { onClose: () => void }) {
   const recipes = useRecipes();
   const [picked, setPicked] = useState<Recipe | "custom" | null>(null);
+  const [category, setCategory] = useState("");
+  const [search, setSearch] = useState("");
+  const all = recipes.data ?? [];
+  const categories = [...new Set(all.map((r) => r.category).filter((c): c is string => !!c))].sort();
+  const q = search.trim().toLowerCase();
+  const shown = all.filter((r) => (!category || r.category === category) && (!q || `${r.name} ${r.description}`.toLowerCase().includes(q)));
   return (
     <Modal title={picked === null ? "Add an integration" : picked === "custom" ? "Custom integration" : `Connect ${picked.name}`} onClose={onClose} size="lg">
       {picked === null ? (
         <div className="space-y-3">
           <p className="text-sm text-zinc-600">Start from a recipe, or build your own for any app that can send webhooks or has an API.</p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Select aria-label="Category" value={category} onChange={(e) => setCategory(e.target.value)} className="sm:w-48">
+              <option value="">All categories</option>
+              {categories.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </Select>
+            <Input aria-label="Search recipes" type="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search, e.g. Shopify, bookings" className="sm:flex-1" />
+          </div>
+          {recipes.isLoading ? <p className="text-sm text-zinc-500">Loading recipes…</p> : null}
+          {recipes.isError ? <InlineError message={errorMessage(recipes.error)} /> : null}
+          {!recipes.isLoading && !recipes.isError && shown.length === 0 ? <p className="text-sm text-zinc-500">No recipe matches. Build your own with "Any other app".</p> : null}
           <div className="grid gap-2 sm:grid-cols-2">
-            {(recipes.data ?? []).map((r) => (
+            {shown.map((r) => (
               <button key={r.key} type="button" onClick={() => setPicked(r)} className="rounded-lg border border-zinc-200 p-3 text-left transition-colors hover:border-accent-600 hover:bg-accent-50/40">
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-medium text-zinc-900">{r.name}</span>
