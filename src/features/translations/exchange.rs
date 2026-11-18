@@ -144,7 +144,7 @@ pub fn from_csv(text: &str) -> AppResult<Vec<Unit>> {
 
 /// Apply imported strings to `content` in `lang` as reviewed translations. Returns a summary:
 /// how many were applied, left empty, skipped because the default changed, or refused (with why).
-pub fn apply(content: &mut Value, lang: &str, units: &[Unit]) -> Value {
+pub fn apply(content: &mut Value, lang: &str, units: &[Unit], own: &[String]) -> Value {
     let current: Vec<Field> = fields::fields(content);
     let (mut applied, mut empty, mut changed) = (0, 0, Vec::new());
     let mut refused: Vec<Value> = Vec::new();
@@ -164,7 +164,7 @@ pub fn apply(content: &mut Value, lang: &str, units: &[Unit]) -> Value {
         if f.kind == fields::Kind::Link && target == source {
             continue;
         }
-        if let Err(why) = fields::check_text(f.kind, &f.source, target) {
+        if let Err(why) = fields::check_text_for(f.kind, &f.source, target, own) {
             refused.push(json!({"id": id, "why": why}));
             continue;
         }
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(units.len(), 2);
         units[0].2 = "Salut & <welcome> {{ first_name }}".into();
         units[1].2 = "<p>Achetez « maintenant »</p>".into();
-        let r = apply(&mut c, "fr", &units);
+        let r = apply(&mut c, "fr", &units, &[]);
         assert_eq!(r["applied"], 2, "{r}");
         assert_eq!(fields::entry(&c, "subject", "fr").unwrap()["text"], "Salut & <welcome> {{ first_name }}");
         let csv = to_csv(&c, "fr").unwrap();
@@ -196,10 +196,10 @@ mod tests {
         assert_eq!(rows[1].2, "<p>Achetez « maintenant »</p>");
         // The default changed after the export: that string is skipped.
         c["subject"] = json!("Hello {{ first_name }}");
-        let r = apply(&mut c, "fr", &rows);
+        let r = apply(&mut c, "fr", &rows, &[]);
         assert_eq!(r["changed_since_export"], json!(["subject"]));
         // A translation that drops a template tag is refused.
-        let r = apply(&mut c, "fr", &[("subject".into(), "Hello {{ first_name }}".into(), "Bonjour".into())]);
+        let r = apply(&mut c, "fr", &[("subject".into(), "Hello {{ first_name }}".into(), "Bonjour".into())], &[]);
         assert_eq!(r["refused"][0]["id"], "subject");
         assert!(from_xliff("not xml").is_err());
     }

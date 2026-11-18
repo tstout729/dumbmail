@@ -42,6 +42,12 @@ fn scheduled_ok(ctx: &Ctx) -> bool {
     crate::api::messaging::editable_for(ctx).contains(&"scheduled")
 }
 
+/// DumbMail's own hosts for this account (see `translations::own_hosts`).
+async fn own_hosts(state: &AppState, account_id: Uuid) -> AppResult<Vec<String>> {
+    let account = crate::campaigns::load_account(&state.db, account_id).await?;
+    Ok(super::own_hosts(state, Some(&account)))
+}
+
 // ---------- Account languages ----------
 
 pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
@@ -176,6 +182,7 @@ pub struct SetBody {
 }
 
 pub async fn set(state: &AppState, ctx: &Ctx, t: &Target, b: SetBody) -> AppResult<Value> {
+    let own = own_hosts(state, ctx.account_id).await?;
     ctx.require(write_perm(t))?;
     if b.strings.len() > fields::MAX_ENTRIES {
         return Err(AppError::bad(format!("at most {} strings at a time", fields::MAX_ENTRIES)));
@@ -200,7 +207,7 @@ pub async fn set(state: &AppState, ctx: &Ctx, t: &Target, b: SetBody) -> AppResu
             };
             match st.text.as_deref().filter(|t| !t.is_empty()) {
                 Some(text) => {
-                    fields::check_text(f.kind, &f.source, text).map_err(|e| AppError::bad(format!("{} ({}): {e}", f.label, f.id)))?;
+                    fields::check_text_for(f.kind, &f.source, text, &own).map_err(|e| AppError::bad(format!("{} ({}): {e}", f.label, f.id)))?;
                     fields::set_entry(&mut l.content, &f.id, &lang, Some((text, status)))?;
                 }
                 None => fields::set_entry(&mut l.content, &f.id, &lang, None)?,
@@ -283,6 +290,7 @@ pub struct ImportBody {
 }
 
 pub async fn import(state: &AppState, ctx: &Ctx, t: &Target, b: ImportBody) -> AppResult<Value> {
+    let own = own_hosts(state, ctx.account_id).await?;
     ctx.require(write_perm(t))?;
     let units = match b.format.as_str() {
         "xliff" | "xlf" => exchange::from_xliff(&b.data)?,
@@ -295,7 +303,7 @@ pub async fn import(state: &AppState, ctx: &Ctx, t: &Target, b: ImportBody) -> A
     let lang = check_lang(state, ctx.account_id, &b.language, &default).await?;
     let saved_block = matches!(t, Target::SavedBlock { .. });
     let summary = store::update(&state.db, ctx.account_id, t, scheduled_ok(ctx), |l| {
-        let r = exchange::apply(&mut l.content, &lang, &units);
+        let r = exchange::apply(&mut l.content, &lang, &units, &own);
         if !saved_block && r["applied"].as_u64().unwrap_or(0) > 0 {
             fields::add_language(&mut l.content, &default, &lang);
         }
@@ -790,6 +798,7 @@ pub struct ApplyBody {
 
 /// `content` with translations set (checked, with their source hashes filled in).
 pub async fn apply(state: &AppState, account_id: Uuid, b: ApplyBody) -> AppResult<Value> {
+    let own = own_hosts(state, account_id).await?;
     check_size(&b.content)?;
     let s = texts::settings(&state.db, account_id).await?;
     let mut content = b.content;
@@ -808,7 +817,7 @@ pub async fn apply(state: &AppState, account_id: Uuid, b: ApplyBody) -> AppResul
         let status = if st.status.as_deref() == Some("machine") { fields::MACHINE } else { fields::REVIEWED };
         match st.text.as_deref().filter(|t| !t.is_empty()) {
             Some(text) => {
-                fields::check_text(f.kind, &f.source, text).map_err(|e| AppError::bad(format!("{} ({}): {e}", f.label, f.id)))?;
+                fields::check_text_for(f.kind, &f.source, text, &own).map_err(|e| AppError::bad(format!("{} ({}): {e}", f.label, f.id)))?;
                 fields::set_entry(&mut content, &f.id, &lang, Some((text, status)))?;
             }
             None => fields::set_entry(&mut content, &f.id, &lang, None)?,
@@ -863,6 +872,7 @@ pub struct ImportContentBody {
 }
 
 pub async fn import_content(state: &AppState, account_id: Uuid, b: ImportContentBody) -> AppResult<Value> {
+    let own = own_hosts(state, account_id).await?;
     check_size(&b.content)?;
     let units = match b.format.as_str() {
         "xliff" | "xlf" => exchange::from_xliff(&b.data)?,
@@ -873,7 +883,7 @@ pub async fn import_content(state: &AppState, account_id: Uuid, b: ImportContent
     let mut content = b.content;
     let default = default_of(&content, &s);
     let lang = check_lang(state, account_id, &b.language, &default).await?;
-    let summary = exchange::apply(&mut content, &lang, &units);
+    let summary = exchange::apply(&mut content, &lang, &units, &own);
     if is_message(&content) && summary["applied"].as_u64().unwrap_or(0) > 0 {
         fields::add_language(&mut content, &default, &lang);
     }

@@ -572,7 +572,7 @@ async fn prepare_in<'c>(state: &AppState, account: &Account, content: &'c Value,
         return Ok(Some(Cow::Borrowed(content)));
     }
     let mut saved = load_saved(&state.db, account.id, &content_refs(content)).await?;
-    crate::features::translations::localize_saved(&mut saved, lang);
+    crate::features::translations::localize_saved(&mut saved, lang, &crate::features::translations::own_hosts(state, Some(account)));
     let (prepared, shows, rule_errors) = expand_with(state, account, content, ctx, &saved, false)?;
     if rule_errors > 0 {
         tracing::info!(account = %account.id, rules = rule_errors, "display rules couldn't be decided for a recipient; their blocks were hidden");

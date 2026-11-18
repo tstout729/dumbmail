@@ -56,6 +56,7 @@ pub async fn findings(state: &AppState, account: &Account, content: &Value) -> V
         return out;
     }
     let default_name = label(default.as_deref().unwrap_or("en"));
+    let own = super::own_hosts(state, Some(account));
     for lang in &langs {
         let name = label(lang);
         let sum = fields::summary(content, lang);
@@ -69,7 +70,7 @@ pub async fn findings(state: &AppState, account: &Account, content: &Value) -> V
         if n(MACHINE) > 0 {
             out.push(("translation_unreviewed", "warning", format!("{name}: {} not reviewed", plural(n(MACHINE), "machine draft is", "machine drafts are")), "They'll be sent as drafted. Have someone read them and mark them reviewed.".to_string()));
         }
-        let local = fields::localize(content, lang);
+        let local = fields::localize(content, lang, &own);
         let subject = local.get("subject").and_then(|v| v.as_str()).unwrap_or("").trim();
         if subject.chars().count() > 60 {
             out.push(("translation_subject_long", "warning", format!("{name}: shorten the subject line"), format!("It's {} characters; phones show about 40 and desktops about 60.", subject.chars().count())));

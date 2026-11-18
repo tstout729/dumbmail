@@ -28,6 +28,9 @@ enum Tok {
     /// `{% … %}` or `{# … #}`, normalized, with its opener.
     Ctl(String),
     Elem(Elem),
+    /// A `<` that starts a tag but can't be read as one: everything from there on, which must be
+    /// exactly the original's (a browser would read it in ways this can't predict).
+    Bad(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,14 +79,21 @@ fn norm_expr(inner: &str) -> String {
     out
 }
 
+// The scanners below work on bytes and only ever slice at ASCII delimiters, so they never split
+// a character.
+
+fn at_template(b: &[u8], j: usize) -> bool {
+    b[j..].starts_with(b"{{") || b[j..].starts_with(b"{%") || b[j..].starts_with(b"{#")
+}
+
 /// Where a template tag that starts at `i` (with `{{`, `{%` or `{#`) ends, quotes respected.
 fn tag_end(s: &str, i: usize) -> Option<usize> {
-    let close = match &s[i..i + 2] {
-        "{{" => "}}",
-        "{%" => "%}",
-        _ => "#}",
-    };
     let b = s.as_bytes();
+    let close: &[u8] = match &b[i..i + 2] {
+        b"{{" => b"}}",
+        b"{%" => b"%}",
+        _ => b"#}",
+    };
     let mut j = i + 2;
     let mut quote: Option<u8> = None;
     while j < b.len() {
@@ -91,7 +101,7 @@ fn tag_end(s: &str, i: usize) -> Option<usize> {
             Some(q) if b[j] == q => quote = None,
             Some(_) => {}
             None if b[j] == b'\'' || b[j] == b'"' => quote = Some(b[j]),
-            None if s[j..].starts_with(close) => return Some(j + 2),
+            None if b[j..].starts_with(close) => return Some(j + 2),
             None => {}
         }
         j += 1;
@@ -107,145 +117,151 @@ fn template_tok(t: &str) -> Tok {
     }
 }
 
-/// Where an HTML tag starting at `i` (`<`) ends: the `>` outside quotes and template tags.
-fn html_end(s: &str, i: usize) -> Option<usize> {
-    if s[i..].starts_with("<!--") {
-        return s[i + 4..].find("-->").map(|e| i + 4 + e + 3);
-    }
+fn starts_tag(b: &[u8], i: usize) -> bool {
+    b[i] == b'<' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'))
+}
+
+/// Skip a template tag at `j` if there is one (template tags are filled in before a browser
+/// reads the markup, and their output is escaped).
+fn skip_template(s: &str, j: usize) -> Option<Option<usize>> {
+    at_template(s.as_bytes(), j).then(|| tag_end(s, j))
+}
+
+/// Read the HTML tag starting at `i` (a `<` followed by a letter, `/`, `!` or `?`) the way an HTML5
+/// tokenizer does: the name ends at whitespace, `/` or `>`; a quote starts a value only right after
+/// `=`; an unquoted value ends at whitespace or `>`. None when it never ends.
+fn parse_tag(s: &str, i: usize) -> Option<(usize, Elem)> {
     let b = s.as_bytes();
+    let ws = |c: u8| c.is_ascii_whitespace();
+    if b[i..].starts_with(b"<!--") {
+        let e = s[i + 4..].find("-->")? + i + 4 + 3;
+        return Some((e, Elem { name: "!--".into(), attrs: Vec::new(), self_closing: false, raw: s[i..e].to_string() }));
+    }
+    if b[i + 1] == b'!' || b[i + 1] == b'?' {
+        let e = s[i..].find('>')? + i + 1;
+        let raw = s[i..e].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        return Some((e, Elem { name: "!".into(), attrs: Vec::new(), self_closing: false, raw }));
+    }
     let mut j = i + 1;
-    let mut quote: Option<u8> = None;
-    while j < b.len() {
-        if quote.is_none() && (s[j..].starts_with("{{") || s[j..].starts_with("{%") || s[j..].starts_with("{#")) {
-            j = tag_end(s, j)?;
-            continue;
-        }
-        match quote {
-            Some(q) if b[j] == q => quote = None,
-            Some(_) => {}
-            None if b[j] == b'"' || b[j] == b'\'' => quote = Some(b[j]),
-            None if b[j] == b'>' => return Some(j + 1),
-            None if b[j] == b'<' => return None,
-            None => {}
-        }
+    let closing = b[j] == b'/';
+    if closing {
         j += 1;
     }
-    None
-}
-
-fn starts_tag(s: &str, i: usize) -> bool {
-    let next = s[i + 1..].chars().next();
-    next.is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!')
-}
-
-fn parse_elem(raw: &str) -> Elem {
-    if raw.starts_with("<!--") {
-        return Elem { name: "!--".into(), attrs: Vec::new(), self_closing: false, raw: raw.to_string() };
+    let ns = j;
+    while j < b.len() && !ws(b[j]) && b[j] != b'/' && b[j] != b'>' {
+        j += 1;
     }
-    if raw.starts_with("<!") || raw.starts_with("<?") {
-        return Elem { name: "!".into(), attrs: Vec::new(), self_closing: false, raw: raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase() };
-    }
-    let body = &raw[1..raw.len() - 1];
-    let (closing, body) = match body.strip_prefix('/') {
-        Some(b) => (true, b),
-        None => (false, body),
-    };
-    let body = body.trim_end();
-    let (self_closing, body) = match body.strip_suffix('/') {
-        Some(b) => (true, b),
-        None => (false, body),
-    };
-    let name_end = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
-    let name = format!("{}{}", if closing { "/" } else { "" }, body[..name_end].to_lowercase());
+    let name = format!("{}{}", if closing { "/" } else { "" }, s[ns..j].to_lowercase());
     let mut attrs = Vec::new();
-    let rest = &body[name_end..];
-    let b = rest.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
+    let mut self_closing = false;
+    loop {
+        while j < b.len() && ws(b[j]) {
+            j += 1;
         }
-        if i >= b.len() {
-            break;
+        if j >= b.len() {
+            return None;
         }
-        let start = i;
-        while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'=' {
-            if rest[i..].starts_with("{{") || rest[i..].starts_with("{%") || rest[i..].starts_with("{#") {
-                i = tag_end(rest, i).unwrap_or(b.len());
-            } else {
-                i += 1;
+        match b[j] {
+            b'>' => return Some((j + 1, Elem { name, attrs, self_closing, raw: String::new() })),
+            b'/' => {
+                j += 1;
+                self_closing = b.get(j) == Some(&b'>');
+                continue;
+            }
+            _ => {}
+        }
+        self_closing = false;
+        // Attribute name (a leading `=` belongs to it).
+        let an = j;
+        j += 1;
+        while j < b.len() && !ws(b[j]) && !matches!(b[j], b'/' | b'>' | b'=') {
+            match skip_template(s, j) {
+                Some(e) => j = e?,
+                None => j += 1,
             }
         }
-        let aname = rest[start..i].to_lowercase();
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
+        let aname = s[an..j].to_lowercase();
+        while j < b.len() && ws(b[j]) {
+            j += 1;
         }
-        if i < b.len() && b[i] == b'=' {
-            i += 1;
-            while i < b.len() && b[i].is_ascii_whitespace() {
-                i += 1;
+        if j < b.len() && b[j] == b'=' {
+            j += 1;
+            while j < b.len() && ws(b[j]) {
+                j += 1;
             }
-            let value = if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
-                let q = b[i];
-                let vs = i + 1;
-                let mut j = vs;
+            if j >= b.len() {
+                return None;
+            }
+            let value = if b[j] == b'"' || b[j] == b'\'' {
+                let q = b[j];
+                let vs = j + 1;
+                j = vs;
                 while j < b.len() && b[j] != q {
-                    if rest[j..].starts_with("{{") || rest[j..].starts_with("{%") || rest[j..].starts_with("{#") {
-                        j = tag_end(rest, j).unwrap_or(b.len());
-                    } else {
-                        j += 1;
+                    match skip_template(s, j) {
+                        Some(e) => j = e?,
+                        None => j += 1,
                     }
                 }
-                let v = rest[vs..j.min(b.len())].to_string();
-                i = (j + 1).min(b.len());
+                if j >= b.len() {
+                    return None;
+                }
+                let v = s[vs..j].to_string();
+                j += 1;
                 v
             } else {
-                let vs = i;
-                while i < b.len() && !b[i].is_ascii_whitespace() {
-                    i += 1;
+                let vs = j;
+                while j < b.len() && !ws(b[j]) && b[j] != b'>' {
+                    match skip_template(s, j) {
+                        Some(e) => j = e?,
+                        None => j += 1,
+                    }
                 }
-                rest[vs..i].to_string()
+                s[vs..j].to_string()
             };
             attrs.push((aname, Some(value)));
-        } else if !aname.is_empty() {
+        } else {
             attrs.push((aname, None));
         }
     }
-    Elem { name, attrs, self_closing, raw: String::new() }
 }
 
 /// Read a string into tokens: text, template tags and HTML elements.
 fn tokens(s: &str) -> Vec<Tok> {
+    let b = s.as_bytes();
     let mut out = Vec::new();
-    let mut text = String::new();
-    let mut i = 0;
-    let flush = |text: &mut String, out: &mut Vec<Tok>| {
-        if !text.is_empty() {
-            out.push(Tok::Text(std::mem::take(text)));
+    let (mut i, mut ts) = (0, 0);
+    let flush = |from: usize, to: usize, out: &mut Vec<Tok>| {
+        if to > from {
+            out.push(Tok::Text(s[from..to].to_string()));
         }
     };
-    while i < s.len() {
-        let rest = &s[i..];
-        if rest.starts_with("{{") || rest.starts_with("{%") || rest.starts_with("{#") {
+    while i < b.len() {
+        if at_template(b, i) {
             if let Some(e) = tag_end(s, i) {
-                flush(&mut text, &mut out);
+                flush(ts, i, &mut out);
                 out.push(template_tok(&s[i..e]));
                 i = e;
+                ts = e;
                 continue;
             }
-        } else if rest.starts_with('<') && starts_tag(s, i) {
-            if let Some(e) = html_end(s, i) {
-                flush(&mut text, &mut out);
-                out.push(Tok::Elem(parse_elem(&s[i..e])));
-                i = e;
-                continue;
+        } else if starts_tag(b, i) {
+            flush(ts, i, &mut out);
+            match parse_tag(s, i) {
+                Some((e, el)) => {
+                    out.push(Tok::Elem(el));
+                    i = e;
+                    ts = e;
+                    continue;
+                }
+                None => {
+                    out.push(Tok::Bad(s[i..].to_string()));
+                    return out;
+                }
             }
         }
-        let c = rest.chars().next().expect("not empty");
-        text.push(c);
-        i += c.len_utf8();
+        i += 1;
     }
-    flush(&mut text, &mut out);
+    flush(ts, b.len(), &mut out);
     out
 }
 
@@ -288,6 +304,7 @@ fn describe(t: &Tok) -> String {
         Tok::Ctl(x) => format!("the template tag {x}…"),
         Tok::Elem(e) if e.name == "!--" => "an HTML comment".into(),
         Tok::Elem(e) => format!("<{}>", e.name),
+        Tok::Bad(_) => "an unfinished tag".into(),
         _ => String::new(),
     }
 }
@@ -317,15 +334,36 @@ fn same_elem(a: &Elem, b: &Elem) -> Result<(), String> {
     Ok(())
 }
 
+/// `s` with every template tag replaced by `with` (for parsing an address that has tags in it).
+pub fn without_tags(s: &str, with: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("{{") || rest.starts_with("{%") || rest.starts_with("{#") {
+            if let Some(e) = tag_end(s, i) {
+                out.push_str(with);
+                i = e;
+                continue;
+            }
+        }
+        let c = rest.chars().next().expect("not empty");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
 /// Whether `translation` changes only words of `original` (see the module docs).
 pub fn compare(original: &str, translation: &str) -> Result<(), String> {
     let (o, t) = (tokens(original), tokens(translation));
-    let structural = |v: &[Tok]| v.iter().filter(|x| matches!(x, Tok::Ctl(_) | Tok::Elem(_))).cloned().collect::<Vec<_>>();
+    let structural = |v: &[Tok]| v.iter().filter(|x| matches!(x, Tok::Ctl(_) | Tok::Elem(_) | Tok::Bad(_))).cloned().collect::<Vec<_>>();
     let (os, ts) = (structural(&o), structural(&t));
     for (i, (a, b)) in os.iter().zip(&ts).enumerate() {
         match (a, b) {
             (Tok::Elem(x), Tok::Elem(y)) => same_elem(x, y)?,
             (Tok::Ctl(x), Tok::Ctl(y)) if x == y => {}
+            (Tok::Bad(x), Tok::Bad(y)) if x == y => {}
             _ => return Err(format!("it must keep the original's tags and markup in the same order: {} at position {} became {}", describe(a), i + 1, describe(b))),
         }
     }
@@ -369,6 +407,29 @@ mod tests {
         assert!(compare("Sale today", "Soldes <b>aujourd'hui</b>").is_err(), "no markup in a plain-text field");
         assert!(compare("<p>a</p><p>b</p>", "<p>a<p>b</p></p>").is_err(), "nesting");
         assert!(compare("<!--[if mso]>x<![endif]-->", "<!--[if !mso]>x<![endif]-->").is_err());
+    }
+
+    #[test]
+    fn tags_are_read_the_way_a_browser_reads_them() {
+        // A tag that never closes, or one that swallows the next one, isn't text.
+        assert!(compare("<p>Hi</p>", "<p>Hi <img src=x onerror=alert(1) <b>x</b></p>").is_err());
+        assert!(compare("<p>Hi</p>", "<p>Hi</p><img src=x onerror=alert(1)").is_err());
+        assert!(compare("Win <SAVE", "Gagnez <SAVE x").is_err(), "an unreadable tag must match from there on");
+        assert!(compare("Win <SAVE", "Gagnez <SAVE").is_ok());
+        assert!(compare("Win <SAVE now", "Win <SAVE now").is_ok());
+        // A quote inside a words attribute can't open a new attribute.
+        assert!(compare("<img src=\"a.png\" alt=\"A bag\">", "<img src=\"a.png\" alt=\"x\" onerror=\"alert(1)\">").is_err());
+        assert!(compare("<img src=\"a.png\" alt='A bag'>", "<img src=\"a.png\" alt='Un \"sac\"'>").is_ok());
+        // An unquoted value ends at whitespace; a quote in the middle of one doesn't start a string.
+        assert!(compare("<a href=https://a.test/x>Go</a>", "<a href=https://a.test/x>Aller</a>").is_ok());
+        assert!(compare("<a title=a'b href=https://a.test>Go</a>", "<a title=a'b href=https://a.test>Aller</a>").is_ok());
+        // Text in other scripts, in text, attributes and template tags, never splits a character.
+        assert!(compare("<p title=\"日本\">こんにちは {{ x|default('名前') }}</p>", "<p title=\"Japon\">Bonjour {{ x|default('名前') }}</p>").is_ok());
+        assert!(compare("<a href=\"https://a.test/é\">é</a>", "<a href=\"https://a.test/é\">ê</a>").is_ok());
+        for weird in ["<é", "<a é=1>", "{{ 'é", "<a href=\"é", "<!-- é", "<p 日=本>x</p>", "<{{ é }}>", "<a {{ é }}>"] {
+            let _ = compare(weird, weird);
+            let _ = compare("x", weird);
+        }
     }
 
     #[test]

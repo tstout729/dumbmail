@@ -420,10 +420,65 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
         }
     }
     if kind == Kind::Link {
-        let lower = text.trim().to_ascii_lowercase();
-        if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:") || lower.starts_with("tel:")) || text.len() > 2048 || text.trim().contains(char::is_whitespace) {
-            return Err("a localized link must start with https://, http://, mailto: or tel:".into());
-        }
+        check_link(source, text)?;
+    }
+    Ok(())
+}
+
+/// The scheme of a link, lower case (`https`, `mailto`).
+fn scheme(u: &str) -> String {
+    u.trim().split(':').next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// Whether a link is one of DumbMail's own (unsubscribe, preferences, any address on `own` hosts),
+/// which can't be localized.
+pub fn dumbmail_link(u: &str, own: &[String]) -> bool {
+    if u.contains("unsubscribe_url") {
+        return true;
+    }
+    let plain = super::structure::without_tags(u.trim(), "x");
+    url::Url::parse(&plain).ok().and_then(|p| p.host_str().map(str::to_ascii_lowercase)).is_some_and(|h| own.iter().any(|o| h == *o || h.ends_with(&format!(".{o}"))))
+}
+
+/// Why `text` can't replace the link `source`, if it can't: a real web address (https, or http when
+/// the original was http) with a host written out (no template tag in it) and no user name or
+/// password, or a `mailto:`/`tel:` link replacing one of the same kind. DumbMail's own links
+/// (unsubscribe, preferences) can't be localized at all.
+fn check_link(source: &str, text: &str) -> Result<(), String> {
+    if dumbmail_link(source, &[]) {
+        return Err("this is DumbMail's own link (unsubscribe or preferences); it can't be localized".into());
+    }
+    let t = text.trim();
+    if t != text || t.is_empty() || t.len() > 2048 || super::structure::without_tags(t, "x").chars().any(char::is_whitespace) {
+        return Err("a localized link is one address with no spaces".into());
+    }
+    let (from, to) = (scheme(source), scheme(t));
+    match to.as_str() {
+        "mailto" | "tel" if from == to => return if t.len() > to.len() + 1 { Ok(()) } else { Err(format!("give the {to}: address")) },
+        "mailto" | "tel" => return Err(format!("a {to}: link can only replace a {to}: link")),
+        _ if from == "mailto" || from == "tel" => return Err(format!("a {from}: link can only be localized to another {from}: link")),
+        "https" => {}
+        "http" if from == "http" => {}
+        _ => return Err("a localized link must be an https:// web address".into()),
+    }
+    let after = t[to.len()..].strip_prefix("://").ok_or("a localized link must be a full web address like https://example.com/fr")?;
+    let authority = &after[..after.find(['/', '?', '#']).unwrap_or(after.len())];
+    if authority.contains('{') || authority.contains('%') {
+        return Err("a localized link's host must be written out, not filled in by a template tag".into());
+    }
+    let parsed = url::Url::parse(&super::structure::without_tags(t, "x")).map_err(|_| "that isn't a web address".to_string())?;
+    if parsed.host_str().is_none_or(|h| h.is_empty()) || authority.contains('@') || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("a localized link needs a host, and no user name or password".into());
+    }
+    Ok(())
+}
+
+/// [`check_text`] plus, for links, that neither the original nor the translation is on one of
+/// DumbMail's own hosts (`own`, see `translations::own_hosts`).
+pub fn check_text_for(kind: Kind, source: &str, text: &str, own: &[String]) -> Result<(), String> {
+    check_text(kind, source, text)?;
+    if kind == Kind::Link && (dumbmail_link(source, own) || dumbmail_link(text, own)) {
+        return Err("links to DumbMail's own pages (unsubscribe, preferences, tracking) can't be localized".into());
     }
     Ok(())
 }
@@ -583,7 +638,7 @@ pub fn choose(content: &Value, person_locale: Option<&str>, pinned: Option<&str>
 
 /// One block in `lang`: each translated field that's current replaces the default text, then the
 /// translations are taken off (also from blocks inside columns and saved blocks).
-pub fn localize_block(b: &mut Value, lang: &str) {
+pub fn localize_block(b: &mut Value, lang: &str, own: &[String]) {
     if let Some(o) = b.as_object_mut() {
         if let Some(i18n) = o.remove("i18n") {
             if let Some(m) = i18n.get(lang).and_then(|m| m.as_object()) {
@@ -591,7 +646,7 @@ pub fn localize_block(b: &mut Value, lang: &str) {
                     let Some(kind) = block_field_kind(b, path) else { continue };
                     let Some(source) = get_path(b, path) else { continue };
                     let text = s(e, "text");
-                    if text.is_empty() || s(e, "source") != hash(source) || check_text(kind, source, text).is_err() {
+                    if text.is_empty() || s(e, "source") != hash(source) || check_text_for(kind, source, text, own).is_err() {
                         continue;
                     }
                     let text = text.to_string();
@@ -604,13 +659,13 @@ pub fn localize_block(b: &mut Value, lang: &str) {
         "columns" => {
             for col in b.get_mut("columns").and_then(|c| c.as_array_mut()).into_iter().flatten() {
                 for x in col.as_array_mut().into_iter().flatten() {
-                    localize_block(x, lang);
+                    localize_block(x, lang, own);
                 }
             }
         }
         "saved" => {
             for x in b.get_mut("blocks").and_then(|v| v.as_array_mut()).into_iter().flatten() {
-                localize_block(x, lang);
+                localize_block(x, lang, own);
             }
         }
         _ => {}
@@ -619,7 +674,7 @@ pub fn localize_block(b: &mut Value, lang: &str) {
 
 /// `content` in `lang` (see [`localize_block`]), without its translations, with `_lang` set (unless
 /// `lang` is empty: then the computed keys are only removed).
-pub fn localize(content: &Value, lang: &str) -> Value {
+pub fn localize(content: &Value, lang: &str, own: &[String]) -> Value {
     let mut c = content.clone();
     let Some(o) = c.as_object_mut() else { return c };
     for k in COMPUTED {
@@ -641,7 +696,7 @@ pub fn localize(content: &Value, lang: &str) -> Value {
     }
     if let Some(blocks) = o.get_mut("blocks").and_then(|b| b.as_array_mut()) {
         for b in blocks {
-            localize_block(b, lang);
+            localize_block(b, lang, own);
         }
     }
     if !lang.is_empty() {
@@ -717,7 +772,7 @@ mod tests {
         // The default heading changes: its French is stale and the default is sent for it.
         c["blocks"][0]["text"] = json!("Hello there");
         check_saved(&c).unwrap();
-        let fr = localize(&c, "fr");
+        let fr = localize(&c, "fr", &[]);
         assert_eq!(fr["subject"], "Salut {{ first_name }}");
         assert_eq!(fr["blocks"][0]["text"], "Hello there");
         assert_eq!(fr["blocks"][1]["columns"][0][0]["href"], "https://a.test/fr");
@@ -736,6 +791,28 @@ mod tests {
         assert!(check_text(Kind::Text, "Hi", "Salut {{ person.properties.secret }}").is_err());
         assert!(check_text(Kind::Html, "{% if x %}a{% endif %}", "{% endif %}b{% if x %}").is_err(), "tags in the wrong order don't parse");
         assert!(check_text(Kind::Link, "https://a.test", "javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn localized_links_are_real_web_addresses() {
+        let ok = |src: &str, t: &str| check_text(Kind::Link, src, t);
+        assert!(ok("https://a.test/en", "https://a.test/fr?x={{ id }}").is_err(), "a tag the original doesn't have");
+        assert!(ok("https://a.test/en?x={{ id }}", "https://a.test/fr?x={{ id }}").is_ok());
+        assert!(ok("https://a.test/en", "https://b.test/fr").is_ok());
+        assert!(ok("http://a.test/en", "http://a.test/fr").is_ok(), "http only where the original was");
+        assert!(ok("https://a.test/en", "http://a.test/fr").is_err());
+        for bad in ["javascript:alert(1)", "data:text/html,x", "https://", "https://user:pw@a.test/fr", "https://a.test@evil.test/", "ftp://a.test", "//a.test/fr", " https://a.test/fr", "mailto:fr@a.test"] {
+            assert!(ok("https://a.test/en", bad).is_err(), "{bad}");
+        }
+        assert!(ok("https://{{ shop }}/en", "https://{{ shop }}/fr").is_err(), "the host is written out");
+        assert!(ok("mailto:en@a.test", "mailto:fr@a.test").is_ok());
+        assert!(ok("tel:+15035550100", "tel:+33100000000").is_ok());
+        assert!(ok("mailto:en@a.test", "https://a.test").is_err());
+        assert!(ok("{{ unsubscribe_url }}", "{{ unsubscribe_url }}").is_err(), "DumbMail's own links aren't localized");
+        let own = vec!["pl.test".to_string()];
+        assert!(check_text_for(Kind::Link, "https://a.test/en", "https://pl.test/u/abc", &own).is_err());
+        assert!(check_text_for(Kind::Link, "https://links.pl.test/x", "https://a.test/fr", &own).is_err());
+        assert!(check_text_for(Kind::Link, "https://a.test/en", "https://a.test/fr", &own).is_ok());
         let mut c = email();
         add_language(&mut c, "en", "fr");
         c["translations"]["fields"] = json!({"fr": {"subject": {"text": "Salut", "status": "reviewed", "source": hash("Hi {{ first_name }}")}}});

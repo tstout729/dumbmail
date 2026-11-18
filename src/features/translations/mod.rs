@@ -61,7 +61,7 @@ fn pin() -> Option<String> {
 pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx: &Value) -> AppResult<Option<(Value, String)>> {
     let person = ctx.pointer("/person/locale").and_then(|v| v.as_str());
     let Some(lang) = fields::choose(content, person, pin().as_deref()) else { return Ok(None) };
-    let mut out = fields::localize(content, &lang);
+    let mut out = fields::localize(content, &lang, &own_hosts(state, Some(account)));
     if !lang.is_empty() {
         out["_footer"] = texts::footer(&state.db, account.id, &lang).await;
     }
@@ -69,15 +69,30 @@ pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx
 }
 
 /// Saved blocks in the language being sent (their blocks carry their own translations).
-pub fn localize_saved(saved: &mut SavedMap, lang: &str) {
+pub fn localize_saved(saved: &mut SavedMap, lang: &str, own: &[String]) {
     if lang.is_empty() {
         return;
     }
     for (_, blocks) in saved.values_mut() {
         for b in blocks.as_array_mut().into_iter().flatten() {
-            fields::localize_block(b, lang);
+            fields::localize_block(b, lang, own);
         }
     }
+}
+
+/// DumbMail's own hosts (the app, the link host, the marketing site, retired hosts and the
+/// account's branded link domain): links there (unsubscribe, preferences, tracking) can't be
+/// localized, and no localized link can point there.
+pub fn own_hosts(state: &AppState, account: Option<&Account>) -> Vec<String> {
+    let host = |u: &str| url::Url::parse(u).ok().and_then(|p| p.host_str().map(str::to_ascii_lowercase));
+    let mut v: Vec<String> = [Some(state.cfg.public_url()), Some(state.cfg.link_url()), state.cfg.site_url()].into_iter().flatten().filter_map(host).collect();
+    v.extend(state.cfg.redirect_hosts.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()));
+    if let Some(d) = account.and_then(|a| a.link_domain.as_deref()) {
+        v.push(d.trim().to_ascii_lowercase());
+    }
+    v.sort();
+    v.dedup();
+    v
 }
 
 // ---------- A person's language ----------
