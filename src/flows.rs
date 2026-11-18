@@ -110,7 +110,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
+            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -202,6 +202,8 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for key in [&def.settings.exit_condition, &def.settings.profile_filter].into_iter().flatten() {
         segments::parse(key)?;
     }
+    // Delay options, trigger splits and notification steps (see features::flows_plus).
+    crate::features::flows_plus::validate(&def, v)?;
     Ok(def)
 }
 
@@ -347,13 +349,37 @@ async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
 pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: Value) -> AppResult<Option<Uuid>> {
     let def = parse_definition(&flow.definition)?;
     let Some(entry) = def.entry.clone() else { return Ok(None) };
+    if let Some(f) = &def.settings.profile_filter {
+        if !segments::profile_matches(&state.db, profile_id, &segments::load(&state.db, flow.account_id, f, None).await?).await? {
+            return Ok(None);
+        }
+    }
+    let mut tx = state.db.begin().await?;
+    let id = enter(&mut tx, flow, &def, profile_id, &entry, &context, None).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Start a run at step `node` inside `tx` unless re-entry rules say no, with its first job at
+/// `run_at` (now when None). The re-entry check and the insert run under a lock on this flow and
+/// person, so two starts can't both pass it. Back-populate uses this to place people mid-flow.
+pub async fn enter(
+    tx: &mut sqlx::PgConnection,
+    flow: &FlowRow,
+    def: &FlowDef,
+    profile_id: Uuid,
+    node: &str,
+    context: &Value,
+    run_at: Option<chrono::DateTime<Utc>>,
+) -> AppResult<Option<Uuid>> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(profile_id).execute(&mut *tx).await?;
     let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
     let blocked: bool = match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
         (Value::String(s), _) if s == "always" => {
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')")
                 .bind(flow.id)
                 .bind(profile_id)
-                .fetch_one(&state.db)
+                .fetch_one(&mut *tx)
                 .await?
         }
         (_, Some(days)) => {
@@ -361,24 +387,19 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
                 .bind(flow.id)
                 .bind(profile_id)
                 .bind(days * 86400.0)
-                .fetch_one(&state.db)
+                .fetch_one(&mut *tx)
                 .await?
         }
         _ => {
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2)")
                 .bind(flow.id)
                 .bind(profile_id)
-                .fetch_one(&state.db)
+                .fetch_one(&mut *tx)
                 .await?
         }
     };
     if blocked {
         return Ok(None);
-    }
-    if let Some(f) = &def.settings.profile_filter {
-        if !segments::profile_matches(&state.db, profile_id, &segments::load(&state.db, flow.account_id, f, None).await?).await? {
-            return Ok(None);
-        }
     }
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context) VALUES ($1, $2, $3, $4, $5, $6)")
@@ -386,11 +407,11 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
         .bind(flow.id)
         .bind(flow.account_id)
         .bind(profile_id)
-        .bind(&entry)
-        .bind(&context)
-        .execute(&state.db)
+        .bind(node)
+        .bind(context)
+        .execute(&mut *tx)
         .await?;
-    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": id}), None).await?;
+    crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": id}), run_at).await?;
     Ok(Some(id))
 }
 
@@ -591,6 +612,17 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
         let mut next = node.next().map(str::to_string);
         match node.kind.as_str() {
             "delay" if !waited => {
+                // A time of day, weekdays or a date (see features::flows_plus::delay); plain delays: None.
+                let until = match crate::features::flows_plus::delay::begin(&account, &person, &node, &mut context, Utc::now()) {
+                    None => None,
+                    Some(crate::features::flows_plus::delay::Wait::Until(at)) => Some(at),
+                    Some(crate::features::flows_plus::delay::Wait::Exit) => return finish(&state.db, run.id, "exited").await,
+                    Some(crate::features::flows_plus::delay::Wait::Continue) => {
+                        current = next;
+                        sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&current).bind(&context).execute(&state.db).await?;
+                        continue;
+                    }
+                };
                 let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let secs = amount
                     * match node.str("unit") {
@@ -605,11 +637,17 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     .bind(&context)
                     .execute(&state.db)
                     .await?;
-                let at = Utc::now() + Duration::milliseconds((secs * 1000.0) as i64);
+                let at = until.unwrap_or_else(|| Utc::now() + Duration::milliseconds((secs * 1000.0) as i64));
                 crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
                 return Ok(());
             }
             "delay" => {
+                if let Some(at) = crate::features::flows_plus::delay::wake(&account, &person, &node, &mut context, Utc::now()) {
+                    // Woken before its time (or its time moved with the person's zone): keep waiting.
+                    sqlx::query("UPDATE flow_runs SET context = $2 WHERE id = $1").bind(run.id).bind(&context).execute(&state.db).await?;
+                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                    return Ok(());
+                }
                 if let Some(o) = context.as_object_mut() {
                     o.remove("_waited");
                 }
@@ -659,7 +697,9 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
             }
             "condition" => {
                 let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-                let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                // A trigger split also tests the event that started the run (see features::flows_plus::split).
+                let yes = crate::features::flows_plus::split::event_matches(&node, &context)
+                    && segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }
             // Wait until they text back (yes) or the time runs out (no); see `features::inbox`. The
@@ -730,6 +770,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     }
                 }
             }
+            "notify" => crate::features::flows_plus::notify::run(state, &account, &flow, &person, run.id, &node_id, &node, &context).await?,
             "webhook" => {
                 let url = node.str("url").unwrap_or_default().to_string();
                 let payload = json!({

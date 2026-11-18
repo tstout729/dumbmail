@@ -740,6 +740,8 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
         }
     }
+    // Notification steps: outside addresses get a confirmation link the first time.
+    crate::features::flows_plus::on_save(state, account_id, &def).await?;
     Ok(())
 }
 
