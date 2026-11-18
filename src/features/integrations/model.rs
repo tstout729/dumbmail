@@ -59,9 +59,18 @@ impl Integration {
         Signature::parse(&self.signature).map_err(|e| e.public_message())
     }
 
-    /// Whether webhooks can be accepted: the check's settings read, and its secret is saved.
-    fn signature_ready(&self) -> bool {
-        self.signature().is_ok_and(|s| !s.needs_secret() || self.signature_secret_enc.is_some())
+    /// What stops webhooks being accepted, if anything: settings that don't read, or a secret that's
+    /// missing or that the check can't sign with (the same test the verifier makes first).
+    fn signature_problem(&self, state: &AppState) -> Option<String> {
+        let sig = match self.signature() {
+            Ok(s) => s,
+            Err(e) => return Some(e),
+        };
+        let secret = match self.secret(state) {
+            Ok(s) => s,
+            Err(_) => return Some("the signing secret can't be read; save it again".into()),
+        };
+        signature::check_secret(&sig, secret.as_deref()).err()
     }
 
     pub fn pull_config(&self) -> Option<PullConfig> {
@@ -153,13 +162,14 @@ impl Integration {
 
     /// The API's view: no secrets, only hints that they're saved.
     pub fn view(&self, state: &AppState) -> Value {
+        let problem = self.signature_problem(state);
         json!({
             "id": self.id, "name": self.name, "recipe": self.recipe, "status": self.status,
             "inbound_url": self.inbound_url(state),
             "signature": self.signature,
             "signature_secret": self.signature_secret_hint.as_ref().map(|h| json!({"saved": true, "hint": h})).unwrap_or(json!({"saved": false})),
-            "signature_ready": self.signature_ready(),
-            "signature_error": self.signature().err(),
+            "signature_ready": problem.is_none(),
+            "signature_error": problem,
             "script": self.script, "settings": self.settings, "pull": self.pull,
             "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id,
             "metrics": self.metrics, "redact": self.redact,
@@ -180,7 +190,8 @@ impl Integration {
 
     /// The view for people who may see integrations but not change them: no inbound URL (it is a
     /// credential), no saved state or backfill cursor (they can hold people's details).
-    pub fn view_limited(&self) -> Value {
+    pub fn view_limited(&self, state: &AppState) -> Value {
+        let problem = self.signature_problem(state);
         let backfill = self.backfill.as_ref().map(|b| {
             let mut b = b.clone();
             if let Some(o) = b.as_object_mut() {
@@ -194,8 +205,8 @@ impl Integration {
             "inbound_url": null, "limited": true,
             "signature": self.signature,
             "signature_secret": json!({"saved": self.signature_secret_hint.is_some()}),
-            "signature_ready": self.signature_ready(),
-            "signature_error": self.signature().err(),
+            "signature_ready": problem.is_none(),
+            "signature_error": problem,
             "script": self.script, "settings": self.settings, "pull": self.pull,
             "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id, "metrics": self.metrics, "redact": self.redact,
             "pull_next_at": self.pull_next_at,
@@ -208,10 +219,10 @@ impl Integration {
     }
 
     /// A short view for lists.
-    pub fn summary(&self) -> Value {
+    pub fn summary(&self, state: &AppState) -> Value {
         json!({
             "id": self.id, "name": self.name, "recipe": self.recipe, "status": self.status,
-            "has_pull": self.pull.is_some(), "signature_ready": self.signature_ready(), "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
+            "has_pull": self.pull.is_some(), "signature_ready": self.signature_problem(state).is_none(), "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
             "last_delivery_at": self.last_delivery_at, "last_error": self.last_error, "last_error_at": self.last_error_at,
             "created_at": self.created_at,
         })
@@ -405,6 +416,19 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
         Some(v) => Some(serde_json::to_value(Signature::parse(v)?)?),
         None => None,
     };
+    // The settings and the secret that will be saved together must be able to verify a request:
+    // checked the same way the verifier checks them (a secret not saved yet is fine for now).
+    let sig_after = match &signature {
+        Some(v) => Some(Signature::parse(v)?),
+        None => cur.signature().ok(),
+    };
+    let secret_after = match c.signature_secret.as_deref() {
+        Some(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
+        None => cur.secret(state)?,
+    };
+    if let (Some(sig), Some(secret)) = (&sig_after, &secret_after) {
+        signature::check_secret(sig, Some(secret)).map_err(|e| AppError::bad(format!("the signing secret doesn't work with these signature settings: {e}")))?;
+    }
     let (secret_enc, secret_hint, set_secret) = match c.signature_secret.as_deref() {
         Some("") => (None, None, true),
         Some(s) if s.len() > 1000 => return Err(AppError::bad("the signing secret is too long")),

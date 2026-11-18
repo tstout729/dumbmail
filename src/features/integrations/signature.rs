@@ -173,14 +173,36 @@ fn check_header_name(h: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Check a request. `url` is the webhook URL as the app was given it (for `sign_url`); `now` is
-/// Unix seconds.
-pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query: &HashMap<String, String>, url: &str, body: &[u8], now: i64) -> Result<(), String> {
+/// The key a check signs with, from the saved secret: the same step [`verify`] takes first, so
+/// "ready" (and saving) can say whether a request could ever verify.
+fn signing_key(sig: &Signature, secret: Option<&str>) -> Result<Vec<u8>, String> {
     let secret = match (sig, secret) {
-        (Signature::None, _) => return Ok(()),
+        (Signature::None, _) => return Ok(Vec::new()),
         (_, Some(s)) if !s.is_empty() => s,
         _ => return Err("this integration checks signatures but has no signing secret saved".into()),
     };
+    match sig {
+        Signature::Hmac { format: Format::Svix, .. } => {
+            b64(secret.strip_prefix("whsec_").unwrap_or(secret)).filter(|k| !k.is_empty()).ok_or_else(|| "the signing secret should look like whsec_ followed by base64".into())
+        }
+        Signature::Hmac { format: Format::Plain, secret_encoding: Some(Encoding::Base64), .. } => b64(secret).filter(|k| !k.is_empty()).ok_or_else(|| "the signing secret isn't valid base64".into()),
+        _ => Ok(secret.as_bytes().to_vec()),
+    }
+}
+
+/// Whether this secret works with these settings (see [`signing_key`]).
+pub fn check_secret(sig: &Signature, secret: Option<&str>) -> Result<(), String> {
+    signing_key(sig, secret).map(|_| ())
+}
+
+/// Check a request. `url` is the webhook URL as the app was given it (for `sign_url`); `now` is
+/// Unix seconds.
+pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query: &HashMap<String, String>, url: &str, body: &[u8], now: i64) -> Result<(), String> {
+    if matches!(sig, Signature::None) {
+        return Ok(());
+    }
+    let key = signing_key(sig, secret)?;
+    let secret = secret.unwrap_or_default();
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
     match sig {
         Signature::None => Ok(()),
@@ -198,7 +220,7 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                 Err("the shared secret doesn't match".into())
             }
         }
-        Signature::Hmac { algorithm, header: name, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding, timestamp_separator, timestamp_unit, sign_url } => {
+        Signature::Hmac { algorithm, header: name, format, encoding, prefix, timestamp_header, tolerance_seconds, secret_encoding: _, timestamp_separator, timestamp_unit, sign_url } => {
             let raw = header(name).ok_or_else(|| format!("the {name} header is missing"))?;
             let tolerance = tolerance_seconds.unwrap_or(300);
             let unit = timestamp_unit.unwrap_or_default();
@@ -216,10 +238,6 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
             };
             match format {
                 Format::Plain => {
-                    let key = match secret_encoding.unwrap_or(Encoding::Utf8) {
-                        Encoding::Base64 => b64(secret).filter(|k| !k.is_empty()).ok_or("the signing secret isn't valid base64")?,
-                        _ => secret.as_bytes().to_vec(),
-                    };
                     let mut text = raw;
                     if let Some(p) = prefix {
                         text = strip_prefix_ci(text, p).ok_or_else(|| format!("the signature doesn't start with {p:?}"))?;
@@ -277,7 +295,6 @@ pub fn verify(sig: &Signature, secret: Option<&str>, headers: &HeaderMap, query:
                     let id = header(&format!("{base}-id")).ok_or_else(|| format!("the {base}-id header is missing"))?;
                     let ts = header(&format!("{base}-timestamp")).ok_or_else(|| format!("the {base}-timestamp header is missing"))?;
                     fresh(ts)?;
-                    let key = b64(secret.strip_prefix("whsec_").unwrap_or(secret)).filter(|k| !k.is_empty()).ok_or("the signing secret should look like whsec_ followed by base64")?;
                     let signed = [id.as_bytes(), b".", ts.as_bytes(), b".", body].concat();
                     let ok = raw
                         .split_whitespace()

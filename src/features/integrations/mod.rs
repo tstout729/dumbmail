@@ -205,7 +205,7 @@ impl Feature for Module {
                     let id = uuid_arg(a, "id")?;
                     let i = model::load(state, acct, id).await?;
                     if !confirmed(a) {
-                        return Ok(json!({"dry_run": true, "integration": i.summary(), "note": "Nothing deleted. This removes the integration and its delivery log (profiles and events it wrote stay). Call again with confirm=true once the user approves."}));
+                        return Ok(json!({"dry_run": true, "integration": i.summary(state), "note": "Nothing deleted. This removes the integration and its delivery log (profiles and events it wrote stay). Call again with confirm=true once the user approves."}));
                     }
                     api::remove(state, ctx, id).await?;
                     Ok(json!({"deleted": true}))

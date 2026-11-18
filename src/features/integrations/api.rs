@@ -58,7 +58,7 @@ pub fn can_manage(ctx: &Ctx) -> bool {
 
 /// The integration as this caller may see it.
 pub fn view_for(i: &model::Integration, state: &AppState, ctx: &Ctx) -> Value {
-    if can_manage(ctx) { i.view(state) } else { i.view_limited() }
+    if can_manage(ctx) { i.view(state) } else { i.view_limited(state) }
 }
 
 /// Audit-log a change to an integration (fixed fields only: never payloads or secret values).
@@ -264,7 +264,7 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
 
 pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     let rows = model::list(state, account_id).await?;
-    Ok(json!({"data": rows.iter().map(|i| i.summary()).collect::<Vec<_>>()}))
+    Ok(json!({"data": rows.iter().map(|i| i.summary(state)).collect::<Vec<_>>()}))
 }
 
 pub async fn create(state: &AppState, ctx: &Ctx, c: Changes) -> AppResult<Value> {

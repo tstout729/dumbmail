@@ -1265,8 +1265,20 @@ async fn unreadable_signature_settings_and_empty_keys_refuse_every_webhook() {
     assert_eq!(list["data"][0]["signature_ready"], false);
     let log = h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await;
     assert!(log["data"][0]["error"].as_str().unwrap().contains("can't be read"), "{log}");
-    // A whsec_ secret that decodes to an empty key never verifies, even with a matching empty-key HMAC.
-    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "hmac", "header": "svix-signature", "format": "svix"}, "signature_secret": "whsec_"}))).await;
+    // A whsec_ secret that decodes to an empty key can't be saved with the svix format (the same
+    // check the verifier makes), nor can the format be switched under such a secret.
+    let (st, e) = h.req("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "hmac", "header": "svix-signature", "format": "svix"}, "signature_secret": "whsec_"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "hmac", "header": "svix-signature"}, "signature_secret": "whsec_"}))).await;
+    let (st, e) = h.req("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "hmac", "header": "svix-signature", "format": "svix"}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{e}");
+    // Stored that way anyway (an older row): not ready, and it never verifies, even with a matching empty-key HMAC.
+    sqlx::query("UPDATE integrations SET signature = '{\"type\": \"hmac\", \"header\": \"svix-signature\", \"format\": \"svix\"}' WHERE id = $1::uuid").bind(&id).execute(&h.state.db).await.unwrap();
+    let v = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    assert_eq!(v["signature_ready"], false, "{v}");
+    assert!(v["signature_error"].as_str().is_some_and(|e| e.contains("whsec_")), "{v}");
+    let list = h.ok("GET", "/api/integrations", None).await;
+    assert_eq!(list["data"][0]["signature_ready"], false);
     let body = r#"{"email": "anyone@example.com"}"#;
     let ts = chrono::Utc::now().timestamp().to_string();
     let mac = b64(&mac256(b"", format!("msg_1.{ts}.{body}").as_bytes()));
