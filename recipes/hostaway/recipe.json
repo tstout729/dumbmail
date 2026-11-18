@@ -8,7 +8,8 @@
     "Reservation Total",
     "Reservation Confirmed",
     "Reservation Cancelled",
-    "Inquiry Received"
+    "Inquiry Received",
+    "Reservation Unconfirmed"
   ],
   "docs": [
     "https://api.hostaway.com/documentation"
@@ -34,7 +35,8 @@
     "method": "GET",
     "url": "https://api.hostaway.com/v1/reservations",
     "query": {
-      "limit": 100
+      "limit": 100,
+      "includePayments": 1
     },
     "auth": {
       "type": "oauth2_client_credentials",
@@ -65,7 +67,9 @@
     "**.paymentMethod",
     "**.rentalAgreementFileUrl",
     "**.customFieldValues",
-    "**.protectionProviders"
+    "**.protectionProviders",
+    "**.guestAuthHash",
+    "**.guestPortalUrl"
   ],
   "setup": [
     "Create the integration from this recipe.",
@@ -78,7 +82,7 @@
   "flows": [
     {
       "name": "Hostaway: pre-arrival",
-      "description": "Two days before check-in at 10am, a short note about the stay. Only for confirmed bookings Hostaway reports as paid in full; skipped if the booking is cancelled or replaced. A service message. Contains no access details.",
+      "description": "Two days before check-in at 10am, a short note about the stay. Only for confirmed bookings Hostaway reports as paid in full (a remaining balance of exactly zero; missing or conflicting payment details mean no send); skipped if the booking is cancelled, replaced or goes back to pending or awaiting payment. A service message. Contains no access details.",
       "trigger": {
         "type": "event_date",
         "metric": "Reservation Confirmed",
@@ -87,7 +91,8 @@
         "hour": 10,
         "key": "reservation_id",
         "cancelled_by": [
-          "Reservation Cancelled"
+          "Reservation Cancelled",
+          "Reservation Unconfirmed"
         ],
         "filters": [
           {

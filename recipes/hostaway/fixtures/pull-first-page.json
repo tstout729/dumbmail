@@ -159,7 +159,7 @@
         "guests": 2,
         "listing_id": 40160,
         "nights": 3,
-        "paid_in_full": true,
+        "paid_in_full": false,
         "reservation_id": "21",
         "status": "cancelled"
       },
@@ -189,7 +189,7 @@
         "guests": 2,
         "listing_id": 40160,
         "nights": 3,
-        "paid_in_full": true,
+        "paid_in_full": false,
         "reservation_id": "22",
         "status": "inquiry"
       },

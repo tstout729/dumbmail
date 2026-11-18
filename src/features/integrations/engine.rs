@@ -1184,17 +1184,18 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
 /// `X-Rate-Limit-Time-Reset-Ms`. At most two hours.
 fn cooldown(headers: &Map<String, Value>) -> Option<chrono::Duration> {
     let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, v)| v.as_str()).map(str::trim);
-    let wait = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
-        chrono::Duration::milliseconds(ms)
+    // Values are clamped before a duration is built, so an absurd header can't overflow it.
+    let ms: i64 = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
+        ms
     } else if let Some(v) = get("retry-after") {
         match v.parse::<i64>() {
-            Ok(s) => chrono::Duration::seconds(s),
-            Err(_) => DateTime::parse_from_rfc2822(v).ok()? .with_timezone(&Utc) - Utc::now(),
+            Ok(s) => s.clamp(0, 7200) * 1000,
+            Err(_) => (DateTime::parse_from_rfc2822(v).ok()?.timestamp() - Utc::now().timestamp()).clamp(0, 7200) * 1000,
         }
     } else {
         return None;
     };
-    Some(wait.clamp(chrono::Duration::seconds(1), chrono::Duration::hours(2)))
+    Some(chrono::Duration::milliseconds(ms.clamp(1000, 7_200_000)))
 }
 
 /// Job: make the lookup a fetch intent holds, then keep the answer on that same row and queue its

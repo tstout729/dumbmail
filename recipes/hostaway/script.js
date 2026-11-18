@@ -11,6 +11,8 @@
 //   follow the newest version.
 // Reservation Cancelled: cancelled, declined or expired, dated by updatedOn.
 // Inquiry Received: inquiries. Owner stays are skipped (setting skip_owner_stays).
+// Reservation Unconfirmed: a version that's pending, awaiting payment or otherwise not booked;
+//   the pre-arrival flow is cancelled by it, so an earlier "paid" version can't send.
 // Door codes, access notes and wifi details are never put in events or profiles.
 
 var BOOKED = ["new", "modified", "confirmed"];
@@ -36,9 +38,15 @@ function e164(p) {
   return s.charAt(0) === "+" && d.length >= 8 && d.length <= 15 ? "+" + d : undefined;
 }
 
+// Paid in full only when every signal agrees: a booked status, a total above zero, a remaining
+// balance (sent only with includePayments=1) of exactly zero, and isPaid not saying otherwise.
+// Missing or conflicting signals mean not paid.
 function paidInFull(r) {
-  if (r.isPaid === true || r.isPaid === 1) return true;
-  return typeof r.remainingBalance === "number" && r.remainingBalance <= 0 && r.totalPrice > 0;
+  if (BOOKED.indexOf(String(r.status || "")) < 0) return false;
+  if (!(typeof r.totalPrice === "number" && r.totalPrice > 0)) return false;
+  if (typeof r.remainingBalance !== "number" || Math.abs(r.remainingBalance) >= 0.005) return false;
+  if (r.isPaid === false || r.isPaid === 0) return false;
+  return true;
 }
 
 function reservation(r, historical, settings) {
@@ -69,7 +77,8 @@ function reservation(r, historical, settings) {
     return out;
   }
   if (BOOKED.indexOf(status) < 0) {
-    out.push({ type: "log", message: "reservation " + id + " is " + status + "; it's recorded once it's booked" });
+    // Pending, awaiting payment and the like: a reminder waiting for an earlier version stops.
+    out.push({ type: "track_event", metric: "Reservation Unconfirmed", profile: who, time: updated, unique_id: "hostaway:" + id + ":unconfirmed:" + updated, properties: props });
     return out;
   }
   out.push({ type: "track_event", metric: "Reservation Booked", profile: who, time: iso(r.reservationDate) || updated, unique_id: "hostaway:" + id + ":booked", properties: props });

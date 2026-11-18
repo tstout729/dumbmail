@@ -618,6 +618,7 @@ async fn mock_hostaway() -> (std::sync::Arc<MockHostaway>, String) {
             "/v1/reservations",
             get(|State(m): State<Arc<MockHostaway>>, headers: axum::http::HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
                 assert!(headers.get("authorization").and_then(|v| v.to_str().ok()).is_some_and(|a| a.starts_with("Bearer ha-token-")));
+                assert_eq!(q.get("includePayments").map(String::as_str), Some("1"), "remainingBalance only comes with includePayments=1");
                 let after = q.get("afterId").cloned().unwrap_or_default();
                 m.pages.lock().unwrap().push(after.clone());
                 let rows = m.rows.lock().unwrap().clone();
@@ -660,9 +661,17 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     let now = chrono::Utc::now();
     let stamp = |mins: i64| (now - chrono::Duration::minutes(mins)).format("%Y-%m-%d %H:%M:%S").to_string();
     let today = now.with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
-    let in_two = (today + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
-    // Robin: paid in full. Guest 20: a balance is still due. Guest 21: cancelled. All arriving in two days.
+    // Arriving in three days: the reminder (two days before) waits until tomorrow.
+    let in_two = (today + chrono::Duration::days(3)).format("%Y-%m-%d").to_string();
+    // Robin: paid in full. Guest 20: a balance is still due. Guest 21: cancelled. Pay 40: isPaid but
+    // no remaining balance. Pay 41: a zero balance but isPaid false. Sam: paid in full. All arriving in two days.
+    let signals = fixture("hostaway", "pull-payment-signals.json")["input"]["payload"]["result"].as_array().unwrap().clone();
+    let mut sam = first[0].clone();
+    sam["id"] = json!(50);
+    sam["guestEmail"] = json!("sam.example@example.com");
+    sam["phone"] = Value::Null;
     let mut rows: Vec<Value> = first[..3].to_vec();
+    rows.extend([signals[0].clone(), signals[1].clone(), sam]);
     for (i, r) in rows.iter_mut().enumerate() {
         r["updatedOn"] = json!(stamp(30 + i as i64 * 10));
         r["arrivalDate"] = json!(in_two);
@@ -670,27 +679,43 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     *api.rows.lock().unwrap() = rows.clone();
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Booked").await, 2);
+    assert_eq!(events(&h, "Reservation Booked").await, 5);
     assert_eq!(values(&h, "Reservation Total", "robin.example@example.com").await, vec![867.0]);
     assert_eq!(events(&h, "Reservation Cancelled").await, 1);
     // The next run reads back only to the change the last one saw: nothing new, nothing twice.
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Confirmed").await, 2);
-    // Guest 20 pays: a new version arrives, newest first, and is the only one read.
+    assert_eq!(events(&h, "Reservation Confirmed").await, 5);
+    let waiting = "SELECT count(*) FROM flow_event_date_fires WHERE outcome = 'pending'";
+    assert_eq!(count(&h, waiting).await, 5, "each confirmed version waits; the paid-in-full filter is checked when it fires");
+    // Newer versions, newest first: guest 20 pays; Robin's booking now shows a balance due again;
+    // Sam's goes back to awaiting payment.
     let mut paid = rows[1].clone();
     paid["remainingBalance"] = json!(0);
     paid["updatedOn"] = json!(stamp(1));
-    rows.insert(0, paid);
-    rows.remove(2);
-    *api.rows.lock().unwrap() = rows;
+    let mut unpaid = rows[0].clone();
+    unpaid["remainingBalance"] = json!(50);
+    unpaid["updatedOn"] = json!(stamp(2));
+    let mut waiting = rows[5].clone();
+    waiting["status"] = json!("awaitingPayment");
+    waiting["updatedOn"] = json!(stamp(3));
+    let rest: Vec<Value> = vec![rows[2].clone(), rows[3].clone(), rows[4].clone()];
+    let newest: Vec<Value> = [paid, unpaid, waiting].into_iter().chain(rest).collect();
+    *api.rows.lock().unwrap() = newest;
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Confirmed").await, 3);
+    assert_eq!(events(&h, "Reservation Confirmed").await, 7);
+    assert_eq!(events(&h, "Reservation Unconfirmed").await, 1);
+    // Tomorrow comes.
+    sqlx::query("UPDATE flow_event_date_fires SET due_at = now() - interval '1 minute' WHERE outcome = 'pending'").execute(&h.state.db).await.unwrap();
     assert_eq!(api.tokens.load(std::sync::atomic::Ordering::SeqCst), 1, "the token is reused");
     dumbmail::flows::date_triggers(&h.state).await.unwrap();
     h.fast_forward().await;
-    assert_eq!(sent_to(&h, "See you soon"), vec!["guest20@example.com", "robin.example@example.com"], "paid stays only, once each; none for the cancelled one");
+    assert_eq!(
+        sent_to(&h, "See you soon"),
+        vec!["guest20@example.com"],
+        "only the stay that's now paid in full: not the cancelled one, not missing or conflicting payment details, and not the two whose newest version isn't paid"
+    );
     // Held back from marketing.
     assert_eq!(consent(&h, "robin.example@example.com").await, (true, "never_subscribed".into()));
     assert!(!campaign_reaches(&mut h, "robin.example@example.com").await);
