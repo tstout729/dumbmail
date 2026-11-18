@@ -137,7 +137,7 @@ async fn store(state: &AppState, topic: &str, domain: &str, webhook_id: &str, bo
         }
         if PRIVACY_TOPICS.contains(&topic) {
             // A store that's gone has no worker; privacy work also runs as its own job.
-            crate::jobs::enqueue(&mut *tx, "shopify_privacy", json!({"account_id": account_id}), None).await?;
+            crate::jobs::enqueue_background(&mut *tx, "shopify_privacy", json!({"account_id": account_id}), None).await?;
         } else {
             shop::kick(&mut tx, account_id).await?;
         }

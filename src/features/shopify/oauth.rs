@@ -5,7 +5,7 @@
 //! link (`/api/shopify/install`) with a single-use `state`; opening it in their browser, signed in as
 //! the same person, sets a short-lived signed cookie tied to that state and goes on to Shopify. The
 //! callback finishes only in that browser (the cookie), signed in as that person, while they may
-//! still manage integrations. So nobody can connect their store to someone else's account, someone
+//! still hold `shopify.manage`. So nobody can connect their store to someone else's account, someone
 //! else's store to theirs, or finish a teammate's install by forwarding a link.
 
 use axum::extract::{Query, State};
@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::client::{self, ApiError};
 use super::shop::{self, valid_shop};
 use crate::auth::{self, Ctx};
+use crate::features::team::access::{self, Perm};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -85,15 +86,16 @@ fn fresh(params: &BTreeMap<String, String>) -> bool {
     params.get("timestamp").and_then(|t| t.parse::<i64>().ok()).is_some_and(|t| (Utc::now().timestamp() - t).abs() < 3600)
 }
 
-/// May this person connect or disconnect the store? Today: an owner or admin of the account.
-// TODO(wiring round): replace with the team layer's integrations permission (a `Perm`) once #13's
-// access rules are merged into this branch.
-async fn may_manage(db: &sqlx::PgPool, account_id: Uuid, user_id: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE account_id = $1 AND user_id = $2 AND role IN ('owner', 'admin'))")
-        .bind(account_id)
-        .bind(user_id)
-        .fetch_one(db)
-        .await
+/// The signed-in member in this browser, as the team layer sees them (role, two-factor, single
+/// sign-on), if they may manage the Shopify connection. `Err` is the code the settings page explains.
+async fn manager(state: &AppState, headers: &HeaderMap) -> Result<Ctx, &'static str> {
+    let jar = CookieJar::from_headers(headers);
+    let token = jar.get(auth::SESSION_COOKIE).map(|c| c.value().to_string()).ok_or("signin")?;
+    let ctx = crate::features::team::login::session_ctx(state, &token, &crate::features::team::login::ReqMeta::from_headers(headers)).await.map_err(|_| "signin")?;
+    if !access::allows(&ctx, Perm::ShopifyManage) {
+        return Err("role");
+    }
+    Ok(ctx)
 }
 
 /// Start an install for the signed-in account: returns the DumbMail link to open, which goes on to
@@ -104,11 +106,7 @@ pub async fn start(state: &AppState, ctx: &Ctx, shop_input: &str) -> AppResult<V
         return Err(AppError::Conflict("Shopify isn't available on this server (SHOPIFY_API_KEY and SHOPIFY_API_SECRET aren't set)".into()));
     }
     let domain = shop::shop_from_input(shop_input).ok_or_else(|| AppError::bad("enter your store's myshopify.com address, like your-store.myshopify.com"))?;
-    if let Some(user) = ctx.user_id {
-        if !may_manage(&state.db, ctx.account_id, user).await? {
-            return Err(AppError::Forbidden("only an owner or admin of this account can connect a store".into()));
-        }
-    }
+    access::require(ctx, Perm::ShopifyManage)?;
     if let Some(cur) = shop::load(&state.db, ctx.account_id).await? {
         if cur.status == "connected" && cur.shop_domain != domain {
             return Err(AppError::Conflict(format!("{} is already connected. One store per DumbMail account: disconnect it first.", cur.shop_domain)));
@@ -145,18 +143,6 @@ fn settings_page(state: &AppState, query: &str) -> Redirect {
     Redirect::to(&format!("{}/settings/shopify{query}", state.cfg.public_url()))
 }
 
-/// The signed-in person in this browser: (account, user).
-async fn session(state: &AppState, headers: &HeaderMap) -> Option<(Uuid, Uuid)> {
-    let jar = CookieJar::from_headers(headers);
-    let token = jar.get(auth::SESSION_COOKIE)?.value().to_string();
-    sqlx::query_as("SELECT account_id, user_id FROM sessions WHERE token_hash = $1 AND expires_at > now()")
-        .bind(auth::sha256_hex(&token))
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-}
-
 #[derive(serde::Deserialize)]
 pub struct InstallQuery {
     state: Option<String>,
@@ -175,7 +161,8 @@ pub async fn install(State(state): State<AppState>, headers: HeaderMap, jar: Coo
 async fn install_inner(state: &AppState, headers: &HeaderMap, st: Option<&str>) -> Result<(Cookie<'static>, String), &'static str> {
     let key = state.cfg.shopify.key().ok_or("unavailable")?;
     let st = st.filter(|s| !s.is_empty() && s.len() < 200).ok_or("expired")?;
-    let (account_id, user_id) = session(state, headers).await.ok_or("signin")?;
+    let ctx = manager(state, headers).await?;
+    let (account_id, user_id) = (ctx.account_id, ctx.user_id.ok_or("signin")?);
     let hash = auth::sha256_hex(st);
     // Bind the attempt to this person (if an API key started it), or require it's theirs.
     let row: Option<String> = sqlx::query_scalar(
@@ -191,9 +178,6 @@ async fn install_inner(state: &AppState, headers: &HeaderMap, st: Option<&str>) 
     .await
     .map_err(|_| "failed")?;
     let domain = row.ok_or("signin")?;
-    if !may_manage(&state.db, account_id, user_id).await.map_err(|_| "failed")? {
-        return Err("role");
-    }
     let cookie = Cookie::build((NONCE_COOKIE, auth::sign(&state.cfg.secret_key, &format!("shopify-install:{hash}"))))
         .path(NONCE_PATH)
         .http_only(true)
@@ -272,14 +256,12 @@ async fn finish(state: &AppState, headers: &HeaderMap, nonce: Option<&str>, q: &
     if !cookie_ok {
         return Err("browser");
     }
-    // The browser finishing the install must be signed in as the person who started it…
-    let (session_account, session_user) = session(state, headers).await.ok_or("signin")?;
-    if session_account != account_id || user_id != Some(session_user) {
+    // The browser finishing the install must be signed in as the person who started it, who may
+    // still manage the Shopify connection.
+    let ctx = manager(state, headers).await?;
+    let session_user = ctx.user_id.ok_or("signin")?;
+    if ctx.account_id != account_id || user_id != Some(session_user) {
         return Err("signin");
-    }
-    // …who may still manage integrations.
-    if !may_manage(&state.db, account_id, session_user).await.map_err(|_| "failed")? {
-        return Err("role");
     }
     let tokens = client::token_request(state, &domain, &[("code", code), ("expiring", "1")]).await.map_err(|e| match e {
         ApiError::Unauthorized => "denied",
@@ -290,7 +272,9 @@ async fn finish(state: &AppState, headers: &HeaderMap, nonce: Option<&str>, q: &
     if REQUIRED.iter().any(|s| !has(s)) {
         return Err("scopes");
     }
-    save_connection(state, account_id, Some(session_user), &domain, &tokens).await
+    save_connection(state, account_id, Some(session_user), &domain, &tokens).await?;
+    crate::features::team::audit(state, &ctx, "shopify.connect", Some(&domain), json!({"scopes": tokens.scope})).await;
+    Ok(())
 }
 
 /// Save the connection as a new install (generation), and queue its setup in the same transaction.
@@ -353,6 +337,11 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
         .execute(&mut *tx)
         .await
         .map_err(|_| "failed")?;
+    super::events::close_history(&mut tx, account_id).await.map_err(|_| "failed")?;
+    // The metrics this app records come only from Shopify's servers from now on: the browser
+    // endpoint refuses them for this account (they stay that way after a disconnect).
+    let names: Vec<String> = super::SERVER_METRICS.iter().map(|m| m.to_string()).collect();
+    crate::features::integrations::model::mark_server_only(&mut tx, account_id, &names).await.map_err(|_| "failed")?;
     // A different store than before: its inventory ids mean nothing here. Customer links stay (they
     // name their store) so privacy requests for the old store still find its data.
     if before.as_deref().is_some_and(|b| b != domain) {
@@ -361,7 +350,7 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
     client::save_tokens(&mut *tx, &state.cfg.secret_key, account_id, t).await.map_err(|_| "failed")?;
     // Webhooks, shop details, the pixel and the theme embed's settings: in the background, so a slow
     // store doesn't hold the browser. Queued with the connection, so neither exists without the other.
-    crate::jobs::enqueue(&mut *tx, "shopify_setup", json!({"account_id": account_id, "generation": generation}), None).await.map_err(|_| "failed")?;
+    crate::jobs::enqueue_background(&mut *tx, "shopify_setup", json!({"account_id": account_id, "generation": generation}), None).await.map_err(|_| "failed")?;
     tx.commit().await.map_err(|_| "failed")?;
     Ok(())
 }
@@ -635,6 +624,7 @@ pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generatio
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
+    super::events::close_history(&mut tx, account_id).await?;
     sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1").bind(account_id).execute(&mut *tx).await?;
     // Unprocessed deliveries: privacy requests still get done; the rest is dropped with its data.
     sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact')")
@@ -653,7 +643,7 @@ pub async fn setup_due(db: &sqlx::PgPool) -> sqlx::Result<()> {
     .fetch_all(db)
     .await?;
     for (account_id, generation) in due {
-        crate::jobs::enqueue(db, "shopify_setup", json!({"account_id": account_id, "generation": generation}), None).await?;
+        crate::jobs::enqueue_background(db, "shopify_setup", json!({"account_id": account_id, "generation": generation}), None).await?;
     }
     Ok(())
 }

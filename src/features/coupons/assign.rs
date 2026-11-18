@@ -368,7 +368,26 @@ pub async fn prepare_send_for(state: &AppState, spec: &SendSpec<'_>, content: &V
     }
     coupons.sort_by_key(|c| c.id);
     let send = if coupons.iter().any(|c| c.new_code_each_time) { send_name(state, spec, message_id).await? } else { String::new() };
-    match claim_all(&state.db, &coupons, spec.profile.id, &Via::Message { message_id, send: &send }).await? {
+    let mut claim = claim_all(&state.db, &coupons, spec.profile.id, &Via::Message { message_id, send: &send }).await?;
+    // A coupon whose codes the connected store makes (Shopify): give this person their own code
+    // through `give_code` and its store hook (no lock held while the store answers), then claim again.
+    let mut asked = 0;
+    while let (Claim::Empty(i), true) = (&claim, asked < coupons.len()) {
+        let c = coupons[*i].clone();
+        let Some(tpl) = crate::features::shopify::coupons::template_for(&state.db, &c).await? else { break };
+        asked += 1;
+        let make = crate::features::shopify::coupons::make(state, &tpl, &send);
+        match give_code(&state.db, &c, spec.profile.id, Via::Message { message_id, send: &send }, Some(&make)).await {
+            Ok(Some(_)) => claim = claim_all(&state.db, &coupons, spec.profile.id, &Via::Message { message_id, send: &send }).await?,
+            Ok(None) => break,
+            Err(e) => {
+                // Rate limits and outages pass: try this message again shortly.
+                tracing::warn!(coupon = %c.id, error = %e.public_message(), "the store couldn't make a discount code yet");
+                return Ok(Prepared::Hold(Utc::now() + chrono::Duration::seconds(BUSY_SECONDS)));
+            }
+        }
+    }
+    match claim {
         Claim::Got(given) => {
             for c in coupons.iter().filter(|c| c.out_of_codes_at.is_some()) {
                 lift_hold(state, c, spec.campaign_id, spec.flow_id).await?;

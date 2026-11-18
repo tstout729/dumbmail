@@ -111,7 +111,7 @@ pub async fn queue_due(db: &PgPool) -> sqlx::Result<()> {
     .fetch_all(db)
     .await?;
     for a in due {
-        crate::jobs::enqueue(db, "shopify_privacy", json!({"account_id": a}), None).await?;
+        crate::jobs::enqueue_background(db, "shopify_privacy", json!({"account_id": a}), None).await?;
     }
     Ok(())
 }

@@ -217,10 +217,13 @@ pub enum Perm {
     /// replay and backfill them, install recipes, and read stored payloads and script output
     /// (personal data). Admins and owners.
     IntegrationsManage,
+    /// Connect or disconnect the Shopify store, start, pause or cancel its history import, resync its
+    /// products and download privacy-request exports (personal data). Admins and owners.
+    ShopifyManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 44] = [
+    pub const ALL: [Perm; 45] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -265,6 +268,7 @@ impl Perm {
         Perm::ExportsManage,
         Perm::IntegrationsRead,
         Perm::IntegrationsManage,
+        Perm::ShopifyManage,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -315,6 +319,7 @@ impl Perm {
             ExportsManage => "exports.manage",
             IntegrationsRead => "integrations.read",
             IntegrationsManage => "integrations.manage",
+            ShopifyManage => "shopify.manage",
         }
     }
 
@@ -333,7 +338,7 @@ impl Perm {
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
             AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead | IntegrationsRead => (Area::Account, false),
-            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage => (Area::Account, true),
+            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage | ShopifyManage => (Area::Account, true),
         })
     }
 

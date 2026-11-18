@@ -581,8 +581,9 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone. Neither
-    // does one while past activity is being imported into the account (`absorb_entries`).
-    if refreshed_at.is_none() || absorb {
+    // does one while past activity is being imported into the account (`absorb_entries`, and a Shopify
+    // history page being written right now).
+    if refreshed_at.is_none() || absorb || crate::features::shopify::events::history_open(&state.db, account_id).await? {
         return Ok(());
     }
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $2 AND status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")

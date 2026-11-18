@@ -200,15 +200,24 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         if found.is_some() {
             return Ok(found);
         }
+        // Made here from the store's data, nobody has opted in yet: held back from marketing in the
+        // same statement (`marketing_hold`; Shopify's own subscribed state, applied next, clears it),
+        // and the address is marked as the store's, so only flows marked as service messages (order
+        // and shipping updates) reach it while it's held.
+        let tag = source_tag(shop);
+        let phone = if email.is_some() { None } else { phone };
         let r: Result<P, sqlx::Error> = sqlx::query_as(
-            "INSERT INTO profiles (id, account_id, email, phone_number, first_name, last_name) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, phone_number",
+            "INSERT INTO profiles (id, account_id, email, phone_number, first_name, last_name, source, marketing_hold, email_source, phone_source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, true, CASE WHEN $3::text IS NULL THEN NULL ELSE $7 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $7 END)
+             RETURNING id, email, phone_number",
         )
         .bind(Uuid::now_v7())
         .bind(account_id)
         .bind(email)
-        .bind(if email.is_some() { None } else { phone })
+        .bind(phone)
         .bind(first)
         .bind(last)
+        .bind(&tag)
         .fetch_one(db)
         .await;
         match r {
@@ -226,6 +235,12 @@ async fn create(db: &PgPool, account_id: Uuid, shop: &str, email: Option<&str>, 
         }
     }
     Ok(None)
+}
+
+/// The marker for addresses and profiles this app brought in (`email_source`, `phone_source`,
+/// `source`): the same `integration:` form main's marketing-hold rule recognises.
+pub fn source_tag(shop: &str) -> String {
+    format!("integration:shopify:{shop}")
 }
 
 /// Give a profile that has no email this address. Its email consent starts over (never subscribed):

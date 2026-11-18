@@ -15,6 +15,7 @@
 
 pub mod api;
 pub mod client;
+pub mod coupons;
 pub mod customers;
 pub mod discounts;
 pub mod events;
@@ -37,7 +38,6 @@ use crate::error::AppResult;
 use crate::state::AppState;
 
 pub use discounts::{create_discount_code, create_discount_codes, DiscountTemplate, DiscountValue};
-pub use events::absorb_segment_entries;
 
 /// The Admin API version every call uses. 2026-10 is supported until October 16, 2027; move to a
 /// newer stable version before then (see docs/SHOPIFY.md).
@@ -71,10 +71,10 @@ impl Settings {
     }
 }
 
-/// Metrics only this app records from Shopify's servers; the browser endpoint refuses them (see
-/// `audience::BROWSER_RESERVED_METRICS`). `Placed Order` and `Started Checkout` stay open to the
-/// browser snippet (stores without the app rely on it) and are reconciled by `unique_id`.
-pub const SERVER_METRICS: &[&str] = &["Ordered Product", "Fulfilled Order", "Fulfilled Partial Order", "Cancelled Order", "Refunded Order"];
+/// The metrics this app records from Shopify's servers. When a store connects they become
+/// server-only for that account (`metrics.server_only`): the public browser endpoint refuses them,
+/// and flows ignore browser copies recorded earlier. Other accounts' browser metrics are untouched.
+pub const SERVER_METRICS: &[&str] = &["Placed Order", "Started Checkout", "Ordered Product", "Fulfilled Order", "Fulfilled Partial Order", "Cancelled Order", "Refunded Order"];
 
 pub struct Module;
 
@@ -195,6 +195,13 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
     })
 }
 
+/// Job: delete old delivery records, unprocessed bodies past 30 days, and old exports.
+async fn cleanup(state: &AppState) -> anyhow::Result<()> {
+    webhooks::prune(&state.db).await?;
+    privacy::prune(&state.db).await?;
+    Ok(())
+}
+
 #[async_trait]
 impl Feature for Module {
     fn name(&self) -> &'static str {
@@ -203,6 +210,10 @@ impl Feature for Module {
 
     fn routes(&self) -> Router<AppState> {
         api::routes()
+    }
+
+    fn access(&self) -> crate::features::team::access::Access {
+        crate::features::team::access::Access { routes: api::ROUTES, tools: api::TOOLS }
     }
 
     fn mcp_tools(&self) -> Vec<Value> {
@@ -240,6 +251,11 @@ impl Feature for Module {
                 Ok(a) => privacy::run(state, a).await,
                 Err(e) => Err(e),
             },
+            events::JOB_REBASELINE => match account() {
+                Ok(a) => events::rebaseline(state, a).await,
+                Err(e) => Err(e),
+            },
+            "shopify_cleanup" => cleanup(state).await,
             _ => return None,
         })
     }
@@ -258,8 +274,8 @@ impl Feature for Module {
             import::queue_reconciles(&state.db).await?;
         }
         if tick.is_multiple_of(180) {
-            webhooks::prune(&state.db).await?;
-            privacy::prune(&state.db).await?;
+            // Clean-up runs in the background lane, like the rest of this app's work.
+            crate::jobs::enqueue_background(&state.db, "shopify_cleanup", serde_json::json!({}), None).await?;
         }
         Ok(())
     }

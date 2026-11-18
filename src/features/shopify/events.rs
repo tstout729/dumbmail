@@ -2,13 +2,14 @@
 //!
 //! The browser snippet and checkout pixel send `Placed Order` with `unique_id` `order:<id>` and
 //! `Started Checkout` with `checkout:<token>`; this module uses the same ids, so one order is one
-//! event whichever arrives first. When the browser's copy is already there, the server's facts
-//! replace it in place and it becomes trusted (`from_browser = false`); when the server's copy is
-//! there first, the browser's is dropped as a duplicate. Either way revenue is counted once.
+//! event whichever arrives first. When the browser's copy is already there, it is replaced by a fresh
+//! trusted row (nothing of the browser's is kept); when the server's copy is there first, the
+//! browser's is dropped as a duplicate. Either way revenue is counted once.
 //!
-//! New activity (within a day) goes through `audience::record_event`, so flows start. Anything
-//! older, and everything a history import brings in, is recorded quietly: no flows start, nothing is
-//! sent or billed, and the profile's last activity moves only as far as the event's own time.
+//! New activity (within a day) goes through `audience::record_event_from(.., Integration)`, so flows
+//! start. Anything older, and everything a history import brings in, goes through
+//! `audience::record_history`: no flows start, nothing is sent or billed, and the profile's last
+//! activity moves only as far as the event's own time.
 
 use std::collections::HashMap;
 
@@ -17,7 +18,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::audience::{self, NewEvent};
+use crate::audience::{self, EventSource, HistoryEvent, NewEvent};
 
 /// Events older than this when they reach us are history, not something happening now.
 pub const LIVE_WINDOW_HOURS: i64 = 24;
@@ -57,47 +58,43 @@ pub enum Put {
 }
 
 /// Save one server event (see the module docs). `quiet` forces history (imports).
+///
+/// A copy only a browser recorded (same `unique_id`) is never updated or merged from: anything it
+/// carries could be forged. The trusted event is recorded as a fresh row through the shared paths
+/// (`audience::record_event_from(.., Integration)`, which replaces the browser's copy in the same
+/// transaction, or `audience::record_history` for the past), so every consumer (flows, catalog
+/// learning, coupon redemption, webhooks) sees it as new.
 pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: ServerEvent<'_>, quiet: bool, merge: Merge<'_>) -> anyhow::Result<Put> {
     let metric_id = metrics.id(db, account_id, ev.metric).await?;
     for _ in 0..2 {
-        let existing: Option<(Uuid, Option<bool>, Value, Option<f64>, Uuid)> = sqlx::query_as(
-            "SELECT id, from_browser, properties, value, profile_id FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3",
+        let existing: Option<(Uuid, Value, Option<f64>, Uuid)> = sqlx::query_as(
+            "SELECT id, properties, value, profile_id FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false",
         )
         .bind(account_id)
         .bind(metric_id)
         .bind(&ev.unique_id)
         .fetch_optional(db)
         .await?;
-        if let Some((id, from_browser, old_props, old_value, old_profile)) = existing {
-            let browser = from_browser != Some(false);
-            // A browser's copy is never merged from: anything it carries (amounts, server-only
-            // state) could be forged. The server's facts replace it whole.
+        if let Some((id, old_props, old_value, old_profile)) = existing {
             let (props, value) = match merge {
-                Some(f) if !browser => f(&old_props),
-                Some(f) => f(&Value::Object(Default::default())),
+                Some(f) => f(&old_props),
                 None => (ev.properties.clone(), ev.value),
             };
-            if !browser && props == old_props && value == old_value && old_profile == ev.profile_id {
+            if props == old_props && value == old_value && old_profile == ev.profile_id {
                 return Ok(Put::Unchanged);
             }
-            // The browser's copy takes the order's real time, person and amounts.
-            sqlx::query(
-                "UPDATE events SET properties = $2, value = $3, from_browser = false, profile_id = $4,
-                    occurred_at = CASE WHEN from_browser IS DISTINCT FROM false THEN $5 ELSE occurred_at END
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(&props)
-            .bind(value)
-            .bind(ev.profile_id)
-            .bind(ev.at)
-            .execute(db)
-            .await?;
+            sqlx::query("UPDATE events SET properties = $2, value = $3, profile_id = $4 WHERE id = $1 AND from_browser = false")
+                .bind(id)
+                .bind(&props)
+                .bind(value)
+                .bind(ev.profile_id)
+                .execute(db)
+                .await?;
             return Ok(Put::Updated);
         }
         let live = !quiet && ev.at > Utc::now() - Duration::hours(LIVE_WINDOW_HOURS);
         let inserted = if live {
-            audience::record_event(
+            audience::record_event_from(
                 db,
                 NewEvent {
                     account_id,
@@ -109,12 +106,30 @@ pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: Serve
                     unique_id: Some(ev.unique_id.clone()),
                     message_id: None,
                 },
+                EventSource::Integration,
             )
             .await
             .map_err(|e| anyhow::anyhow!(e.public_message()))?
             .is_some()
         } else {
-            record_history(db, account_id, ev.profile_id, metric_id, &ev.properties, ev.value, ev.at, &ev.unique_id).await?
+            // History: no flows start, nothing is sent or billed. A browser's copy goes in the same
+            // transaction, so the trusted one is a fresh row.
+            let mut tx = db.begin().await?;
+            sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser")
+                .bind(account_id)
+                .bind(metric_id)
+                .bind(&ev.unique_id)
+                .execute(&mut *tx)
+                .await?;
+            let n = audience::record_history(
+                &mut *tx,
+                account_id,
+                &[HistoryEvent { profile_id: ev.profile_id, metric_id, properties: ev.properties.clone(), value: ev.value, occurred_at: ev.at, unique_id: ev.unique_id.clone() }],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            tx.commit().await?;
+            n > 0
         };
         if inserted {
             return Ok(Put::Created);
@@ -124,49 +139,72 @@ pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: Serve
     Ok(Put::Unchanged)
 }
 
-/// Record a past event quietly: no flows, no sends, no billing; `last_event_at` moves only up to
-/// the event's own time. Returns false when it was already there.
-///
-/// This is the smallest form of the history path another change (`audience::record_history`) adds;
-/// once that is on `main`, this should call it instead.
-pub async fn record_history(db: &PgPool, account_id: Uuid, profile_id: Uuid, metric_id: Uuid, properties: &Value, value: Option<f64>, at: DateTime<Utc>, unique_id: &str) -> anyhow::Result<bool> {
-    let value = value.or_else(|| properties.get("$value").and_then(|v| v.as_f64()));
-    let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, from_browser)
-         SELECT $1, $2, p.id, $4, $5, $6, $7, $8, false FROM profiles p WHERE p.id = $3 AND p.account_id = $2
-         ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
-         RETURNING id",
+// ---------- The history window ----------
+//
+// Imported orders and customers can move people into segments; those entries mustn't start
+// segment-triggered flows. The same mechanism as the Klaviyo import (`segments.absorb_entries`): the
+// window opens while a page of this store's history is being written and closes as soon as the
+// import pauses, finishes, fails or is cancelled; then each marked segment is refreshed once more
+// (quietly: its new baseline includes everyone history moved in) and unmarked. Live webhooks
+// written while no history page is being written start segment flows as usual.
+
+pub const JOB_REBASELINE: &str = "shopify_rebaseline_segments";
+const REBASELINE_BATCH: i64 = 25;
+
+/// Open the window for this history import (or keep it open), and mark segments made since.
+pub async fn open_history(db: &PgPool, import_id: Uuid, account_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "WITH i AS (UPDATE shopify_imports SET history_open = true WHERE id = $1 AND kind = 'history' AND NOT history_open RETURNING 1)
+         UPDATE segments SET absorb_entries = true WHERE account_id = $2 AND NOT absorb_entries AND EXISTS (SELECT 1 FROM shopify_imports WHERE id = $1 AND kind = 'history')",
     )
-    .bind(Uuid::now_v7())
+    .bind(import_id)
     .bind(account_id)
-    .bind(profile_id)
-    .bind(metric_id)
-    .bind(properties)
-    .bind(value)
-    .bind(at)
-    .bind(unique_id)
-    .fetch_optional(db)
+    .execute(db)
     .await?;
-    if inserted.is_some() {
-        sqlx::query("UPDATE profiles SET last_event_at = $2 WHERE id = $1 AND (last_event_at IS NULL OR last_event_at < $2)")
-            .bind(profile_id)
-            .bind(at)
-            .execute(db)
-            .await?;
-    }
-    Ok(inserted.is_some())
+    Ok(())
 }
 
-/// Segment-triggered flows must not start for people who entered a segment only because imported
-/// history arrived. True while a Shopify history import is running for the account, or when one
-/// ended since the segment's last refresh: that refresh records who is in without starting anyone.
-pub async fn absorb_segment_entries(db: &PgPool, account_id: Uuid, refreshed_at: Option<DateTime<Utc>>) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND kind = 'history'
-            AND (status IN ('running', 'paused') OR finished_at >= COALESCE($2, '-infinity'::timestamptz)))",
-    )
-    .bind(account_id)
-    .bind(refreshed_at)
-    .fetch_one(db)
-    .await?)
+/// Close the window of every import of the account that isn't running any more (paused, done,
+/// failed, cancelled), in the caller's transaction, and queue the re-baseline with it.
+pub async fn close_history(conn: &mut sqlx::PgConnection, account_id: Uuid) -> sqlx::Result<()> {
+    let closed: Vec<Uuid> = sqlx::query_scalar("UPDATE shopify_imports SET history_open = false WHERE account_id = $1 AND history_open AND status <> 'running' RETURNING id")
+        .bind(account_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    if !closed.is_empty() {
+        crate::jobs::enqueue_background(&mut *conn, JOB_REBASELINE, serde_json::json!({"account_id": account_id}), None).await?;
+    }
+    Ok(())
+}
+
+/// [`close_history`] in its own transaction.
+pub async fn close_history_now(db: &PgPool, account_id: Uuid) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    close_history(&mut tx, account_id).await?;
+    tx.commit().await
+}
+
+/// Is a page of this account's Shopify history being written now? `flows::refresh_segment` asks
+/// (with `absorb_entries`), so another import's re-baseline can't let entries through early.
+pub async fn history_open(db: &PgPool, account_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND history_open)").bind(account_id).fetch_one(db).await
+}
+
+/// Job: refresh the account's marked segments once more, quietly, then unmark them, a batch at a time.
+/// If a window (this store's or a Klaviyo import's) opened again meanwhile, its own close does this.
+pub async fn rebaseline(state: &crate::state::AppState, account_id: Uuid) -> anyhow::Result<()> {
+    const ANY_OPEN: &str = "(EXISTS (SELECT 1 FROM shopify_imports WHERE account_id = $1 AND history_open) OR EXISTS (SELECT 1 FROM klaviyo_imports WHERE account_id = $1 AND history_open))";
+    let open: bool = sqlx::query_scalar(&format!("SELECT {ANY_OPEN}")).bind(account_id).fetch_one(&state.db).await?;
+    if open {
+        return Ok(());
+    }
+    let segs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM segments WHERE account_id = $1 AND absorb_entries ORDER BY id LIMIT $2").bind(account_id).bind(REBASELINE_BATCH).fetch_all(&state.db).await?;
+    for sid in &segs {
+        crate::flows::refresh_segment(state, *sid).await?;
+        sqlx::query(&format!("UPDATE segments SET absorb_entries = false WHERE id = $2 AND NOT {ANY_OPEN}")).bind(account_id).bind(sid).execute(&state.db).await?;
+    }
+    if segs.len() as i64 == REBASELINE_BATCH {
+        crate::jobs::enqueue_background(&state.db, JOB_REBASELINE, serde_json::json!({"account_id": account_id}), None).await?;
+    }
+    Ok(())
 }

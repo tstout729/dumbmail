@@ -138,6 +138,9 @@ pub async fn set_status(state: &AppState, account_id: Uuid, action: &str) -> App
     .ok_or_else(|| AppError::Conflict(format!("there's no import to {action}")))?;
     if to == "running" {
         super::shop::kick_now(&state.db, account_id).await?;
+    } else {
+        // Paused or cancelled: segments stop absorbing entries (see `events::close_history`).
+        super::events::close_history_now(&state.db, account_id).await?;
     }
     if to == "cancelled" {
         // Stop Shopify's side too (best effort; it ends on its own otherwise).
@@ -246,9 +249,11 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
             .bind(i.id)
             .execute(&state.db)
             .await?;
+        super::events::close_history_now(&state.db, shop.account_id).await?;
         return Ok(Step::More);
     }
-    match step_inner(state, shop, lease, metrics, &mut i, deadline).await {
+    let r = step_inner(state, shop, lease, metrics, &mut i, deadline).await;
+    let out = match r {
         Ok(s) => {
             // A pause or cancel that came in meanwhile is kept (save only changes a running import's status).
             save(&state.db, &i, lease).await?;
@@ -266,7 +271,10 @@ pub async fn step(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut
                 Ok(Step::Idle)
             }
         },
-    }
+    };
+    // Finished, failed, paused or cancelled meanwhile: the history window closes.
+    super::events::close_history_now(&state.db, shop.account_id).await?;
+    out
 }
 
 async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &mut Metrics, i: &mut ImportRow, deadline: std::time::Instant) -> Result<Step, ApiError> {
@@ -336,6 +344,10 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
             return Ok(Step::More);
         };
         buf.extend_from_slice(&bytes);
+        if i.kind == "history" {
+            // Segments absorb the entries this page of history causes (see `events::open_history`).
+            super::events::open_history(&state.db, i.id, shop.account_id).await.map_err(|_| ApiError::Network("database"))?;
+        }
         let consumed = process_chunk(state, shop, metrics, i, &buf, at_end).await.map_err(|_| ApiError::Network("database"))?;
         if consumed > 0 {
             i.result_offset += consumed as i64;

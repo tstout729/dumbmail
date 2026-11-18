@@ -11,8 +11,46 @@ use super::{customers, import, oauth, privacy, shop, webhooks};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{public, rule, Perm, RouteRule, ToolRule};
+use crate::features::team::audit;
 use crate::mcp::{from, obj, tool};
 use crate::state::AppState;
+
+/// Who may do what (see `team::access`). Seeing the connection and its progress needs account
+/// read; changing it, its import and product sync, and downloading a privacy export need
+/// `shopify.manage` (admins and the owner). Shopify's own requests are public and signed; the
+/// install link and callback check the signed-in member themselves (see `oauth`).
+pub static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/shopify", Perm::AccountRead),
+    rule("POST", "/api/shopify/connect", Perm::ShopifyManage),
+    rule("POST", "/api/shopify/disconnect", Perm::ShopifyManage),
+    rule("GET", "/api/shopify/import", Perm::AccountRead),
+    rule("POST", "/api/shopify/import", Perm::ShopifyManage),
+    rule("POST", "/api/shopify/import/{action}", Perm::ShopifyManage),
+    rule("POST", "/api/shopify/products/resync", Perm::ShopifyManage),
+    rule("GET", "/api/shopify/data-requests/{id}", Perm::ShopifyManage),
+    rule("PUT", "/api/shopify/coupons/{id}", Perm::ShopifyManage),
+    rule("DELETE", "/api/shopify/coupons/{id}", Perm::ShopifyManage),
+    public("GET", "/api/shopify/app"),
+    public("GET", "/api/shopify/install"),
+    public("GET", "/api/shopify/callback"),
+    public("POST", "/webhooks/shopify"),
+];
+
+pub static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "get_shopify_status", perm: Perm::AccountRead },
+    ToolRule { name: "get_shopify_import", perm: Perm::AccountRead },
+    ToolRule { name: "connect_shopify", perm: Perm::ShopifyManage },
+    ToolRule { name: "disconnect_shopify", perm: Perm::ShopifyManage },
+    ToolRule { name: "start_shopify_import", perm: Perm::ShopifyManage },
+    ToolRule { name: "pause_shopify_import", perm: Perm::ShopifyManage },
+    ToolRule { name: "resume_shopify_import", perm: Perm::ShopifyManage },
+    ToolRule { name: "cancel_shopify_import", perm: Perm::ShopifyManage },
+    ToolRule { name: "resync_shopify_products", perm: Perm::ShopifyManage },
+    ToolRule { name: "get_shopify_data_request", perm: Perm::ShopifyManage },
+    ToolRule { name: "set_shopify_coupon", perm: Perm::ShopifyManage },
+    ToolRule { name: "remove_shopify_coupon", perm: Perm::ShopifyManage },
+];
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -23,6 +61,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/shopify/import/{action}", post(import_action_h))
         .route("/api/shopify/products/resync", post(resync_h))
         .route("/api/shopify/data-requests/{id}", get(data_request_h))
+        .route("/api/shopify/coupons/{id}", axum::routing::put(set_coupon_h).delete(remove_coupon_h))
         // Public: signed by Shopify.
         .route("/api/shopify/app", get(oauth::app_entry))
         .route("/api/shopify/install", get(oauth::install))
@@ -97,6 +136,7 @@ pub async fn status(state: &AppState, account_id: Uuid) -> AppResult<Value> {
         "products_sync": products.as_ref().map(import::to_json),
         "storefront": {"embed_link": embed_link, "pixel_installed": s.as_ref().is_some_and(|s| s.web_pixel_id.is_some()), "error": s.as_ref().and_then(|s| s.storefront_error.clone())},
         "data_requests": data_requests,
+        "coupons": super::coupons::list(&state.db, account_id).await?,
         "webhook_url": oauth::webhook_uri(state),
         "redirect_url": oauth::redirect_uri(state),
         "app_url": format!("{}/api/shopify/app", state.cfg.public_url()),
@@ -129,7 +169,9 @@ async fn disconnect(state: &AppState, ctx: &Ctx, confirm: bool) -> AppResult<Val
         let s = shop::connected(&state.db, ctx.account_id).await?;
         return Ok(json!({"dry_run": true, "note": format!("Nothing changed. Disconnecting {} removes DumbMail's webhooks, pixel and theme embed settings from the store and forgets its access. Profiles, events and products already brought in stay. Call again with confirm=true once the user approves.", s.shop_domain)}));
     }
-    oauth::disconnect(state, ctx.account_id).await
+    let r = oauth::disconnect(state, ctx.account_id).await?;
+    audit(state, ctx, "shopify.disconnect", None, json!({"cleaned_up": r["cleaned_up"]})).await;
+    Ok(r)
 }
 
 async fn disconnect_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ConfirmBody>) -> AppResult<Json<Value>> {
@@ -145,7 +187,23 @@ async fn start_import(state: &AppState, ctx: &Ctx, confirm: bool, order_days: Op
             s.shop_domain
         )}));
     }
-    Ok(import::to_json(&import::start(state, ctx.account_id, ctx.user_id, "history", order_days).await?))
+    let r = import::start(state, ctx.account_id, ctx.user_id, "history", order_days).await?;
+    audit(state, ctx, "shopify.import_start", Some(&r.id.to_string()), json!({"orders_since": r.orders_since})).await;
+    Ok(import::to_json(&r))
+}
+
+/// Pause, resume or cancel the import (recorded in the audit log).
+async fn import_action(state: &AppState, ctx: &Ctx, action: &str) -> AppResult<Value> {
+    let r = import::set_status(state, ctx.account_id, action).await?;
+    audit(state, ctx, &format!("shopify.import_{action}"), Some(&r.id.to_string()), json!({"kind": r.kind})).await;
+    Ok(import::to_json(&r))
+}
+
+/// A privacy export (personal data): recorded in the audit log, without its contents.
+async fn data_request(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let export = privacy::get(&state.db, ctx.account_id, id).await?.ok_or_else(|| AppError::not_found("data request"))?;
+    audit(state, ctx, "shopify.privacy_export", Some(&id.to_string()), json!({})).await;
+    Ok(export)
 }
 
 async fn start_import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ConfirmBody>) -> AppResult<Json<Value>> {
@@ -164,7 +222,7 @@ async fn get_import_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json
 }
 
 async fn import_action_h(State(state): State<AppState>, ctx: Ctx, Path(action): Path<String>) -> AppResult<Json<Value>> {
-    Ok(Json(import::to_json(&import::set_status(&state, ctx.account_id, &action).await?)))
+    Ok(Json(import_action(&state, &ctx, &action).await?))
 }
 
 async fn resync(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
@@ -177,14 +235,34 @@ async fn resync_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Val
 }
 
 async fn data_request_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(privacy::get(&state.db, ctx.account_id, id).await?.ok_or_else(|| AppError::not_found("data request"))?))
+    Ok(Json(data_request(&state, &ctx, id).await?))
+}
+
+async fn set_coupon(state: &AppState, ctx: &Ctx, id: Uuid, body: &Value) -> AppResult<Value> {
+    let r = super::coupons::set(state, ctx.account_id, id, body).await?;
+    audit(state, ctx, "shopify.coupon_link", Some(&id.to_string()), json!({})).await;
+    Ok(r)
+}
+
+async fn remove_coupon(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let r = super::coupons::remove(state, ctx.account_id, id).await?;
+    audit(state, ctx, "shopify.coupon_unlink", Some(&id.to_string()), json!({})).await;
+    Ok(r)
+}
+
+async fn set_coupon_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Value>> {
+    Ok(Json(set_coupon(&state, &ctx, id, &b).await?))
+}
+
+async fn remove_coupon_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    Ok(Json(remove_coupon(&state, &ctx, id).await?))
 }
 
 pub fn tools() -> Vec<Value> {
     let confirm = json!({"type": "boolean", "description": "true to do it. Without it, only describes what would happen."});
     vec![
         tool("get_shopify_status", "Get Shopify status", "The connected Shopify store (if any), what syncs, the last webhook, import and product sync progress, problems in plain words, data requests waiting, and whether orders are arriving from Shopify or only from the browser snippet.", obj(json!({}), &[]), true, false),
-        tool("connect_shopify", "Connect a Shopify store", "Start connecting a Shopify store (one per account). Returns a DumbMail link to open in a browser signed in as an owner or admin of this account; it goes on to Shopify, where the merchant approves the app, and comes back. Only that browser can finish it.",
+        tool("connect_shopify", "Connect a Shopify store", "Start connecting a Shopify store (one per account). Returns a DumbMail link to open in a browser signed in as a member who may manage the Shopify connection (an admin or the owner); it goes on to Shopify, where the merchant approves the app, and comes back. Only that browser can finish it.",
             obj(json!({"shop": {"type": "string", "description": "The store's myshopify.com address (your-store.myshopify.com) or name.", "maxLength": 200}}), &["shop"]), false, false),
         tool("disconnect_shopify", "Disconnect the Shopify store", "Remove DumbMail's webhooks, pixel and theme embed settings from the store and forget its access. Says what Shopify didn't confirm removing. Profiles, events and products stay. Without confirm=true it only describes what would happen.",
             obj(json!({"confirm": confirm}), &[]), false, true),
@@ -197,6 +275,18 @@ pub fn tools() -> Vec<Value> {
         tool("resync_shopify_products", "Sync Shopify products now", "Read every product, price and stock level from Shopify again now (it also happens daily, and webhooks keep products current in between).", obj(json!({}), &[]), false, false),
         tool("get_shopify_data_request", "Export a Shopify data request", "Return the personal data DumbMail prepared for a Shopify customer's data request (customers/data_request), to hand to that customer, and record that it was downloaded. Listed in get_shopify_status.",
             obj(json!({"id": {"type": "string"}}), &["id"]), false, false),
+        tool("set_shopify_coupon", "Make a coupon's codes in Shopify", "Link a coupon (Content → Coupons) to the connected store: when the coupon has no free code for someone, each person gets their own single-use Shopify discount code made from this template, keyed by store, coupon, person and send.",
+            obj(json!({
+                "coupon_id": {"type": "string"},
+                "title": {"type": "string", "maxLength": 255, "description": "Shown in Shopify and at checkout."},
+                "value": {"type": "object", "description": "{\"percentage\": 10} (0-100) or {\"fixed_amount\": 5} in the store's currency."},
+                "minimum_subtotal": {"type": "number", "minimum": 0},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100, "description": "Shopify collection ids; empty means everything."},
+                "prefix": {"type": "string", "maxLength": 12, "description": "Letters and digits at the start of each code."},
+                "combines_with_other_discounts": {"type": "boolean"},
+                "expires_after_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "Otherwise the coupon's own expiry."}
+            }), &["coupon_id", "title", "value"]), false, false),
+        tool("remove_shopify_coupon", "Stop making a coupon's codes in Shopify", "Unlink a coupon from the store. Codes already given stay theirs.", obj(json!({"coupon_id": {"type": "string"}}), &["coupon_id"]), false, false),
     ]
 }
 
@@ -212,13 +302,24 @@ pub async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResu
         "disconnect_shopify" => disconnect(state, ctx, confirm).await,
         "start_shopify_import" => start_import(state, ctx, confirm, a["order_days"].as_i64()).await,
         "get_shopify_import" => get_import(state, acct).await,
-        "pause_shopify_import" => Ok(import::to_json(&import::set_status(state, acct, "pause").await?)),
-        "resume_shopify_import" => Ok(import::to_json(&import::set_status(state, acct, "resume").await?)),
-        "cancel_shopify_import" => Ok(import::to_json(&import::set_status(state, acct, "cancel").await?)),
+        "pause_shopify_import" => import_action(state, ctx, "pause").await,
+        "resume_shopify_import" => import_action(state, ctx, "resume").await,
+        "cancel_shopify_import" => import_action(state, ctx, "cancel").await,
         "resync_shopify_products" => resync(state, ctx).await,
         "get_shopify_data_request" => {
             let id: Uuid = a["id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("id must be an id"))?;
-            privacy::get(&state.db, acct, id).await?.ok_or_else(|| AppError::not_found("data request"))
+            data_request(state, ctx, id).await
+        }
+        "set_shopify_coupon" | "remove_shopify_coupon" => {
+            let id: Uuid = a["coupon_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| AppError::bad("coupon_id must be an id"))?;
+            if name == "remove_shopify_coupon" {
+                return remove_coupon(state, ctx, id).await;
+            }
+            let mut body = a.clone();
+            if let Some(o) = body.as_object_mut() {
+                o.remove("coupon_id");
+            }
+            set_coupon(state, ctx, id, &body).await
         }
         _ => Err(AppError::not_found("tool")),
     }
