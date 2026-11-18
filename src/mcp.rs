@@ -146,6 +146,7 @@ Messaging: campaigns are one-off sends to lists/segments; flows are automations 
 Email content is a list of blocks (see the dumbmail://docs/email resource) personalized with Jinja tags like {{ first_name|default('there') }}. \
 Always render_preview new content and send_test before sending. Sending a campaign or turning a flow live reaches real people: \
 the tools require confirm=true and you should get the user's explicit go-ahead first. Data: get_analytics, query_metric, campaign_performance, get_campaign_report, get_flow_report. \
+Custom integrations (any app's webhooks or API, Guesty, Stripe, Calendly): read dumbmail://docs/integrations, then create_integration_from_recipe or create_integration and test_integration. \
 Sign-up forms: create_form / update_form take a config described in the dumbmail://docs/forms resource; check one with get_form's preview_url before publishing, and upload images with upload_image. \
 Times are ISO 8601; the account has a time zone (default America/Los_Angeles) used for reporting buckets.";
 
@@ -308,7 +309,7 @@ Read dumbmail://docs/segments for the details and examples.",
     let email_content = json!({"type": "object", "description": "Email: {subject, preheader?, from_name?, from_email?, reply_to?, blocks: [...]} or raw html. Block types: heading{text,level?,align?}, text{html}, image{src,alt?,href?}, button{text,href,color?}, divider, spacer{height?}, columns{columns:[[blocks],[blocks]]}, product{title,image?,price?,href,button_text?}, html{html}. SMS: {body, media_url?}. Push: {title, body, url?, icon?, image?, actions?, platforms?, ...} (see dumbmail://docs/push). Jinja personalization: {{ first_name|default('there') }}, {{ person.properties.x }}, {{ event.properties.x }} in flows, {{ organization.name }}."});
     let profile_ref = json!({"type": "object", "description": "Who did it: email, phone_number (E.164) or external_id, plus optional first_name, last_name and custom properties.",
         "properties": {"email": {"type": "string"}, "phone_number": {"type": "string"}, "external_id": {"type": "string"}, "first_name": {"type": "string"}, "last_name": {"type": "string"}, "properties": {"type": "object"}}});
-    let trigger = json!({"type": "object", "description": "Flow trigger. {type:'metric', metric:'Placed Order', filters?:[{field, op, value}]} | {type:'list', list_id} | {type:'segment', segment_id} | {type:'date_property', field:'birthday', offset_days?}"});
+    let trigger = json!({"type": "object", "description": "Flow trigger. {type:'metric', metric:'Placed Order', filters?:[{field, op, value}]} | {type:'list', list_id} | {type:'segment', segment_id} | {type:'date_property', field:'birthday', offset_days?} | {type:'event_date', metric, field (event property holding the date), offset_days?, hour?, filters?, key?, cancelled_by?}. metric and event_date triggers take key + cancelled_by to stop when the thing is cancelled (see dumbmail://docs/flows)."});
     let ab_test = json!({"type": ["object", "null"], "description": "A/B test. The campaign's own content is version A; variants are versions b, c, d in order, each with a full content object. A random test_percent (5-100, default 20) of the audience is split evenly across versions; after wait_hours (1-168, default 4) the best version by metric (open_rate (email only), click_rate (default) or revenue) goes to everyone else. pick: auto (default) or manual (call pick_campaign_winner). null removes the test.",
         "properties": {"variants": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "object", "properties": {"id": {"enum": ["b", "c", "d"]}, "content": {"type": "object"}}, "required": ["id", "content"]}},
             "test_percent": {"type": "integer", "minimum": 5, "maximum": 100}, "wait_hours": {"type": "integer", "minimum": 1, "maximum": 168},
@@ -888,8 +889,9 @@ A definition is `{"match": "all" | "any", "conditions": [...]}`. Groups nest up 
 - `{"type": "message", "action": "received" | "opened" | "clicked", "campaign_id": "..." | "flow_id": "...", "op": "has" | "has_not", "within_days": 30}`.
 - `{"type": "form", "form_id": "...", "op": "has" | "has_not", "within_days": 30}`: signed up through a form (any form when `form_id` is left out). `since` and `until` work too.
 - `{"type": "coupon", "coupon_id": "...", "action": "given" | "redeemed", "op": "has" | "has_not", "within_days": 30}`: got a code from a coupon (it reached them in a message or on a form), or used it in an order. Only orders recorded by the API or a store integration count as redeemed; orders from the website script are unverified and don't.
-- `{"type": "can_receive", "channel": "email" | "sms" | "push", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, and no bounce or complaint suppression. SMS needs a phone and subscribed consent. Push needs a device that allowed notifications and no push opt-out.
-- `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint.
+- `{"type": "can_receive", "channel": "email" | "sms" | "push", "value": true}`: a send would reach them now. Email needs an address, consent not unsubscribed or pending, no bounce or complaint suppression, and no marketing hold (see `marketing_hold`). SMS needs a phone and subscribed consent. Push needs a device that allowed notifications and no push opt-out (the marketing hold is about email and doesn't apply to push).
+- `{"type": "property", "field": "marketing_hold", "op": "eq", "value": true}`: people held back from marketing (added by an integration or import without an opt-in). Campaigns skip them; only flows marked `service_messages` reach them.
+- `{"type": "suppressed", "value": true}`: email suppressed after a hard bounce or spam complaint, or by an integration (a booking-site relay address, or one marked not for marketing).
 - `{"type": "consent", "channel": "email" | "sms", "status": "subscribed" | "unsubscribed" | "never_subscribed" | "pending"}`.
 
 ## Lists and other segments
@@ -966,7 +968,10 @@ SMS: `{"body": "Hi {{ first_name|default('there') }}! 20% off today: https://...
 
 const FLOW_DOC: &str = r#"# Flows
 
-Triggers: `{"type": "metric", "metric": "Started Checkout", "filters": [{"field": "value", "op": "gt", "value": 50}]}`, `{"type": "list", "list_id": "..."}`, `{"type": "segment", "segment_id": "..."}`, `{"type": "date_property", "field": "birthday", "offset_days": -7}`.
+Triggers: `{"type": "metric", "metric": "Started Checkout", "filters": [{"field": "value", "op": "gt", "value": 50}]}`, `{"type": "list", "list_id": "..."}`, `{"type": "segment", "segment_id": "..."}`, `{"type": "date_property", "field": "birthday", "offset_days": -7}`, `{"type": "event_date", "metric": "Reservation Confirmed", "field": "check_in", "offset_days": -2, "hour": 10, "key": "reservation_id", "cancelled_by": ["Reservation Cancelled"]}`.
+
+- `event_date`: N days before (negative) or after the date in event property `field` of each `metric` event, at `hour` (0-23, default 9) in the account's time zone. Each event starts the flow once, so a guest with two bookings gets both (re-entry doesn't apply). Optional `filters` on the event's properties, like metric triggers.
+- `key` + `cancelled_by` (on `event_date` and `metric` triggers): people leave the flow before the next step when a `cancelled_by` event with the same value of property `key` happens later, or a newer event of the trigger metric with the same key replaces this one (e.g. the booking's dates changed). Event-date triggers also check this when they fire.
 
 ```json
 {"entry": "d1",
@@ -985,9 +990,10 @@ Triggers: `{"type": "metric", "metric": "Started Checkout", "filters": [{"field"
 - `exit_condition`: checked before every step; people who match leave the flow (e.g. they purchased).
 - `profile_filter`: only people matching it enter.
 - `smart_sending_hours`: skip a message if the person got one on that channel in the last N hours.
+- `service_messages: true`: also email people held back from marketing (`marketing_hold`: added by an integration without an opt-in). Only for messages about the person's own booking or order, never promotions. Unsubscribed and suppressed people still get nothing.
 - `random_split {percent, yes, no}`: an A/B test inside a flow. Each person goes down `yes` (path A) with `percent`% chance, otherwise `no` (path B). Compare the paths' steps in get_flow's per-step stats, then replace the split with the winning path.
 - Other steps: `update_profile {properties}`, `add_to_list`/`remove_from_list {list_id}`, `webhook {url, method, body}`.
-- In metric-triggered flows, `{{ event.properties.* }}` is the triggering event (e.g. cart items, checkout_url).
+- In metric-triggered and event-date flows, `{{ event.properties.* }}` is the triggering event (e.g. cart items, checkout_url, check_in).
 "#;
 
 #[cfg(test)]

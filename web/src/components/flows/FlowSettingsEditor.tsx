@@ -1,6 +1,6 @@
 import type { FlowSettings, Reentry, SegmentDefinition } from "../../api";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
-import { Field, Input, Select } from "../ui";
+import { Checkbox, Field, Input, Select } from "../ui";
 
 type Props = { settings: FlowSettings; onChange: (s: FlowSettings) => void; readOnly?: boolean };
 
@@ -43,6 +43,12 @@ export function FlowSettingsEditor({ settings, onChange, readOnly }: Props) {
           className="w-28"
         />
       </Field>
+      <Checkbox
+        checked={settings.service_messages === true}
+        onChange={(e) => onChange({ ...settings, service_messages: e.target.checked ? true : undefined })}
+        label="Service messages"
+        description="Also send to people who haven't agreed to marketing. Use only for messages about the person's own booking or order. People who unsubscribed still get nothing."
+      />
       <div>
         <div className="mb-1 text-xs font-medium text-zinc-700">Profile filter</div>
         <p className="mb-2 text-xs text-zinc-500">Only people who match can enter. Checked again before each step.</p>
