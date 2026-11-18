@@ -1,0 +1,54 @@
+{
+  "description": "customer.updated for someone who unsubscribed from Square's marketing emails: suppressed from marketing here",
+  "doc": "https://developer.squareup.com/reference/square/customers-api/webhooks/customer.created (example; personal data replaced)",
+  "expect": [
+    {
+      "email": "quinn.example@example.com",
+      "first_name": "Quinn",
+      "keys": {
+        "square_customer": "UNSUBSCRIBEDCUSTOMER00000"
+      },
+      "last_name": "Example",
+      "marketing": false,
+      "type": "upsert_profile"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": "2022-11-10T21:23:25Z",
+      "data": {
+        "id": "UNSUBSCRIBEDCUSTOMER00000",
+        "object": {
+          "customer": {
+            "address": {
+              "address_line_1": "1 Test Street",
+              "administrative_district_level_1": "CA",
+              "locality": "Oakland",
+              "postal_code": "94608"
+            },
+            "birthday": "1962-03-04",
+            "created_at": "2022-11-09T21:23:25.519Z",
+            "creation_source": "DIRECTORY",
+            "email_address": "quinn.example@example.com",
+            "family_name": "Example",
+            "given_name": "Quinn",
+            "group_ids": [
+              "JGJCW9S0G68NE.APPOINTMENTS"
+            ],
+            "id": "UNSUBSCRIBEDCUSTOMER00000",
+            "phone_number": null,
+            "preferences": {
+              "email_unsubscribed": true
+            },
+            "updated_at": "2022-11-09T21:23:25Z",
+            "version": 3
+          }
+        },
+        "type": "customer"
+      },
+      "event_id": "f12b5591-e0b6-4967-810a-307c7efcb1a7",
+      "merchant_id": "6SSW7HV8K2ST5",
+      "type": "customer.updated"
+    }
+  }
+}

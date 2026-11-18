@@ -1,0 +1,62 @@
+{
+  "description": "refund.updated, COMPLETED: Refunded Order with its own amount, found through the payment id",
+  "doc": "https://developer.squareup.com/reference/square/refunds-api/webhooks/refund.updated (example; the refund's payment_id points at the payment fixture)",
+  "expect": [
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "if_missing": "retry",
+        "property": "square_payment",
+        "value": "hYy9pRFVxpDsO1FB05SunFWUe9JZY"
+      },
+      "properties": {
+        "currency": "USD",
+        "order_id": "haOyDuHiqtAXMk0d8pDKXpL7Jg4F",
+        "payment_id": "hYy9pRFVxpDsO1FB05SunFWUe9JZY",
+        "refund_id": "KkAkhdMsgzn59SM8A89WgKwekxLZY_ptNBVqHYxt5gAdfcobBe4u1AZsXhoz06KTtuq9Ls24P"
+      },
+      "time": "2020-02-06T22:14:16.381Z",
+      "type": "track_event",
+      "unique_id": "square:refund:KkAkhdMsgzn59SM8A89WgKwekxLZY_ptNBVqHYxt5gAdfcobBe4u1AZsXhoz06KTtuq9Ls24P",
+      "value": 0.6
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": "2020-02-06T22:14:16.421Z",
+      "data": {
+        "id": "KkAkhdMsgzn59SM8A89WgKwekxLZY_ptNBVqHYxt5gAdfcobBe4u1AZsXhoz06KTtuq9Ls24P",
+        "object": {
+          "refund": {
+            "amount_money": {
+              "amount": 60,
+              "currency": "USD"
+            },
+            "created_at": "2020-02-06T21:27:41.836Z",
+            "id": "KkAkhdMsgzn59SM8A89WgKwekxLZY_ptNBVqHYxt5gAdfcobBe4u1AZsXhoz06KTtuq9Ls24P",
+            "location_id": "NAQ1FHV6ZJ8YV",
+            "order_id": "haOyDuHiqtAXMk0d8pDKXpL7Jg4F",
+            "payment_id": "hYy9pRFVxpDsO1FB05SunFWUe9JZY",
+            "processing_fee": [
+              {
+                "amount_money": {
+                  "amount": -59,
+                  "currency": "USD"
+                },
+                "effective_at": "2020-02-06T23:27:31.000Z",
+                "type": "INITIAL"
+              }
+            ],
+            "status": "COMPLETED",
+            "updated_at": "2020-02-06T22:14:16.381Z",
+            "version": 10
+          }
+        },
+        "type": "refund"
+      },
+      "event_id": "bc316346-6691-4243-88ed-6d651a0d0c47",
+      "merchant_id": "6SSW7HV8K2ST5",
+      "type": "refund.updated"
+    }
+  }
+}
