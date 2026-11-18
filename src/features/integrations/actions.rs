@@ -101,6 +101,13 @@ pub struct UpsertProfile {
     pub keys: Option<Map<String, Value>>,
 }
 
+/// Key names DumbMail keeps its own consent bookkeeping under: a script can't write them.
+pub const RESERVED_KEY_PREFIX: &str = "consent_";
+
+fn reserved_key(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(RESERVED_KEY_PREFIX)
+}
+
 /// Most values kept per key in an `upsert_profile`'s `keys`.
 pub const MAX_KEY_VALUES: usize = 100;
 
@@ -281,6 +288,9 @@ fn check_who(i: usize, kind: &str, w: &Who) -> Result<(), String> {
             if p.is_empty() || p.len() > 100 {
                 return Err(format!("action {i} ({kind}): profile.property must be 1-100 characters"));
             }
+            if reserved_key(p) {
+                return Err(format!("action {i} ({kind}): profile.property can't be one of DumbMail's own keys ({RESERVED_KEY_PREFIX}…)"));
+            }
             if w.value.as_ref().is_none_or(|v| v.is_null() || v.is_object() || v.is_array()) {
                 return Err(format!("action {i} ({kind}): profile.property needs a plain `value` to match"));
             }
@@ -360,6 +370,9 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                         if name.is_empty() || name.len() > 100 || !ok {
                             return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
                         }
+                        if reserved_key(name) {
+                            return Err(format!("action {i} ({k}): key names starting with {RESERVED_KEY_PREFIX} are DumbMail's own"));
+                        }
                     }
                 }
                 Action::UpsertProfile(a)
@@ -418,6 +431,9 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     let ok = v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200);
                     if name.is_empty() || name.len() > 100 || !ok {
                         return Err(format!("action {i} ({k}): each key needs a name (1-100 characters) and a text value (1-200 characters)"));
+                    }
+                    if reserved_key(name) {
+                        return Err(format!("action {i} ({k}): key names starting with {RESERVED_KEY_PREFIX} are DumbMail's own"));
                     }
                 }
                 Action::AddKeys(a)
@@ -610,6 +626,7 @@ fn key_text(v: &Value) -> String {
 fn trusted_keys(props: &Map<String, Value>) -> Map<String, Value> {
     props
         .iter()
+        .filter(|(k, _)| !reserved_key(k))
         .filter(|(_, v)| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)))
         .map(|(k, v)| (k.clone(), Value::String(key_text(v))))
         .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200))
@@ -1158,13 +1175,13 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
     let q = format!(
         "WITH cur AS (
             SELECT p.id, p.{col} AS c, p.{addr_col} AS addr, p.integration_keys AS k,
-                   ($3::timestamptz IS NULL OR NOT (split_part(p.integration_keys->'{vkey}'->>0, '|', 1) = p.{addr_col}
-                        AND NULLIF(split_part(p.integration_keys->'{vkey}'->>0, '|', 2), '')::timestamptz >= $3::timestamptz)) AS fresh,
-                   (p.{col} = 'subscribed' AND split_part(p.integration_keys->'{pkey}'->>0, '|', 1) = $4 AND split_part(p.integration_keys->'{pkey}'->>0, '|', 2) = p.{addr_col}
+                   COALESCE($3::timestamptz IS NULL OR NOT (split_part(p.integration_keys->'{vkey}'->>0, '|', 1) = p.{addr_col}
+                        AND NULLIF(split_part(p.integration_keys->'{vkey}'->>0, '|', 2), '')::timestamptz >= $3::timestamptz), true) AS fresh,
+                   COALESCE(p.{col} = 'subscribed' AND split_part(p.integration_keys->'{pkey}'->>0, '|', 1) = $4 AND split_part(p.integration_keys->'{pkey}'->>0, '|', 2) = p.{addr_col}
                         AND NOT EXISTS (SELECT 1 FROM events e JOIN metrics m ON m.id = e.metric_id
                              WHERE e.profile_id = p.id AND e.account_id = p.account_id
                                AND e.occurred_at > NULLIF(split_part(p.integration_keys->'{pkey}'->>0, '|', 3), '')::timestamptz
-                               AND (m.name = ANY($6) OR (m.name = $7 AND COALESCE(e.properties->>'integration_id', '') <> $4)))) AS own
+                               AND (m.name = ANY($6) OR (m.name = $7 AND COALESCE(e.properties->>'integration_id', '') <> $4))), false) AS own
             FROM profiles p WHERE p.id = $1 AND p.account_id = $2 FOR UPDATE
          ), next AS (
             SELECT id, c, fresh, own, addr, k,

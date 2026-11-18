@@ -691,6 +691,16 @@ async fn paddle_orders_refunds_and_its_marketing_consent_box() {
     ann_off["data"]["updated_at"] = json!("2024-07-05T10:00:00.000Z");
     p.post_as(&h, &ann_off.to_string(), &json!({}), &json!({}), &p.secret).await;
     assert_eq!(consent(&h, "ann.example@example.com").await.1, "subscribed", "her own later opt-in stays");
+    // A script can't write (or look people up by) DumbMail's consent bookkeeping keys.
+    for bad in [
+        json!([{"type": "upsert_profile", "email": "ann.example@example.com", "keys": {"consent_by:email": "x"}}]),
+        json!([{"type": "add_keys", "profile": {"email": "ann.example@example.com"}, "keys": {"consent_as_of:x:email": "y"}}]),
+        json!([{"type": "track_event", "metric": "Placed Order", "profile": {"property": "consent_by:email", "value": "x"}}]),
+    ] {
+        let out = h.ok("POST", &format!("/api/integrations/{}/test", p.id), Some(json!({"payload": {}, "script": format!("function handle() {{ return {bad}; }}")}))).await;
+        assert_eq!(out["ok"], false, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("DumbMail's own"), "{out}");
+    }
     let names = ["transaction-completed.json"];
     never_stored(&mut h, &p, &sensitive("paddle", &names), &names).await;
     h.cleanup().await;
