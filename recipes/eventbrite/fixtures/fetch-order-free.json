@@ -1,0 +1,85 @@
+{
+  "description": "A free order (the documented example's gross is 0.00): Registered for Event, not an order",
+  "doc": "https://www.eventbrite.com/platform/docs/order-lookup (example order; personal data replaced)",
+  "expect": [
+    {
+      "email": "kennedy.example@example.com",
+      "first_name": "Kennedy",
+      "keys": {
+        "eventbrite_order": "1234567890"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Registered for Event",
+      "profile": {
+        "email": "kennedy.example@example.com"
+      },
+      "properties": {
+        "event_id": "123456",
+        "order_id": "1234567890"
+      },
+      "time": "2018-11-02T19:07:24Z",
+      "type": "track_event",
+      "unique_id": "eventbrite:order:1234567890:registered"
+    }
+  ],
+  "input": {
+    "payload": {
+      "changed": "2018-11-02T19:07:24Z",
+      "costs": {
+        "base_price": {
+          "currency": "CAD",
+          "display": "CA$0.00",
+          "major_value": "0.00",
+          "value": 0
+        },
+        "eventbrite_fee": {
+          "currency": "CAD",
+          "display": "CA$0.00",
+          "major_value": "0.00",
+          "value": 0
+        },
+        "gross": {
+          "currency": "CAD",
+          "display": "CA$0.00",
+          "major_value": "0.00",
+          "value": 0
+        },
+        "payment_fee": {
+          "currency": "CAD",
+          "display": "CA$0.00",
+          "major_value": "0.00",
+          "value": 0
+        },
+        "tax": {
+          "currency": "CAD",
+          "display": "CA$0.00",
+          "major_value": "0.00",
+          "value": 0
+        }
+      },
+      "created": "2018-11-02T19:07:24Z",
+      "email": "kennedy.example@example.com",
+      "event_id": "123456",
+      "first_name": "Kennedy",
+      "id": "1234567890",
+      "last_name": "Example",
+      "name": "Kennedy Example",
+      "resource_uri": "https://www.eventbriteapi.com/v3/orders/1234567890/",
+      "status": "placed",
+      "time_remaining": null
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://www.eventbriteapi.com/v3/orders/1234567890/"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:00:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

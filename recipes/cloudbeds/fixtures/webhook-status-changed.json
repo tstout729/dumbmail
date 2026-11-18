@@ -1,0 +1,29 @@
+{
+  "description": "reservation/status_changed: the status in the webhook isn't trusted; the reservation is fetched",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/status_changed fields)",
+  "expect": [
+    {
+      "query": {
+        "propertyID": "12345",
+        "reservationID": "31415926"
+      },
+      "type": "next_request",
+      "url": "/api/v1.3/getReservation"
+    }
+  ],
+  "input": {
+    "payload": {
+      "actor": {
+        "id": "7",
+        "type": "user"
+      },
+      "event": "reservation/status_changed",
+      "propertyID": 12345,
+      "propertyID_str": "12345",
+      "reservationID": "31415926",
+      "status": "confirmed",
+      "timestamp": 1611758257.5,
+      "version": "1.0"
+    }
+  }
+}

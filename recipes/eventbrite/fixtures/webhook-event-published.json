@@ -1,0 +1,21 @@
+{
+  "description": "Other actions (event.published) aren't recorded",
+  "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
+  "expect": [
+    {
+      "message": "ignored Eventbrite webhook for /v3/events/12345/",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_url": "https://www.eventbriteapi.com/v3/events/12345/",
+      "config": {
+        "action": "event.published",
+        "endpoint_url": "https://dumbmail.example/webhooks/in/x",
+        "user_id": "1548223516143",
+        "webhook_id": "157236"
+      }
+    }
+  }
+}

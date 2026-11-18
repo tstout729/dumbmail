@@ -1,0 +1,16 @@
+{
+  "description": "ORDER_NOTIFY isn't recorded (only shipments are)",
+  "doc": "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks (example payload)",
+  "expect": [
+    {
+      "message": "ignored ShipStation ORDER_NOTIFY",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "resource_type": "ORDER_NOTIFY",
+      "resource_url": "https://ssapi.shipstation.com/orders?storeID=123456&importBatch=1ab23c4d-12ab-1abc-a1bc-a12b12cdabcd"
+    }
+  }
+}

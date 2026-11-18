@@ -1,0 +1,257 @@
+{
+  "key": "cloudbeds",
+  "name": "Cloudbeds",
+  "category": "Hotels",
+  "description": "Cloudbeds reservations become events on the main guest's profile: Reservation Booked (once), Reservation Confirmed (each version of its status and dates), Reservation Cancelled and Checked Out. Each reservation is also kept as a reservation object (status, dates, nights, guests, total, balance, and whether it's paid in full), checked again every hour for arrivals in the next week, so the pre-arrival email goes only to stays Cloudbeds reports as paid in full. Guests are held back from marketing: they booked, they didn't sign up.",
+  "metrics": [
+    "Reservation Booked",
+    {
+      "name": "Reservation Confirmed",
+      "purchase": true
+    },
+    "Reservation Cancelled",
+    "Checked Out"
+  ],
+  "docs": [
+    "https://developers.cloudbeds.com/docs/webhooks-1",
+    "https://developers.cloudbeds.com/reference/get_getreservation-2",
+    "https://developers.cloudbeds.com/reference/get_getreservations-2",
+    "https://developers.cloudbeds.com/docs/reservation-faqs"
+  ],
+  "signature": {
+    "type": "shared_secret",
+    "header": "X-Webhook-Token"
+  },
+  "signature_secret": {
+    "label": "Webhook header value",
+    "help": "A long random value you choose, for example the output of: openssl rand -hex 24. Give it as authHeaderValue (with authHeaderName X-Webhook-Token) when you create each Cloudbeds webhook."
+  },
+  "credentials": [
+    {
+      "name": "api_key",
+      "label": "Cloudbeds API key",
+      "help": "An API key with the read:reservation scope (Cloudbeds → Account → Apps & Marketplace → API credentials). Used to fetch each reservation a webhook names and for the hourly payment check."
+    }
+  ],
+  "settings": {
+    "property_id": "",
+    "payment_check_days": 7,
+    "currency": ""
+  },
+  "pull": {
+    "method": "GET",
+    "url": "https://api.cloudbeds.com/api/v1.3/getReservations",
+    "query": {
+      "status": "confirmed",
+      "checkInFrom": "{{state.from|'2000-01-01'}}",
+      "checkInTo": "{{state.to|'2000-01-01'}}",
+      "pageNumber": "{{state.page|'1'}}",
+      "pageSize": 100
+    },
+    "auth": {
+      "type": "header",
+      "name": "X-Api-Key",
+      "value": "{{secret.api_key}}"
+    },
+    "interval_minutes": 60,
+    "max_pages": 10,
+    "fetch": {
+      "prefix": "/api/v1.3/",
+      "paths": [
+        "/api/v1.3/getReservation"
+      ],
+      "query": [
+        "reservationID",
+        "propertyID"
+      ],
+      "id": "^[A-Za-z0-9]{1,40}$"
+    }
+  },
+  "redact": [
+    "keep:event",
+    "keep:version",
+    "keep:timestamp",
+    "keep:reservationID",
+    "keep:reservationId",
+    "keep:propertyID",
+    "keep:propertyId",
+    "keep:status",
+    "keep:success",
+    "keep:count",
+    "keep:total",
+    "keep:data[].reservationID",
+    "keep:data[].propertyID",
+    "keep:data.reservationID",
+    "keep:data.propertyID",
+    "keep:data.status",
+    "keep:data.guestEmail",
+    "keep:data.isAnonymized",
+    "keep:data.dateCreated",
+    "keep:data.dateModified",
+    "keep:data.dateCancelledUTC",
+    "keep:data.startDate",
+    "keep:data.endDate",
+    "keep:data.total",
+    "keep:data.balance",
+    "keep:data.balanceDetailed.paid",
+    "keep:data.balanceDetailed.grandTotal",
+    "keep:data.source",
+    "keep:data.guestList.*.isMainGuest",
+    "keep:data.guestList.*.guestFirstName",
+    "keep:data.guestList.*.guestLastName",
+    "keep:data.guestList.*.guestPhone",
+    "keep:data.guestList.*.guestCellPhone",
+    "keep:data.assigned[].adults",
+    "keep:data.assigned[].children",
+    "keep:data.unassigned[].adults",
+    "keep:data.unassigned[].children"
+  ],
+  "object_types": [
+    {
+      "key": "reservation",
+      "name": "Reservation",
+      "plural": "Reservations",
+      "title_field": "reservation_id",
+      "fields": [
+        {
+          "key": "reservation_id",
+          "label": "Reservation ID",
+          "type": "text"
+        },
+        {
+          "key": "status",
+          "label": "Status",
+          "type": "text"
+        },
+        {
+          "key": "property_id",
+          "label": "Property ID",
+          "type": "text"
+        },
+        {
+          "key": "check_in",
+          "label": "Check-in",
+          "type": "date"
+        },
+        {
+          "key": "check_out",
+          "label": "Check-out",
+          "type": "date"
+        },
+        {
+          "key": "nights",
+          "label": "Nights",
+          "type": "number"
+        },
+        {
+          "key": "guests",
+          "label": "Guests",
+          "type": "number"
+        },
+        {
+          "key": "total",
+          "label": "Total",
+          "type": "number"
+        },
+        {
+          "key": "balance",
+          "label": "Balance due",
+          "type": "number"
+        },
+        {
+          "key": "source_channel",
+          "label": "Channel",
+          "type": "text"
+        },
+        {
+          "key": "paid_in_full",
+          "label": "Paid in full",
+          "type": "boolean"
+        },
+        {
+          "key": "paid_checked_at",
+          "label": "Payment checked at",
+          "type": "datetime"
+        }
+      ]
+    }
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Cloudbeds, create an API key with the read:reservation scope and save it as the credential api_key.",
+    "Pick a long random value and save it as the integration's signing secret. Cloudbeds doesn't sign webhooks; it sends this value in a header instead.",
+    "Create four webhooks with Cloudbeds' API: POST https://api.cloudbeds.com/api/v1.3/postWebhook (form fields) with object=reservation, action=created, endpointUrl=<webhook URL>, authHeaderName=X-Webhook-Token and authHeaderValue=<the same value>. Repeat with action=status_changed, action=dates_changed and action=deleted. Add ?propertyID=<id> to the address if your key covers several properties.",
+    "If the key covers several properties and this integration is for one of them, set property_id in the settings; reservations for other properties are ignored.",
+    "Optional: set currency in the settings (for example USD) to record each booking's total as revenue on Reservation Booked. Cloudbeds' reservation doesn't say which currency it's in.",
+    "Make a test reservation and check the delivery log: each webhook is followed by a fetch of the reservation.",
+    "Every hour, DumbMail lists confirmed reservations arriving in the next payment_check_days days (7 by default) and fetches each one again, because Cloudbeds sends no webhook when a payment is taken.",
+    "Guests are held back from marketing. The pre-arrival flow is a service message about their own stay, so it still reaches them. Review it, edit the email, and turn it on. It never includes door codes or other access details; add those yourself only through a channel that checks payment.",
+    "Guest documents, addresses, cards, notes and custom fields are never stored: only the fields the recipe reads are kept from each answer."
+  ],
+  "flows": [
+    {
+      "name": "Cloudbeds: pre-arrival",
+      "description": "Two days before check-in at 10am, a note about the guest's stay. Only while the reservation is confirmed and Cloudbeds reported it paid in full in a check at most three hours old and at least as new as the reservation's last change: checked when it's due. It follows the newest dates. A service message, with placeholders and no access details.",
+      "trigger": {
+        "type": "object_date",
+        "object_type": "reservation",
+        "field": "check_in",
+        "offset_days": -2,
+        "hour": 10,
+        "relationship": "guest",
+        "filters": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": "confirmed"
+          },
+          {
+            "field": "paid_in_full",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "paid_checked_at",
+            "op": "gte",
+            "value": {
+              "field": "$as_of"
+            }
+          },
+          {
+            "field": "paid_checked_at",
+            "op": "within_last_days",
+            "value": 0.125
+          }
+        ]
+      },
+      "definition": {
+        "entry": "o1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "o1",
+            "type": "email",
+            "name": "Before you arrive",
+            "next": null,
+            "content": {
+              "subject": "See you soon",
+              "preheader": "Check-in is {{ object.check_in|date }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your stay starts in two days"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, we're getting ready for you.</p><p>Check-in: {{ object.check_in|date }}<br>Check-out: {{ object.check_out|date }}<br>Reservation: {{ object.reservation_id }}</p><p>Reply to this email if you have any questions before you arrive.</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

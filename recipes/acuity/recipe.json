@@ -1,0 +1,84 @@
+{
+  "key": "acuity",
+  "name": "Acuity Scheduling",
+  "category": "Scheduling",
+  "description": "Acuity Scheduling appointments become events on the client's profile: Appointment Scheduled, Appointment Rescheduled (once per new time) and Appointment Cancelled, with the time, type, calendar and length. Acuity's webhooks only name the appointment, so DumbMail fetches each one and records what Acuity says now. Intake forms and notes are never stored. Clients are held back from marketing: booking isn't consent.",
+  "metrics": [
+    "Appointment Scheduled",
+    "Appointment Rescheduled",
+    "Appointment Cancelled"
+  ],
+  "docs": [
+    "https://developers.acuityscheduling.com/docs/webhooks",
+    "https://developers.acuityscheduling.com/page/webhooks-webhooks-webhooks",
+    "https://developers.acuityscheduling.com/reference/get-appointments-id",
+    "https://developers.acuityscheduling.com/reference/get-appointments"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "X-Acuity-Signature",
+    "encoding": "base64"
+  },
+  "signature_secret": {
+    "label": "Acuity API key",
+    "help": "Acuity signs webhooks with your API key: Integrations → API → View credentials. Paste the API key here as well as in the credentials."
+  },
+  "credentials": [
+    {
+      "name": "user_id",
+      "label": "Acuity user ID",
+      "help": "Integrations → API → View credentials."
+    },
+    {
+      "name": "api_key",
+      "label": "Acuity API key",
+      "help": "The same page. Used to fetch each appointment a webhook names."
+    }
+  ],
+  "settings": {},
+  "pull": {
+    "method": "GET",
+    "url": "https://acuityscheduling.com/api/v1/appointments",
+    "auth": {
+      "type": "basic",
+      "username": "{{secret.user_id}}",
+      "password": "{{secret.api_key}}"
+    },
+    "fetch": {
+      "prefix": "/api/v1/",
+      "paths": [
+        "/api/v1/appointments/{id}"
+      ],
+      "id": "^[0-9]{1,20}$",
+      "context": [
+        "action"
+      ]
+    }
+  },
+  "redact": [
+    "keep:action",
+    "keep:id",
+    "keep:calendarID",
+    "keep:appointmentTypeID",
+    "keep:firstName",
+    "keep:lastName",
+    "keep:email",
+    "keep:phone",
+    "keep:datetime",
+    "keep:type",
+    "keep:calendar",
+    "keep:duration",
+    "keep:timezone",
+    "keep:canceled",
+    "keep:noShow"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Acuity, open Integrations → API → View credentials. Save the user ID and API key as the credentials user_id and api_key, and the API key again as the integration's signing secret (Acuity signs webhooks with it).",
+    "In Acuity, open Integrations → Webhooks (Set up). Paste the webhook URL in the boxes for Appointment scheduled, Appointment rescheduled and Appointment canceled, and save. Leave the \"any change\" box empty: it repeats the others.",
+    "Book a test appointment and check the delivery log: each webhook is followed by a fetch of the appointment.",
+    "Clients are held back from marketing: booking an appointment isn't consent. Flows marked as service messages (a booking follow-up, say) still reach them.",
+    "Only the client's name, email and phone and the appointment's time, type, calendar and length are kept. Intake form answers, notes, prices and links are dropped before anything is stored."
+  ],
+  "flows": []
+}

@@ -1,0 +1,33 @@
+{
+  "description": "reservation/dates_changed spells its ids reservationId and propertyId: fetch the reservation",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/dates_changed fields)",
+  "expect": [
+    {
+      "query": {
+        "propertyID": "12345",
+        "reservationID": "31415926"
+      },
+      "type": "next_request",
+      "url": "/api/v1.3/getReservation"
+    }
+  ],
+  "input": {
+    "payload": {
+      "endDate": "2020-05-22",
+      "event": "reservation/dates_changed",
+      "propertyId": 12345,
+      "propertyId_str": "12345",
+      "reservationId": "31415926",
+      "startDate": "2020-05-20",
+      "subReservations": [
+        {
+          "endDate": "2020-05-22",
+          "id": "31415926-1",
+          "startDate": "2020-05-20"
+        }
+      ],
+      "timestamp": 1611758357.1,
+      "version": "1.0"
+    }
+  }
+}

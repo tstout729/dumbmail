@@ -1,0 +1,25 @@
+{
+  "description": "order.refunded: look the order up (so the buyer is known) and fetch its tickets (Eventbrite marks each refunded one)",
+  "doc": "https://www.eventbrite.com/platform/docs/webhooks (example payload; config fields from the same page)",
+  "expect": [
+    {
+      "type": "lookup",
+      "url": "/v3/orders/1234567890/"
+    },
+    {
+      "type": "next_request",
+      "url": "/v3/orders/1234567890/attendees/"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_url": "https://www.eventbriteapi.com/v3/orders/1234567890/",
+      "config": {
+        "action": "order.refunded",
+        "endpoint_url": "https://dumbmail.example/webhooks/in/x",
+        "user_id": "1548223516143",
+        "webhook_id": "157236"
+      }
+    }
+  }
+}

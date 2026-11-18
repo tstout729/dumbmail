@@ -1,0 +1,76 @@
+{
+  "description": "An order that isn't placed records nothing yet",
+  "doc": "https://www.eventbrite.com/platform/docs/order-lookup (example order; personal data replaced)",
+  "expect": [
+    {
+      "email": "kennedy.example@example.com",
+      "first_name": "Kennedy",
+      "keys": {
+        "eventbrite_order": "1234567890"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "message": "order 1234567890 is started; it's recorded once it's placed",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "changed": "2018-11-02T19:07:24Z",
+      "costs": {
+        "base_price": {
+          "currency": "CAD",
+          "display": "CA$25.00",
+          "major_value": "25.00",
+          "value": 2500
+        },
+        "eventbrite_fee": {
+          "currency": "CAD",
+          "display": "CA$2.50",
+          "major_value": "2.50",
+          "value": 250
+        },
+        "gross": {
+          "currency": "CAD",
+          "display": "CA$29.95",
+          "major_value": "29.95",
+          "value": 2995
+        },
+        "payment_fee": {
+          "currency": "CAD",
+          "display": "CA$1.20",
+          "major_value": "1.20",
+          "value": 120
+        },
+        "tax": {
+          "currency": "CAD",
+          "display": "CA$1.25",
+          "major_value": "1.25",
+          "value": 125
+        }
+      },
+      "created": "2018-11-02T19:07:24Z",
+      "email": "kennedy.example@example.com",
+      "event_id": "123456",
+      "first_name": "Kennedy",
+      "id": "1234567890",
+      "last_name": "Example",
+      "name": "Kennedy Example",
+      "resource_uri": "https://www.eventbriteapi.com/v3/orders/1234567890/",
+      "status": "started",
+      "time_remaining": null
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://www.eventbriteapi.com/v3/orders/1234567890/"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:00:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

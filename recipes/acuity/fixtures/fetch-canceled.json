@@ -1,0 +1,106 @@
+{
+  "description": "A cancelled appointment comes back with noShow (false: a plain cancellation): Appointment Cancelled once",
+  "doc": "https://developers.acuityscheduling.com/reference/get-appointments-id (example response; personal data replaced); noShow as documented for cancelled appointments",
+  "expect": [
+    {
+      "email": "bob.example@example.com",
+      "first_name": "Bob",
+      "last_name": "Example",
+      "phone_number": "+15125550110",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Appointment Cancelled",
+      "profile": {
+        "email": "bob.example@example.com"
+      },
+      "properties": {
+        "appointment_id": "54321",
+        "calendar": "My Calendar",
+        "datetime": "2013-06-17T10:15:00-07:00",
+        "duration_minutes": 60,
+        "no_show": false,
+        "timezone": "America/New_York",
+        "type": "Regular Visit"
+      },
+      "time": "2026-11-17T17:50:00.000Z",
+      "type": "track_event",
+      "unique_id": "acuity:54321:cancelled"
+    }
+  ],
+  "input": {
+    "context": {
+      "action": "canceled"
+    },
+    "payload": {
+      "amountPaid": "0.00",
+      "appointmentTypeID": 1,
+      "calendar": "My Calendar",
+      "calendarID": 27238,
+      "canClientCancel": false,
+      "canClientReschedule": false,
+      "certificate": "GIFT-7781",
+      "classID": null,
+      "confirmationPage": "https://acuityscheduling.com/schedule.php?owner=11145481&id[]=1220aa9f41091c50c0cc659385cfa1d0&action=appt",
+      "date": "June 17, 2013",
+      "dateCreated": "July 2, 2013",
+      "datetime": "2013-06-17T10:15:00-0700",
+      "duration": "60",
+      "email": "bob.example@example.com",
+      "endTime": "11:15am",
+      "firstName": "Bob",
+      "forms": [
+        {
+          "id": 1,
+          "name": "Example Intake Form",
+          "values": [
+            {
+              "fieldID": 1,
+              "id": 21502993,
+              "name": "Is this your first visit?",
+              "value": "yes"
+            },
+            {
+              "fieldID": 2,
+              "id": 21502994,
+              "name": "What is your goal for this appointment?",
+              "value": "Back pain since surgery"
+            }
+          ]
+        }
+      ],
+      "formsText": "Is this your first visit?: yes\nWhat is your goal for this appointment?: Back pain since surgery",
+      "id": 54321,
+      "labels": [
+        {
+          "color": "pink",
+          "id": 3,
+          "name": "Completed"
+        }
+      ],
+      "lastName": "Example",
+      "location": "",
+      "noShow": false,
+      "notes": "Prefers the side entrance",
+      "paid": "no",
+      "phone": "+1 512 555 0110",
+      "price": "10.00",
+      "scheduledBy": null,
+      "time": "10:15am",
+      "timezone": "America/New_York",
+      "type": "Regular Visit"
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://acuityscheduling.com/api/v1/appointments/54321"
+    },
+    "response": {
+      "headers": {
+        "content-type": "application/json"
+      },
+      "received_at": "2026-11-17T17:50:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

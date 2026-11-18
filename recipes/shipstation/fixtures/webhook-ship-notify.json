@@ -1,0 +1,22 @@
+{
+  "description": "SHIP_NOTIFY: fetch the batch's shipments, 50 a page",
+  "doc": "https://help.shipstation.com/hc/en-us/articles/360025856252-ShipStation-Webhooks (example payload)",
+  "expect": [
+    {
+      "query": {
+        "batchId": "12345678",
+        "page": "1",
+        "pageSize": "50",
+        "storeID": "123456"
+      },
+      "type": "next_request",
+      "url": "/shipments"
+    }
+  ],
+  "input": {
+    "payload": {
+      "resource_type": "SHIP_NOTIFY",
+      "resource_url": "https://ssapi.shipstation.com/shipments?storeID=123456&batchId=12345678"
+    }
+  }
+}

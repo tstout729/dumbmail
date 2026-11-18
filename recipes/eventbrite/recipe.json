@@ -1,0 +1,86 @@
+{
+  "key": "eventbrite",
+  "name": "Eventbrite",
+  "category": "Events",
+  "description": "Eventbrite orders and check-ins become events: Placed Order (paid orders, once, in their currency), Registered for Event (free orders), Refunded Order (once per refunded ticket) and Checked In (once per attendee). Eventbrite's webhooks only point at the order or attendee, so DumbMail fetches each one with your Eventbrite token and records what Eventbrite says. Buyers and attendees are held back from marketing: a ticket isn't consent.",
+  "metrics": [
+    {
+      "name": "Placed Order",
+      "purchase": true
+    },
+    "Registered for Event",
+    "Refunded Order",
+    "Checked In"
+  ],
+  "docs": [
+    "https://www.eventbrite.com/platform/docs/webhooks",
+    "https://www.eventbrite.com/platform/docs/order-lookup",
+    "https://www.eventbrite.com/platform/docs/attendees",
+    "https://www.eventbrite.com/platform/docs/cancelling-and-refunding-orders",
+    "https://www.eventbrite.com/platform/docs/authentication"
+  ],
+  "signature": {
+    "type": "none"
+  },
+  "credentials": [
+    {
+      "name": "token",
+      "label": "Eventbrite private token",
+      "help": "Eventbrite → Account settings → Developer links → API keys → your key's private token. Used to fetch each order and attendee a webhook points to."
+    }
+  ],
+  "settings": {},
+  "pull": {
+    "method": "GET",
+    "url": "https://www.eventbriteapi.com/v3/users/me/",
+    "auth": {
+      "type": "bearer",
+      "token": "{{secret.token}}"
+    },
+    "fetch": {
+      "prefix": "/v3/",
+      "paths": [
+        "/v3/orders/{id}/",
+        "/v3/orders/{id}/attendees/",
+        "/v3/events/{id}/attendees/{id}/"
+      ],
+      "id": "^[0-9]{1,20}$"
+    }
+  },
+  "redact": [
+    "keep:api_url",
+    "keep:config.action",
+    "keep:config.webhook_id",
+    "keep:id",
+    "keep:status",
+    "keep:email",
+    "keep:first_name",
+    "keep:last_name",
+    "keep:event_id",
+    "keep:created",
+    "keep:changed",
+    "keep:costs.gross.major_value",
+    "keep:costs.gross.currency",
+    "keep:profile.email",
+    "keep:checked_in",
+    "keep:order_id",
+    "keep:ticket_class_name",
+    "keep:attendees[].id",
+    "keep:attendees[].order_id",
+    "keep:attendees[].refunded",
+    "keep:attendees[].changed",
+    "keep:attendees[].event_id",
+    "keep:attendees[].costs.gross.major_value",
+    "keep:attendees[].costs.gross.currency",
+    "keep:pagination.has_more_items"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL. Keep it private: Eventbrite doesn't sign webhooks, so the URL is the secret (Eventbrite's docs say the same).",
+    "In Eventbrite, open Account settings → Developer links → API keys and copy your private token. Save it as the credential token.",
+    "Still in Account settings → Developer links, open Webhooks → Add webhook. Paste the webhook URL, pick the event or All events, tick Order placed, Order updated, Order refunded and Attendee checked in, and save. Click Test to send a test delivery.",
+    "Place a test order and check the delivery log: each webhook is followed by a fetch of the order (and, for a refund, of its tickets).",
+    "Buyers and attendees are held back from marketing: buying a ticket isn't consent. Flows marked as service messages (an order follow-up, say) still reach them.",
+    "Barcodes, answers to custom questions and addresses are never stored: only the fields the recipe reads are kept."
+  ],
+  "flows": []
+}

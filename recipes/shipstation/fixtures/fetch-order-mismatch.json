@@ -1,0 +1,90 @@
+{
+  "description": "An answer for another order than the one asked for is ignored",
+  "doc": "https://www.shipstation.com/docs/api/orders/get-order/ (example response, trimmed; personal data replaced)",
+  "expect": [
+    {
+      "message": "the answer isn't order 43945660",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "context": {
+      "shipments": [
+        {
+          "id": "33974374"
+        }
+      ]
+    },
+    "payload": {
+      "amountPaid": 218.73,
+      "billTo": {
+        "addressVerified": null,
+        "city": null,
+        "company": null,
+        "country": null,
+        "name": "Yoda Example",
+        "phone": null,
+        "postalCode": null,
+        "residential": null,
+        "state": null,
+        "street1": null,
+        "street2": null,
+        "street3": null
+      },
+      "createDate": "2015-07-16T14:00:34.8230000",
+      "customerEmail": "yoda.example@example.com",
+      "customerId": 37701499,
+      "customerNotes": "Leave by the side gate, code 5150",
+      "customerUsername": "yoda.example@example.com",
+      "gift": true,
+      "giftMessage": "Happy birthday from Mom",
+      "internalNotes": "Customer called and would like to upgrade shipping",
+      "items": [
+        {
+          "name": "Test item #1",
+          "orderItemId": 128836912,
+          "quantity": 2,
+          "sku": "ABC123",
+          "unitPrice": 99.99
+        }
+      ],
+      "modifyDate": "2015-09-08T11:03:12.3800000",
+      "orderDate": "2015-06-29T08:46:27.0000000",
+      "orderId": 1,
+      "orderKey": "0f6bec18-9-4771-83aa-f392d84f4c74",
+      "orderNumber": "100038-1",
+      "orderStatus": "shipped",
+      "orderTotal": 194.43,
+      "paymentDate": "2015-06-29T08:46:27.0000000",
+      "paymentMethod": "Credit Card",
+      "requestedShippingService": "Priority Mail",
+      "shipByDate": "2015-07-05T00:00:00.0000000",
+      "shipDate": "2015-07-02",
+      "shipTo": {
+        "addressVerified": "Address validation warning",
+        "city": "MANCHACA",
+        "company": "",
+        "country": "US",
+        "name": "Yoda Example",
+        "phone": "2105550144",
+        "postalCode": "78652-3602",
+        "residential": false,
+        "state": "TX",
+        "street1": "12223 LOWDEN LN",
+        "street2": ""
+      },
+      "shippingAmount": 10,
+      "taxAmount": 5
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://ssapi.shipstation.com/orders/43945660"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:01:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

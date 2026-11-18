@@ -1,0 +1,96 @@
+{
+  "description": "The consent box left empty: marketing_consent false",
+  "doc": "https://api.jotform.com/docs/#submission-id (example response; answers extended with documented question types; personal data replaced)",
+  "expect": [
+    {
+      "email": "bart.example@example.com",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Form Submitted",
+      "profile": {
+        "email": "bart.example@example.com"
+      },
+      "properties": {
+        "answers": {
+          "3": "Bart Example",
+          "7": "Surfing"
+        },
+        "form_id": "31751954731962",
+        "marketing_consent": false,
+        "submission_id": "237955080346633702"
+      },
+      "type": "track_event",
+      "unique_id": "jotform:31751954731962:237955080346633702"
+    }
+  ],
+  "input": {
+    "payload": {
+      "content": {
+        "answers": {
+          "3": {
+            "answer": {
+              "first": "Bart",
+              "last": "Example"
+            },
+            "prettyFormat": "Bart Example",
+            "text": "Name",
+            "type": "control_fullname"
+          },
+          "4": {
+            "answer": "My door code is 2468",
+            "text": "Your Message",
+            "type": "control_textarea"
+          },
+          "5": {
+            "answer": "bart.example@example.com",
+            "text": "Email",
+            "type": "control_email"
+          },
+          "6": {
+            "answer": "",
+            "prettyFormat": "",
+            "text": "Can we email you?",
+            "type": "control_checkbox"
+          },
+          "7": {
+            "answer": "Surfing",
+            "text": "Interest",
+            "type": "control_dropdown"
+          }
+        },
+        "created_at": "2013-06-25 03:38:00",
+        "form_id": "31751954731962",
+        "id": "237955080346633702",
+        "ip": "203.0.113.7",
+        "new": "1",
+        "status": "ACTIVE",
+        "updated_at": "2013-06-27 04:58:00",
+        "workflowStatus": "Approve"
+      },
+      "limit-left": 9991,
+      "message": "success",
+      "responseCode": 200
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://api.jotform.com/submission/237955080346633702"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:00:00.000Z",
+      "status": 200
+    },
+    "settings": {
+      "consent_field": "6",
+      "consent_value": "Yes, send me emails",
+      "copy_fields": [
+        "7",
+        "3"
+      ],
+      "email_field": "5",
+      "form_id": "31751954731962"
+    },
+    "source": "fetch"
+  }
+}

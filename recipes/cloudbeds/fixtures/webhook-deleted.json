@@ -1,0 +1,28 @@
+{
+  "description": "reservation/deleted: marked deleted and not paid as of Cloudbeds' event time (it can't be fetched any more)",
+  "doc": "https://developers.cloudbeds.com/docs/webhooks-1 (reservation/deleted fields)",
+  "expect": [
+    {
+      "as_of": "2021-01-27T14:40:57.250Z",
+      "external_id": "cloudbeds:31415926",
+      "fields": {
+        "paid_checked_at": "2021-01-27T14:40:57.250Z",
+        "paid_in_full": false,
+        "reservation_id": "31415926",
+        "status": "deleted"
+      },
+      "object_type": "reservation",
+      "type": "upsert_object"
+    }
+  ],
+  "input": {
+    "payload": {
+      "event": "reservation/deleted",
+      "propertyId": 12345,
+      "propertyId_str": "12345",
+      "reservationId": "31415926",
+      "timestamp": 1611758457.25,
+      "version": "1.0"
+    }
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "description": "The attendee isn't checked in (a forged or stale webhook): nothing recorded",
+  "doc": "https://www.eventbrite.com/platform/docs/attendees (example attendee; personal data replaced)",
+  "expect": [
+    {
+      "message": "attendee 12345 isn't checked in",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "affiliate": null,
+      "answers": [
+        {
+          "answer": "Peanut allergy",
+          "question": "Dietary needs",
+          "question_id": "88",
+          "type": "text"
+        }
+      ],
+      "barcodes": [
+        {
+          "barcode": "BARCODE123459911",
+          "changed": "2018-11-02T22:36:48Z",
+          "checkin_method": "search",
+          "checkin_type": 0,
+          "created": "2018-11-02T19:07:24Z",
+          "is_printed": false,
+          "status": "used"
+        }
+      ],
+      "cancelled": false,
+      "changed": "2018-11-02T22:36:48Z",
+      "checked_in": false,
+      "costs": {
+        "base_price": {
+          "currency": "CAD",
+          "display": "CA$12.50",
+          "major_value": "12.50",
+          "value": 1250
+        },
+        "eventbrite_fee": {
+          "currency": "CAD",
+          "display": "CA$1.25",
+          "major_value": "1.25",
+          "value": 125
+        },
+        "gross": {
+          "currency": "CAD",
+          "display": "CA$14.97",
+          "major_value": "14.97",
+          "value": 1497
+        },
+        "payment_fee": {
+          "currency": "CAD",
+          "display": "CA$0.60",
+          "major_value": "0.60",
+          "value": 60
+        },
+        "tax": {
+          "currency": "CAD",
+          "display": "CA$0.62",
+          "major_value": "0.62",
+          "value": 62
+        }
+      },
+      "created": "2018-11-02T19:07:24Z",
+      "delivery_method": "electronic",
+      "event_id": "12345",
+      "guestlist_id": null,
+      "id": "12345",
+      "invited_by": null,
+      "order_id": "123123123",
+      "profile": {
+        "addresses": {
+          "bill": {},
+          "fulfillment": {},
+          "home": {
+            "address_1": "1 Test Street"
+          },
+          "ship": {},
+          "work": {}
+        },
+        "email": "kennedy.example@example.com",
+        "first_name": "Kennedy",
+        "last_name": "Example",
+        "name": "Kennedy Example"
+      },
+      "quantity": 1,
+      "refunded": false,
+      "resource_uri": "https://www.eventbriteapi.com/v3/events/123456/attendees/12345/",
+      "status": "Attending",
+      "team": null,
+      "ticket_class_id": "123123123",
+      "ticket_class_name": "General Admission",
+      "variant_id": null
+    },
+    "request": {
+      "method": "GET",
+      "url": "https://www.eventbriteapi.com/v3/events/12345/attendees/12345/"
+    },
+    "response": {
+      "headers": {},
+      "received_at": "2026-11-17T17:02:00.000Z",
+      "status": 200
+    },
+    "source": "fetch"
+  }
+}

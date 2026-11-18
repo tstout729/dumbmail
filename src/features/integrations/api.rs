@@ -242,7 +242,12 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     let message_id = integ.message_id_of(&parts.headers, &bytes);
     let headers = keep_headers(&parts.headers, sig.secret_header().as_deref());
     let ct = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
-    let body = String::from_utf8_lossy(&bytes).into_owned();
+    // A multipart form (Jotform) is kept as an ordinary form of its text fields, once its
+    // signature (if any) has been checked against the raw bytes.
+    let (ct, body) = match ct.as_deref().and_then(|c| engine::multipart_as_form(c, &bytes)) {
+        Some(form) => (Some("application/x-www-form-urlencoded".to_string()), form),
+        None => (ct, String::from_utf8_lossy(&bytes).into_owned()),
+    };
     let query = json!(query);
     let scrub = Scrub::new(integ.secret_values(&state).await);
     // A turned-off integration keeps only a log line: nothing of the payload is stored.

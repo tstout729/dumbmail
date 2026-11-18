@@ -160,6 +160,55 @@ pub fn parse_body(content_type: Option<&str>, body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
+/// A `multipart/form-data` body (Jotform's webhooks) as an ordinary form: its text fields,
+/// URL-encoded, so it is stored, redacted and handed to the script like any form. File parts and
+/// anything that isn't UTF-8 are left out. `None` when the body isn't a readable multipart form.
+pub fn multipart_as_form(content_type: &str, body: &[u8]) -> Option<String> {
+    let ct = content_type.to_ascii_lowercase();
+    if !ct.trim_start().starts_with("multipart/form-data") {
+        return None;
+    }
+    let boundary = content_type
+        .split(';')
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("boundary"))
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .filter(|b| !b.is_empty() && b.len() <= 200)?;
+    let text = std::str::from_utf8(body).ok()?;
+    let delim = format!("--{boundary}");
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    let mut fields = 0;
+    for part in text.split(delim.as_str()).skip(1) {
+        if part.starts_with("--") {
+            break;
+        }
+        let part = part.strip_prefix("\r\n").or_else(|| part.strip_prefix('\n')).unwrap_or(part);
+        let (head, value) = part.split_once("\r\n\r\n").or_else(|| part.split_once("\n\n"))?;
+        let value = value.strip_suffix("\r\n").or_else(|| value.strip_suffix('\n')).unwrap_or(value);
+        let disposition = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))?;
+        let mut name = None;
+        let mut file = false;
+        for attr in disposition.split(';').skip(1) {
+            let Some((k, v)) = attr.trim().split_once('=') else { continue };
+            match k.trim().to_ascii_lowercase().as_str() {
+                "name" => name = Some(v.trim().trim_matches('"').to_string()),
+                "filename" | "filename*" => file = true,
+                _ => {}
+            }
+        }
+        let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
+        if file {
+            continue;
+        }
+        fields += 1;
+        if fields > 1000 {
+            break;
+        }
+        out.append_pair(&name, value);
+    }
+    Some(out.finish())
+}
+
 #[derive(Default)]
 pub struct Input {
     pub source: String,
@@ -1389,13 +1438,18 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     Ok(())
 }
 
-/// How long the app asked us to wait: `Retry-After` (seconds or an HTTP date) or BigCommerce's
-/// `X-Rate-Limit-Time-Reset-Ms`. At most two hours.
+/// How long the app asked us to wait: `Retry-After` (seconds or an HTTP date), BigCommerce's
+/// `X-Rate-Limit-Time-Reset-Ms` or ShipStation's `X-Rate-Limit-Reset` (seconds until its window
+/// resets). At most two hours.
 fn cooldown(headers: &Map<String, Value>) -> Option<chrono::Duration> {
     let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).and_then(|(_, v)| v.as_str()).map(str::trim);
     // Values are clamped before a duration is built, so an absurd header can't overflow it.
     let ms: i64 = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
         ms
+    } else if let Some(s) = get("x-rate-limit-reset").and_then(|v| v.parse::<i64>().ok()) {
+        // Seconds to wait; a value that looks like a Unix time is read as the moment to wait for.
+        let s = if s > 1_000_000_000 { s - Utc::now().timestamp() } else { s };
+        s.clamp(0, 7200) * 1000
     } else {
         let v = get("retry-after")?;
         match v.parse::<i64>() {
@@ -1504,7 +1558,9 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
         Err(e) => return fetch_failed(state, &integ, &scrub, id, attempts, Some(logged.log_json()), &e.public_message(), None, true).await,
     };
     let mut made = logged.log_json();
-    made["response"] = json!({"status": resp.status, "headers": resp.headers});
+    // When DumbMail got the answer: a script can version what it learned by it (the record as it
+    // stood then), since a later answer for the same record is always received later.
+    made["response"] = json!({"status": resp.status, "headers": resp.headers, "received_at": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)});
     if !(200..300).contains(&resp.status) {
         if token.is_some() && matches!(resp.status, 401 | 403) {
             pull::drop_token(state, integ.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -1649,4 +1705,34 @@ pub async fn prune_with(state: &AppState, budget: Duration, bytes_per_account: i
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multipart_forms_become_plain_forms() {
+        let body = "--XyZ\r\nContent-Disposition: form-data; name=\"formID\"\r\n\r\n31751954731962\r\n--XyZ\r\nContent-Disposition: form-data; name=\"submissionID\"\r\n\r\n2379550\r\n--XyZ\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--XyZ\r\nContent-Disposition: form-data; name=\"rawRequest\"\r\n\r\n{\"q3_email\":\"a&b@example.com\"}\r\n--XyZ--\r\n";
+        let form = multipart_as_form("multipart/form-data; boundary=XyZ", body.as_bytes()).unwrap();
+        let parsed = parse_body(Some("application/x-www-form-urlencoded"), &form);
+        assert_eq!(parsed, json!({"formID": "31751954731962", "submissionID": "2379550", "rawRequest": "{\"q3_email\":\"a&b@example.com\"}"}));
+        assert_eq!(multipart_as_form("multipart/form-data; boundary=\"XyZ\"", body.as_bytes()), Some(form));
+        assert_eq!(multipart_as_form("application/json", body.as_bytes()), None);
+        assert_eq!(multipart_as_form("multipart/form-data", body.as_bytes()), None, "no boundary");
+    }
+
+    #[test]
+    fn cooldowns_follow_the_apps_own_headers() {
+        let h = |k: &str, v: &str| json!({k: v}).as_object().cloned().unwrap();
+        assert_eq!(cooldown(&h("Retry-After", "30")), Some(chrono::Duration::seconds(30)));
+        assert_eq!(cooldown(&h("X-Rate-Limit-Time-Reset-Ms", "15000")), Some(chrono::Duration::seconds(15)));
+        // ShipStation: seconds until its window resets.
+        assert_eq!(cooldown(&h("X-Rate-Limit-Reset", "20")), Some(chrono::Duration::seconds(20)));
+        let at = (Utc::now().timestamp() + 60).to_string();
+        let w = cooldown(&h("x-rate-limit-reset", &at)).unwrap();
+        assert!(w <= chrono::Duration::seconds(60) && w >= chrono::Duration::seconds(55), "{w:?}");
+        assert_eq!(cooldown(&h("X-Rate-Limit-Reset", "999999")), Some(chrono::Duration::hours(2)), "at most two hours");
+        assert_eq!(cooldown(&Map::new()), None);
+    }
 }

@@ -123,7 +123,10 @@ impl FetchRules {
         let url = next.url.as_deref().ok_or("a webhook's fetch needs a url (a path)")?;
         let id = regex::Regex::new(&self.id).map_err(|_| "the fetch id pattern isn't valid".to_string())?;
         let segs: Vec<&str> = url.split('/').collect();
-        if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().skip(1).any(|s| s.is_empty() || *s == "." || *s == "..") {
+        // A plain path: no empty segment except a trailing slash (Eventbrite's API paths end with
+        // one), which must then be declared too.
+        let last = segs.len() - 1;
+        if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().enumerate().skip(1).any(|(i, s)| (s.is_empty() && i != last) || *s == "." || *s == "..") {
             return Err(format!("fetch path {:?} isn't a plain path", url.chars().take(100).collect::<String>()));
         }
         // The prefix, rendered, must itself be a plain path, and the lookup must sit under it.
@@ -814,7 +817,7 @@ async fn read(res: reqwest::Response, place: &str) -> AppResult<Response> {
     if res.status().is_redirection() {
         return Err(AppError::bad(format!("{place} answered with a redirect (HTTP {status}); redirects aren't followed, so use the final address")));
     }
-    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-rate-limit-time-reset-ms", "x-rate-limit-requests-left"];
+    let keep = ["content-type", "link", "x-total-count", "ratelimit-remaining", "ratelimit-reset", "retry-after", "x-ratelimit-remaining", "x-rate-limit-time-reset-ms", "x-rate-limit-requests-left", "x-rate-limit-reset"];
     let headers: Map<String, Value> = res
         .headers()
         .iter()
@@ -1079,6 +1082,22 @@ mod tests {
         }
         let rel = NextRequest { url: Some("/v1/items?page=2".into()), ..Default::default() };
         assert_eq!(build(&cfg, &rel, &v).unwrap().url, "https://api.example.com/v1/items?page=2");
+    }
+
+    #[test]
+    fn a_lookup_may_end_with_a_slash_only_where_declared() {
+        let cfg = PullConfig::parse(&json!({"url": "https://www.eventbriteapi.com/v3/orders", "fetch": {"prefix": "/v3/", "paths": ["/v3/orders/{id}/", "/v3/events/{id}/attendees/{id}/", "/v3/plain/{id}"]}})).unwrap();
+        let rules = cfg.fetch.unwrap();
+        let empty = Map::new();
+        let v = vars(&empty, &empty, &empty, false);
+        let ask = |url: &str| rules.allow(&NextRequest { url: Some(url.into()), ..Default::default() }, &v);
+        assert!(ask("/v3/orders/123/").is_ok());
+        assert!(ask("/v3/events/9/attendees/12/").is_ok());
+        assert!(ask("/v3/orders/123").is_err(), "the declared path has the slash");
+        assert!(ask("/v3/plain/7/").is_err(), "this one doesn't");
+        assert!(ask("/v3/plain/7").is_ok());
+        assert!(ask("/v3/orders//").is_err());
+        assert!(ask("/v3//orders/123/").is_err());
     }
 
     #[test]
