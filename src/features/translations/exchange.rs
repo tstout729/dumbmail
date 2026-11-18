@@ -110,14 +110,34 @@ pub fn from_xliff(xml: &str) -> AppResult<Vec<Unit>> {
     Ok(out)
 }
 
-/// CSV with columns id, where, source, translation, status.
+/// Whether a spreadsheet could read a cell as a formula: it starts with `=`, `+`, `-`, `@`, a tab
+/// or a carriage return, possibly after apostrophes this guard added before.
+fn formula_like(cell: &str) -> bool {
+    cell.trim_start_matches('\'').starts_with(['=', '+', '-', '@', '\t', '\r'])
+}
+
+/// A cell safe to open in a spreadsheet: formula-like text gets a leading apostrophe.
+fn guard(cell: &str) -> String {
+    if formula_like(cell) { format!("'{cell}") } else { cell.to_string() }
+}
+
+/// The cell as it was before [`guard`].
+fn unguard(cell: &str) -> String {
+    match cell.strip_prefix('\'') {
+        Some(rest) if formula_like(cell) => rest.to_string(),
+        _ => cell.to_string(),
+    }
+}
+
+/// CSV with columns id, where, source, translation, status. Cells a spreadsheet would run as a
+/// formula start with an apostrophe; importing removes exactly that.
 pub fn to_csv(content: &Value, lang: &str) -> AppResult<String> {
     let mut w = csv::Writer::from_writer(Vec::new());
     w.write_record(["id", "where", "source", "translation", "status"]).map_err(|e| AppError::Internal(e.into()))?;
     for f in fields::fields(content) {
         let st = fields::status(content, &f, lang);
         let target = fields::entry(content, &f.id, lang).and_then(|e| e.get("text")).and_then(|t| t.as_str()).filter(|_| st != "stale").unwrap_or("");
-        w.write_record([f.id.as_str(), f.label.as_str(), f.source.as_str(), target, st]).map_err(|e| AppError::Internal(e.into()))?;
+        w.write_record([guard(&f.id), guard(&f.label), guard(&f.source), guard(target), st.to_string()]).map_err(|e| AppError::Internal(e.into()))?;
     }
     let bytes = w.into_inner().map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
     String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))
@@ -137,7 +157,7 @@ pub fn from_csv(text: &str) -> AppResult<Vec<Unit>> {
     let mut out = Vec::new();
     for rec in r.records().take(fields::MAX_ENTRIES) {
         let rec = rec.map_err(|e| AppError::bad(format!("couldn't read the CSV: {e}")))?;
-        out.push((rec.get(id).unwrap_or("").to_string(), rec.get(source).unwrap_or("").to_string(), rec.get(target).unwrap_or("").to_string()));
+        out.push((unguard(rec.get(id).unwrap_or("")), unguard(rec.get(source).unwrap_or("")), unguard(rec.get(target).unwrap_or(""))));
     }
     Ok(out)
 }
@@ -202,6 +222,21 @@ mod tests {
         let r = apply(&mut c, "fr", &[("subject".into(), "Hello {{ first_name }}".into(), "Bonjour".into())], &[]);
         assert_eq!(r["refused"][0]["id"], "subject");
         assert!(from_xliff("not xml").is_err());
+    }
+
+    #[test]
+    fn csv_cells_cant_run_as_formulas_and_still_round_trip() {
+        for cell in ["=SUM(A1)", "+1 503", "-50% today", "@here", "\tx", "'=already", "''+x", "'plain", "plain", ""] {
+            let g = guard(cell);
+            assert!(!g.starts_with(['=', '+', '-', '@', '\t', '\r']), "{g:?}");
+            assert_eq!(unguard(&g), cell, "{cell:?}");
+        }
+        let c = json!({"subject": "-50% today", "blocks": [{"type": "heading", "text": "=HYPERLINK(\"https://evil.test\")"}]});
+        let csv = to_csv(&c, "fr").unwrap();
+        assert!(csv.contains("'-50% today") && csv.contains("'=HYPERLINK"));
+        let rows = from_csv(&csv).unwrap();
+        assert_eq!(rows[0].1, "-50% today");
+        assert_eq!(rows[1].1, "=HYPERLINK(\"https://evil.test\")");
     }
 
     #[test]

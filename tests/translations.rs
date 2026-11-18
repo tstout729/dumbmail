@@ -1284,3 +1284,23 @@ async fn the_opt_out_stays_visible() {
     assert!(p["text"].as_str().unwrap().contains("\u{2066}1 Main St, Portland, OR 97201\u{2069}"), "{}", p["text"]);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn csv_exports_are_safe_to_open_and_still_round_trip() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr"])).await;
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "Sale", "channel": "email", "content": {"subject": "-50% today", "blocks": [{"type": "heading", "text": "=Deals"}]}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (_, _, csv) = h.raw("GET", &format!("/api/translations/templates/{tid}/export?language=fr&format=csv"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
+    assert!(csv.contains("'-50% today") && csv.contains("'=Deals"), "{csv}");
+    assert!(!csv.lines().skip(1).any(|l| l.split(',').any(|cell| cell.trim_start_matches('"').starts_with(['=', '+', '-', '@']))), "{csv}");
+    // A translator fills in the translations (formula-like too) and the file comes back.
+    let filled = csv.replace("'-50% today,,missing", "'-50% today,'-50 % aujourd'hui,missing").replace("'=Deals,,missing", "'=Deals,'=Promos,missing");
+    let v = h.ok("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "fr", "format": "csv", "data": filled}))).await;
+    assert_eq!(v["import"]["applied"], 2, "{v}");
+    let text = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["text"].clone();
+    assert_eq!(text("subject"), "-50 % aujourd'hui");
+    assert_eq!(text("b0:text"), "=Promos");
+    h.cleanup().await;
+}
