@@ -649,6 +649,10 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
         sqlx::query("UPDATE transactional_sends SET status = 'failed', error = 'nothing to send', payload_enc = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
         return Ok(());
     };
+    // A closed account sends nothing; the send and its message are settled, not left queued.
+    if crate::models::account_closed(&state.db, account_id).await? {
+        return Ok(finish_unsent(&state.db, id, message_id, "skipped", "account closed").await?);
+    }
     let (account, email, profile_id) = match prepare(state, account_id, profile_id, &to_email, attempts, payload.as_deref(), rendered, message_id).await? {
         Ready::Send(r) => *r,
         Ready::Fail(msg) => return Ok(finish_unsent(&state.db, id, message_id, "failed", &msg).await?),
@@ -723,8 +727,9 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
 /// the account, transactional email paused or turned off, or the mailbox suppressed. Returns the
 /// final status and why, or None to send.
 async fn last_check(db: &PgPool, account_id: Uuid, to_email: &str) -> sqlx::Result<Option<(&'static str, String)>> {
-    let (all_paused, off, paused, suppressed): (bool, bool, bool, Option<String>) = sqlx::query_as(&format!(
-        "SELECT COALESCE((SELECT sending_paused_at IS NOT NULL OR closed_at IS NOT NULL FROM accounts WHERE id = $1), true),
+    let (closed, all_paused, off, paused, suppressed): (bool, bool, bool, bool, Option<String>) = sqlx::query_as(&format!(
+        "SELECT COALESCE((SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1), true),
+                COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true),
                 COALESCE((SELECT enabled_at IS NULL FROM transactional_settings WHERE account_id = $1), true),
                 COALESCE((SELECT paused_at IS NOT NULL FROM transactional_settings WHERE account_id = $1), false),
                 {SUPPRESSED}"
@@ -733,7 +738,9 @@ async fn last_check(db: &PgPool, account_id: Uuid, to_email: &str) -> sqlx::Resu
     .bind(to_email)
     .fetch_one(db)
     .await?;
-    Ok(if let Some(reason) = suppressed {
+    Ok(if closed {
+        Some(("skipped", "account closed".into()))
+    } else if let Some(reason) = suppressed {
         Some(("skipped", suppressed_message(&reason)))
     } else if all_paused {
         Some(("failed", "not sent: email sending is paused for this account".into()))

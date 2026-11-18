@@ -566,6 +566,12 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery, _met
 /// account until they're invited again. `Ok(Err(code))` is a refusal for the login page.
 async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, verified: bool, name: Option<String>) -> AppResult<Result<Uuid, &'static str>> {
     let mut tx = state.db.begin().await?;
+    // The account row first, as every membership change takes it (then memberships, then
+    // invites); a closed account takes nobody in.
+    let open: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE id = $1 AND closed_at IS NULL FOR SHARE").bind(cfg.account_id).fetch_optional(&mut *tx).await?;
+    if open.is_none() {
+        return Ok(Err("sso_unavailable"));
+    }
     // One sign-in per email at a time, and never alongside a removal of the same person.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("team-member:{}:{email}", cfg.account_id)).execute(&mut *tx).await?;
     let linked: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sso_identities WHERE account_id = $1 AND issuer = $2 AND subject = $3")
@@ -594,7 +600,7 @@ async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, ver
             if !verified {
                 return Ok(Err("sso_unverified"));
             }
-            match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1 FOR UPDATE").bind(email).fetch_optional(&mut *tx).await? {
+            match sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1 AND disabled_at IS NULL FOR UPDATE").bind(email).fetch_optional(&mut *tx).await? {
                 Some(uid) => {
                     let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(uid).bind(cfg.account_id).fetch_one(&mut *tx).await?;
                     // Never link a login outside the account, even with an invite: whoever made that
@@ -631,6 +637,11 @@ async fn sign_in(state: &AppState, cfg: &Config, subject: &str, email: &str, ver
             }
         }
     };
+    // The login must still be active (one given up meanwhile can't join or sign in).
+    let active: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1 AND disabled_at IS NULL FOR SHARE").bind(uid).fetch_optional(&mut *tx).await?;
+    if active.is_none() {
+        return Ok(Err("sso_failed"));
+    }
     if linked.is_none() {
         // The primary key (account, issuer, subject) and the unique (account, issuer, user_id)
         // settle a race: whoever loses inserts nothing and is refused.

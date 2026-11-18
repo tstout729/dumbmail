@@ -623,13 +623,21 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
     .await?;
     for (id, account_id, number, price, past_due_since, due_at) in due {
         if !state.cfg.hosted || balance(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? >= price {
+            // Under the account's row lock, taken before charging: an account closed a moment ago
+            // pays nothing (closing holds the same row).
+            let mut tx = state.db.begin().await?;
+            let closed: Option<bool> = sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_optional(&mut *tx).await?;
+            if closed != Some(false) {
+                continue;
+            }
             if state.cfg.hosted {
                 // Keyed by the billing period (not today's date), so a late payment can't make the
                 // next period's charge look like a duplicate.
                 let reference = format!("{id}:{}", due_at.format("%Y-%m-%d"));
-                post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                post_entry_tx(&mut tx, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
             }
-            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
             continue;
         }
         match past_due_since {

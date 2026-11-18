@@ -1386,6 +1386,30 @@ fn with(cfg: &Value, extra: Value) -> Value {
 }
 
 #[tokio::test]
+async fn sso_joining_takes_the_account_lock_first_and_skips_a_closed_account() {
+    let h = harness!();
+    let idp = oidc::start().await;
+    let (_owner, account_id, _) = sso_account(&h, &idp).await;
+    let acct: Uuid = account_id.parse().unwrap();
+    // The account is being closed (its row held) while someone signs in through the provider.
+    let mut closing = h.state.db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(acct).execute(&mut *closing).await.unwrap();
+    let (res, ()) = tokio::join!(sso_round(&h, &idp, "new@acme.test", "idp-new", |_| {}), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(acct).execute(&mut *closing).await.unwrap();
+        closing.commit().await.unwrap();
+    });
+    assert!(res.is_err());
+    let joined: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = 'new@acme.test' AND m.account_id = $1")
+        .bind(acct)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(joined, 0, "nobody joins a closed account");
+    h.cleanup().await;
+}
+
+#[tokio::test]
 async fn sso_cannot_undo_a_removal_or_take_over_a_login() {
     let h = harness!();
     let idp = oidc::start().await;

@@ -229,13 +229,31 @@ pub async fn complete_if_signed_in(state: &AppState, sid: Uuid, meta: &ReqMeta) 
     let mut tx = state.db.begin().await?;
     type Row = (Uuid, String, String, bool, Option<i32>, Option<bool>);
     let row: Option<Row> = sqlx::query_as(
-        "UPDATE google_link_pending SET used_at = now() WHERE session_id = $1 AND used_at IS NULL AND expires_at > now()
-         RETURNING user_id, email, google_sub, google_authoritative, credential_version, was_confirmed",
+        "SELECT user_id, email, google_sub, google_authoritative, credential_version, was_confirmed FROM google_link_pending
+         WHERE session_id = $1 AND used_at IS NULL AND expires_at > now() FOR UPDATE",
     )
     .bind(sid)
     .fetch_optional(&mut *tx)
     .await?;
     let Some((uid, email, sub, authoritative, Some(version), Some(was_confirmed))) = row else { return Ok(false) };
+    // The login's row first: turning two-factor on writes it, so from here it can't change. Then
+    // the session's proof, read again under that lock (and the account's rule, held too): the
+    // check above may be from just before two-factor was turned on.
+    let totp_on: Option<bool> = sqlx::query_scalar("SELECT totp_enabled_at IS NOT NULL FROM users WHERE id = $1 FOR UPDATE").bind(uid).fetch_optional(&mut *tx).await?;
+    let proof: Option<(bool, String, bool)> = sqlx::query_as(
+        "SELECT s.mfa_ok, s.auth_method, a.require_two_factor FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.id = $1 AND s.user_id = $2 FOR SHARE OF a",
+    )
+    .bind(sid)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (Some(totp_on), Some((mfa_ok, method, required))) = (totp_on, proof) else { return Ok(false) };
+    let needs_code = ((method == "password" || method == "google") && totp_on) || required;
+    if needs_code && !mfa_ok {
+        // Two-factor arrived meanwhile: the link waits for this session's code.
+        return Ok(false);
+    }
+    sqlx::query("UPDATE google_link_pending SET used_at = now() WHERE session_id = $1").bind(sid).execute(&mut *tx).await?;
     // Only while the login is exactly as it was checked, and this session is still its own.
     let linked = sqlx::query(
         "UPDATE users SET google_sub = $3, email_confirmed_at = CASE WHEN $4 THEN COALESCE(email_confirmed_at, now()) ELSE email_confirmed_at END
@@ -372,9 +390,11 @@ pub const RELEASE_NUMBERS_JOB: &str = "team_release_numbers";
 
 /// Make a login unusable and empty, and close the accounts it alone owned. Returns those accounts.
 ///
-/// Locks first, in the order every ownership change takes them too (see `members`): this login's
-/// membership rows, then the rows of the accounts it owns. Only then is "alone" decided, so a role
-/// change or an ownership transfer racing with this one is either seen here or waits for it.
+/// Locks first, in the one order every ownership change and every join takes them too (see
+/// `members` and `sso`): the rows of every account this login belongs to, in id order, then the
+/// membership rows in those accounts, then (when deleting them) invites. Only then is "alone"
+/// decided, so a role change, a transfer or a join racing with this one is either seen here or
+/// waits for it, and two of these can't deadlock.
 ///
 /// The login: its password, sessions, resets, confirmation links, recovery codes, two-factor and
 /// single sign-on links go; every API key it made (anywhere) is revoked; it leaves every account;
@@ -387,16 +407,15 @@ pub const RELEASE_NUMBERS_JOB: &str = "team_release_numbers";
 /// email sending is paused, auto-recharge and plan renewal stop, and a background job releases its
 /// phone numbers. A closed account then does nothing: see `crate::models::account_closed`.
 pub async fn give_up_login(tx: &mut sqlx::PgConnection, user_id: Uuid) -> AppResult<Vec<Uuid>> {
-    let mine: Vec<(Uuid, String)> = sqlx::query_as("SELECT account_id, role FROM memberships WHERE user_id = $1 ORDER BY account_id FOR UPDATE").bind(user_id).fetch_all(&mut *tx).await?;
-    let owned: Vec<Uuid> = mine.iter().filter(|(_, role)| role == "owner").map(|(a, _)| *a).collect();
-    sqlx::query("SELECT id FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(&owned).execute(&mut *tx).await?;
-    // Every owner change in these accounts holds the account row, so this is current.
-    let shared: Vec<Uuid> = sqlx::query_scalar("SELECT DISTINCT account_id FROM memberships WHERE account_id = ANY($1) AND user_id <> $2 AND role = 'owner'")
-        .bind(&owned)
-        .bind(user_id)
+    let theirs: Vec<Uuid> = sqlx::query_scalar("SELECT account_id FROM memberships WHERE user_id = $1").bind(user_id).fetch_all(&mut *tx).await?;
+    sqlx::query("SELECT id FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(&theirs).execute(&mut *tx).await?;
+    // Every membership change in these accounts holds the account row, so this is current.
+    let members: Vec<(Uuid, Uuid, String)> = sqlx::query_as("SELECT account_id, user_id, role FROM memberships WHERE account_id = ANY($1) ORDER BY account_id, user_id FOR UPDATE")
+        .bind(&theirs)
         .fetch_all(&mut *tx)
         .await?;
-    let closed: Vec<Uuid> = owned.into_iter().filter(|a| !shared.contains(a)).collect();
+    let owned = members.iter().filter(|(_, u, role)| *u == user_id && role == "owner").map(|(a, ..)| *a);
+    let closed: Vec<Uuid> = owned.filter(|a| !members.iter().any(|(acct, u, role)| acct == a && *u != user_id && role == "owner")).collect();
     sqlx::query(
         "UPDATE accounts SET closed_at = now(), public_key = 'pk_closed_' || replace(gen_random_uuid()::text, '-', ''),
                 sending_paused_at = COALESCE(sending_paused_at, now()), sending_paused_reason = COALESCE(sending_paused_reason, 'account closed'),

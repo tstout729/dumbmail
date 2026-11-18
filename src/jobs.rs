@@ -104,7 +104,8 @@ async fn on_dead(state: &AppState, kind: &str, payload: &Value, msg: &str) {
 /// Jobs that start work for an account, and how each finds that account (payload key, query).
 /// [`dispatch`] skips them when the account is closed (see `models::account_closed`), so nothing
 /// runs for a closed account, whichever feature queued the work. A job kind that starts work for
-/// an account belongs here.
+/// an account belongs here, unless it must settle what it was holding instead (a transactional
+/// retry marks its message skipped, "account closed": see `transactional::send`).
 const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("campaign_send", "campaign_id", "SELECT account_id FROM campaigns WHERE id = $1"),
     ("campaign_batch", "campaign_id", "SELECT account_id FROM campaigns WHERE id = $1"),
@@ -124,7 +125,6 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("warehouse_run", "run_id", "SELECT account_id FROM warehouse_runs WHERE id = $1"),
     ("inbox_auto_send", "id", "SELECT account_id FROM sms_auto_sends WHERE id = $1"),
     ("inbox_digest", "account_id", "SELECT $1::uuid"),
-    ("transactional_retry", "send_id", "SELECT account_id FROM transactional_sends WHERE id = $1"),
     ("coupons_alert", "coupon_id", "SELECT account_id FROM coupons WHERE id = $1"),
 ];
 
@@ -261,6 +261,8 @@ pub async fn scheduler_tick(state: &AppState, tick: u64) -> anyhow::Result<()> {
              WHERE (s.refreshed_at IS NULL OR s.refreshed_at < now() - interval '15 minutes'
                     OR EXISTS (SELECT 1 FROM flows f WHERE f.status = 'live' AND f.trigger->>'type' = 'segment' AND f.trigger->>'segment_id' = s.id::text))
                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.kind = 'segment_refresh' AND j.payload->>'segment_id' = s.id::text AND j.run_at <> 'infinity')
+               -- Closed accounts' segments never take a place in the batch.
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.closed_at IS NOT NULL)
              ORDER BY s.refreshed_at NULLS FIRST
              LIMIT 500",
         )

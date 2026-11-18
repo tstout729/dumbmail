@@ -331,6 +331,11 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
     if open.is_none() {
         return Ok(false);
     }
+    // The joining login must still be active: one given up meanwhile can't own or join anything.
+    let active: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1 AND disabled_at IS NULL FOR SHARE").bind(user_id).fetch_optional(&mut *tx).await?;
+    if active.is_none() {
+        return Ok(false);
+    }
     let n = sqlx::query(
         "UPDATE team_invites SET accepted_at = now(), accepted_by = $2
          WHERE id = $1 AND token_hash = $3 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()",
@@ -499,9 +504,9 @@ async fn member_row(tx: &mut sqlx::PgConnection, account_id: Uuid, user_id: Uuid
     Ok((email, Role::parse(&role).unwrap_or(Role::Analyst)))
 }
 
-/// After an owner change has locked the memberships it touches, lock the account row. Closing an
-/// account ("start fresh", `google_link::give_up_login`) takes the same locks in the same order
-/// and decides who owns what only after holding them, so the two can't cross.
+/// The first lock of every membership change: the account row. Then membership rows, then invites:
+/// the one order closing an account ("start fresh", `google_link::give_up_login`), joining and
+/// single sign-on joining take too, so they can't cross or deadlock.
 async fn lock_account(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<()> {
     sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     Ok(())
@@ -515,9 +520,9 @@ async fn owners(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<Vec<
 pub async fn change_role(state: &AppState, ctx: &Ctx, user_id: Uuid, role: &str) -> AppResult<Value> {
     let new = parse_role(role)?;
     let mut tx = state.db.begin().await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, old) = member_row(&mut tx, ctx.account_id, user_id).await?;
-    lock_account(&mut tx, ctx.account_id).await?;
     if (old == Role::Owner || new == Role::Owner) && old != new {
         if ctx.role != Role::Owner {
             return Err(AppError::Forbidden("only owners can make or change owners".into()));
@@ -544,9 +549,9 @@ pub async fn change_role_h(State(state): State<AppState>, ctx: Ctx, Path(user_id
 /// sessions on it (moved to another account of theirs when they have one).
 pub async fn remove(state: &AppState, ctx: &Ctx, user_id: Uuid, dry_run: bool) -> AppResult<Value> {
     let mut tx = state.db.begin().await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, role) = member_row(&mut tx, ctx.account_id, user_id).await?;
-    lock_account(&mut tx, ctx.account_id).await?;
     let leaving = Some(user_id) == ctx.user_id;
     if role == Role::Owner && ctx.role != Role::Owner && !leaving {
         return Err(AppError::Forbidden("only owners can remove an owner".into()));
@@ -617,9 +622,9 @@ pub async fn transfer_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     }
     require_fresh_sign_in(&ctx)?;
     let mut tx = state.db.begin().await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     owner_acting(&mut tx, &ctx).await?;
     let (email, _) = member_row(&mut tx, ctx.account_id, b.user_id).await?;
-    lock_account(&mut tx, ctx.account_id).await?;
     sqlx::query("UPDATE memberships SET role = 'owner' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(b.user_id).execute(&mut *tx).await?;
     sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(me).execute(&mut *tx).await?;
     tx.commit().await?;

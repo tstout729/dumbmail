@@ -636,20 +636,23 @@ fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>
 /// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
 /// settled it. None: claimed, send it.
 async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>) -> AppResult<Option<Stop>> {
-    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>);
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool);
     let account = spec.account;
     let mut tx = state.db.begin().await?;
     crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
     let ours = conversational.map(|_| from);
-    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start): Row = sqlx::query_as(&format!(
+    // The account row is held (shared) until the claim commits, so an account closing right now
+    // either finishes first (and this sees it) or waits for this claim.
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed): Row = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
                 p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
                 ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
                 $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
                 (SELECT max(i.provider_received_at) FROM sms_inbound i
-                  WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {})
+                  WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {}),
+                a.closed_at IS NOT NULL
          FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
-         WHERE a.id = $1",
+         WHERE a.id = $1 FOR SHARE OF a",
         crate::features::inbox::store::NO_WINDOW_KINDS
     ))
     .bind(account.id)
@@ -660,7 +663,9 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
     .fetch_one(&mut *tx)
     .await?;
     let help = conversational.is_some_and(|c| c.kind == "help");
-    let stop = if opted_out && !help {
+    let stop = if closed {
+        Some(Stop::Skip("account closed", None))
+    } else if opted_out && !help {
         Some(Stop::Skip("opted out", None))
     } else if consent.is_none() {
         Some(Stop::Skip("profile deleted", None))

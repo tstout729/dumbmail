@@ -216,3 +216,118 @@ async fn a_closed_account_pays_no_rent_or_renewal_and_a_late_payment_does_not_re
     assert_eq!(status, "released");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn closed_accounts_segments_never_crowd_out_open_ones() {
+    let Some(mut h) = harness_signed().await else { return };
+    h.signup().await;
+    let closed = account_id(&h).await;
+    let (_, open) = dumbmail::api::account::create_account(&h.state, "b@b.test", "b password", None, "Open").await.unwrap();
+    // 500 never-refreshed segments in the closed account, one stale segment in the open one.
+    sqlx::query("INSERT INTO segments (id, account_id, name, definition) SELECT gen_random_uuid(), $1, 'S' || g, '{}' FROM generate_series(1, 500) g").bind(closed).execute(&h.state.db).await.unwrap();
+    let mine = Uuid::now_v7();
+    sqlx::query("INSERT INTO segments (id, account_id, name, definition, refreshed_at) VALUES ($1, $2, 'Mine', '{}', now() - interval '1 hour')").bind(mine).bind(open.id).execute(&h.state.db).await.unwrap();
+    close(&h, closed).await;
+    dumbmail::jobs::scheduler_tick(&h.state, 0).await.unwrap();
+    let queued: Vec<String> = sqlx::query_scalar("SELECT payload->>'segment_id' FROM jobs WHERE kind = 'segment_refresh'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(queued, vec![mine.to_string()], "only the open account's segment is queued");
+    h.cleanup().await;
+}
+
+/// The closing transaction for `account`, left open: its row is changed but not committed.
+async fn closing(h: &Harness, account: Uuid) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = h.state.db.begin().await.unwrap();
+    sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(account).execute(&mut *tx).await.unwrap();
+    tx
+}
+
+#[tokio::test]
+async fn a_text_already_past_the_first_check_is_stopped_when_the_account_closes() {
+    let Some(mut h) = harness_signed().await else { return };
+    h.signup().await;
+    h.credit(5.0).await;
+    h.claim_number().await;
+    let acct = account_id(&h).await;
+    let to = daytime_number(21);
+    h.ok("POST", "/api/profiles", Some(json!({"phone_number": to, "sms_consent": "subscribed"}))).await;
+    let pid: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE phone_number = $1").bind(&to).fetch_one(&h.state.db).await.unwrap();
+    // Loaded while the account was open, as a send in progress would have it.
+    let account = dumbmail::campaigns::load_account(&h.state.db, acct).await.unwrap();
+    let profile = dumbmail::features::inbox::replies::load_profile(&h.state.db, acct, pid).await.unwrap();
+    let content = json!({"body": "Sale today. Reply STOP to opt out."});
+    let spec = dumbmail::sending::SendSpec {
+        account: &account,
+        profile: &profile,
+        channel: "sms",
+        content: &content,
+        campaign_id: None,
+        flow_id: None,
+        flow_node_id: None,
+        event: None,
+        is_test: false,
+        message_id: None,
+        to_override: None,
+    };
+    // The account closes while the text is on its way to the claim.
+    let tx = closing(&h, acct).await;
+    let (out, ()) = tokio::join!(dumbmail::sending::send(&h.state, spec), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tx.commit().await.unwrap();
+    });
+    assert!(matches!(out.unwrap(), dumbmail::sending::Outcome::Skipped("account closed")));
+    assert!(texts_to(&h, &to).is_empty());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn rent_already_selected_is_not_charged_when_the_account_closes() {
+    let Some(mut h) = harness_signed().await else { return };
+    h.signup().await;
+    h.credit(10.0).await;
+    let number = h.claim_number().await;
+    let acct = account_id(&h).await;
+    sqlx::query("UPDATE phone_numbers SET next_charge_at = now() - interval '1 minute' WHERE phone_number = $1").bind(&number).execute(&h.state.db).await.unwrap();
+    let before = dumbmail::billing::balance(&h.state.db, acct).await.unwrap();
+    let tx = closing(&h, acct).await;
+    let (run, ()) = tokio::join!(dumbmail::billing::charge_numbers(&h.state), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tx.commit().await.unwrap();
+    });
+    run.unwrap();
+    assert_eq!(dumbmail::billing::balance(&h.state.db, acct).await.unwrap(), before, "no rent charged");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_transactional_retry_for_a_closed_account_is_settled_not_left_queued() {
+    let Some(mut h) = harness_signed().await else { return };
+    h.signup().await;
+    let acct = account_id(&h).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "buyer@shop.test"}))).await;
+    let pid: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'buyer@shop.test'").fetch_one(&h.state.db).await.unwrap();
+    let (mid, sid) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status) VALUES ($1, $2, $3, 'email', 'buyer@shop.test', 'queued')")
+        .bind(mid)
+        .bind(acct)
+        .bind(pid)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO transactional_sends (id, account_id, message_id, profile_id, to_email, status, request_hash, request) VALUES ($1, $2, $3, $4, 'buyer@shop.test', 'queued', 'h', '{}')")
+        .bind(sid)
+        .bind(acct)
+        .bind(mid)
+        .bind(pid)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    // The kind the transactional module really queues.
+    dumbmail::jobs::enqueue(&h.state.db, dumbmail::features::transactional::RETRY_JOB, json!({"send_id": sid}), None).await.unwrap();
+    close(&h, acct).await;
+    run_main_jobs(&h).await;
+    let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM messages WHERE id = $1").bind(mid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), error.as_deref()), ("skipped", Some("account closed")));
+    let send: String = sqlx::query_scalar("SELECT status FROM transactional_sends WHERE id = $1").bind(sid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(send, "skipped");
+    h.cleanup().await;
+}

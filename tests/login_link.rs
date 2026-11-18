@@ -720,10 +720,10 @@ async fn starting_fresh_and_an_ownership_transfer_cannot_leave_an_account_ownerl
     let mut victim = B::new(&h, "198.51.100.130");
     assert_eq!(google(&h, &mut victim, "g-victim", "victim@acme.test", "/").await, "/link-google");
     // M hands X to L in a transaction that's still open (the locks an ownership transfer takes:
-    // the memberships it changes, then the account) while the victim starts fresh.
+    // the account, then the memberships it changes) while the victim starts fresh.
     let mut transfer = h.state.db.begin().await.unwrap();
-    sqlx::query("SELECT user_id FROM memberships WHERE account_id = $1 AND user_id = ANY($2) ORDER BY user_id FOR UPDATE").bind(x).bind(vec![l_id, m_id]).execute(&mut *transfer).await.unwrap();
     sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(x).execute(&mut *transfer).await.unwrap();
+    sqlx::query("SELECT user_id FROM memberships WHERE account_id = $1 AND user_id = ANY($2) ORDER BY user_id FOR UPDATE").bind(x).bind(vec![l_id, m_id]).execute(&mut *transfer).await.unwrap();
     sqlx::query("UPDATE memberships SET role = 'owner' WHERE account_id = $1 AND user_id = $2").bind(x).bind(l_id).execute(&mut *transfer).await.unwrap();
     sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(x).bind(m_id).execute(&mut *transfer).await.unwrap();
     let (fresh, ()) = tokio::join!(call(&h, &mut victim, "POST", "/api/auth/google/link/fresh", None), async {
@@ -882,4 +882,95 @@ async fn the_migration_confirms_google_logins_only() {
     assert_eq!(rows, vec![("both@acme.test".into(), true), ("g@acme.test".into(), true), ("pw@acme.test".into(), false)]);
     db.close().await;
     sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")).execute(&admin).await.unwrap();
+}
+
+// ---- Races the last review named ----
+
+#[tokio::test]
+async fn the_link_write_rechecks_two_factor_under_the_login_lock() {
+    let h = harness!();
+    let mut owner = B::new(&h, "198.51.100.150");
+    signup(&h, &mut owner, "owner@acme.test", "correct horse", "Acme").await;
+    let (uid, ..) = user_row(&h, "owner@acme.test").await;
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE id = $1").bind(uid).execute(&h.state.db).await.unwrap();
+    let (sid, version): (Uuid, i32) = sqlx::query_as("SELECT s.id, u.credential_version FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.user_id = $1").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    // A Google link waiting on this (fully signed-in) session.
+    sqlx::query(
+        "INSERT INTO google_link_pending (token_hash, user_id, email, google_sub, google_authoritative, session_id, credential_version, was_confirmed, expires_at)
+         VALUES ('race-1', $1, 'owner@acme.test', 'g-owner', true, $2, $3, true, now() + interval '15 minutes')",
+    )
+    .bind(uid)
+    .bind(sid)
+    .bind(version)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    // Two-factor is turned on between the "is it signed in" check and the write.
+    let mut on = h.state.db.begin().await.unwrap();
+    sqlx::query("UPDATE users SET totp_enabled_at = now() WHERE id = $1").bind(uid).execute(&mut *on).await.unwrap();
+    let meta = dumbmail::features::team::login::ReqMeta::default();
+    let (linked, ()) = tokio::join!(dumbmail::features::team::google_link::complete_if_signed_in(&h.state, sid, &meta), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        on.commit().await.unwrap();
+    });
+    assert!(!linked.unwrap(), "two-factor arrived first: the link waits for a code");
+    assert_eq!(user_row(&h, "owner@acme.test").await.1, None);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn starting_fresh_takes_locks_in_the_one_order_and_cannot_deadlock() {
+    let h = harness!();
+    // Two logins, each the only owner of an account and an admin in the other's.
+    let mut l1 = B::new(&h, "203.0.113.160");
+    let a1: Uuid = signup(&h, &mut l1, "one@acme.test", "one password", "One").await["account"]["id"].as_str().unwrap().parse().unwrap();
+    let mut l2 = B::new(&h, "203.0.113.161");
+    let a2: Uuid = signup(&h, &mut l2, "two@acme.test", "two password", "Two").await["account"]["id"].as_str().unwrap().parse().unwrap();
+    for (owner, who) in [(&mut l1, "two@acme.test"), (&mut l2, "one@acme.test")] {
+        ok(&h, owner, "POST", "/api/team/invites", Some(json!({"email": who, "role": "admin"}))).await;
+    }
+    let t = link_token(&h, "two@acme.test", "/invite/").await;
+    ok(&h, &mut l2, "POST", &format!("/api/invites/{t}/accept"), None).await;
+    let t = link_token(&h, "one@acme.test", "/invite/").await;
+    ok(&h, &mut l1, "POST", &format!("/api/invites/{t}/accept"), None).await;
+    let mut victim = B::new(&h, "198.51.100.160");
+    assert_eq!(google(&h, &mut victim, "g-one", "one@acme.test", "/").await, "/link-google");
+    // Another change to both accounts in the one order (accounts, then memberships) is under way
+    // as "start fresh" begins. Taken in the other order, the two would deadlock.
+    let mut other = h.state.db.begin().await.unwrap();
+    sqlx::query("SELECT id FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(vec![a1, a2]).execute(&mut *other).await.unwrap();
+    let (fresh, second) = tokio::join!(call(&h, &mut victim, "POST", "/api/auth/google/link/fresh", None), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let r = sqlx::query("SELECT 1 FROM memberships WHERE account_id = ANY($1) ORDER BY account_id, user_id FOR UPDATE").bind(vec![a1, a2]).execute(&mut *other).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let c = other.commit().await;
+        (r.is_ok(), c.is_ok())
+    });
+    assert_eq!(second, (true, true), "the other change wasn't aborted");
+    assert!(fresh.0.is_success(), "{fresh:?}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn joining_rechecks_that_the_login_is_still_active() {
+    let h = harness!();
+    let mut owner = B::new(&h, "203.0.113.170");
+    let x: Uuid = signup(&h, &mut owner, "boss@x.test", "boss password", "X").await["account"]["id"].as_str().unwrap().parse().unwrap();
+    let mut l = B::new(&h, "203.0.113.171");
+    signup(&h, &mut l, "pat@acme.test", "pat password", "Pat").await;
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "pat@acme.test", "role": "admin"}))).await;
+    let t = link_token(&h, "pat@acme.test", "/invite/").await;
+    let (pid, ..) = user_row(&h, "pat@acme.test").await;
+    // The login is being given up while it accepts.
+    let mut gone = h.state.db.begin().await.unwrap();
+    sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1").bind(pid).execute(&mut *gone).await.unwrap();
+    let path = format!("/api/invites/{t}/accept");
+    let (accept, ()) = tokio::join!(call(&h, &mut l, "POST", &path, None), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        gone.commit().await.unwrap();
+    });
+    assert!(!accept.0.is_success(), "{accept:?}");
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1 AND account_id = $2)").bind(pid).bind(x).fetch_one(&h.state.db).await.unwrap();
+    assert!(!member, "a disabled login didn't join (or come to own) the account");
+    h.cleanup().await;
 }
