@@ -49,22 +49,32 @@
   function existing() {
     return ours().then(function (reg) { return reg ? reg.pushManager.getSubscription() : null; });
   }
-  function report(sub, force) {
-    var j = sub.toJSON(), id = identity();
+  function report(sub, force, retried) {
+    var j = sub.toJSON(), id = identity(), auth = j.keys && j.keys.auth, had = store.get("pl_push_sub");
+    // New keys for the same endpoint: show DumbMail the auth secret this browser had for it, now.
+    var rekeyed = !!(had && had.endpoint === j.endpoint && had.auth && had.auth !== auth);
     var sig = j.endpoint + "|" + (id.type || "") + "|" + (id.value || ""), last = store.get("pl_push_sent");
-    // Once a day, or when the subscription or who the site says is signed in changes.
-    if (!force && last && last.sig === sig && now() - last.at < 86400000) return Promise.resolve("granted");
-    return post("/client/push/subscribe", { subscription: j, identity: id, url: location.href }).then(function (r) {
-      if (r && r.ok) { store.set("pl_push_sent", { sig: sig, at: now() }); store.set("pl_push_sub", { endpoint: j.endpoint, auth: j.keys && j.keys.auth }); }
+    // Once a day, or when the subscription, its keys or who the site says is signed in changes.
+    if (!force && !rekeyed && last && last.sig === sig && now() - last.at < 86400000) return Promise.resolve("granted");
+    var body = { subscription: j, identity: id, url: location.href };
+    if (rekeyed) body.proof = { auth: had.auth };
+    return post("/client/push/subscribe", body).then(function (r) {
+      if (r && r.status === 409) {
+        // DumbMail won't take this subscription as this browser's (it can't prove it holds it): stop
+        // using it here and make a fresh one, once.
+        store.del("pl_push_sub"); store.del("pl_push_sent");
+        return Promise.resolve(sub.unsubscribe()).catch(function () {}).then(function () { return retried ? "error" : subscribe(true, true); });
+      }
+      if (r && r.ok) { store.set("pl_push_sent", { sig: sig, at: now() }); store.set("pl_push_sub", { endpoint: j.endpoint, auth: auth }); }
       return "granted";
     });
   }
-  function subscribe(force) {
+  function subscribe(force, retried) {
     return registration().then(function (reg) {
       return reg.pushManager.getSubscription().then(function (s) {
         return s || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(CFG.key) });
       });
-    }).then(function (sub) { return report(sub, force); });
+    }).then(function (sub) { return report(sub, force, retried); });
   }
   // A click on Allow (the card's, or the site's own button).
   function prompt() {
