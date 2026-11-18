@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { useNavigate } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { Check, FileUp, Sparkles } from "lucide-react";
 import type { BrandKit, ImportResult } from "../../api";
 import { socialNetworks } from "../../api";
@@ -340,6 +340,13 @@ function ContactsStep({ onDone, onSkip, markDone }: { onDone: () => void; onSkip
   return (
     <div>
       <StepHeader title="Bring your contacts" description="Paste a CSV or drop a file. We match columns like email, phone_number, first_name and last_name; anything else becomes a custom property." />
+      <p className="mb-4 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
+        Coming from Klaviyo?{" "}
+        <Link to="/settings/klaviyo" className="font-medium text-accent-800 hover:underline">
+          Move everything across in one step
+        </Link>{" "}
+        instead: profiles with their consent, lists, segments, history, templates, campaigns and flows.
+      </p>
       {result ? (
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-3">
