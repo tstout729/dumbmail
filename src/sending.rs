@@ -337,7 +337,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     // Review request blocks and links are made for this person (see features::reviews).
-    let filled = match crate::features::reviews::personalize(state, spec.account, Some(p), spec.event, &content, spec.is_test, Some(message_id)).await? {
+    let filled = match crate::features::reviews::personalize(state, spec.account, Some(p), spec.event, &content, spec.channel, spec.is_test, Some(message_id)).await? {
         std::borrow::Cow::Owned(v) => Some(v),
         std::borrow::Cow::Borrowed(_) => None,
     };

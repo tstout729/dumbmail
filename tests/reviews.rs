@@ -1287,12 +1287,25 @@ async fn a_text_ask_always_has_its_link() {
     // What the review step hands the sender: a text with no tag, and its requests.
     let content = json!({"body": "Thanks for your order! Tell us how it went."});
     let event = json!({"_review_requests": [rid]});
-    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &content, false, None).await.unwrap();
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &content, "sms", false, None).await.unwrap();
     assert_eq!(out["body"], format!("Thanks for your order! Tell us how it went. {link}"));
     // A text that has the tag gets the link in its place, once.
     let tagged = json!({"body": "How was it? {% review_link %} Thanks!"});
-    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &tagged, false, None).await.unwrap();
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &tagged, "sms", false, None).await.unwrap();
     assert_eq!(out["body"], format!("How was it? {link} Thanks!"));
+    // Round 3, item 9: decided by the send's channel, not the content's shape. A text whose content
+    // also carries email fields (copied from an email step, say) still gets its link; so does one
+    // with no body at all.
+    let mixed = json!({"body": "Tell us how it went.", "subject": "How was it?", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]});
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &mixed, "sms", false, None).await.unwrap();
+    assert_eq!(out["body"], format!("Tell us how it went. {link}"));
+    let empty = json!({"html": "<p>x</p>"});
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &empty, "sms", false, None).await.unwrap();
+    assert_eq!(out["body"], link);
+    // And an email never gets a text's link pasted into it.
+    let email = json!({"subject": "How was it?", "body": "plain", "blocks": []});
+    let out = dumbmail::features::reviews::personalize(&h.state, &account, Some(&profile), Some(&event), &email, "email", false, None).await.unwrap();
+    assert_eq!(out["body"], "plain");
     h.cleanup().await;
 }
 

@@ -156,7 +156,7 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
     let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
     // Review blocks and links show samples in a preview and make nothing (see features::reviews).
-    let content = crate::features::reviews::personalize(state, &account, profile.as_ref(), b.event.as_ref(), &content, true, None).await?.into_owned();
+    let content = crate::features::reviews::personalize(state, &account, profile.as_ref(), b.event.as_ref(), &content, &b.channel, true, None).await?.into_owned();
     // A preview shows a sample coupon code and uses none.
     crate::features::coupons::template::fill_sample(&mut ctx);
     if b.channel == "email" {

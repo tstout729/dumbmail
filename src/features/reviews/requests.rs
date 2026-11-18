@@ -990,7 +990,8 @@ fn tag_products(v: &Value, out: &mut Vec<Option<String>>) {
 /// person's requests and turns the blocks into plain HTML blocks. Content without either passes
 /// through untouched. `preview` (dashboard previews, test sends) shows sample links and makes
 /// nothing. People not subscribed on the message's channel get no review ask: the blocks are left
-/// out and the tags are empty.
+/// out and the tags are empty. `channel` is the send's own ("sms" for a text), never guessed from
+/// the content's shape: a text always carries its link.
 #[allow(clippy::too_many_arguments)]
 pub async fn personalize<'c>(
     state: &AppState,
@@ -998,6 +999,7 @@ pub async fn personalize<'c>(
     profile: Option<&Profile>,
     event: Option<&Value>,
     content: &'c Value,
+    channel: &str,
     preview: bool,
     message_id: Option<Uuid>,
 ) -> AppResult<Cow<'c, Value>> {
@@ -1006,7 +1008,7 @@ pub async fn personalize<'c>(
     if !uses_reviews(content) && handed.is_empty() {
         return Ok(Cow::Borrowed(content));
     }
-    let sms = content.get("body").is_some() && content.get("blocks").is_none() && content.get("html").is_none();
+    let sms = channel == "sms";
     let allowed = match profile {
         Some(p) if !preview => may_ask(&state.db, p.id, if sms { "sms" } else { "email" }).await?,
         _ => false,
@@ -1094,12 +1096,13 @@ pub async fn personalize<'c>(
         }
         replace_tags(&mut out, &links);
     }
-    // A text without the tag still carries its link.
+    // A text without the tag still carries its link (the body is all a text sends).
     if sms && !preview {
-        if let (Some(body), Some(r)) = (out.get("body").and_then(|b| b.as_str()).map(String::from), asker.given.as_ref().and_then(|g| g.first())) {
+        if let Some(r) = asker.given.as_ref().and_then(|g| g.first()) {
+            let body = out.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
             let l = link(state, account, r.id);
             if !body.contains(&l) {
-                out["body"] = json!(format!("{} {l}", body.trim_end()));
+                out["body"] = json!(format!("{} {l}", body.trim_end()).trim_start().to_string());
             }
         }
     }
