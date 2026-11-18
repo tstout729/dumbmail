@@ -241,17 +241,17 @@ pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value>
         .collect()
 }
 
-/// Run the script and fix its actions: validated, without `next_request` unless this is a pull
-/// page, and in canonical form. A run whose actions or saved state would hold one of the
-/// integration's credentials fails (nothing secret is ever stored).
-async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub) -> Result<Vec<Value>, String> {
+/// Run the script and fix its actions: validated, in canonical form, and with every credential
+/// masked (the list is stored, and what is stored is what is applied, now and on a retry). The
+/// script's `next_request` comes back separately, as it was: it can carry what the app put in a
+/// `Link` header, so it stays in memory (and encrypted when it must be kept).
+async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub) -> Result<(Vec<Value>, Option<NextRequest>), String> {
     let raw = sandbox::run(slot, script, &input).await?;
-    actions::parse(&raw, pull)?;
+    let parsed = actions::parse(&raw, pull)?;
+    let next = parsed.into_iter().find_map(|a| if let Action::NextRequest(n) = a { Some(n) } else { None });
     let list = canonical(&raw_list(&raw), root, Utc::now());
-    if scrub.finds_in(&Value::Array(list.clone())) {
-        return Err("the script's actions include one of this integration's credentials; nothing was written".into());
-    }
-    Ok(list)
+    let list: Vec<Value> = list.iter().map(|a| scrub.value(a)).collect();
+    Ok((list, next))
 }
 
 /// Job: process one stored delivery (webhook or replay). The first successful script run fixes the
@@ -298,7 +298,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
             let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub).await;
             drop(slot);
             match ran {
-                Ok(list) => {
+                Ok((list, _)) => {
                     let list: Vec<Value> = list.into_iter().filter(|a| a["type"] != "next_request").collect();
                     // Whoever stored a list first wins; this run applies that one.
                     let kept: Value = sqlx::query_scalar("UPDATE integration_deliveries SET actions = COALESCE(actions, $2) WHERE id = $1 RETURNING actions")
@@ -943,8 +943,10 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+        let mut raw_next = None;
         let res = match ran {
-            Ok(list) => {
+            Ok((list, next)) => {
+                raw_next = next;
                 sqlx::query("UPDATE integration_deliveries SET actions = $2 WHERE id = $1").bind(delivery).bind(Value::Array(list.clone())).execute(&state.db).await?;
                 match actions::parse(&Value::Array(list.clone()), true) {
                     Ok(acts) => {
@@ -971,7 +973,8 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                     .execute(&mut *guard)
                     .await?;
                 sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *guard).await?;
-                let more = o.next_request.clone();
+                // The page asked for: as the script wrote it (the stored list has it masked).
+                let more = raw_next.clone().filter(|_| o.next_request.is_some());
                 let mut upcoming = next.clone();
                 if let Some(n) = more.clone() {
                     merge_next(&mut upcoming, n);

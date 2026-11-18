@@ -729,6 +729,11 @@ pub async fn reschedule_event_dates(db: &PgPool, account_id: Uuid) -> anyhow::Re
 /// budget for the tick across all flows, schedule the events that existed before a live flow (or
 /// its current trigger), a batch at a time.
 async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
+    event_date_tick(state, EVENT_DATE_SEED_BUDGET).await
+}
+
+/// One event-date tick with an explicit seeding budget (events across all flows); tests use it.
+pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Result<()> {
     // Too late to be useful: say so in the flow report rather than send a stale reminder.
     sqlx::query(
         "UPDATE flow_event_date_fires x SET outcome = CASE WHEN fl.status = 'live' THEN 'missed' ELSE 'not_live' END, fired_at = now()
@@ -743,7 +748,7 @@ async fn event_date_triggers(state: &AppState) -> anyhow::Result<()> {
         }
     }
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
-    let mut budget = EVENT_DATE_SEED_BUDGET;
+    let mut budget = seed_budget;
     for f in &flows {
         if budget <= 0 {
             break;
@@ -868,6 +873,31 @@ async fn event_date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx:
     }
     if let Some(why) = event_date_stale(&state.db, f.account_id, event_id, key.as_deref(), &cancelled_by).await? {
         return Ok(Err(if why == "cancelled" { "cancelled" } else { "superseded" }));
+    }
+    // A newer version of the same booking (same key) that didn't move its date (only its notes
+    // changed, say) doesn't send the reminder a second time: one start per key and due time.
+    if let Some(k) = key.as_deref() {
+        let kv = obj.pointer(&format!("/{}", k.replace('.', "/"))).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        if let Some(kv) = kv {
+            let again: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM flow_event_date_fires x JOIN events e ON e.id = x.event_id
+                   WHERE x.flow_id = $1 AND x.outcome = 'started' AND e.profile_id = $2 AND e.properties #>> $3 = $4
+                     AND x.due_at = (SELECT due_at FROM flow_event_date_fires WHERE flow_id = $1 AND event_id = $5))",
+            )
+            .bind(f.id)
+            .bind(profile_id)
+            .bind(json_path(k))
+            .bind(&kv)
+            .bind(event_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if again {
+                return Ok(Err("already_sent"));
+            }
+        }
     }
     let def = parse_definition(&f.definition).map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let Some(entry) = def.entry.clone() else { return Ok(Err("not_started")) };

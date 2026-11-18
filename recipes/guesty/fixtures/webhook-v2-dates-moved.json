@@ -4,6 +4,7 @@
     {
       "metric": "Reservation Booked",
       "profile": {
+        "if_missing": "retry",
         "property": "guesty_guest_id",
         "value": "69guest"
       },
@@ -11,6 +12,7 @@
         "check_in": "2026-12-03",
         "check_out": "2026-12-06",
         "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 3,
@@ -25,6 +27,7 @@
     {
       "metric": "Reservation Confirmed",
       "profile": {
+        "if_missing": "retry",
         "property": "guesty_guest_id",
         "value": "69guest"
       },
@@ -32,6 +35,7 @@
         "check_in": "2026-12-03",
         "check_out": "2026-12-06",
         "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 3,
@@ -47,6 +51,7 @@
     {
       "metric": "Reservation Updated",
       "profile": {
+        "if_missing": "retry",
         "property": "guesty_guest_id",
         "value": "69guest"
       },
@@ -67,7 +72,7 @@
       "unique_id": "guesty:69c0d1e2f3:updated:2026-11-17T20:00:00.000Z"
     },
     {
-      "message": "reservation.updated.v2 ALTERATION for 69c0d1e2f3 (guest 69guest); skipped if the guest isn't known yet, and the next pull fills it in",
+      "message": "reservation.updated.v2 ALTERATION for 69c0d1e2f3 (guest 69guest); retried until the guest is known",
       "type": "log"
     }
   ],

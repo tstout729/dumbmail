@@ -2,9 +2,10 @@
   "key": "guesty",
   "name": "Guesty",
   "category": "Vacation rentals",
-  "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once, with the total when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Reservations import through Guesty's current Open API.",
+  "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once), Reservation Total (the booking's value, once, when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Reservations import through Guesty's current Open API.",
   "metrics": [
     "Reservation Booked",
+    "Reservation Total",
     "Reservation Confirmed",
     "Reservation Cancelled",
     "Reservation Updated",
@@ -50,7 +51,8 @@
     "query": {
       "limit": 50,
       "sort": "lastUpdatedAt",
-      "filter[lastUpdatedAt][gte]": "{{state.cursor|since}}"
+      "filter[lastUpdatedAt][gte]": "{{state.cursor|since}}",
+      "skip": "{{state.skip|'0'}}"
     },
     "auth": {
       "type": "oauth2_client_credentials",
@@ -67,12 +69,13 @@
     "Create the integration from this recipe and copy its webhook URL.",
     "In Guesty, create an Open API key (Integrations → API & Webhooks) and save its client ID and secret as the credentials client_id and client_secret. DumbMail asks Guesty for an access token at most 4 times a day (Guesty allows 5) and reuses it until it expires.",
     "Subscribe the webhook URL to Guesty's current reservation webhooks: POST https://open-api.guesty.com/v1/webhooks with {\"url\": \"<webhook URL>\", \"events\": [\"reservation.created.v2\", \"reservation.updated.v2\"]}. They update guests DumbMail already knows at once (cancellations included); the 15-minute pull adds new guests, because these events don't carry the guest's email.",
-    "Optional, until 1 March 2027 only: also subscribe reservation.new and reservation.updated. Guesty retires them on that date; until then they are the only source of booking totals (the current reservation API has no money fields).",
+    "Optional, until 1 March 2027 only: also subscribe reservation.new and reservation.updated. Guesty retires them on that date; until then they are the only source of booking totals (recorded as Reservation Total) (the current reservation API has no money fields).",
     "Save the webhook signing secret (GET https://open-api.guesty.com/v1/webhooks-v2/secret, starts with whsec_) as the integration's signing secret.",
     "Test the pull (Pull tab → Test pull, or test_integration with pull: true) to see the first page of reservations and exactly what would be written.",
     "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
     "Guests are held back from marketing: the three suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
-    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on."
+    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on.",
+    "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile."
   ],
   "flows": [
     {
@@ -219,5 +222,16 @@
   ],
   "message_id": {
     "header": "svix-id"
-  }
+  },
+  "redact": [
+    "**.notes",
+    "**.keyCode",
+    "**.doorCode",
+    "**.lockCode",
+    "**.accessCode",
+    "**.accessCodes",
+    "**.checkInInstructions",
+    "**.guestContact",
+    "**.wifiPassword"
+  ]
 }

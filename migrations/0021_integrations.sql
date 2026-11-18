@@ -124,7 +124,7 @@ CREATE TABLE flow_event_date_fires (
     event_id   uuid NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     due_at     timestamptz NOT NULL,
-    -- pending | queued | started | missed | filtered | superseded | cancelled | not_started
+    -- pending | started | missed | filtered | superseded | cancelled | already_sent | not_started | not_live
     outcome    text NOT NULL DEFAULT 'pending',
     run_id     uuid,
     fired_at   timestamptz,

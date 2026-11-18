@@ -1,5 +1,5 @@
 {
-  "description": "The guests for a page of reservations: profiles and events are written, the cursor moves on, and the next page is asked for. Guest 2 isn't in the answer, so it is matched by Guesty guest id (or skipped).",
+  "description": "The guests for a page of reservations: profiles and events are written, the cursor moves on, and the next page is asked for. Guest 2 isn't in the answer, so it is matched by Guesty guest id (or skipped). (Guesty's real answer shape: _id, email, phone with the country code and no +.)",
   "expect": [
     {
       "email": "dana.whitfield@example.com",
@@ -22,6 +22,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -42,6 +43,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -74,6 +76,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00001",
+        "guest_id": "6g0000000000000000000001",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -94,6 +97,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00001",
+        "guest_id": "6g0000000000000000000001",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -116,6 +120,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00002",
+        "guest_id": "6g0000000000000000000002",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -137,6 +142,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00002",
+        "guest_id": "6g0000000000000000000002",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -169,6 +175,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00007",
+        "guest_id": "6g0000000000000000000007",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -177,7 +184,7 @@
         "status": "canceled",
         "version": "2026-11-17T10:00:07.000Z"
       },
-      "time": "2026-11-17T18:00:00.000Z",
+      "time": "2026-11-17T10:00:07.000Z",
       "type": "track_event",
       "unique_id": "guesty:6a0000000000000000000007:cancelled:2026-11-17T10:00:07.000Z"
     },
@@ -186,7 +193,10 @@
       "values": {
         "cursor": "2026-11-17T10:00:49.000Z",
         "page_last": null,
-        "pending": null
+        "page_more": null,
+        "page_skip": null,
+        "pending": null,
+        "skip": 0
       }
     },
     {
@@ -211,23 +221,22 @@
     "payload": {
       "results": [
         {
+          "_id": "6g0000000000000000000000",
+          "email": "dana.whitfield@example.com",
           "firstName": "Dana",
           "fullName": "Dana Whitfield",
-          "guestEmail": "dana.whitfield@example.com",
-          "guestPhone": "+1 (503) 555-0142",
-          "id": "6g0000000000000000000000",
-          "lastName": "Whitfield"
+          "lastName": "Whitfield",
+          "phone": "15035550142"
         },
         {
-          "fullName": "Sam Ortiz",
-          "guestEmail": "abc123xyz@guest.airbnb.com",
-          "guestPhone": null,
-          "id": "6g0000000000000000000001"
+          "_id": "6g0000000000000000000001",
+          "email": "abc123xyz@guest.airbnb.com",
+          "fullName": "Sam Ortiz"
         },
         {
+          "_id": "6g0000000000000000000007",
+          "email": "lee@example.org",
           "firstName": "Lee",
-          "guestEmail": "lee@example.org",
-          "id": "6g0000000000000000000007",
           "lastName": "Park"
         }
       ],

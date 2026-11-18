@@ -391,7 +391,10 @@ fn mock_updated_at(i: usize) -> String {
 
 /// A stand-in for Guesty's Open API: OAuth tokens, `GET /v1/reservations-v3/search` (changed
 /// reservations, oldest change first, `filter[lastUpdatedAt][gte]`, skip/limit and
-/// `pagination.hasMore`) and `GET /v1/guests-crud` (guests by id, with `guestEmail`).
+/// `pagination.hasMore`) and `GET /v1/guests-crud`. As the live API does (checked read-only by the
+/// lead): guests are found only by a filter on `_id` (a filter on `id` matches nothing), and come
+/// back as `_id`, `email` and `phone` (digits with the country code, no "+"). Reservations carry
+/// door codes in `notes` and contact details in `channelMetadata.guestContact`.
 async fn mock_guesty(total: usize) -> (Arc<MockGuesty>, String) {
     use axum::extract::{Query, State};
     use axum::routing::{get, post};
@@ -437,7 +440,8 @@ async fn mock_guesty(total: usize) -> (Arc<MockGuesty>, String) {
                         json!({"reservationId": format!("res{i}"), "status": "confirmed", "source": "manual", "channel": "manual", "confirmationCode": format!("C{i}"),
                                "guestId": format!("g{i}"), "checkIn": "2027-01-10T23:00:00.000Z", "checkOut": "2027-01-12T18:00:00.000Z",
                                "checkInDateLocalized": "2027-01-10", "checkOutDateLocalized": "2027-01-12", "createdAt": "2026-11-17T09:00:00.000Z",
-                               "lastUpdatedAt": mock_updated_at(*i), "notes": {"keyCode": "1234"},
+                               "lastUpdatedAt": mock_updated_at(*i), "notes": {"keyCode": "1234", "guest": "Door code 1234, lockbox 9876"},
+                               "channelMetadata": {"confirmedAt": "2026-11-17T09:00:00.000Z", "guestContact": {"phone": "+15035550000", "accessCode": "9876"}},
                                "stay": [{"listingId": "L1", "checkInDateLocalized": "2027-01-10", "checkOutDateLocalized": "2027-01-12", "guestsCount": 2}]})
                     })
                     .collect();
@@ -457,13 +461,13 @@ async fn mock_guesty(total: usize) -> (Arc<MockGuesty>, String) {
                 assert!(q.get("columns").is_some_and(|c| c.contains("guestEmail")), "{q:?}");
                 assert!(!q.contains_key("sort") && !q.contains_key("filter[lastUpdatedAt][gte]"), "the search's own query isn't sent here: {q:?}");
                 let f: Value = serde_json::from_str(&filters).unwrap_or(json!({}));
-                let ids: Vec<String> = f["id"]["@in"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+                let ids: Vec<String> = f["_id"]["@in"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
                 let results: Vec<Value> = ids
                     .iter()
                     .map(|g| {
                         let i: usize = g.trim_start_matches('g').parse().unwrap();
                         let email = if i == 0 { "relay-1@guest.airbnb.com".to_string() } else { format!("guest{i}@example.com") };
-                        json!({"id": g, "fullName": format!("Guest {i}"), "guestEmail": email})
+                        json!({"_id": g, "fullName": format!("Guest {i}"), "email": email, "phone": format!("1503555{:04}", 1000 + i)})
                     })
                     .collect();
                 (StatusCode::OK, axum::Json(json!({"results": results, "total": results.len()})))
@@ -541,13 +545,14 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 150, "a reservation seen twice (the cursor's own row) counts once");
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email_suppressed_reason = 'booking_relay'").await, 1);
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE marketing_hold").await, 150, "guests didn't opt in: all held from marketing");
-    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE server_only").await, 5, "the recipe's metrics can't be forged from a browser, from the moment it's set up");
+    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE server_only").await, 6, "the recipe's metrics can't be forged from a browser, from the moment it's set up");
     assert_eq!(mock.tokens.load(Ordering::SeqCst), 1);
     let got = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
     assert_eq!(got["state"]["cursor"], mock_updated_at(149), "{}", got["state"]);
     assert!(got["state"].get("pending").is_none(), "{}", got["state"]);
     let pulls = h.ok("GET", &format!("/api/integrations/{id}/deliveries?source=pull"), None).await;
-    assert_eq!(pulls["total"], 8, "four reservation pages and four guest pages; test pulls aren't logged: {pulls}");
+    assert_eq!(pulls["total"], 7, "three reservation pages, their three guest pages and an empty last page (the cursor's own row isn't read again); test pulls aren't logged: {pulls}");
+    assert_eq!(got["state"]["skip"], 1, "the next run skips the row at the cursor it already read: {}", got["state"]);
 
     // A backfill runs from its own start date, in chained jobs, and reports progress.
     mock.seen.lock().unwrap().clear();
@@ -556,7 +561,7 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     h.drain().await;
     let got = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
     assert_eq!(got["backfill"]["status"], "done", "{}", got["backfill"]);
-    assert_eq!(got["backfill"]["pages"], 8);
+    assert_eq!(got["backfill"]["pages"], 7, "no page is read twice");
     assert_eq!(mock.seen.lock().unwrap()[0].2, "2025-01-01T00:00:00.000Z", "{:?}", mock.seen.lock().unwrap()[0]);
     assert_eq!(got["state"]["cursor"], mock_updated_at(149), "a backfill leaves the live cursor alone");
     assert_eq!(count(&h, "SELECT count(*) FROM events").await, 300, "nothing counted twice");
@@ -1425,7 +1430,9 @@ async fn capped_backfills_resume_and_old_pages_cant_overwrite_progress() {
     }
     let b = h.ok("GET", &format!("/api/integrations/{id}"), None).await["backfill"].clone();
     assert_eq!(b["status"], "done", "{b}");
-    assert_eq!(b["pages"], 8);
+    // Three pages of reservations, their three guest pages and the empty page that ends it: a
+    // resumed run continues exactly where the capped one stopped, with no page read twice.
+    assert_eq!(b["pages"], 7);
     assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked'").await, 150);
 
     // A page from an older run arriving late never overwrites a newer run's progress.
@@ -1544,5 +1551,656 @@ async fn stripe_orders_refunds_and_late_customers() {
     stripe_post(&mut h, &path, "subscription-updated-activated.json").await;
     stripe_post(&mut h, &path, "subscription-updated-still-active.json").await;
     assert_eq!(count(&h, started).await, 1);
+    h.cleanup().await;
+}
+
+// ---------- The last review round: one test per fix ----------
+
+/// Invite `email` with `role` and sign in as them; returns the owner's cookie to switch back.
+async fn join_as(h: &mut Harness, email: &str, role: &str) -> Option<String> {
+    h.ok("POST", "/api/team/invites", Some(json!({"email": email, "role": role}))).await;
+    let sent = h.state.email.sent();
+    let m = sent.iter().rev().find(|e| e.to == email && e.text.contains("/invite/")).unwrap_or_else(|| panic!("no invite to {email}"));
+    let i = m.text.find("/invite/").unwrap() + "/invite/".len();
+    let token = m.text[i..].split_whitespace().next().unwrap().to_string();
+    let owner = h.cookie.take();
+    h.ok("POST", &format!("/api/invites/{token}/accept"), Some(json!({"name": "Member", "password": "member pass 1"}))).await;
+    owner
+}
+
+async fn with_key(h: &Harness, key: &str, method: &str, path: &str, body: Option<Value>) -> StatusCode {
+    use axum::body::Body;
+    use tower::ServiceExt;
+    let b = axum::http::Request::builder().method(method).uri(path).header("authorization", format!("Bearer {key}"));
+    let req = match body {
+        Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    };
+    h.router.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn integration_permissions_follow_roles_keys_and_are_audited() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let integ = ship_integration(&mut h).await;
+    let id = integ["id"].as_str().unwrap().to_string();
+    let body = json!({"id": "p1", "email": "pay@example.com", "total": 3, "plan": "x"}).to_string();
+    let sig = format!("sha256={}", hmac_hex("ship-secret-123456", &body));
+    h.raw("POST", &path_of(&integ), &[("x-sig", &sig), ("content-type", "application/json")], &body).await;
+    h.drain().await;
+    let did = h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await["data"][0]["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"name": "Shipping 2", "credentials": {"api_key": "live-secret-998877"}}))).await;
+    h.ok("POST", &format!("/api/integrations/{id}/replay"), Some(json!({"delivery_ids": [did]}))).await;
+    let read_key = h.ok("POST", "/api/api-keys", Some(json!({"name": "r", "scopes": ["read"]}))).await["key"].as_str().unwrap().to_string();
+    let acct_read = h.ok("POST", "/api/api-keys", Some(json!({"name": "ar", "scopes": ["account:read"]}))).await["key"].as_str().unwrap().to_string();
+    let acct = h.ok("POST", "/api/api-keys", Some(json!({"name": "a", "scopes": ["account"]}))).await["key"].as_str().unwrap().to_string();
+
+    // A manager sees integrations and the log, but not payloads, the inbound URL or script output.
+    let owner = join_as(&mut h, "manager@acme.test", "manager").await;
+    let list = h.ok("GET", "/api/integrations", None).await;
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+    let got = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    assert!(got["inbound_url"].is_null() && got.get("state").is_none(), "{got}");
+    h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await;
+    let d = h.ok("GET", &format!("/api/integrations/{id}/deliveries/{did}"), None).await;
+    assert!(d.get("payload").is_none() && d.get("body").is_none() && d.get("result").is_none() && d["payload_hidden"] == true, "{d}");
+    assert!(!d.to_string().contains("pay@example.com"), "{d}");
+    for (m, p, b) in [
+        ("PATCH", format!("/api/integrations/{id}"), json!({"name": "x"})),
+        ("POST", format!("/api/integrations/{id}/test"), json!({"payload": {}})),
+        ("POST", format!("/api/integrations/{id}/replay"), json!({"all_failed": true})),
+        ("POST", format!("/api/integrations/{id}/rotate-url"), json!({})),
+        ("POST", "/api/integrations".to_string(), json!({"name": "new"})),
+        ("POST", "/api/integrations/from-recipe".to_string(), json!({"recipe": "stripe"})),
+        ("DELETE", format!("/api/integrations/{id}"), json!({})),
+    ] {
+        let (s, _) = h.req(m, &p, Some(b)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "a manager can't {m} {p}");
+    }
+    // An analyst doesn't see integrations at all.
+    h.cookie = owner.clone();
+    let _ = join_as(&mut h, "analyst@acme.test", "analyst").await;
+    let (s, _) = h.req("GET", "/api/integrations", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    h.cookie = owner;
+    // API keys need the account scope: plain `read` isn't enough, and reading isn't managing.
+    assert_eq!(with_key(&h, &read_key, "GET", "/api/integrations", None).await, StatusCode::FORBIDDEN);
+    assert_eq!(with_key(&h, &acct_read, "GET", "/api/integrations", None).await, StatusCode::OK);
+    assert_eq!(with_key(&h, &acct_read, "PATCH", &format!("/api/integrations/{id}"), Some(json!({"name": "y"}))).await, StatusCode::FORBIDDEN);
+    assert_eq!(with_key(&h, &acct, "PATCH", &format!("/api/integrations/{id}"), Some(json!({"name": "Shipping 3"}))).await, StatusCode::OK);
+    // The owner still sees everything, and the changes are in the audit log, without secrets or payloads.
+    let full = h.ok("GET", &format!("/api/integrations/{id}/deliveries/{did}"), None).await;
+    assert!(full["payload"].is_object(), "{full}");
+    h.ok("DELETE", &format!("/api/integrations/{id}"), None).await;
+    let log: Vec<(String, Value)> = sqlx::query_as("SELECT action, details FROM audit_log WHERE action LIKE 'integration.%' ORDER BY created_at").fetch_all(&h.state.db).await.unwrap();
+    let actions: Vec<&str> = log.iter().map(|(a, _)| a.as_str()).collect();
+    for want in ["integration.create", "integration.update", "integration.secrets_change", "integration.replay", "integration.delete"] {
+        assert!(actions.contains(&want), "{want} in {actions:?}");
+    }
+    let all = format!("{log:?}");
+    assert!(!all.contains("live-secret-998877") && !all.contains("ship-secret-123456") && !all.contains("pay@example.com"), "{all}");
+    assert!(all.contains("credential api_key"), "names what changed: {all}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_profiles_index_is_built_after_startup_not_in_a_migration() {
+    use dumbmail::features::Feature;
+    let migration = include_str!("../migrations/0022_marketing_hold.sql");
+    let statements: String = migration.lines().filter(|l| !l.trim_start().starts_with("--")).collect::<Vec<_>>().join("\n");
+    assert!(!statements.to_uppercase().contains("CREATE INDEX"), "no index is built on profiles inside the migration");
+    let h = integ_harness!();
+    let exists = "SELECT count(*) FROM pg_class WHERE relname = 'profiles_integration_keys_idx'";
+    assert_eq!(count(&h, exists).await, 0, "the migration leaves it to startup");
+    dumbmail::features::integrations::Module.after_start(&h.state).await.unwrap();
+    let valid: bool = sqlx::query_scalar("SELECT i.indisvalid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = 'profiles_integration_keys_idx'").fetch_one(&h.state.db).await.unwrap();
+    assert!(valid);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_new_profile_and_its_hold_commit_together() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return [{type: 'upsert_profile', email: 'boom@example.com', properties: {booking_ref: 'B-1'}}] }"}))).await;
+    // Something fails while the profile is being made (here: anything that writes the hold).
+    sqlx::query(
+        "CREATE FUNCTION boom() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.marketing_hold AND NEW.email = 'boom@example.com' THEN RAISE EXCEPTION 'boom'; END IF; RETURN NEW; END $$;",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER boom BEFORE INSERT OR UPDATE ON profiles FOR EACH ROW EXECUTE FUNCTION boom()").execute(&h.state.db).await.unwrap();
+    h.raw("POST", &path_of(&integ), &[], "{}").await;
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'boom@example.com'").await, 0, "nothing is left half-made (an unheld profile a retry would never hold)");
+    sqlx::query("DROP TRIGGER boom ON profiles").execute(&h.state.db).await.unwrap();
+    for _ in 0..2 {
+        h.fast_forward().await;
+    }
+    let (held, source, keys): (bool, Option<String>, Value) = sqlx::query_as("SELECT marketing_hold, source, integration_keys FROM profiles WHERE email = 'boom@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert!(held && source.unwrap().starts_with("integration:") && keys["booking_ref"] == "B-1");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn browsers_cant_redirect_an_integrations_messages_or_borrow_consent() {
+    let mut h = integ_harness!();
+    let me = h.signup().await;
+    h.credit(5.0).await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let script = "function handle(i) { return [{type: 'upsert_profile', email: 'guest@example.com', phone_number: '+15035550123', properties: {guesty_guest_id: 'g1'}}, {type: 'track_event', metric: 'Stay Booked', profile: {email: 'guest@example.com'}}] }";
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": script, "metrics": ["Stay Booked"]}))).await;
+    h.raw("POST", &path_of(&integ), &[], "{}").await;
+    h.drain().await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Footer", "kind": "embed", "config": {"collect": ["email", "phone_number"]}}))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "live"}))).await;
+    // A form that matches the guest by phone, with someone else's email: the guest's profile keeps
+    // its email; the new address gets its own profile, without the guest's phone.
+    let (s, _, r) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": fid, "email": "attacker@evil.test", "phone_number": "+15035550123"}).to_string()).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let (email, email_src): (Option<String>, Option<String>) = sqlx::query_as("SELECT email, email_source FROM profiles WHERE phone_number = '+15035550123'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(email.as_deref(), Some("guest@example.com"));
+    assert!(email_src.unwrap().starts_with("integration:"));
+    let (phone, consent): (Option<String>, String) = sqlx::query_as("SELECT phone_number, email_consent FROM profiles WHERE email = 'attacker@evil.test'").fetch_one(&h.state.db).await.unwrap();
+    assert!(phone.is_none(), "the guest's number isn't copied across");
+    assert_eq!(consent, "subscribed", "the address they typed is theirs to subscribe");
+    // The website script can't add an email to a held guest who has none either.
+    let integ2 = h.ok("POST", "/api/integrations", Some(json!({"name": "Phones", "script": "function handle(i) { return [{type: 'upsert_profile', phone_number: '+15035550124'}] }"}))).await;
+    h.raw("POST", &path_of(&integ2), &[], "{}").await;
+    h.drain().await;
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &json!({"metric": "Viewed Page", "profile": {"phone_number": "+15035550124", "email": "sneaky@evil.test"}}).to_string()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE phone_number = '+15035550124' AND email IS NULL").await, 1);
+    // Consent from a form goes only to what was typed: a phone match never subscribes another
+    // profile's stored email (here an ordinary profile the API made).
+    h.ok("POST", "/api/profiles", Some(json!({"email": "plain@example.com", "phone_number": "+15035550125"}))).await;
+    h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &json!({"form_id": fid, "email": "typed@example.com", "phone_number": "+15035550125"}).to_string()).await;
+    let c: String = sqlx::query_scalar("SELECT email_consent FROM profiles WHERE phone_number = '+15035550125'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(c, "never_subscribed", "the stored address wasn't the one typed");
+    // A service-message flow reaches the held guest only at the address the integration supplied.
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "Your stay", "trigger": {"type": "metric", "metric": "Stay Booked"},
+        "definition": {"entry": "e1", "settings": {"reentry": "always", "service_messages": true}, "nodes": [{"id": "e1", "type": "email", "next": null, "content": {"subject": "Your stay", "blocks": [{"type": "text", "html": "<p>Hi</p>"}]}}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.raw("POST", &path_of(&integ), &[], "{}").await;
+    h.fast_forward().await;
+    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject == "Your stay").map(|m| m.to).collect::<Vec<_>>();
+    assert_eq!(sent(&h), vec!["guest@example.com"], "the held guest gets it, at the address the integration gave");
+    let gid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'guest@example.com'").fetch_one(&h.state.db).await.unwrap();
+    let acct = account_id(&h).await;
+    let ev = |n: &str| dumbmail::audience::NewEvent { account_id: acct, profile_id: gid, metric: "Stay Booked", properties: json!({}), value: None, occurred_at: None, unique_id: Some(n.into()), message_id: None };
+    // Any other change of the address (here straight in the database, as any other path would) means
+    // the integration no longer vouches for it: the held person isn't sent service messages there.
+    sqlx::query("UPDATE profiles SET email = 'changed@evil.test' WHERE id = $1").bind(gid).execute(&h.state.db).await.unwrap();
+    dumbmail::audience::record_event_from(&h.state.db, ev("s-2"), dumbmail::audience::EventSource::Integration).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent(&h), vec!["guest@example.com"]);
+    let why: String = sqlx::query_scalar("SELECT error FROM messages WHERE to_address = 'changed@evil.test' OR (profile_id = $1 AND status = 'skipped') ORDER BY created_at DESC LIMIT 1").bind(gid).fetch_one(&h.state.db).await.unwrap_or_default();
+    assert!(why.contains("no marketing consent") || count(&h, "SELECT count(*) FROM messages WHERE to_address = 'changed@evil.test' AND status = 'sent'").await == 0, "{why}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn integrations_cant_record_dumbmails_alerts_and_held_people_get_their_back_in_stock_alert() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let (s, r) = h.req("POST", "/api/integrations", Some(json!({"name": "X", "metrics": ["Back in Stock"]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{r}");
+    // A browser-reserved name that isn't DumbMail's own is fine to declare.
+    h.ok("POST", "/api/integrations", Some(json!({"name": "Mail app", "metrics": ["Opened Email"]}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Store", "script": "function handle(i) { return [{type: 'track_event', metric: 'Price Dropped', profile: {email: 'a@example.com'}}] }"}))).await;
+    let t = h.ok("POST", &format!("/api/integrations/{}/test", integ["id"].as_str().unwrap()), Some(json!({"payload": {}}))).await;
+    assert!(t["error"].as_str().unwrap().contains("recorded by DumbMail itself"), "{t}");
+    // A held person who confirmed a back-in-stock request gets that alert, and stays held.
+    let held = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return [{type: 'upsert_profile', email: i.payload.e}] }"}))).await;
+    for e in ["bis@example.com", "bis-gone@example.com"] {
+        h.raw("POST", &path_of(&held), &[("content-type", "application/json")], &json!({"e": e}).to_string()).await;
+    }
+    h.drain().await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "bis-gone@example.com", "email_consent": "unsubscribed"}))).await;
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "Back", "trigger": {"type": "metric", "metric": "Back in Stock"},
+        "definition": {"entry": "e1", "settings": {"reentry": "always"}, "nodes": [{"id": "e1", "type": "email", "next": null, "content": {"subject": "It's back", "blocks": [{"type": "text", "html": "<p>Back</p>"}]}}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    let acct = account_id(&h).await;
+    for e in ["bis@example.com", "bis-gone@example.com"] {
+        let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = $1").bind(e).fetch_one(&h.state.db).await.unwrap();
+        dumbmail::audience::record_event(&h.state.db, dumbmail::audience::NewEvent { account_id: acct, profile_id: pid, metric: "Back in Stock", properties: json!({"name": "Mug"}), value: None, occurred_at: None, unique_id: Some(format!("bis:{e}")), message_id: None }).await.unwrap();
+    }
+    h.fast_forward().await;
+    let to: Vec<String> = h.state.email.sent().into_iter().filter(|m| m.subject == "It's back").map(|m| m.to).collect();
+    assert_eq!(to, vec!["bis@example.com"], "the held person gets the alert they asked for; the unsubscribed one doesn't");
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'bis@example.com' AND marketing_hold").await, 1, "the alert doesn't clear the hold");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_retry_applies_the_actions_from_the_first_run() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    // The script's output changes every run (the time); the second action can't be written yet.
+    let script = "function handle(i) { return [
+        {type: 'track_event', metric: 'Tick', profile: {email: 'tick@example.com'}, properties: {at: String(Date.now()) + Math.random()}},
+        {type: 'track_event', metric: 'Tock', profile: {property: 'order_ref', value: 'O-1', if_missing: 'retry'}}] }";
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Clock", "script": script, "metrics": ["Tick", "Tock"]}))).await;
+    h.raw("POST", &path_of(&integ), &[], "{}").await;
+    h.drain().await;
+    let (first, applied): (Value, Value) = sqlx::query_as("SELECT actions, applied FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(first.as_array().unwrap().len(), 2, "the first run's list is kept: {first}");
+    assert!(first[0]["unique_id"].as_str().unwrap().starts_with("delivery:") && first[0]["time"].is_string(), "missing ids and times are fixed: {first}");
+    assert!(applied.get("0").is_some(), "the first action is in the ledger: {applied}");
+    // Now the person the second action needs exists; the retry applies the same list.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "order@example.com"}))).await;
+    sqlx::query("UPDATE profiles SET integration_keys = '{\"order_ref\": \"O-1\"}' WHERE email = 'order@example.com'").execute(&h.state.db).await.unwrap();
+    for _ in 0..2 {
+        h.fast_forward().await;
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Tick'").await, 1, "never a second Tick");
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Tock'").await, 1);
+    let (after, status): (Value, String) = sqlx::query_as("SELECT actions, status FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(after, first, "the list never changes");
+    assert_eq!(status, "ok");
+    let at: String = sqlx::query_scalar("SELECT e.properties->>'at' FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Tick'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(at, first[0]["properties"]["at"].as_str().unwrap());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_trusted_event_replaces_a_browser_copy_never_the_reverse() {
+    use dumbmail::audience::{self, EventSource, NewEvent};
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "buyer@example.com"}))).await;
+    let pid: uuid::Uuid = p["id"].as_str().unwrap().parse().unwrap();
+    let ev = |props: Value| NewEvent { account_id: acct, profile_id: pid, metric: "Ordered Thing", properties: props, value: Some(10.0), occurred_at: None, unique_id: Some("order-1".into()), message_id: None };
+    let forged = audience::record_browser_event(&h.state.db, ev(json!({"by": "browser"}))).await.unwrap();
+    assert!(forged.is_some());
+    let jobs = "SELECT count(*) FROM jobs WHERE kind = 'flow_event'";
+    let jobs_before = count(&h, jobs).await;
+    let trusted = audience::record_event_from(&h.state.db, ev(json!({"by": "server"})), EventSource::Integration).await.unwrap();
+    assert!(trusted.is_some() && trusted != forged, "the trusted event is recorded as new");
+    let rows: Vec<(bool, Value)> = sqlx::query_as("SELECT from_browser, properties FROM events WHERE unique_id = 'order-1'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows, vec![(false, json!({"by": "server"}))], "the browser copy is gone");
+    let _ = jobs_before;
+    // A browser event never replaces a trusted one, and another trusted copy is a duplicate.
+    assert!(audience::record_browser_event(&h.state.db, ev(json!({"by": "browser again"}))).await.unwrap().is_none());
+    assert!(audience::record_api_event(&h.state.db, ev(json!({"by": "api"}))).await.unwrap().is_none());
+    let rows: Vec<(bool, Value)> = sqlx::query_as("SELECT from_browser, properties FROM events WHERE unique_id = 'order-1'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(rows, vec![(false, json!({"by": "server"}))]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn declared_metrics_are_server_only_from_the_moment_they_are_saved() {
+    let mut h = integ_harness!();
+    let me = h.signup().await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Lessons", "metrics": ["Lesson Booked"], "script": "function handle(i) { return [{type: 'track_event', metric: i.payload.m, profile: {email: 'l@example.com'}}] }"}))).await;
+    let browser = |m: &str| json!({"metric": m, "profile": {"email": "victim@example.com"}}).to_string();
+    // No event has ever arrived, and a browser still can't send it.
+    let (s, _, r) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &browser("Lesson Booked")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{r}");
+    // The script may record only what it declared.
+    h.raw("POST", &path_of(&integ), &[("content-type", "application/json")], &json!({"m": "Lesson Cancelled"}).to_string()).await;
+    h.drain().await;
+    let d = h.ok("GET", &format!("/api/integrations/{}/deliveries", integ["id"].as_str().unwrap()), None).await["data"][0].clone();
+    assert_eq!(d["status"], "error");
+    assert!(d["error"].as_str().unwrap().contains("isn't one of this integration's metrics"), "{d}");
+    h.ok("PATCH", &format!("/api/integrations/{}", integ["id"].as_str().unwrap()), Some(json!({"metrics": ["Lesson Booked", "Lesson Cancelled"]}))).await;
+    let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &browser("Lesson Cancelled")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_replaced_backfill_writes_nothing_from_a_page_it_already_fetched() {
+    use axum::routing::get;
+    let mut h = integ_harness!();
+    h.signup().await;
+    let integ_id: Arc<Mutex<Option<uuid::Uuid>>> = Default::default();
+    let db = h.state.db.clone();
+    let iid2 = integ_id.clone();
+    // The app answers slowly; while it does, someone starts a new backfill (replacing this one).
+    let app = axum::Router::new().route(
+        "/items",
+        get(move || {
+            let db = db.clone();
+            let id = *iid2.lock().unwrap();
+            async move {
+                if let Some(id) = id {
+                    sqlx::query("UPDATE integrations SET backfill = backfill || '{\"id\": \"replacement\"}' WHERE id = $1").bind(id).execute(&db).await.unwrap();
+                }
+                axum::Json(json!({"items": [{"email": "late@example.com"}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let script = "function handle(i) { return i.payload.items.map(function (x) { return {type: 'upsert_profile', email: x.email} }) }";
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Items", "script": script, "pull": {"url": format!("http://{addr}/items")}}))).await;
+    let id: uuid::Uuid = integ["id"].as_str().unwrap().parse().unwrap();
+    *integ_id.lock().unwrap() = Some(id);
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({"backfill_since": "2026-01-01"}))).await;
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'late@example.com'").await, 0, "the replaced run's page wrote nothing");
+    let st: String = sqlx::query_scalar("SELECT status FROM integration_deliveries WHERE source = 'pull'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(st, "ignored");
+    h.cleanup().await;
+}
+
+#[test]
+fn guesty_pages_continue_past_equal_timestamps_across_runs() {
+    use dumbmail::features::integrations::{recipes, sandbox};
+    let r = recipes::get("guesty").unwrap();
+    let t = "2026-11-17T09:00:00.000Z";
+    let res = |n: usize, at: &str| (0..n).map(|i| json!({"reservationId": format!("r{i}"), "guestId": format!("g{i}"), "status": "confirmed", "lastUpdatedAt": at})).collect::<Vec<_>>();
+    let run = |input: Value| -> Value { serde_json::from_str(&sandbox::run_engine(&r.script, &input.to_string(), std::time::Duration::from_secs(5)).unwrap()).unwrap() };
+    let page = |results: Vec<Value>, gte: &str, skip: &str, state: Value| {
+        json!({"source": "pull", "page": 1, "payload": {"results": results, "pagination": {"hasMore": true}}, "settings": {}, "state": state, "now": "2026-11-17T18:00:00.000Z", "backfill": null,
+               "request": {"url": "https://open-api.guesty.com/v1/reservations-v3/search", "query": [["filter[lastUpdatedAt][gte]", gte], ["skip", skip]]}})
+    };
+    // A first page: 48 rows at 08:00 and 2 at 09:00. The next one starts at 09:00 skipping those 2.
+    let mut first = res(48, "2026-11-17T08:00:00.000Z");
+    first.extend(res(2, t));
+    let out = run(page(first, "2026-11-16T00:00:00.000Z", "0", json!({})));
+    assert_eq!(out[0]["values"]["page_last"], t);
+    assert_eq!(out[0]["values"]["page_skip"], 2);
+    // A full page all at 09:00, read with skip 2: the next skip is 52, never back to the same rows.
+    let out = run(page(res(50, t), t, "2", json!({"cursor": t, "skip": 2})));
+    assert_eq!(out[0]["values"]["page_skip"], 52);
+    // The guests step saves cursor and skip, so a run that stops at its page cap resumes there.
+    let guests = json!({"source": "pull", "page": 2, "payload": {"results": []}, "settings": {}, "now": "2026-11-17T18:00:00.000Z", "backfill": null,
+        "state": {"pending": [], "page_last": t, "page_skip": 52, "page_more": true}, "request": {"url": "https://open-api.guesty.com/v1/guests-crud", "query": []}});
+    let out = run(guests);
+    let saved = out.as_array().unwrap().iter().find(|a| a["type"] == "set_state").unwrap();
+    assert_eq!(saved["values"]["cursor"], t);
+    assert_eq!(saved["values"]["skip"], 52);
+    let next = out.as_array().unwrap().iter().find(|a| a["type"] == "next_request").unwrap();
+    assert_eq!(next["query"]["skip"], 52);
+    // And the scheduled pull's own request carries the saved skip.
+    assert_eq!(r.manifest["pull"]["query"]["skip"], "{{state.skip|'0'}}");
+}
+
+#[tokio::test]
+async fn event_date_fires_found_late_are_missed_and_time_zone_changes_move_them() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let flow = |name: &str| json!({"name": name, "trigger": {"type": "event_date", "metric": "Stay", "field": "check_in", "offset_days": -2, "hour": 10},
+        "definition": {"entry": "e1", "settings": {}, "nodes": [{"id": "e1", "type": "email", "next": null, "content": {"subject": name, "blocks": [{"type": "text", "html": "<p>x</p>"}]}}]}});
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
+    let day = |d: i64| (today + chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+    // History: a stay whose reminder was due days ago, and three upcoming stays.
+    track(&mut h, "Stay", "old@example.com", json!({"check_in": day(-3)}), "s-old", "2026-01-01T00:00:00Z").await;
+    for (i, e) in ["a@example.com", "b@example.com", "c@example.com"].iter().enumerate() {
+        track(&mut h, "Stay", e, json!({"check_in": day(10 + i as i64)}), &format!("s-{i}"), "2026-01-01T00:00:00Z").await;
+    }
+    let f = h.ok("POST", "/api/flows", Some(flow("Soon"))).await;
+    let fid = f["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    // One seeding budget per tick, across flows: two events this tick, the rest next tick.
+    dumbmail::flows::event_date_tick(&h.state, 2).await.unwrap();
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_event_date_fires").await, 2);
+    dumbmail::flows::event_date_tick(&h.state, 2).await.unwrap();
+    dumbmail::flows::event_date_tick(&h.state, 2).await.unwrap();
+    let report = h.ok("GET", &format!("/api/flows/{fid}/report"), None).await;
+    assert_eq!(report["event_dates"]["counts"]["missed"], 1, "found more than a day late: shown, not dropped: {report}");
+    assert_eq!(report["event_dates"]["counts"]["pending"], 3, "{report}");
+    // The account moves to New York: 10:00 is now 10:00 there.
+    let due = "SELECT min(due_at) FROM flow_event_date_fires WHERE outcome = 'pending'";
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(due).fetch_one(&h.state.db).await.unwrap();
+    h.ok("PATCH", "/api/account", Some(json!({"timezone": "America/New_York"}))).await;
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(due).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(before - after, chrono::Duration::hours(3), "{before} → {after}");
+    h.cleanup().await;
+}
+
+/// A stand-in app that echoes back whatever credentials it is sent (in its body, its Link header
+/// and its error text), as some real APIs do.
+async fn echoing_app() -> String {
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    let app = axum::Router::new()
+        .route(
+            "/v1/items",
+            get(|headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let pin = headers.get("x-pin").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let token = auth.split(' ').nth(1).unwrap_or("").to_string();
+                if q.contains_key("page") {
+                    return (StatusCode::UNAUTHORIZED, [("link", format!("<https://x.test/?t={token}>"))], axum::Json(json!({"error": format!("bad auth {auth}")})));
+                }
+                (
+                    StatusCode::OK,
+                    [("link", format!("</v1/items?page=2&access_token={token}>; rel=\"next\""))],
+                    axum::Json(json!({"echo": format!("you sent {auth} and pin {pin}"), "items": [{"email": "e@example.com"}]})),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn nothing_a_vendor_echoes_back_leaks_a_credential() {
+    let base = echoing_app().await;
+    let mut h = integ_harness!();
+    h.signup().await;
+    // Page 1 follows the Link header (which carries the token) to page 2, which fails.
+    let script = "function handle(i) {
+        var link = (i.response && i.response.headers.link) || '';
+        var m = /<([^>]+)>/.exec(link);
+        var out = [{type: 'log', message: 'page ' + i.page + ': ' + String(i.payload.echo || '') + ' link ' + link}, {type: 'set_state', values: {seen: i.page}}];
+        if (m && i.page === 1) out.push({type: 'next_request', url: m[1]});
+        return out;
+    }";
+    for (name, auth, creds) in [
+        ("Bearer", json!({"type": "bearer", "token": "{{secret.token}}"}), json!({"token": "tk_live_77aa88bb", "pin": "42"})),
+        ("Basic", json!({"type": "basic", "username": "{{secret.user}}", "password": "{{secret.pass}}"}), json!({"user": "acme", "pass": "pw-9900", "pin": "42"})),
+    ] {
+        let integ = h
+            .ok("POST", "/api/integrations", Some(json!({"name": name, "script": script, "credentials": creds,
+                "pull": {"url": format!("{base}/v1/items"), "headers": {"X-Pin": "{{secret.pin}}"}, "auth": auth}})))
+            .await;
+        let id = integ["id"].as_str().unwrap().to_string();
+        let test = h.ok("POST", &format!("/api/integrations/{id}/test"), Some(json!({"pull": true}))).await;
+        h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+        h.drain().await;
+        let basic = base64::engine::general_purpose::STANDARD.encode("acme:pw-9900");
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT concat_ws(' ', body, headers::text, request::text, error, result::text, actions::text) FROM integration_deliveries WHERE integration_id = $1::uuid
+             UNION ALL SELECT concat_ws(' ', last_error, state::text, backfill::text) FROM integrations WHERE id = $1::uuid
+             UNION ALL SELECT payload::text FROM jobs",
+        )
+        .bind(&id)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+        let deliveries = h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await;
+        let mut shown = vec![test.to_string(), deliveries.to_string()];
+        for d in deliveries["data"].as_array().unwrap() {
+            shown.push(h.ok("GET", &format!("/api/integrations/{id}/deliveries/{}", d["id"].as_str().unwrap()), None).await.to_string());
+        }
+        let everything = format!("{stored:?} {shown:?}");
+        for secret in ["tk_live_77aa88bb", "pw-9900", basic.as_str(), "pin 42"] {
+            assert!(!everything.contains(secret), "{name}: {secret:?} leaked: {everything}");
+        }
+        assert!(everything.contains("pin •••"), "{name}: the short secret is masked as a whole word: {everything}");
+        assert_eq!(count(&h, &format!("SELECT count(*) FROM integration_deliveries WHERE integration_id = '{id}' AND source = 'pull'")).await, 2, "{name}: both pages ran");
+    }
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn stored_payloads_stay_in_budget_from_admission() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    dumbmail::features::integrations::engine::set_payload_budget_for(acct, 3000);
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Big", "script": "function handle(i) { return [] }"}))).await;
+    let body = json!({"pad": "x".repeat(900)}).to_string();
+    // Three waiting payloads fill the budget; a fourth is refused (the app retries later).
+    for _ in 0..3 {
+        let (s, _, _) = h.raw("POST", &path_of(&integ), &[("content-type", "application/json")], &body).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let (s, _, r) = h.raw("POST", &path_of(&integ), &[("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{r}");
+    // Once they've run, older payloads make room for new ones.
+    h.drain().await;
+    for _ in 0..4 {
+        let (s, _, _) = h.raw("POST", &path_of(&integ), &[("content-type", "application/json")], &body).await;
+        assert_eq!(s, StatusCode::OK);
+        h.drain().await;
+    }
+    let used: i64 = sqlx::query_scalar("SELECT bytes FROM integration_payload_bytes WHERE account_id = $1").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    let real: i64 = count(&h, "SELECT COALESCE(sum(octet_length(body)), 0)::bigint FROM integration_deliveries").await;
+    assert!(used <= 3000 && used == real, "{used} {real}");
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries").await, 7, "every log line stays");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn guesty_door_codes_never_reach_stored_or_shown_data() {
+    let (_mock, base) = mock_guesty(3).await;
+    let mut h = integ_harness!();
+    h.signup().await;
+    let id = guesty_with_mock(&mut h, &base).await;
+    let key = b"guesty-svix-key-0123456789abcdef";
+    let secret = format!("whsec_{}", base64::engine::general_purpose::STANDARD.encode(key));
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature_secret": secret}))).await;
+    let integ = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    // A webhook whose reservation (and before-state) carries a door code.
+    let body = fixture("guesty", "webhook-updated-with-door-code.json").to_string();
+    let hdrs = svix(key, "msg-door", &body);
+    let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (s, _, r) = h.raw("POST", &path_of(&integ), &hdrs, &body).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    h.drain().await;
+    // A pull page (codes in notes and channelMetadata.guestContact), and a test pull.
+    let test = h.ok("POST", &format!("/api/integrations/{id}/test"), Some(json!({"pull": true}))).await;
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    assert!(count(&h, "SELECT count(*) FROM profiles WHERE email LIKE 'guest%@example.com'").await >= 2, "the pull found the guests by _id");
+    let phone: Option<String> = sqlx::query_scalar("SELECT phone_number FROM profiles WHERE email = 'guest1@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(phone.as_deref(), Some("+15035551001"), "Guesty's digits-only phone gets its +");
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT concat_ws(' ', body, headers::text, request::text, error, result::text, actions::text) FROM integration_deliveries
+         UNION ALL SELECT concat_ws(' ', state::text, backfill::text) FROM integrations
+         UNION ALL SELECT properties::text FROM events
+         UNION ALL SELECT concat_ws(' ', properties::text, integration_keys::text) FROM profiles",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    let deliveries = h.ok("GET", &format!("/api/integrations/{id}/deliveries"), None).await;
+    let mut shown = vec![test.to_string()];
+    for d in deliveries["data"].as_array().unwrap() {
+        shown.push(h.ok("GET", &format!("/api/integrations/{id}/deliveries/{}", d["id"].as_str().unwrap()), None).await.to_string());
+    }
+    let everything = format!("{stored:?} {shown:?}");
+    assert!(everything.contains("reservations-v3") && everything.contains("66f1c4a1246e7d9f0f8da88a"), "the deliveries are there");
+    for code in ["5512", "1234", "9876", "keyCode", "Lockbox", "guestContact"] {
+        assert!(!everything.contains(code), "{code:?} survived: {everything}");
+    }
+    h.cleanup().await;
+}
+
+async fn send_signed(h: &Harness, path: &str, (hdrs, body): (Vec<(String, String)>, String)) {
+    let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (s, _, r) = h.raw("POST", path, &hdrs, &body).await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    h.drain().await;
+}
+
+#[tokio::test]
+async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
+    let gid = created["integration"]["id"].as_str().unwrap().to_string();
+    let key = b"guesty-svix-key-0123456789abcdef";
+    let secret = format!("whsec_{}", base64::engine::general_purpose::STANDARD.encode(key));
+    h.ok("PATCH", &format!("/api/integrations/{gid}"), Some(json!({"signature_secret": secret}))).await;
+    let pre = created["flows"].as_array().unwrap().iter().find(|f| f["name"].as_str().unwrap().contains("pre-arrival")).unwrap()["id"].as_str().unwrap().to_string();
+    let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
+    let mut trigger = f["trigger"].clone();
+    trigger["hour"] = json!(0);
+    h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
+    h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "ana@example.com"}))).await;
+    sqlx::query("UPDATE profiles SET integration_keys = '{\"guesty_guest_id\": \"gA\"}' WHERE email = 'ana@example.com'").execute(&h.state.db).await.unwrap();
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::America::Los_Angeles).date_naive();
+    let in2 = (today + chrono::Duration::days(2)).format("%Y-%m-%d").to_string();
+    let path = path_of(&created["integration"]);
+    let post = |ev: &str, res: &str, guest: &str, status: &str, published: Option<&str>, changed: Option<Vec<&str>>, msg: &str| {
+        let mut meta = json!({"eventId": msg});
+        if let Some(p) = published {
+            meta["publishedAt"] = json!(p);
+        }
+        if let Some(c) = changed {
+            meta["changedFields"] = json!(c);
+        }
+        let body = json!({"event": ev, "meta": meta, "data": {"reservationId": res, "guestId": guest, "status": status, "checkInDateLocalized": in2, "checkOutDateLocalized": in2, "guestsCount": 2, "event": ev}}).to_string();
+        (svix(key, msg, &body), body)
+    };
+    let metric = |m: &str| format!("SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = '{m}'");
+    // No Guesty time: it can't be put in order, so nothing is recorded (the pull will).
+    send_signed(&h, &path, post("reservation.created.v2", "R0", "gA", "confirmed", None, None, "m0")).await;
+    assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 0);
+    // Booked at 10:00, cancelled at 11:00, reinstated at 12:00; the cancellation arrives last.
+    send_signed(&h, &path, post("reservation.created.v2", "R1", "gA", "confirmed", Some("2026-11-17T10:00:00.000Z"), None, "m1")).await;
+    send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "confirmed", Some("2026-11-17T12:00:00.000Z"), Some(vec!["status"]), "m3")).await;
+    send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "canceled", Some("2026-11-17T11:00:00.000Z"), Some(vec!["status"]), "m2")).await;
+    // Only the notes changed: no new version.
+    send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "confirmed", Some("2026-11-17T13:00:00.000Z"), Some(vec!["notes"]), "m4")).await;
+    assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 2, "10:00 and the reinstatement; nothing for the notes");
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).count();
+    assert_eq!(sent(&h), 1, "the late, older cancellation didn't undo the reinstatement");
+    // A later version that didn't move the date (as a pull sees it) doesn't send the reminder again.
+    send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "confirmed", Some("2026-11-17T14:00:00.000Z"), Some(vec!["checkIn"]), "m5")).await;
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent(&h), 1);
+    let report = h.ok("GET", &format!("/api/flows/{pre}/report"), None).await;
+    assert_eq!(report["event_dates"]["counts"]["already_sent"], 1, "{report}");
+    // A guest DumbMail doesn't know yet: the webhook waits (retried) instead of being dropped.
+    send_signed(&h, &path, post("reservation.created.v2", "R9", "gNew", "confirmed", Some("2026-11-17T15:00:00.000Z"), None, "m9")).await;
+    let d = &h.ok("GET", &format!("/api/integrations/{gid}/deliveries"), None).await["data"][0];
+    assert_eq!(d["status"], "error", "{d}");
+    h.ok("POST", "/api/profiles", Some(json!({"email": "new@example.com"}))).await;
+    sqlx::query("UPDATE profiles SET integration_keys = '{\"guesty_guest_id\": \"gNew\"}' WHERE email = 'new@example.com'").execute(&h.state.db).await.unwrap();
+    for _ in 0..2 {
+        h.fast_forward().await;
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked' AND e.properties->>'reservation_id' = 'R9'").await, 1);
+    // A booking first seen without its total, then with it: booked once, the value once.
+    let legacy = |total: Option<f64>, msg: &str| {
+        let mut r = json!({"_id": "R7", "status": "confirmed", "guestId": "gL", "lastUpdatedAt": "2026-11-17T16:00:00.000Z", "confirmedAt": "2026-11-17T15:59:00.000Z",
+            "checkInDateLocalized": in2, "checkOutDateLocalized": in2, "guest": {"_id": "gL", "email": "lee@example.com", "firstName": "Lee"}});
+        if let Some(t) = total {
+            r["money"] = json!({"totalPaid": t, "balanceDue": 0, "currency": "USD"});
+        }
+        (json!({"event": "reservation.new", "reservation": r}).to_string(), msg.to_string())
+    };
+    for (body, msg) in [legacy(None, "l1"), legacy(Some(480.0), "l2")] {
+        let hdrs = svix(key, &msg, &body);
+        let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        h.raw("POST", &path, &hdrs, &body).await;
+        h.drain().await;
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked' AND e.properties->>'reservation_id' = 'R7'").await, 1);
+    let totals: Vec<f64> = sqlx::query_scalar("SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Total'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(totals, vec![480.0]);
     h.cleanup().await;
 }

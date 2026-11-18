@@ -1,5 +1,5 @@
 {
-  "description": "The last guests page: the cursor is saved and no further page is asked for",
+  "description": "The last guests page: the cursor is saved and no further page is asked for (Guesty's real answer shape: _id, email, phone with the country code and no +.)",
   "expect": [
     {
       "email": "dana.whitfield@example.com",
@@ -22,6 +22,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -42,6 +43,7 @@
         "check_in": "2026-12-10",
         "check_out": "2026-12-14",
         "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 4,
@@ -59,13 +61,9 @@
       "values": {
         "cursor": "2026-11-17T11:00:00.000Z",
         "page_last": null,
-        "pending": null
-      }
-    },
-    {
-      "type": "set_state",
-      "values": {
         "page_more": null,
+        "page_skip": null,
+        "pending": null,
         "skip": 0
       }
     },
@@ -79,12 +77,12 @@
     "payload": {
       "results": [
         {
+          "_id": "6g0000000000000000000000",
+          "email": "dana.whitfield@example.com",
           "firstName": "Dana",
           "fullName": "Dana Whitfield",
-          "guestEmail": "dana.whitfield@example.com",
-          "guestPhone": "+1 (503) 555-0142",
-          "id": "6g0000000000000000000000",
-          "lastName": "Whitfield"
+          "lastName": "Whitfield",
+          "phone": "15035550142"
         }
       ],
       "total": 1

@@ -11,13 +11,22 @@
 //   on 1 March 2027. They carry the guest and the money, so they are the only source of totals.
 //
 // Events, each with reservation_id (the key flows use), dates, nights, guests and the channel:
-// - Reservation Booked: once per reservation, the first time it is seen confirmed. Carries the
-//   total as its value when Guesty sent it (legacy webhooks), so revenue is counted once.
-// - Reservation Confirmed: one per version of a confirmed booking, timed by Guesty's own update
-//   time. Date-based flows follow the newest version; a late, older version never replaces a newer
-//   one, and A → B → A dates make three versions with the last one current.
-// - Reservation Cancelled: as soon as a cancellation is seen on any path.
+// - Reservation Booked: once per reservation, the first time it is seen confirmed (no value).
+// - Reservation Total: once per reservation, with the total as its value, whenever Guesty first
+//   sends it (legacy webhooks), so revenue counts once whichever message arrives first.
+// - Reservation Confirmed: a new version only when the booking's dates, listing, status or guest
+//   change (a webhook that says only the notes changed makes none), timed by Guesty's own update
+//   time. (The pre-arrival flow also never sends the same booking's reminder twice for one date.) Date-based flows follow the newest
+//   version; a late, older version never replaces a newer one, and A → B → A dates make three
+//   versions with the last one current.
+// - Reservation Cancelled: timed by Guesty's own update time, so a late, older cancellation never
+//   undoes a newer reinstatement.
 // - Inquiry Received.
+// A webhook without any Guesty time can't be ordered, so it writes no events; the next pull (every
+// 15 minutes) records the change with Guesty's time. A v2 event for a guest DumbMail doesn't know
+// yet is retried until the pull has added them.
+// Door codes and access notes (`notes`, `keyCode`, `channelMetadata.guestContact`) are never put in
+// events or profiles, and the recipe's redact list keeps them out of the delivery log.
 // Nobody is subscribed: Guesty has no marketing opt-in. People this integration adds are held back
 // from marketing unless the owner says they opted in; booking-site relay addresses are suppressed.
 
@@ -25,7 +34,12 @@ var SEARCH_PATH = "/v1/reservations-v3/search";
 var GUESTS_PATH = "/v1/guests-crud";
 // 50 a page keeps the reservations waiting for their guests well inside the 64 KB saved state.
 var PAGE_SIZE = 50;
+// Guesty answers these columns with `_id`, `email` and `phone` (checked against the live API).
 var GUEST_COLUMNS = "id firstName lastName fullName guestEmail guestPhone";
+// What makes a new booking version: a change to any of these (Guesty's field names in
+// meta.changedFields, and ours when comparing a legacy webhook's before and after).
+var VERSION_CHANGES = ["status", "checkIn", "checkOut", "checkInDateLocalized", "checkOutDateLocalized", "listingId", "unitId", "listing", "guestId", "guest"];
+var VERSION_FIELDS = ["status", "check_in", "check_out", "listing_id", "guest_id"];
 
 function str(v) {
   return v === undefined || v === null || v === "" ? null : String(v);
@@ -55,11 +69,12 @@ function cleanEmail(v) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s) ? s : null;
 }
 
-function cleanPhone(v) {
+// `withCountry`: the number is digits with the country code but no "+" (GET /guests-crud).
+function cleanPhone(v, withCountry) {
   var s = str(v && typeof v === "object" ? v.number || v.phone : v);
   if (!s) return null;
   var digits = s.replace(/[^0-9]/g, "");
-  if (s.trim().charAt(0) === "+" && digits.length >= 8 && digits.length <= 15) return "+" + digits;
+  if ((withCountry || s.trim().charAt(0) === "+") && digits.length >= 8 && digits.length <= 15) return "+" + digits;
   if (digits.length === 10) return "+1" + digits;
   if (digits.length === 11 && digits.charAt(0) === "1") return "+" + digits;
   return null;
@@ -70,11 +85,12 @@ function splitName(full) {
   return { first: parts.shift() || null, last: parts.length ? parts.join(" ") : null };
 }
 
-// A guest from a legacy reservation (`guest`) or from GET /guests-crud (`guestEmail`, `guestPhone`).
-function guestFrom(g, fallbackId) {
+// A guest from a legacy reservation (`guest`) or from GET /guests-crud (`_id`, `email`, `phone`
+// with the country code and no "+"; any of them can be missing).
+function guestFrom(g, fallbackId, crud) {
   g = g || {};
-  var email = cleanEmail(g.guestEmail) || cleanEmail(g.email) || cleanEmail(g.emails && g.emails[0]);
-  var phone = cleanPhone(g.guestPhone) || cleanPhone(g.phone) || cleanPhone(g.phones && g.phones[0]);
+  var email = cleanEmail(g.email) || cleanEmail(g.guestEmail) || cleanEmail(g.emails && g.emails[0]);
+  var phone = cleanPhone(g.phone, crud) || cleanPhone(g.guestPhone, crud) || cleanPhone(g.phones && g.phones[0]);
   var first = str(g.firstName);
   var last = str(g.lastName);
   if (!first && !last && g.fullName) {
@@ -82,7 +98,7 @@ function guestFrom(g, fallbackId) {
     first = n.first;
     last = n.last;
   }
-  return { id: str(g.id || g._id || fallbackId), email: email, phone: phone, first: first, last: last };
+  return { id: str(g._id || g.id || fallbackId), email: email, phone: phone, first: first, last: last };
 }
 
 function isOwnerStay(r, settings) {
@@ -120,6 +136,7 @@ function details(r) {
     total: total,
     currency: m ? str(m.currency) : null,
     source_channel: str(integration.platform || r.channel || r.platform || r.source),
+    guest_id: str(r.guestId || (r.guest && (r.guest._id || r.guest.id))),
   };
 }
 
@@ -128,7 +145,9 @@ var BOOKED = ["confirmed", "checked_in", "checked_out", "completed", "alteration
 // Actions for one reservation as Guesty sees it now.
 // `who`: how to find the guest's profile; `guest`: details to upsert (null when only the Guesty guest id is known).
 // `version`: Guesty's own time for this state of the reservation (meta.publishedAt or lastUpdatedAt).
-function reservationActions(r, guest, who, version, input) {
+// `versioned`: false when the message says nothing that matters for a version changed (only
+// notes, say): then no new Reservation Confirmed version is recorded.
+function reservationActions(r, guest, who, version, input, versioned) {
   var settings = input.settings || {};
   var d = details(r);
   if (!d.reservation_id) return [{ type: "log", message: "skipped a reservation with no id" }];
@@ -143,6 +162,13 @@ function reservationActions(r, guest, who, version, input) {
     out.push(profile);
   }
 
+  // Without Guesty's own time a message can't be put in order: nothing time-dependent is written
+  // (the next pull records the change with Guesty's time).
+  if (!version) {
+    out.push({ type: "log", message: "reservation " + d.reservation_id + ": the message has no Guesty time, so it can't be ordered; the next pull records it" });
+    return out;
+  }
+
   // Old bookings seen for the first time (a backfill, or a first pull) are marked historical so
   // "right after booking" flows skip them. Date-based flows still use them for future stays.
   var confirmedAt = str(r.confirmedAt || (r.channelMetadata && r.channelMetadata.confirmedAt) || r.createdAt);
@@ -151,43 +177,47 @@ function reservationActions(r, guest, who, version, input) {
   var props = {};
   for (var k in d) if (d[k] !== null && k !== "total" && k !== "currency") props[k] = d[k];
   if (historical) props.historical = true;
-  if (version) props.version = version;
+  props.version = version;
 
-  // Without Guesty's own update time, a version is told apart by its content (and dated now).
-  var v = version || ("content:" + [d.status, d.check_in, d.check_out, d.listing_id, d.guests].join("|"));
-  var when = version || input.now;
   var status = String(r.status || "").toLowerCase();
   if (BOOKED.indexOf(status) >= 0) {
     var booked = {};
     for (var b in props) if (b !== "version") booked[b] = props[b];
-    if (d.total !== null) {
-      booked.total = d.total;
-      if (d.currency) booked.currency = d.currency;
-    }
     out.push({
-      type: "track_event", metric: "Reservation Booked", profile: who, properties: booked,
-      value: d.total === null ? undefined : d.total, time: confirmedAt || when,
-      // Once per reservation: a date change or a resend never counts its value again.
+      type: "track_event", metric: "Reservation Booked", profile: who, properties: booked, time: confirmedAt || version,
+      // Once per reservation, whichever message arrives first.
       unique_id: "guesty:" + d.reservation_id + ":booked",
     });
-    out.push({
-      type: "track_event", metric: "Reservation Confirmed", profile: who, properties: props, time: when,
-      unique_id: "guesty:" + d.reservation_id + ":confirmed:" + v,
-    });
+    if (d.total !== null) {
+      // The value, once per reservation, from the first message that carries it.
+      out.push({
+        type: "track_event", metric: "Reservation Total", profile: who, value: d.total, time: confirmedAt || version,
+        properties: clean({ reservation_id: d.reservation_id, total: d.total, currency: d.currency, listing_id: d.listing_id, check_in: d.check_in, check_out: d.check_out, historical: historical || null }),
+        unique_id: "guesty:" + d.reservation_id + ":total",
+      });
+    }
+    if (versioned === false) {
+      out.push({ type: "log", message: "reservation " + d.reservation_id + ": only details that don't change the booking's dates, listing, status or guest changed; no new version" });
+    } else {
+      out.push({
+        type: "track_event", metric: "Reservation Confirmed", profile: who, properties: props, time: version,
+        unique_id: "guesty:" + d.reservation_id + ":confirmed:" + version,
+      });
+    }
   } else if (status === "canceled" || status === "cancelled") {
     var cancelledAt = str(r.canceledAt || (r.channelMetadata && r.channelMetadata.canceledAt));
     if (cancelledAt) props.canceled_at = cancelledAt;
     out.push({
       type: "track_event", metric: "Reservation Cancelled", profile: who, properties: props,
-      // Dated when it is seen, so it is never older than a confirmation already recorded (webhook
-      // and pull times come from different clocks): a cancellation always stops the reminders.
-      time: version && version > input.now ? version : input.now,
-      unique_id: "guesty:" + d.reservation_id + ":cancelled:" + v,
+      // Guesty's own time: a cancellation that arrives late, after the booking was reinstated,
+      // is older than the reinstatement and doesn't stop its reminders.
+      time: version,
+      unique_id: "guesty:" + d.reservation_id + ":cancelled:" + version,
     });
   } else if (status === "inquiry") {
     out.push({
       type: "track_event", metric: "Inquiry Received", profile: who, properties: props,
-      time: str(r.createdAt) || when, unique_id: "guesty:" + d.reservation_id + ":inquiry",
+      time: str(r.createdAt) || version, unique_id: "guesty:" + d.reservation_id + ":inquiry",
     });
   } else {
     out.push({ type: "log", message: "reservation " + d.reservation_id + " is " + (status || "without a status") + "; nothing to record yet" });
@@ -195,28 +225,39 @@ function reservationActions(r, guest, who, version, input) {
   return out;
 }
 
+function clean(o) {
+  var out = {};
+  for (var k in o) if (o[k] !== null && o[k] !== undefined) out[k] = o[k];
+  return out;
+}
+
 function changedFields(r, before) {
   if (!before) return [];
   var a = details(r);
   var b = details(before);
-  return ["status", "check_in", "check_out", "guests", "total", "listing_id"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
+  return ["status", "check_in", "check_out", "guests", "total", "listing_id", "guest_id"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
 }
 
 // "Reservation Updated", once per change (webhooks only: they say what changed).
 function updated(r, who, changed, subType, version, input) {
+  if (!version) return { type: "log", message: "a change without a Guesty time isn't recorded as Reservation Updated" };
   var d = details(r);
   var props = { reservation_id: d.reservation_id, status: d.status, check_in: d.check_in, check_out: d.check_out, listing_id: d.listing_id, changed: changed || [] };
   if (subType) props.change = String(subType);
   return {
-    type: "track_event", metric: "Reservation Updated", profile: who, properties: props, time: version || input.now,
-    unique_id: "guesty:" + d.reservation_id + ":updated:" + (version || input.now),
+    type: "track_event", metric: "Reservation Updated", profile: who, properties: props, time: version,
+    unique_id: "guesty:" + d.reservation_id + ":updated:" + version,
   };
 }
 
-function whoFor(guest, guestId) {
+// `retry`: a guest DumbMail doesn't know yet makes the delivery wait (retried until the pull adds them).
+function whoFor(guest, guestId, retry) {
   if (guest && guest.email) return { email: guest.email };
   if (guest && guest.phone) return { phone_number: guest.phone };
-  return guestId ? { property: "guesty_guest_id", value: String(guestId) } : null;
+  if (!guestId) return null;
+  var w = { property: "guesty_guest_id", value: String(guestId) };
+  if (retry) w.if_missing = "retry";
+  return w;
 }
 
 function fromWebhook(input) {
@@ -226,13 +267,15 @@ function fromWebhook(input) {
   var ev = String(p.event || data.event || "");
   if (ev === "reservation.created.v2" || ev === "reservation.updated.v2") {
     var gid = str(data.guestId);
-    var who = whoFor(null, gid);
+    var who = whoFor(null, gid, true);
     if (!data.reservationId) return [{ type: "log", message: ev + " with no reservationId" }];
     if (!who) return [{ type: "log", message: ev + " for " + data.reservationId + " has no guestId; the next pull picks it up" }];
     // v2 events carry no email: this reaches guests DumbMail already has; the pull adds new ones.
-    var acts = reservationActions(data, null, who, str(meta.publishedAt), input);
+    var changed = Array.isArray(meta.changedFields) ? meta.changedFields : null;
+    var versioned = ev === "reservation.created.v2" || !changed || changed.some(function (f) { return VERSION_CHANGES.indexOf(String(f)) >= 0; });
+    var acts = reservationActions(data, null, who, str(meta.publishedAt), input, versioned);
     if (ev === "reservation.updated.v2") acts.push(updated(data, who, meta.changedFields, meta.subType, str(meta.publishedAt), input));
-    acts.push({ type: "log", message: ev + " " + (meta.subType || "") + " for " + data.reservationId + " (guest " + gid + "); skipped if the guest isn't known yet, and the next pull fills it in" });
+    acts.push({ type: "log", message: ev + " " + (meta.subType || "") + " for " + data.reservationId + " (guest " + gid + "); retried until the guest is known" });
     return acts;
   }
   if (ev === "reservation.new" || ev === "reservation.updated" || ev === "reservation_update_shortlist") {
@@ -241,7 +284,9 @@ function fromWebhook(input) {
     var g = guestFrom(r.guest, r.guestId);
     if (!g.email && !g.phone) return [{ type: "log", message: "reservation " + (r._id || r.id) + ": the guest has no usable email or phone, so there's no profile to write" }];
     var version = str(r.lastUpdatedAt) || str(meta.publishedAt);
-    var legacy = reservationActions(r, g, whoFor(g), version, input);
+    var before = p.reservationBefore;
+    var moved = before ? changedFields(r, before).some(function (f) { return VERSION_FIELDS.indexOf(f) >= 0; }) : true;
+    var legacy = reservationActions(r, g, whoFor(g), version, input, ev === "reservation.new" || moved);
     if (ev !== "reservation.new" && !isOwnerStay(r, input.settings || {})) legacy.push(updated(r, whoFor(g), changedFields(r, p.reservationBefore), null, version, input));
     return legacy;
   }
@@ -270,32 +315,42 @@ function updatedAt(r) {
   return str(r.lastUpdatedAt || (r.channelMetadata && r.channelMetadata.updatedAt));
 }
 
+// The value of query parameter `name` in the request this page answered.
+function requestQuery(input, name) {
+  var q = (input.request && input.request.query) || [];
+  for (var i = 0; i < q.length; i++) if (q[i][0] === name) return q[i][1];
+  return null;
+}
+
 // Step 1: a page of changed reservations. Keep them and ask for their guests.
+// Continuation: the next page starts at the newest change seen (`gte` that time) and skips the
+// reservations at exactly that time already read, so equal timestamps never make it reread the same
+// rows, even across runs (the cursor and the skip are both saved).
 function fromSearch(input) {
   var page = input.payload || {};
   var results = page.results;
   if (!Array.isArray(results)) return [{ type: "log", message: "unexpected answer from Guesty: no results list" }];
-  if (!results.length) return [{ type: "log", message: "page " + input.page + ": no changed reservations" }];
   var st = input.state || {};
+  var usedFrom = requestQuery(input, "filter[lastUpdatedAt][gte]") || st.cursor || null;
+  var usedSkip = Number(requestQuery(input, "skip") || 0) || 0;
+  if (!results.length) return [{ type: "log", message: "page " + input.page + ": no changed reservations" }];
   var last = null;
-  var first = null;
   var ids = [];
   results.forEach(function (r) {
     var u = updatedAt(r);
     if (u && (!last || u > last)) last = u;
-    if (u && (!first || u < first)) first = u;
     if (r.guestId && ids.indexOf(String(r.guestId)) < 0) ids.push(String(r.guestId));
   });
+  var atLast = results.filter(function (r) { return updatedAt(r) === last; }).length;
+  var skip = (last === usedFrom ? usedSkip : 0) + atLast;
   var more = !!(page.pagination && page.pagination.hasMore) || results.length >= PAGE_SIZE;
-  // A full page that all changed at the same moment can't move the cursor: step past it instead.
-  var skip = more && first === last ? Number(st.skip || 0) + results.length : 0;
   var out = [{
     type: "set_state",
-    values: { pending: results.map(compact), page_last: last, page_more: more, skip: skip },
+    values: { pending: results.map(compact), page_last: last || usedFrom, page_skip: last ? skip : usedSkip + results.length, page_more: more },
   }];
   out.push({
     type: "next_request", url: GUESTS_PATH,
-    query: { columns: GUEST_COLUMNS, filters: JSON.stringify({ id: { "@in": ids } }), limit: PAGE_SIZE, skip: null, sort: null, "filter[lastUpdatedAt][gte]": null },
+    query: { columns: GUEST_COLUMNS, filters: JSON.stringify({ _id: { "@in": ids } }), limit: PAGE_SIZE, skip: null, sort: null, "filter[lastUpdatedAt][gte]": null },
   });
   out.push({ type: "log", message: "page " + input.page + ": " + results.length + " changed reservations; fetching their " + ids.length + " guests" });
   return out;
@@ -310,13 +365,13 @@ function fromGuests(input) {
   var list = page.results || [];
   var byId = {};
   (Array.isArray(list) ? list : []).forEach(function (g) {
-    var id = str(g.id || g._id);
+    var id = str(g._id || g.id);
     if (id) byId[id] = g;
   });
   var out = [];
   pending.forEach(function (r) {
     var gid = str(r.guestId);
-    var g = gid && byId[gid] ? guestFrom(byId[gid], gid) : null;
+    var g = gid && byId[gid] ? guestFrom(byId[gid], gid, true) : null;
     var who = whoFor(g && (g.email || g.phone) ? g : null, gid);
     if (!who) {
       out.push({ type: "log", message: "reservation " + r.reservationId + " has no guest; skipped" });
@@ -324,12 +379,12 @@ function fromGuests(input) {
     }
     reservationActions(r, g && (g.email || g.phone) ? g : null, who, updatedAt(r), input).forEach(function (a) { out.push(a); });
   });
-  out.push({ type: "set_state", values: { cursor: st.page_last || st.cursor || null, pending: null, page_last: null } });
+  var cursor = st.page_last || st.cursor || null;
+  var skip = st.page_last ? st.page_skip || 0 : st.skip || 0;
+  out.push({ type: "set_state", values: { cursor: cursor, skip: skip, pending: null, page_last: null, page_skip: null, page_more: null } });
   if (st.page_more) {
-    var q = { limit: PAGE_SIZE, sort: "lastUpdatedAt", "filter[lastUpdatedAt][gte]": st.page_last, skip: st.skip || 0, columns: null, filters: null };
+    var q = { limit: PAGE_SIZE, sort: "lastUpdatedAt", "filter[lastUpdatedAt][gte]": cursor, skip: skip, columns: null, filters: null };
     out.push({ type: "next_request", url: SEARCH_PATH, query: q });
-  } else {
-    out.push({ type: "set_state", values: { skip: 0, page_more: null } });
   }
   out.push({ type: "log", message: "page " + input.page + ": wrote " + pending.length + " reservations" });
   return out;

@@ -579,11 +579,6 @@ impl Scrub {
             other => other.clone(),
         }
     }
-
-    /// Whether a value holds one of the secrets (so it mustn't be saved as it is).
-    pub fn finds_in(&self, v: &Value) -> bool {
-        self.value(v) != *v
-    }
 }
 
 /// A short description of an HTTP status, for error messages (never the app's own text).
