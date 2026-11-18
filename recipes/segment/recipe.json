@@ -41,7 +41,8 @@
       "Product Added",
       "Product Viewed",
       "Signed Up"
-    ]
+    ],
+    "allow_client_sources": false
   },
   "pull": null,
   "redact": [
@@ -56,7 +57,7 @@
     "Pick a random secret and save it as the integration's signing secret.",
     "In Segment, add the Webhooks destination (the classic one, not Webhooks (Actions)) to the source to connect. Under Webhooks, add the webhook URL. Set Shared Secret to the same secret. Leave batching off (Segment signs only the first event of a batch). Turn it on.",
     "Only identify and track calls are used. track calls are recorded only for the event names in settings.events; to record another, add its name to settings.events and to the integration's metrics.",
-    "Connect only sources you trust: anyone with a source's write key can send calls through it, and a browser source's write key is public. Flows that trust these events should be about things a server reported.",
+    "Connect only server-side sources you trust: anyone with a source's write key can send calls through it, and a browser source's write key is public. Calls from Segment's browser and mobile libraries are refused unless you set allow_client_sources to true in the settings; leave it off unless you accept that visitors can send these events.",
     "People this adds are held back from marketing."
   ],
   "flows": []

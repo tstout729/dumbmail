@@ -7,7 +7,7 @@ Checked against Webflow's documentation on 2026-11-17; not yet run against a liv
 - **Resends.** `payload.id` is the message id and the event's `unique_id`.
 - **Who.** `data[settings.email_field]`, or the first field named like "email" that holds an address. Visitors are anonymous, so only the email is set; an existing profile's name never changes.
 - **Consent.** A submission isn't an opt-in; nobody is subscribed. With `settings.consent_field` set to a checkbox's name, whether it was ticked is recorded as `marketing_consent` (`true`, `"true"`, `"on"`, `"yes"` or `"checked"` count as ticked).
-- **Fields.** Only fields named in `settings.copy_fields` are copied onto the event, and the whole `data` object is removed from the stored payload.
+- **Fields.** Only fields named in `settings.copy_fields` are copied onto the event. The stored payload keeps `data` for 30 days (admins only), because the script runs on it; nothing else keeps it.
 
 ## What a live check should look at first
 

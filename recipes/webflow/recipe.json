@@ -33,7 +33,7 @@
   },
   "pull": null,
   "redact": [
-    "payload.data"
+    "payload.schema"
   ],
   "setup": [
     "Create the integration from this recipe and copy its webhook URL.",

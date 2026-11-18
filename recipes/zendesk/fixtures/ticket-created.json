@@ -4,11 +4,9 @@
   "expect": [
     {
       "email": "kai.example@example.com",
-      "first_name": "Kai",
       "keys": {
         "zendesk_ticket": "35436"
       },
-      "last_name": "Example",
       "type": "upsert_profile"
     },
     {

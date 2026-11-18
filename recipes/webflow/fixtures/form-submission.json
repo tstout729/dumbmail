@@ -1,5 +1,5 @@
 {
-  "description": "form_submission: Form Submitted; the message the visitor typed is never stored or copied",
+  "description": "form_submission: Form Submitted; the message the visitor typed isn't copied onto the event",
   "doc": "https://developers.webflow.com/data/reference/webhooks/events/form-submission (documented fields; the page shows no full example, so the values are made up)",
   "expect": [
     {
@@ -69,8 +69,5 @@
       },
       "triggerType": "form_submission"
     }
-  },
-  "sensitive": [
-    "503 555 0177"
-  ]
+  }
 }

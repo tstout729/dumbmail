@@ -693,3 +693,115 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     never_stored(&mut h, &inst, &needles, &[]).await;
     h.cleanup().await;
 }
+
+// ---------- Forms, support, shipping and Segment ----------
+
+#[tokio::test]
+async fn form_submissions_never_subscribe_and_never_rename_anyone() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    // Someone who was already here: a forged form submission with their email mustn't rename them.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "lane.example@example.com", "first_name": "Lane"}))).await;
+    let t = install(&mut h, "typeform", Sign::Base64Prefixed("Typeform-Signature", "sha256="), "typeform-secret-0001", false).await;
+    let w = install(&mut h, "webflow", Sign::Webflow, "webflow-secret-0001", false).await;
+    live_flow(&mut h, "Form Submitted", "We got your form", false).await;
+    t.refused(&h, "form-response.json").await;
+    w.refused(&h, "form-submission.json").await;
+    // A Webflow signature from more than 5 minutes ago is refused.
+    let f = fixture("webflow", "form-submission.json");
+    let body = f["input"]["payload"].to_string();
+    let old = chrono::Utc::now().timestamp_millis() - 400_000;
+    let sig = hex::encode(mac256(b"webflow-secret-0001", format!("{old}:{body}").as_bytes()));
+    let old_s = old.to_string();
+    assert_eq!(h.raw("POST", &w.path(), &[("x-webflow-timestamp", &old_s), ("x-webflow-signature", &sig), ("content-type", "application/json")], &body).await.0, StatusCode::UNAUTHORIZED);
+    h.ok("PATCH", &format!("/api/integrations/{}", t.id), Some(json!({"settings": {"email_field": "", "consent_field": "readable_ref_yes_no"}}))).await;
+    t.post(&h, "form-response.json").await;
+    let (_, again) = t.post_as(&h, &fixture("typeform", "form-response.json")["input"]["payload"].to_string(), &json!({}), &json!({}), &t.secret).await;
+    assert!(again.contains("duplicate"), "{again}");
+    t.post(&h, "form-response-no-email.json").await;
+    h.ok("PATCH", &format!("/api/integrations/{}", w.id), Some(json!({"settings": {"email_field": "Email", "consent_field": "Newsletter", "copy_fields": ["Interest"]}}))).await;
+    w.post(&h, "form-submission.json").await;
+    assert_eq!(events(&h, "Form Submitted").await, 2);
+    assert_eq!(prop(&h, "Form Submitted", "marketing_consent").await, vec!["true", "true"], "the consent box is recorded…");
+    // …but nobody is subscribed, the existing profile kept its name, and the new one is held.
+    let (name, cons): (Option<String>, String) = sqlx::query_as("SELECT first_name, email_consent FROM profiles WHERE email = 'lane.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((name.as_deref(), cons.as_str()), (Some("Lane"), "never_subscribed"));
+    assert_eq!(consent(&h, "ari.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "ari.example@example.com").await);
+    // The marketing flow on Form Submitted reached the existing (unheld) person, not the held one.
+    assert_eq!(sent_to(&h, "We got your form"), vec!["lane.example@example.com"]);
+    never_stored(&mut h, &t, &sensitive("typeform", &["form-response.json"]), &["form-response.json"]).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn zendesk_tickets_keep_only_subject_and_status() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let z = install(&mut h, "zendesk", Sign::Zendesk, "zendesk-secret-0001", false).await;
+    live_flow(&mut h, "Ticket Solved", "How did we do", true).await;
+    z.refused(&h, "ticket-created.json").await;
+    for name in ["ticket-solved.json", "ticket-created.json", "ticket-satisfaction.json", "ticket-solved.json"] {
+        z.post(&h, name).await;
+    }
+    assert_eq!(events(&h, "Ticket Created").await, 1);
+    assert_eq!(events(&h, "Ticket Solved").await, 1, "the resent solve counts once");
+    assert_eq!(prop(&h, "Satisfaction Rated", "rating").await, vec!["Good, I'm satisfied"]);
+    assert_eq!(consent(&h, "kai.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "kai.example@example.com").await);
+    assert_eq!(sent_to(&h, "How did we do"), vec!["kai.example@example.com"]);
+    never_stored(&mut h, &z, &sensitive("zendesk", &["ticket-satisfaction.json"]), &["ticket-satisfaction.json"]).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn aftership_updates_reach_the_buyer_once_per_status() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let a = install(&mut h, "aftership", Sign::Base64("aftership-hmac-sha256"), "aftership-secret-0001", true).await;
+    let ofd = a.flow("out for delivery");
+    h.ok("POST", &format!("/api/flows/{ofd}/status"), Some(json!({"status": "live"}))).await;
+    a.refused(&h, "in-transit.json").await;
+    // Out of order: delivered first, then the earlier updates; each once.
+    for name in ["delivered.json", "in-transit.json", "out-for-delivery.json", "out-for-delivery.json", "pending.json", "exception.json"] {
+        a.post(&h, name).await;
+    }
+    for m in ["Shipment In Transit", "Out For Delivery", "Delivered", "Shipment Exception"] {
+        assert_eq!(events(&h, m).await, 1, "{m}");
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'shop@example.com'").await, 0, "the sender isn't the customer");
+    assert_eq!(consent(&h, "sky.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "sky.example@example.com").await);
+    assert_eq!(sent_to(&h, "Your order arrives today"), vec!["sky.example@example.com"], "a service message, once");
+    never_stored(&mut h, &a, &sensitive("aftership", &["in-transit.json"]), &["in-transit.json"]).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn segment_identify_then_track() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let s = install(&mut h, "segment", Sign::Sha1Hex("X-Signature"), "segment-secret-0001", false).await;
+    live_flow(&mut h, "Order Completed", "Thanks from Segment", true).await;
+    s.refused(&h, "identify.json").await;
+    // The track arrives before the identify that says who the userId is: it waits.
+    s.post(&h, "track-order-completed.json").await;
+    s.post(&h, "identify.json").await;
+    retry_now(&h).await;
+    s.post(&h, "track-unlisted.json").await;
+    s.post(&h, "track-from-browser.json").await;
+    s.post(&h, "page.json").await;
+    let (_, again) = s.post_as(&h, &fixture("segment", "track-order-completed.json")["input"]["payload"].to_string(), &json!({}), &json!({}), &s.secret).await;
+    assert!(again.contains("duplicate"), "{again}");
+    assert_eq!(values(&h, "Order Completed", "achilles.example@example.com").await, vec![39.95]);
+    assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE name = 'Purchased an Item'").await, 0);
+    assert_eq!(consent(&h, "achilles.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "achilles.example@example.com").await);
+    assert_eq!(sent_to(&h, "Thanks from Segment"), vec!["achilles.example@example.com"]);
+    never_stored(&mut h, &s, &sensitive("segment", &["identify.json"]), &["identify.json"]).await;
+    h.cleanup().await;
+}

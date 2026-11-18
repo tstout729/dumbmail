@@ -1,0 +1,29 @@
+{
+  "description": "a track call from analytics.js (a browser library) is refused while allow_client_sources is off",
+  "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
+  "expect": [
+    {
+      "message": "refused a call from analytics.js (a browser or app library); see the recipe's setup",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "context": {
+        "library": {
+          "name": "analytics.js",
+          "version": "2.11.1"
+        }
+      },
+      "event": "Order Completed",
+      "messageId": "ajs-track-0003",
+      "properties": {
+        "revenue": "1000"
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z",
+      "type": "track",
+      "userId": "019mr8mf4r",
+      "version": 1
+    }
+  }
+}

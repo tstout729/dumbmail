@@ -12,8 +12,9 @@
 var COPY = ["choice", "choices", "boolean", "number", "date"];
 
 function answerValue(a) {
-  if (a.type === "choice") return a.choice ? a.choice.label || a.choice.other : undefined;
-  if (a.type === "choices") return a.choices ? (a.choices.labels || []).concat(a.choices.other ? [a.choices.other] : []) : undefined;
+  // Only the form's own labels: an "other" answer is free text.
+  if (a.type === "choice") return a.choice ? a.choice.label : undefined;
+  if (a.type === "choices") return a.choices ? a.choices.labels : undefined;
   return a[a.type];
 }
 

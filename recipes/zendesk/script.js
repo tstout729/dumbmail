@@ -2,7 +2,7 @@
 //
 // Zendesk triggers notify a webhook with a JSON body you paste in (see the setup steps), built from
 // Zendesk's placeholders: the ticket id, subject, status, the requester's email and name, the update
-// time and which trigger fired (event). Ticket Created, Ticket Solved and Satisfaction Rated go on
+// time and which trigger fired (event). Anyone can open a ticket, so only the email is used. Ticket Created, Ticket Solved and Satisfaction Rated go on
 // the requester's profile. Only the subject and status are kept, never the ticket's comments, and a
 // satisfaction comment isn't recorded. Support tickets aren't consent: nobody is subscribed.
 // See README.md for the Zendesk page behind each assumption.
@@ -22,11 +22,7 @@ function handle(input) {
   if (!when) return [{ type: "log", message: "ticket " + p.ticket_id + " has no update time, so it can't be put in order" }];
   var who = { email: p.requester_email };
   var up = { type: "upsert_profile", email: p.requester_email, keys: { zendesk_ticket: String(p.ticket_id) } };
-  if (p.requester_name) {
-    var parts = String(p.requester_name).trim().split(/\s+/);
-    up.first_name = parts.shift();
-    if (parts.length) up.last_name = parts.join(" ");
-  }
+  // Anyone can email support under any name, so the requester's name never changes a profile.
   var props = { ticket_id: String(p.ticket_id), subject: p.subject, status: p.status, via: p.via };
   for (var k in props) if (props[k] === undefined || props[k] === null || props[k] === "") delete props[k];
   var ev = String(p.event || "");

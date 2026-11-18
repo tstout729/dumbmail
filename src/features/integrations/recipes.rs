@@ -188,7 +188,7 @@ mod tests {
                     }
                     json!({"types": types, "tail": arr[arr.len().saturating_sub(2)..]})
                 } else {
-                    out
+                    out.clone()
                 };
                 if write {
                     let mut f = f.clone();
@@ -198,6 +198,21 @@ mod tests {
                     continue;
                 }
                 assert_eq!(got, f["expect"], "{}/{name}: script output differs from the fixture's expect", r.key);
+                // A webhook's (or fetch's) script runs on the stored payload, which has the redact
+                // list applied: removing those fields must not change what the script does.
+                if !pull {
+                    let paths = super::super::redact::paths(&strings(&r.manifest["redact"]));
+                    let body = input["payload"].to_string();
+                    if let Some(kept) = super::super::redact::body(Some("application/json"), &body, &paths) {
+                        let mut redacted = input.clone();
+                        redacted["payload"] = serde_json::from_str(&kept).unwrap();
+                        redacted["body"] = json!(kept);
+                        let again: Value = super::super::sandbox::run_engine(&r.script, &redacted.to_string(), std::time::Duration::from_secs(5))
+                            .map(|t| serde_json::from_str(&t).unwrap())
+                            .unwrap_or_else(|e| panic!("{}/{name} (redacted): {e}", r.key));
+                        assert_eq!(again, out, "{}/{name}: the redact list removes something the script reads", r.key);
+                    }
+                }
             }
         }
     }

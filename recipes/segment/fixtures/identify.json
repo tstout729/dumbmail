@@ -4,11 +4,9 @@
   "expect": [
     {
       "email": "achilles.example@example.com",
-      "first_name": "Achilles",
       "keys": {
         "segment_user_id": "019mr8mf4r"
       },
-      "last_name": "Example",
       "type": "upsert_profile"
     }
   ],
