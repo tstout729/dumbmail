@@ -451,6 +451,16 @@ async fn recharge_subscriptions_wait_for_their_customer_and_remind_before_charge
     assert_eq!(events(&h, "Subscription Cancelled").await, 1, "a resend counts once");
     let order: Vec<String> = sqlx::query_scalar("SELECT m.name FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name IN ('Subscription Cancelled', 'Subscription Reactivated') ORDER BY e.occurred_at, e.id").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(order, vec!["Subscription Cancelled", "Subscription Reactivated"]);
+    // Recharge's documented window is 48 hours: a delivery signed 30 hours ago is accepted.
+    let late = fixture("recharge", "customer-created.json")["input"]["payload"].to_string();
+    let t = chrono::Utc::now().timestamp() - 30 * 3600;
+    let sig = format!("t={t},v1={}", hex::encode(mac256(r.secret.as_bytes(), format!("{t}.{late}").as_bytes())));
+    let (st, _, _) = h.raw("POST", &format!("{}?topic=customer/created", r.path()), &[("X-Recharge-Webhook-Signature", &sig), ("content-type", "application/json")], &late).await;
+    assert_eq!(st, StatusCode::OK, "within Recharge's 48 hours");
+    let t = chrono::Utc::now().timestamp() - 49 * 3600;
+    let sig = format!("t={t},v1={}", hex::encode(mac256(r.secret.as_bytes(), format!("{t}.{late}").as_bytes())));
+    let (st, _, _) = h.raw("POST", &format!("{}?topic=customer/created", r.path()), &[("X-Recharge-Webhook-Signature", &sig), ("content-type", "application/json")], &late).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "older than 48 hours");
     // The topic in the URL is only a hint: relabelled bodies record only what they show.
     for name in ["subscription-relabelled.json", "subscription-created-relabelled-activated.json", "charge-queued-relabelled-paid.json"] {
         r.post(&h, name).await;
@@ -1187,5 +1197,23 @@ async fn webhook_fetches_are_read_only_lookups_of_declared_paths() {
     h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
     h.drain().await;
     assert_eq!(store.seen.lock().unwrap().iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), vec!["/stores/abc123/v3/customers?id%3Ain=32"]);
+    h.cleanup().await;
+}
+
+// ---------- Shared: a new phone number hasn't agreed to texts ----------
+
+#[tokio::test]
+async fn patching_a_profiles_phone_leaves_the_sms_subscription_with_the_old_number() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "pat@example.com", "phone_number": "+15035550100", "sms_consent": "subscribed"}))).await;
+    let id = p["id"].as_str().unwrap().to_string();
+    let same = h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"phone_number": "+1 (503) 555-0100"}))).await;
+    assert_eq!(same["sms_consent"], "subscribed", "the same number, written differently: unchanged");
+    let moved = h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"phone_number": "+15035550199"}))).await;
+    assert_eq!((moved["phone_number"].as_str(), moved["sms_consent"].as_str()), (Some("+15035550199"), Some("never_subscribed")));
+    // Setting the consent in the same request applies it to the new number.
+    let opted = h.ok("PATCH", &format!("/api/profiles/{id}"), Some(json!({"phone_number": "+15035550142", "sms_consent": "subscribed"}))).await;
+    assert_eq!(opted["sms_consent"], "subscribed");
     h.cleanup().await;
 }
