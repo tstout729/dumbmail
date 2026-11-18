@@ -148,7 +148,11 @@ pub(crate) async fn record_click(state: &AppState, id: Uuid, url: &str) -> Respo
         .bind(id)
         .fetch_optional(&state.db)
         .await;
-        let metric = if m.channel == "sms" { "Clicked SMS" } else { "Clicked Email" };
+        let metric = match m.channel.as_str() {
+            "sms" => "Clicked SMS",
+            "whatsapp" => "Clicked WhatsApp",
+            _ => "Clicked Email",
+        };
         let _ = msg_event(state, &m, metric, json!({"url": recorded}), None).await;
         if matches!(first, Ok(Some(_))) && m.channel == "email" {
             let _ = msg_event(state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;

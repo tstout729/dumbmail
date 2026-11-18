@@ -550,12 +550,14 @@ pub async fn wake_waiting_flows(db: &PgPool, profile_id: Uuid, received_at: Date
     Ok(())
 }
 
-/// For the flow step "wait for a reply": did this person send a verified text that counts as a
+/// For the flow step "wait for a reply": did this person send a verified text (or a WhatsApp message,
+/// see `features::whatsapp`) that counts as a
 /// reply (not an opt-out, START, HELP or a text while opted out) between `since` and `until`?
 pub async fn replied_between(db: &PgPool, profile_id: Uuid, since: DateTime<Utc>, until: DateTime<Utc>) -> AppResult<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM sms_inbound WHERE profile_id = $1 AND verified AND provider_received_at >= $2 AND provider_received_at <= $3
-                        AND kind IN ('message', 'keyword', 'confirm'))",
+                        AND kind IN ('message', 'keyword', 'confirm'))
+                OR EXISTS (SELECT 1 FROM whatsapp_inbound WHERE profile_id = $1 AND received_at >= $2 AND received_at <= $3 AND kind IN ('message', 'keyword'))",
     )
     .bind(profile_id)
     .bind(since)

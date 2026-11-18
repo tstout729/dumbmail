@@ -260,7 +260,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "push" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" | "review_request" => vec!["next"],
+            "delay" | "email" | "sms" | "push" | "whatsapp" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" | "review_request" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -287,7 +287,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                     return Err(AppError::bad(format!("delay {} unit must be minutes, hours or days", n.id)));
                 }
             }
-            "email" | "sms" | "push" => need("content")?,
+            "email" | "sms" | "push" | "whatsapp" => need("content")?,
             "review_request" => crate::features::reviews::check_step(&n.id, &n.data)?,
             "condition" => {
                 need("condition")?;
@@ -1303,7 +1303,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     o.remove("_waited");
                 }
             }
-            "email" | "sms" | "push" => {
+            "email" | "sms" | "push" | "whatsapp" => {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
@@ -1315,9 +1315,9 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     };
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
                     let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
-                    // A push step's message id is stored with the run (under its claim) before it's sent, so
+                    // A push or WhatsApp step's message id is stored with the run (under its claim) before it's sent, so
                     // a re-run of the visit finds that message instead of sending a second one.
-                    let message_id = if node.kind == "push" {
+                    let message_id = if node.kind == "push" || node.kind == "whatsapp" {
                         match push_message_id(&state.db, &hold, &node_id, &mut context).await? {
                             Some(id) => Some(id),
                             None => return Ok(()),
