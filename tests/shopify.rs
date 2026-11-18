@@ -1380,7 +1380,7 @@ async fn bulk_children_join_their_own_parent() {
         assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["price"], 11.0, "grouping ignored: {ignore_grouping}");
         assert_eq!(h.ok("GET", "/api/catalog/products/2", None).await["price"], 22.0);
         let v = h.ok("GET", "/api/shopify/import", None).await;
-        assert_eq!(v["products_sync"]["counts"]["skipped_children"], 1, "{v}");
+        assert_eq!(v["products_sync"]["counts"]["reread_parents"], 1, "{v}");
     }
     let (s, _) = h.req("GET", "/api/catalog/products/9", None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
@@ -2660,5 +2660,83 @@ async fn old_work_cannot_write_into_a_new_install() {
     uninstall_in_shopify(&mock);
     assert_eq!(hook(&h, "app/uninstalled", "u3", &json!({})).await, StatusCode::OK);
     assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], false, "the store refused the token: really uninstalled");
+    h.cleanup().await;
+}
+
+fn bulk_order(id: i64, email: &str, refunds: Value) -> Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    json!({"id": format!("gid://shopify/Order/{id}"), "name": format!("#{}", id - 4000), "createdAt": now, "processedAt": now, "updatedAt": now, "cancelledAt": null,
+        "cancelReason": null, "test": false, "email": email, "phone": null, "currencyCode": "USD", "displayFinancialStatus": "PAID", "displayFulfillmentStatus": "UNFULFILLED",
+        "discountCodes": [], "totalPriceSet": {"shopMoney": {"amount": "50.00", "currencyCode": "USD"}}, "subtotalPriceSet": {"shopMoney": {"amount": "50.00"}},
+        "totalDiscountsSet": {"shopMoney": {"amount": "0"}}, "totalShippingPriceSet": {"shopMoney": {"amount": "0"}}, "totalTaxSet": {"shopMoney": {"amount": "0"}},
+        "customer": null, "refunds": refunds, "fulfillments": []})
+}
+
+fn bulk_line(order: i64, line: i64) -> Value {
+    json!({"id": format!("gid://shopify/LineItem/{line}"), "title": "Mug", "variantTitle": null, "sku": "SKU", "vendor": "Acme", "quantity": 1,
+        "originalUnitPriceSet": {"shopMoney": {"amount": "50.00"}}, "totalDiscountSet": {"shopMoney": {"amount": "0.00"}}, "product": {"id": "gid://shopify/Product/101"},
+        "variant": {"id": "gid://shopify/ProductVariant/1011"}, "image": null, "__parentId": format!("gid://shopify/Order/{order}")})
+}
+
+/// Item 4: a child row whose parent was saved from an earlier read isn't dropped: the parent is
+/// read again in full.
+#[tokio::test]
+async fn bulk_import_never_drops_a_line() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let prod = |p: i64| json!({"id": format!("gid://shopify/Product/{p}"), "title": format!("P{p}"), "handle": format!("p{p}"), "status": "ACTIVE", "publishedAt": "2025-01-01T00:00:00Z", "tags": [], "descriptionHtml": "x".repeat(120)});
+    let variant = json!({"id": "gid://shopify/ProductVariant/11", "title": "Default Title", "price": "11.00", "inventoryQuantity": 1, "availableForSale": true,
+        "inventoryItem": {"id": "gid://shopify/InventoryItem/19", "tracked": true}, "__parentId": "gid://shopify/Product/1"});
+    let mut full = product(1, "P1", 1, "11.00");
+    full["id"] = json!("gid://shopify/Product/1");
+    {
+        let mut m = mock.lock().unwrap();
+        // Ungrouped, and small reads: product 1 is saved before its variant arrives.
+        m.ignore_grouping = true;
+        m.max_chunk = 160;
+        m.files.insert("products".into(), jsonl(&[prod(1), prod(2), prod(3), variant]));
+        m.products.insert(1, full);
+        let o5001 = bulk_order(5001, "ann@example.com", json!([]));
+        let mut o = o5001.clone();
+        o["lineItems"] = json!({"nodes": [{"id": "gid://shopify/LineItem/71", "title": "Mug", "variantTitle": null, "sku": "SKU", "vendor": "Acme", "quantity": 1,
+            "originalUnitPriceSet": {"shopMoney": {"amount": "50.00"}}, "totalDiscountSet": {"shopMoney": {"amount": "0.00"}}, "product": {"id": "gid://shopify/Product/101"},
+            "variant": {"id": "gid://shopify/ProductVariant/1011"}, "image": null}]});
+        m.orders.insert(5001, o);
+        m.files.insert("orders".into(), jsonl(&[o5001, bulk_order(5002, "bob@example.com", json!([])), bulk_order(5003, "cat@example.com", json!([])), bulk_line(5001, 71)]));
+    }
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    for _ in 0..3 {
+        h.fast_forward().await;
+    }
+    assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["price"], 11.0, "the variant that came after its product was saved isn't lost");
+    assert!(event(&h, "Ordered Product", "order:5001:71").await.is_some(), "the line that came after its order was saved isn't lost");
+    h.cleanup().await;
+}
+
+/// Item 5: refunds the history import finds are history: no live refund flow starts.
+#[tokio::test]
+async fn history_refunds_are_quiet() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    live_flow(&mut h, "Refunded Order").await;
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let mut m = mock.lock().unwrap();
+        m.files.insert("orders".into(), jsonl(&[bulk_order(5001, "ann@example.com", json!([{"id": "gid://shopify/Refund/9"}])), bulk_line(5001, 1)]));
+        // A recent refund, discovered only by the import.
+        m.orders.insert(5001, gql_order(5001, &now, vec![refund(9, &now, &[("SUCCESS", "20.00")], &[])]));
+    }
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    for _ in 0..3 {
+        h.fast_forward().await;
+    }
+    assert_eq!(value(&h, "Refunded Order", "refund:9").await, Some(20.0));
+    assert_eq!(flow_runs(&h).await, 0, "the import's refund starts no flow");
     h.cleanup().await;
 }

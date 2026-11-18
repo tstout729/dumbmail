@@ -374,16 +374,21 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
 /// Group result lines under their parents. With `groupObjects` Shopify puts each object's children
 /// right after it, but every child is still checked: it joins the parent its `__parentId` names
 /// (looked up by id among the records in this read), never simply the record before it. A child
-/// whose parent isn't in this read is counted and left out.
-pub fn group(lines: Vec<(usize, Value)>) -> (Vec<(usize, Value, Vec<Value>)>, u64) {
+/// whose parent isn't in this read (its parent was saved from an earlier read) is returned by its
+/// parent's id: that parent is read again in full by id, so no line is lost.
+pub fn group(lines: Vec<(usize, Value)>) -> (Vec<(usize, Value, Vec<Value>)>, Vec<String>) {
     let mut groups: Vec<(usize, Value, Vec<Value>)> = Vec::new();
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut orphans = 0;
+    let mut orphans: Vec<String> = Vec::new();
     for (off, v) in lines {
         match v.get("__parentId").and_then(|p| p.as_str()).map(String::from) {
             Some(parent) => match index.get(&parent) {
                 Some(&g) => groups[g].2.push(v),
-                None => orphans += 1,
+                None => {
+                    if !orphans.contains(&parent) {
+                        orphans.push(parent);
+                    }
+                }
             },
             None => {
                 if let Some(id) = v["id"].as_str() {
@@ -420,8 +425,20 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
     // Group: a top-level line (no __parentId) and its children. The last group may continue in the
     // next chunk unless this is the end of the file.
     let (mut groups, orphans) = group(lines);
-    if orphans > 0 {
-        bump(&mut i.counts, "skipped_children", orphans);
+    if !orphans.is_empty() {
+        // Their parents were saved from an earlier read: read each again in full, by id (bounded:
+        // at most one queued read per parent).
+        bump(&mut i.counts, "reread_parents", orphans.len() as u64);
+        let kind = match i.phase.as_str() {
+            "products" => Some("product"),
+            "orders" => Some(orders::FULL_HISTORY),
+            _ => None,
+        };
+        for id in orphans.iter().filter_map(|p| super::customers::num_id(&Value::String(p.clone()))) {
+            if let Some(k) = kind {
+                products::queue_refresh(&state.db, shop.account_id, k, id).await?;
+            }
+        }
     }
     let used = if at_end {
         complete_end

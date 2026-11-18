@@ -296,6 +296,37 @@ pub const REFUNDS_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on
 /// Orders read per refunds query.
 pub const REFUNDS_PER_QUERY: usize = 5;
 
+/// Refresh-queue kinds for orders: refunds read after a live webhook ("order"), refunds read for an
+/// order the history import found (quiet), and an order read again in full for the history import
+/// (a line of it arrived after the order itself was saved; quiet).
+pub const REFUNDS_LIVE: &str = "order";
+pub const REFUNDS_HISTORY: &str = "order_history";
+pub const FULL_HISTORY: &str = "order_full";
+
+/// An order read again in full, in the same shape the bulk import reads (lines included).
+pub const ORDER_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Order { id name createdAt processedAt updatedAt cancelledAt cancelReason test email phone currencyCode
+    displayFinancialStatus displayFulfillmentStatus discountCodes
+    totalPriceSet { shopMoney { amount currencyCode } } subtotalPriceSet { shopMoney { amount } } totalDiscountsSet { shopMoney { amount } }
+    totalShippingPriceSet { shopMoney { amount } } totalTaxSet { shopMoney { amount } }
+    customer { id firstName lastName }
+    refunds { id }
+    fulfillments { id createdAt status }
+    lineItems(first: 250) { nodes { id title variantTitle sku vendor quantity originalUnitPriceSet { shopMoney { amount } }
+        totalDiscountSet { shopMoney { amount } } product { id } variant { id } image { url } } } } } }";
+
+/// Read orders again in full and record them (history: quiet).
+pub async fn refresh_full(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> Result<(), ApiError> {
+    let gids: Vec<String> = ids.iter().map(|i| gid("Order", *i)).collect();
+    let data = client::graphql(cx.state, shop, ORDER_QUERY, json!({"ids": gids})).await?;
+    for n in data["nodes"].as_array().into_iter().flatten() {
+        let lines: Vec<Value> = n["lineItems"]["nodes"].as_array().cloned().unwrap_or_default();
+        if let Some(o) = Order::from_graphql(n, &lines) {
+            apply(cx, &o).await.map_err(|_| ApiError::Network("database"))?;
+        }
+    }
+    Ok(())
+}
+
 /// An email and phone, either the event's own or its nested customer record's.
 #[derive(Clone, Copy)]
 pub struct Contact<'a> {
@@ -616,7 +647,9 @@ async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Cancelled Order", unique_id: format!("order:{}", o.id), properties: Value::Object(p), value: Some(to_f64(o.total)), at }, quiet, None).await?;
     }
     if o.has_refunds {
-        super::products::queue_refresh(db, cx.account_id, "order", o.id).await?;
+        // Found by the history import: its refunds are history too (no refund flows start).
+        let kind = if cx.quiet { REFUNDS_HISTORY } else { REFUNDS_LIVE };
+        super::products::queue_refresh(db, cx.account_id, kind, o.id).await?;
     }
     redeem(db, cx.account_id, cx.shop, o).await?;
     if !cx.quiet {
@@ -629,7 +662,7 @@ async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
 /// transactions in the buyer's currency, so it isn't used for amounts).
 pub async fn apply_refund(cx: &mut Ctx<'_>, body: &Value) -> anyhow::Result<()> {
     if let Some(order_id) = num_id(&body["order_id"]) {
-        super::products::queue_refresh(&cx.state.db, cx.account_id, "order", order_id).await?;
+        super::products::queue_refresh(&cx.state.db, cx.account_id, REFUNDS_LIVE, order_id).await?;
     }
     Ok(())
 }

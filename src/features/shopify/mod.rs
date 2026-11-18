@@ -164,15 +164,19 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
         let kind = batch[0].0.clone();
         let per = match kind.as_str() {
             "product" => products::PER_QUERY,
-            "order" => orders::REFUNDS_PER_QUERY,
+            orders::REFUNDS_LIVE | orders::REFUNDS_HISTORY | orders::FULL_HISTORY => orders::REFUNDS_PER_QUERY,
             _ => 50,
         };
         let ids: Vec<i64> = batch.iter().filter(|(k, _)| *k == kind).map(|(_, i)| *i).take(per).collect();
+        // What the history import queued is history: recorded quietly (no flows start).
+        cx.quiet = kind == orders::REFUNDS_HISTORY || kind == orders::FULL_HISTORY;
         let r = match kind.as_str() {
             "product" => products::refresh(state, &s, &ids).await,
-            "order" => orders::refresh_refunds(&mut cx, &s, &ids).await,
+            orders::REFUNDS_LIVE | orders::REFUNDS_HISTORY => orders::refresh_refunds(&mut cx, &s, &ids).await,
+            orders::FULL_HISTORY => orders::refresh_full(&mut cx, &s, &ids).await,
             _ => customers::refresh(state, &s, &ids).await,
         };
+        cx.quiet = false;
         match r {
             Ok(()) => {
                 sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1 AND kind = $2 AND shopify_id = ANY($3)").bind(account_id).bind(&kind).bind(&ids).execute(&state.db).await?;
