@@ -993,5 +993,49 @@ async fn single_writes_are_audited_and_type_edits_keep_stored_values_valid() {
     h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields, "convert": true}))).await;
     let nights: Vec<(String, Option<Value>)> = sqlx::query_as("SELECT external_id, fields->'nights' FROM objects ORDER BY external_id").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(nights, vec![("E2".to_string(), Some(json!(3))), ("E3".to_string(), None)]);
+    // A sensitive field's stored values aren't described, not even by count.
+    let mut fields: Vec<Value> = h.ok("GET", "/api/object-types/stay", None).await["fields"].as_array().unwrap().clone();
+    fields.push(json!({"key": "code", "type": "text", "sensitive": true}));
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone()}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "E2", "fields": {"code": "abc"}}))).await;
+    fields.last_mut().unwrap()["type"] = json!("number");
+    let (s, e) = h.req("PATCH", "/api/object-types/stay", Some(json!({"fields": fields}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let msg = e["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("sensitive") && !msg.chars().any(|c| c.is_ascii_digit()), "{msg}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn daylight_saving_moments_are_pinned() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "check_in", "type": "date"}]}))).await;
+    let at = |hour: i64| json!({"type": "object_date", "object_type": "stay", "field": "check_in", "offset_days": -2, "hour": hour});
+    h.ok("POST", "/api/flows", Some(email_flow("Two", at(2), "x"))).await;
+    h.ok("POST", "/api/flows", Some(email_flow("One", at(1), "x"))).await;
+    // 8 March 2026 (Los Angeles springs forward at 02:00) and 1 November 2026 (01:00 happens twice).
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "spring", "fields": {"check_in": "2026-03-10"}}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "fall", "fields": {"check_in": "2026-11-03"}}))).await;
+    dumbmail::flows::event_date_tick(&h.state, 1000).await.unwrap();
+    let due = |obj: &str, flow: &str| {
+        let db = h.state.db.clone();
+        let (obj, flow) = (obj.to_string(), flow.to_string());
+        async move {
+            sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT f.due_at FROM flow_object_date_fires f JOIN objects o ON o.id = f.object_id JOIN flows fl ON fl.id = f.flow_id WHERE o.external_id = $1 AND fl.name = $2",
+            )
+            .bind(obj)
+            .bind(flow)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let utc = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+    // 02:00 doesn't exist that day: it fires at 03:00 PDT.
+    assert_eq!(due("spring", "Two").await, vec![utc("2026-03-08T10:00:00Z")]);
+    // 01:00 happens twice: it fires once, at the second one (01:00 PST).
+    assert_eq!(due("fall", "One").await, vec![utc("2026-11-01T09:00:00Z")]);
     h.cleanup().await;
 }

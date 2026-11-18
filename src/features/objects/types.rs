@@ -380,6 +380,9 @@ pub const MAX_CONVERT: i64 = 100_000;
 /// which case values that fit are put in the new form and the rest removed. In the edit's
 /// transaction, under the type's row lock.
 async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef], convert: bool) -> AppResult<u64> {
+    // One bound for the whole edit, across fields, and a deadline for its statements.
+    sqlx::query("SET LOCAL statement_timeout = '30s'").execute(&mut *conn).await?;
+    let mut checked: i64 = 0;
     let mut converted = 0;
     for f in new {
         let Some(old) = t.field(&f.key) else { continue };
@@ -387,41 +390,57 @@ async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef],
             continue;
         }
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE type_id = $1 AND fields ? $2").bind(t.id).bind(&f.key).fetch_one(&mut *conn).await?;
-        if n > MAX_CONVERT {
-            return Err(AppError::bad(format!("{} objects have {}: too many to check in one edit; add a new field instead", n, f.key)));
+        checked += n;
+        if checked > MAX_CONVERT {
+            return Err(AppError::bad(format!("this edit would check more than {MAX_CONVERT} stored values; change fewer fields at once, or add a new field instead")));
         }
         let rows: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, fields->$2 FROM objects WHERE type_id = $1 AND fields ? $2").bind(t.id).bind(&f.key).fetch_all(&mut *conn).await?;
         let mut misfit = 0u64;
-        let mut changes: Vec<(Uuid, Option<Value>)> = Vec::new();
+        let mut ids: Vec<Uuid> = Vec::new();
+        let mut values: Vec<Option<Value>> = Vec::new();
         for (id, v) in rows {
             match normalize(f, &v) {
                 Ok(nv) if nv == v => {}
-                Ok(nv) => changes.push((id, Some(nv))),
+                Ok(nv) => {
+                    ids.push(id);
+                    values.push(Some(nv));
+                }
                 Err(_) => {
                     misfit += 1;
-                    changes.push((id, None));
+                    ids.push(id);
+                    values.push(None);
                 }
             }
         }
-        if changes.is_empty() {
+        if ids.is_empty() {
             continue;
         }
         if !convert {
+            // A sensitive field's values aren't described, not even by count.
+            if old.sensitive || f.sensitive {
+                return Err(AppError::Conflict(format!("Stored values of {} (a sensitive field) don't all fit its new type. Save with convert to convert those that fit and remove the rest.", f.key)));
+            }
+            let n = ids.len();
             return Err(AppError::Conflict(format!(
-                "{} {} {} a value in {} that a {} field holds differently ({misfit} can't be kept). Save with convert to convert those that fit and remove the rest.",
-                changes.len(),
-                if changes.len() == 1 { t.name.to_lowercase() } else { t.plural.to_lowercase() },
-                if changes.len() == 1 { "has" } else { "have" },
+                "{n} {} {} a value in {} that a {} field holds differently ({misfit} can't be kept). Save with convert to convert those that fit and remove the rest.",
+                if n == 1 { t.name.to_lowercase() } else { t.plural.to_lowercase() },
+                if n == 1 { "has" } else { "have" },
                 f.key,
                 serde_json::to_value(f.kind).ok().and_then(|k| k.as_str().map(String::from)).unwrap_or_default()
             )));
         }
-        for (id, nv) in changes {
-            match nv {
-                Some(v) => sqlx::query("UPDATE objects SET fields = jsonb_set(fields, ARRAY[$2], $3) WHERE id = $1").bind(id).bind(&f.key).bind(v).execute(&mut *conn).await?,
-                None => sqlx::query("UPDATE objects SET fields = fields - $2 WHERE id = $1").bind(id).bind(&f.key).execute(&mut *conn).await?,
-            };
-            converted += 1;
+        for (ids, values) in ids.chunks(5000).zip(values.chunks(5000)) {
+            converted += sqlx::query(
+                "UPDATE objects o SET fields = CASE WHEN x.v IS NULL THEN o.fields - $3 ELSE jsonb_set(o.fields, ARRAY[$3], x.v) END
+                 FROM unnest($1::uuid[], $2::jsonb[]) AS x(id, v) WHERE o.id = x.id AND o.type_id = $4",
+            )
+            .bind(ids)
+            .bind(values)
+            .bind(&f.key)
+            .bind(t.id)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
         }
     }
     Ok(converted)

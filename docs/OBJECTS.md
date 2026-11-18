@@ -106,7 +106,10 @@ e.g. only `guest`), and the run remembers its object.
 - `offset_days` (−365 to 365) with `hour` (0-23, default 9) in the account's time zone, or
   `offset_hours` (−8760 to 8760) on its own for a moment N hours before or after (a plain date's
   moment is its local midnight). Day boundaries and daylight saving follow the account's time zone,
-  and pending sends move if the account's time zone changes.
+  and pending sends move if the account's time zone changes. On the night clocks go forward, an
+  hour that doesn't exist (02:00 in Los Angeles on 8 March 2026) fires an hour later (03:00); on the
+  night they go back, the repeated hour (01:00 on 1 November 2026) fires once, at the second one
+  (01:00 standard time).
 - Each object starts the flow once for each moment it is due: a guest with two reservations gets
   two runs. If the date moves, the old moment is dropped and the new one scheduled; a moment that
   already sent never sends again.
