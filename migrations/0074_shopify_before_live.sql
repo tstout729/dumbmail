@@ -13,3 +13,15 @@ ALTER TABLE shopify_products ADD COLUMN generation integer;
 
 -- The install a discount code was made for: a code is reused only for that store and install.
 ALTER TABLE shopify_discount_codes ADD COLUMN generation integer;
+
+-- People a Shopify history import wrote about. Segment-triggered flows don't start for them when they
+-- enter a segment (that entry came from history), checked after each refresh, so it holds whenever
+-- the history was written; real entries by anyone else start flows as usual. Cleared once every
+-- segment of the account has been refreshed since (see `features::shopify::events`).
+CREATE TABLE shopify_history_touched (
+    account_id  uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    profile_id  uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    touched_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, profile_id)
+);
+CREATE INDEX shopify_history_touched_at_idx ON shopify_history_touched(account_id, touched_at);

@@ -221,6 +221,7 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
 async fn cleanup(state: &AppState) -> anyhow::Result<()> {
     webhooks::prune(&state.db).await?;
     privacy::prune(&state.db).await?;
+    events::prune_history(&state.db).await?;
     Ok(())
 }
 
@@ -271,10 +272,6 @@ impl Feature for Module {
             },
             "shopify_privacy" => match account() {
                 Ok(a) => privacy::run(state, a).await,
-                Err(e) => Err(e),
-            },
-            events::JOB_REBASELINE => match account() {
-                Ok(a) => events::rebaseline(state, a).await,
                 Err(e) => Err(e),
             },
             "shopify_cleanup" => cleanup(state).await,

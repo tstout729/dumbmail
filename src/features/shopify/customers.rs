@@ -301,15 +301,16 @@ async fn apply_sms_state(db: &mut sqlx::PgConnection, id: Uuid, phone: &str, sta
 /// Save a Shopify customer: find or make the right profile, apply consent for its exact address and
 /// number, fill in details, and remember the link. Returns the profile it's linked to. A customer
 /// erased by a privacy request, or a snapshot older than the one already saved, changes nothing.
-pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, c: &Customer) -> anyhow::Result<Option<Uuid>> {
+/// `history`: written by a history import (segment-triggered flows don't start for this person).
+pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, c: &Customer, history: bool) -> anyhow::Result<Option<Uuid>> {
     // Written inside the fence: not into a newer install, and not after a privacy request erased it.
     let Some(fence) = super::fence::open(db, account_id, shop, generation, Some(c.id), None).await? else { return Ok(None) };
-    let r = apply_inner(db, account_id, shop, c).await?;
+    let r = apply_inner(db, account_id, shop, c, history).await?;
     fence.done().await?;
     Ok(r)
 }
 
-async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> anyhow::Result<Option<Uuid>> {
+async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, history: bool) -> anyhow::Result<Option<Uuid>> {
     let email = c.email.as_deref().and_then(normalize_email);
     let phone = c.phone.as_deref().and_then(normalize_phone);
     let saved: Option<(Option<Uuid>, Option<DateTime<Utc>>)> = sqlx::query_as("SELECT profile_id, shopify_updated_at FROM shopify_customers WHERE account_id = $1 AND customer_id = $2")
@@ -350,6 +351,10 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) ->
         },
     };
     let Some(main) = main else { return Ok(None) };
+    if history {
+        // Before anything about them changes: their segment entries from this are history.
+        super::events::touch_history(db, account_id, &[main.id]).await?;
+    }
     note_profile(db, account_id, shop, Some(c.id), main.id).await?;
     if let Some(e) = &email {
         // The consent time and the profile's consent commit together: a crash between them can't
@@ -369,6 +374,9 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) ->
             None => create(db, account_id, shop, None, Some(ph), first, last).await?.map(|p| p.id),
         };
         if let Some(owner) = sms_owner {
+            if history {
+                super::events::touch_history(db, account_id, &[owner]).await?;
+            }
             note_profile(db, account_id, shop, Some(c.id), owner).await?;
             let mut tx = db.begin().await?;
             if newer_consent(&mut tx, account_id, "sms", ph, c.sms_state.as_deref(), parse_time(c.sms_updated_at.as_deref())).await? {
@@ -516,7 +524,7 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
     // Ids Shopify doesn't return (null) were deleted: nothing to read.
     for n in data["nodes"].as_array().into_iter().flatten() {
         if let Some(c) = Customer::from_graphql(n) {
-            apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c).await.map_err(|_| ApiError::Network("database"))?;
+            apply(&state.db, shop.account_id, &shop.shop_domain, shop.generation, &c, false).await.map_err(|_| ApiError::Network("database"))?;
         }
     }
     Ok(())

@@ -127,10 +127,10 @@
     version: VERSION
   };
 
-  if (CONSENT && (CONSENT.analytics === false || CONSENT.withdrawn)) api.stop();
-
   // Events from visitors the browser doesn't know yet wait here (for up to 3 days) and are sent once they're recognized.
   var BUFFER = "pl_buffer";
+  // Consent withdrawn (or never given for analytics) before the script started: stop now.
+  if (CONSENT && (CONSENT.analytics === false || CONSENT.withdrawn)) api.stop();
   function buffer(ev) {
     if (STOPPED) return;
     var b = (store.get(BUFFER) || []).filter(function (e) { return e && now() - e.time < 3 * 86400000; });

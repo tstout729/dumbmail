@@ -1279,9 +1279,8 @@ async fn history_import() {
     assert_eq!(flow_runs(&h).await, 0, "imported history starts no flows, metric or segment");
     let members: i32 = sqlx::query_scalar("SELECT member_count FROM segments").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(members, 2, "but people are in the segment");
-    // The window is closed once the import is done: nothing is absorbed any more.
-    assert!(!dumbmail::features::shopify::events::history_open(&h.state.db, account_id(&h).await).await.unwrap());
-    assert_eq!(count(&h, "SELECT count(*) FROM segments WHERE absorb_entries").await, 0, "segments re-baselined and unmarked");
+    // Nothing is left marked to absorb other people's entries.
+    assert_eq!(count(&h, "SELECT count(*) FROM segments WHERE absorb_entries").await, 0);
 
     assert_eq!(consent(&h, "ann@example.com").await.0, "subscribed");
     assert_eq!(consent(&h, "bob@example.com").await.0, "never_subscribed");
@@ -2154,10 +2153,10 @@ async fn shopify_metrics_are_server_only_per_account() {
     h.cleanup().await;
 }
 
-/// Item 4: segments absorb entries only while a page of history is being written; a real order
-/// while an import is paused starts segment-triggered flows.
+/// Wiring item 4 and item 12: segment entries caused by history never start flows, whenever the
+/// history was written; real entries start flows while an import runs, is paused, or just finished.
 #[tokio::test]
-async fn history_window_only_while_history_is_written() {
+async fn history_entries_never_start_flows_and_real_ones_always_do() {
     let (mock, base) = mock_shopify().await;
     let mut h = shopify_harness!(base);
     h.signup().await;
@@ -2167,29 +2166,37 @@ async fn history_window_only_while_history_is_written() {
     h.ok("POST", "/api/flows", Some(json!({"name": "Welcome buyers", "trigger": {"type": "segment", "segment_id": seg_id.to_string()}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
     sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
     dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
-    // An import is started and paused before it writes anything: no window.
-    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")]));
+    // History: an order the import brings in. Its buyer enters the segment, quietly, whenever the
+    // refresh runs (here: after the import finished).
+    mock.lock().unwrap().files.insert("orders".into(), jsonl(&[bulk_order(5001, "old@example.com", json!([])), bulk_line(5001, 1)]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    assert_eq!(flow_runs(&h).await, 0, "history starts no flow");
+    // A real order right after the import finished starts the flow (nothing is absorbed).
+    hook(&h, "orders/create", "o1", &order_body(5002, 7, "live@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    assert_eq!(flow_runs(&h).await, 1, "a real entry after the import starts the flow");
+    // An import started and paused: a real order meanwhile still starts the flow.
     h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
     h.ok("POST", "/api/shopify/import/pause", None).await;
-    assert!(!dumbmail::features::shopify::events::history_open(&h.state.db, account_id(&h).await).await.unwrap());
-    // A real order now: its buyer enters the segment and the flow starts.
-    hook(&h, "orders/create", "o1", &order_body(5001, 7, "live@example.com", chrono::Utc::now())).await;
+    hook(&h, "orders/create", "o2", &order_body(5003, 8, "during@example.com", chrono::Utc::now())).await;
     h.drain().await;
     dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
-    assert_eq!(flow_runs(&h).await, 1, "a paused import doesn't swallow real entries");
-    // While a page is being written, entries are absorbed (and the segment re-baselined after).
-    dumbmail::features::shopify::events::open_history(&h.state.db, sqlx::query_scalar("SELECT id FROM shopify_imports WHERE kind = 'history' ORDER BY started_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap(), account_id(&h).await).await.unwrap();
-    hook(&h, "orders/create", "o2", &order_body(5002, 8, "during@example.com", chrono::Utc::now())).await;
-    h.drain().await;
-    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
-    assert_eq!(flow_runs(&h).await, 1, "absorbed while history is being written");
+    assert_eq!(flow_runs(&h).await, 2, "a real entry during a paused import starts the flow");
+    // The race the old flag missed: a refresh that read "nothing to absorb" before a history page
+    // committed, and saw that page's buyer as a new member. Here: the history is in, nothing is
+    // flagged to absorb any more, and the buyer reaches a live refresh as a new member.
     h.ok("POST", "/api/shopify/import/cancel", None).await;
-    h.drain().await;
-    assert_eq!(count(&h, "SELECT count(*) FROM segments WHERE absorb_entries").await, 0);
-    hook(&h, "orders/create", "o3", &order_body(5003, 9, "after@example.com", chrono::Utc::now())).await;
-    h.drain().await;
+    mock.lock().unwrap().files.insert("orders".into(), jsonl(&[bulk_order(5004, "late@example.com", json!([])), bulk_line(5004, 4)]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    settle_imports(&h).await;
+    let late = profile_id_of(&h, "late@example.com").await.unwrap();
+    sqlx::query("DELETE FROM segment_members WHERE profile_id = $1").bind(late).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE segments SET absorb_entries = false").execute(&h.state.db).await.unwrap();
     dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
-    assert_eq!(flow_runs(&h).await, 2, "closed on cancel: real entries start flows again");
+    assert_eq!(flow_runs(&h).await, 2, "history's buyer starts no flow, however the refresh and the import interleaved");
     h.cleanup().await;
 }
 
@@ -2642,7 +2649,7 @@ async fn old_work_cannot_write_into_a_new_install() {
     let answer = dumbmail::features::shopify::customers::Customer::from_graphql(&customer(9, Some("inflight@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")).unwrap();
     h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
     connect(&mut h).await;
-    let written = dumbmail::features::shopify::customers::apply(&h.state.db, acct, SHOP, gen1, &answer).await.unwrap();
+    let written = dumbmail::features::shopify::customers::apply(&h.state.db, acct, SHOP, gen1, &answer, false).await.unwrap();
     assert!(written.is_none() && profile_id_of(&h, "inflight@example.com").await.is_none(), "install 1's answer wrote nothing");
     // A worker job queued for install 1 does nothing for install 2.
     mock.lock().unwrap().customers.insert(9, customer(9, Some("inflight@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
@@ -2970,7 +2977,8 @@ async fn storefront_consent_is_respected() {
     assert_eq!(a["posts"], json!([]), "marketing withdrawn: nothing more is sent: {a}");
     assert_eq!(a["profile"], Value::Null);
     // B: analytics withdrawn after the snippet was added but before it started.
-    let b = run(both, "listeners.visitorConsentCollected({ detail: { analyticsAllowed: false, marketingAllowed: false } }); start();
+    let b = run(both, "ls.setItem('pl_buffer', JSON.stringify([{ metric: 'Held', time: Date.now() }])); listeners.visitorConsentCollected({ detail: { analyticsAllowed: false, marketingAllowed: false } }); start();
+        if (ls.getItem('pl_buffer') !== null) posts.push('buffer kept');
         window.dumbmail.identify({ email: 'ann@example.com' }); window.dumbmail.track('Viewed', {});");
     assert_eq!(b["added"], 1);
     assert_eq!(b["posts"], json!([]), "the withdrawal before start-up is honoured: {b}");

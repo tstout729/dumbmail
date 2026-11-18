@@ -554,6 +554,10 @@ async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         return Ok(());
     };
     let profile_id = buyer.profile_id;
+    if cx.quiet {
+        // History: recorded before the order is, so its segment entries never start flows.
+        super::events::touch_history(db, cx.account_id, &[profile_id]).await?;
+    }
     // No email or phone on the order: kept for the record, but nothing is sent because of it.
     let quiet = cx.quiet || buyer.no_contact;
     let pids: Vec<String> = o.lines.iter().filter_map(|l| l.product_id.map(|p| p.to_string())).collect();
@@ -779,6 +783,9 @@ async fn set_refunds_inner(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<D
         .await?;
     // Not seen yet (or only the browser's copy): the order webhook will bring it, and read refunds again.
     let Some((event_id, profile_id, mut props)) = row.filter(|r| !r.2["shopify_state"].is_null()) else { return Ok(()) };
+    if cx.quiet {
+        super::events::touch_history(db, cx.account_id, &[profile_id]).await?;
+    }
     let st = &mut props["shopify_state"];
     if let (Some(read), Some(this)) = (parse_time(st["refunds_read_at"].as_str()), updated_at) {
         if this < read {

@@ -337,7 +337,6 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
         .execute(&mut *tx)
         .await
         .map_err(|_| "failed")?;
-    super::events::close_history(&mut tx, account_id).await.map_err(|_| "failed")?;
     // The metrics this app records come only from Shopify's servers from now on: the browser
     // endpoint refuses them for this account (they stay that way after a disconnect).
     let names: Vec<String> = super::SERVER_METRICS.iter().map(|m| m.to_string()).collect();
@@ -627,7 +626,6 @@ pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generatio
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
-    super::events::close_history(&mut tx, account_id).await?;
     sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1").bind(account_id).execute(&mut *tx).await?;
     // Unprocessed deliveries: privacy requests still get done; the rest is dropped with its data.
     sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact', 'app/uninstalled')")
