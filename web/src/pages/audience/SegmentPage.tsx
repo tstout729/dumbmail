@@ -1,15 +1,16 @@
 import { InlineTitle } from "../../components/ui/InlineTitle";
 import { useState } from "react";
 import { Link, useBlocker, useNavigate, useParams } from "react-router";
-import { Loader2, Trash2, Users } from "lucide-react";
+import { Loader2, Megaphone, Trash2, Users } from "lucide-react";
 import type { Segment, SegmentDefinition } from "../../api";
 import { useCreateSegment, useDeleteSegment, useSegment, useSegmentPreview, useUpdateSegment } from "../../api";
 import { ConditionBuilder } from "../../components/segments/ConditionBuilder";
 import { emptyDefinition, isDefinitionComplete } from "../../components/segments/conditions";
-import { Badge, Button, Card, ConfirmDialog, Page, PageHeader, Skeleton, StatusBadge, cx } from "../../components/ui";
+import { Badge, Button, ButtonLink, Card, ConfirmDialog, Page, PageHeader, Skeleton, StatusBadge, cx } from "../../components/ui";
 import { formatNumber, formatRelative, fullName } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
 import { toast } from "../../lib/toast";
+import { useCan } from "../../features/team/api";
 
 export function SegmentPage() {
   const { id = "" } = useParams();
@@ -40,6 +41,7 @@ function ExistingSegment({ id }: { id: string }) {
 
 function SegmentEditor({ segment }: { segment: Segment | null }) {
   const navigate = useNavigate();
+  const canSyncAds = useCan("ad_audiences.manage");
   const create = useCreateSegment();
   const update = useUpdateSegment(segment?.id ?? "");
   const remove = useDeleteSegment();
@@ -104,6 +106,11 @@ function SegmentEditor({ segment }: { segment: Segment | null }) {
               <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
                 Delete
               </Button>
+            ) : null}
+            {segment && canSyncAds ? (
+              <ButtonLink to={`/settings/ad-audiences?new=segment:${segment.id}`} icon={<Megaphone className="size-3.5" />}>
+                Sync to ads
+              </ButtonLink>
             ) : null}
             <Button variant="primary" disabled={!canSave || !dirty} loading={saving} onClick={onSave}>
               {segment ? (dirty ? "Save" : "Saved") : "Create segment"}
