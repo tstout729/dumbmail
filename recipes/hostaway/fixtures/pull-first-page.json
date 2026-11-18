@@ -202,10 +202,82 @@
       "type": "log"
     },
     {
+      "email": "old@example.com",
+      "first_name": "Robin",
+      "keys": {
+        "hostaway_reservation": "9"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "9",
+        "status": "new"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "currency": "USD",
+        "reservation_id": "9"
+      },
+      "time": "2026-11-10T10:41:10.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:total",
+      "value": 867
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "old@example.com"
+      },
+      "properties": {
+        "channel": "airbnb",
+        "check_in": "2026-12-15",
+        "check_out": "2026-12-18",
+        "confirmation_code": "HMP2KQ4B44",
+        "guests": 2,
+        "listing_id": 40160,
+        "nights": 3,
+        "paid_in_full": true,
+        "reservation_id": "9",
+        "status": "new"
+      },
+      "time": "2026-11-16T23:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "hostaway:9:confirmed:2026-11-16T23:00:00.000Z"
+    },
+    {
       "type": "set_state",
       "values": {
         "cursor": "2026-11-17T09:00:00.000Z",
-        "pending": null
+        "cursor_ids": [
+          "13"
+        ],
+        "pending": null,
+        "pending_ids": null,
+        "resume_after": null
       }
     }
   ],

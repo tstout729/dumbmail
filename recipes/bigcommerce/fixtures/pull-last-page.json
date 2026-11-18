@@ -78,7 +78,8 @@
       "type": "set_state",
       "values": {
         "cursor": "2019-03-12T08:00:00.000Z",
-        "page": "1"
+        "page": "1",
+        "pending": null
       }
     }
   ],

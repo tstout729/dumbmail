@@ -91,6 +91,11 @@ function reservation(r, historical, settings) {
 
 var LIMIT = 100;
 
+// Reservations come newest change first (updatedOn DESC, id DESC), paged with afterId. A run reads
+// back to the boundary the last run saved: its newest change's time and the ids read at that time
+// (rows changed in the same second count as read only if their id was). While a run pages, it
+// saves where it got to (resume_after); if it stops at the page cap, the next run continues from
+// there before starting over from the newest. The boundary moves only when a sweep reaches it.
 function handle(input) {
   if (input.source !== "pull") return [{ type: "log", message: "this recipe reads Hostaway's API; webhooks aren't used" }];
   var body = input.payload || {};
@@ -98,23 +103,37 @@ function handle(input) {
   var rows = Array.isArray(body.result) ? body.result : [];
   var st = input.state || {};
   var first = input.page === 1;
-  // Read back to the newest change the last run saw (or the backfill's start date).
+  if (first && st.resume_after) {
+    return [{ type: "log", message: "continuing after reservation " + st.resume_after }, { type: "next_request", query: { afterId: String(st.resume_after) } }];
+  }
   var stop = input.backfill ? iso(input.backfill.since) : st.cursor || new Date(Date.parse(input.now) - 86400000).toISOString();
-  var newest = first ? (rows.length ? iso(rows[0].updatedOn) : undefined) : st.pending;
+  var stopIds = input.backfill ? [] : (st.cursor_ids || []).map(String);
+  var newest = st.pending || null;
+  var newestIds = st.pending_ids || [];
+  if (first && rows.length) {
+    newest = iso(rows[0].updatedOn) || null;
+    newestIds = rows.filter(function (r) { return iso(r.updatedOn) === newest; }).map(function (r) { return String(r.id); });
+  }
   var out = [];
   var done = rows.length < LIMIT;
   for (var i = 0; i < rows.length; i++) {
     var u = iso(rows[i].updatedOn);
-    if (u && stop && u <= stop) { done = true; break; }
+    if (u && stop && (u < stop || (u === stop && stopIds.indexOf(String(rows[i].id)) >= 0))) { done = true; break; }
     out = out.concat(reservation(rows[i], !!input.backfill, input.settings || {}));
   }
   if (done) {
-    var values = { pending: null };
-    if (newest && (!st.cursor || newest > st.cursor)) values.cursor = newest;
+    var values = { pending: null, pending_ids: null, resume_after: null };
+    if (newest && (!st.cursor || newest > st.cursor)) {
+      values.cursor = newest;
+      values.cursor_ids = newestIds.slice(0, 100);
+    } else if (newest && newest === st.cursor) {
+      values.cursor_ids = stopIds.concat(newestIds.filter(function (x) { return stopIds.indexOf(x) < 0; })).slice(0, 100);
+    }
     out.push({ type: "set_state", values: values });
   } else {
-    out.push({ type: "set_state", values: { pending: newest || null } });
-    out.push({ type: "next_request", query: { afterId: String(rows[rows.length - 1].id) } });
+    var last = rows[rows.length - 1].id;
+    out.push({ type: "set_state", values: { pending: newest, pending_ids: newestIds.slice(0, 100), resume_after: String(last) } });
+    out.push({ type: "next_request", query: { afterId: String(last) } });
   }
   return out;
 }

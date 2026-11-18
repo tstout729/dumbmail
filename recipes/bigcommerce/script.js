@@ -126,19 +126,25 @@ function fetched(input) {
 
 var LIMIT = 50;
 
+// Pages run oldest change first from the cursor (inclusive). A full page asks for the next one and
+// remembers its newest change; a short or empty page ends the run, moves the cursor to the newest
+// change read, and starts the next run from page 1 (an empty page after a full one never leaves
+// the run stuck on a page past the end).
 function pulled(input) {
   var rows = Array.isArray(input.payload) ? input.payload : [];
+  var st = input.state || {};
   var out = [];
   rows.forEach(function (o) { out = out.concat(orderActions(o, null, !!input.backfill)); });
-  if (!rows.length) return out.concat([{ type: "log", message: "no changed orders" }]);
-  var page = parseInt((input.state && input.state.page) || "1", 10) || 1;
+  var page = parseInt(st.page || "1", 10) || 1;
+  var newest = rows.length ? rfc2822(rows[rows.length - 1].date_modified) : null;
   if (rows.length >= LIMIT) {
-    out.push({ type: "set_state", values: { page: String(page + 1) } });
+    out.push({ type: "set_state", values: { page: String(page + 1), pending: newest } });
     out.push({ type: "next_request", query: { page: String(page + 1) } });
-  } else {
-    // Done: the next run starts at the newest change read (inclusive, so nothing is missed).
-    out.push({ type: "set_state", values: { cursor: rfc2822(rows[rows.length - 1].date_modified), page: "1" } });
+    return out;
   }
+  var cursor = newest || st.pending || st.cursor || null;
+  out.push({ type: "set_state", values: { cursor: cursor, page: "1", pending: null } });
+  if (!rows.length) out.push({ type: "log", message: "no changed orders" });
   return out;
 }
 

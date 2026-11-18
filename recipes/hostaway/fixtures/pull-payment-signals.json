@@ -318,7 +318,12 @@
       "type": "set_state",
       "values": {
         "cursor": "2026-11-17T09:30:00.000Z",
-        "pending": null
+        "cursor_ids": [
+          "40"
+        ],
+        "pending": null,
+        "pending_ids": null,
+        "resume_after": null
       }
     }
   ],

@@ -6,7 +6,11 @@
       {
         "type": "set_state",
         "values": {
-          "pending": "2026-11-17T09:59:00.000Z"
+          "pending": "2026-11-17T09:59:00.000Z",
+          "pending_ids": [
+            "1000"
+          ],
+          "resume_after": "901"
         }
       },
       {
