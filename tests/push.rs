@@ -1326,3 +1326,44 @@ async fn received_push_is_recorded_however_often_it_fails_first() {
     assert_eq!(events(&h, "Received Push").await, 1, "written in the end, once");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_flow_push_step_is_sent_by_the_worker_holding_the_run_only() {
+    let (mut h, m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "People").await;
+    let p = person(&mut h, &l, "p@x.test", "P").await;
+    let q = person(&mut h, &l, "q@x.test", "Q").await;
+    enroll(&h, &a, &browser(&base, "p1"), "p@x.test").await;
+    enroll(&h, &a, &browser(&base, "q1"), "q@x.test").await;
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "Hello", "trigger": {"type": "metric", "metric": "Hello"}, "definition": {"entry": "n", "nodes": [
+        {"id": "n", "type": "push", "content": {"title": "Hello"}, "next": null}]}}))).await;
+    let fid = flow["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    let row: dumbmail::models::FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
+
+    // A worker that loaded the run before another one sent it: it sends nothing.
+    let run = dumbmail::flows::start(&h.state, &row, p, json!({})).await.unwrap().unwrap();
+    let pause = dumbmail::flows::StepPause::hold(run);
+    let st = h.state.clone();
+    let stale = tokio::spawn(async move { dumbmail::flows::step(&st, run).await });
+    pause.arrived().await;
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    pause.release();
+    stale.await.unwrap().unwrap();
+    assert_eq!(m.hits("/webpush/p1").len(), 1);
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM messages WHERE profile_id = '{p}' AND flow_id = '{fid}'")).await, 1);
+
+    // A second worker while the first is with the push service: it sends nothing either.
+    let run = dumbmail::flows::start(&h.state, &row, q, json!({})).await.unwrap().unwrap();
+    let gate = m.gate("/webpush/q1");
+    let st = h.state.clone();
+    let first = tokio::spawn(async move { dumbmail::flows::step(&st, run).await });
+    gate.wait(1).await;
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    gate.open();
+    first.await.unwrap().unwrap();
+    assert_eq!(m.hits("/webpush/q1").len(), 1, "only the first worker's push");
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM messages WHERE profile_id = '{q}' AND flow_id = '{fid}'")).await, 1, "one message for the visit");
+    h.cleanup().await;
+}
