@@ -301,8 +301,8 @@ pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     Err(AppError::Busy("this device is being registered elsewhere at the same time; try again".into()))
 }
 
-/// A device as first read (unlocked): (profile, test user, anonymous).
-type Seen = (Option<Uuid>, Option<Uuid>, bool);
+/// A device as first read (unlocked): (profile, test user, anonymous, has an install secret).
+type Seen = (Option<Uuid>, Option<Uuid>, bool, bool);
 /// A device under its lock.
 #[derive(sqlx::FromRow)]
 struct Held {
@@ -339,21 +339,26 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     };
     let prev_address = r.previous.as_ref().map(|p| p.address).filter(|a| *a != r.address);
     let addresses: Vec<&str> = std::iter::once(r.address).chain(prev_address).collect();
-    let seen_rows: Vec<(String, Option<Uuid>, Option<Uuid>, bool)> =
-        sqlx::query_as("SELECT address, profile_id, test_user_id, anonymous FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = ANY($3)")
+    let seen_rows: Vec<(String, Option<Uuid>, Option<Uuid>, bool, bool)> =
+        sqlx::query_as("SELECT address, profile_id, test_user_id, anonymous, install_secret_hash IS NOT NULL FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = ANY($3)")
             .bind(account_id)
             .bind(r.kind)
             .bind(&addresses)
             .fetch_all(&mut *tx)
             .await?;
-    let seen_of = |addr: &str| -> Option<Seen> { seen_rows.iter().find(|x| x.0 == addr).map(|x| (x.1, x.2, x.3)) };
+    let seen_of = |addr: &str| -> Option<Seen> { seen_rows.iter().find(|x| x.0 == addr).map(|x| (x.1, x.2, x.3, x.4)) };
     let seen = seen_of(r.address);
     let seen_prev = prev_address.and_then(seen_of);
     if seen.as_ref().is_some_and(|e| e.1.is_some()) {
         return Err(AppError::Conflict("this browser is a team member's test device".into()));
     }
-    // A sign-out never stores a device.
-    if owner == Want::Anonymous && seen.is_none() {
+    // An app device from before install secrets that belongs to nobody named: its token alone
+    // proves nothing, so it counts as not registered and this registration is its first (a new
+    // anonymous profile unless a grant names someone, and a new install secret), as if the row
+    // weren't there. Its row is kept until then, so nothing is deleted to get here.
+    let unclaimed = r.kind != "web" && seen.as_ref().is_some_and(|e| e.2 && !e.3);
+    // A sign-out never stores a device (nor touches an unclaimed one: it already belongs to nobody).
+    if owner == Want::Anonymous && (seen.is_none() || unclaimed) {
         return Ok(Some(None));
     }
     let old_owner = seen.as_ref().and_then(|e| e.0);
@@ -362,8 +367,8 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     let (profile_id, anonymous, fresh) = match (owner, prev_owner, old_owner) {
         (Want::Person(p), ..) => (p, false, false),
         (Want::Keep, Some((p, anon)), _) => (p, anon, false),
-        (Want::Keep, None, Some(p)) => (p, seen.as_ref().is_some_and(|e| e.2), false),
-        (Want::Keep, None, None) | (Want::Anonymous, ..) => (Uuid::now_v7(), true, true),
+        (Want::Keep, None, Some(p)) if !unclaimed => (p, seen.as_ref().is_some_and(|e| e.2), false),
+        (Want::Keep, None, _) | (Want::Anonymous, ..) => (Uuid::now_v7(), true, true),
     };
     let mut people: Vec<Uuid> = old_owner.into_iter().chain(prev_owner.map(|p| p.0)).chain((!fresh).then_some(profile_id)).collect();
     people.sort();
@@ -388,7 +393,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     .await?;
     let existing = held.iter().find(|d| d.address == r.address);
     let prev = prev_address.and_then(|a| held.iter().find(|d| d.address == a));
-    let as_seen = |d: Option<&Held>| d.map(|d| (d.profile_id, d.test_user_id, d.anonymous));
+    let as_seen = |d: Option<&Held>| d.map(|d| (d.profile_id, d.test_user_id, d.anonymous, d.install_secret_hash.is_some()));
     if as_seen(existing) != seen || as_seen(prev) != seen_prev {
         return Ok(None);
     }
@@ -399,7 +404,9 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         }
     }
     let mut issue_secret = false;
-    if let Some(e) = existing {
+    if unclaimed {
+        issue_secret = prev.is_none();
+    } else if let Some(e) = existing {
         let owner_changes = e.profile_id != Some(profile_id);
         let proven = holds(r.kind, e.auth_secret.as_deref(), e.install_secret_hash.as_deref(), r.proof);
         if r.kind == "web" {
@@ -417,8 +424,9 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
                 // old one stops working). A grant for anyone else never does.
                 Some(_) if same_owner_grant => issue_secret = true,
                 Some(_) => return Err(not_holder(r.kind)),
-                // Registered before install secrets: the token alone proves nothing, so only a grant
-                // for its owner adopts one; any other call (even a refresh) changes nothing.
+                // Registered before install secrets to a named person: the token alone proves
+                // nothing, so only a grant for its owner adopts one; any other call (even a refresh)
+                // changes nothing.
                 None if same_owner_grant => issue_secret = true,
                 None => {
                     return Err(AppError::Conflict(
@@ -432,7 +440,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     }
     let install_secret = issue_secret.then(crypto::new_install_secret);
     // A moved app device keeps its install secret (it goes only on a newly stored device).
-    let secret_hash = install_secret.as_deref().map(crypto::install_secret_hash).or_else(|| prev.filter(|_| existing.is_none()).and_then(|p| p.install_secret_hash.clone()));
+    let secret_hash = install_secret.as_deref().map(crypto::install_secret_hash).or_else(|| prev.filter(|_| existing.is_none() || unclaimed).and_then(|p| p.install_secret_hash.clone()));
     // The old registration of a move goes now, so it doesn't count against the caps.
     if let Some(p) = prev {
         sqlx::query("DELETE FROM push_devices WHERE id = $1").bind(p.id).execute(&mut *tx).await?;

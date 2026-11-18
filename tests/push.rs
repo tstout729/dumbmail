@@ -1607,16 +1607,39 @@ async fn a_device_registered_before_install_secrets_adopts_one_on_its_first_call
     app_call(&h, &a, "/client/push/devices", "android", &anon_tok, json!({})).await;
     let web = browser(&base, "w1");
     enroll(&h, &a, &web, "ivy@x.test").await;
-    // As they were before this change, then the migration: the ownerless app device goes, the named
-    // one and the browser stay.
+    let old_anon = app_owner(&h, &anon_tok).await.flatten().unwrap();
+    // As they were before this change, then the migration: it deletes nothing.
     sqlx::query("UPDATE push_devices SET install_secret_hash = NULL").execute(&h.state.db).await.unwrap();
     let migration: String = include_str!("../migrations/0101_push_install_secret.sql").lines().filter(|l| !l.trim_start().starts_with("--")).collect::<Vec<_>>().join("\n");
     for stmt in migration.split(';').filter(|s| !s.trim().is_empty()) {
         sqlx::query(stmt).execute(&h.state.db).await.unwrap();
     }
-    assert_eq!(app_owner(&h, &anon_tok).await, None, "ownerless legacy app device deleted");
+    assert_eq!(app_owner(&h, &anon_tok).await, Some(Some(old_anon)), "the ownerless legacy app device is kept");
     assert_eq!(app_owner(&h, &tok).await, Some(Some(ivy)));
     assert!(web_device(&h, &web.endpoint).await.is_some());
+
+    // The ownerless one counts as not registered: a sign-out with its token changes nothing, a
+    // removal needs a secret, and its next registration is its first (a new anonymous profile, a
+    // new secret), as if the row had been deleted.
+    let before = snapshot(&h, &anon_tok).await;
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "android", &anon_tok, json!({})).await.0, StatusCode::OK);
+    assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "android", &anon_tok, json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(snapshot(&h, &anon_tok).await, before, "untouched by token-only calls");
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &anon_tok, json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let anon_secret = v["install_secret"].as_str().expect("a first registration's secret").to_string();
+    let fresh = app_owner(&h, &anon_tok).await.flatten().unwrap();
+    assert_ne!(fresh, old_anon, "a new anonymous profile, not the old one");
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &anon_tok, json!({})).await;
+    assert_eq!((st, v.get("install_secret")), (StatusCode::CONFLICT, None), "now it has a secret, the token alone is refused");
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "android", &anon_tok, json!({"install_secret": anon_secret})).await.0, StatusCode::OK);
+    // A grant on another unclaimed one puts it on that person, with a new secret.
+    let anon_tok2 = format!("h{}", "x".repeat(40));
+    app_call(&h, &a, "/client/push/devices", "android", &anon_tok2, json!({})).await;
+    sqlx::query("UPDATE push_devices SET install_secret_hash = NULL WHERE address = $1").bind(&anon_tok2).execute(&h.state.db).await.unwrap();
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &anon_tok2, json!({"identity": a.grant("email", "dan@x.test")})).await;
+    assert!(st == StatusCode::OK && v["install_secret"].is_string(), "{st} {v}");
+    assert_eq!(app_owner(&h, &anon_tok2).await, Some(Some(dan)));
     let permission = || async { sqlx::query_scalar::<_, String>("SELECT permission FROM push_devices WHERE address = $1").bind(&tok).fetch_one(&h.state.db).await.unwrap() };
 
     // The token alone changes nothing: no new owner, no sign-out, no removal, not even a refresh.
