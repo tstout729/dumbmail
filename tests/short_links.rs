@@ -28,7 +28,10 @@ async fn setup(h: &mut Harness) -> (Uuid, String) {
     h.credit(20.0).await;
     h.claim_number().await;
     short_links::ensure_index(&h.state).await.unwrap();
-    assert!(short_links::index_ready());
+    assert!(short_links::index_ready(&h.state));
+    short_links::mark_serving(&h.state);
+    short_links::runtime::set_issue_delay(&h.state, std::time::Duration::ZERO);
+    assert!(short_links::issuing(&h.state));
     let list = h.ok("POST", "/api/lists", Some(json!({"name": "Texts"}))).await["id"].as_str().unwrap().to_string();
     (account_id(h).await, list)
 }
@@ -462,5 +465,31 @@ async fn cleanup_never_deletes_a_target_a_send_is_refreshing() {
     job.await.unwrap().unwrap();
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM short_link_targets WHERE code = $1").bind(&code).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(left, 1, "a target refreshed by a send survives cleanup");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_freshly_started_server_sends_long_links_until_it_has_served_a_while() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(20.0).await;
+    h.claim_number().await;
+    short_links::ensure_index(&h.state).await.unwrap();
+    // Just started: the old server of a deploy may still get the clicks, and it can't resolve /s/.
+    short_links::mark_serving(&h.state);
+    short_links::runtime::set_issue_delay(&h.state, std::time::Duration::from_secs(2));
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Texts"}))).await["id"].as_str().unwrap().to_string();
+    let (_, phone) = texter(&mut h, &list, 7801).await;
+    flow_text(&mut h, "Early", "Acme Goods: early https://shop.test/early", &phone).await;
+    let early = body_to(&h, &phone);
+    assert!(short_paths(&early).is_empty() && early.contains("https://pl.test/t/c/"), "{early}");
+    assert_eq!(h.ok("GET", "/api/short-links/settings", None).await["ready"], false);
+    let r = h.ok("POST", "/api/render", Some(json!({"channel": "sms", "content": {"body": "Acme Goods: https://shop.test/early"}}))).await;
+    assert!(r["body"].as_str().unwrap().contains("https://shop.test/early"), "the preview matches the send: {r}");
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    flow_text(&mut h, "Later", "Acme Goods: later https://shop.test/later", &phone).await;
+    let later = body_to(&h, &phone);
+    assert_eq!(short_paths(&later).len(), 1, "{later}");
+    assert_eq!(h.ok("GET", "/api/short-links/settings", None).await["ready"], true);
     h.cleanup().await;
 }

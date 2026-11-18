@@ -8,7 +8,6 @@
 //! writes the message row (`sending::send`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -17,6 +16,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::code::{self, PATH_LEN, REF_LEN, TARGET_LEN};
+use super::runtime;
 use crate::error::AppResult;
 use crate::models::Account;
 use crate::render::{LinkHook, SmsLinks};
@@ -33,26 +33,6 @@ pub const MAX_LINKS: usize = 10;
 pub const MAX_URL: usize = 2000;
 /// What previews show after `/s/`: the real length, so the segment count is right.
 pub const SAMPLE_PATH: &str = "Ab12Cd34Ef56Gh78Jk90Lm12";
-
-/// The index clicks find messages by (see [`super::INDEXES`]). Until it's in place on this server's
-/// database no short links are made, so no click ever has to scan `messages`.
-static INDEX_READY: AtomicBool = AtomicBool::new(false);
-
-pub fn index_ready() -> bool {
-    INDEX_READY.load(Ordering::Relaxed)
-}
-
-/// Check whether the index is in place (and remember it once it is).
-pub async fn check_index(db: &sqlx::PgPool) -> bool {
-    if index_ready() {
-        return true;
-    }
-    let valid: Option<bool> = sqlx::query_scalar(crate::features::reports::indexes::STATE_SQL).bind(super::INDEXES[0].0).fetch_optional(db).await.ok().flatten();
-    if valid == Some(true) {
-        INDEX_READY.store(true, Ordering::Relaxed);
-    }
-    index_ready()
-}
 
 static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
 
@@ -139,7 +119,7 @@ impl SmsLinks for TextLinks {
 /// no links the sender wrote, short links off, or the index isn't in place yet. `content` is the
 /// content as prepared for this person; `hook` adds the message's link tags.
 pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, hook: Option<&dyn LinkHook>, message_id: Uuid, link_base: &str) -> AppResult<Option<TextLinks>> {
-    if spec.channel != "sms" || !index_ready() {
+    if spec.channel != "sms" || !runtime::issuing(state) {
         return Ok(None);
     }
     let Some(body) = content.get("body").and_then(Value::as_str) else { return Ok(None) };
@@ -233,7 +213,7 @@ pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign
         per.extend(vs.iter().map(|v| v.get("content").map(dests_of).unwrap_or_default()));
     }
     let all: Vec<String> = per.iter().flatten().cloned().collect::<HashSet<_>>().into_iter().collect();
-    let codes = if all.is_empty() || !index_ready() { HashMap::new() } else { ensure_targets(conn, account_id, &all).await? };
+    let codes = if all.is_empty() || !runtime::issuing(state) { HashMap::new() } else { ensure_targets(conn, account_id, &all).await? };
     let set = |c: &mut Value, dests: &[String]| -> bool {
         let Some(o) = c.as_object_mut() else { return false };
         let targets: Map<String, Value> = dests.iter().filter_map(|d| codes.get(d).map(|code| (d.clone(), json!(code)))).collect();
@@ -261,7 +241,7 @@ pub async fn freeze_campaign(state: &AppState, conn: &mut PgConnection, campaign
 
 /// Sample short links for a preview: every link a real send would shorten, as a short link of the
 /// real length. None when the body has no such link, the account has short links off or short
-/// links aren't in use yet (see [`index_ready`]).
+/// this server doesn't issue short links yet (see [`runtime::issuing`]).
 pub struct Sample {
     links: HashSet<String>,
     short: String,
@@ -277,7 +257,7 @@ impl SmsLinks for Sample {
 /// See [`Sample`]. One statement, only when the body has a link the sender wrote.
 pub async fn preview(state: &AppState, account: &Account, body: &str) -> AppResult<Option<Sample>> {
     // Until the index is in place, sends use the long form, so the preview does too.
-    if !index_ready() {
+    if !runtime::issuing(state) {
         return Ok(None);
     }
     let links = written_links(body, &own_hosts(state, account.link_domain.as_deref()));

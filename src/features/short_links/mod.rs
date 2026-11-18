@@ -15,6 +15,7 @@
 //! deleted by a background job.
 
 pub mod code;
+pub mod runtime;
 pub mod send;
 
 use async_trait::async_trait;
@@ -36,12 +37,13 @@ use crate::features::team::audit;
 use crate::mcp::{from, obj, tool};
 use crate::state::AppState;
 
-pub use send::{check_index, for_send, freeze_campaign, index_ready};
+pub use runtime::{check_index, index_ready, issuing, mark_serving};
+pub use send::{for_send, freeze_campaign};
 
 pub struct Module;
 
 /// The index clicks find a message by: the account and the message's reference. Built in the
-/// background after startup (`messages` is big); short links wait for it (see [`send::index_ready`]).
+/// background after startup (`messages` is big); short links wait for it (see [`runtime`]).
 pub const INDEXES: &[(&str, &str)] =
     &[("messages_short_ref_idx", "CREATE INDEX CONCURRENTLY messages_short_ref_idx ON messages (account_id, short_ref) WHERE short_ref IS NOT NULL")];
 const INDEX_LOCK: i64 = 0x0d4d_7368_6f72_746c;
@@ -68,7 +70,7 @@ static TOOLS: &[ToolRule] = &[
 /// Build the index, then remember it's in place.
 pub async fn ensure_index(state: &AppState) -> anyhow::Result<()> {
     crate::features::reports::indexes::build(state, INDEX_LOCK, "short link", INDEXES).await?;
-    check_index(&state.db).await;
+    check_index(state).await;
     Ok(())
 }
 
@@ -114,7 +116,7 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
         "enabled": enabled,
         "sample": sample,
         "link_length": sample.chars().count(),
-        "ready": index_ready() || check_index(&state.db).await,
+        "ready": issuing(state),
     }))
 }
 
@@ -220,9 +222,10 @@ impl Feature for Module {
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
-        // Another server may be the one building the index: notice when it's done.
-        if !index_ready() && tick.is_multiple_of(3) {
-            check_index(&state.db).await;
+        // Another server may be the one building the index: notice when it's done, and notice if it
+        // ever goes missing (clicks then answer not found instead of scanning `messages`).
+        if tick.is_multiple_of(3) {
+            check_index(state).await;
         }
         if tick.is_multiple_of(180) {
             crate::jobs::enqueue_background(&state.db, JOB_CLEANUP, json!({}), None).await?;

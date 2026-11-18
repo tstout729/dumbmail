@@ -119,6 +119,8 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(email = state.email.name(), sms = state.sms.name(), "providers ready");
     jobs::spawn_workers(state.clone());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    // Short links in texts start once this server has served for a while (see features::short_links::runtime).
+    dumbmail::features::short_links::mark_serving(&state);
     tracing::info!("DumbMail listening on http://{bind}");
     axum::serve(listener, app(state)).with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

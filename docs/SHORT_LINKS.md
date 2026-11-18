@@ -86,8 +86,11 @@ fails a send or misattributes a click.
   deleted target shows the "link not found" page.
 - A closed account's short links stop redirecting.
 - Lookups use an index on `messages (account_id, short_ref)`, built in the background after the
-  server starts. Until it's in place (briefly, after an upgrade), texts use the long form; the
-  setting's `ready` says which.
+  server starts.
+- A server puts short links in texts only once that index is in place and it has been accepting
+  requests for 2 minutes. During a deploy the old server keeps getting some clicks for a short while
+  and can't resolve `/s/` links, so texts sent in a new server's first 2 minutes use the long form.
+  The setting's `ready` says whether short links are being issued now.
 
 ## API and MCP
 
