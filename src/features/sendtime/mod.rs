@@ -109,8 +109,8 @@ async fn preview(state: &AppState, account_id: Uuid, b: PreviewBody) -> AppResul
         None => None,
     };
     let channel = b.channel.or_else(|| c.as_ref().map(|c| c.channel.clone())).unwrap_or_else(|| "email".into());
-    if channel != "email" && channel != "sms" {
-        return Err(AppError::bad("channel must be email or sms"));
+    if !matches!(channel.as_str(), "email" | "sms" | "push") {
+        return Err(AppError::bad("channel must be email, sms or push"));
     }
     let audience_v = b.audience.or_else(|| c.as_ref().map(|c| c.audience.clone())).ok_or_else(|| AppError::bad("give an audience or a campaign_id"))?;
     let audience: Audience = serde_json::from_value(audience_v).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;

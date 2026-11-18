@@ -110,7 +110,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
+            "delay" | "email" | "sms" | "push" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -137,7 +137,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                     return Err(AppError::bad(format!("delay {} unit must be minutes, hours or days", n.id)));
                 }
             }
-            "email" | "sms" => need("content")?,
+            "email" | "sms" | "push" => need("content")?,
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
@@ -614,7 +614,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     o.remove("_waited");
                 }
             }
-            "email" | "sms" => {
+            "email" | "sms" | "push" => {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);

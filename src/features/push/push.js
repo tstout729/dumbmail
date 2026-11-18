@@ -1,0 +1,140 @@
+/* DumbMail web push: loaded by the website snippet when push is on. It never asks for permission
+   on page load: a small card with the site's own wording shows by the rules set in DumbMail, and
+   only its "Allow" button (or the site's own button calling dumbmail.notifications.prompt()) opens
+   the browser's prompt. A browser that said no is never asked again. */
+(function () {
+  "use strict";
+  var BASE = __BASE__, KEY = __KEY__, CFG = __CONFIG__;
+  if (!CFG || window.__dumbmailPush) return;
+  window.__dumbmailPush = true;
+  var supported = !!(window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window);
+  var now = function () { return Date.now(); };
+  var store = {
+    get: function (k, s) { try { return JSON.parse((s ? sessionStorage : localStorage).getItem(k)); } catch (e) { return null; } },
+    set: function (k, v, s) { try { (s ? sessionStorage : localStorage).setItem(k, JSON.stringify(v)); } catch (e) {} },
+    del: function (k) { try { localStorage.removeItem(k); } catch (e) {} }
+  };
+  function post(path, body) {
+    return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), credentials: "omit", keepalive: true
+    });
+  }
+  // Who this browser is, as only DumbMail or the site's own server can vouch for: the signed token
+  // from a tracked link, or a verified identity (user_hash) the site passed in.
+  function identity() {
+    var id = {}, p = store.get("pl_profile") || {}, v = store.get("pl_push_identity");
+    if (p.$token) id.$token = p.$token;
+    if (v && v.user_hash) { if (v.external_id) id.external_id = v.external_id; if (v.email) id.email = v.email; id.user_hash = v.user_hash; }
+    return id;
+  }
+  function keyBytes(b64) {
+    var s = (b64 + "===".slice((b64.length + 3) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+    var raw = atob(s), out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function registration() {
+    return navigator.serviceWorker.register(CFG.sw, { scope: "/" }).then(function () { return navigator.serviceWorker.ready; });
+  }
+  function report(sub, force) {
+    var j = sub.toJSON(), id = identity();
+    var sig = j.endpoint + "|" + JSON.stringify(id), last = store.get("pl_push_sent");
+    // Once a day, or when the subscription or the identity changes.
+    if (!force && last && last.sig === sig && now() - last.at < 86400000) return Promise.resolve("granted");
+    return post("/client/push/subscribe", { subscription: j, identity: id, url: location.href }).then(function (r) {
+      if (r && r.ok) { store.set("pl_push_sent", { sig: sig, at: now() }); store.set("pl_push_sub", { endpoint: j.endpoint, auth: j.keys && j.keys.auth }); }
+      return "granted";
+    });
+  }
+  function subscribe(force) {
+    return registration().then(function (reg) {
+      return reg.pushManager.getSubscription().then(function (s) {
+        return s || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(CFG.key) });
+      });
+    }).then(function (sub) { return report(sub, force); });
+  }
+  function prompt() {
+    if (!supported) return Promise.resolve("unsupported");
+    if (Notification.permission === "denied") return Promise.resolve("denied");
+    if (Notification.permission === "granted") return subscribe(false).catch(function () { return "error"; });
+    hide();
+    return Promise.resolve(Notification.requestPermission()).then(function (p) {
+      if (p === "granted") return subscribe(true).catch(function () { return "error"; });
+      if (p === "denied") forget();
+      return p;
+    });
+  }
+  // Permission was taken back: tell DumbMail so it stops trying this browser.
+  function forget() {
+    var s = store.get("pl_push_sub");
+    store.del("pl_push_sub"); store.del("pl_push_sent");
+    if (s && s.endpoint) post("/client/push/unsubscribe", { endpoint: s.endpoint, auth: s.auth });
+  }
+  function unsubscribe() {
+    if (!supported) return Promise.resolve(false);
+    return navigator.serviceWorker.getRegistration(CFG.sw).then(function (reg) {
+      return reg ? reg.pushManager.getSubscription() : null;
+    }).then(function (sub) {
+      forget();
+      return sub ? sub.unsubscribe() : false;
+    });
+  }
+
+  // ---------- The in-page card ----------
+  var card = null;
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function hide() { if (card) { card.remove(); card = null; } }
+  function show() {
+    if (card || !document.body) return;
+    var P = CFG.prompt, host = document.createElement("div");
+    host.setAttribute("data-dumbmail-push", "");
+    var root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
+    var edge = P.position === "top" ? "top:16px" : "bottom:16px";
+    root.innerHTML = "<style>.c{position:fixed;" + edge + ";left:50%;transform:translateX(-50%);z-index:2147483646;width:min(380px,calc(100vw - 32px));box-sizing:border-box;background:#fff;color:#111827;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.18);padding:16px;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}" +
+      ".t{font-weight:600;font-size:15px;margin:0 0 4px}.b{margin:0 0 12px;color:#4b5563}.r{display:flex;gap:8px;justify-content:flex-end}" +
+      "button{font:inherit;font-weight:600;border-radius:8px;padding:8px 14px;cursor:pointer;border:1px solid #d1d5db;background:#fff;color:#374151}button.y{background:" + esc(CFG.color) + ";border-color:transparent;color:#fff}</style>" +
+      "<div class='c' role='dialog' aria-label='" + esc(P.title) + "'><p class='t'>" + esc(P.title) + "</p><p class='b'>" + esc(P.body) + "</p>" +
+      "<div class='r'><button type='button' class='n'>" + esc(P.deny_text) + "</button><button type='button' class='y'>" + esc(P.allow_text) + "</button></div></div>";
+    root.querySelector(".y").addEventListener("click", function () { prompt(); });
+    root.querySelector(".n").addEventListener("click", function () { store.set("pl_push_dismissed", now()); hide(); });
+    document.body.appendChild(host);
+    card = host;
+  }
+  function pageOk(P) {
+    var u = location.href;
+    if (P.url_excludes && P.url_excludes.some(function (x) { return u.indexOf(x) >= 0; })) return false;
+    return !P.url_contains || !P.url_contains.length || P.url_contains.some(function (x) { return u.indexOf(x) >= 0; });
+  }
+  function maybeShow() {
+    var P = CFG.prompt;
+    if (!P || !P.enabled || Notification.permission !== "default") return;
+    var views = (store.get("pl_push_pv", true) || 0) + 1;
+    store.set("pl_push_pv", views, true);
+    var dismissed = store.get("pl_push_dismissed");
+    if (dismissed && now() - dismissed < P.frequency_days * 86400000) return;
+    if (views < P.page_views || !pageOk(P)) return;
+    setTimeout(function () { if (Notification.permission === "default") show(); }, (P.delay_seconds || 0) * 1000);
+  }
+
+  var api = {
+    supported: supported,
+    /** "granted", "denied", "default" or "unsupported". */
+    status: function () { return supported ? Notification.permission : "unsupported"; },
+    prompt: prompt,
+    subscribe: prompt,
+    unsubscribe: unsubscribe,
+    /** A verified identity from your server: { external_id or email, user_hash } (see Settings → Push). */
+    identify: function (v) {
+      if (!v || typeof v !== "object" || !v.user_hash) return api;
+      store.set("pl_push_identity", { external_id: v.external_id || null, email: v.email || null, user_hash: String(v.user_hash) });
+      if (supported && Notification.permission === "granted") subscribe(false).catch(function () {});
+      return api;
+    }
+  };
+  if (window.dumbmail && typeof window.dumbmail === "object") window.dumbmail.notifications = api;
+  if (!supported) return;
+  if (Notification.permission === "granted") subscribe(false).catch(function () {});
+  else if (Notification.permission === "denied") { if (store.get("pl_push_sub")) forget(); }
+  else if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", maybeShow);
+  else maybeShow();
+})();

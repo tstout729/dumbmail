@@ -31,6 +31,8 @@ pub struct Prices {
     pub sms_segment: i64,
     pub mms: i64,
     pub number_monthly: i64,
+    /// Per push notification (one person, all their devices); 0 unless PRICE_PUSH is set.
+    pub push: i64,
 }
 
 pub fn prices(state: &AppState) -> Prices {
@@ -40,6 +42,7 @@ pub fn prices(state: &AppState) -> Prices {
         sms_segment: to_micros(c.price_sms_segment),
         mms: to_micros(c.price_mms),
         number_monthly: to_micros(c.price_number_monthly),
+        push: to_micros(c.price_push.max(0.0)),
     }
 }
 
@@ -84,6 +87,7 @@ pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: 
                 p.email
             }
         }
+        "push" => p.push,
         _ if own_provider => 0,
         _ if mms => p.mms,
         _ => p.sms_segment * segments.max(1),
@@ -115,6 +119,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     let cost = if channel == "email" {
         let covered = free_emails_remaining(state, account_id).await? + crate::subscription::emails_remaining(&state.db, account_id).await?;
         (recipients - covered).max(0) * p.email
+    } else if channel == "push" {
+        recipients * p.push
     } else if !sms_billed(state, account_id).await? {
         0
     } else if mms {
@@ -147,6 +153,11 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
         // Free allowance first, then the monthly plan, then prepaid credit.
         let covered = used as i64 <= state.cfg.free_emails_per_month || crate::subscription::use_email(&state.db, account_id).await?;
         ("email", 1i64, if covered { 0 } else { p.email })
+    } else if channel == "push" {
+        if p.push <= 0 {
+            return Ok(0);
+        }
+        ("push", 1, p.push)
     } else if own_provider {
         return Ok(0);
     } else if mms {
@@ -193,6 +204,7 @@ pub async fn debit_usage_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind:
         "email" => "Emails sent",
         "sms" => "SMS segments sent",
         "mms" => "MMS sent",
+        "push" => "Push notifications sent",
         _ => "Usage",
     };
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;

@@ -76,10 +76,15 @@ CREATE TABLE push_deliveries (
     device_id     uuid REFERENCES push_devices(id) ON DELETE SET NULL,
     kind          text NOT NULL,
     -- sending: claimed and handed (or about to be handed) to the provider; never sent again.
-    status        text NOT NULL DEFAULT 'sending' CHECK (status IN ('sending', 'sent', 'failed', 'gone', 'skipped')),
+    -- retry: the push service was busy or down; a background job tries again at next_attempt_at.
+    status        text NOT NULL DEFAULT 'sending' CHECK (status IN ('sending', 'sent', 'retry', 'failed', 'gone', 'skipped')),
     provider_id   text,
     error         text,
     attempts      integer NOT NULL DEFAULT 0,
+    next_attempt_at timestamptz,
+    -- What the device is sent, kept only while a retry is waiting.
+    payload       jsonb,
+    claimed_at    timestamptz,
     created_at    timestamptz NOT NULL DEFAULT now(),
     sent_at       timestamptz,
     delivered_at  timestamptz,
@@ -87,7 +92,7 @@ CREATE TABLE push_deliveries (
 );
 CREATE UNIQUE INDEX push_deliveries_message_device_uq ON push_deliveries(message_id, device_id);
 CREATE INDEX push_deliveries_message_idx ON push_deliveries(message_id);
-CREATE INDEX push_deliveries_sending_idx ON push_deliveries(created_at) WHERE status = 'sending';
+CREATE INDEX push_deliveries_sending_idx ON push_deliveries(claimed_at) WHERE status = 'sending';
 
 -- Device registrations per account, per hashed client address and hour (a bound on the public endpoints).
 CREATE TABLE push_registration_counts (

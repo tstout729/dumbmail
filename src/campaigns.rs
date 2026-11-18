@@ -91,7 +91,7 @@ pub fn parse_ab_test(channel: &str, v: &Value) -> AppResult<AbTest> {
     }
     match (t.metric.as_str(), channel) {
         ("open_rate", "email") | ("click_rate", _) | ("revenue", _) => {}
-        ("open_rate", _) => return Err(AppError::bad("SMS has no opens; pick the winner by click_rate or revenue")),
+        ("open_rate", _) => return Err(AppError::bad("only email has opens; pick the winner by click_rate or revenue")),
         _ => return Err(AppError::bad("metric must be open_rate, click_rate or revenue")),
     }
     if !matches!(t.pick.as_str(), "auto" | "manual") {
@@ -158,7 +158,9 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
 }
 
 pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
-    if channel == "sms" {
+    if channel == "push" {
+        qb.push(" AND ").push(crate::features::push::send::REACHABLE_SQL);
+    } else if channel == "sms" {
         qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed'");
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
@@ -258,6 +260,8 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         if account.address.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
         }
+    } else if c.channel == "push" {
+        // Push setup is checked when it launches (`features::push::setup_problems`).
     } else if account.sms_from.is_none() {
         problems.push("Set an SMS sending number in Settings → SMS".into());
     }
@@ -286,6 +290,8 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
                 problems.push(e);
             }
         }
+    } else if channel == "push" {
+        problems.extend(crate::features::push::content::problems(content));
     } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
         problems.push("Write the SMS message".into());
     }
@@ -333,7 +339,7 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             return Ok(());
         }
     }
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let addr = recipient_column(&c.channel);
     let ab = ab_test(&c);
     let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
     // Set once everyone who gets the campaign has a row (or a holdout row): a retried send job then adds
@@ -409,7 +415,7 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
 /// Runs entirely on `tx`: the audience is resolved beforehand (and only used, so only has to have
 /// resolved, when there are no holdouts).
 async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, resolved: AppResult<ResolvedAudience>) -> AppResult<()> {
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let addr = recipient_column(&c.channel);
     let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
     qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
     let holdouts: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL AND ab_test IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut **tx).await?;
@@ -423,6 +429,16 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, 
     qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
     qb.build().execute(&mut **tx).await?;
     Ok(())
+}
+
+/// What a campaign's queued message rows record as the recipient's address.
+fn recipient_column(channel: &str) -> &'static str {
+    match channel {
+        "sms" => "p.phone_number",
+        // Push goes to the person's devices, fixed when each message is claimed.
+        "push" => "'push'",
+        _ => "p.email",
+    }
 }
 
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
@@ -523,8 +539,8 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         )
         .await;
         match outcome {
-            // A text outside its recipient's hours waits alone; everyone else in the batch goes on.
-            Ok(Outcome::Deferred(until)) if c.channel == "sms" => {
+            // A text or push outside its recipient's hours waits alone; everyone else in the batch goes on.
+            Ok(Outcome::Deferred(until)) if c.channel != "email" => {
                 if requeue_claimed(&state.db, c.id, *mid, &c.channel, Some(until)).await? {
                     held.entry(until).or_default().push(*mid);
                 }
@@ -578,7 +594,7 @@ pub async fn claim(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &s
         "UPDATE messages m SET status = 'sending', claimed_at = now()
          WHERE m.id = $1 AND m.status = 'queued' AND (m.send_after IS NULL OR m.send_after <= $2)
            AND EXISTS (SELECT 1 FROM campaigns c JOIN accounts a ON a.id = c.account_id
-                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 = 'sms' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
+                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 <> 'email' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
          RETURNING m.profile_id, m.variant",
     )
     .bind(message_id)
@@ -822,6 +838,9 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
         .await?;
     if recent + to.len() as i64 > 50 {
         return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
+    }
+    if c.channel == "push" {
+        return crate::features::push::campaign_test(state, account, c, content, to, create_profiles).await;
     }
     let mut sent = 0;
     for raw in to {

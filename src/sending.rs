@@ -171,6 +171,10 @@ pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversat
 }
 
 async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
+    // Push has its own consent, claim and providers (see features::push::send); the steps match these.
+    if spec.channel == "push" && conversational.is_none() {
+        return crate::features::push::send::send(state, &spec).await;
+    }
     let p = spec.profile;
     // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
     let mut send_note: Option<String> = None;
@@ -248,7 +252,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 None => None,
             }
         }
-        _ => return Err(AppError::bad("channel must be email or sms")),
+        _ => return Err(AppError::bad("channel must be email, sms or push")),
     };
     let Some(to) = to else { return Ok(Outcome::Skipped("no address")) };
 
