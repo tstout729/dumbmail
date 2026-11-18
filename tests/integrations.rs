@@ -898,7 +898,10 @@ async fn mcp_tools_and_docs() {
 
     let recipes = call(tool("list_integration_recipes", json!({}))).await;
     let keys: Vec<&str> = recipes["result"]["structuredContent"]["recipes"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
-    assert_eq!(keys, vec!["aftership", "bigcommerce", "calendly", "guesty", "hostaway", "paddle", "recharge", "segment", "square", "stripe", "typeform", "webflow", "woocommerce", "zendesk"]);
+    assert_eq!(
+        keys,
+        vec!["acuity", "aftership", "bigcommerce", "calendly", "cloudbeds", "eventbrite", "gorgias", "guesty", "hostaway", "jotform", "paddle", "recharge", "segment", "shipstation", "square", "stripe", "typeform", "webflow", "woocommerce", "zendesk"]
+    );
     let made = call(tool("create_integration_from_recipe", json!({"recipe": "calendly"}))).await;
     let sc = &made["result"]["structuredContent"];
     assert!(sc["integration"]["inbound_url"].as_str().unwrap().contains("/webhooks/in/"));

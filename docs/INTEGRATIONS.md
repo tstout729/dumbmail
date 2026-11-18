@@ -2,7 +2,7 @@
 
 An integration connects any app to DumbMail. The app sends webhooks to the integration's secret URL, or DumbMail fetches from the app's API on a schedule (a *pull*). A small JavaScript function you write, the *script*, turns each payload into a list of *actions*: create or update profiles, track events, change lists, record consent. Every step is logged, failures retry, and anything can be replayed.
 
-Ready-made integrations (*recipes*) exist for WooCommerce, BigCommerce, Stripe, Square, Recharge, Paddle, Guesty, Hostaway, Calendly, Typeform, Webflow forms, Zendesk, AfterShip and Segment (see Recipes). Start from one when it fits (`list_integration_recipes`, `create_integration_from_recipe`); otherwise build one with the steps below.
+Ready-made integrations (*recipes*) exist for WooCommerce, BigCommerce, Stripe, Square, Recharge, Paddle, Guesty, Hostaway, Cloudbeds, Calendly, Acuity Scheduling, Eventbrite, Typeform, Jotform, Webflow forms, Zendesk, Gorgias, AfterShip, ShipStation and Segment (see Recipes). Start from one when it fits (`list_integration_recipes`, `create_integration_from_recipe`); otherwise build one with the steps below.
 
 ## Build one in five steps
 
@@ -60,7 +60,7 @@ function handle(input) {
 | --- | --- |
 | `source` | `webhook`, `pull` or `test` |
 | `replay` | `true` when a stored delivery is being run again |
-| `payload` | The body: parsed JSON, a form as an object, otherwise the text |
+| `payload` | The body: parsed JSON, a form as an object (a `multipart/form-data` body is read as a form of its text fields; file parts are dropped), otherwise the text |
 | `body` | The raw body text |
 | `headers` | Request headers, lower-case names. `authorization` and `cookie` are never kept. |
 | `query` | Query string parameters |
@@ -69,7 +69,7 @@ function handle(input) {
 | `now` | The current time, ISO 8601 UTC |
 | `integration` | `{id, name}` |
 | `response`, `request`, `page`, `backfill` | Pulls only: the app's answer status and headers, the request made (secrets hidden), the page number (from 1) and `{since}` during a backfill, otherwise `null` |
-| `response`, `request`, `context` | Fetches (`source` `fetch`): the app's answer status and headers, the request made (secrets hidden), and the `context` the webhook's `next_request` carried |
+| `response`, `request`, `context` | Fetches (`source` `fetch`): the app's answer status, headers and `received_at` (when DumbMail got the answer; a later answer for the same record is always received later, so a script can version what it says by it), the request made (secrets hidden), and the `context` the webhook's `next_request` carried |
 
 Return `[]` (or nothing) when there's nothing to do; the delivery is logged as `ignored`.
 
@@ -199,11 +199,11 @@ In a pull, fetch another page. In a webhook, look up the record it names: many a
 ```
 
 - Always a `GET`. The script gives only `url` (a path), `query` and `context`; `method`, `headers` or `body` are refused.
-- The path must match one of `paths` exactly, where `{id}` is one path segment matching `id` (digits by default) and `{{settings.KEY}}` is filled in; query keys must be listed in `query`, with values that match `id`.
+- The path must match one of `paths` exactly, where `{id}` is one path segment matching `id` (digits by default) and `{{settings.KEY}}` is filled in; query keys must be listed in `query`, with values that match `id`. A path ends with `/` only if the declared one does (Eventbrite's do).
 - Every lookup stays under `prefix` (default `/`; the recipes name the part of the vendor's API they use). Each path in `paths` must start with it, and a lookup whose path, filled in and normalised, isn't under it is refused, even on the same site.
 - Only the `context` keys listed are kept; the context is put through the redact list's removals, sealed (it isn't shown in the delivery's request record), counted in the payload budget, and handed to the run on the answer as `input.context` (up to 16 KB).
 - The lookup is reserved in the same step that marks the webhook done: a delivery row (source `fetch`) that counts against the limits on work waiting to run, unique on the record (its path and query) while it's outstanding, so a second webhook for the same record joins it, and its context replaces the first one's. Only the job holding it makes the request, never before the row's due time (a retry wait or the app's cooldown), and only once the payload budget has room for a whole answer: that room is reserved before the request and held until the answer is stored, so a request that worked is never repeated for lack of space.
-- An answer that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes, or after the wait the app asked for (`Retry-After`, or BigCommerce's `X-Rate-Limit-Time-Reset-Ms`, up to two hours).
+- An answer that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes, or after the wait the app asked for (`Retry-After`, BigCommerce's `X-Rate-Limit-Time-Reset-Ms` or ShipStation's `X-Rate-Limit-Reset`, up to two hours).
 - The answer is kept on that row (redacted) and the script runs on it with `input.request`, `input.response` and `input.context`. That run may look up once more (up to 3 lookups from one webhook), for example a refund, then its order. A replay runs the current script again, which decides afresh what to look up.
 
 ## Signatures
@@ -332,7 +332,7 @@ A recipe is a ready-made integration kept in the DumbMail repository under `reci
 - **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order (not for checkouts that needed no payment), Refunded Order (once per refund, its own amount, once it has succeeded, found through its PaymentIntent or charge), Subscription Started (when it becomes active, once) / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
 - **calendly**: bookings and cancellations → Meeting Scheduled / Meeting Cancelled, with draft reminder and follow-up flows.
 
-Every recipe below was checked against the vendor's documentation on 2026-11-17 and hasn't yet run against a live account. Each recipe's `README.md` lists the doc page behind each assumption, what's removed before payloads are stored, and what a live check should look at first. None of them subscribes anyone without an opt-in field the vendor documents for that purpose; everyone else they add is held back from marketing.
+Every recipe below was checked against the vendor's documentation on 2026-11-17 (Cloudbeds, Acuity Scheduling, Eventbrite, Jotform, Gorgias and ShipStation on 2026-11-18) and hasn't yet run against a live account. Each recipe's `README.md` lists the doc page behind each assumption, what's removed before payloads are stored, and what a live check should look at first. None of them subscribes anyone without an opt-in field the vendor documents for that purpose; everyone else they add is held back from marketing.
 
 ### Commerce and subscriptions
 
@@ -345,18 +345,20 @@ Every recipe below was checked against the vendor's documentation on 2026-11-17 
 ### Hospitality and bookings
 
 - **hostaway**: reservations read from Hostaway's API every 15 minutes (its webhooks' body isn't documented): Reservation Booked, Reservation Total, Reservation Confirmed (each version, with `paid_in_full` as Hostaway reports it), Reservation Cancelled, Inquiry Received. Door codes, lockbox instructions and wifi details are removed from stored pages and never reach events. Draft pre-arrival flow that fires only for bookings paid in full, with placeholders, not access details. Setup: the Hostaway account ID and API key as credentials.
+- **cloudbeds**: Cloudbeds' reservation webhooks only name the reservation (and are checked by a secret header, since Cloudbeds doesn't sign them), so each one fetches it from Cloudbeds' API: Reservation Booked (once), Reservation Confirmed (each version of its status and dates), Reservation Cancelled and Checked Out, on the main guest. Each reservation is kept as a `reservation` object, versioned by when DumbMail received Cloudbeds' answer, with `paid_in_full` only on exact evidence (a booked status, a total above zero, a balance of exactly zero and payments covering the total). Cloudbeds sends no webhook for payments, so an hourly check fetches every confirmed arrival in the next week again. Draft object-based pre-arrival flow: confirmed, paid in full, checked at most three hours ago; placeholders, no access details. Guest documents, addresses, cards and custom fields are never stored. Setup: an API key, and four webhooks created with Cloudbeds' API.
+- **acuity**: Acuity Scheduling's signed, form-encoded webhooks name an appointment; it's fetched, and what Acuity says now is recorded: Appointment Scheduled (once), Appointment Rescheduled (once per new time) and Appointment Cancelled (once, with `no_show`), so a late webhook can't bring back a cancelled appointment. Intake forms, notes and prices are never stored. Setup: the user ID and API key (also the signing secret), and the webhook URL in Integrations → Webhooks.
+- **eventbrite**: Eventbrite's webhooks aren't signed and only point at an order or attendee (the integration's URL is the secret); each one is fetched with your private token, and only pointers into Eventbrite's API are followed. Placed Order (placed, gross above zero, in its currency), Registered for Event (free orders), Refunded Order (once per ticket Eventbrite marks refunded, its own amount, on the buyer found by the order) and Checked In (once per attendee). Barcodes and custom answers are never stored.
 
 ### Forms, support, shipping and data
 
 - **typeform** and **webflow**: Form Submitted on the respondent's profile. A form submission never subscribes anyone and never renames an existing profile (anyone can type an address into a form); a consent question or checkbox you map in the settings is recorded on the event as `marketing_consent`. Only the fields you map (email, consent, `copy_fields`) and the form and submission ids are stored; everything else is dropped first. Webflow signs only webhooks created through its API, so the setup creates it that way.
+- **jotform**: the same for Jotform, whose webhooks aren't signed: each one only gives the submission id (its multipart body's answers are dropped), and the submission is fetched with your API key. Questions are mapped by their IDs (`email_field`, `consent_field` with `consent_value`, `copy_fields`), and `form_id` limits it to one form.
 - **zendesk**: Ticket Created, Ticket Solved and Satisfaction Rated from triggers that post a JSON body the setup gives (Zendesk placeholders). Only the subject and status are kept, never the conversation, and requesters' names aren't taken. Event ids come from the signed body (ticket, status or rating, update time), so identical solves within one minute count once.
+- **gorgias**: Ticket Created, Ticket Closed (each closing) and Satisfaction Rated (with the score), from an HTTP integration whose body only names the ticket and carries a secret header; the ticket is fetched from Gorgias's API. Only the subject, status and channel are kept, never messages or the survey comment, and customers' names aren't taken. Setup: the API key, and the Pull tab's address set to your Gorgias account.
 - **aftership**: Shipment In Transit, Out For Delivery, Delivered and Shipment Exception, once per shipment and status, for the shipment's customer (not the sender). Draft out-for-delivery email (service message).
+- **shipstation**: ShipStation's webhooks aren't signed and only point at a batch of shipments (the integration's URL is the secret); the batch is fetched with your API key and secret, a page at a time, then each shipped order for its customer's email. Order Shipped once per shipment (not voided or return labels). It waits as long as ShipStation's rate limit says. Draft shipping email (service message).
 - **segment**: identify calls (with `traits.email`) become profiles and keep the Segment userId as a key (a known userId's email isn't changed by a call); track calls become events for the names in `settings.events` (Segment's ecommerce events by default), found by that userId. Calls from Segment's browser and mobile libraries are refused unless `allow_client_sources` is on, because a browser source's write key is public.
 
-
-### Not yet
-
-Cloudbeds, Acuity Scheduling, Eventbrite, Jotform, Gorgias and ShipStation have no recipe yet. Acuity, Eventbrite and ShipStation send thin webhooks that a recipe can turn into lookups with `next_request`; until then, build one with the steps at the top of this page.
 
 ## Worked example: "connect my Guesty"
 
