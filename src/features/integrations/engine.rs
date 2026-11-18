@@ -1189,13 +1189,12 @@ fn cooldown(headers: &Map<String, Value>) -> Option<chrono::Duration> {
     // Values are clamped before a duration is built, so an absurd header can't overflow it.
     let ms: i64 = if let Some(ms) = get("x-rate-limit-time-reset-ms").and_then(|v| v.parse::<i64>().ok()) {
         ms
-    } else if let Some(v) = get("retry-after") {
+    } else {
+        let v = get("retry-after")?;
         match v.parse::<i64>() {
             Ok(s) => s.clamp(0, 7200) * 1000,
             Err(_) => (DateTime::parse_from_rfc2822(v).ok()?.timestamp() - Utc::now().timestamp()).clamp(0, 7200) * 1000,
         }
-    } else {
-        return None;
     };
     Some(chrono::Duration::milliseconds(ms.clamp(1000, 7_200_000)))
 }

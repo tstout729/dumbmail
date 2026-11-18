@@ -46,7 +46,7 @@ impl Filter {
             Value::Bool(b) => b.to_string(),
             _ => return false,
         };
-        self.values.iter().any(|v| *v == text)
+        self.values.contains(&text)
     }
 }
 
