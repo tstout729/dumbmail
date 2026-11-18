@@ -4,6 +4,7 @@ import { ArrowRight } from "lucide-react";
 import { useSending, useSession } from "../../api";
 import { Button, Card, Field, Input, StatusBadge, Toggle } from "../../components/ui";
 import { formatNumber } from "../../lib/format";
+import { SendingReviewCard } from "../../features/screening/SendingReviewCard";
 import { formString, useSaveAccount } from "./shared";
 
 export function SendingSettingsPage() {
@@ -20,6 +21,7 @@ export function SendingSettingsPage() {
   };
   return (
     <div className="space-y-4">
+      <SendingReviewCard />
       <form onSubmit={onSubmit}>
         <Card title="Default sender">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
