@@ -73,16 +73,23 @@ pub async fn find_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -
 
 /// Create or update a profile, merging properties. Identity priority: id, external_id, email, phone.
 pub async fn upsert_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, false).await
+    upsert_inner(db, account_id, input, false, true).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
+}
+
+/// [`upsert_profile`] that only updates the profile these identifiers match, and returns None when
+/// nobody matches (it never creates one). For callers that create profiles through their own single
+/// insert (an integration's, which also holds them from marketing).
+pub async fn update_matching_profile(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Option<Upserted>> {
+    upsert_inner(db, account_id, input, false, false).await
 }
 
 /// For unauthenticated callers (browser snippet, forms): an existing profile's identity and
 /// names are only filled in where blank, never overwritten, so nobody can take over a profile.
 pub async fn upsert_profile_public(db: &PgPool, account_id: Uuid, input: &ProfileInput) -> AppResult<Upserted> {
-    upsert_inner(db, account_id, input, true).await
+    upsert_inner(db, account_id, input, true, true).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("profile upsert created nothing")))
 }
 
-async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool) -> AppResult<Upserted> {
+async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_only: bool, may_create: bool) -> AppResult<Option<Upserted>> {
     let email = match input.email.as_deref().filter(|e| !e.trim().is_empty()) {
         Some(e) => Some(normalize_email(e).ok_or_else(|| AppError::bad(format!("{e:?} is not a valid email")))?),
         None => None,
@@ -107,9 +114,12 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         if fill_only {
             if let Some(p) = &existing {
                 if let Some(narrowed) = protect_from_public(db, p, input, email.as_deref(), phone.as_deref()).await? {
-                    return Box::pin(upsert_inner(db, account_id, &narrowed, true)).await;
+                    return Box::pin(upsert_inner(db, account_id, &narrowed, true, may_create)).await;
                 }
             }
+        }
+        if existing.is_none() && !may_create {
+            return Ok(None);
         }
         let mut old_consent: Option<(String, String)> = None;
         let res = match &existing {
@@ -196,8 +206,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                 let source = if fill_only { EventSource::Browser } else { EventSource::Api };
                 let consent_before = old_consent.as_ref().map(|(e, s)| (e.as_str(), s.as_str()));
                 crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), consent_before, &u.profile, source).await;
-                return Ok(u);
+                return Ok(Some(u));
             }
+            // The matched profile was deleted before the update: an update-only caller creates nothing.
+            Err(sqlx::Error::RowNotFound) if !may_create => return Ok(None),
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {

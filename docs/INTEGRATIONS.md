@@ -156,6 +156,18 @@ Adds ids to the `keys` of a person found another way, so later actions find them
 
 Like a webhook's `next_request`, but there can be up to 100, in a pull page as well as a webhook (a history import looking up each order's refunds, say). Each is checked against the integration's `fetch` rules and reserved the same way; the script runs on each answer with `source` `fetch`.
 
+### upsert_object / delete_object
+
+```json
+{"type": "upsert_object", "object_type": "reservation", "external_id": "R-1042",
+ "fields": {"status": "confirmed", "check_in": "2026-12-01", "check_out": "2026-12-05", "nights": 4},
+ "profiles": [{"email": "ana@example.com", "relationship": "guest"}],
+ "as_of": "2026-11-17T10:00:00Z"}
+{"type": "delete_object", "object_type": "reservation", "external_id": "R-1042"}
+```
+
+Creates or updates a custom object (see dumbmail://docs/objects): fields merge, `null` removes one, every change is recorded and can start object flows. The type is made on first use with field types guessed from the values. `profiles` find people like `profile` in other actions (email, phone_number, external_id, or property + value with `if_missing`); someone new is held back from marketing as above, and a lookup that finds nobody leaves the object unlinked. `as_of` is the app's own time or version for this state: an older one never overwrites a newer one. `only_if_as_of_at_most` (instead of `as_of`) writes evidence about an existing object as of a moment, only if it hasn't changed since (the Guesty recipe's payment check uses it). The integration's `redact` list is applied to `fields` before they're written, so `**.doorCode` keeps a door code out of objects too. An object without an `external_id` gets one from the delivery (stable across retries). Counted as `objects_upserted` and `objects_deleted`; tests and dry runs say what would change.
+
 ### set_state
 
 ```json
@@ -268,7 +280,10 @@ OAuth2 tokens are cached (encrypted) and reused until five minutes before they e
 Every webhook, pull page, fetch and replay is a *delivery* with its time, source (`webhook`, `pull`, `fetch`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload.
 
 - A webhook is checked, stored and queued in one step, and answered with 200 in milliseconds; the script runs right after in the background.
-- A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again.
+- A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again. A page fetched again
+  before its progress was saved (after a crash or a failure) carries on with the earlier attempt's
+  record of what it already wrote, so those actions aren't applied twice: a delete it already made
+  never removes an object created since under the same id.
 - The first time a delivery's script runs successfully, its list of actions is kept with the delivery (missing `unique_id`s and `time`s filled in). A retry applies exactly that list; it never runs the script again, so a script whose output depends on the time can't record something twice. Each delivery also records which actions it already wrote, and a retry or replay skips those (`already_written` in the counts).
 - Nothing secret is stored or shown: every credential value, the access token, the encoded Basic value and anything else a request sent are masked wherever they appear (payloads, response headers such as `Link`, errors, the script's actions and logs, test results), including short ones (a PIN is masked where it stands as a whole word). The next-page request between pages is kept encrypted.
 - `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`. Replays count against the same limits as new webhooks.
@@ -313,7 +328,7 @@ Events from integrations start flows like any other events, and `{{ event.proper
 
 A recipe is a ready-made integration kept in the DumbMail repository under `recipes/<key>/`: `recipe.json` (name, description, signature, pull, settings, the metrics it records, the credentials it needs, setup steps and suggested flows; a metric is a name, or `{"name": ..., "purchase": true}` for one that records a purchase or a stay, which makes a review asked about it verified), `script.js`, and `fixtures/` with sample payloads and the actions they must produce. `create_integration_from_recipe` copies it into the account and creates the suggested flows as drafts (nothing sends until someone turns them on). Add one by pull request; the test suite runs every fixture.
 
-- **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Total (the booking's value, once), Reservation Confirmed (one per version of its dates, listing, status or guest), Reservation Cancelled, Reservation Updated and Inquiry Received, ordered by Guesty's own update time; door codes and access notes removed from stored payloads; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); and draft booking confirmation, pre-arrival and review request flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
+- **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Total (the booking's value, once), Reservation Confirmed (one per version of its dates, listing, status or guest), Reservation Cancelled, Reservation Updated and Inquiry Received, ordered by Guesty's own update time; door codes and access notes removed from stored payloads; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); each reservation kept as a `reservation` object linked to its guest (status, dates, listing, nights, guests, channel; written with Guesty's time so an older message never wins); and draft booking confirmation, pre-arrival, review request and object-based pre-arrival flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
 - **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order (not for checkouts that needed no payment), Refunded Order (once per refund, its own amount, once it has succeeded, found through its PaymentIntent or charge), Subscription Started (when it becomes active, once) / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
 - **calendly**: bookings and cancellations → Meeting Scheduled / Meeting Cancelled, with draft reminder and follow-up flows.
 

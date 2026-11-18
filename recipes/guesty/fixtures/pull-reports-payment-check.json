@@ -1,0 +1,131 @@
+{
+  "description": "A page of the hourly payment check (GET /v1/reservations-reports/reservations/search, shaped as Guesty's public documentation describes it): paid in full, something still due, and no money; each written as evidence only onto a reservation that hasn't changed since; dated by the response's Date header",
+  "expect": [
+    {
+      "external_id": "66f1c4a1246e7d9f0f8da88a",
+      "fields": {
+        "paid_checked_at": "2026-11-17T17:59:58.000Z",
+        "paid_in_full": true
+      },
+      "object_type": "reservation",
+      "only_if_as_of_at_most": "2026-11-17T17:59:58.000Z",
+      "type": "upsert_object"
+    },
+    {
+      "external_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+      "fields": {
+        "paid_checked_at": "2026-11-17T17:59:58.000Z",
+        "paid_in_full": false
+      },
+      "object_type": "reservation",
+      "only_if_as_of_at_most": "2026-11-17T17:59:58.000Z",
+      "type": "upsert_object"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "payment_check_pages": null,
+        "payment_checked_at": "2026-11-17T18:00:00.000Z"
+      }
+    },
+    {
+      "message": "payment check page 1: 3 reservations",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "page": 2,
+    "payload": {
+      "pagination": {
+        "hasMore": false,
+        "limit": 100,
+        "skip": 0
+      },
+      "results": [
+        {
+          "checkIn": "2026-12-19T16:00:00",
+          "checkInDate": "2026-12-19",
+          "checkOutDate": "2026-12-23",
+          "confirmationCode": "GY-h5SdcsBL",
+          "guestId": "66f1c4a06100f639de7adab8",
+          "guestNotes": "Door code 5512",
+          "keyCode": "5512",
+          "listingId": "66054019764cbb000f37c450",
+          "money": {
+            "balanceDue": 0,
+            "currency": "USD",
+            "hostPayout": 1210.2,
+            "isFullyPaid": true,
+            "totalPaid": 1312.5
+          },
+          "reservationId": "66f1c4a1246e7d9f0f8da88a",
+          "status": "confirmed"
+        },
+        {
+          "checkInDate": "2026-12-02",
+          "checkOutDate": "2026-12-05",
+          "confirmationCode": "GY-due",
+          "guestId": "67guest",
+          "money": {
+            "balanceDue": 412.5,
+            "currency": "USD",
+            "isFullyPaid": false,
+            "totalPaid": 600
+          },
+          "reservationId": "67a0b1c2d3e4f5a6b7c8d9e0",
+          "status": "confirmed"
+        },
+        {
+          "checkInDate": "2026-12-10",
+          "checkOutDate": "2026-12-12",
+          "confirmationCode": "GY-nomoney",
+          "reservationId": "68nomoney000000000000000",
+          "status": "confirmed"
+        }
+      ]
+    },
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "filter[checkInDate][gte]",
+          "2026-11-16"
+        ],
+        [
+          "filter[checkInDate][lt]",
+          "2027-01-01"
+        ],
+        [
+          "filter[status]",
+          "confirmed"
+        ],
+        [
+          "sort",
+          "_id"
+        ],
+        [
+          "limit",
+          "100"
+        ],
+        [
+          "skip",
+          "0"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/reservations-reports/reservations/search"
+    },
+    "response": {
+      "headers": {
+        "date": "Tue, 17 Nov 2026 17:59:58 GMT"
+      },
+      "status": 200
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-17T10:00:49.000Z",
+      "skip": 0
+    }
+  }
+}

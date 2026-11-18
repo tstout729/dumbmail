@@ -1,3 +1,4 @@
+import { objectTriggerSummary } from "../../features/objects/conditionRules";
 import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowTrigger, List, RandomSplitNode, Segment, WaitForReplyNode } from "../../api";
 import { shortId } from "../../lib/id";
 import { starterEmail } from "../email/blocks";
@@ -140,9 +141,12 @@ export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Seg
       const when = n === 0 ? "On" : `${Math.abs(n)} ${Math.abs(n) === 1 ? "day" : "days"} ${n < 0 ? "before" : "after"}`;
       return `${when} ${t.field || "a date"} in ${t.metric || "an event"}`;
     }
+    case "object":
+    case "object_date":
+      return objectTriggerSummary(t);
   }
 }
 
 export function triggerKind(t: FlowTrigger): string {
-  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date", event_date: "Event date" }[t.type];
+  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date", event_date: "Event date", object: "Object", object_date: "Object date" }[t.type];
 }

@@ -2,6 +2,35 @@
   "description": "reservation.updated.v2 where only the notes changed: Reservation Updated, but no new Reservation Confirmed version",
   "expect": [
     {
+      "as_of": "2026-11-17T21:00:00.000Z",
+      "external_id": "69c0d1e2f3",
+      "fields": {
+        "check_in": "2026-12-03",
+        "check_out": "2026-12-06",
+        "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 3,
+        "paid_checked_at": null,
+        "paid_in_full": null,
+        "source_channel": "direct",
+        "status": "confirmed"
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "property": "guesty_guest_id",
+          "relationship": "guest",
+          "value": "69guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
       "metric": "Reservation Booked",
       "profile": {
         "if_missing": "retry",

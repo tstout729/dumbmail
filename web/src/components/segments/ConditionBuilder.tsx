@@ -14,10 +14,11 @@ import type {
   SegmentDefinition,
   TimeOp,
 } from "../../api";
-import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, isValuelessOp, numericOps, predictions, productActions, propOps, timeOps } from "./conditions";
+import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, dayOps, eventOps, isValuelessOp, numericOps, predictions, productActions, propOps, timeOps } from "./conditions";
 import { useCatalogFacets } from "../../features/catalog/api";
 import type { ProductCondition } from "../../features/catalog/types";
 import { CouponConditionFields } from "../../features/coupons/CouponConditionFields";
+import { ObjectConditionFields } from "../../features/objects/ObjectConditionFields";
 import { ReviewConditionFields } from "../../features/reviews/ReviewConditionFields";
 import { LanguageConditionFields } from "../../features/translations/LanguageConditionFields";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
@@ -329,6 +330,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
       return <ProductFields condition={c} onChange={onChange} />;
     case "coupon":
       return <CouponConditionFields condition={c} onChange={onChange} />;
+    case "object":
+      return <ObjectConditionFields condition={c} onChange={onChange} />;
     case "review":
       return <ReviewConditionFields condition={c} onChange={onChange} />;
     case "list":
@@ -783,7 +786,7 @@ export function FilterFields({ filter, onChange, fieldPlaceholder, fieldList }: 
         ))}
       </Select>
       <ValueInput filter={filter} onChange={(value) => onChange({ ...filter, value })} />
-      {filter.op === "within_last_days" || filter.op === "more_than_days_ago" || filter.op === "anniversary_within_days" ? <Hint>days</Hint> : null}
+      {dayOps.has(filter.op) ? <Hint>days</Hint> : null}
     </>
   );
 }

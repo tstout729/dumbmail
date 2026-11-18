@@ -202,6 +202,76 @@ pub struct Log {
     pub message: String,
 }
 
+/// A person an object belongs to: who (as in other actions) and how (`guest`, `owner` ...).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWho {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default, alias = "phone")]
+    pub phone_number: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub property: Option<String>,
+    #[serde(default)]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub if_missing: Option<String>,
+    #[serde(default)]
+    pub relationship: Option<String>,
+}
+
+impl ObjectWho {
+    fn who(&self) -> Who {
+        Who {
+            email: self.email.clone(),
+            phone_number: self.phone_number.clone(),
+            external_id: self.external_id.clone(),
+            property: self.property.clone(),
+            value: self.value.clone(),
+            if_missing: self.if_missing.clone(),
+        }
+    }
+}
+
+/// Create or update a custom object (see `features::objects`), linked to the people given.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpsertObject {
+    pub object_type: String,
+    /// Its id in the app. Missing: one is made from the delivery (stable across retries).
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub fields: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub profiles: Vec<ObjectWho>,
+    /// Relationships whose links `profiles` replace (e.g. `["guest"]`): people linked that way and
+    /// not named here are unlinked at once, even when the new person isn't known yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replace_links: Vec<String>,
+    /// The app's own version for this state (a whole number or an RFC 3339 time): an older or
+    /// equal one never overwrites what's stored.
+    #[serde(default)]
+    pub as_of: Option<Value>,
+    /// Evidence about the object as of a moment (e.g. when a payment was checked): written only if
+    /// the object exists and its stored version isn't newer. Never creates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_if_as_of_at_most: Option<Value>,
+    /// Set by the engine (never by scripts in practice): fields put back from a delivery's sealed
+    /// copy, written only while the type still marks them sensitive.
+    #[serde(default, rename = "_sealed", skip_serializing_if = "Vec::is_empty")]
+    pub sealed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteObject {
+    pub object_type: String,
+    pub external_id: String,
+}
+
 /// Fetch another page (pulls), or fetch the record a webhook names (webhooks of an integration with
 /// pull settings, which give the site and the credentials). Fields given replace the previous
 /// request's; `query` merges. `context` is handed to the script run on the answer, as `input.context`.
@@ -240,12 +310,14 @@ pub enum Action {
     /// A lookup of a record (same shape as `next_request`, checked against the integration's fetch
     /// rules): unlike `next_request` there can be several, in a pull as well as a webhook.
     Lookup(NextRequest),
+    UpsertObject(UpsertObject),
+    DeleteObject(DeleteObject),
 }
 
 /// Most lookups one run may ask for.
 pub const MAX_LOOKUPS: usize = 100;
 
-pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request", "lookup"];
+pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request", "lookup", "upsert_object", "delete_object"];
 
 fn part<T: DeserializeOwned>(i: usize, kind: &str, v: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(v)).map_err(|e| format!("action {i} ({kind}): {e}"))
@@ -457,6 +529,42 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 }
                 Action::AddKeys(a)
             }
+            "upsert_object" => {
+                let a: UpsertObject = part(i, k, obj)?;
+                if !crate::features::objects::types::valid_type_key(a.object_type.trim()) {
+                    return Err(format!("action {i} ({k}): object_type is the type's key, 1-40 lower-case letters, digits and _ (e.g. reservation)"));
+                }
+                if a.external_id.as_deref().is_some_and(|e| e.trim().is_empty() || e.chars().count() > 200) {
+                    return Err(format!("action {i} ({k}): external_id must be 1-200 characters"));
+                }
+                crate::features::objects::store::check_fields_shape(&a.fields.clone().unwrap_or_default()).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                if a.profiles.len() > crate::features::objects::store::MAX_LINKS {
+                    return Err(format!("action {i} ({k}): at most {} profiles", crate::features::objects::store::MAX_LINKS));
+                }
+                for w in &a.profiles {
+                    check_who(i, k, &w.who())?;
+                    crate::features::objects::store::relationship(w.relationship.as_deref()).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                }
+                for r in &a.replace_links {
+                    crate::features::objects::store::relationship(Some(r)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                }
+                if a.replace_links.len() > 10 {
+                    return Err(format!("action {i} ({k}): replace at most 10 relationships"));
+                }
+                crate::features::objects::store::Version::parse(a.as_of.as_ref().unwrap_or(&Value::Null)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                crate::features::objects::store::Version::parse(a.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                if a.as_of.as_ref().is_some_and(|v| !v.is_null()) && a.only_if_as_of_at_most.as_ref().is_some_and(|v| !v.is_null()) {
+                    return Err(format!("action {i} ({k}): give as_of or only_if_as_of_at_most, not both"));
+                }
+                Action::UpsertObject(a)
+            }
+            "delete_object" => {
+                let a: DeleteObject = part(i, k, obj)?;
+                if !crate::features::objects::types::valid_type_key(a.object_type.trim()) || a.external_id.trim().is_empty() || a.external_id.chars().count() > 200 {
+                    return Err(format!("action {i} ({k}): needs object_type (the type's key) and external_id (1-200 characters)"));
+                }
+                Action::DeleteObject(a)
+            }
             "set_state" => {
                 let a: SetState = part(i, k, obj)?;
                 if serde_json::to_string(&a.values).map(|s| s.len()).unwrap_or(0) > MAX_STATE_BYTES {
@@ -532,6 +640,8 @@ pub struct Source {
     pub metrics: Vec<String>,
     /// The delivery whose ledger (`applied`) records each action as it is written.
     pub ledger: Option<Uuid>,
+    /// The integration's redact list: also removed from object fields before they're written.
+    pub redact: Vec<String>,
 }
 
 impl Source {
@@ -552,15 +662,23 @@ pub struct Counts {
     pub suppressed: u32,
     pub consents: u32,
     pub skipped: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objects_upserted: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objects_deleted: u32,
     /// New profiles held back from marketing (no opt-in).
     pub held: u32,
     /// Actions skipped on a retry or replay because they were already written.
     pub already_written: u32,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl Counts {
     pub fn wrote_anything(&self) -> bool {
-        self.profiles_created + self.profiles_updated + self.events + self.list_adds + self.list_removes + self.unsubscribes + self.suppressed + self.consents > 0
+        self.profiles_created + self.profiles_updated + self.events + self.list_adds + self.list_removes + self.unsubscribes + self.suppressed + self.consents + self.objects_upserted + self.objects_deleted > 0
     }
 }
 
@@ -804,22 +922,30 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
     if dry {
         return Ok(Some(Found { id: existing.as_ref().map(|p| p.id).unwrap_or_else(Uuid::nil), created: existing.is_none() }));
     }
-    if existing.is_none() {
-        if let Some((p, _)) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
-            out.counts.profiles_created += 1;
-            if !src.contacts_opted_in {
-                out.counts.held += 1;
+    // A new profile only ever comes from the single insert that holds it and records its source;
+    // an existing match is only updated (if it vanished meanwhile, look again).
+    let mut existing = existing;
+    for _ in 0..3 {
+        if existing.is_none() {
+            crate::features::objects::hooks::pause(src.account_id, "before_create").await;
+            if let Some((p, _)) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
+                out.counts.profiles_created += 1;
+                if !src.contacts_opted_in {
+                    out.counts.held += 1;
+                }
+                return Ok(Some(Found { id: p.id, created: true }));
             }
-            return Ok(Some(Found { id: p.id, created: true }));
+        } else {
+            crate::features::objects::hooks::pause(src.account_id, "before_update").await;
+            if let Some(up) = audience::update_matching_profile(&state.db, src.account_id, &input).await? {
+                after_write(state, src, up.profile.id, false, up.profile.email.as_deref(), false, out).await?;
+                mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
+                return Ok(Some(Found { id: up.profile.id, created: false }));
+            }
         }
+        existing = audience::find_profile(&state.db, src.account_id, &input).await?;
     }
-    let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
-    if up.created {
-        out.counts.profiles_created += 1;
-    }
-    after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), false, out).await?;
-    mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
-    Ok(Some(Found { id: up.profile.id, created: up.created }))
+    Err(AppError::Conflict("that profile kept changing while this ran; this delivery will be tried again".into()))
 }
 
 /// Create a profile the integration found nobody for, in one transaction with everything that
@@ -829,6 +955,39 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
 /// so a retry never finds an unheld profile it made. None when someone else created a matching
 /// profile at the same moment (the caller updates that one instead).
 async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<(Profile, Vec<String>)>> {
+    let mut tx = state.db.begin().await?;
+    // Each key value belongs to one profile: one another profile holds isn't given to this one.
+    lock_key_values(&mut tx, src.account_id, extra_keys).await?;
+    let taken = keys_held_elsewhere(&mut tx, src.account_id, Uuid::nil(), extra_keys).await?;
+    let extra: Map<String, Value> = extra_keys.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let created = insert_profile_in(&mut tx, src.account_id, &src.tag(), src.contacts_opted_in, input, props, &extra, no_marketing).await?;
+    let Some(p) = created else { return Ok(None) };
+    if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
+        // Another attempt of this delivery got there first: its profile is the one to update.
+        if !mark_applied(&mut *tx, d, i, print).await? {
+            return Ok(None);
+        }
+    }
+    tx.commit().await?;
+    crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
+    Ok(Some((p, taken)))
+}
+
+/// The one insert that creates a profile for an integration (`tag` is `integration:<id>`), inside
+/// the caller's transaction: where it came from, the marketing hold unless the owner said its
+/// contacts opted in, its trusted keys, a relay-address or `marketing: false` suppression, and which
+/// source supplied its email and phone. None when a matching profile exists already.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_profile_in(
+    conn: &mut sqlx::PgConnection,
+    account_id: Uuid,
+    tag: &str,
+    contacts_opted_in: bool,
+    input: &ProfileInput,
+    props: &Map<String, Value>,
+    extra_keys: &Map<String, Value>,
+    no_marketing: bool,
+) -> AppResult<Option<Profile>> {
     let email = input.email.as_deref().and_then(normalize_email);
     let phone = input.phone_number.as_deref().and_then(normalize_phone);
     let suppressed = match &email {
@@ -836,13 +995,7 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
         Some(_) if no_marketing => Some(REASON_NO_MARKETING),
         _ => None,
     };
-    let tag = src.tag();
-    let mut tx = state.db.begin().await?;
-    // Each key value belongs to one profile: one another profile holds isn't given to this one.
-    lock_key_values(&mut tx, src.account_id, extra_keys).await?;
-    let taken = keys_held_elsewhere(&mut tx, src.account_id, Uuid::nil(), extra_keys).await?;
-    let extra: Map<String, Value> = extra_keys.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let keys = Value::Object(merge_keys(&trusted_keys(props), &extra));
+    let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
     let q = format!(
         "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
                                     source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
@@ -850,39 +1003,35 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
                  CASE WHEN $3::text IS NULL THEN NULL ELSE $9 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $9 END)
          ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
     );
-    let created: Option<Profile> = sqlx::query_as(&q)
+    Ok(sqlx::query_as(&q)
         .bind(Uuid::now_v7())
-        .bind(src.account_id)
+        .bind(account_id)
         .bind(&email)
         .bind(&phone)
         .bind(&input.external_id)
         .bind(&input.first_name)
         .bind(&input.last_name)
         .bind(Value::Object(props.clone()))
-        .bind(&tag)
-        .bind(!src.contacts_opted_in)
+        .bind(tag)
+        .bind(!contacts_opted_in)
         .bind(&keys)
         .bind(suppressed)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let Some(p) = created else { return Ok(None) };
-    if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
-        mark_applied(&mut *tx, d, i, print).await?;
-    }
-    tx.commit().await?;
-    crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
-    Ok(Some((p, taken)))
+        .fetch_optional(conn)
+        .await?)
 }
 
-/// Record in the delivery's ledger that action `i` was written.
-async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<()> {
-    sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1")
+/// Record in the delivery's ledger that action `i` was written. False: another attempt already
+/// recorded it (it waited on this row and saw that attempt's entry), so a caller writing in the
+/// same transaction must roll back.
+pub(crate) async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<bool> {
+    let n = sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1 AND (applied->>$2) IS DISTINCT FROM $3")
         .bind(delivery)
         .bind(i.to_string())
         .bind(print)
         .execute(db)
-        .await?;
-    Ok(())
+        .await?
+        .rows_affected();
+    Ok(n > 0)
 }
 
 /// Note that this integration supplied the profile's current email and phone (only where the
@@ -1095,6 +1244,31 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                 }
                 out.effect(i, format!("stopped all marketing to {}", who_label(&who)));
             }
+            Action::UpsertObject(o) => upsert_object(state, src, i, o, &print, dry, out).await?,
+            Action::DeleteObject(d) => {
+                let id = crate::features::objects::store::ids_for(&state.db, src.account_id, &d.object_type, &[d.external_id.trim().to_string()]).await?;
+                if dry {
+                    out.effect(i, if id.is_empty() { format!("would skip deleting {} {}: there's no such object", d.object_type, d.external_id) } else { format!("would delete {} {}", d.object_type, d.external_id) });
+                    if !id.is_empty() {
+                        out.counts.objects_deleted += 1;
+                    }
+                    continue;
+                }
+                // The delete and its ledger entry commit together: a retry never deletes a
+                // replacement made later under the same external id.
+                let ids: Vec<Uuid> = id.iter().map(|(id, _)| *id).collect();
+                let receipt = match src.ledger {
+                    Some(delivery) => crate::features::objects::store::Receipt::Ledger { delivery, index: i, print: &print },
+                    None => crate::features::objects::store::Receipt::None,
+                };
+                crate::features::objects::hooks::pause(src.account_id, "before_delete").await;
+                let n = crate::features::objects::store::delete_with(&state.db, src.account_id, &ids, receipt).await?;
+                if src.ledger.is_some() {
+                    out.applied.insert(i.to_string(), json!(print));
+                }
+                out.counts.objects_deleted += n as u32;
+                out.effect(i, if n > 0 { format!("deleted {} {}", d.object_type, d.external_id) } else { format!("{} {} was already gone", d.object_type, d.external_id) });
+            }
             Action::SetState(s) => {
                 for (k, v) in &s.values {
                     if v.is_null() {
@@ -1121,6 +1295,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             }
         }
         if writes && !dry {
+            crate::features::objects::hooks::pause(src.account_id, "after_action").await;
             // Written right after the action's effects (in the same transaction where the action
             // wrote one itself, like a new profile); each effect is also keyed so a retry that
             // reruns it changes nothing.
@@ -1134,6 +1309,101 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
     }
     if new_state != *current_state {
         out.state = new_state;
+    }
+    Ok(())
+}
+
+/// Write (or, dry, describe) an `upsert_object`: its people are found or created as for other
+/// actions (new ones held back from marketing without an opt-in), the integration's redact list is
+/// applied to its fields, and it's written with the app's `as_of` so an older state never wins.
+async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObject, print: &str, dry: bool, out: &mut Outcome) -> AppResult<()> {
+    use crate::features::objects::store::{self, LinkReq, LinkWho, Receipt, Version, Write, Writer};
+    let key = o.object_type.trim();
+    let external_id = match (&o.external_id, dry) {
+        (Some(e), _) => e.trim().to_string(),
+        (None, true) => "(made from the delivery)".into(),
+        (None, false) => return Err(AppError::bad(format!("action {i} (upsert_object): external_id is missing"))),
+    };
+    let fields = o.fields.clone().unwrap_or_default();
+    let redact = super::redact::paths(&src.redact);
+    let mut links = Vec::new();
+    let mut who = Vec::new();
+    for w in &o.profiles {
+        let rel = store::relationship(w.relationship.as_deref())?;
+        let label = who_label(&w.who());
+        who.push(if rel.is_empty() { label } else { format!("{label} ({rel})") });
+        // A lookup that finds nobody yet leaves the object unlinked from them for now (the object
+        // itself is still written, and a replacement still unlinks whoever it replaces).
+        let target = match (&w.property, &w.value) {
+            (Some(p), Some(v)) => LinkWho::Property { name: p.clone(), value: key_text(v) },
+            _ => LinkWho::Ids {
+                email: w.email.as_deref().and_then(normalize_email),
+                phone_number: w.phone_number.as_deref().and_then(normalize_phone),
+                external_id: w.external_id.clone().filter(|s| !s.trim().is_empty()),
+            },
+        };
+        links.push(LinkReq { who: target, relationship: rel });
+    }
+    let replace = o.replace_links.iter().map(|r| store::relationship(Some(r))).collect::<AppResult<Vec<_>>>()?;
+    let people = if who.is_empty() { String::new() } else { format!(" for {}", who.join(", ")) };
+    let unlinks = if replace.is_empty() { String::new() } else { format!("; replaces its {} links", replace.join(", ")) };
+    if dry {
+        let (what, changed) = store::preview(state, src.account_id, key, &external_id, &fields, &redact).await?;
+        if what != "unchanged" {
+            out.counts.objects_upserted += 1;
+        }
+        let detail = if changed.is_empty() { String::new() } else { format!(" ({})", changed.join(", ")) };
+        out.effect(i, match what {
+            "created" => format!("would create {key} {external_id}{detail}{people}{unlinks}"),
+            "updated" => format!("would update {key} {external_id}{detail}{people}{unlinks}"),
+            _ => format!("{key} {external_id} unchanged{detail}{people}{unlinks}"),
+        });
+        return Ok(());
+    }
+    let w = Writer { account_id: src.account_id, source: src.tag(), redact, creator: store::Creator::Integration { tag: src.tag(), opted_in: src.contacts_opted_in } };
+    let req = Write {
+        type_key: key,
+        external_id: &external_id,
+        fields: &fields,
+        sealed: &o.sealed,
+        links,
+        replace,
+        as_of: Version::parse(o.as_of.as_ref().unwrap_or(&Value::Null))?,
+        at_most: Version::parse(o.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null))?,
+    };
+    // The write and this action's ledger entry commit together: a retry resumes after it.
+    let receipt = match src.ledger {
+        Some(delivery) => Receipt::Ledger { delivery, index: i, print },
+        None => Receipt::None,
+    };
+    let r = store::write(state, &w, &req, receipt).await?;
+    if src.ledger.is_some() {
+        out.applied.insert(i.to_string(), json!(print));
+    }
+    out.counts.profiles_created += r.created_profiles.len() as u32;
+    if !src.contacts_opted_in {
+        out.counts.held += r.created_profiles.len() as u32;
+    }
+    let mut named = r.changed.clone();
+    match r.hidden_changed {
+        0 => {}
+        1 => named.push("1 hidden field".into()),
+        n => named.push(format!("{n} hidden fields")),
+    }
+    let detail = if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) };
+    let links_line = match (r.linked, r.unlinked) {
+        (0, 0) => String::new(),
+        (l, u) => format!("; linked {l}, unlinked {u}"),
+    };
+    match r.result {
+        "created" | "updated" => {
+            out.counts.objects_upserted += 1;
+            out.effect(i, format!("{} {key} {}{detail}{people}{links_line}", r.result, r.external_id));
+        }
+        "older" | "duplicate" => out.effect(i, format!("kept {key} {}: this state is {} the one stored", r.external_id, if r.result == "older" { "older than" } else { "the same version as" })),
+        "stale" => out.effect(i, format!("kept {key} {}: it changed after this was checked", r.external_id)),
+        "not_found" => out.effect(i, format!("skipped {key} {}: there's no such object yet", r.external_id)),
+        _ => out.effect(i, format!("{key} {} unchanged{people}{links_line}", r.external_id)),
     }
     Ok(())
 }
@@ -1213,7 +1483,22 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
     // Nobody has these identifiers: create the profile with its hold, source, keys and suppression
     // in one transaction (with the ledger entry, when nothing else follows).
-    if audience::find_profile(&state.db, src.account_id, &input).await?.is_none() {
+    // A new profile only ever comes from the single insert that holds it; an existing match is only
+    // updated (if it vanished meanwhile, look again).
+    let mut tries = 0;
+    let up = loop {
+        tries += 1;
+        if tries > 3 {
+            return Err(AppError::Conflict("that profile kept changing while this ran; this delivery will be tried again".into()));
+        }
+        if audience::find_profile(&state.db, src.account_id, &input).await?.is_some() {
+            crate::features::objects::hooks::pause(src.account_id, "before_update").await;
+            match audience::update_matching_profile(&state.db, src.account_id, &input).await? {
+                Some(up) => break up,
+                None => continue,
+            }
+        }
+        crate::features::objects::hooks::pause(src.account_id, "before_create").await;
         let last = p.consent.is_empty();
         let props = p.properties.clone().unwrap_or_default();
         let keys = p.keys.clone().unwrap_or_default();
@@ -1244,8 +1529,7 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
             out.effect(i, line);
             return Ok(());
         }
-    }
-    let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
+    };
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;

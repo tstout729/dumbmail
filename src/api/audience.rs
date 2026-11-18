@@ -468,7 +468,7 @@ async fn count_into(state: &AppState, account_id: Uuid, id: Uuid, def: &segments
 pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the segment a name"))?;
     let raw = b.definition.unwrap_or(json!({"match": "all", "conditions": []}));
-    let def = segments::load(&state.db, account_id, &raw, None).await?;
+    let def = segments::load_checked(&state.db, account_id, &raw, None).await?;
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO segments (id, account_id, name, definition) VALUES ($1, $2, $3, $4)")
         .bind(id)
@@ -482,7 +482,7 @@ pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) 
 
 pub async fn update_segment(state: &AppState, account_id: Uuid, id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let cur = get_segment(state, account_id, id).await?;
-    let def = segments::load(&state.db, account_id, &b.definition.unwrap_or(cur.definition), Some(id)).await?;
+    let def = segments::load_checked(&state.db, account_id, &b.definition.unwrap_or(cur.definition), Some(id)).await?;
     sqlx::query("UPDATE segments SET name = COALESCE($2, name), definition = $3, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(b.name.filter(|n| !n.trim().is_empty()))
@@ -542,7 +542,7 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
 }
 
 pub async fn preview(state: &AppState, account_id: Uuid, definition: &Value) -> AppResult<Value> {
-    let def = segments::load(&state.db, account_id, definition, None).await?;
+    let def = segments::load_checked(&state.db, account_id, definition, None).await?;
     let (count, sample) = segments::preview(&state.db, account_id, &def, 10).await?;
     Ok(json!({"count": count, "sample": sample}))
 }

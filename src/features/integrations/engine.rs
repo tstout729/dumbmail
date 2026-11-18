@@ -48,7 +48,7 @@ pub const JOB_FETCH: &str = "integrations_fetch";
 pub const MAX_FETCH_HOPS: u64 = 3;
 
 fn source_of(i: &Integration, delivery: Option<Uuid>, ledger: Option<Uuid>) -> Source {
-    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger }
+    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger, redact: i.redact.clone() }
 }
 
 /// Everything secret about this integration, to scrub from what is stored or shown.
@@ -244,6 +244,11 @@ pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value>
         .enumerate()
         .map(|(i, a)| {
             let mut a = a.clone();
+            // An object without its own id gets one from the delivery, so a retry updates the same one.
+            if a["type"] == "upsert_object" && a.get("external_id").is_none_or(Value::is_null) {
+                let print = actions::fingerprint(&a);
+                a["external_id"] = json!(format!("delivery:{root}:{i}:{print}"));
+            }
             if a["type"] == "track_event" {
                 if a.get("unique_id").is_none_or(Value::is_null) {
                     let print = actions::fingerprint(&a);
@@ -262,33 +267,128 @@ pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value>
 /// masked (the list is stored, and what is stored is what is applied, now and on a retry). The
 /// script's `next_request` comes back separately, as it was: it can carry what the app put in a
 /// `Link` header, so it stays in memory (and encrypted when it must be kept).
-async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub) -> Result<(Vec<Value>, Option<NextRequest>), String> {
+async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub, redact: &[super::redact::Path]) -> Result<(Vec<Value>, Option<NextRequest>), String> {
     let raw = sandbox::run(slot, script, &input).await?;
     let parsed = actions::parse(&raw, pull)?;
     let next = parsed.into_iter().find_map(|a| if let Action::NextRequest(n) = a { Some(n) } else { None });
     let list = canonical(&raw_list(&raw), root, Utc::now());
-    let list: Vec<Value> = list.iter().map(|a| scrub.value(a)).collect();
+    // The redact list comes off object fields before the list is stored (it's applied from there).
+    let list: Vec<Value> = list.iter().map(|a| scrub.value(&redact_object_fields(a, redact))).collect();
     Ok((list, next))
+}
+
+/// An `upsert_object` action with the integration's redact paths applied to its fields.
+fn redact_object_fields(a: &Value, redact: &[super::redact::Path]) -> Value {
+    let mut a = a.clone();
+    if a["type"] == "upsert_object" && !redact.is_empty() {
+        if let Some(f) = a.get_mut("fields").filter(|f| f.is_object()) {
+            super::redact::apply(f, redact);
+        }
+    }
+    a
+}
+
+/// Take the fields an object's type marks sensitive out of a script's `upsert_object` actions,
+/// before the list is stored: the values come back sealed with the server key (by action index),
+/// for a retry to put back in memory, and the stored list never holds them.
+async fn seal_sensitive(state: &AppState, integ: &Integration, list: Vec<Value>) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+    let mut types: std::collections::HashMap<String, Option<crate::features::objects::types::ObjectType>> = std::collections::HashMap::new();
+    let mut sealed = Map::new();
+    let mut out = Vec::with_capacity(list.len());
+    for (i, mut a) in list.into_iter().enumerate() {
+        if a["type"] == "upsert_object" {
+            let key = a["object_type"].as_str().unwrap_or("").to_string();
+            if !types.contains_key(&key) {
+                let t = crate::features::objects::types::by_key(&state.db, integ.account_id, &key).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                types.insert(key.clone(), t);
+            }
+            if let (Some(Some(t)), Some(fields)) = (types.get(&key), a.get_mut("fields").and_then(Value::as_object_mut)) {
+                let hidden: Vec<String> = fields.keys().filter(|k| t.is_sensitive(k)).cloned().collect();
+                if !hidden.is_empty() {
+                    let mut taken = Map::new();
+                    for k in hidden {
+                        if let Some(v) = fields.remove(&k) {
+                            taken.insert(k, v);
+                        }
+                    }
+                    sealed.insert(i.to_string(), Value::Object(taken));
+                }
+            }
+        }
+        out.push(a);
+    }
+    let sealed = if sealed.is_empty() { None } else { Some(crate::crypto::encrypt(&state.cfg.secret_key, &Value::Object(sealed).to_string())?) };
+    Ok((out, sealed))
+}
+
+/// The stored list with its sealed sensitive fields put back (in memory only), each marked so the
+/// write keeps it only while its type still marks it sensitive (checked under the write's lock on
+/// the type): a field un-marked since, its old values erased, never gets one back from a retry.
+async fn unsealed(state: &AppState, account_id: Uuid, list: &[Value], sealed: Option<&str>) -> Result<Vec<Value>, String> {
+    let Some(s) = sealed else { return Ok(list.to_vec()) };
+    let unreadable = || "the delivery's hidden fields couldn't be read".to_string();
+    let opened = crate::crypto::decrypt(&state.cfg.secret_key, s).map_err(|_| unreadable())?;
+    let map: Map<String, Value> = serde_json::from_str(&opened).map_err(|_| unreadable())?;
+    let mut out = list.to_vec();
+    for (i, taken) in map {
+        let Ok(i) = i.parse::<usize>() else { continue };
+        let Some(action) = out.get_mut(i) else { continue };
+        let key = action["object_type"].as_str().unwrap_or("").to_string();
+        let t = crate::features::objects::types::by_key(&state.db, account_id, &key).await.map_err(|e| e.public_message())?;
+        let Some(taken) = taken.as_object() else { continue };
+        let kept: Map<String, Value> = taken.iter().filter(|(k, _)| t.as_ref().is_some_and(|t| t.is_sensitive(k))).map(|(k, v)| (k.clone(), v.clone())).collect();
+        if let Some(fields) = action.get_mut("fields").and_then(Value::as_object_mut) {
+            fields.extend(kept.clone());
+        }
+        action["_sealed"] = json!(kept.keys().collect::<Vec<_>>());
+    }
+    Ok(out)
+}
+
+/// Actions as a test run or dry run shows them: object fields the redact list names, or the
+/// object's type marks sensitive, are left out (only how many: `hidden_fields`).
+async fn shown_actions(state: &AppState, integ: &Integration, raw: &Value) -> Value {
+    let redact = super::redact::paths(&integ.redact);
+    let Some(list) = raw.as_array() else { return raw.clone() };
+    let mut out = Vec::with_capacity(list.len());
+    for a in list {
+        let mut a = redact_object_fields(a, &redact);
+        if a["type"] == "upsert_object" {
+            let key = a["object_type"].as_str().unwrap_or("").to_string();
+            let t = crate::features::objects::types::by_key(&state.db, integ.account_id, &key).await.ok().flatten();
+            let mut n = 0;
+            if let Some(fields) = a.get_mut("fields").and_then(Value::as_object_mut) {
+                let before = fields.len();
+                fields.retain(|k, _| !t.as_ref().is_some_and(|t| t.is_sensitive(k)));
+                n = before - fields.len();
+            }
+            if n > 0 {
+                a["hidden_fields"] = json!(n);
+            }
+        }
+        out.push(a);
+    }
+    Value::Array(out)
 }
 
 /// Job: process one stored delivery (webhook or replay). The first successful script run fixes the
 /// delivery's action list; a retry applies that list and never runs the script again.
 pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Result<()> {
-    type Row = (Uuid, Uuid, String, String, Option<String>, Value, Value, Option<String>, i32, Option<Value>, Option<Uuid>, Value, Option<Value>);
+    type Row = (Uuid, Uuid, String, String, Option<String>, Value, Value, Option<String>, i32, Option<Value>, Option<Uuid>, Value, Option<Value>, Option<String>);
     let row: Option<Row> = sqlx::query_as(
-        "SELECT integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, actions FROM integration_deliveries WHERE id = $1",
+        "SELECT integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, actions, sealed_fields FROM integration_deliveries WHERE id = $1",
     )
     .bind(delivery_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, stored)) = row else { return Ok(()) };
+    let Some((integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, stored, mut sealed)) = row else { return Ok(()) };
     if !matches!(status.as_str(), "pending" | "error") {
         return Ok(());
     }
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
     if integ.status != "enabled" {
         // Turned off while it waited: nothing is written, and its payload isn't kept.
-        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now(), body = NULL, headers = '{}', query = '{}', body_bytes = 0 WHERE id = $1")
+        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now(), body = NULL, headers = '{}', query = '{}', body_bytes = 0, sealed_fields = NULL WHERE id = $1")
             .bind(delivery_id)
             .execute(&state.db)
             .await?;
@@ -330,34 +430,39 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 }
             }
             let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
-            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull" || can_fetch, root, &scrub).await;
+            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull" || can_fetch, root, &scrub, &super::redact::paths(&integ.redact)).await;
             drop(slot);
             match ran {
                 Ok((list, next)) => {
                     let list: Vec<Value> = list.into_iter().filter(|a| a["type"] != "next_request").collect();
                     // Pull deliveries (replayed pages) never fetch more; a webhook's fetch is kept
                     // encrypted with its action list (it can carry what the app sent).
+                    let (list, seal) = seal_sensitive(state, &integ, list).await?;
                     let lookup = match (next.filter(|_| can_fetch), &rules) {
                         (Some(n), Some(r)) => Some(checked_lookup(&integ, r, &n)),
                         _ => None,
                     };
-                    let sealed = match lookup {
+                    let sealed_next = match lookup {
                         Some(Ok(n)) => seal_next(state, &n).map_err(|e| anyhow::anyhow!(e.public_message()))?,
                         Some(Err(e)) => return delivery_failed(state, &integ, &scrub, delivery_id, attempts, started.elapsed().as_millis() as i32, &e).await,
                         None => Value::Null,
                     };
-                    // Whoever stored a list first wins; this run applies that one (and its fetch).
-                    let (kept, kept_fetch): (Value, Option<Value>) = sqlx::query_as(
+                    // Whoever stored a list first wins; this run applies that one (its sealed fields
+                    // and its fetch).
+                    let (kept, kept_seal, kept_fetch): (Value, Option<String>, Option<Value>) = sqlx::query_as(
                         "UPDATE integration_deliveries
                          SET request = CASE WHEN actions IS NULL THEN jsonb_strip_nulls((COALESCE(request, '{}'::jsonb) - 'fetch_enc') || jsonb_build_object('fetch_enc', $3::jsonb)) ELSE request END,
+                             sealed_fields = CASE WHEN actions IS NULL THEN $4 ELSE sealed_fields END,
                              actions = COALESCE(actions, $2)
-                         WHERE id = $1 RETURNING actions, request->'fetch_enc'",
+                         WHERE id = $1 RETURNING actions, sealed_fields, request->'fetch_enc'",
                     )
                     .bind(delivery_id)
                     .bind(Value::Array(list))
-                    .bind(sealed)
+                    .bind(sealed_next)
+                    .bind(seal)
                     .fetch_one(&state.db)
                     .await?;
+                    sealed = kept_seal;
                     fetch_next = kept_fetch.unwrap_or(Value::Null);
                     Ok(kept.as_array().cloned().unwrap_or_default())
                 }
@@ -368,7 +473,10 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let skip = applied.as_object().cloned().unwrap_or_default();
     let src = source_of(&integ, Some(root), Some(delivery_id));
     let res = match list {
-        Ok(list) => match actions::parse(&Value::Array(list.clone()), true) {
+        // Applied with the sealed fields put back; fingerprints come from the stored list.
+        // A sealed list that can't be opened fails like any other bad delivery (and its seal is
+        // dropped once no retry is left), rather than erroring the job forever.
+        Ok(list) => match unsealed(state, account_id, &list, sealed.as_deref()).await.and_then(|full| actions::parse(&Value::Array(full), true)) {
             Ok(acts) => {
                 let (o, err) = actions::apply(state, &src, &acts, &list, &skip, &integ.state_map(), false).await;
                 match err {
@@ -394,7 +502,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 result["fetch"] = json!("queued");
             }
             let mut tx = state.db.begin().await?;
-            sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, error = NULL, duration_ms = $4, attempts = attempts + 1, next_attempt_at = NULL, processed_at = now() WHERE id = $1")
+            sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, error = NULL, duration_ms = $4, attempts = attempts + 1, next_attempt_at = NULL, processed_at = now(), sealed_fields = NULL WHERE id = $1")
                 .bind(delivery_id)
                 .bind(if fetch { "ok" } else { status_for(n) })
                 .bind(scrub.value(&result))
@@ -479,7 +587,9 @@ async fn delivery_failed(state: &AppState, integ: &Integration, scrub: &Scrub, d
     let tries = attempts + 1;
     let retry_at: Option<DateTime<Utc>> = (tries < MAX_ATTEMPTS).then(|| Utc::now() + chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)]));
     let mut tx = state.db.begin().await?;
-    sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = $4, next_attempt_at = $5, processed_at = now() WHERE id = $1")
+    // Sealed fields stay only while a retry may need them.
+    sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = $4, next_attempt_at = $5, processed_at = now(),
+                    sealed_fields = CASE WHEN $5::timestamptz IS NULL THEN NULL ELSE sealed_fields END WHERE id = $1")
         .bind(delivery_id)
         .bind(&msg)
         .bind(ms)
@@ -677,7 +787,7 @@ const FREE_OLDEST_SQL: &str = "WITH ranked AS (
         WHERE account_id = $1 AND body IS NOT NULL AND status <> 'pending' AND NOT (status = 'error' AND next_attempt_at IS NOT NULL)
         ORDER BY created_at, id LIMIT 1000),
      pick AS (SELECT id, body_bytes FROM ranked WHERE running - body_bytes < $2),
-     cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0 FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
+     cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0, sealed_fields = NULL FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
      SELECT sum(body_bytes)::bigint FROM cleared";
 
 /// Store a pull page's delivery (never deduplicated, never queued). Over the payload budget, the
@@ -778,16 +888,16 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
     drop(slot);
     let acts = match actions::parse(&raw, is_pull) {
         Ok(a) => a,
-        Err(e) => return Ok(json!({"ok": false, "actions": raw, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
+        Err(e) => return Ok(json!({"ok": false, "actions": shown_actions(state, integ, &raw).await, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
     };
     let (o, err) = actions::apply(state, &source_of(integ, None, None), &acts, &raw_list(&raw), &Map::new(), &integ.state_map(), true).await;
     match err {
         None => Ok(json!({
-            "ok": true, "actions": raw, "would_write": o.counts, "effects": o.effects, "logs": o.logs,
+            "ok": true, "actions": shown_actions(state, integ, &raw).await, "would_write": o.counts, "effects": o.effects, "logs": o.logs,
             "state_after": if o.state.is_empty() { Value::Null } else { Value::Object(o.state) },
             "next_request": o.next_request, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64,
         })),
-        Some(e) => Ok(json!({"ok": false, "actions": raw, "error": e.public_message(), "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
+        Some(e) => Ok(json!({"ok": false, "actions": shown_actions(state, integ, &raw).await, "error": e.public_message(), "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
     }
 }
 
@@ -992,6 +1102,30 @@ async fn pull_failed(state: &AppState, integ: &Integration, scrub: &Scrub, run_i
     Ok(())
 }
 
+/// Where a pull page is: its integration, run (or the live pull) and request position.
+fn page_key(integration_id: Uuid, run: Option<&str>, pages: u32, next: &NextRequest) -> String {
+    use sha2::Digest;
+    let at = json!({"integration": integration_id, "run": run.unwrap_or("live"), "page": pages, "next": next});
+    hex::encode(sha2::Sha256::digest(at.to_string().as_bytes()))
+}
+
+/// Give `delivery` the page's key and the ledger of any earlier attempt at that page not yet
+/// checkpointed (taking the key from it), in one statement. Returns the ledger to skip by.
+async fn resume_page(state: &AppState, integration_id: Uuid, delivery: Uuid, key: &str) -> anyhow::Result<Map<String, Value>> {
+    let applied: Value = sqlx::query_scalar(
+        "WITH old AS (UPDATE integration_deliveries SET page_key = NULL
+                      WHERE integration_id = $1 AND page_key = $2 AND id <> $3 AND created_at > now() - interval '7 days' RETURNING applied),
+              carried AS (SELECT coalesce(jsonb_object_agg(e.key, e.value), '{}'::jsonb) AS a FROM old, jsonb_each(old.applied) e)
+         UPDATE integration_deliveries SET page_key = $2, applied = (SELECT a FROM carried) || applied WHERE id = $3 RETURNING applied",
+    )
+    .bind(integration_id)
+    .bind(key)
+    .bind(delivery)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(applied.as_object().cloned().unwrap_or_default())
+}
+
 /// Job: fetch up to a few pages of a pull (or backfill), running the script on each, then hand
 /// over to a new job if the script asks for more. At most [`PULLS_PER_ACCOUNT`] run at once per
 /// account (and a few in all); the rest wait in the queue.
@@ -1082,7 +1216,12 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         extra.insert("backfill".into(), if backfill { json!({"since": bf["since"]}) } else { Value::Null });
         let input = Input { source: "pull".into(), content_type: ct.clone(), body: resp.body.clone(), extra, ..Default::default() };
         let delivery = store_log(state, &integ, &scrub, NewDelivery { content_type: ct.as_deref(), body, request: Some(logged_req), ..NewDelivery::log("pull", "ok", None) }).await?;
-        let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub).await;
+        // The same page tried again (its job retried after a crash, or the next scheduled pull
+        // from the same place) carries on with the earlier attempt's ledger: what it already wrote
+        // is skipped, so a retried delete never removes a replacement made since. The key is
+        // cleared when the page's progress is saved.
+        let skip = resume_page(state, integ.id, delivery, &page_key(integ.id, run, pages, &next)).await?;
+        let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub, &super::redact::paths(&integ.redact)).await;
         drop(slot);
         // A backfill page is applied under a lock on the integration that a replacement or a
         // cancel must wait for, and only while its run is still the current one: a replaced run
@@ -1096,7 +1235,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 .await?;
             if current.is_none() {
                 guard.rollback().await?;
-                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1 WHERE id = $1")
+                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1, sealed_fields = NULL, page_key = NULL WHERE id = $1")
                     .bind(delivery)
                     .execute(&state.db)
                     .await?;
@@ -1105,12 +1244,15 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         }
         let mut raw_next = None;
         let res = match ran {
-            Ok((list, next)) => {
+            Ok((full, next)) => {
                 raw_next = next;
+                // The stored list never holds sensitive object fields; this page applies them from
+                // memory (a retried page fetches and runs again).
+                let (list, _) = seal_sensitive(state, &integ, full.clone()).await?;
                 sqlx::query("UPDATE integration_deliveries SET actions = $2 WHERE id = $1").bind(delivery).bind(Value::Array(list.clone())).execute(&state.db).await?;
-                match actions::parse(&Value::Array(list.clone()), true) {
+                match actions::parse(&Value::Array(full), true) {
                     Ok(acts) => {
-                        let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery), Some(delivery)), &acts, &list, &Map::new(), &run_state, false).await;
+                        let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery), Some(delivery)), &acts, &list, &skip, &run_state, false).await;
                         match err {
                             None => Ok((o, acts)),
                             Some(e) => Err(e.public_message()),
@@ -1125,7 +1267,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         pages += 1;
         match res {
             Ok((o, acts)) => {
-                sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, duration_ms = $4, attempts = 1 WHERE id = $1")
+                sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, duration_ms = $4, attempts = 1, page_key = NULL WHERE id = $1")
                     .bind(delivery)
                     .bind(status_for(acts.len()))
                     .bind(scrub.value(&result_json(&o)))
