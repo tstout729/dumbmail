@@ -61,23 +61,46 @@ fn shortenable(link: &str, own: &HashSet<String>) -> bool {
     !own.contains(&host) && !OPT_OUT_WORDS.iter().any(|w| where_to.contains(w))
 }
 
-/// Where in a text's template each link a send would shorten is written: the exact characters the
-/// URL pattern matches (nothing trimmed: they are the destination), outside template tags, at most
-/// [`MAX_LINKS`] different links.
+/// How much of what the URL pattern found is the link: trailing sentence punctuation (`.` `,` `!`
+/// `?` `;` `:`, quotes, and closing brackets that aren't balanced inside the link) is left out, so
+/// "Shop the sale: https://shop.example/sale." links to `/sale` and keeps its full stop in the text.
+pub fn link_len(found: &str) -> usize {
+    let mut end = found.len();
+    while let Some(last) = found[..end].chars().last() {
+        let link = &found[..end];
+        let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
+        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Where in a text's template each link a send would shorten is written: the link the URL pattern
+/// found, without trailing sentence punctuation ([`link_len`]), outside template tags, at most
+/// [`MAX_LINKS`] different links. These exact characters are what the short link replaces and where
+/// it goes; the punctuation stays in the text after it.
 fn literal_spans(template: &str, own: &HashSet<String>) -> Vec<std::ops::Range<usize>> {
     let tags: Vec<std::ops::Range<usize>> = TAG.find_iter(template).map(|m| m.range()).collect();
     let mut distinct: Vec<&str> = Vec::new();
     let mut out = Vec::new();
     for m in URL.find_iter(template) {
-        let r = m.range();
-        if tags.iter().any(|t| t.start < r.end && r.start < t.end) || !shortenable(m.as_str(), own) {
+        let found = m.range();
+        if tags.iter().any(|t| t.start < found.end && found.start < t.end) {
             continue;
         }
-        if !distinct.contains(&m.as_str()) {
+        let r = found.start..found.start + link_len(m.as_str());
+        let link = &template[r.clone()];
+        if !shortenable(link, own) {
+            continue;
+        }
+        if !distinct.contains(&link) {
             if distinct.len() >= MAX_LINKS {
                 continue;
             }
-            distinct.push(m.as_str());
+            distinct.push(link);
         }
         out.push(r);
     }
@@ -167,8 +190,9 @@ impl SmsLinks for TextLinks {
         replace_literals(template, &self.own, |l| self.links.get(l).cloned())
     }
 
-    fn issued(&self, link: &str) -> bool {
-        self.issued.contains(link)
+    fn issued(&self, found: &str) -> bool {
+        // The rendered text's URL pattern also takes the punctuation after a short link.
+        self.issued.contains(&found[..link_len(found)])
     }
 }
 
@@ -331,8 +355,8 @@ impl SmsLinks for Sample {
         replace_literals(template, &self.own, |_| Some(self.short.clone()))
     }
 
-    fn issued(&self, link: &str) -> bool {
-        link == self.short
+    fn issued(&self, found: &str) -> bool {
+        found[..link_len(found)] == self.short
     }
 }
 
@@ -370,17 +394,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_links_written_literally_are_shortened_exactly_as_written() {
+    fn trailing_sentence_punctuation_isnt_part_of_the_link() {
+        let cut = |f: &'static str| &f[..link_len(f)];
+        assert_eq!(cut("https://shop.example/sale."), "https://shop.example/sale");
+        assert_eq!(cut("https://shop.example/a,"), "https://shop.example/a");
+        assert_eq!(cut("https://shop.example/go!"), "https://shop.example/go");
+        assert_eq!(cut("https://shop.example/q?"), "https://shop.example/q");
+        assert_eq!(cut("https://shop.example/x?a=1;"), "https://shop.example/x?a=1");
+        assert_eq!(cut("https://shop.example/y:"), "https://shop.example/y");
+        assert_eq!(cut("https://shop.example/sale)"), "https://shop.example/sale", "a `)` with no `(` in the link closes the sentence's bracket");
+        assert_eq!(cut("https://en.wikipedia.org/wiki/Foo_(bar)"), "https://en.wikipedia.org/wiki/Foo_(bar)", "a balanced `)` is part of the link");
+        assert_eq!(cut("https://en.wikipedia.org/wiki/Foo_(bar))."), "https://en.wikipedia.org/wiki/Foo_(bar)");
+        assert_eq!(cut("https://shop.example/c\""), "https://shop.example/c");
+        assert_eq!(cut("https://shop.example/d'"), "https://shop.example/d");
+        assert_eq!(cut("https://shop.example/e!)."), "https://shop.example/e");
+        assert_eq!(cut("https://shop.example/"), "https://shop.example/");
+        assert_eq!(cut("https://shop.example/?a=b"), "https://shop.example/?a=b");
+    }
+
+    #[test]
+    fn only_links_written_literally_are_shortened() {
         let own: HashSet<String> = ["pl.test".to_string()].into_iter().collect();
-        let body = "Acme: sale https://shop.test/a! Also https://shop.test/a! and https://shop.test/p?u={{ email }} and {{ product_url }} \
-                    and {{ 'https://shop.test/a!' }} and https://pl.test/f/abc and https://shop.test/{% if x %}b{% endif %} http://shop.test/c. \
+        let body = "Acme: sale https://shop.test/a! Also (https://shop.test/a) and https://shop.test/p?u={{ email }} and {{ product_url }} \
+                    and {{ 'https://shop.test/a' }} and https://pl.test/f/abc and https://shop.test/{% if x %}b{% endif %} http://shop.test/c. \
                     https://shop.test/unsubscribe https://shop.test/x/STOP https://stop.shop.test/ https://shop.test/opt-out?y=1";
-        // Nothing is trimmed: the `!` and `.` are part of what's replaced, and so of the destination.
-        assert_eq!(written_links(body, &own), vec!["https://shop.test/a!".to_string(), "http://shop.test/c.".to_string()]);
+        assert_eq!(written_links(body, &own), vec!["https://shop.test/a".to_string(), "http://shop.test/c".to_string()]);
+        // The punctuation stays in the text after what's replaced.
         let out = replace_literals(body, &own, |l| Some(format!("<{l}>")));
-        assert!(out.starts_with("Acme: sale <https://shop.test/a!> Also <https://shop.test/a!> and https://shop.test/p?u={{ email }}"), "{out}");
-        assert!(out.contains("{{ 'https://shop.test/a!' }}"), "a link inside a template tag is left to the template: {out}");
-        assert!(out.contains(" <http://shop.test/c.> https://shop.test/unsubscribe https://shop.test/x/STOP https://stop.shop.test/ https://shop.test/opt-out?y=1"), "{out}");
+        assert!(out.starts_with("Acme: sale <https://shop.test/a>! Also (<https://shop.test/a>) and https://shop.test/p?u={{ email }}"), "{out}");
+        assert!(out.contains("{{ 'https://shop.test/a' }}"), "a link inside a template tag is left to the template: {out}");
+        assert!(out.contains(" <http://shop.test/c>. https://shop.test/unsubscribe https://shop.test/x/STOP https://stop.shop.test/ https://shop.test/opt-out?y=1"), "{out}");
         let many: String = (0..15).map(|i| format!("https://shop.test/{i} ")).collect();
         assert_eq!(written_links(&many, &own).len(), MAX_LINKS);
         let long = format!("https://shop.test/{}", "a".repeat(MAX_URL));

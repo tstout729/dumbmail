@@ -566,19 +566,21 @@ async fn shortening_changes_nothing_but_the_link() {
     let mut h = harness!();
     let (_, list) = setup(&mut h).await;
     let (_, phone) = texter(&mut h, &list, 8001).await;
-    let id = sms_campaign(&mut h, &list, "Acme Goods: wow https://shop.test/deal! and {{ 'https://shop.test/deal!' }} or https://shop.test/unsubscribe-me").await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: wow https://shop.test/deal! and {{ 'https://shop.test/deal' }} or https://shop.test/unsubscribe-me. Shop the sale: https://shop.test/sale.").await;
     launch(&mut h, &id).await;
     let body = body_to(&h, &phone);
     // Only the link written literally is shortened: the same link produced by the template, and a
     // link about unsubscribing, keep the long form that shows where they go.
     let p = short_paths(&body);
-    assert_eq!(p.len(), 1, "{body}");
-    assert!(body.starts_with(&format!("Acme Goods: wow https://pl.test/s/{} and https://pl.test/t/c/", p[0])), "{body}");
+    assert_eq!(p.len(), 2, "{body}");
+    assert!(body.starts_with(&format!("Acme Goods: wow https://pl.test/s/{}! and https://pl.test/t/c/", p[0])), "{body}");
+    assert!(body.contains(&format!("Shop the sale: https://pl.test/s/{}. Reply STOP", p[1])), "the full stop stays in the text: {body}");
     assert_eq!(body.matches("/t/c/").count(), 2, "{body}");
-    // The destination is exactly what was replaced, `!` included.
+    // The destination is exactly what was replaced; the punctuation left in the text isn't part of it.
     let (s, location, _) = click(&h, &p[0]).await;
     assert!(s.is_redirection());
-    assert_eq!(location.as_deref(), Some("https://shop.test/deal!"));
+    assert_eq!(location.as_deref(), Some("https://shop.test/deal"));
+    assert_eq!(click(&h, &p[1]).await.1.as_deref(), Some("https://shop.test/sale"));
     h.cleanup().await;
 }
 

@@ -16,9 +16,11 @@ them off in Settings → Texting (`PATCH /api/short-links/settings`, MCP
 ## What gets shortened
 
 - Links the sender typed into the text: `http` and `https` links written literally in the message,
-  outside any template tag. The short link replaces exactly the characters of the link, up to the
-  next space, and the destination is exactly those characters: nothing is trimmed (so leave a space
-  before a full stop that isn't part of the link).
+  outside any template tag. Sentence punctuation right after a link (`.` `,` `!` `?` `;` `:`, quotes,
+  and closing brackets that aren't balanced inside the link) isn't part of it: it stays in the text
+  after the short link. The destination is exactly the characters the short link replaced. So
+  "Shop the sale: https://shop.com/sale." shows the short link followed by a full stop and goes to
+  `https://shop.com/sale`.
 - Not shortened (they keep the long tracked form, as before): anything a variable or template tag
   produces, even when it's a link written elsewhere in the message (like
   `https://shop.com/?ref={{ email }}` or a product link); links whose address or path contains
