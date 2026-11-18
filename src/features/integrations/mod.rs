@@ -235,6 +235,7 @@ impl Feature for Module {
                 })
             }
             engine::JOB_PULL => Some(engine::run_pull(state, payload).await),
+            engine::JOB_FETCH => Some(engine::run_fetch(state, payload).await),
             _ => None,
         }
     }

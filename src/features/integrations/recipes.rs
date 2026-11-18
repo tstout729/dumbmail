@@ -175,7 +175,7 @@ mod tests {
                 let out: Value = super::super::sandbox::run_engine(&r.script, &input.to_string(), std::time::Duration::from_secs(5))
                     .map(|t| serde_json::from_str(&t).unwrap())
                     .unwrap_or_else(|e| panic!("{}/{name}: {e}", r.key));
-                super::super::actions::parse(&out, pull).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
+                super::super::actions::parse(&out, pull || !r.manifest["pull"].is_null()).unwrap_or_else(|e| panic!("{}/{name}: invalid actions: {e}", r.key));
                 // Long outputs are checked by their action counts and last two actions.
                 let summary_only = f["summary_only"] == true;
                 let got = if summary_only {

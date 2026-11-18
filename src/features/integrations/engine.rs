@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::actions::{self, Action, NextRequest, Outcome, Source};
 use super::model::{self, Integration};
-use super::pull::{self, Scrub, TokenFor, Vars};
+use super::pull::{self, PullConfig, Scrub, TokenFor, Vars};
 use super::sandbox::{self, Slot, Slots};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -42,6 +42,10 @@ pub const RETENTION_DAYS: i64 = 30;
 
 pub const JOB_DELIVERY: &str = "integrations_delivery";
 pub const JOB_PULL: &str = "integrations_pull";
+pub const JOB_FETCH: &str = "integrations_fetch";
+/// Fetches one webhook may chain: its script asks for one, the script run on that answer may ask
+/// for another, and so on, up to this many.
+pub const MAX_FETCH_HOPS: u64 = 3;
 
 fn source_of(i: &Integration, delivery: Option<Uuid>, ledger: Option<Uuid>) -> Source {
     Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger }
@@ -284,6 +288,11 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let replay = source == "replay";
     let shown_source = if replay { original.clone().unwrap_or_else(|| "webhook".into()) } else { source.clone() };
     let root = replay_of.unwrap_or(delivery_id);
+    // A webhook (or the answer to a fetch it asked for) may ask to fetch the record it names, when
+    // the integration's pull settings give the site and credentials to use.
+    let hop = request.as_ref().and_then(|r| r["fetch"]["hop"].as_u64()).unwrap_or(0);
+    let can_fetch = integ.pull_config().is_some() && matches!(shown_source.as_str(), "webhook" | "fetch") && hop < MAX_FETCH_HOPS;
+    let mut fetch_next = request.as_ref().map(|r| r["fetch_enc"].clone()).unwrap_or(Value::Null);
     let list: Result<Vec<Value>, String> = match stored.as_ref().and_then(|v| v.as_array()) {
         Some(a) => Ok(a.clone()),
         None => {
@@ -291,21 +300,46 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 return requeue(state, JOB_DELIVERY, json!({"delivery_id": delivery_id})).await;
             };
             let mut extra = Map::new();
-            if let Some(resp) = request.as_ref().and_then(|r| r.get("response")) {
-                extra.insert("response".into(), resp.clone());
+            if let Some(r) = request.as_ref() {
+                if let Some(resp) = r.get("response") {
+                    extra.insert("response".into(), resp.clone());
+                }
+                if shown_source == "fetch" {
+                    let mut made = r.clone();
+                    if let Some(o) = made.as_object_mut() {
+                        for k in ["response", "fetch", "context", "fetch_enc", "original_source"] {
+                            o.remove(k);
+                        }
+                    }
+                    extra.insert("request".into(), made);
+                    extra.insert("context".into(), r.get("context").cloned().unwrap_or(Value::Null));
+                }
             }
             let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
-            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub).await;
+            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull" || can_fetch, root, &scrub).await;
             drop(slot);
             match ran {
-                Ok((list, _)) => {
+                Ok((list, next)) => {
                     let list: Vec<Value> = list.into_iter().filter(|a| a["type"] != "next_request").collect();
-                    // Whoever stored a list first wins; this run applies that one.
-                    let kept: Value = sqlx::query_scalar("UPDATE integration_deliveries SET actions = COALESCE(actions, $2) WHERE id = $1 RETURNING actions")
-                        .bind(delivery_id)
-                        .bind(Value::Array(list))
-                        .fetch_one(&state.db)
-                        .await?;
+                    // Pull deliveries (replayed pages) never fetch more; a webhook's fetch is kept
+                    // encrypted with its action list (it can carry what the app sent).
+                    let sealed = match next.filter(|_| can_fetch) {
+                        Some(n) => seal_next(state, &n).map_err(|e| anyhow::anyhow!(e.public_message()))?,
+                        None => Value::Null,
+                    };
+                    // Whoever stored a list first wins; this run applies that one (and its fetch).
+                    let (kept, kept_fetch): (Value, Option<Value>) = sqlx::query_as(
+                        "UPDATE integration_deliveries
+                         SET request = CASE WHEN actions IS NULL THEN jsonb_strip_nulls((COALESCE(request, '{}'::jsonb) - 'fetch_enc') || jsonb_build_object('fetch_enc', $3::jsonb)) ELSE request END,
+                             actions = COALESCE(actions, $2)
+                         WHERE id = $1 RETURNING actions, request->'fetch_enc'",
+                    )
+                    .bind(delivery_id)
+                    .bind(Value::Array(list))
+                    .bind(sealed)
+                    .fetch_one(&state.db)
+                    .await?;
+                    fetch_next = kept_fetch.unwrap_or(Value::Null);
                     Ok(kept.as_array().cloned().unwrap_or_default())
                 }
                 Err(e) => Err(e),
@@ -333,14 +367,25 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let ms = started.elapsed().as_millis() as i32;
     match res {
         Ok((o, n)) => {
+            // The fetch it asked for is queued in the same transaction that marks it done.
+            let fetch = can_fetch && fetch_next.is_string();
+            let mut result = result_json(&o);
+            if fetch {
+                result["fetch"] = json!("queued");
+            }
+            let mut tx = state.db.begin().await?;
             sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, error = NULL, duration_ms = $4, attempts = attempts + 1, next_attempt_at = NULL, processed_at = now() WHERE id = $1")
                 .bind(delivery_id)
-                .bind(status_for(n))
-                .bind(scrub.value(&result_json(&o)))
+                .bind(if fetch { "ok" } else { status_for(n) })
+                .bind(scrub.value(&result))
                 .bind(ms)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&state.db).await?;
+            sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *tx).await?;
+            if fetch {
+                crate::jobs::enqueue_background(&mut *tx, JOB_FETCH, json!({"delivery_id": delivery_id, "hop": hop + 1}), None).await?;
+            }
+            tx.commit().await?;
         }
         Err(msg) => {
             let msg = scrub.text(&msg);
@@ -614,7 +659,8 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
             (Input { source: "pull".into(), content_type: resp.headers.get("content-type").and_then(|v| v.as_str()).map(String::from), body: resp.body, extra, ..Default::default() }, Some(meta))
         }
     };
-    let is_pull = input.source == "pull";
+    // With pull settings, a webhook's script may ask to fetch the record it names (shown, not run).
+    let is_pull = input.source == "pull" || integ.pull_config().is_some();
     let script_in = script_input(integ, &input, &integ.state_map());
     let raw = match sandbox::run(&slot, script, &script_in).await {
         Ok(x) => x,
@@ -677,6 +723,10 @@ pub async fn replay(state: &AppState, integ: &Integration, ids: &[Uuid], all_fai
         let orig = if source == "replay" { request.as_ref().and_then(|r| r["original_source"].as_str()).unwrap_or("webhook").to_string() } else { source };
         let mut req = request.unwrap_or(json!({}));
         req["original_source"] = json!(orig);
+        // A replay runs the current script again, which decides afresh what to fetch.
+        if let Some(o) = req.as_object_mut() {
+            o.remove("fetch_enc");
+        }
         // Point at the original delivery, and carry over what it (and earlier replays) wrote.
         let root = replay_of.unwrap_or(id);
         let written: Value = sqlx::query_scalar("SELECT COALESCE(jsonb_object_agg(k, v), '{}') FROM integration_deliveries d, jsonb_each(d.applied) AS e(k, v) WHERE d.integration_id = $1 AND (d.id = $2 OR d.replay_of = $2)")
@@ -725,6 +775,7 @@ fn merge_next(acc: &mut NextRequest, n: NextRequest) {
     if n.body.is_some() {
         acc.body = n.body;
     }
+    acc.context = n.context;
 }
 
 /// Queue a live pull unless one for this integration is already waiting or running. The check and
@@ -1023,6 +1074,119 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         }
     }
     crate::jobs::enqueue_background(&state.db, JOB_PULL, continue_with(&next, pages)?, None).await?;
+    Ok(())
+}
+
+/// Job: fetch the record a webhook asked for (its `next_request`) from the app's API, with the
+/// pull's site and credentials, and store the answer as a delivery of its own (source `fetch`),
+/// whose script run gets the request, the answer and the webhook's `context`. Each fetch is stored
+/// once (keyed by the webhook and the hop), so a job that runs twice doesn't record it twice. An
+/// answer that says "not yet" (404, 409, 429, a server error) or a lost connection is tried again
+/// after 1, 5, 30 and 120 minutes, as webhooks are.
+pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
+    let Some(parent) = p["delivery_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let hop = p["hop"].as_u64().unwrap_or(1);
+    let row: Option<(Uuid, Option<Value>)> = sqlx::query_as("SELECT integration_id, request FROM integration_deliveries WHERE id = $1").bind(parent).fetch_optional(&state.db).await?;
+    let Some((integration_id, request)) = row else { return Ok(()) };
+    let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
+    if integ.status != "enabled" {
+        return Ok(());
+    }
+    let Some(cfg) = integ.pull_config() else { return Ok(()) };
+    let next = open_next(state, &request.as_ref().map(|r| r["fetch_enc"].clone()).unwrap_or(Value::Null));
+    let Some(_pull_slot) = PullSlots::try_take(integ.account_id) else {
+        return requeue(state, JOB_FETCH, p.clone()).await;
+    };
+    let mut scrub = scrub_for(state, &integ).await;
+    if !integ.missing_credentials().is_empty() {
+        return fetch_failed(state, &integ, &scrub, p, None, "the integration's credentials aren't saved yet", true).await;
+    }
+    // Only the site, headers and credentials come from the pull settings; the path, query and
+    // context come from the script.
+    let base = PullConfig { method: "GET".into(), query: Map::new(), body: None, body_format: None, ..cfg.clone() };
+    let creds = integ.credentials(state).map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let settings = integ.settings_map();
+    let st = integ.state_map();
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(1);
+    let vars = Vars { secrets: &creds, state: &st, settings: &settings, now, since, redact: false };
+    let shown = Vars { secrets: &creds, state: &st, settings: &settings, now, since, redact: true };
+    let (req, logged) = match (pull::build(&base, &next, &vars), pull::build(&base, &next, &shown)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return fetch_failed(state, &integ, &scrub, p, None, &e, false).await,
+    };
+    scrub.add_request(&req);
+    let origin = cfg.origin();
+    let who = TokenFor { integration_id: integ.id, auth_version: integ.auth_version, origin: &origin };
+    let token = match pull::oauth_token(state, &who, &cfg.auth, &vars).await {
+        Ok(t) => t,
+        Err(e) => return fetch_failed(state, &integ, &scrub, p, Some(logged.log_json()), &format!("couldn't get an access token: {}", e.public_message()), true).await,
+    };
+    if let Some(t) = &token {
+        scrub.add(t);
+    }
+    let resp = match pull::send(&req, token.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => return fetch_failed(state, &integ, &scrub, p, Some(logged.log_json()), &e.public_message(), true).await,
+    };
+    let response = json!({"status": resp.status, "headers": resp.headers});
+    let mut logged_req = logged.log_json();
+    logged_req["response"] = response;
+    if !(200..300).contains(&resp.status) {
+        if token.is_some() && matches!(resp.status, 401 | 403) {
+            pull::drop_token(state, integ.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        }
+        let again = matches!(resp.status, 401 | 403 | 404 | 408 | 409 | 425 | 429) || resp.status >= 500;
+        let msg = format!("{} answered HTTP {} ({})", req.place(), resp.status, pull::status_class(resp.status));
+        return fetch_failed(state, &integ, &scrub, p, Some(logged_req), &msg, again).await;
+    }
+    if resp.body.len() > BODY_MAX_BYTES {
+        return fetch_failed(state, &integ, &scrub, p, Some(logged_req), &format!("{} answered with more than 1 MB", req.place()), false).await;
+    }
+    logged_req["fetch"] = json!({"of": parent, "hop": hop});
+    if let Some(c) = &next.context {
+        logged_req["context"] = c.clone();
+    }
+    let ct = resp.headers.get("content-type").and_then(|v| v.as_str()).map(String::from);
+    let d = NewDelivery {
+        source: "fetch",
+        content_type: ct.as_deref(),
+        body: Some(&resp.body),
+        request: Some(logged_req),
+        status: "pending",
+        message_id: Some(format!("fetch:{parent}:{hop}")),
+        ..NewDelivery::log("fetch", "pending", None)
+    };
+    match store_delivery(state, &integ, &scrub, d).await {
+        Ok(_) | Err(Refused::Duplicate(_)) => Ok(()),
+        Err(Refused::Busy(msg) | Refused::OverBudget(msg)) => fetch_failed(state, &integ, &scrub, p, None, &msg, true).await,
+        Err(Refused::Error(e)) => Err(anyhow::anyhow!(e.public_message())),
+    }
+}
+
+/// A fetch that didn't work: logged, and tried again later when it may work then.
+async fn fetch_failed(state: &AppState, integ: &Integration, scrub: &Scrub, p: &Value, request: Option<Value>, msg: &str, retry: bool) -> anyhow::Result<()> {
+    let tries = p["attempt"].as_i64().unwrap_or(0) as i32 + 1;
+    let retry_at = (retry && tries < MAX_ATTEMPTS).then(|| Utc::now() + chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)]));
+    let msg = match retry_at {
+        Some(_) => format!("fetch failed: {msg}; it will be tried again"),
+        None => format!("fetch failed: {msg}"),
+    };
+    let msg = scrub.text(&msg);
+    store_log(state, integ, scrub, NewDelivery { request, ..NewDelivery::log("fetch", "error", Some(&msg)) }).await?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + $2, last_delivery_at = now(), last_error = $3, last_error_at = now() WHERE id = $1")
+        .bind(integ.id)
+        .bind(i64::from(retry_at.is_none()))
+        .bind(&msg)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(at) = retry_at {
+        let mut again = p.clone();
+        again["attempt"] = json!(tries);
+        crate::jobs::enqueue_background(&mut *tx, JOB_FETCH, again, Some(at)).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

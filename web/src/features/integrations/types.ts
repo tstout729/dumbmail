@@ -1,6 +1,6 @@
 export type IntegrationStatus = "enabled" | "disabled";
 
-export type SignatureFormat = "plain" | "stripe" | "svix";
+export type SignatureFormat = "plain" | "stripe" | "svix" | "paddle";
 
 export type Signature =
   | { type: "none" }
@@ -14,6 +14,9 @@ export type Signature =
       timestamp_header?: string;
       tolerance_seconds?: number;
       secret_encoding?: "base64";
+      timestamp_separator?: string;
+      timestamp_unit?: "seconds" | "milliseconds" | "iso8601";
+      sign_url?: boolean;
     }
   | { type: "shared_secret"; header?: string; query?: string };
 
@@ -107,7 +110,7 @@ export type FromRecipeResult = {
 };
 
 export type DeliveryStatus = "pending" | "ok" | "error" | "ignored";
-export type DeliverySource = "webhook" | "pull" | "test" | "replay";
+export type DeliverySource = "webhook" | "pull" | "fetch" | "test" | "replay";
 
 export type WriteCounts = {
   profiles_created: number;

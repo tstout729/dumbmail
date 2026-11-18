@@ -170,7 +170,9 @@ pub struct Log {
     pub message: String,
 }
 
-/// Pull runs only: fetch another page. Fields given replace the previous request's; `query` merges.
+/// Fetch another page (pulls), or fetch the record a webhook names (webhooks of an integration with
+/// pull settings, which give the site and the credentials). Fields given replace the previous
+/// request's; `query` merges. `context` is handed to the script run on the answer, as `input.context`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NextRequest {
@@ -184,7 +186,12 @@ pub struct NextRequest {
     pub headers: Option<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
 }
+
+/// Largest `context` a `next_request` may carry to the next run.
+pub const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -268,7 +275,8 @@ fn check_who(i: usize, kind: &str, w: &Who) -> Result<(), String> {
     }
 }
 
-/// Parse and validate a script's result. `pull` allows `next_request`.
+/// Parse and validate a script's result. `pull` allows `next_request` (pulls, and webhooks of an
+/// integration that can fetch).
 pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
     let items = match result {
         Value::Null => return Ok(Vec::new()),
@@ -390,9 +398,12 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
             }
             "next_request" => {
                 if !pull {
-                    return Err(format!("action {i} (next_request): only pulls can fetch another page"));
+                    return Err(format!("action {i} (next_request): only pulls, and webhooks of an integration with pull settings, can fetch"));
                 }
                 let a: NextRequest = part(i, k, obj)?;
+                if a.context.as_ref().is_some_and(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0) > MAX_CONTEXT_BYTES) {
+                    return Err(format!("action {i} (next_request): context is over 16 KB"));
+                }
                 if let Some(m) = &a.method {
                     if !matches!(m.to_ascii_uppercase().as_str(), "GET" | "POST") {
                         return Err(format!("action {i} (next_request): method must be GET or POST"));
