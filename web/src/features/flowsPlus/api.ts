@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "../../api/client";
-import type { Backfill, BackfillDryRun, FlowResults, NotifyAddressStatus, WaitingPage } from "./types";
+import type { Backfill, BackfillDryRun, FlowResults, NotifyAddressRow, WaitingPage } from "./types";
 
 const keys = {
   results: (id: string, days: number) => ["flowsPlus", "results", id, days] as const,
@@ -78,7 +78,7 @@ export function useNotifyAddresses(emails: string[]) {
   const joined = [...emails].sort().join(",");
   return useQuery({
     queryKey: keys.addresses(joined),
-    queryFn: () => api<{ statuses: { email: string; status: NotifyAddressStatus }[] }>("GET", withQuery("/api/flows-plus/notify-addresses", { emails: joined })),
+    queryFn: () => api<{ statuses: NotifyAddressRow[] }>("GET", withQuery("/api/flows-plus/notify-addresses", { emails: joined })),
     select: (r) => r.statuses,
     enabled: joined.length > 0,
     placeholderData: keepPreviousData,

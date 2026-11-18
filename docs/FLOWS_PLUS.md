@@ -99,11 +99,13 @@ only on events your server or an integration sent. The editor shows a note when 
   (`POST /api/flows-plus/notify-addresses/send-confirmation {email, confirm: true}`, MCP
   `send_notify_confirmation`; without `confirm` it only checks). It's refused while sending is
   paused and for addresses that bounced or complained, and pause and bounces are checked again
-  when the email goes out. Limits: one per address a day across all accounts (each account's first
-  request to an address still goes, up to three a day for that address), and 50 per account a day.
-  The address gets nothing until someone opens the link and presses the button.
+  when the email goes out. Limits, counting links actually sent: one per address an hour from an
+  account, 50 per account a day, and three per address a day across all accounts. A request over a
+  limit is refused when that's already clear; one that only hits a limit when its turn comes (other
+  accounts' links went out meanwhile) isn't sent, and the step's settings say why ("try again
+  tomorrow"). The address gets nothing until someone opens the link and presses the button.
 - **Bounces and complaints:** if a notification hard bounces or is marked as spam, that address gets
-  no more from the account. It shows as bounced or marked as spam in the step. An Admin or the owner
+  no more from the account. It doesn't count toward pausing the account's other email. It shows as bounced or marked as spam in the step. An Admin or the owner
   can clear a bounce after fixing the address (`POST /api/flows-plus/notify-addresses/clear-bounce`,
   MCP `clear_notify_bounce`); a complaint can't be cleared.
 - `subject` (up to 200 characters) and `body` (plain text, up to 5,000) can use the person's and the
@@ -120,8 +122,9 @@ only on events your server or an integration sent. The editor shows a note when 
 - Sent once, to the people chosen the first time: when the step first runs for someone, its
   recipients and message are stored, and a retry uses them even if the profile changed. Each send is
   marked as being handed to the provider just before the call. If the server stops before that, it's
-  sent on the retry; if it stops after, it's marked `unconfirmed`, never sent again, and billed
-  (it may have gone out).
+  sent on the retry; if it stops after, it's marked `unconfirmed`, never sent again, and not billed
+  (we can't know it went out). A step with nobody to email records that too, so a retry after the
+  profile changes doesn't pick someone new.
 
 REST: `GET /api/flows-plus/notify-addresses?emails=a@x.com,b@y.com` (outside addresses, and the
 status of the ones asked: `team`, `confirmed`, `unconfirmed`, `removed`, `bounced`, `complained`,
@@ -143,11 +146,17 @@ Back-populate adds the people already on the list or in the segment.
   they're still on the list or in the segment, pass the profile filter, don't match the exit
   condition, and may enter under the re-entry rules. Consent, suppressions and quiet hours are
   checked when each message goes out.
-- It adds people in batches of 200, and waits for a batch's first steps to start before adding more,
-  so it never crowds out other sending.
+- It adds only as many people as there's room for, so it never crowds out other sending: at most
+  200 of a flow's, 400 of an account's and 1,000 on the server (`FLOW_BACKFILL_SERVER_CAP`) added
+  people may be waiting for their first step at once.
+- Each person is added in one transaction that re-reads the flow and their list membership (or
+  segment) after the flow's entry lock. Taking them off the list or changing their profile meanwhile
+  waits for it, or happened first and they're skipped. If the flow is turned off or its trigger
+  changes, the back-populate stops with that reason.
 - Each person is marked done in the same transaction that starts their run, so if the job stops
   halfway it picks up where it left off and adds nobody twice. A profile deleted meanwhile counts as
-  skipped. If the job keeps failing it's marked failed, and the flow can start a new one.
+  skipped. If the job keeps failing it's marked failed (in the same transaction that gives up on the
+  job), and the flow can start a new one.
 - `POST /api/flows/{id}/backfills/{backfill_id}/cancel` (MCP `cancel_flow_backfill`) stops it: once it
   returns, nobody else is added. People already added stay in the flow.
   `GET /api/flows/{id}/backfills` (MCP `list_flow_backfills`) shows recent ones with how many were
@@ -183,6 +192,15 @@ lists the people at a step, oldest run first. Pass `next_after` back as `after` 
 takes up to 500 people out of a flow: they get nothing more from it. Without `confirm` it only
 counts. Someone whose step is sending to them at that moment isn't removed (their send already
 started); they're listed in `sending_now`, so try again in a minute. Recorded in the audit log.
+
+## One worker per run
+
+Every write to a run is conditional on nobody else having written it since the worker read it. A
+step that reaches someone outside (a message, a notification, a webhook) takes a claim first, with
+an expiry longer than any provider time-out; a second worker leaves the run alone until the claim
+ends, and the next retry takes over a claim left by a worker that stopped. A run waiting at a step
+moves on only when the wake-up job queued for that wait runs; a duplicate or leftover job does
+nothing.
 
 ## Editing a flow while people wait
 

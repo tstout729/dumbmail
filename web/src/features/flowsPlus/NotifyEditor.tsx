@@ -40,10 +40,12 @@ export function NotifyEditor({ node, onChange, readOnly }: { node: NotifyNode; o
       {to.length > 0 ? (
         <ul className="space-y-1">
           {to.map((e) => {
-            const st = statuses.data?.find((s) => s.email === e)?.status;
+            const row = statuses.data?.find((s) => s.email === e);
+            const st = row?.status;
+            const last = row?.last_confirmation;
             const [label, tone] = st ? statusText[st] : ["Checking…", "gray" as Tone];
             return (
-              <li key={e} className="flex flex-wrap items-center justify-between gap-2 text-sm">
+              <li key={e} className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-sm">
                 <span className="min-w-0 truncate text-zinc-800">{e}</span>
                 <span className="flex items-center gap-2">
                   <Badge tone={tone}>{label}</Badge>
@@ -63,6 +65,11 @@ export function NotifyEditor({ node, onChange, readOnly }: { node: NotifyNode; o
                     </Button>
                   ) : null}
                 </span>
+                {last && (last.status === "dropped" || last.status === "skipped" || last.status === "failed") && last.error ? (
+                  <span className="w-full text-xs text-amber-700">Confirm link {last.error}</span>
+                ) : last && (last.status === "queued" || last.status === "handing") ? (
+                  <span className="w-full text-xs text-zinc-500">Confirm link on its way.</span>
+                ) : null}
               </li>
             );
           })}

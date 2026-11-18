@@ -108,3 +108,8 @@ export type BackfillDryRun = {
 };
 
 export type NotifyAddressStatus = "team" | "confirmed" | "unconfirmed" | "removed" | "new" | "bounced" | "complained";
+
+/** The latest request to email an address its confirmation link, and why it wasn't sent if it wasn't. */
+export type ConfirmationAttempt = { status: "queued" | "handing" | "sent" | "failed" | "dropped" | "skipped"; error: string | null; at: string };
+
+export type NotifyAddressRow = { email: string; status: NotifyAddressStatus; blocked_reason: string | null; last_confirmation: ConfirmationAttempt | null };
