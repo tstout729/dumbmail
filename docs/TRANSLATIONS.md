@@ -39,6 +39,7 @@ Each translated field has a status:
 | --- | --- |
 | `missing` | Not translated. The default text is sent. |
 | `machine` | A machine draft nobody has reviewed yet. It is sent as drafted. |
+| `check` | A machine draft whose numbers, links or email addresses differ from the original. It is **not** sent (the original text is) until a person checks it and marks it reviewed. |
 | `reviewed` | Written, imported or reviewed by a person. |
 | `stale` | The default text changed after it was translated. The default text is sent until someone updates it. |
 | `default` | A link nobody localized (the default link is used). |
@@ -94,7 +95,9 @@ When the server has `ANTHROPIC_API_KEY`, "Draft with AI" machine-translates a me
 
 - `POST {path}/draft` `{"language": "fr"}` (or `ids`). MCP: `draft_translations` (without `confirm: true` it says how many texts and characters it would translate).
 - It runs in the background: `GET /api/translations/jobs/{id}` (MCP `get_translation_run`) shows `queued`, `running`, `done` or `failed`, with how many texts were translated or skipped.
-- Only the texts and your glossary are sent to the model, never anything about people. Template tags, HTML tags and never-translate terms are replaced by placeholders before the request and put back after; a result that loses, repeats or reorders one is thrown away, and so is one that adds a template tag. What comes back is checked like a hand-typed translation and saved as a `machine` draft.
+- Machine drafts are drafts: nobody has checked that they mean what the original means. Read them before marking them reviewed.
+- Only the texts and the glossary terms that occur in them are sent to the model (as data, apart from the instructions), never anything about people.
+- After the model answers, every number (prices, dates, percentages, phone numbers), web address and email address in the original must appear unchanged in the draft, and no new ones may appear. A draft that fails this is kept with the status `check`, the check before sending lists it as a problem that blocks sending, and the original text is sent in its place until a person marks it reviewed. Template tags, HTML tags and never-translate terms are replaced by placeholders before the request and put back after; a result that loses, repeats or reorders one is thrown away, and so is one that adds a template tag. What comes back is checked like a hand-typed translation and saved as a `machine` draft.
 - A draft is written only where the default text is still the one that was translated and nobody has saved a reviewed translation in the meantime.
 - Limits: one run per account at a time, a daily character allowance per account (`TRANSLATION_DAILY_CHARS`, 200,000 by default; days in the account's time zone), at most 12,000 characters per request and 40,000 per text. Starting a run needs content.write and the permission that changes that message; it's recorded in the audit log (who, which message, how many texts and characters, never the text).
 - Price: free unless the hosted service sets `PRICE_TRANSLATION_PER_1000_CHARS`.

@@ -1,5 +1,5 @@
 /** A translatable text's state in one language. `default`: a link nobody localized. */
-export type TranslationStatus = "missing" | "machine" | "reviewed" | "stale" | "default";
+export type TranslationStatus = "missing" | "machine" | "check" | "reviewed" | "stale" | "default";
 
 export type TranslationString = {
   id: string;
@@ -11,7 +11,7 @@ export type TranslationString = {
   status: TranslationStatus;
 };
 
-export type StatusCounts = { missing: number; machine: number; reviewed: number; stale: number };
+export type StatusCounts = { missing: number; machine: number; check: number; reviewed: number; stale: number };
 
 /** A message's translations in one language (from the stored message or sent content). */
 export type TranslationView = {

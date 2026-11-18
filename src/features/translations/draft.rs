@@ -268,7 +268,8 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         batches.push(cur);
     }
 
-    let mut drafts: BTreeMap<String, String> = BTreeMap::new();
+    // Each draft with its status: `check` when its numbers, links or addresses differ from the original's.
+    let mut drafts: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
     let mut failure: Option<String> = None;
     for batch in &batches {
         let req = ai::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch };
@@ -281,7 +282,8 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
                     };
                     match ai::restore(p, t, source) {
                         Ok(text) => {
-                            drafts.insert(fid.clone(), text);
+                            let status = if ai::same_literals(source, &text) { fields::MACHINE } else { fields::CHECK };
+                            drafts.insert(fid.clone(), (text, status));
                         }
                         Err(why) => {
                             tracing::info!(job = %id, reason = why, "a machine translation was rejected");
@@ -307,7 +309,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         let mut n = 0;
         let mut later = 0;
         let current = fields::fields(&l.content);
-        for (fid, text) in &drafts {
+        for (fid, (text, status)) in &drafts {
             let Some(f) = current.iter().find(|f| &f.id == fid) else {
                 later += 1;
                 continue;
@@ -316,7 +318,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
                 later += 1;
                 continue;
             }
-            fields::set_entry(&mut l.content, fid, &lang, Some((text, fields::MACHINE)))?;
+            fields::set_entry(&mut l.content, fid, &lang, Some((text, status)))?;
             n += 1;
         }
         if n > 0 {

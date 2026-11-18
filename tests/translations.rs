@@ -343,13 +343,17 @@ async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
                 let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 let version = headers.get("anthropic-version").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 c.lock().unwrap().requests.push((body.clone(), key, version));
-                let strings: serde_json::Map<String, Value> = serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+                let user: Value = serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+                let strings = user["strings"].as_object().unwrap().clone();
                 let out: serde_json::Map<String, Value> = strings
                     .into_iter()
                     .map(|(k, v)| {
                         let s = v.as_str().unwrap();
                         let t = if s.contains("MANGLE") {
                             "kaputt".to_string()
+                        } else if s.contains("PRICE") {
+                            // A model that changes a price.
+                            format!("DE:{}", s.replace("19.99", "29.99"))
                         } else if s.contains("LINKIFY") {
                             // A model that adds a link of its own.
                             r#"<a href="https://evil.test">DE</a>"#.to_string()
@@ -995,5 +999,49 @@ async fn machine_translation_requests_are_bounded_as_a_whole() {
     }
     assert_eq!(done["skipped"], 1, "{done}");
     assert_eq!(done["translated"], 5, "the subject and the four that fit: {done}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn machine_drafts_cant_quietly_change_the_facts() {
+    let (calls, url) = mock_anthropic().await;
+    let Some(mut h) = Harness::with(|c| {
+        c.anthropic_api_key = Some("sk-ant-test".into());
+        c.anthropic_api_base = Some(url.clone());
+    })
+    .await
+    else {
+        return;
+    };
+    h.signup().await;
+    set_languages(&mut h, json!(["de"])).await;
+    h.ok("POST", "/api/translations/glossary", Some(json!({"term": "free shipping", "translations": {"de": "Gratisversand"}}))).await;
+    h.ok("POST", "/api/translations/glossary", Some(json!({"term": "gift card", "translations": {"de": "Gutschein"}}))).await;
+    let content = json!({"subject": "Free shipping this week", "blocks": [{"type": "heading", "text": "Only $19.99 today PRICE"}]});
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Facts", "content": content}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de"}))).await;
+    h.drain().await;
+    // The glossary goes as data, and only the terms the text uses.
+    let (body, _, _) = calls.lock().unwrap().requests[0].clone();
+    let user: Value = serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(user["glossary"], json!([{"term": "free shipping", "translation": "Gratisversand"}]));
+    assert!(!body["system"].as_str().unwrap().contains("Gratisversand"));
+    // The draft whose price changed is kept for a careful look, blocks the check and isn't sent.
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    let st = |v: &Value, id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["status"].clone();
+    assert_eq!(st(&v, "b0:text"), "check", "{v}");
+    assert_eq!(st(&v, "subject"), "machine");
+    let chk = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": cid, "skip_links": true}))).await;
+    let f = chk["findings"].as_array().unwrap().iter().find(|f| f["id"] == "translation_needs_check").expect("listed");
+    assert_eq!(f["blocks_sending"], true);
+    let saved = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
+    assert!(p["html"].as_str().unwrap().contains("Only $19.99 today") && !p["html"].as_str().unwrap().contains("29.99"));
+    // Once a person has looked and marked it reviewed, it's used.
+    h.ok("POST", &format!("/api/translations/campaigns/{cid}/review"), Some(json!({"language": "de", "ids": ["b0:text"]}))).await;
+    let saved = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
+    assert!(p["html"].as_str().unwrap().contains("29.99"));
     h.cleanup().await;
 }

@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use super::fields::{self, MACHINE};
+use super::fields::{self, CHECK, MACHINE};
 use crate::models::Account;
 use crate::state::AppState;
 
@@ -66,6 +66,14 @@ pub async fn findings(state: &AppState, account: &Account, content: &Value) -> V
         }
         if n("stale") > 0 {
             out.push(("translation_stale", "warning", format!("{name}: {} out of date", plural(n("stale"), "translation is", "translations are")), format!("The {default_name} text changed after it was translated, so the {default_name} text is sent there until you update the translation.")));
+        }
+        if n(CHECK) > 0 {
+            out.push((
+                "translation_needs_check",
+                "error",
+                format!("{name}: {} need a careful look", plural(n(CHECK), "machine draft", "machine drafts")),
+                format!("Their numbers, links or email addresses differ from the original. Until someone checks and marks them reviewed, the {default_name} text is sent in their place."),
+            ));
         }
         if n(MACHINE) > 0 {
             out.push(("translation_unreviewed", "warning", format!("{name}: {} not reviewed", plural(n(MACHINE), "machine draft is", "machine drafts are")), "They'll be sent as drafted. Have someone read them and mark them reviewed.".to_string()));

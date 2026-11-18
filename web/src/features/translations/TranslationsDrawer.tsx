@@ -12,6 +12,7 @@ import type { TranslationStatus, TranslationString, TranslationTarget, Translati
 const statusLabel: Record<TranslationStatus, { label: string; tone: "gray" | "amber" | "green" | "red" | "blue" }> = {
   missing: { label: "Missing", tone: "red" },
   machine: { label: "Machine draft", tone: "amber" },
+  check: { label: "Check numbers and links", tone: "red" },
   reviewed: { label: "Reviewed", tone: "green" },
   stale: { label: "Out of date", tone: "amber" },
   default: { label: "Same as default", tone: "gray" },
@@ -93,6 +94,7 @@ function Summary({ view, lang }: { view: TranslationView; lang: string }) {
     <div className="flex flex-wrap gap-1">
       {s.missing > 0 ? <Badge tone="red">{s.missing} missing</Badge> : null}
       {s.stale > 0 ? <Badge tone="amber">{s.stale} out of date</Badge> : null}
+      {s.check > 0 ? <Badge tone="red">{s.check} to check carefully</Badge> : null}
       {s.machine > 0 ? <Badge tone="amber">{s.machine} to review</Badge> : null}
       <Badge tone="green">{s.reviewed} reviewed</Badge>
     </div>
@@ -189,7 +191,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
 
   const exportAs = (format: "xliff" | "csv") => act(() => downloadCsv("/api/translations/export", { content: value, language: lang, format, name: name ?? "message" }, `message.${lang}.${format === "csv" ? "csv" : "xlf"}`));
   const showPreview = () => act(async () => setPreview(await contentApi.preview(channel, value, lang)));
-  const machineIds = view.strings.filter((s) => s.status === "machine").map((s) => s.id);
+  const machineIds = view.strings.filter((s) => s.status === "machine" || s.status === "check").map((s) => s.id);
   const running = run.data && (run.data.status === "queued" || run.data.status === "running");
 
   return (
@@ -263,7 +265,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
             value={edits[s.id] ?? (s.status === "stale" ? "" : s.text)}
             readOnly={readOnly}
             onChange={(text) => setEdits({ ...edits, [s.id]: text })}
-            onReview={s.status === "machine" ? () => markReviewed([s.id]) : undefined}
+            onReview={s.status === "machine" || s.status === "check" ? () => markReviewed([s.id]) : undefined}
             onDraft={machine && target && s.kind !== "link" ? () => draft([s.id]) : undefined}
           />
         ))}

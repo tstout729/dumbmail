@@ -33,6 +33,9 @@ pub const MAX_ENTRIES: usize = 5_000;
 
 pub const MACHINE: &str = "machine";
 pub const REVIEWED: &str = "reviewed";
+/// A machine draft whose numbers, links or email addresses differ from the original: kept for a
+/// person to look at, never sent (the original is) until they mark it reviewed.
+pub const CHECK: &str = "check";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -271,7 +274,7 @@ pub fn entry<'a>(content: &'a Value, id: &str, lang: &str) -> Option<&'a Value> 
     }
 }
 
-/// missing, machine, reviewed or stale (links nobody localized: `default`).
+/// missing, machine, check, reviewed or stale (links nobody localized: `default`).
 pub fn status(content: &Value, f: &Field, lang: &str) -> &'static str {
     match entry(content, &f.id, lang) {
         Some(e) if !s(e, "text").is_empty() => {
@@ -279,6 +282,8 @@ pub fn status(content: &Value, f: &Field, lang: &str) -> &'static str {
                 "stale"
             } else if s(e, "status") == MACHINE {
                 MACHINE
+            } else if s(e, "status") == CHECK {
+                CHECK
             } else {
                 REVIEWED
             }
@@ -341,7 +346,7 @@ pub fn set_entry(content: &mut Value, id: &str, lang: &str, value: Option<(&str,
 pub fn mark_reviewed(content: &mut Value, lang: &str, ids: Option<&[String]>) -> AppResult<usize> {
     let mut n = 0;
     for f in fields(content) {
-        if ids.is_some_and(|ids| !ids.contains(&f.id)) || status(content, &f, lang) != MACHINE {
+        if ids.is_some_and(|ids| !ids.contains(&f.id)) || !matches!(status(content, &f, lang), MACHINE | CHECK) {
             continue;
         }
         let text = entry(content, &f.id, lang).map(|e| s(e, "text").to_string()).unwrap_or_default();
@@ -489,8 +494,8 @@ fn check_entry(kind: Kind, source: Option<&str>, e: &Value, label: &str) -> AppR
         return Err(AppError::bad(format!("{label}: a translation has only text, status and source")));
     }
     let text = o.get("text").and_then(|t| t.as_str()).ok_or_else(|| AppError::bad(format!("{label}: text must be text")))?;
-    if !matches!(o.get("status").and_then(|t| t.as_str()), Some(MACHINE | REVIEWED)) {
-        return Err(AppError::bad(format!("{label}: status must be machine or reviewed")));
+    if !matches!(o.get("status").and_then(|t| t.as_str()), Some(MACHINE | REVIEWED | CHECK)) {
+        return Err(AppError::bad(format!("{label}: status must be machine, check or reviewed")));
     }
     let src = o.get("source").and_then(|t| t.as_str()).unwrap_or("");
     if src.len() != 8 || !src.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -697,7 +702,8 @@ pub fn localize_block(b: &mut Value, lang: &str, own: &[String]) {
                     let Some(kind) = block_field_kind(b, path) else { continue };
                     let Some(source) = get_path(b, path) else { continue };
                     let text = s(e, "text");
-                    if text.is_empty() || s(e, "source") != hash(source) || check_text_for(kind, source, text, own).is_err() {
+                    // A draft waiting for a careful look is never sent: the original is.
+                    if text.is_empty() || s(e, "source") != hash(source) || s(e, "status") == CHECK || check_text_for(kind, source, text, own).is_err() {
                         continue;
                     }
                     let text = text.to_string();
@@ -740,7 +746,7 @@ pub fn localize(content: &Value, lang: &str, own: &[String]) -> Value {
         for (k, kind) in tops {
             let (Some(e), Some(source)) = (m.get(k), o.get(k).and_then(|v| v.as_str())) else { continue };
             let text = s(e, "text");
-            if !text.is_empty() && s(e, "source") == hash(source) && check_text(kind, source, text).is_ok() {
+            if !text.is_empty() && s(e, "source") == hash(source) && s(e, "status") != CHECK && check_text(kind, source, text).is_ok() {
                 o.insert(k.into(), json!(text));
             }
         }
@@ -776,7 +782,7 @@ pub fn localized_links(content: &Value) -> Vec<(String, String)> {
 /// A map of status counts for `lang`.
 pub fn summary(content: &Value, lang: &str) -> Map<String, Value> {
     let mut m = Map::new();
-    for k in ["missing", MACHINE, REVIEWED, "stale"] {
+    for k in ["missing", MACHINE, CHECK, REVIEWED, "stale"] {
         m.insert(k.into(), json!(0));
     }
     for f in fields(content) {
