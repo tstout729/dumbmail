@@ -1456,6 +1456,28 @@ async fn add_keys_gives_a_value_to_one_profile_only() {
     h.cleanup().await;
 }
 
+#[tokio::test]
+async fn keep_email_never_moves_an_opt_in_to_the_kept_address() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "Keep", "script": "function handle(i) { return i.payload.actions }"}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    for actions in [
+        json!([{"type": "upsert_profile", "external_id": "app:7", "email": "rue.example@example.com"}]),
+        json!([{"type": "upsert_profile", "external_id": "app:7", "email": "someone.else@example.com", "keep_email": true,
+                "consent": [{"channel": "email", "subscribed": true, "source": "Signup form"}]}]),
+    ] {
+        h.raw("POST", &path, &[("content-type", "application/json")], &json!({"actions": actions}).to_string()).await;
+        h.drain().await;
+    }
+    let (email, consent): (String, String) = sqlx::query_as("SELECT email, email_consent FROM profiles WHERE external_id = 'app:7'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((email.as_str(), consent.as_str()), ("rue.example@example.com", "never_subscribed"), "the opt-in was for the other address");
+    let log: String = sqlx::query_scalar("SELECT result::text FROM integration_deliveries ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!(log.contains("skipped the email consent"), "{log}");
+    h.cleanup().await;
+}
+
 // ---------- Shared: a new phone number hasn't agreed to texts ----------
 
 #[tokio::test]

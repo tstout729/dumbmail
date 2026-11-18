@@ -1200,6 +1200,10 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
             line.push_str(" held back from marketing (no opt-in)");
         }
         for c in &p.consent {
+            if kept_email && c.channel == Channel::Email {
+                line.push_str("; would skip the email consent: it was given for the address the call named, which wasn't used");
+                continue;
+            }
             out.counts.consents += 1;
             line.push_str(&format!("; {} {} consent (source: {})", if c.subscribed { "record" } else { "remove" }, if c.channel == Channel::Email { "email" } else { "SMS" }, c.source));
         }
@@ -1266,6 +1270,11 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         out.counts.held -= 1;
     }
     for c in &p.consent {
+        // An opt-in belongs to the address it was given for, never to the one the profile kept.
+        if kept_email && c.channel == Channel::Email {
+            line.push_str("; skipped the email consent: it was given for the address the call named, which wasn't used");
+            continue;
+        }
         line.push_str(&consent(state, src, up.profile.id, c).await?);
         out.counts.consents += 1;
     }
