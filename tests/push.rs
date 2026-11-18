@@ -1776,3 +1776,42 @@ async fn a_sign_out_only_updates_what_is_there_now() {
     assert_eq!(snapshot(&h, &b.endpoint).await, None, "not recreated");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_test_browser_is_taken_from_another_member_only_with_its_subscription() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    // Another member's test browser (made directly: who they are doesn't matter here).
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, 'other@acme.test', 'x')").bind(other).execute(&h.state.db).await.unwrap();
+    let theirs = browser(&base, "their-test");
+    sqlx::query("INSERT INTO push_devices (id, account_id, test_user_id, kind, address, p256dh, auth_secret, permission) VALUES ($1, $2, $3, 'web', $4, $5, $6, 'granted')")
+        .bind(Uuid::now_v7())
+        .bind(a.id)
+        .bind(other)
+        .bind(&theirs.endpoint)
+        .bind(&theirs.p256dh)
+        .bind(&theirs.auth)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    // This member already has five test browsers.
+    for i in 0..5 {
+        let b = browser(&base, &format!("mine-{i}"));
+        h.ok("POST", "/api/push/test-devices", Some(json!({"subscription": {"endpoint": b.endpoint, "keys": {"p256dh": b.p256dh, "auth": b.auth}}}))).await;
+    }
+    let mine = "SELECT count(*) FROM push_devices WHERE test_user_id IS NOT NULL AND address LIKE '%/mine-%'";
+    assert_eq!(count(&h, mine).await, 5);
+    let before = snapshot(&h, &theirs.endpoint).await;
+
+    // Only the endpoint: refused, and none of this member's browsers is evicted for it.
+    let fake = Browser { endpoint: theirs.endpoint.clone(), ..browser(&base, "their-test") };
+    let (st, _) = h.req("POST", "/api/push/test-devices", Some(json!({"subscription": {"endpoint": fake.endpoint, "keys": {"p256dh": fake.p256dh, "auth": fake.auth}}}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!((snapshot(&h, &theirs.endpoint).await, count(&h, mine).await), (before, 5), "nothing changed, nothing evicted");
+    // The browser itself (its current subscription) may become this member's.
+    h.ok("POST", "/api/push/test-devices", Some(json!({"subscription": {"endpoint": theirs.endpoint, "keys": {"p256dh": theirs.p256dh, "auth": theirs.auth}}}))).await;
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT test_user_id FROM push_devices WHERE address = $1").bind(&theirs.endpoint).fetch_one(&h.state.db).await.unwrap();
+    assert!(owner.is_some_and(|o| o != other));
+    h.cleanup().await;
+}
