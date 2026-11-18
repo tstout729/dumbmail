@@ -3,6 +3,7 @@ import { LayoutTemplate, Loader2, Save } from "lucide-react";
 import type { SmsContent } from "../../api";
 import { useSession, useSmsRender } from "../../api";
 import { useDebouncedValue } from "../../lib/hooks";
+import { ShortLinkNote } from "../../features/shortLinks/ShortLinkNote";
 import { Button, Field, Input, Textarea, cx } from "../ui";
 import { LoadTemplateDialog, SaveTemplateDialog } from "./TemplateDialogs";
 import { VariableMenu, insertAtCursor } from "./VariableMenu";
@@ -65,6 +66,7 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
             {segments} segment{segments === 1 ? "" : "s"}
           </span>
           {local.unicode ? <span className="text-amber-700">Contains emoji or special characters (70 per segment)</span> : null}
+          <ShortLinkNote body={value.body} />
           {render.isFetching ? <Loader2 className="size-3 animate-spin" /> : null}
         </div>
         <Field label="Image URL (MMS, optional)">

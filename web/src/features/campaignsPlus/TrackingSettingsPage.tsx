@@ -28,7 +28,7 @@ function TrackingForm({ defaults }: { defaults: LinkDefaults }) {
         <div className="flex items-start justify-between gap-4">
           <p className="text-sm text-zinc-600">
             Add UTM parameters to the web links in your campaign and flow emails, so Google Analytics and similar tools can tell which email brought a visitor. Links
-            that already have a parameter keep their own value. Unsubscribe and other DumbMail links are never changed. Text messages aren't tagged yet.
+            that already have a parameter keep their own value. Unsubscribe and other DumbMail links are never changed. Links in texts are tagged when they're shortened (Settings → Texting).
           </p>
           <Toggle checked={enabled} onChange={setEnabled} label="Tag links" />
         </div>
