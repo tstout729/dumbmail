@@ -71,7 +71,8 @@ function FlowBuilder({ flow }: { flow: Flow }) {
   const canGoLive = useCan("flows.live");
   const [waitingAt, setWaitingAt] = useState<string | null>(null);
   const [backfill, setBackfill] = useState<{ justTurnedOn: boolean } | null>(null);
-  const canBackfill = flow.trigger.type !== "metric";
+  // Back-populate is for list and segment flows (see features/flowsPlus).
+  const canBackfill = flow.trigger.type === "list" || flow.trigger.type === "segment";
 
   const current: Draft = draft ?? { name: flow.name, trigger: flow.trigger, definition: flow.definition };
   const def = current.definition;

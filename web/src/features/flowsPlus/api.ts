@@ -85,10 +85,20 @@ export function useNotifyAddresses(emails: string[]) {
   });
 }
 
-export function useAskToConfirm() {
+/** Email an outside address a link to confirm (needs the permission to change account settings). */
+export function useSendConfirmation() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (email: string) => api<{ email: string; status: NotifyAddressStatus }>("POST", "/api/flows-plus/notify-addresses", { email }),
+    mutationFn: (email: string) => api<{ email: string; sent: boolean }>("POST", "/api/flows-plus/notify-addresses/send-confirmation", { email, confirm: true }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["flowsPlus", "addresses"] }),
+  });
+}
+
+/** Let a bounced address get notifications again (Admins and Owners). */
+export function useClearBounce() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (email: string) => api<{ cleared: boolean }>("POST", "/api/flows-plus/notify-addresses/clear-bounce", { email }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["flowsPlus", "addresses"] }),
   });
 }

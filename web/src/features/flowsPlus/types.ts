@@ -18,8 +18,6 @@ export type DelayOptions = {
   at?: string | null;
   weekdays?: Weekday[] | null;
   until?: DelayUntil | null;
-  /** Work the time out again when it fires, if the person's time zone changed. */
-  recompute_zone?: boolean;
 };
 
 /** Filters on the event that started the run (a trigger split). */
@@ -60,7 +58,7 @@ export type StepResult = {
   reached: number;
   waiting: number;
   messages?: StepMessages;
-  notifications?: { sent: number; skipped: number; failed: number };
+  notifications?: { sent: number; skipped: number; failed: number; unconfirmed: number };
 };
 
 export type FlowResults = {
@@ -109,4 +107,4 @@ export type BackfillDryRun = {
   note: string;
 };
 
-export type NotifyAddressStatus = "team" | "confirmed" | "pending" | "removed" | "new" | "waiting" | "unreachable";
+export type NotifyAddressStatus = "team" | "confirmed" | "unconfirmed" | "removed" | "new" | "bounced" | "complained";

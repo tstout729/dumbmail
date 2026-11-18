@@ -21,7 +21,6 @@ function clean(n: DelayNode): DelayNode {
   if (!out.at) delete out.at;
   if (!out.weekdays?.length) delete out.weekdays;
   if (!out.until) delete out.until;
-  if (!out.recompute_zone) delete out.recompute_zone;
   return out;
 }
 
@@ -125,15 +124,10 @@ export function DelayEditor({ node, onChange, trigger, readOnly }: Props) {
           </div>
         ) : null}
         {node.at || days.length > 0 || node.until ? (
-          <>
-            <p className="text-xs text-zinc-500">Times use each person's time zone when we know it, otherwise your account's. If the time has passed that day, they wait for the next one.</p>
-            <Checkbox
-              label="Recheck their time zone when the wait ends"
-              description="If their time zone changed while they waited, work the time out again. Off: keep the time worked out when they arrived."
-              checked={!!node.recompute_zone}
-              onChange={(e) => set({ recompute_zone: e.target.checked })}
-            />
-          </>
+          <p className="text-xs text-zinc-500">
+            Times use each person's time zone when we know it, otherwise your account's. If the time has passed that day, they wait for the next one. Once someone is waiting, their time
+            stays put.
+          </p>
         ) : null}
       </div>
     </fieldset>

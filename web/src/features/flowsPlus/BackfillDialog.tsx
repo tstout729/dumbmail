@@ -11,7 +11,7 @@ const tone: Record<BackfillStatus, Tone> = { running: "blue", done: "green", can
 const triggerText = {
   list: "everyone on the trigger list now",
   segment: "everyone in the trigger segment now",
-  date_property: "people whose date already passed its trigger day but who still have a step ahead (they start where their date puts them)",
+  date_property: "",
   metric: "",
 };
 

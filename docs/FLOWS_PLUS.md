@@ -17,7 +17,10 @@ before.
 | `at` | A local time of day, `"HH:MM"`. "Wait 2 days, at 10:00": if 10:00 has already passed on the day the wait ends, it's 10:00 the next day. |
 | `weekdays` | Allowed days, e.g. `["tue", "wed", "thu"]`. If the wait ends on another day it moves to the next allowed day (at `at` if set, else the same time of day). |
 | `until` | Wait until a date instead of for a set time (see below). `amount` is ignored; send `0`. |
-| `recompute_zone` | `true`: when the wait ends, work the time out again in the person's current time zone. Default `false`: keep the moment worked out when they reached the step. |
+
+The moment a wait ends is worked out once, when the person reaches the step, and kept: a later change
+to their time zone, their date or the step doesn't move it. The wait and its wake-up are saved
+together.
 
 Times are in the person's time zone when DumbMail knows it (their `timezone` property, or one
 worked out from their region, zip, country or phone number; see `dumbmail://docs/sendtime`), else
@@ -37,9 +40,10 @@ first one.
 
 - `field`: `event.<property>` reads the triggering event's properties (`event.booking.check_in`
   for nested values); `profile.<property>` reads a profile property.
-- The value can be a date (`2026-12-20`, the start of that day in the person's time zone), a
-  date-time with or without a zone, or Unix seconds. Dates before 1900 or after 2199 count as
-  unreadable.
+- The value can be a date written exactly `YYYY-MM-DD` (the start of that day in the person's time
+  zone), a date-time with a zone (`2026-12-20T15:30:00Z`), a date-time without one (in the person's
+  time zone, seconds kept), or Unix seconds. Anything else, and dates before 1900 or after 2199,
+  count as unreadable.
 - `offset_amount` (0 or more, up to a year), `offset_unit` (`minutes`, `hours`, `days`) and
   `offset_direction` (`before` or `after`, default `after`).
 - `if_past`: what happens when the time has already passed (or the date is missing or unreadable)
@@ -88,55 +92,69 @@ only on events your server or an integration sent. The editor shows a note when 
 
 - Up to 5 recipients: fixed addresses in `to`, plus the address in the profile property
   `to_property`.
-- **Who gets it:** your team members' addresses, and outside addresses that confirmed. The first time
-  an outside address is saved in a flow it gets an email with a link to confirm; it gets nothing until
-  someone opens the link and presses the button. The same rule applies to addresses read from a
-  profile property. Each address gets at most one confirmation email an hour, and an account sends at
-  most 50 a day. Addresses whose mail bounced or drew a complaint get none.
+- **Who gets it:** your team members' addresses, and outside addresses that confirmed. The same rule
+  applies to addresses read from a profile property.
+- **Confirming an outside address:** saving a flow only records it as unconfirmed; nobody is emailed.
+  Someone who can change account settings sends it a confirmation link
+  (`POST /api/flows-plus/notify-addresses/send-confirmation {email, confirm: true}`, MCP
+  `send_notify_confirmation`; without `confirm` it only checks). It's refused while sending is
+  paused and for addresses that bounced or complained, and pause and bounces are checked again
+  when the email goes out. Limits: one per address a day across all accounts (each account's first
+  request to an address still goes, up to three a day for that address), and 50 per account a day.
+  The address gets nothing until someone opens the link and presses the button.
+- **Bounces and complaints:** if a notification hard bounces or is marked as spam, that address gets
+  no more from the account. It shows as bounced or marked as spam in the step. An Admin or the owner
+  can clear a bounce after fixing the address (`POST /api/flows-plus/notify-addresses/clear-bounce`,
+  MCP `clear_notify_bounce`); a complaint can't be cleared.
 - `subject` (up to 200 characters) and `body` (plain text, up to 5,000) can use the person's and the
   event's fields, like emails. Coupon codes aren't allowed.
 - It comes from your account's sender, has no unsubscribe link, and ends with "You get this because
   <account> set up a notification in a DumbMail flow". It isn't marketing and doesn't count for smart
   sending.
-- Billed like any email on the hosted service, held to the sending rate and the account's pause.
+- Billed like any email on the hosted service, counted in the account's daily sending allowance (past
+  it, the step waits until there's room), held to the sending rate and the account's pause.
 - **Daily cap:** a flow sends at most `settings.notify_daily_cap` notifications a day (default 200,
   1-2,000), counted per local day of the account.
 - Runs started by an event from your website get no notification unless `allow_browser_events` is
   `true`.
-- Sent once: each run, step and address is recorded before it goes out, so a retried step never
-  sends it twice. One cut off mid-send is marked `unknown` and not sent again.
+- Sent once, to the people chosen the first time: when the step first runs for someone, its
+  recipients and message are stored, and a retry uses them even if the profile changed. Each send is
+  marked as being handed to the provider just before the call. If the server stops before that, it's
+  sent on the retry; if it stops after, it's marked `unconfirmed`, never sent again, and billed
+  (it may have gone out).
 
 REST: `GET /api/flows-plus/notify-addresses?emails=a@x.com,b@y.com` (outside addresses, and the
-status of the ones asked: `team`, `confirmed`, `pending`, `removed`, `new`),
-`POST /api/flows-plus/notify-addresses {email}` (send the confirmation link again),
-`POST /api/flows-plus/notify-addresses/remove {email}`. MCP: `list_notify_addresses`,
-`add_notify_address`, `remove_notify_address`.
+status of the ones asked: `team`, `confirmed`, `unconfirmed`, `removed`, `bounced`, `complained`,
+`new`), `POST /api/flows-plus/notify-addresses {email}` (record one as unconfirmed),
+`POST /api/flows-plus/notify-addresses/remove {email}`, plus the two above. MCP:
+`list_notify_addresses`, `add_notify_address`, `send_notify_confirmation`, `remove_notify_address`,
+`clear_notify_bounce`.
 
 ## Add people who already qualify (back-populate)
 
-List-, segment- and date-triggered flows start only for people who join or whose date comes after
-the flow is turned on. Back-populate adds the people who already qualify.
+List- and segment-triggered flows start only for people who join after the flow is turned on.
+Back-populate adds the people already on the list or in the segment.
 
 - `POST /api/flows/{id}/backfill` without `confirm` (or MCP `backfill_flow`) counts them and changes
   nothing. With `"confirm": true` it starts adding them in the background. `limit` lowers the cap.
 - The flow must be live. One back-populate per flow at a time, three per account.
 - Capped per run at 50,000 people (`FLOW_BACKFILL_MAX` on self-hosted servers).
-- Follows the flow's re-entry rules, profile filter and exit condition, checked for each person as
-  they're added. Consent, suppressions and quiet hours are checked when each message goes out.
-- **List flows:** everyone on the list now. **Segment flows:** everyone who matches the segment's
-  rules now.
-- **Date flows:** people whose trigger day (their date plus `offset_days`) already passed but who
-  still have something ahead in the flow. They're placed where the flow would be for them today:
-  delays already over are skipped, a delay still running is joined with the time it has left, and
-  steps whose time has passed (an email that would have gone out yesterday) are skipped. Planning
-  stops at the first split or `until` delay; they start there. People with nothing left aren't
-  added. People whose trigger day is today or later are started by the daily date check as usual.
+- The set of people is fixed when it starts. As each person is added, DumbMail checks again that
+  they're still on the list or in the segment, pass the profile filter, don't match the exit
+  condition, and may enter under the re-entry rules. Consent, suppressions and quiet hours are
+  checked when each message goes out.
+- It adds people in batches of 200, and waits for a batch's first steps to start before adding more,
+  so it never crowds out other sending.
+- Each person is marked done in the same transaction that starts their run, so if the job stops
+  halfway it picks up where it left off and adds nobody twice. A profile deleted meanwhile counts as
+  skipped. If the job keeps failing it's marked failed, and the flow can start a new one.
+- `POST /api/flows/{id}/backfills/{backfill_id}/cancel` (MCP `cancel_flow_backfill`) stops it: once it
+  returns, nobody else is added. People already added stay in the flow.
+  `GET /api/flows/{id}/backfills` (MCP `list_flow_backfills`) shows recent ones with how many were
+  added and skipped.
 - **Metric flows can't be back-populated:** past events don't start flows, only new ones do.
-- The set of people is fixed when it starts. Each person is marked done in the same transaction that
-  starts their run, so if the job stops halfway it picks up where it left off and adds nobody twice.
-- `POST /api/flows/{id}/backfills/{backfill_id}/cancel` (MCP `cancel_flow_backfill`) stops it.
-  People already added stay in the flow. `GET /api/flows/{id}/backfills` (MCP `list_flow_backfills`)
-  shows recent ones with how many were added and skipped.
+- **Date flows can't be back-populated:** people whose date is still ahead enter on their own when it
+  arrives.
 - Starting and cancelling are recorded in the audit log.
 
 ## Per-step results and who is waiting
@@ -150,7 +168,11 @@ zone; MCP `get_flow_results`) returns, for every step:
   unsubscribed, skipped (with the top three reasons), failed and open and click rates for messages
   created in the range, and `orders` and `revenue` the account's attribution settings credit to the
   step for conversions in the range.
-- `notifications` (notification steps): sent, skipped and failed.
+- `notifications` (notification steps): sent, skipped, failed and unconfirmed.
+
+Skips show where a message row records them (consent, suppression, quiet hours, a paused account). A
+step skipped by smart sending, or a message skipped before a row was written, isn't counted there,
+as with flows elsewhere in DumbMail.
 
 It is one query per flow and runs as a report (one at a time per account).
 
@@ -159,14 +181,14 @@ lists the people at a step, oldest run first. Pass `next_after` back as `after` 
 
 `POST /api/flows/{id}/runs/remove {"run_ids": [...], "confirm": true}` (MCP `remove_from_flow`)
 takes up to 500 people out of a flow: they get nothing more from it. Without `confirm` it only
-counts. Recorded in the audit log.
+counts. Someone whose step is sending to them at that moment isn't removed (their send already
+started); they're listed in `sending_now`, so try again in a minute. Recorded in the audit log.
 
 ## Editing a flow while people wait
 
 - A step that's deleted while people wait at it: they leave the flow when they reach it.
 - A plain delay that's changed: people already waiting keep the time they had.
-- A delay with `at`, `weekdays` or `until`: people keep the moment worked out when they arrived,
-  unless the step has `recompute_zone` (then only their time zone is looked at again).
+- A delay with `at`, `weekdays` or `until`: people keep the moment worked out when they arrived.
 
 ## Permissions
 
@@ -175,4 +197,6 @@ counts. Recorded in the audit log.
 | Per-step results, back-populate history | Messaging read |
 | The waiting list | Profiles read |
 | Back-populate, cancelling it, taking people out of a flow | Turning flows live (`flows.live`) |
-| Editing steps, notification addresses | Flow edit |
+| Editing steps, recording or removing notification addresses | Flow edit |
+| Sending a notification address its confirmation link | Changing account settings |
+| Clearing a notification address's bounce | Admins and owners (`domains.manage`) |

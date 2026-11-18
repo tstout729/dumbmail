@@ -64,6 +64,7 @@ export function StepResultLine({ result, onWaiting }: { result: StepResult; onWa
         <>
           <span>{formatNumber(n.sent)} sent</span>
           {n.skipped > 0 ? <span>{formatNumber(n.skipped)} skipped</span> : null}
+          {n.unconfirmed > 0 ? <span>{formatNumber(n.unconfirmed)} unconfirmed</span> : null}
         </>
       ) : null}
     </div>
@@ -90,7 +91,7 @@ export function StepResultDetail({ result }: { result: StepResult }) {
       ["Revenue", `${formatCurrency(m.revenue)} · ${formatNumber(m.orders)} orders`],
     );
   }
-  if (n) cells.push(["Sent", formatNumber(n.sent)], ["Skipped", formatNumber(n.skipped)], ["Failed", formatNumber(n.failed)]);
+  if (n) cells.push(["Sent", formatNumber(n.sent)], ["Skipped", formatNumber(n.skipped)], ["Failed", formatNumber(n.failed)], ["Unconfirmed", formatNumber(n.unconfirmed)]);
   return (
     <div className="mb-4 rounded-lg bg-zinc-50 p-3">
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">

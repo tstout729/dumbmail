@@ -2,7 +2,8 @@ import { Info } from "lucide-react";
 import { Badge, Button, Checkbox, Field, Input, Notice, TagInput, Textarea } from "../../components/ui";
 import type { Tone } from "../../components/ui/Layout";
 import { toast } from "../../lib/toast";
-import { useAskToConfirm, useNotifyAddresses } from "./api";
+import { useCan } from "../team/api";
+import { useClearBounce, useNotifyAddresses, useSendConfirmation } from "./api";
 import type { NotifyAddressStatus, NotifyNode } from "./types";
 
 const MAX = 5;
@@ -10,18 +11,21 @@ const MAX = 5;
 const statusText: Record<NotifyAddressStatus, [string, Tone]> = {
   team: ["Team member", "green"],
   confirmed: ["Confirmed", "green"],
-  pending: ["Waiting to confirm", "amber"],
-  waiting: ["Waiting to confirm", "amber"],
+  unconfirmed: ["Not confirmed yet", "amber"],
+  new: ["Not confirmed yet", "amber"],
   removed: ["Removed", "gray"],
-  new: ["Gets a confirm link when you save", "blue"],
-  unreachable: ["Mail to it bounced", "red"],
+  bounced: ["Bounced", "red"],
+  complained: ["Marked as spam", "red"],
 };
 
 /** A notification step: email the team or confirmed addresses when someone reaches it. */
 export function NotifyEditor({ node, onChange, readOnly }: { node: NotifyNode; onChange: (n: NotifyNode) => void; readOnly?: boolean }) {
   const to = node.to ?? [];
   const statuses = useNotifyAddresses(to);
-  const ask = useAskToConfirm();
+  const send = useSendConfirmation();
+  const clear = useClearBounce();
+  const canAsk = useCan("settings.write");
+  const canClear = useCan("domains.manage");
   const count = to.length + (node.to_property ? 1 : 0);
   const set = (patch: Partial<NotifyNode>) => onChange({ ...node, ...patch });
   return (
@@ -30,7 +34,7 @@ export function NotifyEditor({ node, onChange, readOnly }: { node: NotifyNode; o
       <Field label="Step name">
         <Input value={node.name ?? ""} onChange={(e) => set({ name: e.target.value || undefined })} placeholder="Notify the team" />
       </Field>
-      <Field label="Send to" hint="Team members' addresses work right away. Anyone else gets a link to confirm first and gets nothing until they do." error={count > MAX ? `At most ${MAX} recipients.` : null}>
+      <Field label="Send to" hint="Team members' addresses work right away. Anyone else gets nothing until they confirm: save the flow, then send them a confirm link (someone who can change account settings can). An address that bounces or marks a notification as spam gets no more." error={count > MAX ? `At most ${MAX} recipients.` : null}>
         <TagInput value={to} onChange={(v) => set({ to: v.map((e) => e.trim().toLowerCase()).filter(Boolean) })} placeholder="name@example.com" aria-label="Addresses" />
       </Field>
       {to.length > 0 ? (
@@ -43,18 +47,19 @@ export function NotifyEditor({ node, onChange, readOnly }: { node: NotifyNode; o
                 <span className="min-w-0 truncate text-zinc-800">{e}</span>
                 <span className="flex items-center gap-2">
                   <Badge tone={tone}>{label}</Badge>
-                  {st === "pending" || st === "removed" || st === "waiting" ? (
+                  {(st === "unconfirmed" || st === "new" || st === "removed") && canAsk ? (
                     <Button
                       size="sm"
                       variant="ghost"
-                      loading={ask.isPending && ask.variables === e}
-                      onClick={() =>
-                        ask.mutate(e, {
-                          onSuccess: (r) => (r.status === "pending" ? toast.success(`Sent a confirm link to ${e}`) : toast.success(`A link went to ${e} within the last hour; try again later`)),
-                        })
-                      }
+                      loading={send.isPending && send.variables === e}
+                      onClick={() => send.mutate(e, { onSuccess: () => toast.success(`Sent ${e} a link to confirm`) })}
                     >
-                      Send link again
+                      Send confirm link
+                    </Button>
+                  ) : null}
+                  {st === "bounced" && canClear ? (
+                    <Button size="sm" variant="ghost" loading={clear.isPending && clear.variables === e} onClick={() => clear.mutate(e, { onSuccess: () => toast.success(`${e} can get notifications again`) })}>
+                      Clear bounce
                     </Button>
                   ) : null}
                 </span>
