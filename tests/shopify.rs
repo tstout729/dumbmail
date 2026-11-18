@@ -2051,7 +2051,8 @@ const posts = [];
 globalThis.fetch = (url, opts) => {{ posts.push(JSON.parse(opts.body)); return Promise.resolve({{}}); }};
 const store = () => {{ const m = new Map(); return {{ getItem: async (k) => m.has(k) ? m.get(k) : null, setItem: async (k, v) => m.set(k, v), removeItem: async (k) => m.delete(k) }}; }};
 const subs = {{}};
-function register(fn) {{ fn({{ analytics: {{ subscribe: (n, cb) => subs[n] = cb }}, browser: {{ localStorage: store(), sessionStorage: store() }}, settings: {{ base: "https://dm.test", key: "pk" }} }}); }}
+function register(fn) {{ fn({{ analytics: {{ subscribe: (n, cb) => subs[n] = cb }}, browser: {{ localStorage: store(), sessionStorage: store() }}, settings: {{ base: "https://dm.test", key: "pk" }},
+  init: {{ customerPrivacy: {{ analyticsProcessingAllowed: true, marketingAllowed: true }} }}, customerPrivacy: {{ subscribe: () => {{}} }} }}); }}
 {src}
 const checkout = (extra) => ({{ data: {{ checkout: Object.assign({{ email: "ann@example.com", lineItems: [], totalPrice: {{ amount: 10, currencyCode: "USD" }} }}, extra) }}, context: {{ document: {{ location: {{ href: "https://shop.test/c", origin: "https://shop.test" }} }} }} }});
 await subs.checkout_completed(checkout({{ order: {{}} }}));
@@ -2887,4 +2888,119 @@ async fn reads_cannot_starve_the_import() {
     sqlx::query("UPDATE shopify_shops SET lease_until = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
     assert!(!dumbmail::features::shopify::shop::renew(&h.state, &lease).await.unwrap(), "an expired lease isn't renewed");
     h.cleanup().await;
+}
+
+/// The browser stand-in the storefront tests run the snippet in (Node, no DOM library).
+const BROWSER: &str = r#"
+const posts = [];
+const storage = () => { const m = new Map(); return { getItem: (k) => m.has(k) ? m.get(k) : null, setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k), _m: m }; };
+const ls = storage(), ss = storage();
+const listeners = {};
+const el = () => new Proxy({
+  attrs: {}, style: {}, dataset: {}, children: [], childNodes: [], textContent: "", innerHTML: "", className: "", value: "",
+  classList: { contains: () => false, add: () => {}, remove: () => {}, toggle: () => {} },
+  setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k] ?? null; }, hasAttribute(k) { return k in this.attrs; },
+  querySelector: () => null, querySelectorAll: () => [], getElementsByTagName: () => [], closest: () => null, matches: () => false,
+  appendChild: (c) => c, insertBefore: (c) => c, removeChild: (c) => c, remove: () => {}, addEventListener: () => {}, removeEventListener: () => {},
+  attachShadow: () => el(), getBoundingClientRect: () => ({ top: 0, left: 0, width: 0, height: 0 }),
+}, { get: (t, k) => k in t ? t[k] : (typeof k === "symbol" ? undefined : (() => null)) });
+const script = el();
+script.attrs.src = "https://dm.test/onsite.js?k=pk";
+script.src = "https://dm.test/onsite.js?k=pk";
+globalThis.localStorage = ls; globalThis.sessionStorage = ss;
+globalThis.location = { href: "https://shop.test/products/mug", origin: "https://shop.test", pathname: "/products/mug", search: "", hostname: "shop.test", protocol: "https:" };
+Object.defineProperty(globalThis, "navigator", { value: { userAgent: "node", sendBeacon: () => true }, configurable: true });
+globalThis.fetch = (url, opts) => { if (opts && opts.method === "POST") posts.push(String(url)); return Promise.resolve({ ok: true, json: () => Promise.resolve([]) }); };
+globalThis.document = new Proxy({
+  currentScript: script, readyState: "complete", head: { appendChild: (s) => { added.push(s); } }, body: el(), documentElement: el(),
+  createElement: () => el(), querySelector: () => null, querySelectorAll: () => [], getElementById: () => null, getElementsByTagName: () => [],
+  removeEventListener: () => {}, visibilityState: "visible", hidden: false,
+  addEventListener: (n, cb) => { listeners[n] = cb; }, cookie: "", title: "Mug", referrer: "",
+}, { get: (t, k) => k in t ? t[k] : undefined });
+const added = [];
+globalThis.window = globalThis;
+window.addEventListener = () => {}; window.removeEventListener = () => {};
+globalThis.history = { pushState: () => {}, replaceState: () => {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+globalThis.requestAnimationFrame = (f) => setTimeout(f, 0);
+globalThis.getComputedStyle = () => ({}); globalThis.innerWidth = 1200; globalThis.innerHeight = 800; globalThis.scrollY = 0;
+globalThis.Intl = Intl;
+window.setTimeout = setTimeout; window.setInterval = () => 0;
+window.Shopify = { loadFeatures: (f, cb) => { window.Shopify.customerPrivacy = { analyticsProcessingAllowed: () => true, marketingAllowed: () => true }; cb(false); } };
+"#;
+
+async fn served_snippet() -> Option<String> {
+    let mut h = Harness::new().await?;
+    h.signup().await;
+    let pk: String = sqlx::query_scalar("SELECT public_key FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    let (_, _, onsite) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[], "").await;
+    h.cleanup().await;
+    Some(onsite)
+}
+
+fn embed_js() -> String {
+    let liquid = include_str!("../connectors/shopify/extensions/dumbmail-embed/blocks/dumbmail.liquid");
+    liquid.split("<script>").nth(1).unwrap().split("</script>").next().unwrap().replace("{{ dumbmail_src | json }}", "\"https://dm.test/onsite.js?k=pk\"")
+}
+
+/// Item 10: marketing withdrawn alone stops the snippet; a withdrawal between the snippet being
+/// added and it starting is honoured when it starts; without marketing consent the snippet never
+/// recognises anyone; the pixel passes nothing on without consent.
+#[tokio::test]
+async fn storefront_consent_is_respected() {
+    if !node_available() {
+        eprintln!("node not installed; skipping");
+        return;
+    }
+    let Some(onsite) = served_snippet().await else { return };
+    let run = |consent: &str, steps: &str| {
+        let script = format!(
+            "{BROWSER}\nwindow.Shopify = {{ loadFeatures: (f, cb) => {{ window.Shopify.customerPrivacy = {consent}; cb(false); }} }};\n{embed}\nconst start = () => (new Function({onsite}))();\n{steps}\nsetTimeout(() => console.log(JSON.stringify({{ posts, profile: ls.getItem('pl_profile'), added: added.length }})), 20);",
+            embed = embed_js(),
+            onsite = serde_json::to_string(&onsite).unwrap()
+        );
+        serde_json::from_str::<Value>(&run_node(&script)).unwrap()
+    };
+    let both = "{ analyticsProcessingAllowed: () => true, marketingAllowed: () => true }";
+    // A: marketing withdrawn alone, after the snippet started.
+    let a = run(both, "start(); window.dumbmail.identify({ email: 'ann@example.com' }); const before = posts.length;
+        listeners.visitorConsentCollected({ detail: { analyticsAllowed: true, marketingAllowed: false } }); posts.length = 0;
+        window.dumbmail.track('After', {}); window.dumbmail.identify({ email: 'bob@example.com' });");
+    assert_eq!(a["posts"], json!([]), "marketing withdrawn: nothing more is sent: {a}");
+    assert_eq!(a["profile"], Value::Null);
+    // B: analytics withdrawn after the snippet was added but before it started.
+    let b = run(both, "listeners.visitorConsentCollected({ detail: { analyticsAllowed: false, marketingAllowed: false } }); start();
+        window.dumbmail.identify({ email: 'ann@example.com' }); window.dumbmail.track('Viewed', {});");
+    assert_eq!(b["added"], 1);
+    assert_eq!(b["posts"], json!([]), "the withdrawal before start-up is honoured: {b}");
+    // C: no marketing consent: a stored profile isn't used, and identify does nothing.
+    let c = run("{ analyticsProcessingAllowed: () => true, marketingAllowed: () => false }", "ls.setItem('pl_profile', JSON.stringify({ email: 'old@example.com' })); start();
+        window.dumbmail.track('Viewed', {}); window.dumbmail.identify({ email: 'new@example.com' });");
+    let posted: Vec<String> = serde_json::from_value(c["posts"].clone()).unwrap();
+    assert!(!posted.iter().any(|p| p.contains("/client/events")), "nothing tracked against the stored profile: {c}");
+    assert_eq!(c["profile"], json!("{\"email\":\"old@example.com\"}"), "identify changed nothing");
+
+    // D: the pixel without marketing consent passes nothing on.
+    let src = include_str!("../connectors/shopify/extensions/dumbmail-pixel/src/index.js").replace("import { register } from \"@shopify/web-pixels-extension\";", "");
+    let pixel = format!(
+        r#"
+const posts = [];
+globalThis.fetch = (url, opts) => {{ posts.push(JSON.parse(opts.body)); return Promise.resolve({{}}); }};
+const local = (() => {{ const m = new Map(); return {{ getItem: async (k) => m.has(k) ? m.get(k) : null, setItem: async (k, v) => m.set(k, v), removeItem: async (k) => m.delete(k), m }}; }})();
+const session = (() => {{ const m = new Map(); return {{ getItem: async (k) => m.has(k) ? m.get(k) : null, setItem: async (k, v) => m.set(k, v), removeItem: async (k) => m.delete(k) }}; }})();
+const subs = {{}};
+function register(fn) {{ fn({{ analytics: {{ subscribe: (n, cb) => subs[n] = cb }}, browser: {{ localStorage: local, sessionStorage: session }}, settings: {{ base: "https://dm.test", key: "pk" }},
+  init: {{ customerPrivacy: {{ analyticsProcessingAllowed: true, marketingAllowed: false }} }}, customerPrivacy: {{ subscribe: () => {{}} }} }}); }}
+{src}
+await local.setItem("pl_buffer", JSON.stringify([{{ metric: "Viewed", time: Date.now() }}]));
+await subs.checkout_completed({{ data: {{ checkout: {{ email: "ann@example.com", lineItems: [], order: {{ id: "gid://shopify/Order/5" }} }} }}, context: {{ document: {{ location: {{ href: "x", origin: "https://shop.test" }} }} }} }});
+await new Promise((r) => setTimeout(r, 10));
+console.log(JSON.stringify({{ posts: posts.length, profile: await local.getItem("pl_profile"), buffer: await local.getItem("pl_buffer") }}));
+"#
+    );
+    let d: Value = serde_json::from_str(&run_node(&pixel)).unwrap();
+    assert_eq!(d["posts"], 0, "{d}");
+    assert_eq!(d["profile"], Value::Null, "no identity passed to the storefront script");
+    assert!(d["buffer"].is_string(), "held browsing activity isn't flushed");
 }
