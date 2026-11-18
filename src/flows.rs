@@ -260,7 +260,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
+            "delay" | "email" | "sms" | "push" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -287,7 +287,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                     return Err(AppError::bad(format!("delay {} unit must be minutes, hours or days", n.id)));
                 }
             }
-            "email" | "sms" => need("content")?,
+            "email" | "sms" | "push" => need("content")?,
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
@@ -644,17 +644,17 @@ pub async fn on_list_add(state: &AppState, list_id: Uuid, profile_ids: &[Uuid]) 
 
 /// Job: refresh a segment's membership and start segment-triggered flows for new members.
 pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Result<()> {
-    // `absorb_entries`, or a Shopify history page being written for the account right now (one
-    // statement either way; the second is a partial index that's empty unless an import is writing).
-    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as(
-        "SELECT account_id, definition, refreshed_at,
-                absorb_entries OR EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = segments.account_id AND i.history_open)
+    // Whether the account ever ran a Shopify history import rides in the same statement: only then
+    // is one more read needed below.
+    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool, bool)> = sqlx::query_as(
+        "SELECT account_id, definition, refreshed_at, absorb_entries,
+                EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = segments.account_id AND i.kind = 'history')
          FROM segments WHERE id = $1",
     )
         .bind(segment_id)
         .fetch_optional(&state.db)
         .await?;
-    let Some((account_id, def, refreshed_at, absorb)) = row else { return Ok(()) };
+    let Some((account_id, def, refreshed_at, absorb, shopify_history)) = row else { return Ok(()) };
     // Rules that can't load (e.g. they include a segment that was since deleted) won't fix themselves
     // on a retry: log it and try again on the next scheduled refresh.
     let def = match segments::load(&state.db, account_id, &def, Some(segment_id)).await {
@@ -666,11 +666,13 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone. Neither
-    // does one while past activity is being imported into the account (`absorb_entries`, and a Shopify
-    // history page being written right now).
+    // does one while past activity is being imported into the account (`absorb_entries`).
     if refreshed_at.is_none() || absorb {
         return Ok(());
     }
+    // People a Shopify history import wrote about entered because of history: no flows for them.
+    // Read after the refresh, so history written at any point before it is accounted for.
+    let entered = if shopify_history && !entered.is_empty() { crate::features::shopify::events::without_history(&state.db, account_id, entered).await? } else { entered };
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $2 AND status = 'live' AND trigger->>'type' = 'segment' AND trigger->>'segment_id' = $1")
         .bind(segment_id.to_string())
         .bind(account_id)
@@ -1114,6 +1116,27 @@ async fn finish(db: &PgPool, h: &Hold, status: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The message id of a push step in a run: made the first time and saved with the run, under this
+/// worker's claim (see [`Hold`]), before anything is sent; the same on every re-run of the visit.
+/// None: another worker moved the run meanwhile, so stop.
+async fn push_message_id(db: &PgPool, hold: &Hold, node_id: &str, context: &mut Value) -> anyhow::Result<Option<Uuid>> {
+    let key = format!("_push_message_{node_id}");
+    if let Some(id) = context.get(&key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        return Ok(Some(id));
+    }
+    let id = Uuid::now_v7();
+    context[key.as_str()] = json!(id);
+    let n = sqlx::query(&format!("UPDATE flow_runs SET context = $4 WHERE {HELD}"))
+        .bind(hold.run)
+        .bind(hold.claim)
+        .bind(&hold.node)
+        .bind(&*context)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok((n == 1).then_some(id))
+}
+
 /// Job: advance a run until it hits a delay or finishes. A wake-up job carries the wait it is for
 /// (`wake`, the claim id it parked the run with) and does nothing unless the run is still in that
 /// wait; a job without one does nothing while the run is waiting for its own wake-up.
@@ -1275,7 +1298,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     o.remove("_waited");
                 }
             }
-            "email" | "sms" => {
+            "email" | "sms" | "push" => {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
@@ -1287,6 +1310,16 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     };
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
                     let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
+                    // A push step's message id is stored with the run (under its claim) before it's sent, so
+                    // a re-run of the visit finds that message instead of sending a second one.
+                    let message_id = if node.kind == "push" {
+                        match push_message_id(&state.db, &hold, &node_id, &mut context).await? {
+                            Some(id) => Some(id),
+                            None => return Ok(()),
+                        }
+                    } else {
+                        None
+                    };
                     let out = sending::send(
                         state,
                         SendSpec {
@@ -1299,7 +1332,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                             flow_node_id: Some(&node_id),
                             event: event.as_ref(),
                             is_test: false,
-                            message_id: None,
+                            message_id,
                             to_override: None,
                         },
                     )

@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  BellRing,
   Bell,
   Clock,
   CornerDownRight,
@@ -28,6 +29,7 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   delay: { icon: Clock, tone: "bg-zinc-100 text-zinc-600" },
   email: { icon: Mail, tone: "bg-sky-50 text-sky-700" },
   sms: { icon: MessageSquare, tone: "bg-violet-50 text-violet-700" },
+  push: { icon: BellRing, tone: "bg-orange-50 text-orange-700" },
   condition: { icon: GitBranch, tone: "bg-amber-50 text-amber-700" },
   random_split: { icon: Shuffle, tone: "bg-fuchsia-50 text-fuchsia-700" },
   wait_for_reply: { icon: MessageSquareReply, tone: "bg-violet-50 text-violet-700" },
@@ -189,7 +191,7 @@ function branchLabel(node: ConditionNode | RandomSplitNode | WaitForReplyNode, b
 }
 
 function nodeTitle(node: FlowNode): string {
-  if ((node.type === "email" || node.type === "sms" || node.type === "notify") && node.name) return node.name;
+  if ((node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "notify") && node.name) return node.name;
   return nodeLabels[node.type];
 }
 
@@ -202,6 +204,8 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return node.content.subject ? { text: node.content.subject } : { text: "No subject", warning: "Add a subject line" };
     case "sms":
       return node.content.body ? { text: node.content.body } : { text: "Empty message", warning: "Write a message" };
+    case "push":
+      return node.content.title || node.content.body ? { text: node.content.title || node.content.body } : { text: "Empty notification", warning: "Write a title or message" };
     case "condition": {
       const event = eventSplitSummary(node.event_condition);
       if (node.condition.conditions.length) return { text: [definitionSummary(node.condition, listName), event].filter(Boolean).join("; ") };
@@ -231,7 +235,7 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
   const summary = nodeSummary(node, ctx.lists);
   const s = ctx.stats.get(node.id);
   const r = ctx.results?.find((x) => x.node_id === node.id);
-  const isMessage = node.type === "email" || node.type === "sms";
+  const isMessage = node.type === "email" || node.type === "sms" || node.type === "push";
   const selected = ctx.selected === node.id;
   return (
     <button

@@ -44,6 +44,9 @@ pub struct Given {
     pub id: i64,
     pub code: String,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Made in a connected store for this person (`assigned_via = 'store'`): reused only while it's
+    /// that store's (see the store hook in `prepare_send_for`).
+    pub store_made: bool,
 }
 
 /// How a code is being given out.
@@ -97,20 +100,20 @@ enum One {
 /// The person's existing code for this coupon (and send). A code not yet sent gets its "N days
 /// after it's given" expiry restarted, so the clock starts when it really goes out.
 async fn existing(tx: &mut Transaction<'_, Postgres>, c: &Coupon, profile_id: Uuid, key: Option<&str>) -> AppResult<Option<Given>> {
-    let row: Option<(i64, String, Option<DateTime<Utc>>, bool)> = match key {
-        None => sqlx::query_as("SELECT id, code, expires_at, delivered_at IS NOT NULL FROM coupon_codes WHERE coupon_id = $1 AND profile_id = $2 AND send_key IS NULL")
+    let row: Option<(i64, String, Option<DateTime<Utc>>, bool, bool)> = match key {
+        None => sqlx::query_as("SELECT id, code, expires_at, delivered_at IS NOT NULL, assigned_via IS NOT DISTINCT FROM 'store' FROM coupon_codes WHERE coupon_id = $1 AND profile_id = $2 AND send_key IS NULL")
             .bind(c.id)
             .bind(profile_id)
             .fetch_optional(&mut **tx)
             .await?,
-        Some(k) => sqlx::query_as("SELECT id, code, expires_at, delivered_at IS NOT NULL FROM coupon_codes WHERE coupon_id = $1 AND profile_id = $2 AND send_key = $3")
+        Some(k) => sqlx::query_as("SELECT id, code, expires_at, delivered_at IS NOT NULL, assigned_via IS NOT DISTINCT FROM 'store' FROM coupon_codes WHERE coupon_id = $1 AND profile_id = $2 AND send_key = $3")
             .bind(c.id)
             .bind(profile_id)
             .bind(k)
             .fetch_optional(&mut **tx)
             .await?,
     };
-    let Some((id, code, mut expires_at, delivered)) = row else { return Ok(None) };
+    let Some((id, code, mut expires_at, delivered, store_made)) = row else { return Ok(None) };
     if let (Some(days), false) = (c.expires_after_days, delivered) {
         expires_at = sqlx::query_scalar("UPDATE coupon_codes SET expires_at = now() + make_interval(days => $2) WHERE id = $1 RETURNING expires_at")
             .bind(id)
@@ -118,7 +121,7 @@ async fn existing(tx: &mut Transaction<'_, Postgres>, c: &Coupon, profile_id: Uu
             .fetch_one(&mut **tx)
             .await?;
     }
-    Ok(Some(Given { id, code, expires_at }))
+    Ok(Some(Given { id, code, expires_at, store_made }))
 }
 
 /// Claim inside `tx`: the person's code if they have one, else the next free code.
@@ -155,7 +158,7 @@ async fn claim_in(tx: &mut Transaction<'_, Postgres>, c: &Coupon, profile_id: Uu
         match picked {
             Ok(Some((id, code, expires_at))) => {
                 sp.commit().await?;
-                return Ok(One::Got(Given { id, code, expires_at }));
+                return Ok(One::Got(Given { id, code, expires_at, store_made: false }));
             }
             Ok(None) => {
                 sp.commit().await?;
@@ -245,7 +248,7 @@ pub async fn give_code<'a>(db: &PgPool, c: &'a Coupon, profile_id: Uuid, via: Vi
     match inserted {
         Ok(Some((id, expires_at))) => {
             sqlx::query("UPDATE coupons SET codes_total = codes_total + 1 WHERE id = $1").bind(c.id).execute(db).await?;
-            Ok(Some(Given { id, code, expires_at }))
+            Ok(Some(Given { id, code, expires_at, store_made: true }))
         }
         // Someone else gave this person a code meanwhile: keep the new store code in the pool, use theirs.
         Err(e) if is_unique_violation(&e) => {
@@ -369,6 +372,21 @@ pub async fn prepare_send_for(state: &AppState, spec: &SendSpec<'_>, content: &V
     coupons.sort_by_key(|c| c.id);
     let send = if coupons.iter().any(|c| c.new_code_each_time) { send_name(state, spec, message_id).await? } else { String::new() };
     let mut claim = claim_all(&state.db, &coupons, spec.profile.id, &Via::Message { message_id, send: &send }).await?;
+    // A code a store made for this person is reused only while it's that store's (and install's):
+    // after a store is disconnected or another connected, it's retired and the store hook makes a
+    // new one. Codes not made by a store aren't looked at.
+    if let Claim::Got(given) = &claim {
+        let mut retired = false;
+        for (c, g) in coupons.iter().zip(given.iter()).filter(|(_, g)| g.store_made) {
+            if !crate::features::shopify::coupons::code_is_current(&state.db, c, &g.code).await? {
+                crate::features::shopify::coupons::retire(&state.db, g.id).await?;
+                retired = true;
+            }
+        }
+        if retired {
+            claim = claim_all(&state.db, &coupons, spec.profile.id, &Via::Message { message_id, send: &send }).await?;
+        }
+    }
     // A coupon whose codes the connected store makes (Shopify): give this person their own code
     // through `give_code` and its store hook (no lock held while the store answers), then claim again.
     let mut asked = 0;

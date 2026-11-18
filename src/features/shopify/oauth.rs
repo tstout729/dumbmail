@@ -326,7 +326,7 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
         .map_err(|_| "failed")?;
     // Work queued for the previous install goes: deliveries (privacy requests stay), items to read,
     // imports.
-    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact')")
+    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact', 'app/uninstalled')")
         .bind(account_id)
         .execute(&mut *tx)
         .await
@@ -337,7 +337,6 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
         .execute(&mut *tx)
         .await
         .map_err(|_| "failed")?;
-    super::events::close_history(&mut tx, account_id).await.map_err(|_| "failed")?;
     // The metrics this app records come only from Shopify's servers from now on: the browser
     // endpoint refuses them for this account (they stay that way after a disconnect).
     let names: Vec<String> = super::SERVER_METRICS.iter().map(|m| m.to_string()).collect();
@@ -381,7 +380,10 @@ pub async fn setup(state: &AppState, account_id: Uuid, generation: Option<i32>) 
             // Retried by the scheduler (setup_after) as well as by the job queue.
             anyhow::bail!("shopify setup: {} webhook subscriptions refused", missing.len());
         }
-        Ok(_) => start_history(state, &s).await?,
+        Ok(_) => {
+            start_history(state, &s).await?;
+            super::starters::ensure(&state.db, account_id).await?;
+        }
     }
     Ok(())
 }
@@ -605,6 +607,9 @@ pub async fn disconnect(state: &AppState, account_id: Uuid) -> AppResult<Value> 
 /// whether anything changed.
 pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generation: Option<i32>) -> sqlx::Result<bool> {
     let mut tx = db.begin().await?;
+    // Waits for writes in flight inside a fence (`fence::open` holds the row FOR KEY SHARE); later
+    // ones find the install gone.
+    sqlx::query("SELECT 1 FROM shopify_shops WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     let changed: Option<i32> = sqlx::query_scalar(
         "UPDATE shopify_shops SET status = $2, access_token_enc = NULL, refresh_token_enc = NULL, token_expires_at = NULL, refresh_expires_at = NULL,
             webhook_ids = '{}', web_pixel_id = NULL, disconnected_at = now(), work_queued_at = NULL, lease_until = NULL, lease_token = NULL, updated_at = now()
@@ -624,10 +629,9 @@ pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generatio
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
-    super::events::close_history(&mut tx, account_id).await?;
     sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1").bind(account_id).execute(&mut *tx).await?;
     // Unprocessed deliveries: privacy requests still get done; the rest is dropped with its data.
-    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact')")
+    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact', 'app/uninstalled')")
         .bind(account_id)
         .execute(&mut *tx)
         .await?;

@@ -252,7 +252,8 @@ async fn personal_histograms(db: &PgPool, people: &[(Uuid, Tz)], now: DateTime<U
 async fn build_plan(state: &AppState, account: &Account, channel: &str, opts: SendOptions, start: DateTime<Utc>) -> AppResult<Plan> {
     let account_tz = crate::sending::account_tz(account);
     let local_date = opts.local_date.unwrap_or_else(|| start.with_timezone(&account_tz).date_naive());
-    let sms_window = if channel == "sms" { Some(super::settings::sms_window(&state.db, account.id).await?) } else { None };
+    // Texts and push notifications wait for the recipient's quiet hours to end (push in the profile's zone).
+    let sms_window = if channel == "sms" || channel == "push" { Some(super::settings::sms_window(&state.db, account.id).await?) } else { None };
     let account_hist = if opts.timing == Timing::BestTime { account_histogram(&state.db, account.id, account_tz).await? } else { Histogram::default() };
     Ok(Plan { opts, start, account_tz, local_date, sms_window, account_hist })
 }
@@ -320,7 +321,8 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
                 (Timing::Gradual, Some(at)) => *at,
                 _ => plan.slot(*tz, 0, 1, hists.get(pid)),
             };
-            let sms_zones = super::settings::sms_zones(props, phone.as_deref(), account_tz);
+            // Push has no phone number to go by: the profile's zone (with the account's) decides.
+            let sms_zones = super::settings::sms_zones(props, if c.channel == "push" { None } else { phone.as_deref() }, account_tz);
             ids.push(*mid);
             ats.push(plan.adjust(&sms_zones, base));
             tzs.push(tz.name().to_string());
@@ -345,11 +347,12 @@ pub async fn plan_campaign(state: &AppState, c: &CampaignRow) -> anyhow::Result<
 /// recorded, the options to store (the caller stores them with the launch).
 pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, send_at: Option<DateTime<Utc>>) -> AppResult<(Option<DateTime<Utc>>, Option<Value>)> {
     let Some(mut opts) = options::of(c.send_options.as_ref()) else { return Ok((send_at, None)) };
-    if c.channel == "sms" {
+    if c.channel == "sms" || c.channel == "push" {
         let (s, e) = super::settings::sms_window(&state.db, account.id).await?;
         if opts.timing == Timing::LocalTime && !(s..e).contains(&opts.local_minute()) {
             return Err(AppError::bad(format!(
-                "Texts only go out between {} and {} in each person's time zone; pick a local time in that window",
+                "{} only go out between {} and {} in each person's time zone; pick a local time in that window",
+                if c.channel == "sms" { "Texts" } else { "Push notifications" },
                 super::clock::hhmm(s),
                 super::clock::hhmm(e)
             )));
@@ -373,16 +376,22 @@ pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, 
 
 /// Estimate when a send goes out: release times for a random sample of the audience, scaled to its
 /// size, in 15-minute buckets. Also counts who smart sending would skip right now.
-pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience: &Audience, opts: Option<SendOptions>, send_at: Option<DateTime<Utc>>) -> AppResult<Value> {
+pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience: &Audience, push_platforms: Option<Vec<String>>, opts: Option<SendOptions>, send_at: Option<DateTime<Utc>>) -> AppResult<Value> {
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
     let tz = crate::sending::account_tz(&account);
-    let total = crate::campaigns::estimate(&state.db, account_id, channel, audience).await?;
+    // Push: only people with a device on a platform it goes to.
+    let resolved = crate::campaigns::resolve_audience(&state.db, account_id, channel, audience).await?.with_push_platforms(push_platforms);
+    let total: i64 = {
+        let mut qb = QueryBuilder::new("SELECT count(*)");
+        crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
+        qb.build_query_scalar().fetch_one(&state.db).await?
+    };
     let now = Utc::now();
     let start = send_at.filter(|t| *t > now).unwrap_or(now);
     let skipped = match opts.as_ref().and_then(SendOptions::smart_hours) {
         Some(h) => {
             let mut qb = QueryBuilder::new("SELECT count(*)");
-            crate::campaigns::append_audience(&mut qb, &state.db, account_id, channel, audience).await?;
+            crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
             qb.push(" AND ");
             push_recently_messaged(&mut qb, channel, h);
             Some(qb.build_query_scalar::<i64>().fetch_one(&state.db).await?)
@@ -390,7 +399,13 @@ pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience
         None => None,
     };
     let description = options::describe(opts.as_ref());
-    let Some(mut opts) = opts.filter(SendOptions::plans) else {
+    // Push waits for each person's quiet hours even when it goes to everyone at once, as the send does.
+    let planned = match opts {
+        Some(o) if o.plans() || channel == "push" => Some(o),
+        None if channel == "push" => Some(SendOptions::default()),
+        _ => None,
+    };
+    let Some(mut opts) = planned else {
         let buckets = if total > 0 { vec![json!({"at": start, "count": total, "zones": []})] } else { vec![] };
         return Ok(json!({"total": total, "starts_at": start, "ends_at": start, "buckets": buckets, "smart_sending_skips": skipped, "description": description, "sampled": 0}));
     };
@@ -405,7 +420,7 @@ pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience
     };
     let plan = build_plan(state, &account, channel, opts, local_start).await?;
     let mut qb = QueryBuilder::new("SELECT p.id, p.properties, p.phone_number");
-    crate::campaigns::append_audience(&mut qb, &state.db, account_id, channel, audience).await?;
+    crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
     qb.push(" ORDER BY random() LIMIT ").push_bind(SAMPLE);
     let rows: Vec<(Uuid, Value, Option<String>)> = qb.build_query_as().fetch_all(&state.db).await?;
     let zones: Vec<(Uuid, Tz)> = rows.iter().map(|(id, props, phone)| (*id, zone::resolve_parts(props, phone.as_deref(), tz).0)).collect();
@@ -414,7 +429,12 @@ pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience
     let mut buckets: BTreeMap<DateTime<Utc>, (i64, BTreeMap<String, i64>)> = BTreeMap::new();
     for (i, (pid, ptz)) in zones.iter().enumerate() {
         // Spread the sample's positions over the whole audience for a gradual send.
-        let at = plan.release(*ptz, i as i64 * total.max(1) / n.max(1), total, hists.get(pid));
+        let (index, personal) = (i as i64 * total.max(1) / n.max(1), hists.get(pid));
+        let at = if channel == "push" {
+            plan.adjust(&super::settings::sms_zones(&rows[i].1, None, tz), plan.slot(*ptz, index, total, personal))
+        } else {
+            plan.release(*ptz, index, total, personal)
+        };
         let key = at - Duration::minutes(i64::from(at.minute() % 15)) - Duration::seconds(i64::from(at.second()));
         let e = buckets.entry(key).or_default();
         e.0 += 1;
