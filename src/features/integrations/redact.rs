@@ -11,8 +11,10 @@
 //! The last segment must be a key name (`name` or `name[]`), which is removed. For example
 //! `results[].notes`, `reservation.notes`, `**.keyCode`.
 //!
-//! **Keep-only mode.** Paths starting with `keep:` turn the list into an allow-list: only what
-//! they name is kept (then the other paths are removed from that). A key segment may filter the
+//! **Keep-only mode.** Paths starting with `keep:` turn the list into an allow-list: only the
+//! leaves they name are kept (a path that ends on an object keeps it empty, and on a list of
+//! objects keeps empty items; name the leaves under them), then the other paths are removed from
+//! that. The mode never turns off: when none of its paths resolves, nothing is kept. A key segment may filter the
 //! items of an array, `name[sub/key=a|b]` (items whose `sub.key` is `a` or `b`), and
 //! `{setting:KEY}` stands for the integration's setting `KEY` (a text, or each item of a list), so
 //! what's kept can follow what the installer mapped: `keep:payload.data.{setting:email_field}`,
@@ -137,6 +139,8 @@ pub fn paths_with(list: &[String], settings: &Map<String, Value>) -> Vec<Path> {
         }
     };
     let mut out = Vec::new();
+    // Allow-list mode stays on even when none of its paths resolves: then nothing is kept.
+    let keep_mode = list.iter().any(|r| r.trim_start().starts_with("keep:"));
     'raw: for raw in list {
         let mut expanded = vec![raw.clone()];
         let mut passes = 0;
@@ -168,7 +172,49 @@ pub fn paths_with(list: &[String], settings: &Map<String, Value>) -> Vec<Path> {
             break;
         }
     }
+    if keep_mode && !out.iter().any(|p| p.keep) {
+        out.push(Path { segs: Vec::new(), keep: true });
+    }
     out
+}
+
+/// A leaf: a plain value, or a list of plain values. Objects and other lists are containers, kept
+/// only as deep as a keep path names.
+fn is_leaf(v: &Value) -> bool {
+    match v {
+        Value::Object(_) => false,
+        Value::Array(a) => a.iter().all(|x| !x.is_object() && !x.is_array()),
+        _ => true,
+    }
+}
+
+/// What a keep path that ends on `v` keeps of it: a leaf whole, a container empty (its own named
+/// leaves are copied in by their own paths).
+fn kept_end(v: &Value) -> Value {
+    if is_leaf(v) {
+        v.clone()
+    } else if v.is_array() {
+        Value::Array(v.as_array().unwrap().iter().map(|x| if is_leaf(x) { x.clone() } else if x.is_array() { Value::Array(Vec::new()) } else { Value::Object(Map::new()) }).collect())
+    } else {
+        Value::Object(Map::new())
+    }
+}
+
+fn merge_kept(slot: &mut Value, v: Value) {
+    match (slot, v) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, x) in s {
+                match d.get_mut(&k) {
+                    Some(existing) => merge_kept(existing, x),
+                    None => {
+                        d.insert(k, x);
+                    }
+                }
+            }
+        }
+        (slot @ Value::Null, v) => *slot = v,
+        _ => {}
+    }
 }
 
 /// Keep what the keep paths name (when there are any), then remove what the other paths name.
@@ -206,7 +252,8 @@ fn keep_into(src: &Value, segs: &[Seg], dst: &mut Value, depth: usize) {
                 continue;
             }
             if rest.is_empty() {
-                d[i] = item.clone();
+                let end = kept_end(item);
+                merge_kept(&mut d[i], end);
             } else {
                 if d[i].is_null() {
                     d[i] = if item.is_array() { Value::Array(Vec::new()) } else { Value::Object(Map::new()) };
@@ -222,7 +269,8 @@ fn keep_into(src: &Value, segs: &[Seg], dst: &mut Value, depth: usize) {
             let (Value::Object(s), Value::Object(d)) = (src, &mut *dst) else { return };
             for (k, c) in s {
                 if rest.is_empty() {
-                    d.insert(k.clone(), c.clone());
+                    let end = kept_end(c);
+                    merge_kept(d.entry(k.clone()).or_insert(Value::Null), end);
                 } else {
                     let slot = d.entry(k.clone()).or_insert_with(|| if c.is_array() { Value::Array(Vec::new()) } else { Value::Object(Map::new()) });
                     keep_into(c, rest, slot, depth + 1);
@@ -239,7 +287,8 @@ fn keep_into(src: &Value, segs: &[Seg], dst: &mut Value, depth: usize) {
                 let slot = d.entry(name.clone()).or_insert_with(|| Value::Array(Vec::new()));
                 items(child, slot, &|it| filter.as_ref().is_none_or(|f| f.matches(it)));
             } else if rest.is_empty() {
-                d.insert(name.clone(), child.clone());
+                let end = kept_end(child);
+                merge_kept(d.entry(name.clone()).or_insert(Value::Null), end);
             } else {
                 let slot = d.entry(name.clone()).or_insert_with(|| if child.is_array() { Value::Array(Vec::new()) } else { Value::Object(Map::new()) });
                 keep_into(child, rest, slot, depth + 1);
@@ -381,17 +430,24 @@ mod tests {
     #[test]
     fn keep_paths_keep_only_what_they_name() {
         let v = json!({"event_id": "e1", "form_response": {"token": "t", "hidden": {"user_id": "u"}, "answers": [
-            {"type": "email", "email": "a@example.com", "field": {"ref": "em"}},
+            {"type": "email", "email": "a@example.com", "field": {"ref": "em", "id": "f1"}},
             {"type": "text", "text": "free text", "field": {"ref": "note"}},
-            {"type": "choice", "choice": {"label": "London", "other": "typed"}, "field": {"ref": "city"}}]}});
+            {"type": "choice", "choice": {"label": "London", "other": "typed", "extra": {"deep": "x"}}, "field": {"ref": "city"}}]}});
         let settings = json!({"email_field": "em", "copy_fields": ["city"]}).as_object().unwrap().clone();
-        let list: Vec<String> = ["keep:event_id", "keep:form_response.token", "keep:form_response.answers[field/ref={setting:email_field}]", "keep:form_response.answers[field/ref={setting:copy_fields}]", "keep:form_response.answers[field/ref={setting:consent_field}]", "form_response.answers[].choice.other"]
+        let list: Vec<String> = ["keep:event_id", "keep:form_response.token",
+            "keep:form_response.answers[field/ref={setting:email_field}].email", "keep:form_response.answers[field/ref={setting:email_field}].field.ref",
+            "keep:form_response.answers[field/ref={setting:copy_fields}].choice.label", "keep:form_response.answers[field/ref={setting:copy_fields}].field.ref",
+            "keep:form_response.answers[field/ref={setting:consent_field}].boolean"]
             .iter().map(|s| s.to_string()).collect();
         let mut out = v.clone();
         apply(&mut out, &paths_with(&list, &settings));
         assert_eq!(out, json!({"event_id": "e1", "form_response": {"token": "t", "answers": [
-            {"type": "email", "email": "a@example.com", "field": {"ref": "em"}},
-            {"type": "choice", "choice": {"label": "London"}, "field": {"ref": "city"}}]}}));
+            {"email": "a@example.com", "field": {"ref": "em"}},
+            {"choice": {"label": "London"}, "field": {"ref": "city"}}]}}), "only the named leaves; nothing nested beside them");
+        // An object named on its own is kept empty.
+        let mut out = json!({"a": {"secret": 1, "b": {"c": 2}}, "id": 7});
+        apply(&mut out, &paths(&["keep:a".into(), "keep:id".into()]));
+        assert_eq!(out, json!({"a": {}, "id": 7}));
         // Object keys from a setting, one path per value; an unset setting keeps nothing.
         let d = json!({"payload": {"id": "s1", "data": {"Email": "a@example.com", "Message": "call me", "Interest": "x"}}});
         let settings = json!({"email_field": "Email", "copy_fields": ["Interest", "bad.name"]}).as_object().unwrap().clone();
@@ -399,6 +455,10 @@ mod tests {
         let mut out = d.clone();
         apply(&mut out, &paths_with(&list, &settings));
         assert_eq!(out, json!({"payload": {"id": "s1", "data": {"Email": "a@example.com", "Interest": "x"}}}));
+        // A keep list whose selectors all resolve to nothing keeps nothing (it never turns off).
+        let mut out = d.clone();
+        apply(&mut out, &paths_with(&["keep:payload.data.{setting:email_field}".to_string()], &Map::new()));
+        assert_eq!(out, json!({}));
         // A setting holding a placeholder is skipped, never expanded again.
         let loopy = json!({"copy_fields": ["{setting:copy_fields}", "ok"]}).as_object().unwrap().clone();
         let ps = paths_with(&["keep:a.{setting:copy_fields}".to_string()], &loopy);

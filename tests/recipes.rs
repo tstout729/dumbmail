@@ -1311,3 +1311,49 @@ async fn patching_a_profiles_phone_leaves_the_sms_subscription_with_the_old_numb
     assert_eq!(opted["sms_consent"], "subscribed");
     h.cleanup().await;
 }
+
+// ---------- Allow-lists keep only named leaves; dry runs see what would be stored ----------
+
+#[tokio::test]
+async fn keep_lists_keep_only_named_leaves_everywhere() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    // Webflow: a mapped field whose value is an object keeps nothing nested in it.
+    let w = install(&mut h, "webflow", Sign::Webflow, "webflow-secret-0001", false).await;
+    h.ok("PATCH", &format!("/api/integrations/{}", w.id), Some(json!({"settings": {"email_field": "Email", "copy_fields": ["Interest"]}}))).await;
+    let mut body = fixture("webflow", "form-submission.json")["input"]["payload"].clone();
+    body["payload"]["data"]["Interest"] = json!({"label": "Weekend stays", "note": "NESTED-SECRET-1"});
+    let (s, _) = w.post_as(&h, &body.to_string(), &json!({}), &json!({}), &w.secret).await;
+    assert_eq!(s, StatusCode::OK);
+    // Typeform: a selected answer with something nested beside the named leaves.
+    let t = install(&mut h, "typeform", Sign::Base64Prefixed("Typeform-Signature", "sha256="), "typeform-secret-0001", false).await;
+    h.ok("PATCH", &format!("/api/integrations/{}", t.id), Some(json!({"settings": {"copy_fields": ["readable_ref_choice"]}}))).await;
+    let mut tf = fixture("typeform", "form-response.json")["input"]["payload"].clone();
+    tf["form_response"]["answers"][2]["choice"] = json!({"label": "London", "extra": {"deep": "NESTED-SECRET-2"}});
+    let (s, _) = t.post_as(&h, &tf.to_string(), &json!({}), &json!({}), &t.secret).await;
+    assert_eq!(s, StatusCode::OK);
+    // A custom keep list whose only selector is unset keeps nothing (it never turns off).
+    let script = "function handle(i) { return [{type: 'log', message: 'saw ' + JSON.stringify(i.payload)}] }";
+    let c = h.ok("POST", "/api/integrations", Some(json!({"name": "Keep nothing", "script": script, "redact": ["keep:data.{setting:field}"]}))).await;
+    let url = c["inbound_url"].as_str().unwrap();
+    let path = &url[url.find("/webhooks/in/").unwrap()..];
+    let (s, _, _) = h.raw("POST", path, &[("content-type", "application/json")], r#"{"data": {"secret": "UNSET-SECRET-3"}}"#).await;
+    assert_eq!(s, StatusCode::OK);
+    h.drain().await;
+    let everything: String = sqlx::query_scalar("SELECT COALESCE(string_agg(concat_ws(' ', body, result::text, actions::text), ' '), '') FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    let written: String = sqlx::query_scalar("SELECT COALESCE(string_agg(properties::text, ' '), '') FROM events").fetch_one(&h.state.db).await.unwrap();
+    for n in ["NESTED-SECRET-1", "NESTED-SECRET-2", "UNSET-SECRET-3"] {
+        assert!(!everything.contains(n), "{n} was stored: {everything}");
+        assert!(!written.contains(n), "{n} reached an event");
+    }
+    assert!(everything.contains("saw {}"), "the script ran on the kept (empty) body: {everything}");
+    // A dry run gives the script the same projected input, so its logs can't show more.
+    let peek = "function handle(i) { return [{type: 'log', message: JSON.stringify(i.payload)}] }";
+    let out = h.ok("POST", &format!("/api/integrations/{}/test", w.id), Some(json!({"payload": body, "script": peek}))).await;
+    assert_eq!(out["ok"], true, "{out}");
+    let shown = out.to_string();
+    assert!(!shown.contains("NESTED-SECRET-1") && !shown.contains("503 555 0177"), "the dry run saw what would be stored only: {shown}");
+    assert!(!shown.contains("Weekend stays"), "an object value keeps none of its leaves unless they're named: {shown}");
+    assert!(shown.contains("Email"), "{shown}");
+    h.cleanup().await;
+}

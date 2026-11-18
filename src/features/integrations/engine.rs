@@ -679,6 +679,11 @@ async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>,
                 other => other.to_string(),
             };
             let ct = if payload.is_string() { None } else { Some("application/json".to_string()) };
+            // A dry run gives the script what a real delivery's run would get: the payload as it
+            // would be stored (redacted, or projected by a keep list), so its actions and logs can't
+            // show more than a live run.
+            let (kept, _) = kept_body(integ, scrub, ct.as_deref(), Some(&body));
+            let body = kept.unwrap_or_default();
             (Input { source: source.unwrap_or_else(|| "test".into()), content_type: ct, body, headers: headers.unwrap_or(json!({})), query: query.unwrap_or(json!({})), ..Default::default() }, None)
         }
         TestSample::Pull => {
