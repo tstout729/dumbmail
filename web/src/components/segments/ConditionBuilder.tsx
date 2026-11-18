@@ -18,6 +18,7 @@ import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, 
 import { useCatalogFacets } from "../../features/catalog/api";
 import type { ProductCondition } from "../../features/catalog/types";
 import { CouponConditionFields } from "../../features/coupons/CouponConditionFields";
+import { ReviewConditionFields } from "../../features/reviews/ReviewConditionFields";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
 import { IconButton, Input, Select, cx } from "../ui";
 
@@ -327,6 +328,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
       return <ProductFields condition={c} onChange={onChange} />;
     case "coupon":
       return <CouponConditionFields condition={c} onChange={onChange} />;
+    case "review":
+      return <ReviewConditionFields condition={c} onChange={onChange} />;
     case "list":
       return (
         <>

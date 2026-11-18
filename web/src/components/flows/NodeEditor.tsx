@@ -3,6 +3,7 @@ import { Pencil, Plus, Trash2, X } from "lucide-react";
 import type { DelayUnit, FlowNode, List } from "../../api";
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
+import { ReviewStepEditor } from "../../features/reviews/StepEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 
@@ -112,6 +113,8 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
       );
     case "webhook":
       return <WebhookEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
+    case "review_request":
+      return <ReviewStepEditor node={node} onChange={onChange} onEditEmail={onEditEmail} readOnly={readOnly} />;
   }
 }
 

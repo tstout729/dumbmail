@@ -9,6 +9,8 @@ import {
   LayoutGrid,
   MoveVertical,
   ShoppingBag,
+  Star,
+  StarHalf,
   TicketPercent,
   type LucideIcon,
 } from "lucide-react";
@@ -16,6 +18,7 @@ import type { EmailBlock, EmailBlockType, EmailContent } from "../../api";
 import { newProductsBlock, sourceLabel } from "../../features/catalog/ProductsBlockFields";
 import { contentBlockMeta, contentBlockOrder, contentBlockSummary, isContentBlock, isContentType, newContentBlock } from "../../features/content/blockDefs";
 import { couponBlockSummary, newCouponBlock } from "../../features/coupons/CouponBlockFields";
+import { newReviewRequestBlock, newReviewsBlock, reviewRequestBlockSummary, reviewsBlockSummary } from "../../features/reviews/BlockFields";
 
 export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon }> = {
   heading: { label: "Heading", icon: Heading },
@@ -28,11 +31,13 @@ export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon
   product: { label: "Product", icon: ShoppingBag },
   products: { label: "Products from catalog", icon: LayoutGrid },
   coupon: { label: "Coupon code", icon: TicketPercent },
+  review_request: { label: "Review request", icon: Star },
+  reviews: { label: "Reviews", icon: StarHalf },
   html: { label: "HTML", icon: Code },
   ...contentBlockMeta,
 };
 
-export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "coupon", "columns", "divider", "spacer", "html", ...contentBlockOrder];
+export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "coupon", "review_request", "reviews", "columns", "divider", "spacer", "html", ...contentBlockOrder];
 
 export function newBlock(type: EmailBlockType): EmailBlock {
   if (isContentType(type)) return newContentBlock(type);
@@ -65,6 +70,10 @@ export function newBlock(type: EmailBlockType): EmailBlock {
       return newProductsBlock();
     case "coupon":
       return newCouponBlock();
+    case "reviews":
+      return newReviewsBlock();
+    case "review_request":
+      return newReviewRequestBlock();
   }
 }
 
@@ -97,6 +106,10 @@ export function blockSummary(b: EmailBlock): string {
       return `${b.count ?? 4} × ${sourceLabel(b.source)}`;
     case "coupon":
       return couponBlockSummary(b);
+    case "reviews":
+      return reviewsBlockSummary(b);
+    case "review_request":
+      return reviewRequestBlockSummary(b);
   }
 }
 
@@ -119,5 +132,6 @@ export const templateVariables: { label: string; value: string }[] = [
   { label: "A product by its ID", value: '{{ catalog.products["YOUR-ID"].title }}' },
   { label: "Top pick for this person", value: "{{ recommendations[0].title }} {{ recommendations[0].url }}" },
   { label: "Unique coupon code", value: "{% coupon_code 'COUPON NAME' %}" },
+  { label: "Review link", value: "{% review_link %}" },
   { label: "Unsubscribe link", value: "{{ unsubscribe_url }}" },
 ];
