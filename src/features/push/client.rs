@@ -193,8 +193,8 @@ pub struct Registration<'a> {
 
 /// Save a registration in one transaction, taking its locks in the push module's one order: the
 /// people (the device's current owner and its new one), then the device, then the account's push
-/// settings row (so the caps hold under concurrent registrations). The version goes up whenever the
-/// owner, the address or the keys change. Returns (device id, linked to a known person).
+/// settings row (so the caps hold under concurrent registrations). Every registration, a refresh with
+/// the same keys too, bumps the version, so a provider's answer to an earlier one can't touch it. Returns (device id, linked to a known person).
 pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<(Uuid, bool)> {
     // The owner read before its lock can change under us; then start over (rarely more than once).
     for _ in 0..5 {
@@ -256,12 +256,11 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     }
     let keys = r.keys.map(|k| (k.0.to_string(), k.1.to_string()));
     let id = match &existing {
-        Some((id, old_profile, p256dh, auth, ..)) => {
-            let changed = *old_profile != Some(profile_id) || (keys.is_some() && keys != p256dh.clone().zip(auth.clone()));
+        Some((id, ..)) => {
             sqlx::query(
                 "UPDATE push_devices SET profile_id = $2, anonymous = $3, p256dh = COALESCE($4, p256dh), auth_secret = COALESCE($5, auth_secret), permission = $6,
-                        status = 'active', failures = 0, disabled_at = NULL, last_seen_at = now(), version = version + CASE WHEN $7 THEN 1 ELSE 0 END,
-                        user_agent = COALESCE($8, user_agent), app_version = COALESCE($9, app_version), apns_environment = COALESCE($10, apns_environment)
+                        status = 'active', failures = 0, disabled_at = NULL, last_seen_at = now(), version = version + 1,
+                        user_agent = COALESCE($7, user_agent), app_version = COALESCE($8, app_version), apns_environment = COALESCE($9, apns_environment)
                  WHERE id = $1",
             )
             .bind(id)
@@ -270,7 +269,6 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(keys.as_ref().map(|k| k.0.clone()))
             .bind(keys.as_ref().map(|k| k.1.clone()))
             .bind(r.permission)
-            .bind(changed)
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
             .bind(r.apns_environment)

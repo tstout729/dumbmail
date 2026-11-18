@@ -170,7 +170,7 @@ async fn test_device_h(State(state): State<AppState>, ctx: Ctx, headers: axum::h
          VALUES ($1, $2, $3, 'web', $4, $5, $6, $7, 'granted')
          ON CONFLICT (account_id, kind, address) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth_secret = EXCLUDED.auth_secret, status = 'active', failures = 0, last_seen_at = now(),
             permission = 'granted', test_user_id = EXCLUDED.test_user_id,
-            version = push_devices.version + CASE WHEN push_devices.test_user_id IS DISTINCT FROM EXCLUDED.test_user_id OR push_devices.auth_secret IS DISTINCT FROM EXCLUDED.auth_secret THEN 1 ELSE 0 END
+            version = push_devices.version + 1
          WHERE push_devices.profile_id IS NULL
          RETURNING id",
     )

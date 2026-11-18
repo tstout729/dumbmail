@@ -589,6 +589,20 @@ async fn a_push_goes_only_to_the_person_and_registration_it_was_made_for() {
     assert_eq!(count(&h, &format!("SELECT count(*) FROM push_devices WHERE profile_id = '{dan}'")).await, 1, "the renewed registration stays");
     assert_eq!(message_of(&h, dan).await.1, "failed");
 
+    // 3b. The same when the browser only refreshes its registration, with the very same keys.
+    let same = browser(&base, "gone-y");
+    let gus = person(&mut h, &l2, "gus@x.test", "Gus").await;
+    enroll(&h, &a, &same, "gus@x.test").await;
+    let gate = m.gate("/webpush/gone-y");
+    let cid3b = push_campaign(&mut h, &l2, json!({"title": "For Gus"})).await;
+    h.ok("POST", &format!("/api/campaigns/{cid3b}/send"), None).await;
+    let task = drain_in_background(&h);
+    gate.wait(1).await;
+    enroll(&h, &a, &same, "gus@x.test").await;
+    gate.open();
+    task.await.unwrap();
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM push_devices WHERE profile_id = '{gus}'")).await, 1, "the refreshed registration stays");
+
     // 4. A test to one device still respects its owner's push opt-out.
     let erin = person(&mut h, &l2, "erin@x.test", "Erin").await;
     let eb = browser(&base, "e1");
