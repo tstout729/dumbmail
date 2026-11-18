@@ -1111,7 +1111,7 @@ async fn stopping_and_deleting_a_started_resend_at_once_keeps_its_slot() {
         assert!(stop.await.unwrap(), "round {round}");
         assert!(!del.await.unwrap(), "round {round}: a resend that started can't be deleted");
         let held: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_resends WHERE original_id = $1 AND (campaign_id IS NOT NULL OR started_at IS NOT NULL)").bind(orig_u).fetch_one(&h.state.db).await.unwrap();
-        assert!(held >= 1 && held <= 2, "round {round}: {held}");
+        assert!((1..=2).contains(&held), "round {round}: {held}");
         if held == 2 {
             let (st, _) = h.req("POST", &format!("/api/campaigns/{orig}/resend"), None).await;
             assert_eq!(st, StatusCode::CONFLICT, "round {round}: the stopped resend still holds its slot");
