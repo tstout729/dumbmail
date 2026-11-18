@@ -77,9 +77,14 @@ pub struct Profile {
     #[serde(default)]
     #[sqlx(default)]
     pub locale: Option<String>,
+    /// A browser's language, only for choosing a message's language version (see
+    /// `features::translations`). Not shown to templates or segments.
+    #[serde(default, skip_serializing)]
+    #[sqlx(default)]
+    pub locale_hint: Option<String>,
 }
 
-pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at, p.locale";
+pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at, p.locale, p.locale_hint";
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct List {

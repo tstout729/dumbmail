@@ -435,7 +435,7 @@ pub fn pick(s: &Settings, profile_locale: Option<&str>, accept: Option<&str>) ->
 pub async fn for_page(db: &PgPool, account_id: Uuid, profile_id: Option<Uuid>, headers: &HeaderMap) -> Texts {
     let Ok(s) = settings(db, account_id).await else { return Texts::english() };
     let loc: Option<String> = match profile_id {
-        Some(p) if !s.languages.is_empty() => sqlx::query_scalar("SELECT locale FROM profiles WHERE id = $1 AND account_id = $2").bind(p).bind(account_id).fetch_optional(db).await.ok().flatten().flatten(),
+        Some(p) if !s.languages.is_empty() => sqlx::query_scalar("SELECT COALESCE(locale, locale_hint) FROM profiles WHERE id = $1 AND account_id = $2").bind(p).bind(account_id).fetch_optional(db).await.ok().flatten().flatten(),
         _ => None,
     };
     let accept = headers.get(axum::http::header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok());

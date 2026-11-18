@@ -726,7 +726,7 @@ mod tests {
         let profile = Profile {
             id: Uuid::nil(), account_id: Uuid::nil(), email: Some("a@b.co".into()), phone_number: None, external_id: None,
             first_name: None, last_name: Some("".into()), properties: json!({}), email_consent: "subscribed".into(), sms_consent: "never_subscribed".into(),
-            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), last_event_at: None, locale: None,
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), last_event_at: None, locale: None, locale_hint: None,
         };
         let ctx = context(&acct, Some(&profile), None, "#");
         assert_eq!(render_str("Hi {{ first_name|default('there') }} {{ person.last_name|default('') }}", &ctx, false).unwrap().trim(), "Hi there");

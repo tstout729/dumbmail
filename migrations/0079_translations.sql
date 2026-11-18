@@ -3,6 +3,9 @@
 -- A person's language as a BCP 47 tag (normalized: fr, fr-CA, pt-BR). Nullable, no default: adding it
 -- doesn't rewrite the table.
 ALTER TABLE profiles ADD COLUMN locale text;
+-- A browser's language (a sign-up form, the website script): a hint that may choose which version
+-- of a message someone gets, and nothing else. Fill-only; segments and templates never read it.
+ALTER TABLE profiles ADD COLUMN locale_hint text;
 
 -- The language a message was sent in, when its content had language versions (for reports).
 -- Nullable, no default, no index.

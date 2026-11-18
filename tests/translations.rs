@@ -263,7 +263,9 @@ async fn a_persons_language_comes_from_the_api_imports_and_forms() {
         let db = h.state.db.clone();
         async move { sqlx::query_scalar::<_, Option<String>>("SELECT locale FROM profiles WHERE email = $1").bind(e).fetch_one(&db).await.unwrap() }
     };
-    assert_eq!(got("new@x.test").await.as_deref(), Some("nl-BE"));
+    assert_eq!(got("new@x.test").await, None, "a browser's language is only a hint");
+    let hint: Option<String> = sqlx::query_scalar("SELECT locale_hint FROM profiles WHERE email = 'new@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(hint.as_deref(), Some("nl-BE"));
     assert_eq!(got("a@x.test").await.as_deref(), Some("pt-BR"), "a browser can't overwrite the language the API set");
     // The site snippet can't overwrite it either.
     h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &json!({"metric": "Viewed Page", "profile": {"email": "a@x.test", "locale": "ru"}}).to_string()).await;
@@ -276,7 +278,7 @@ async fn a_persons_language_comes_from_the_api_imports_and_forms() {
     let n = h.ok("POST", "/api/segments/preview", Some(count(json!({"type": "language", "op": "is", "value": "de-DE"})))).await;
     assert_eq!(n["count"], 0, "a region matches only that region");
     let n = h.ok("POST", "/api/segments/preview", Some(count(json!({"type": "language", "op": "is_one_of", "values": ["de", "nl", "es"]})))).await;
-    assert_eq!(n["count"], 3);
+    assert_eq!(n["count"], 2, "the browser's hint (nl-BE) doesn't count");
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles").fetch_one(&h.state.db).await.unwrap();
     let n = h.ok("POST", "/api/segments/preview", Some(count(json!({"type": "language", "op": "is_not", "value": "pt"})))).await;
     assert_eq!(n["count"].as_i64().unwrap(), total - 1, "is_not includes people with no language");
@@ -1197,4 +1199,49 @@ async fn a_paid_draft_run_asks_first_and_charges_with_its_drafts() {
     assert!(v["strings"].as_array().unwrap().iter().all(|s| s["status"] == "missing"), "{v}");
     assert_eq!(translation_charges(&h, None).await, ledger);
     h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_browsers_language_hint_picks_a_translation_and_nothing_else() {
+    let mut h = harness!();
+    let me = h.signup().await;
+    h.credit(5.0).await;
+    let pk = me["account"]["public_key"].as_str().unwrap().to_string();
+    set_languages(&mut h, json!(["fr"])).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let form = h.ok("POST", "/api/forms", Some(json!({"name": "Popup", "list_id": list["id"], "config": {"headline": "Join"}}))).await;
+    let fid = form["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/forms/{fid}"), Some(json!({"status": "live"}))).await;
+    // The browser says French, and a "language" field on the form says French too.
+    let body = json!({"form_id": fid, "email": "zoe@x.test", "locale": "fr-FR", "fields": {"language": "fr"}}).to_string();
+    let (s, _, out) = h.raw("POST", &format!("/client/subscribe?k={pk}"), &[("content-type", "application/json")], &body).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    let (locale, hint, props): (Option<String>, Option<String>, Value) = sqlx::query_as("SELECT locale, locale_hint, properties FROM profiles WHERE email = 'zoe@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((locale, hint.as_deref()), (None, Some("fr-FR")));
+    assert!(props.get("language").is_none() && props.get("locale").is_none(), "language answers aren't custom properties: {props}");
+    // The website script can't set the trusted language either.
+    h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &json!({"metric": "Viewed Page", "profile": {"email": "zoe@x.test", "locale": "de"}}).to_string()).await;
+    let locale: Option<String> = sqlx::query_scalar("SELECT locale FROM profiles WHERE email = 'zoe@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(locale, None);
+    // A "language is French" segment doesn't include her.
+    let n = h.ok("POST", "/api/segments/preview", Some(json!({"definition": {"match": "all", "conditions": [{"type": "language", "op": "is", "value": "fr"}]}}))).await;
+    assert_eq!(n["count"], 0);
+    // But she gets the French version, and templates see no language for her.
+    let content = json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "Hello"}, {"type": "text", "html": "<p>[{{ person.locale|default('none') }}]</p>"}]});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": content, "language": "fr", "strings": [{"id": "b0:text", "text": "Bonjour"}]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Hint", "audience": {"include": [{"type": "list", "id": list["id"]}]}, "content": v["content"]}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let m = h.state.email.sent().into_iter().find(|m| m.to == "zoe@x.test").expect("sent");
+    assert!(m.html.contains("Bonjour") && m.html.contains("[none]"), "{}", m.html);
+    h.cleanup().await;
+}
+
+#[test]
+fn klaviyos_locale_becomes_the_trusted_language() {
+    let p = json!({"id": "01K", "attributes": {"email": "k@x.test", "locale": "fr_CA", "subscriptions": {}}});
+    let k = dumbmail::features::klaviyo_import::profiles::parse(&p, false, Uuid::nil()).unwrap();
+    assert_eq!(k.locale.as_deref(), Some("fr-CA"));
+    let p = json!({"id": "01L", "attributes": {"email": "l@x.test", "locale": "French", "subscriptions": {}}});
+    assert_eq!(dumbmail::features::klaviyo_import::profiles::parse(&p, false, Uuid::nil()).unwrap().locale, None);
 }

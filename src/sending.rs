@@ -306,7 +306,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // features::content); email that uses none of them goes on untouched. When every block is hidden
     // for this person they get nothing (a test send says why). This runs before coupon codes are
     // claimed, so a code is only used for what this person will see.
-    let Some(prepared) = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await? else {
+    let Some(prepared) = crate::features::translations::with_hint(p.locale_hint.clone(), crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx)).await? else {
         if spec.is_test {
             return Err(AppError::bad("Nothing to show for this person: every block is hidden by a display rule, so they'd be skipped."));
         }

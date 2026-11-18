@@ -750,12 +750,15 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
         (Some(l), Some(_)) => sqlx::query_scalar::<_, bool>("SELECT double_opt_in FROM lists WHERE id = $1").bind(l).fetch_optional(&state.db).await?.unwrap_or(false),
         _ => false,
     };
+    // A language answer is only a hint (see features::translations), never a custom property.
+    let mut answer_props = answers.properties;
+    let language_answer = crate::features::translations::take_language_answers(&mut answer_props);
     let input = ProfileInput {
         email: email.clone(),
         phone_number: phone.clone(),
         first_name: answers.first_name,
         last_name: answers.last_name,
-        properties: (!answers.properties.is_empty()).then_some(answers.properties),
+        properties: (!answer_props.is_empty()).then_some(answer_props),
         email_consent: email.as_ref().filter(|_| !double_opt_in).map(|_| "subscribed".to_string()),
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
@@ -766,7 +769,7 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
         audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
     }
     // A language field on the form, else the browser's language: fills an empty profile language only.
-    crate::features::translations::fill_from_form(&state.db, p.id, &b.given(), b.locale.as_deref()).await?;
+    crate::features::translations::fill_from_form(&state.db, p.id, language_answer, b.locale.as_deref()).await?;
     // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
     if double_opt_in && upserted.created {
         sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;

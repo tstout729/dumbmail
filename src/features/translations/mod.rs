@@ -44,8 +44,16 @@ pub struct Module;
 tokio::task_local! {
     /// A language chosen for a preview or test send, overriding the person's.
     static PIN: String;
+    /// The recipient's browser language hint (`profiles.locale_hint`), used only when they have no
+    /// trusted language.
+    static HINT: Option<String>;
     /// The campaign whose batch is being sent (its footer wording snapshot applies only there).
     static CAMPAIGN: Uuid;
+}
+
+/// Run `f` (the content prepare step for one recipient) knowing their browser language hint.
+pub async fn with_hint<F: Future>(hint: Option<String>, f: F) -> F::Output {
+    HINT.scope(hint, f).await
 }
 
 /// Run `f` as part of sending campaign `id`'s batch.
@@ -69,7 +77,9 @@ fn pin() -> Option<String> {
 /// `saved_langs` are the languages the email's saved blocks carry (see [`saved_languages`]); with
 /// those, an email whose only translations are in a saved block is versioned too.
 pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx: &Value, saved_langs: &[String]) -> AppResult<Option<(Value, String)>> {
-    let person = ctx.pointer("/person/locale").and_then(|v| v.as_str());
+    // The trusted language, else the browser's hint (which only ever picks a version).
+    let hint = HINT.try_with(|h| h.clone()).ok().flatten();
+    let person = ctx.pointer("/person/locale").and_then(|v| v.as_str()).or(hint.as_deref());
     let mut extra = saved_langs.to_vec();
     for l in fields::saved_block_languages(content) {
         if !extra.contains(&l) {
@@ -220,27 +230,41 @@ pub fn is_locale_key(k: &str, v: &Value) -> bool {
 }
 
 /// Save a person's language. Trusted callers (the API, imports, integrations, the dashboard) set
-/// it; a browser (a form, the site snippet) only fills it in when it's empty, so it can choose
-/// which language someone is sent but never overwrite what a trusted source said. Returns the
-/// language now saved.
+/// `locale`. A browser (a form, the site snippet) only fills in the separate `locale_hint` when it's
+/// empty: it can choose which language version someone is sent, and nothing else (segments and
+/// templates read only `locale`). Returns the trusted language now saved.
 pub async fn save_locale(db: &PgPool, profile_id: Uuid, value: Option<&str>, from_browser: bool) -> AppResult<Option<String>> {
-    let q = if from_browser {
-        "UPDATE profiles SET locale = $2, updated_at = now() WHERE id = $1 AND locale IS NULL AND $2::text IS NOT NULL RETURNING locale"
-    } else {
-        "UPDATE profiles SET locale = $2, updated_at = now() WHERE id = $1 AND locale IS DISTINCT FROM $2 RETURNING locale"
-    };
-    let changed: Option<Option<String>> = sqlx::query_scalar(q).bind(profile_id).bind(value).fetch_optional(db).await?;
+    if from_browser {
+        sqlx::query("UPDATE profiles SET locale_hint = $2 WHERE id = $1 AND locale_hint IS NULL AND $2::text IS NOT NULL").bind(profile_id).bind(value).execute(db).await?;
+        return Ok(sqlx::query_scalar("SELECT locale FROM profiles WHERE id = $1").bind(profile_id).fetch_optional(db).await?.flatten());
+    }
+    let changed: Option<Option<String>> = sqlx::query_scalar("UPDATE profiles SET locale = $2, updated_at = now() WHERE id = $1 AND locale IS DISTINCT FROM $2 RETURNING locale")
+        .bind(profile_id)
+        .bind(value)
+        .fetch_optional(db)
+        .await?;
     match changed {
         Some(l) => Ok(l),
         None => Ok(sqlx::query_scalar("SELECT locale FROM profiles WHERE id = $1").bind(profile_id).fetch_optional(db).await?.flatten()),
     }
 }
 
+/// Take a form's language answers (`locale`, `language`) out of what becomes custom properties:
+/// they're only a hint, and land nowhere else.
+pub fn take_language_answers(props: &mut Map<String, Value>) -> Option<String> {
+    let mut hint = None;
+    for k in ["locale", "language"] {
+        if let Some(v) = props.remove(k) {
+            hint = hint.or_else(|| v.as_str().and_then(locale::normalize));
+        }
+    }
+    hint
+}
+
 /// A form's language hint (a `locale` or `language` field, else the browser's language): fills an
-/// empty profile language only.
-pub async fn fill_from_form(db: &PgPool, profile_id: Uuid, answers: &Map<String, Value>, browser: Option<&str>) -> AppResult<()> {
-    let given = ["locale", "language"].iter().find_map(|k| answers.get(*k).and_then(|v| v.as_str()).and_then(locale::normalize));
-    let tag = given.or_else(|| browser.and_then(|b| locale::accept_language(b).into_iter().next()));
+/// empty language hint only (see [`save_locale`]).
+pub async fn fill_from_form(db: &PgPool, profile_id: Uuid, answer: Option<String>, browser: Option<&str>) -> AppResult<()> {
+    let tag = answer.or_else(|| browser.and_then(|b| locale::accept_language(b).into_iter().next()));
     if let Some(t) = tag {
         save_locale(db, profile_id, Some(&t), true).await?;
     }
