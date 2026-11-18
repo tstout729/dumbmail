@@ -4,9 +4,9 @@
 // order or customer object the REST API returns. A pull of /wp-json/wc/v3/orders imports past
 // orders. See README.md for the WooCommerce page behind each assumption.
 //
-// Placed Order: once per order (woocommerce:order:<id>:placed), when WooCommerce says it's paid
-//   (date_paid_gmt set, or status processing or completed). Pending, on-hold, failed and free orders
-//   aren't orders.
+// Placed Order: once per order (woocommerce:order:<id>:placed), when WooCommerce records the
+//   payment (date_paid_gmt), or, for cash on delivery, when the order is completed. Pending,
+//   on-hold, failed and free orders aren't orders.
 // Fulfilled Order: once, when the status is completed.
 // Cancelled Order: once, when a paid order is cancelled. Unpaid Order Cancelled: once, when an
 //   order that was never paid is cancelled (kept apart from orders, which it never was).
@@ -16,7 +16,6 @@
 // People are matched by billing email and never subscribed: WooCommerce has no marketing opt-in
 // field, so everyone this adds is held back from marketing.
 
-var PAID = ["processing", "completed"];
 
 function num(s) {
   var n = parseFloat(s);
@@ -61,7 +60,10 @@ function orderActions(o, historical, canFetch) {
   if (!b.email) return [{ type: "log", message: "order " + o.id + " has no billing email" }];
   var who = { email: b.email };
   var out = [person(b.email, b.first_name, b.last_name, b.phone, b.country, o.customer_id > 0 ? o.customer_id : null)];
-  var paid = !!o.date_paid_gmt || PAID.indexOf(o.status) >= 0;
+  // Cash on delivery: WooCommerce moves the order to processing (and may set date_paid) before the
+  // cash is collected, so it's paid only once completed. Other methods: when WooCommerce records
+  // the payment (date_paid_gmt).
+  var paid = o.payment_method === "cod" ? o.status === "completed" : !!o.date_paid_gmt;
   var total = num(o.total);
   var base = clean({ order_id: o.id, order_number: o.number, currency: o.currency, status: o.status, historical: historical || undefined });
   if (!paid) {
@@ -91,8 +93,11 @@ function orderActions(o, historical, canFetch) {
   }
   // The order's refund list is only a summary: the refund records (their dates, and whether the
   // gateway refunded the money) are fetched next. A history import records refunds as they come.
-  if ((o.refunds || []).length && canFetch && /^[0-9]{1,20}$/.test(String(o.id))) {
-    out.push({ type: "next_request", url: "/wp-json/wc/v3/orders/" + o.id + "/refunds", context: { order: clean({ id: o.id, number: o.number, currency: o.currency, email: b.email }) } });
+  if ((o.refunds || []).length && /^[0-9]{1,20}$/.test(String(o.id))) {
+    // In a webhook the lookup is the fetch; in a history import each order's refunds are looked up
+    // the same way, so they keep their own dates there too.
+    var look = { url: "/wp-json/wc/v3/orders/" + o.id + "/refunds", context: { order: clean({ id: o.id, number: o.number, currency: o.currency, email: b.email }) } };
+    out.push(canFetch ? Object.assign({ type: "next_request" }, look) : Object.assign({ type: "lookup" }, look));
   }
   return out;
 }

@@ -229,9 +229,15 @@ pub enum Action {
     SetState(SetState),
     Log(Log),
     NextRequest(NextRequest),
+    /// A lookup of a record (same shape as `next_request`, checked against the integration's fetch
+    /// rules): unlike `next_request` there can be several, in a pull as well as a webhook.
+    Lookup(NextRequest),
 }
 
-pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request"];
+/// Most lookups one run may ask for.
+pub const MAX_LOOKUPS: usize = 100;
+
+pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "add_keys", "set_state", "log", "next_request", "lookup"];
 
 fn part<T: DeserializeOwned>(i: usize, kind: &str, v: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(v)).map_err(|e| format!("action {i} ({kind}): {e}"))
@@ -465,9 +471,22 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 }
                 Action::NextRequest(a)
             }
+            "lookup" => {
+                if !pull {
+                    return Err(format!("action {i} (lookup): only an integration with pull settings can look records up"));
+                }
+                let a: NextRequest = part(i, k, obj)?;
+                if a.context.as_ref().is_some_and(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0) > MAX_CONTEXT_BYTES) {
+                    return Err(format!("action {i} (lookup): context is over 16 KB"));
+                }
+                Action::Lookup(a)
+            }
             other => return Err(format!("action {i}: unknown type {other:?} (use one of {})", ACTION_TYPES.join(", "))),
         };
         out.push(a);
+    }
+    if out.iter().filter(|a| matches!(a, Action::Lookup(_))).count() > MAX_LOOKUPS {
+        return Err(format!("return at most {MAX_LOOKUPS} lookups"));
     }
     if out.iter().filter(|a| matches!(a, Action::NextRequest(_))).count() > 1 {
         return Err("return at most one next_request".into());
@@ -875,7 +894,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
     let list_for = |i: usize| lists.iter().find(|(j, _)| *j == i).map(|(_, l)| l.clone());
     let mut new_state = current_state.clone();
     for (i, a) in actions.iter().enumerate() {
-        let writes = !matches!(a, Action::SetState(_) | Action::Log(_) | Action::NextRequest(_));
+        let writes = !matches!(a, Action::SetState(_) | Action::Log(_) | Action::NextRequest(_) | Action::Lookup(_));
         let print = raw.get(i).map(fingerprint).unwrap_or_default();
         if writes && !dry && skip.get(&i.to_string()).and_then(|v| v.as_str()) == Some(print.as_str()) {
             out.counts.already_written += 1;
@@ -1032,6 +1051,9 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             Action::NextRequest(n) => {
                 out.next_request = Some(n.clone());
                 out.effect(i, "fetch the next page".into());
+            }
+            Action::Lookup(n) => {
+                out.effect(i, format!("look up {}", n.url.as_deref().unwrap_or("").split('?').next().unwrap_or("")));
             }
         }
         if writes && !dry {

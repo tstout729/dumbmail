@@ -146,6 +146,14 @@ The address must never get marketing: an email is suppressed, a phone number is 
 
 Adds ids to the `keys` of a person found another way, so later actions find them by these ids too (a payment that names only its customer, so the refund that names only the payment finds them). Up to 20 keys, as in `upsert_profile`.
 
+### lookup
+
+```json
+{"type": "lookup", "url": "/wp-json/wc/v3/orders/727/refunds", "context": {"order": {"id": 727}}}
+```
+
+Like a webhook's `next_request`, but there can be up to 100, in a pull page as well as a webhook (a history import looking up each order's refunds, say). Each is checked against the integration's `fetch` rules and reserved the same way; the script runs on each answer with `source` `fetch`.
+
 ### set_state
 
 ```json

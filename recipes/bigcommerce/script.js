@@ -103,7 +103,9 @@ function fetched(input) {
     // The refund must belong to the order the webhook named (BigCommerce resolves a refund id from
     // another order too), and only its successful payments count.
     if (ctx.webhook_order_id && String(r.order_id) !== String(ctx.webhook_order_id)) return [{ type: "log", message: "refund " + r.id + " belongs to order " + r.order_id + ", not " + ctx.webhook_order_id + "; ignored" }];
-    var ok = (r.payments || []).filter(function (x) { return !x.is_declined && num(x.amount) > 0; });
+    // A part counts only when BigCommerce says it wasn't declined (is_declined: false); a part
+    // without the flag isn't proof the money moved.
+    var ok = (r.payments || []).filter(function (x) { return x.is_declined === false && num(x.amount) > 0; });
     var amount = ok.reduce(function (t, x) { return t + num(x.amount); }, 0);
     if (!(amount > 0)) return [{ type: "log", message: "refund " + r.id + " has no successful payment" }];
     // The order gives the buyer and the currency.

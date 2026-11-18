@@ -361,7 +361,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 match err {
                     None => {
                         save_live_state(&state.db, integ.id, &acts).await?;
-                        Ok((o, acts.len()))
+                        Ok((o, acts))
                     }
                     Some(e) => Err(e.public_message()),
                 }
@@ -372,7 +372,8 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     };
     let ms = started.elapsed().as_millis() as i32;
     match res {
-        Ok((o, n)) => {
+        Ok((o, acts)) => {
+            let n = acts.len();
             // The fetch it asked for is queued in the same transaction that marks it done.
             let fetch = can_fetch && fetch_next.is_string();
             let mut result = result_json(&o);
@@ -388,6 +389,16 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *tx).await?;
+            if can_fetch {
+                match queue_lookups(&mut tx, state, &integ, delivery_id, hop + 1, &acts).await {
+                    Ok(_) | Err(Refused::Duplicate(_)) => {}
+                    Err(Refused::Busy(m) | Refused::OverBudget(m)) => {
+                        tx.rollback().await?;
+                        return delivery_failed(state, &integ, &scrub, delivery_id, attempts, ms, &m).await;
+                    }
+                    Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+                }
+            }
             if fetch {
                 match queue_fetch(&mut tx, state, &integ, delivery_id, hop + 1, &fetch_next).await {
                     Ok(()) | Err(Refused::Duplicate(_)) => {}
@@ -405,6 +416,25 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
         Err(msg) => return delivery_failed(state, &integ, &scrub, delivery_id, attempts, ms, &msg).await,
     }
     Ok(())
+}
+
+/// Reserve every `lookup` a run asked for (inside the transaction that settles the run), checked
+/// like a webhook's fetch. Returns how many were reserved and how many the fetch rules refused.
+async fn queue_lookups(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &AppState, integ: &Integration, parent: Uuid, hop: u64, acts: &[Action]) -> Result<(usize, usize), Refused> {
+    let Some(rules) = integ.pull_config().and_then(|c| c.fetch) else { return Ok((0, acts.iter().filter(|a| matches!(a, Action::Lookup(_))).count())) };
+    let (mut queued, mut refused) = (0, 0);
+    for a in acts {
+        let Action::Lookup(n) = a else { continue };
+        match checked_lookup(integ, &rules, n) {
+            Ok(ok) => {
+                let sealed = seal_next(state, &ok).map_err(Refused::Error)?;
+                queue_fetch(tx, state, integ, parent, hop, &sealed).await?;
+                queued += 1;
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    Ok((queued, refused))
 }
 
 /// A lookup a webhook's script asked for, made safe to keep: allowed by the integration's fetch
@@ -1089,6 +1119,15 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                     .execute(&mut *guard)
                     .await?;
                 sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *guard).await?;
+                // Lookups the page asked for (a record's details, say) are reserved with the page.
+                match queue_lookups(&mut guard, state, &integ, delivery, 1, &acts).await {
+                    Ok(_) | Err(Refused::Duplicate(_)) => {}
+                    Err(Refused::Busy(_) | Refused::OverBudget(_)) => {
+                        // No room for more work now: the page stands, its lookups are skipped and noted.
+                        sqlx::query("UPDATE integration_deliveries SET error = 'its lookups were skipped: too much work is waiting' WHERE id = $1").bind(delivery).execute(&mut *guard).await?;
+                    }
+                    Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+                }
                 // The page asked for: as the script wrote it (the stored list has it masked).
                 let more = raw_next.clone().filter(|_| o.next_request.is_some());
                 let mut upcoming = next.clone();

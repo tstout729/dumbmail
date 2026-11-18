@@ -377,7 +377,14 @@ async fn mock_woo() -> (std::sync::Arc<MockWoo>, String) {
             get(move |State(m): State<Arc<MockWoo>>, h: axum::http::HeaderMap, Path(id): Path<u64>| async move {
                 assert!(authed(&h));
                 m.seen.lock().unwrap().push(format!("refunds:{id}"));
-                axum::Json(fixture("woocommerce", "fetch-refunds.json")["input"]["payload"].clone())
+                let mut recs = fixture("woocommerce", "fetch-refunds.json")["input"]["payload"].clone();
+                // Refund ids are the store's own; the example's for order 727, others made up per order.
+                if id != 727 {
+                    for (k, r) in recs.as_array_mut().unwrap().iter_mut().enumerate() {
+                        r["id"] = json!(id * 10 + k as u64);
+                    }
+                }
+                axum::Json(recs)
             }),
         )
         .with_state(m.clone());
@@ -408,6 +415,9 @@ async fn woocommerce_history_reads_time_windows_without_offsets() {
             o["billing"]["email"] = json!(format!("buyer{k}@example.com"));
             o["billing"]["phone"] = json!("");
             o["date_modified_gmt"] = json!(format!("2026-03-{:02}T10:00:{:02}", 1 + k / 20, (k % 3)));
+            if k < 3 {
+                o["refunds"] = json!([{"id": 1, "refund": "", "total": "-10.00"}]);
+            }
             o
         })
         .collect();
@@ -420,6 +430,10 @@ async fn woocommerce_history_reads_time_windows_without_offsets() {
     assert_eq!(st["backfill"]["status"], "done", "{}", st["backfill"]);
     assert_eq!(events(&h, "Placed Order").await, 250, "every order once: {:?}", api.seen.lock().unwrap());
     assert_eq!(count(&h, "SELECT count(DISTINCT unique_id) FROM events").await, count(&h, "SELECT count(*) FROM events").await);
+    // The refunded orders' refund records were looked up during the import: their own dates.
+    assert_eq!(events(&h, "Refunded Order").await, 6, "two refund records for each of the three refunded orders");
+    let dates: Vec<String> = sqlx::query_scalar("SELECT DISTINCT to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Refunded Order' ORDER BY 1").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(dates, vec!["2017-03-21 19:55:37", "2017-03-21 20:07:11"]);
     h.cleanup().await;
 }
 
