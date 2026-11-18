@@ -510,7 +510,9 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
         }
     }
     if kind == Kind::Link {
+        // As typed, and as it's sent (see `canonical_link`).
         check_link(source, text)?;
+        check_link(source, &canonical_link(text))?;
     }
     // A link the original places for unsubscribing keeps words people can see.
     if kind == Kind::Html {
@@ -547,7 +549,12 @@ pub fn canonical_link(u: &str) -> String {
         Some(i) => authority.split_at(i),
         None => (authority, ""),
     };
-    format!("{scheme}://{}{port}{tail}", host.trim_end_matches('.').to_ascii_lowercase())
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        // Nothing would be left of the host: leave it as written (the link check refuses it).
+        return t.to_string();
+    }
+    format!("{scheme}://{}{port}{tail}", host.to_ascii_lowercase())
 }
 
 /// Whether a link is one of DumbMail's own (unsubscribe, preferences, any address on `own` hosts),
@@ -587,7 +594,7 @@ fn check_link(source: &str, text: &str) -> Result<(), String> {
         return Err("a localized link's host must be written out, not filled in by a template tag".into());
     }
     let parsed = url::Url::parse(&super::structure::without_tags(t, "x")).map_err(|_| "that isn't a web address".to_string())?;
-    if parsed.host_str().is_none_or(|h| h.is_empty()) || authority.contains('@') || !parsed.username().is_empty() || parsed.password().is_some() {
+    if parsed.host_str().is_none_or(|h| h.trim_matches('.').is_empty()) || authority.contains('@') || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("a localized link needs a host, and no user name or password".into());
     }
     Ok(())
@@ -816,13 +823,14 @@ pub fn localize_block(b: &mut Value, lang: &str, own: &[String]) {
                 for (path, e) in m {
                     let Some(kind) = block_field_kind(b, path) else { continue };
                     let Some(source) = get_path(b, path) else { continue };
-                    let text = s(e, "text");
+                    // A link is sent read the way a browser reads it (so it's tracked and tagged like
+                    // the original), and that's what's checked.
+                    let raw = s(e, "text");
+                    let text = if kind == Kind::Link { canonical_link(raw) } else { raw.to_string() };
                     // A draft waiting for a careful look is never sent: the original is.
-                    if text.is_empty() || s(e, "source") != hash(source) || s(e, "status") == CHECK || check_text_for(kind, source, text, own).is_err() {
+                    if text.is_empty() || s(e, "source") != hash(source) || s(e, "status") == CHECK || check_text_for(kind, source, &text, own).is_err() {
                         continue;
                     }
-                    // Tracked and tagged like the original: read the way a browser reads it.
-                    let text = if kind == Kind::Link { canonical_link(text) } else { text.to_string() };
                     set_path(b, path, &text);
                 }
             }
@@ -923,6 +931,11 @@ mod tests {
         assert_eq!(canonical_link("MAILTO:Hi@Acme.test"), "mailto:Hi@Acme.test");
         assert!(dumbmail_link("HTTPS://PL.TEST./u/x", &["pl.test".into()]));
         assert!(dumbmail_link("https://links.pl.test./x", &["pl.test".into()]));
+        // Nothing is left of a host made of dots: it stays as written, and is refused.
+        assert_eq!(canonical_link("https://.../x"), "https://.../x");
+        assert!(check_text(Kind::Link, "https://a.test/x", "https://.../x").is_err());
+        assert!(check_text(Kind::Link, "https://a.test/x", "https://./x").is_err());
+        assert!(check_text(Kind::Link, "https://a.test/x", "HTTPS://B.TEST./x").is_ok());
     }
 
     fn email() -> Value {
