@@ -1724,3 +1724,55 @@ async fn a_refused_move_changes_nothing() {
     assert_eq!(snapshot(&h, &new).await.unwrap()["install_secret_hash"], o0.unwrap()["install_secret_hash"], "the install keeps its secret");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_sign_out_only_updates_what_is_there_now() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = mobile_setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    person(&mut h, &l, "ivy@x.test", "Ivy").await;
+    let tok = "5".repeat(64);
+    let secret = app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await.1["install_secret"].as_str().unwrap().to_string();
+    let lock_row = |addr: String| {
+        let db = h.state.db.clone();
+        async move {
+            let mut tx = db.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM push_devices WHERE address = $1 FOR UPDATE").bind(&addr).execute(&mut *tx).await.unwrap();
+            tx
+        }
+    };
+
+    // The app turns notifications off while a sign-out waits for the device: the sign-out keeps "denied".
+    let mut tx = lock_row(tok.clone()).await;
+    let (router, key, t, s) = (h.router.clone(), a.key.clone(), tok.clone(), secret.clone());
+    let out = tokio::spawn(async move { router.oneshot(post_req("/client/push/devices/sign-out", &key, "203.0.113.9", &json!({"platform": "ios", "token": t, "install_secret": s}))).await.unwrap().status() });
+    until_lock_wait(&h, "%FROM push_devices%FOR UPDATE%").await;
+    sqlx::query("UPDATE push_devices SET permission = 'denied' WHERE address = $1").bind(&tok).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(out.await.unwrap(), StatusCode::OK);
+    let (permission, anonymous): (String, bool) = sqlx::query_as("SELECT permission, anonymous FROM push_devices WHERE address = $1").bind(&tok).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((permission.as_str(), anonymous), ("denied", true), "signed out, and the permission the app just reported stands");
+
+    // The device is removed while a sign-out waits for it: the sign-out doesn't bring it back.
+    let mut tx = lock_row(tok.clone()).await;
+    let (router, key, t, s) = (h.router.clone(), a.key.clone(), tok.clone(), secret.clone());
+    let out = tokio::spawn(async move { router.oneshot(post_req("/client/push/devices/sign-out", &key, "203.0.113.9", &json!({"platform": "ios", "token": t, "install_secret": s}))).await.unwrap().status() });
+    until_lock_wait(&h, "%FROM push_devices%FOR UPDATE%").await;
+    sqlx::query("DELETE FROM push_devices WHERE address = $1").bind(&tok).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(out.await.unwrap(), StatusCode::OK);
+    assert_eq!(snapshot(&h, &tok).await, None, "not recreated");
+
+    // The same for a browser.
+    let b = browser(&base, "so1");
+    enroll(&h, &a, &b, "ivy@x.test").await;
+    let mut tx = lock_row(b.endpoint.clone()).await;
+    let (router, key, body) = (h.router.clone(), a.key.clone(), json!({"endpoint": b.endpoint, "auth": b.auth}));
+    let out = tokio::spawn(async move { router.oneshot(post_req("/client/push/sign-out", &key, "203.0.113.9", &body)).await.unwrap().status() });
+    until_lock_wait(&h, "%FROM push_devices%FOR UPDATE%").await;
+    sqlx::query("DELETE FROM push_devices WHERE address = $1").bind(&b.endpoint).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(out.await.unwrap(), StatusCode::OK);
+    assert_eq!(snapshot(&h, &b.endpoint).await, None, "not recreated");
+    h.cleanup().await;
+}

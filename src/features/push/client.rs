@@ -211,7 +211,8 @@ pub struct Registration<'a> {
     pub kind: &'a str,
     pub address: &'a str,
     pub keys: Option<(&'a str, &'a str)>,
-    pub permission: &'a str,
+    /// The device's notification permission; None (a sign-out) keeps what's stored.
+    pub permission: Option<&'a str>,
     pub user_agent: Option<&'a str>,
     pub app_version: Option<&'a str>,
     /// iOS: the APNs environment the app says it was built for (kept when a registration doesn't say).
@@ -266,7 +267,10 @@ fn holds(kind: &str, auth: Option<&str>, secret_hash: Option<&str>, claimed: Opt
 /// ([`Registration::previous`]) needs proof for the old registration too, and an endpoint or token
 /// that's already registered needs its own. Every check comes before any write, all in one
 /// transaction: a refusal (409, or a cap) changes nothing.
-pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Saved> {
+///
+/// A sign-out ([`Owner::Anonymous`]) only ever updates a device that's there, keeping its stored
+/// permission (read under its lock): None when there's no such device.
+pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Saved>> {
     // What was read before its lock can change under us; then start over (rarely more than once).
     for _ in 0..5 {
         if let Some(out) = try_save_device(state, account_id, r, owner).await? {
@@ -291,7 +295,7 @@ struct Held {
     install_secret_hash: Option<String>,
 }
 
-async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Saved>> {
+async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Option<Saved>>> {
     let mut tx = state.db.begin().await?;
     let prev_address = r.previous.as_ref().map(|p| p.address).filter(|a| *a != r.address);
     let addresses: Vec<&str> = std::iter::once(r.address).chain(prev_address).collect();
@@ -307,6 +311,10 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     let seen_prev = prev_address.and_then(seen_of);
     if seen.as_ref().is_some_and(|e| e.1.is_some()) {
         return Err(AppError::Conflict("this browser is a team member's test device".into()));
+    }
+    // A sign-out never stores a device.
+    if owner == Owner::Anonymous && seen.is_none() {
+        return Ok(Some(None));
     }
     let old_owner = seen.as_ref().and_then(|e| e.0);
     let prev_owner = seen_prev.as_ref().and_then(|e| e.0.map(|p| (p, e.2)));
@@ -416,7 +424,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     let id = match existing {
         Some(e) => {
             sqlx::query(
-                "UPDATE push_devices SET profile_id = $2, anonymous = $3, p256dh = COALESCE($4, p256dh), auth_secret = COALESCE($5, auth_secret), permission = $6,
+                "UPDATE push_devices SET profile_id = $2, anonymous = $3, p256dh = COALESCE($4, p256dh), auth_secret = COALESCE($5, auth_secret), permission = COALESCE($6, permission),
                         status = 'active', failures = 0, disabled_at = NULL, last_seen_at = now(), version = version + 1,
                         user_agent = COALESCE($7, user_agent), app_version = COALESCE($8, app_version), apns_environment = COALESCE($9, apns_environment),
                         install_secret_hash = COALESCE($10, install_secret_hash)
@@ -450,7 +458,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(r.address)
             .bind(keys.as_ref().map(|k| k.0.clone()))
             .bind(keys.as_ref().map(|k| k.1.clone()))
-            .bind(r.permission)
+            .bind(r.permission.unwrap_or("denied"))
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
             .bind(r.apns_environment)
@@ -467,7 +475,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         forget_nameless_in(&mut tx, &left).await?;
     }
     tx.commit().await?;
-    Ok(Some(Saved { id, linked: !anonymous, install_secret }))
+    Ok(Some(Some(Saved { id, linked: !anonymous, install_secret })))
 }
 
 /// Nameless push profiles (made for a device without a grant) that nothing else is on any more (no
@@ -533,7 +541,7 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                 kind: "web",
                 address: endpoint,
                 keys: Some((p256dh, auth)),
-                permission: "granted",
+                permission: Some("granted"),
                 user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
                 app_version: None,
                 apns_environment: None,
@@ -543,7 +551,7 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                 // with the old one's auth secret as its proof.
                 previous: b["previous"]["endpoint"].as_str().map(|address| Previous { address, proof: b["previous"]["auth"].as_str() }),
             };
-            let saved = save_device(&state, a.id, &reg, owner).await?;
+            let saved = save_device(&state, a.id, &reg, owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
             Ok(json!({"ok": true, "linked": saved.linked}))
         }
         .await,
@@ -574,14 +582,8 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
             let a = account_by_key(&state, &q.k).await?;
             let b = body_json(&body)?;
             let (Some(endpoint), Some(auth)) = (b["endpoint"].as_str(), b["auth"].as_str()) else { return Err(AppError::bad("endpoint and auth are required")) };
-            let found: Option<(Option<String>, String)> = sqlx::query_as("SELECT p256dh, permission FROM push_devices WHERE account_id = $1 AND kind = 'web' AND address = $2 AND auth_secret = $3")
-                .bind(a.id)
-                .bind(endpoint)
-                .bind(auth)
-                .fetch_optional(&state.db)
-                .await?;
-            let Some((_, permission)) = found else { return Ok(json!({"ok": true})) };
-            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None, proof: Some(auth), previous: None };
+            // Proof and permission are read under the device's lock in the save; it only updates.
+            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: None, user_agent: None, app_version: None, apns_environment: None, proof: Some(auth), previous: None };
             save_device(&state, a.id, &reg, Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
@@ -679,7 +681,7 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 kind: platform,
                 address: &token,
                 keys: None,
-                permission,
+                permission: Some(permission),
                 user_agent: None,
                 app_version: b["app_version"].as_str(),
                 apns_environment: environment,
@@ -688,7 +690,7 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 // moved in the same transaction (its owner and secret carried over), or nothing changes.
                 previous: previous_token.as_deref().map(|address| Previous { address, proof: secret }),
             };
-            let saved = save_device(&state, a.id, &reg, owner).await?;
+            let saved = save_device(&state, a.id, &reg, owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
             let mut out = json!({"ok": true, "device_id": saved.id, "linked": saved.linked, "sendable": permission != "denied"});
             if let Some(s) = saved.install_secret {
                 out["install_secret"] = json!(s);
@@ -708,18 +710,12 @@ pub async fn device_sign_out(State(state): State<AppState>, Query(q): Query<KeyQ
             let b = body_json(&body)?;
             let platform = b["platform"].as_str().unwrap_or_default();
             let token = stored_token(platform, b["token"].as_str().unwrap_or_default())?;
-            let permission: Option<String> = sqlx::query_scalar("SELECT permission FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3")
-                .bind(a.id)
-                .bind(platform)
-                .bind(&token)
-                .fetch_optional(&state.db)
-                .await?;
-            let Some(permission) = permission else { return Ok(json!({"ok": true})) };
+            // Proof and permission are read under the device's lock in the save; it only updates.
             let reg = Registration {
                 kind: platform,
                 address: &token,
                 keys: None,
-                permission: &permission,
+                permission: None,
                 user_agent: None,
                 app_version: None,
                 apns_environment: None,
