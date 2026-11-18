@@ -16,9 +16,10 @@ pub const MISSES_PER_MINUTE: u32 = 30;
 /// Requests whose address the proxy didn't tell us share one, larger, allowance.
 pub const UNKNOWN_MISSES_PER_MINUTE: u32 = 600;
 pub const MAX_CONCURRENT: usize = 32;
-/// Addresses tracked in one minute; past that, new addresses aren't tracked (memory stays bounded,
-/// and the server-wide cap still holds).
+/// Addresses tracked in one minute; past that, new addresses share one overflow allowance (memory
+/// stays bounded and the limit still holds).
 const MAX_ADDRESSES: usize = 50_000;
+const OVERFLOW: &str = "overflow";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -54,9 +55,11 @@ fn minute() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0)
 }
 
-/// One key per visitor: an IPv6 address by its /64 (one household or server can hold a whole /64).
+/// One key per visitor: an IPv6 address by its /64 (one household or server can hold a whole /64),
+/// an IPv4 address written as IPv6 by its IPv4 address.
 fn key(ip: Option<&str>) -> String {
     match ip.and_then(|i| i.parse::<std::net::IpAddr>().ok()) {
+        Some(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some() => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_default(),
         Some(std::net::IpAddr::V6(v6)) => {
             let s = v6.segments();
             format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
@@ -76,26 +79,26 @@ impl Limiter {
     /// same time can't slip past the allowance; a valid click gives its count back.
     pub fn admit(&self, ip: Option<&str>) -> Result<Admitted, Refused> {
         let now = minute();
-        let k = key(ip);
-        let allowance = if ip.is_some() { self.per_minute } else { self.unknown_per_minute };
-        let counted = {
+        let mut k = key(ip);
+        let mut allowance = if ip.is_some() { self.per_minute } else { self.unknown_per_minute };
+        {
             let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
             if c.minute != now {
                 // Only the current minute matters.
                 c.minute = now;
                 c.by_address.clear();
             }
-            let tracked = c.by_address.len() < MAX_ADDRESSES || c.by_address.contains_key(&k);
-            if tracked {
-                let n = c.by_address.entry(k.clone()).or_insert(0);
-                if *n >= allowance {
-                    return Err(Refused::TooMany);
-                }
-                *n += 1;
+            if c.by_address.len() >= MAX_ADDRESSES && !c.by_address.contains_key(&k) {
+                k = OVERFLOW.to_string();
+                allowance = self.unknown_per_minute;
             }
-            tracked
-        };
-        let key = counted.then_some((k, now));
+            let n = c.by_address.entry(k.clone()).or_insert(0);
+            if *n >= allowance {
+                return Err(Refused::TooMany);
+            }
+            *n += 1;
+        }
+        let key = Some((k, now));
         match self.slots.clone().try_acquire_owned() {
             Ok(slot) => Ok(Admitted { _slot: slot, key }),
             Err(_) => {
@@ -152,10 +155,30 @@ mod tests {
     }
 
     #[test]
+    fn past_the_address_cap_new_addresses_share_one_allowance() {
+        let l = Limiter::new(1, 2, 10);
+        // Counts reset each clock minute: stay clear of a minute's last seconds.
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if secs % 60 >= 57 {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+        }
+        {
+            let mut c = l.counts.lock().unwrap();
+            c.minute = minute();
+            c.by_address = (0..MAX_ADDRESSES).map(|i| (format!("10.0.{}.{}", i / 256, i % 256), 0)).collect();
+        }
+        assert!(l.admit(Some("203.0.113.1")).is_ok());
+        assert!(l.admit(Some("203.0.113.2")).is_ok());
+        assert_eq!(l.admit(Some("203.0.113.3")).err(), Some(Refused::TooMany), "the overflow allowance is shared, not unlimited");
+        assert_eq!(l.counts.lock().unwrap().by_address.len(), MAX_ADDRESSES + 1);
+    }
+
+    #[test]
     fn an_ipv6_visitor_is_one_key_per_64() {
         assert_eq!(key(Some("2001:db8:1:2:aaaa::1")), key(Some("2001:db8:1:2:bbbb::9")));
         assert_ne!(key(Some("2001:db8:1:2::1")), key(Some("2001:db8:1:3::1")));
         assert_eq!(key(Some("198.51.100.7")), "198.51.100.7");
         assert_eq!(key(None), "unknown");
+        assert_eq!(key(Some("::ffff:198.51.100.7")), "198.51.100.7", "an IPv4 address written as IPv6 is that address");
     }
 }
