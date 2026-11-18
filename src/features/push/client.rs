@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use super::crypto;
 use super::settings::{self, Row};
-use crate::audience::ProfileInput;
 use crate::error::{AppError, AppResult};
 use crate::models::Account;
 use crate::state::AppState;
@@ -157,42 +156,64 @@ async fn take_registration(state: &AppState, account_id: Uuid, headers: &HeaderM
     Ok(())
 }
 
-/// The person an enrollment grant names (`{"type": "external_id" | "email", "value", "grant"}`),
-/// created when the account has nobody with that identifier yet (consent unchanged). None without a
-/// grant. A tracked-link token (`$token`) isn't a grant and is ignored.
-pub async fn resolve_grant(state: &AppState, account_id: Uuid, row: &Row, v: &Value) -> AppResult<Option<Uuid>> {
+/// An enrollment grant, verified: the identifier it names (`email` lowercased and trimmed,
+/// `external_id` trimmed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grant {
+    pub id_type: &'static str,
+    pub value: String,
+}
+
+/// Verify an enrollment grant (`{"type": "external_id" | "email", "value", "grant"}`). None without
+/// one. A tracked-link token (`$token`) isn't a grant and is ignored. Nothing is stored: the person
+/// it names is found (or created) inside the registration's own transaction.
+pub fn verify_grant(state: &AppState, account_id: Uuid, row: &Row, v: &Value) -> AppResult<Option<Grant>> {
     let Some(grant) = v.get("grant").and_then(Value::as_str).filter(|g| !g.is_empty()) else { return Ok(None) };
     if grant.len() > 200 {
         return Err(AppError::bad("that grant is too long"));
     }
     let secret = settings::identity_secret(state, row).ok_or_else(|| AppError::bad("enrollment grants aren't set up for this account"))?;
     let raw = v.get("value").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 320).ok_or_else(|| AppError::bad("a grant needs the value it was made for"))?;
-    let (id_type, value, input) = match v.get("type").and_then(Value::as_str) {
-        Some("external_id") => ("external_id", raw.to_string(), ProfileInput { external_id: Some(raw.to_string()), ..Default::default() }),
-        Some("email") => {
-            let e = crate::models::normalize_email(raw).ok_or_else(|| AppError::bad("that email isn't valid"))?;
-            ("email", e.clone(), ProfileInput { email: Some(e), ..Default::default() })
-        }
+    let (id_type, value) = match v.get("type").and_then(Value::as_str) {
+        Some("external_id") => ("external_id", raw.to_string()),
+        Some("email") => ("email", crate::models::normalize_email(raw).ok_or_else(|| AppError::bad("that email isn't valid"))?),
         _ => return Err(AppError::bad("a grant's type must be external_id or email")),
     };
     crypto::verify_enroll_grant(&secret, &account_id.to_string(), id_type, &value, grant, chrono::Utc::now().timestamp()).map_err(|why| {
         tracing::info!(account = %account_id, why, "push enrollment grant refused");
         AppError::Unauthorized
     })?;
-    // Only a profile with that identifier, of that type (an email grant never names a profile whose
-    // external id is the same string). Created when missing; consent never changes here.
-    let p = match crate::audience::find_profile(&state.db, account_id, &input).await? {
-        Some(p) => p,
-        None => crate::audience::upsert_profile_public(&state.db, account_id, &input).await?.profile,
-    };
-    Ok(Some(p.id))
+    Ok(Some(Grant { id_type, value }))
+}
+
+/// The person a verified grant names, inside the caller's transaction: only a profile with that
+/// identifier, of that type (an email grant never names a profile whose external id is the same
+/// string), created when missing (consent never changes here). Returns (profile, created now).
+async fn grant_profile(tx: &mut sqlx::PgConnection, account_id: Uuid, g: &Grant) -> AppResult<(Uuid, bool)> {
+    let col = if g.id_type == "email" { "email" } else { "external_id" };
+    for _ in 0..2 {
+        let found: Option<Uuid> = sqlx::query_scalar(&format!("SELECT id FROM profiles WHERE account_id = $1 AND {col} = $2")).bind(account_id).bind(&g.value).fetch_optional(&mut *tx).await?;
+        if let Some(id) = found {
+            return Ok((id, false));
+        }
+        let made: Option<Uuid> = sqlx::query_scalar(&format!("INSERT INTO profiles (id, account_id, {col}) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id"))
+            .bind(Uuid::now_v7())
+            .bind(account_id)
+            .bind(&g.value)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(id) = made {
+            return Ok((id, true));
+        }
+    }
+    Err(AppError::Busy("this person is being saved elsewhere at the same time; try again".into()))
 }
 
 /// Who a registration belongs to.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Owner {
-    /// The person a grant named.
-    Person(Uuid),
+    /// The person a verified grant names (found or created in the registration's transaction).
+    Grant(Grant),
     /// Keep the current owner (or, through [`Registration::previous`], the old registration's); a
     /// new device gets an anonymous profile of its own.
     Keep,
@@ -270,7 +291,7 @@ fn holds(kind: &str, auth: Option<&str>, secret_hash: Option<&str>, claimed: Opt
 ///
 /// A sign-out ([`Owner::Anonymous`]) only ever updates a device that's there, keeping its stored
 /// permission (read under its lock): None when there's no such device.
-pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Saved>> {
+pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: &Owner) -> AppResult<Option<Saved>> {
     // What was read before its lock can change under us; then start over (rarely more than once).
     for _ in 0..5 {
         if let Some(out) = try_save_device(state, account_id, r, owner).await? {
@@ -295,8 +316,27 @@ struct Held {
     install_secret_hash: Option<String>,
 }
 
-async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<Option<Saved>>> {
+/// [`Owner`] with a grant's person found.
+#[derive(Clone, Copy, PartialEq)]
+enum Want {
+    Person(Uuid),
+    Keep,
+    Anonymous,
+}
+
+async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: &Owner) -> AppResult<Option<Option<Saved>>> {
     let mut tx = state.db.begin().await?;
+    // A grant's person, in this transaction: a refused registration creates nobody.
+    let mut created: Option<Uuid> = None;
+    let owner = match owner {
+        Owner::Grant(g) => {
+            let (p, made) = grant_profile(&mut tx, account_id, g).await?;
+            created = made.then_some(p);
+            Want::Person(p)
+        }
+        Owner::Keep => Want::Keep,
+        Owner::Anonymous => Want::Anonymous,
+    };
     let prev_address = r.previous.as_ref().map(|p| p.address).filter(|a| *a != r.address);
     let addresses: Vec<&str> = std::iter::once(r.address).chain(prev_address).collect();
     let seen_rows: Vec<(String, Option<Uuid>, Option<Uuid>, bool)> =
@@ -313,17 +353,17 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         return Err(AppError::Conflict("this browser is a team member's test device".into()));
     }
     // A sign-out never stores a device.
-    if owner == Owner::Anonymous && seen.is_none() {
+    if owner == Want::Anonymous && seen.is_none() {
         return Ok(Some(None));
     }
     let old_owner = seen.as_ref().and_then(|e| e.0);
     let prev_owner = seen_prev.as_ref().and_then(|e| e.0.map(|p| (p, e.2)));
     // 1. The people.
     let (profile_id, anonymous, fresh) = match (owner, prev_owner, old_owner) {
-        (Owner::Person(p), ..) => (p, false, false),
-        (Owner::Keep, Some((p, anon)), _) => (p, anon, false),
-        (Owner::Keep, None, Some(p)) => (p, seen.as_ref().is_some_and(|e| e.2), false),
-        (Owner::Keep, None, None) | (Owner::Anonymous, ..) => (Uuid::now_v7(), true, true),
+        (Want::Person(p), ..) => (p, false, false),
+        (Want::Keep, Some((p, anon)), _) => (p, anon, false),
+        (Want::Keep, None, Some(p)) => (p, seen.as_ref().is_some_and(|e| e.2), false),
+        (Want::Keep, None, None) | (Want::Anonymous, ..) => (Uuid::now_v7(), true, true),
     };
     let mut people: Vec<Uuid> = old_owner.into_iter().chain(prev_owner.map(|p| p.0)).chain((!fresh).then_some(profile_id)).collect();
     people.sort();
@@ -370,7 +410,7 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
                 return Err(not_holder(r.kind));
             }
         } else {
-            let same_owner_grant = matches!(owner, Owner::Person(p) if Some(p) == e.profile_id);
+            let same_owner_grant = matches!(owner, Want::Person(p) if Some(p) == e.profile_id);
             match &e.install_secret_hash {
                 Some(_) if proven => {}
                 // Lost the secret: a grant for the person it already belongs to issues a new one (the
@@ -475,6 +515,13 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         forget_nameless_in(&mut tx, &left).await?;
     }
     tx.commit().await?;
+    if let Some(p) = created {
+        let made: Option<crate::models::Profile> =
+            sqlx::query_as(&format!("SELECT {} FROM profiles p WHERE p.id = $1", crate::models::PROFILE_COLS)).bind(p).fetch_optional(&state.db).await?;
+        if let Some(made) = made {
+            crate::features::webhooks::profile_saved(&state.db, account_id, None, None, &made, crate::audience::EventSource::Browser).await;
+        }
+    }
     Ok(Some(Some(Saved { id, linked: !anonymous, install_secret })))
 }
 
@@ -533,8 +580,8 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                 return Err(AppError::bad("the subscription's keys are invalid"));
             }
             take_registration(&state, a.id, &headers).await?;
-            let owner = match resolve_grant(&state, a.id, &row, &b["identity"]).await? {
-                Some(p) => Owner::Person(p),
+            let owner = match verify_grant(&state, a.id, &row, &b["identity"])? {
+                Some(g) => Owner::Grant(g),
                 None => Owner::Keep,
             };
             let reg = Registration {
@@ -551,7 +598,7 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                 // with the old one's auth secret as its proof.
                 previous: b["previous"]["endpoint"].as_str().map(|address| Previous { address, proof: b["previous"]["auth"].as_str() }),
             };
-            let saved = save_device(&state, a.id, &reg, owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
+            let saved = save_device(&state, a.id, &reg, &owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
             Ok(json!({"ok": true, "linked": saved.linked}))
         }
         .await,
@@ -584,7 +631,7 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
             let (Some(endpoint), Some(auth)) = (b["endpoint"].as_str(), b["auth"].as_str()) else { return Err(AppError::bad("endpoint and auth are required")) };
             // Proof and permission are read under the device's lock in the save; it only updates.
             let reg = Registration { kind: "web", address: endpoint, keys: None, permission: None, user_agent: None, app_version: None, apns_environment: None, proof: Some(auth), previous: None };
-            save_device(&state, a.id, &reg, Owner::Anonymous).await?;
+            save_device(&state, a.id, &reg, &Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
         .await,
@@ -663,8 +710,8 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 return Err(AppError::bad(format!("add your {} credentials in Settings → Push first", if platform == "ios" { "Apple (APNs)" } else { "Firebase" })));
             }
             take_registration(&state, a.id, &headers).await?;
-            let owner = match resolve_grant(&state, a.id, &row, &b["identity"]).await? {
-                Some(p) => Owner::Person(p),
+            let owner = match verify_grant(&state, a.id, &row, &b["identity"])? {
+                Some(g) => Owner::Grant(g),
                 None => Owner::Keep,
             };
             let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
@@ -690,7 +737,7 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 // moved in the same transaction (its owner and secret carried over), or nothing changes.
                 previous: previous_token.as_deref().map(|address| Previous { address, proof: secret }),
             };
-            let saved = save_device(&state, a.id, &reg, owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
+            let saved = save_device(&state, a.id, &reg, &owner).await?.ok_or_else(|| AppError::Internal(anyhow::anyhow!("a registration that isn't a sign-out always saves")))?;
             let mut out = json!({"ok": true, "device_id": saved.id, "linked": saved.linked, "sendable": permission != "denied"});
             if let Some(s) = saved.install_secret {
                 out["install_secret"] = json!(s);
@@ -722,7 +769,7 @@ pub async fn device_sign_out(State(state): State<AppState>, Query(q): Query<KeyQ
                 proof: b["install_secret"].as_str(),
                 previous: None,
             };
-            save_device(&state, a.id, &reg, Owner::Anonymous).await?;
+            save_device(&state, a.id, &reg, &Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
         .await,

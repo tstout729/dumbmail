@@ -233,9 +233,10 @@ pub fn verify_enroll_grant(secret: &str, account_id: &str, id_type: &str, value:
     if hmac_hex_matches(secret, &enroll_grant_message(account_id, id_type, value, expires), mac) { Ok(()) } else { Err("the grant doesn't match") }
 }
 
-/// Compare two strings in constant time (for MACs computed elsewhere).
+/// Compare two strings in constant time (`subtle`; only the length may show).
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// A new per-install secret for an app device: 256 random bits, base64url. Only its

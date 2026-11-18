@@ -1815,3 +1815,29 @@ async fn a_test_browser_is_taken_from_another_member_only_with_its_subscription(
     assert!(owner.is_some_and(|o| o != other));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_refused_registration_creates_nobody() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = mobile_setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    person(&mut h, &l, "ana@x.test", "Ana").await;
+    let b = browser(&base, "a1");
+    enroll(&h, &a, &b, "ana@x.test").await;
+    let tok = "6".repeat(64);
+    app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("email", "ana@x.test")})).await;
+    let charged = || count(&h, "SELECT COALESCE(sum(n), 0)::bigint FROM push_registration_counts");
+    let before = charged().await;
+
+    // A stranger's grants for people DumbMail doesn't know yet, on someone else's devices.
+    let stranger = Browser { endpoint: b.endpoint.clone(), ..browser(&base, "a1") };
+    assert_eq!(subscribe(&h, &a, &stranger, a.grant("email", "new1@x.test")).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &tok, json!({"identity": a.grant("external_id", "new-2")})).await.0, StatusCode::CONFLICT);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'new1@x.test' OR external_id = 'new-2'").await, 0, "nobody created");
+    assert_eq!(charged().await, before + 2, "the rate limit still counts them");
+    // Accepted, the grant's person is created then.
+    let fresh = browser(&base, "a2");
+    assert_eq!(subscribe(&h, &a, &fresh, a.grant("email", "new1@x.test")).await.0, StatusCode::OK);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'new1@x.test'").await, 1);
+    h.cleanup().await;
+}
