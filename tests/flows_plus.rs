@@ -333,6 +333,13 @@ async fn confirmation_emails_need_settings_rights_and_respect_pause_and_limits()
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
     let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    // However many accounts ask, an address gets at most 3 a day.
+    for i in 0..3 {
+        let mut x = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
+        x.ok("POST", "/api/auth/signup", Some(json!({"email": format!("x{i}@many.test"), "password": "correct horse", "company": format!("Many {i}")}))).await;
+        let (s, v) = x.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+        assert_eq!(s, if i == 0 { StatusCode::OK } else { StatusCode::TOO_MANY_REQUESTS }, "account {i}: {v}");
+    }
 
     // Two requests racing for the same address and account: exactly one is recorded.
     let (a, b) = tokio::join!(
@@ -670,5 +677,325 @@ async fn a_wait_keeps_its_moment_when_the_person_moves() {
     let f = h.ok("POST", "/api/flows", Some(json!({"name": "x", "trigger": {"type": "metric", "metric": "M"}, "definition": {"entry": "d", "nodes": [
         {"id": "d", "type": "delay", "amount": 1, "unit": "days", "at": "10:00", "recompute_zone": true, "next": null}]}}))).await;
     assert!(f["id"].is_string());
+    h.cleanup().await;
+}
+
+// ---------- Races and the cost of entering a flow ----------
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// A webhook receiver that holds each request until released, and counts them.
+struct Hook {
+    url: String,
+    hits: Arc<AtomicUsize>,
+    arrived: Arc<tokio::sync::Semaphore>,
+    go: Arc<tokio::sync::Semaphore>,
+}
+
+async fn hook_server() -> Hook {
+    dumbmail::features::webhooks::net::allow_localhost_for_tests();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+    let go = Arc::new(tokio::sync::Semaphore::new(0));
+    let (h2, a2, g2) = (hits.clone(), arrived.clone(), go.clone());
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move || {
+            let (h, a, g) = (h2.clone(), a2.clone(), g2.clone());
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                a.add_permits(1);
+                if let Ok(p) = g.acquire().await {
+                    p.forget();
+                }
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}/hook", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Hook { url, hits, arrived, go }
+}
+
+#[tokio::test]
+async fn removing_someone_and_sending_to_them_cant_both_happen() {
+    let mut h = harness!();
+    h.signup().await;
+    let hook = hook_server().await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Hook"}), json!({"entry": "w", "nodes": [
+        {"id": "w", "type": "webhook", "url": hook.url, "next": "u"},
+        {"id": "u", "type": "update_profile", "properties": {"after": "yes"}, "next": null}]})).await;
+
+    // A worker is mid-send (the webhook is waiting): removal leaves that run alone and says so.
+    event(&mut h, "Hook", "busy@x.test", json!({})).await;
+    let state = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&state).await });
+    hook.arrived.acquire().await.unwrap().forget();
+    let (run, ..) = run_of(&h, &fid, "busy@x.test").await;
+    let r = h.ok("POST", &format!("/api/flows/{fid}/runs/remove"), Some(json!({"run_ids": [run], "confirm": true}))).await;
+    assert_eq!(r["removed"], 0, "{r}");
+    assert_eq!(r["sending_now"], json!([run]), "{r}");
+    hook.go.add_permits(1);
+    worker.await.unwrap().unwrap();
+    assert_eq!(run_of(&h, &fid, "busy@x.test").await.1, "completed");
+
+    // Something else ends the run while the send is out (turning the flow to draft does this): the
+    // worker's next write is refused, so the run stays ended and the next step never runs.
+    event(&mut h, "Hook", "ended@x.test", json!({})).await;
+    let state = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&state).await });
+    hook.arrived.acquire().await.unwrap().forget();
+    let (run2, ..) = run_of(&h, &fid, "ended@x.test").await;
+    sqlx::query("UPDATE flow_runs SET status = 'exited', finished_at = now() WHERE id = $1").bind(run2).execute(&h.state.db).await.unwrap();
+    hook.go.add_permits(1);
+    worker.await.unwrap().unwrap();
+    assert_eq!(run_of(&h, &fid, "ended@x.test").await.1, "exited");
+    assert_eq!(prop(&h, "ended@x.test", "after").await, None, "the run didn't go on after it was ended");
+
+    // Removed before its step runs: nothing is sent.
+    let fid2 = live_flow(&mut h, json!({"type": "metric", "metric": "Later"}), json!({"entry": "d", "nodes": [
+        {"id": "d", "type": "delay", "amount": 1, "unit": "minutes", "next": "w"},
+        {"id": "w", "type": "webhook", "url": hook.url, "next": null}]})).await;
+    event(&mut h, "Later", "gone@x.test", json!({})).await;
+    h.drain().await;
+    let (run3, ..) = run_of(&h, &fid2, "gone@x.test").await;
+    let r = h.ok("POST", &format!("/api/flows/{fid2}/runs/remove"), Some(json!({"run_ids": [run3], "confirm": true}))).await;
+    assert_eq!(r["removed"], 1, "{r}");
+    let before = hook.hits.load(Ordering::SeqCst);
+    hook.go.add_permits(10);
+    h.fast_forward().await;
+    assert_eq!(hook.hits.load(Ordering::SeqCst), before);
+    assert_eq!(run_of(&h, &fid2, "gone@x.test").await.1, "exited");
+    h.cleanup().await;
+}
+
+/// A list-triggered live flow with these people on its list, and a back-populate with its people fixed.
+async fn list_backfill(h: &mut Harness, emails: &[&str]) -> (String, Uuid, Uuid) {
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "Guests"}))).await;
+    let lid = list["id"].as_str().unwrap().to_string();
+    for e in emails {
+        h.ok("POST", "/api/profiles", Some(json!({"email": e, "list_ids": [lid]}))).await;
+    }
+    h.drain().await;
+    let fid = live_flow(h, json!({"type": "list", "list_id": lid}), json!({"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]})).await;
+    // Joining the list before the flow was live started nobody; clear anything that did.
+    sqlx::query("DELETE FROM flow_runs WHERE flow_id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    let b = h.ok("POST", &format!("/api/flows/{fid}/backfill"), Some(json!({"confirm": true}))).await;
+    let bid: Uuid = b["id"].as_str().unwrap().parse().unwrap();
+    // Fix the people (the job's first step), leaving the batches to the test.
+    dumbmail::features::flows_plus::backfill::run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'flows_plus_backfill'").execute(&h.state.db).await.unwrap();
+    (fid, bid, lid.parse().unwrap())
+}
+
+async fn flow_runs(h: &Harness, fid: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM flow_runs WHERE flow_id = $1::uuid").bind(fid).fetch_one(&h.state.db).await.unwrap()
+}
+
+#[tokio::test]
+async fn back_populate_and_deleting_a_profile_dont_deadlock() {
+    use dumbmail::features::flows_plus::backfill::{run, EnrollPause};
+    let mut h = harness!();
+    h.signup().await;
+    let (fid, bid, _) = list_backfill(&mut h, &["del@x.test"]).await;
+    let pid: Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'del@x.test'").fetch_one(&h.state.db).await.unwrap();
+    // Hold the enrollment after it claimed the person; delete the profile meanwhile.
+    let pause = EnrollPause::hold(bid);
+    let state = h.state.clone();
+    let enrolling = tokio::spawn(async move { run(&state, &json!({"backfill_id": bid})).await });
+    pause.arrived().await;
+    let db = h.state.db.clone();
+    let deleting = tokio::spawn(async move { sqlx::query("DELETE FROM profiles WHERE id = $1").bind(pid).execute(&db).await.map(|r| r.rows_affected()) });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!deleting.is_finished(), "the delete waits for the enrollment that holds the profile");
+    pause.release(bid);
+    let (e, d) = (enrolling.await.unwrap(), deleting.await.unwrap());
+    assert!(e.is_ok(), "enrollment: {e:?}");
+    assert_eq!(d.expect("delete"), 1, "no deadlock: both finished");
+    assert_eq!(flow_runs(&h, &fid).await, 0, "the deleted profile's run went with it");
+
+    // A profile deleted before its turn counts as skipped.
+    let (_, bid2, _) = list_backfill(&mut h, &["a@x.test", "b@x.test"]).await;
+    sqlx::query("DELETE FROM profiles WHERE email = 'a@x.test'").execute(&h.state.db).await.unwrap();
+    run(&h.state, &json!({"backfill_id": bid2})).await.unwrap();
+    let (added, skipped, status): (i32, i32, String) = sqlx::query_as("SELECT added, skipped, status FROM flow_backfills WHERE id = $1").bind(bid2).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((added, skipped, status.as_str()), (1, 1, "done"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn back_populate_rechecks_the_list_and_stops_when_cancelled() {
+    use dumbmail::features::flows_plus::backfill::{run, EnrollPause};
+    let mut h = harness!();
+    h.signup().await;
+    // Taken off the list while their enrollment is under way: not enrolled.
+    let (fid, bid, lid) = list_backfill(&mut h, &["left@x.test"]).await;
+    let pause = EnrollPause::hold(bid);
+    let state = h.state.clone();
+    let enrolling = tokio::spawn(async move { run(&state, &json!({"backfill_id": bid})).await });
+    pause.arrived().await;
+    sqlx::query("DELETE FROM list_members WHERE list_id = $1").bind(lid).execute(&h.state.db).await.unwrap();
+    pause.release(bid);
+    enrolling.await.unwrap().unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, 0);
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM flow_backfill_members WHERE backfill_id = $1").bind(bid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(outcome, "skipped: no longer in the trigger list or segment");
+
+    // A cancel while someone is being enrolled waits for that one; nobody is enrolled after it returns.
+    let (fid, bid, _) = list_backfill(&mut h, &["c1@x.test", "c2@x.test", "c3@x.test"]).await;
+    let pause = EnrollPause::hold(bid);
+    let state = h.state.clone();
+    let enrolling = tokio::spawn(async move { run(&state, &json!({"backfill_id": bid})).await });
+    pause.arrived().await;
+    let db = h.state.db.clone();
+    let cancelling = tokio::spawn(async move {
+        sqlx::query("UPDATE flow_backfills SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status = 'running'").bind(bid).execute(&db).await.map(|r| r.rows_affected())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!cancelling.is_finished(), "the cancel waits for the enrollment in progress");
+    pause.release(bid);
+    assert_eq!(cancelling.await.unwrap().unwrap(), 1);
+    let at_cancel = flow_runs(&h, &fid).await;
+    enrolling.await.unwrap().unwrap();
+    assert_eq!(at_cancel, 1, "the one in progress finished first");
+    assert_eq!(flow_runs(&h, &fid).await, 1, "nobody after the cancel returned");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn back_populate_is_paced_and_a_dead_job_frees_the_flow() {
+    use dumbmail::features::flows_plus::backfill::{run, BATCH};
+    let mut h = harness!();
+    h.signup().await;
+    let emails: Vec<String> = (0..(BATCH + 50)).map(|i| format!("p{i}@x.test")).collect();
+    let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
+    let (fid, bid, _) = list_backfill(&mut h, &refs).await;
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, BATCH, "one batch");
+    // Their first steps haven't been picked up: the next batch waits.
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, BATCH, "no second batch while the first one's steps wait");
+    let later: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'flows_plus_backfill' AND run_at > now()").fetch_one(&h.state.db).await.unwrap();
+    assert!(later >= 1, "it checks again shortly");
+    // Sending picks them up; the next batch goes.
+    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::MAIN).await.unwrap();
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, BATCH + 50);
+
+    // A back-populate whose job runs out of retries is marked failed, and the flow can start another.
+    let (fid2, bid2, _) = list_backfill(&mut h, &["x1@x.test"]).await;
+    dumbmail::jobs::enqueue_background(&h.state.db, "flows_plus_backfill", json!({"backfill_id": bid2}), None).await.unwrap();
+    sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE kind = 'flows_plus_backfill'").execute(&h.state.db).await.unwrap();
+    sqlx::query("ALTER TABLE flow_backfill_members RENAME TO flow_backfill_members_gone").execute(&h.state.db).await.unwrap();
+    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::BACKGROUND).await.unwrap();
+    sqlx::query("ALTER TABLE flow_backfill_members_gone RENAME TO flow_backfill_members").execute(&h.state.db).await.unwrap();
+    let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM flow_backfills WHERE id = $1").bind(bid2).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "failed");
+    assert!(error.unwrap_or_default().contains("repeated errors"));
+    h.ok("POST", &format!("/api/flows/{fid2}/backfill"), Some(json!({"confirm": true}))).await;
+    h.cleanup().await;
+}
+
+/// A proxy in front of Postgres that counts the statements its clients run (simple queries and
+/// extended-protocol executes) while `on` is set.
+async fn counting_proxy(target: &str) -> (u16, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let count = Arc::new(AtomicUsize::new(0));
+    let on = Arc::new(AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let target = target.to_string();
+    let (c, o) = (count.clone(), on.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else { return };
+            let server = tokio::net::TcpStream::connect(&target).await.unwrap();
+            let (mut cr, mut cw) = client.into_split();
+            let (mut sr, mut sw) = server.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut sr, &mut cw).await;
+            });
+            let (c, o) = (c.clone(), o.clone());
+            tokio::spawn(async move {
+                // Untyped messages first (an SSL request, then the startup message).
+                let mut typed = false;
+                loop {
+                    let mut head = [0u8; 5];
+                    let len = if typed {
+                        if cr.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        if o.load(Ordering::SeqCst) && (head[0] == b'Q' || head[0] == b'E') {
+                            c.fetch_add(1, Ordering::SeqCst);
+                        }
+                        u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize
+                    } else {
+                        if cr.read_exact(&mut head[..4]).await.is_err() {
+                            return;
+                        }
+                        u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize
+                    };
+                    let mut body = vec![0u8; len - 4];
+                    if cr.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let out = if typed { [&head[..], &body[..]].concat() } else { [&head[..4], &body[..]].concat() };
+                    if sw.write_all(&out).await.is_err() {
+                        return;
+                    }
+                    // 80877103 is the SSL request; anything else untyped is the startup message.
+                    if !typed && !(body.len() == 4 && u32::from_be_bytes([body[0], body[1], body[2], body[3]]) == 80877103) {
+                        typed = true;
+                    }
+                }
+            });
+        }
+    });
+    (port, count, on)
+}
+
+#[tokio::test]
+async fn entering_a_flow_costs_what_it_did() {
+    let mut h = harness!();
+    h.signup().await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Count"}), json!({"entry": "d", "settings": {"reentry": "never"}, "nodes": [
+        {"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]})).await;
+    let flow: dumbmail::models::FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
+    let p = h.ok("POST", "/api/profiles", Some(json!({"email": "count@x.test"}))).await;
+    let pid: Uuid = p["id"].as_str().unwrap().parse().unwrap();
+    // The same app on the same database, through the counting proxy, one connection.
+    let opts: sqlx::postgres::PgConnectOptions = h.state.cfg.database_url.parse().unwrap();
+    let (port, count, on) = counting_proxy(&format!("127.0.0.1:{}", opts.get_port())).await;
+    let db = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(opts.host("127.0.0.1").port(port).ssl_mode(sqlx::postgres::PgSslMode::Disable)).await.unwrap();
+    let s = &h.state;
+    let state = dumbmail::AppState(Arc::new(dumbmail::state::Inner {
+        db,
+        cfg: s.cfg.clone(),
+        email: s.email.clone(),
+        sms: s.sms.clone(),
+        http: s.http.clone(),
+        pending_checks: Default::default(),
+        daily_limits: Default::default(),
+    }));
+    let measure = |state: dumbmail::AppState| {
+        let (count, on, flow) = (count.clone(), on.clone(), flow.clone());
+        async move {
+            count.store(0, Ordering::SeqCst);
+            on.store(true, Ordering::SeqCst);
+            let id = dumbmail::flows::start(&state, &flow, pid, json!({})).await.unwrap();
+            on.store(false, Ordering::SeqCst);
+            (id, count.load(Ordering::SeqCst))
+        }
+    };
+    let (accepted, accepted_n) = measure(state.clone()).await;
+    assert!(accepted.is_some());
+    let (blocked, blocked_n) = measure(state.clone()).await;
+    assert!(blocked.is_none());
+    eprintln!("statements: accepted {accepted_n}, blocked {blocked_n}");
+    // On main before this change: accepted 3 (check, insert, enqueue), blocked 1 (the check).
+    assert_eq!(blocked_n, 1, "a blocked entry is one statement, as before");
+    assert!(accepted_n <= 3 + 2, "an accepted entry is at most two more: {accepted_n}");
     h.cleanup().await;
 }

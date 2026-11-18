@@ -36,6 +36,9 @@ pub const MAX_DAILY_CAP: i64 = 2_000;
 pub const MAX_PENDING: i64 = 20;
 /// Confirmation emails an account may send in 24 hours (and each address gets at most one a day).
 pub const MAX_CONFIRMATIONS_PER_DAY: i64 = 50;
+/// The most confirmation emails one address gets in 24 hours from all accounts together, counting
+/// each account's first request (which another account's request can't block).
+pub const MAX_PER_ADDRESS_PER_DAY: i64 = 3;
 const SUBJECT_MAX: usize = 200;
 const BODY_MAX: usize = 5_000;
 /// How long a confirmation link works.
@@ -178,8 +181,9 @@ pub async fn record_addresses(state: &AppState, account_id: Uuid, emails: &[Stri
 /// Ask an outside address to confirm: without `confirm`, says whether a link would go out. Refused
 /// while the account's sending is paused, for team members (they need none), for confirmed,
 /// bounced or complaining addresses. Limits, enforced in the insert that records it: one per
-/// address per day across all accounts, except that each account's first request to an address
-/// always goes (so another account can't block it), and [`MAX_CONFIRMATIONS_PER_DAY`] per account.
+/// address per day across all accounts, except that an account's first request to an address goes
+/// even after another account's (so it can't be blocked) while the address has had fewer than
+/// [`MAX_PER_ADDRESS_PER_DAY`] that day; and [`MAX_CONFIRMATIONS_PER_DAY`] per account.
 pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email: &str, confirm: bool) -> AppResult<Value> {
     let e = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
     if !team_addresses(&state.db, account_id, std::slice::from_ref(&e)).await?.is_empty() {
@@ -227,22 +231,25 @@ pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email
     }
     let sent: Option<i64> = sqlx::query_scalar(
         "INSERT INTO flow_notify_confirm_sends (account_id, email) SELECT $1, $2
-         WHERE (NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours')
-                OR NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2))
+         WHERE ((SELECT count(*) FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') = 0
+                OR (NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2)
+                    AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') < $4))
            AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours') < $3
          RETURNING id",
     )
     .bind(account_id)
     .bind(&e)
     .bind(MAX_CONFIRMATIONS_PER_DAY)
+    .bind(MAX_PER_ADDRESS_PER_DAY)
     .fetch_optional(&mut *tx)
     .await?;
     if sent.is_none() {
-        let address_today: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') AND EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2)")
+        let account_today: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'")
             .bind(account_id)
-            .bind(&e)
             .fetch_one(&mut *tx)
             .await?;
+        // Under the account's limit, so it was the address's.
+        let address_today = account_today < MAX_CONFIRMATIONS_PER_DAY;
         return Err(AppError::Busy(if address_today {
             format!("{e} was sent a confirmation link in the last 24 hours; try again tomorrow")
         } else {
