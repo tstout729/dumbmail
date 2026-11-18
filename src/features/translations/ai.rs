@@ -22,6 +22,14 @@ pub const MODEL: &str = "claude-sonnet-5-5";
 const API_VERSION: &str = "2026-10-21";
 /// Server-side fallback when the model declines (routes by the reason it declined).
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Where requests go. Only a loopback stand-in set in code (tests) replaces it; see [`api_base`].
+pub const API_BASE: &str = "https://api.anthropic.com";
+/// The largest request body (instructions, glossary, strings and JSON together).
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// What the instructions and glossary may take of a request; the strings get the rest.
+pub const RESERVED_BYTES: usize = 16 * 1024;
+/// The most glossary text in one request.
+pub const MAX_GLOSSARY_BYTES: usize = 8 * 1024;
 /// The most source characters in one request.
 pub const MAX_REQUEST_CHARS: usize = 12_000;
 /// The most strings in one request.
@@ -123,9 +131,23 @@ pub fn restore(p: &Protected, translated: &str, source: &str) -> Result<String, 
     Ok(out)
 }
 
+/// The API base: [`API_BASE`], unless `over` is a loopback address (a test's stand-in).
+pub fn api_base(over: Option<&str>) -> &str {
+    match over {
+        Some(u) if u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:") => u,
+        _ => API_BASE,
+    }
+}
+
+/// What one string adds to a request body, in bytes (its id and text as JSON).
+pub fn entry_bytes(id: &str, text: &str) -> usize {
+    serde_json::to_string(id).map(|s| s.len()).unwrap_or(usize::MAX / 4) + serde_json::to_string(text).map(|s| s.len()).unwrap_or(usize::MAX / 4) + 2
+}
+
 /// What a translation request needs, without the key.
 pub struct Request<'a> {
-    pub base_url: &'a str,
+    /// A test's loopback stand-in (see [`api_base`]); None: the Anthropic API.
+    pub base_url: Option<&'a str>,
     pub api_key: &'a str,
     pub source_lang: &'a str,
     pub target_lang: &'a str,
@@ -144,7 +166,15 @@ fn system_prompt(r: &Request<'_>) -> String {
         src = r.source_lang,
         dst = r.target_lang
     );
-    let fixed: Vec<String> = r.glossary.iter().filter_map(|t| t.translation.as_ref().filter(|x| !x.trim().is_empty()).map(|x| format!("\"{}\" → \"{}\"", t.term, x))).collect();
+    let mut fixed: Vec<String> = Vec::new();
+    let mut size = 0;
+    for line in r.glossary.iter().filter_map(|t| t.translation.as_ref().filter(|x| !x.trim().is_empty()).map(|x| format!("\"{}\" → \"{}\"", t.term, x))) {
+        size += line.len() + 2;
+        if size > MAX_GLOSSARY_BYTES {
+            break;
+        }
+        fixed.push(line);
+    }
     if !fixed.is_empty() {
         s.push_str(&format!(" Always translate these terms this way: {}.", fixed.join("; ")));
     }
@@ -181,14 +211,18 @@ pub async fn translate(r: &Request<'_>) -> Result<BTreeMap<String, String>, Fail
         "output_config": {"effort": "medium"},
         "fallbacks": "default",
     });
-    let url = format!("{}/v1/messages", r.base_url.trim_end_matches('/'));
+    let body = serde_json::to_vec(&body).map_err(|_| Failure("couldn't write the request".into()))?;
+    if body.len() > MAX_REQUEST_BYTES {
+        return Err(Failure("the text was too big for one request".into()));
+    }
+    let url = format!("{}/v1/messages", api_base(r.base_url).trim_end_matches('/'));
     let res = client()?
         .post(url)
         .header("x-api-key", r.api_key)
         .header("anthropic-version", API_VERSION)
         .header("anthropic-beta", FALLBACK_BETA)
         .header("content-type", "application/json")
-        .json(&body)
+        .body(body)
         .send()
         .await
         .map_err(|e| Failure(if e.is_timeout() { "the translation service didn't answer in time".into() } else { "couldn't reach the translation service".into() }))?;
@@ -266,6 +300,14 @@ mod tests {
         let p = protect(Kind::Html, a, &[]).unwrap();
         assert_eq!(restore(&p, "⟦H1⟧Allez⟦H2⟧", a).unwrap(), "<a href=\"https://x.test/{{ id }}\">Allez</a>");
         assert!(protect(Kind::Text, "a ⟦T1⟧", &[]).is_none());
+    }
+
+    #[test]
+    fn requests_go_only_to_anthropic() {
+        assert_eq!(api_base(None), "https://api.anthropic.com");
+        assert_eq!(api_base(Some("https://evil.test")), "https://api.anthropic.com");
+        assert_eq!(api_base(Some("http://127.0.0.1.evil.test:80")), "https://api.anthropic.com");
+        assert_eq!(api_base(Some("http://127.0.0.1:4000")), "http://127.0.0.1:4000");
     }
 
     #[test]

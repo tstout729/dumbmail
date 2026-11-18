@@ -242,17 +242,27 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
             None => skipped += 1,
         }
     }
+    // Batches are bounded by characters, strings and the request's size in bytes (the
+    // instructions and glossary get a fixed share); a string too big for any request is skipped.
+    let budget = ai::MAX_REQUEST_BYTES - ai::RESERVED_BYTES;
     let mut batches: Vec<BTreeMap<String, String>> = Vec::new();
     let mut cur = BTreeMap::new();
-    let mut size = 0;
+    let (mut size, mut bytes) = (0, 0);
     for (fid, p) in &protected {
         let n = p.text.chars().count();
-        if !cur.is_empty() && (size + n > ai::MAX_REQUEST_CHARS || cur.len() >= ai::MAX_REQUEST_STRINGS) {
+        let b = ai::entry_bytes(fid, &p.text);
+        if b > budget {
+            skipped += 1;
+            continue;
+        }
+        if !cur.is_empty() && (size + n > ai::MAX_REQUEST_CHARS || bytes + b > budget || cur.len() >= ai::MAX_REQUEST_STRINGS) {
             batches.push(std::mem::take(&mut cur));
             size = 0;
+            bytes = 0;
         }
         cur.insert(fid.clone(), p.text.clone());
         size += n;
+        bytes += b;
     }
     if !cur.is_empty() {
         batches.push(cur);
@@ -261,7 +271,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let mut drafts: BTreeMap<String, String> = BTreeMap::new();
     let mut failure: Option<String> = None;
     for batch in &batches {
-        let req = ai::Request { base_url: &state.cfg.anthropic_api_url, api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch };
+        let req = ai::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch };
         match ai::translate(&req).await {
             Ok(out) => {
                 for fid in batch.keys() {

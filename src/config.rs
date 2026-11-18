@@ -176,9 +176,11 @@ pub struct Config {
     /// `features::translations`). Unset: the button is hidden; importing and exporting still work.
     #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
     pub anthropic_api_key: Option<String>,
-    /// Base URL of the Anthropic API (tests point it at a stand-in).
-    #[arg(long, env = "ANTHROPIC_API_URL", default_value = "https://api.anthropic.com")]
-    pub anthropic_api_url: String,
+    /// A loopback stand-in for the Anthropic API, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored: the key only ever goes to https://api.anthropic.com.
+    #[arg(skip)]
+    pub anthropic_api_base: Option<String>,
     /// Most characters one account may send for machine translation per day (its time zone).
     #[arg(long, env = "TRANSLATION_DAILY_CHARS", default_value_t = 200_000)]
     pub translation_daily_chars: i64,

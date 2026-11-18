@@ -376,7 +376,7 @@ async fn draft_with_ai_sends_only_the_text_and_keeps_tags_exactly() {
     let (calls, url) = mock_anthropic().await;
     let Some(mut h) = Harness::with(|c| {
         c.anthropic_api_key = Some("sk-ant-test-0123456789".into());
-        c.anthropic_api_url = url.clone();
+        c.anthropic_api_base = Some(url.clone());
         c.translation_daily_chars = 2_000;
     })
     .await
@@ -462,7 +462,7 @@ async fn two_draft_requests_at_once_start_one_run() {
     let (_calls, url) = mock_anthropic().await;
     let Some(mut h) = Harness::with(|c| {
         c.anthropic_api_key = Some("sk-ant-test".into());
-        c.anthropic_api_url = url.clone();
+        c.anthropic_api_base = Some(url.clone());
     })
     .await
     else {
@@ -717,7 +717,7 @@ async fn translations_change_only_words_on_every_path() {
     let (calls, url) = mock_anthropic().await;
     let Some(mut h) = Harness::with(|c| {
         c.anthropic_api_key = Some("sk-ant-test".into());
-        c.anthropic_api_url = url.clone();
+        c.anthropic_api_base = Some(url.clone());
     })
     .await
     else {
@@ -959,5 +959,41 @@ async fn a_localized_link_gets_the_same_link_tags_as_the_original() {
     let html = |to: &str| sent.iter().find(|m| m.to == to).unwrap().html.replace("%3F", "?").replace("%3D", "=").replace("%26", "&").replace("%2F", "/").replace("%3A", ":");
     assert!(html("ann@x.test").contains("https://acme.test/fr?utm_source=dumbmail&utm_medium=email"), "{}", html("ann@x.test"));
     assert!(html("bob@x.test").contains("https://acme.test/en?utm_source=dumbmail&utm_medium=email"));
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn machine_translation_requests_are_bounded_as_a_whole() {
+    let (calls, url) = mock_anthropic().await;
+    let Some(mut h) = Harness::with(|c| {
+        c.anthropic_api_key = Some("sk-ant-test".into());
+        c.anthropic_api_base = Some(url.clone());
+        c.translation_daily_chars = 1_000_000;
+    })
+    .await
+    else {
+        return;
+    };
+    h.signup().await;
+    set_languages(&mut h, json!(["de"])).await;
+    // One text that's too big for any request (in bytes, though not in characters), and some that fit.
+    let huge = format!("<p>{}</p>", "😀".repeat(30_000));
+    let mut blocks = vec![json!({"type": "text", "html": huge})];
+    for i in 0..4 {
+        blocks.push(json!({"type": "text", "html": format!("<p>{} {i}</p>", "😀".repeat(5_000))}));
+    }
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Big", "content": {"subject": "Hi", "blocks": blocks}}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    let job = h.ok("POST", &format!("/api/translations/campaigns/{cid}/draft"), Some(json!({"language": "de"}))).await;
+    h.drain().await;
+    let done = h.ok("GET", &format!("/api/translations/jobs/{}", job["id"].as_str().unwrap()), None).await;
+    let reqs = calls.lock().unwrap().requests.clone();
+    assert!(reqs.len() >= 2, "{} requests", reqs.len());
+    for (body, _, _) in &reqs {
+        assert!(body.to_string().len() <= 64 * 1024, "a request of {} bytes", body.to_string().len());
+        assert!(!body.to_string().contains(&"😀".repeat(30_000)), "the oversized text isn't sent");
+    }
+    assert_eq!(done["skipped"], 1, "{done}");
+    assert_eq!(done["translated"], 5, "the subject and the four that fit: {done}");
     h.cleanup().await;
 }
