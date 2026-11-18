@@ -618,3 +618,150 @@ pub async fn click(State(state): State<AppState>, Path(token): Path<String>, Que
     }
     Redirect::to(&q.u).into_response()
 }
+
+/// The snippet's push add-on and the service worker, run in QuickJS with the browser stubbed.
+#[cfg(test)]
+mod js_tests {
+    use serde_json::{json, Value};
+
+    const BROWSER: &str = r#"
+var __log = [], __ls = {}, __ss = {}, __fetchOk = true, __sub = null;
+function mkStorage(o) { return { getItem: function (k) { return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : null; }, setItem: function (k, v) { o[k] = String(v); }, removeItem: function (k) { delete o[k]; } }; }
+var localStorage = mkStorage(__ls), sessionStorage = mkStorage(__ss);
+function fetch(url, init) { __log.push({ fetch: url, body: init && init.body ? JSON.parse(init.body) : null }); return __fetchOk ? Promise.resolve({ ok: true }) : Promise.reject(new Error("offline")); }
+function mkSub() { return { endpoint: "https://fcm.googleapis.com/fcm/send/abc", toJSON: function () { return { endpoint: this.endpoint, keys: { p256dh: "P", auth: "A" } }; }, unsubscribe: function () { __sub = null; __log.push({ unsubscribe: true }); return Promise.resolve(true); } }; }
+var __reg = { active: {}, pushManager: { getSubscription: function () { return Promise.resolve(__sub); }, subscribe: function () { __log.push({ subscribe: true }); __sub = mkSub(); return Promise.resolve(__sub); } } };
+var navigator = { serviceWorker: { register: function (path, o) { __log.push({ register: path, scope: o && o.scope }); return Promise.resolve(__reg); }, getRegistration: function (scope) { return Promise.resolve(__reg); } } };
+var Notification = { permission: "granted", requestPermission: function () { return Promise.resolve(Notification.permission); } };
+var document = { readyState: "complete", body: null, addEventListener: function () {} };
+var location = { href: "https://shop.test/" };
+function setTimeout(f) {}
+function atob(s) { return ""; }
+function btoa(s) { return ""; }
+var window = { isSecureContext: true, PushManager: function () {}, Notification: Notification, dumbmail: {} };
+"#;
+
+    fn push_js() -> String {
+        let cfg = json!({"key": "BKEY", "sw": "/dumbmail-sw.js", "scope": "/dumbmail-push/", "prompt": super::settings::Prompt::default(), "color": "#123456"});
+        super::fill(super::PUSH_JS, "https://dm.test", "site-key").replacen("__CONFIG__", &cfg.to_string(), 1)
+    }
+
+    /// Run `setup`, then the script, then each step, letting promises settle after each. Returns
+    /// the log and local storage.
+    fn run(setup: &str, script: &str, steps: &[&str]) -> Value {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let pump = || while rt.execute_pending_job().unwrap_or(false) {};
+        ctx.with(|c| c.eval::<(), _>(format!("{BROWSER}\n{setup}")).unwrap());
+        ctx.with(|c| c.eval::<(), _>(script.to_string()).unwrap());
+        pump();
+        for s in steps {
+            ctx.with(|c| c.eval::<(), _>(s.to_string()).unwrap());
+            pump();
+        }
+        let out: String = ctx.with(|c| c.eval("JSON.stringify({log: __log, ls: __ls})").unwrap());
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn has(v: &Value, key: &str) -> bool {
+        v["log"].as_array().unwrap().iter().any(|e| e.get(key).is_some())
+    }
+
+    #[test]
+    fn a_granted_browser_without_a_subscription_is_not_subscribed_on_page_load() {
+        let v = run("", &push_js(), &[]);
+        assert!(!has(&v, "subscribe") && !has(&v, "register"), "never created without a click: {v}");
+        // With a subscription it made before, the snippet only reports it.
+        let v = run("__sub = mkSub();", &push_js(), &[]);
+        assert!(!has(&v, "subscribe"));
+        assert!(v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))), "{v}");
+    }
+
+    #[test]
+    fn a_click_registers_the_worker_with_its_own_scope() {
+        let v = run("Notification.permission = 'default'; Notification.requestPermission = function () { Notification.permission = 'granted'; return Promise.resolve('granted'); };", &push_js(), &["window.dumbmail.notifications.prompt()"]);
+        let reg = v["log"].as_array().unwrap().iter().find(|e| e.get("register").is_some()).cloned().unwrap();
+        assert_eq!(reg["scope"], "/dumbmail-push/", "{v}");
+    }
+
+    #[test]
+    fn turned_off_stays_off_and_the_removal_proof_is_kept_until_confirmed() {
+        // Offline: the removal can't be confirmed, so its proof stays.
+        let v = run("__sub = mkSub(); __fetchOk = false;", &push_js(), &["window.dumbmail.notifications.unsubscribe()"]);
+        assert!(v["ls"]["pl_push_removal"].as_str().is_some_and(|s| s.contains("fcm.googleapis.com")), "{v}");
+        assert_eq!(v["ls"]["pl_push_off"], "true");
+        // Next page, back online: it's sent again and then forgotten; nothing is re-subscribed.
+        let ls = v["ls"].to_string();
+        let v = run(&format!("var __saved = {ls}; for (var k in __saved) __ls[k] = __saved[k]; __sub = mkSub();"), &push_js(), &[]);
+        let sent: Vec<&Value> = v["log"].as_array().unwrap().iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/unsubscribe"))).collect();
+        assert_eq!(sent.len(), 1, "{v}");
+        assert_eq!(sent[0]["body"]["auth"], "A");
+        assert!(v["ls"].get("pl_push_removal").is_none(), "{v}");
+        assert!(!v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))), "turned off: not reported again: {v}");
+    }
+
+    #[test]
+    fn the_grant_is_never_stored_and_sign_out_unlinks() {
+        let v = run(
+            "__sub = mkSub();",
+            &push_js(),
+            &["window.dumbmail.notifications.identify({type: 'external_id', value: 'c1', grant: 'v1.9999999999.abcd'})", "window.dumbmail.notifications.signOut()"],
+        );
+        assert!(!v["ls"].to_string().contains("v1.9999999999"), "{v}");
+        let subscribe = v["log"].as_array().unwrap().iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).last().cloned().unwrap();
+        assert_eq!(subscribe["body"]["identity"]["grant"], "v1.9999999999.abcd");
+        assert!(v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/sign-out"))), "{v}");
+    }
+
+    const WORKER: &str = r#"
+var __log = [], __listeners = {}, __showDone = null, __p = [];
+function fetch(url, init) { __log.push({ fetch: url }); return Promise.resolve({ ok: true }); }
+function btoa(s) { return ""; }
+var self = {
+  addEventListener: function (t, f) { __listeners[t] = f; },
+  registration: { showNotification: function (t, o) { __log.push({ show: t }); return new Promise(function (r) { __showDone = r; }); } },
+  clients: { openWindow: function (u) { __log.push({ open: u }); return Promise.resolve(); }, claim: function () { __log.push({ claim: true }); } },
+  skipWaiting: function () { __log.push({ skip: true }); }
+};
+function push(d) { __listeners.push({ data: { json: function () { return d; } }, waitUntil: function (p) { __p.push(p); } }); }
+function click(data, action) { __listeners.notificationclick({ notification: { data: data, close: function () {} }, action: action || "", waitUntil: function (p) {} }); }
+"#;
+
+    fn worker() -> String {
+        super::fill(super::SW_JS, "https://dm.test", "site-key").replacen("__LINKS__", "[\"https://links.test/p/c/\"]", 1).replacen("__VAPID__", "\"BKEY\"", 1)
+    }
+
+    fn run_worker(steps: &[&str]) -> Value {
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        let pump = || while rt.execute_pending_job().unwrap_or(false) {};
+        ctx.with(|c| c.eval::<(), _>(format!("{WORKER}\n{}", worker())).unwrap());
+        pump();
+        for s in steps {
+            ctx.with(|c| c.eval::<(), _>(s.to_string()).unwrap());
+            pump();
+        }
+        let out: String = ctx.with(|c| c.eval("JSON.stringify({log: __log, listeners: Object.keys(__listeners)})").unwrap());
+        serde_json::from_str(&out).unwrap()
+    }
+
+    #[test]
+    fn the_worker_keeps_to_itself() {
+        let v = run_worker(&[]);
+        assert!(!v["listeners"].as_array().unwrap().iter().any(|l| l == "install" || l == "activate"), "no page takeover: {v}");
+        // Someone else's push is left alone.
+        let v = run_worker(&["push({t: 'Not ours', b: 'x'})"]);
+        assert!(v["log"].as_array().unwrap().is_empty(), "{v}");
+        // Ours: shown first, delivery reported only once it's shown.
+        let v = run_worker(&["push({dm: 1, r: 'pdtoken', t: 'Hi', b: 'there', u: 'https://links.test/p/c/x?u=a'})"]);
+        assert_eq!(v["log"].as_array().unwrap().len(), 1, "not reported before it's shown: {v}");
+        let v = run_worker(&["push({dm: 1, r: 'pdtoken', t: 'Hi', b: 'there', u: 'https://links.test/p/c/x?u=a'})", "__showDone()"]);
+        let log = v["log"].as_array().unwrap();
+        assert_eq!(log[0]["show"], "Hi");
+        assert!(log[1]["fetch"].as_str().unwrap().contains("/client/push/delivered"), "{v}");
+        // A tap opens only a signed DumbMail link.
+        let v = run_worker(&["click({dm: 1, u: 'https://evil.test/x', a: []})", "click({dm: 1, u: 'https://links.test/p/c/t?u=b', a: []})", "click({u: 'https://links.test/p/c/t'})"]);
+        let opened: Vec<&Value> = v["log"].as_array().unwrap().iter().filter_map(|e| e.get("open")).collect();
+        assert_eq!(opened, vec![&json!("https://links.test/p/c/t?u=b")]);
+    }
+}
