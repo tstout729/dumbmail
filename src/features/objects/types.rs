@@ -223,7 +223,11 @@ pub fn normalize(def: &FieldDef, v: &Value) -> Result<Value, String> {
             }
             json!(s)
         }
-        Kind::Number | Kind::Money => json!(num(v).ok_or_else(|| format!("{k} must be a number"))?),
+        Kind::Number | Kind::Money => {
+            let n = num(v).ok_or_else(|| format!("{k} must be a number"))?;
+            // Whole numbers stay whole (3, not 3.0).
+            if n.fract() == 0.0 && n.abs() < 9.0e15 { json!(n as i64) } else { json!(n) }
+        }
         Kind::Boolean => match v {
             Value::Bool(b) => json!(b),
             Value::String(s) if s.eq_ignore_ascii_case("true") => json!(true),
@@ -537,6 +541,7 @@ mod tests {
         assert_eq!(normalize(&def(Kind::Datetime), &json!("2026-11-20T10:00:00-08:00")).unwrap(), json!("2026-11-20T18:00:00Z"));
         assert!(normalize(&def(Kind::Datetime), &json!("2026-11-20T10:00:00")).is_err());
         assert_eq!(normalize(&def(Kind::Number), &json!("12.5")).unwrap(), json!(12.5));
+        assert_eq!(normalize(&def(Kind::Number), &json!(3.0)).unwrap(), json!(3));
         assert!(normalize(&def(Kind::Number), &json!("lots")).is_err());
         assert_eq!(normalize(&def(Kind::Boolean), &json!("TRUE")).unwrap(), json!(true));
         assert_eq!(normalize(&def(Kind::List), &json!(["a", 2])).unwrap(), json!(["a", "2"]));

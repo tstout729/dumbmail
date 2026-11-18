@@ -526,6 +526,8 @@ async fn an_integration_never_inserts_a_profile_unheld() {
     go.notify_one();
     assert_eq!(points.recv().await, Some("before_create"));
     go.notify_one();
+    assert_eq!(points.recv().await, Some("after_action"));
+    go.notify_one();
     job.await.unwrap();
     dumbmail::features::objects::hooks::remove(acct);
     let inserts: Vec<(String, bool)> = sqlx::query_as("SELECT email, held FROM test_inserts").fetch_all(&h.state.db).await.unwrap();
@@ -623,5 +625,70 @@ async fn versions_order_writes_exactly_and_ignored_writes_create_nobody() {
     let (s, e) = h.req("POST", "/api/objects", Some(up(json!({"fields": {"plan": "x"}, "as_of": "2026-11-17T10:00:00Z"})))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
     assert_eq!(h.req("POST", "/api/objects", Some(up(json!({"as_of": -4})))).await.0, StatusCode::BAD_REQUEST);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_bulk_upsert_that_dies_resumes_after_its_last_write() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    let items = json!([
+        {"type": "sub", "external_id": "S1", "fields": {"plan": "a"}},
+        {"type": "sub", "external_id": "S1", "fields": {"plan": "b"}},
+        {"type": "sub", "external_id": "S2", "fields": {"plan": "c"}}]);
+    let (s, b) = h.req("POST", "/api/objects/bulk", Some(json!({"objects": items}))).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let id: uuid::Uuid = b["id"].as_str().unwrap().parse().unwrap();
+    // The job dies just as it reaches the third object (A and B are written).
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let state = h.state.clone();
+    let job = tokio::spawn(async move { dumbmail::features::objects::bulk::run(&state, id).await });
+    for _ in 0..2 {
+        assert_eq!(points.recv().await, Some("bulk_item"));
+        go.notify_one();
+    }
+    assert_eq!(points.recv().await, Some("bulk_item"));
+    job.abort();
+    let _ = job.await;
+    dumbmail::features::objects::hooks::remove(acct);
+    // Run again: it carries on at the third object; A and B aren't written again (no B → A → B).
+    dumbmail::features::objects::bulk::run(&h.state, id).await.unwrap();
+    let plans: Vec<String> = sqlx::query_scalar("SELECT c.after->>'plan' FROM object_changes c JOIN objects o ON o.id = c.object_id WHERE o.external_id = 'S1' ORDER BY c.created_at, c.id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(plans, vec!["a", "b"]);
+    let st = h.ok("GET", &format!("/api/objects/bulk/{id}"), None).await;
+    assert_eq!((st["status"].clone(), st["done"].clone(), st["created"].clone(), st["updated"].clone()), (json!("done"), json!(3), json!(2), json!(1)), "{st}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_retried_delete_never_removes_a_replacement() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    let script = "function handle(i) { var p = i.payload; return p.del ? [{type: 'delete_object', object_type: 'stay', external_id: 'S1'}] : [{type: 'upsert_object', object_type: 'stay', external_id: 'S1', fields: {n: p.n}}] }";
+    let (_, path) = integration(&mut h, script, json!([])).await;
+    h.raw("POST", &path, &[("content-type", "application/json")], &json!({"n": 1}).to_string()).await;
+    h.drain().await;
+    // The delete's delivery dies right after its action is written.
+    h.raw("POST", &path, &[("content-type", "application/json")], &json!({"del": true}).to_string()).await;
+    let d: uuid::Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE body LIKE '%del%'").fetch_one(&h.state.db).await.unwrap();
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let state = h.state.clone();
+    let job = tokio::spawn(async move { dumbmail::features::integrations::engine::process_delivery(&state, d).await });
+    assert_eq!(points.recv().await, Some("before_delete"));
+    go.notify_one();
+    assert_eq!(points.recv().await, Some("after_action"));
+    job.abort();
+    let _ = job.await;
+    dumbmail::features::objects::hooks::remove(acct);
+    assert_eq!(count(&h, "SELECT count(*) FROM objects").await, 0);
+    // A replacement arrives under the same id, then the delete's delivery is retried.
+    sqlx::query("DELETE FROM jobs WHERE payload->>'delivery_id' = $1").bind(d.to_string()).execute(&h.state.db).await.unwrap();
+    h.raw("POST", &path, &[("content-type", "application/json")], &json!({"n": 2}).to_string()).await;
+    h.drain().await;
+    dumbmail::features::integrations::engine::process_delivery(&h.state, d).await.unwrap();
+    let n: Option<String> = sqlx::query_scalar("SELECT fields->>'n' FROM objects WHERE external_id = 'S1'").fetch_optional(&h.state.db).await.unwrap();
+    assert_eq!(n.as_deref(), Some("2"), "the retry saw its delete already applied and left the replacement");
     h.cleanup().await;
 }

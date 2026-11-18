@@ -1111,6 +1111,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             }
         }
         if writes && !dry {
+            crate::features::objects::hooks::pause(src.account_id, "after_action").await;
             // Written right after the action's effects (in the same transaction where the action
             // wrote one itself, like a new profile); each effect is also keyed so a retry that
             // reruns it changes nothing.
