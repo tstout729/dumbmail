@@ -209,6 +209,9 @@ pub struct Config {
     /// `http://localhost:…` is ignored.
     #[arg(skip)]
     pub ad_platform_api_base: Option<String>,
+    /// The Shopify app (SHOPIFY_API_KEY, SHOPIFY_API_SECRET; see docs/SHOPIFY.md).
+    #[command(flatten)]
+    pub shopify: crate::features::shopify::Settings,
 }
 
 impl Config {

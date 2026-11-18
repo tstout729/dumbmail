@@ -138,6 +138,11 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("flows_plus_backfill", "backfill_id", "SELECT account_id FROM flow_backfills WHERE id = $1"),
     ("flows_plus_confirm_address", "account_id", "SELECT $1::uuid"),
     ("translations_draft", "job_id", "SELECT account_id FROM translation_jobs WHERE id = $1"),
+    // Shopify: everything but privacy requests (`shopify_privacy`) and the store worker
+    // (`shopify_work`), which for a closed account only does privacy requests and opt-out
+    // write-backs (see `features::shopify`).
+    ("shopify_setup", "account_id", "SELECT $1::uuid"),
+    ("shopify_rebaseline_segments", "account_id", "SELECT $1::uuid"),
 ];
 
 /// Whether this job is for a closed account (one indexed lookup).
