@@ -44,6 +44,8 @@ pub struct KProfile {
     pub fp: String,
     /// Problems to record (invalid email, oversized properties).
     pub notes: Vec<String>,
+    /// Klaviyo's `locale`, as a language tag (see `features::translations::locale`).
+    pub locale: Option<String>,
 }
 
 fn st(v: &Value) -> Option<&str> {
@@ -160,7 +162,22 @@ pub fn parse(p: &Value, hold_never: bool, run: uuid::Uuid) -> Result<KProfile, (
         s_in,
         detail,
         notes,
+        locale: st(&a["locale"]).and_then(crate::features::translations::locale::normalize),
     })
+}
+
+/// Set the language Klaviyo gave (a trusted source) on the profiles just written, in the same
+/// transaction. Nothing runs when no profile on the page has one.
+async fn write_locales(tx: &mut sqlx::PgConnection, ids: &[Uuid], locales: &[Option<String>]) -> sqlx::Result<()> {
+    if locales.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    sqlx::query("UPDATE profiles p SET locale = x.loc FROM unnest($1::uuid[], $2::text[]) AS x(id, loc) WHERE p.id = x.id AND x.loc IS NOT NULL AND p.locale IS DISTINCT FROM x.loc")
+        .bind(ids)
+        .bind(locales)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
 }
 
 /// The merge, as SQL over `p` (the profile as it is now; the rows are locked by the statement before),
@@ -336,6 +353,7 @@ impl Run<'_> {
             .bind(CONSENT_HISTORY)
             .fetch_all(&mut *tx)
             .await?;
+        write_locales(&mut tx, &pid, &rows.iter().map(|(_, k, _)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
         Ok(res.into_iter().map(wrote).collect())
     }
@@ -389,6 +407,7 @@ impl Run<'_> {
         .bind(rows.iter().map(|(_, k)| k.created).collect::<Vec<_>>())
         .fetch_all(&mut *tx)
         .await?;
+        write_locales(&mut tx, &ids, &rows.iter().map(|(_, k)| k.locale.clone()).collect::<Vec<_>>()).await?;
         tx.commit().await?;
         Ok(res
             .into_iter()

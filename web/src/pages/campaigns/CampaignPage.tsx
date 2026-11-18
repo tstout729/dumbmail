@@ -307,11 +307,11 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           ) : null}
           {/* Keyed by version so each tab's editor keeps its own UI state (open blocks, dialogs). */}
           {isEmail(shown, campaign.channel) ? (
-            <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} />
+            <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
           ) : campaign.channel === "push" ? (
             <PushEditor key={version} value={shown as PushContent} onChange={editVersion} readOnly={!editable} />
           ) : (
-            <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} />
+            <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
           )}
         </Step>
 

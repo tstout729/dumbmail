@@ -666,6 +666,8 @@
         for (var k in d) if (has(d, k)) data[k] = d[k];
         // The visitor's time zone lets the server guess their location for new profiles.
         try { data.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e2) {}
+        // The browser's language: a hint for which language version of a message they get.
+        try { if (navigator.language) data.locale = navigator.language; } catch (e3) {}
         send(data, btn, formErr, function (r) { mainDone(data, r); });
       });
       var legalText = trim(c.legal_text) ? h("p", { cls: "dm-legal" }, legal(str(c.legal_text))) : null;

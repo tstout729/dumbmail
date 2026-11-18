@@ -180,6 +180,8 @@ pub fn message_names(channel: &str, content: &Value) -> AppResult<BTreeSet<Strin
 /// coupon blocks naming a valid coupon, at most [`MAX_PER_MESSAGE`] coupons. `channel` is "email" or
 /// "sms"; other content (unknown channel) is checked as email.
 pub fn check_content(channel: &str, content: &Value) -> AppResult<()> {
+    // Language versions are checked on every save of message content too (see features::translations).
+    crate::features::translations::fields::check_saved(content)?;
     if !may_use_coupons(content) {
         return Ok(());
     }
