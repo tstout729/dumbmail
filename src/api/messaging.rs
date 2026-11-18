@@ -757,6 +757,7 @@ async fn check_trigger_refs(state: &AppState, account_id: Uuid, t: &flows::Trigg
     match t {
         flows::Trigger::List { list_id } => crate::audience::list_belongs(&state.db, account_id, *list_id).await,
         flows::Trigger::Segment { segment_id } => super::audience::get_segment(state, account_id, *segment_id).await.map(|_| ()),
+        flows::Trigger::Object { .. } | flows::Trigger::ObjectDate { .. } => crate::features::objects::flow::check_trigger_refs(&state.db, account_id, t).await,
         _ => Ok(()),
     }
 }
@@ -925,6 +926,9 @@ pub async fn flow_report(state: &AppState, account_id: Uuid, id: Uuid) -> AppRes
     let mut out = json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes});
     if f.trigger["type"] == "event_date" {
         out["event_dates"] = flows::event_date_report(&state.db, f.id).await?;
+    }
+    if f.trigger["type"] == "object_date" {
+        out["object_dates"] = crate::features::objects::api::flow_report(state, f.id).await?;
     }
     Ok(out)
 }

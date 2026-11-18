@@ -4,6 +4,7 @@ import type { DelayUnit, FlowNode, List } from "../../api";
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
+import { ObjectSplitFields } from "../../features/objects/ObjectSplitFields";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 
 type Props = {
@@ -63,6 +64,11 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
             People who match go down <b>Yes</b>; everyone else goes down <b>No</b>.
           </p>
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
+          <ObjectSplitFields filters={node.object_filters} onChange={(object_filters) => {
+            const next = { ...node, object_filters };
+            if (!object_filters) delete next.object_filters;
+            onChange(next);
+          }} />
         </fieldset>
       );
     case "wait_for_reply":

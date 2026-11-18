@@ -170,6 +170,63 @@ pub struct Log {
     pub message: String,
 }
 
+/// A person an object belongs to: who (as in other actions) and how (`guest`, `owner` ...).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWho {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default, alias = "phone")]
+    pub phone_number: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub property: Option<String>,
+    #[serde(default)]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub if_missing: Option<String>,
+    #[serde(default)]
+    pub relationship: Option<String>,
+}
+
+impl ObjectWho {
+    fn who(&self) -> Who {
+        Who {
+            email: self.email.clone(),
+            phone_number: self.phone_number.clone(),
+            external_id: self.external_id.clone(),
+            property: self.property.clone(),
+            value: self.value.clone(),
+            if_missing: self.if_missing.clone(),
+        }
+    }
+}
+
+/// Create or update a custom object (see `features::objects`), linked to the people given.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpsertObject {
+    pub object_type: String,
+    /// Its id in the app. Missing: one is made from the delivery (stable across retries).
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub fields: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub profiles: Vec<ObjectWho>,
+    /// The app's own time or version for this state: an older one never overwrites a newer one.
+    #[serde(default)]
+    pub as_of: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteObject {
+    pub object_type: String,
+    pub external_id: String,
+}
+
 /// Pull runs only: fetch another page. Fields given replace the previous request's; `query` merges.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -197,9 +254,11 @@ pub enum Action {
     SetState(SetState),
     Log(Log),
     NextRequest(NextRequest),
+    UpsertObject(UpsertObject),
+    DeleteObject(DeleteObject),
 }
 
-pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "set_state", "log", "next_request"];
+pub const ACTION_TYPES: &[&str] = &["upsert_profile", "track_event", "add_to_list", "remove_from_list", "unsubscribe", "suppress", "set_state", "log", "next_request", "upsert_object", "delete_object"];
 
 fn part<T: DeserializeOwned>(i: usize, kind: &str, v: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(v)).map_err(|e| format!("action {i} ({kind}): {e}"))
@@ -376,6 +435,32 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 }
                 Action::Suppress(a)
             }
+            "upsert_object" => {
+                let a: UpsertObject = part(i, k, obj)?;
+                if !crate::features::objects::types::valid_type_key(a.object_type.trim()) {
+                    return Err(format!("action {i} ({k}): object_type is the type's key, 1-40 lower-case letters, digits and _ (e.g. reservation)"));
+                }
+                if a.external_id.as_deref().is_some_and(|e| e.trim().is_empty() || e.chars().count() > 200) {
+                    return Err(format!("action {i} ({k}): external_id must be 1-200 characters"));
+                }
+                crate::features::objects::store::check_fields_shape(&a.fields.clone().unwrap_or_default()).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                if a.profiles.len() > crate::features::objects::store::MAX_LINKS {
+                    return Err(format!("action {i} ({k}): at most {} profiles", crate::features::objects::store::MAX_LINKS));
+                }
+                for w in &a.profiles {
+                    check_who(i, k, &w.who())?;
+                    crate::features::objects::store::relationship(w.relationship.as_deref()).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                }
+                crate::features::objects::store::as_of_text(&a.as_of).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                Action::UpsertObject(a)
+            }
+            "delete_object" => {
+                let a: DeleteObject = part(i, k, obj)?;
+                if !crate::features::objects::types::valid_type_key(a.object_type.trim()) || a.external_id.trim().is_empty() || a.external_id.chars().count() > 200 {
+                    return Err(format!("action {i} ({k}): needs object_type (the type's key) and external_id (1-200 characters)"));
+                }
+                Action::DeleteObject(a)
+            }
             "set_state" => {
                 let a: SetState = part(i, k, obj)?;
                 if serde_json::to_string(&a.values).map(|s| s.len()).unwrap_or(0) > MAX_STATE_BYTES {
@@ -435,6 +520,8 @@ pub struct Source {
     pub metrics: Vec<String>,
     /// The delivery whose ledger (`applied`) records each action as it is written.
     pub ledger: Option<Uuid>,
+    /// The integration's redact list: also removed from object fields before they're written.
+    pub redact: Vec<String>,
 }
 
 impl Source {
@@ -455,15 +542,23 @@ pub struct Counts {
     pub suppressed: u32,
     pub consents: u32,
     pub skipped: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objects_upserted: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objects_deleted: u32,
     /// New profiles held back from marketing (no opt-in).
     pub held: u32,
     /// Actions skipped on a retry or replay because they were already written.
     pub already_written: u32,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl Counts {
     pub fn wrote_anything(&self) -> bool {
-        self.profiles_created + self.profiles_updated + self.events + self.list_adds + self.list_removes + self.unsubscribes + self.suppressed + self.consents > 0
+        self.profiles_created + self.profiles_updated + self.events + self.list_adds + self.list_removes + self.unsubscribes + self.suppressed + self.consents + self.objects_upserted + self.objects_deleted > 0
     }
 }
 
@@ -932,6 +1027,21 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                 }
                 out.effect(i, format!("stopped all marketing to {}", who_label(&who)));
             }
+            Action::UpsertObject(o) => upsert_object(state, src, i, o, dry, out).await?,
+            Action::DeleteObject(d) => {
+                let id = crate::features::objects::store::ids_for(&state.db, src.account_id, &d.object_type, &[d.external_id.trim().to_string()]).await?;
+                if dry {
+                    out.effect(i, if id.is_empty() { format!("would skip deleting {} {}: there's no such object", d.object_type, d.external_id) } else { format!("would delete {} {}", d.object_type, d.external_id) });
+                    if !id.is_empty() {
+                        out.counts.objects_deleted += 1;
+                    }
+                    continue;
+                }
+                let ids: Vec<Uuid> = id.iter().map(|(id, _)| *id).collect();
+                let n = if ids.is_empty() { 0 } else { crate::features::objects::store::delete(&state.db, src.account_id, &ids).await? };
+                out.counts.objects_deleted += n as u32;
+                out.effect(i, if n > 0 { format!("deleted {} {}", d.object_type, d.external_id) } else { format!("{} {} was already gone", d.object_type, d.external_id) });
+            }
             Action::SetState(s) => {
                 for (k, v) in &s.values {
                     if v.is_null() {
@@ -968,6 +1078,58 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
     }
     if new_state != *current_state {
         out.state = new_state;
+    }
+    Ok(())
+}
+
+/// Write (or, dry, describe) an `upsert_object`: its people are found or created as for other
+/// actions (new ones held back from marketing without an opt-in), the integration's redact list is
+/// applied to its fields, and it's written with the app's `as_of` so an older state never wins.
+async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObject, dry: bool, out: &mut Outcome) -> AppResult<()> {
+    let key = o.object_type.trim();
+    let external_id = match (&o.external_id, dry) {
+        (Some(e), _) => e.trim().to_string(),
+        (None, true) => "(made from the delivery)".into(),
+        (None, false) => return Err(AppError::bad(format!("action {i} (upsert_object): external_id is missing"))),
+    };
+    let fields = o.fields.clone().unwrap_or_default();
+    let redact = super::redact::paths(&src.redact);
+    let mut links = Vec::new();
+    let mut who = Vec::new();
+    for w in &o.profiles {
+        let Some(found) = resolve(state, src, &w.who(), dry, out).await? else {
+            who.push(format!("{} (nobody yet; not linked)", who_label(&w.who())));
+            continue;
+        };
+        let rel = crate::features::objects::store::relationship(w.relationship.as_deref())?;
+        who.push(if rel.is_empty() { who_label(&w.who()) } else { format!("{} ({rel})", who_label(&w.who())) });
+        links.push((found.id, rel));
+    }
+    let people = if who.is_empty() { String::new() } else { format!(" for {}", who.join(", ")) };
+    if dry {
+        let (what, changed) = crate::features::objects::store::preview(state, src.account_id, key, &external_id, &fields, &redact).await?;
+        if what != "unchanged" {
+            out.counts.objects_upserted += 1;
+        }
+        let detail = if changed.is_empty() { String::new() } else { format!(" ({})", changed.join(", ")) };
+        out.effect(i, match what {
+            "created" => format!("would create {key} {external_id}{detail}{people}"),
+            "updated" => format!("would update {key} {external_id}{detail}{people}"),
+            _ => format!("{key} {external_id} unchanged{people}"),
+        });
+        return Ok(());
+    }
+    let w = crate::features::objects::store::Writer { account_id: src.account_id, source: src.tag(), redact };
+    let as_of = crate::features::objects::store::as_of_text(&o.as_of)?;
+    let r = crate::features::objects::store::write(state, &w, key, &external_id, &fields, &links, as_of.as_deref()).await?;
+    let detail = if r.changed.is_empty() { String::new() } else { format!(" ({})", r.changed.join(", ")) };
+    match r.result {
+        "created" | "updated" => {
+            out.counts.objects_upserted += 1;
+            out.effect(i, format!("{} {key} {}{detail}{people}", r.result, r.external_id));
+        }
+        "older" => out.effect(i, format!("kept {key} {}: this state is older than the one stored", r.external_id)),
+        _ => out.effect(i, format!("{key} {} unchanged{people}", r.external_id)),
     }
     Ok(())
 }

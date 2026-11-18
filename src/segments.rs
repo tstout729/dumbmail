@@ -190,6 +190,20 @@ pub enum Condition {
         #[serde(default)]
         until: Option<String>,
     },
+    /// Has (or doesn't have, `zero`) objects of a type (see `features::objects`) whose fields match
+    /// `where`, e.g. a reservation checking in within the next 14 days.
+    Object {
+        object_type: String,
+        #[serde(default = "at_least")]
+        op: EventOp,
+        #[serde(default)]
+        count: Option<i64>,
+        #[serde(rename = "where", default)]
+        where_: Vec<Filter>,
+        /// Only objects they're linked to this way (e.g. `guest`).
+        #[serde(default)]
+        relationship: Option<String>,
+    },
     /// A stable random share of profiles, e.g. a 10% holdout. The same seed always picks the same people.
     Random {
         percent: f64,
@@ -251,6 +265,12 @@ pub enum PropOp {
     MoreThanDaysAgo,
     /// The date's month and day fall within the next N days (0 = today), e.g. birthdays.
     AnniversaryWithinDays,
+    /// The date is today or in the next N days (a date-time: from now to N days ahead).
+    WithinNextDays,
+    /// The date is today or later (a date-time: after now).
+    InFuture,
+    /// The date is before today (a date-time: before now).
+    InPast,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -544,6 +564,21 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 }
                 check_window(*within_days, since, until)?;
             }
+            Condition::Object { object_type, count, where_, relationship, .. } => {
+                if !crate::features::objects::types::valid_type_key(object_type.trim()) {
+                    return Err(AppError::bad("an object condition needs the object type's key (e.g. reservation)"));
+                }
+                if count.is_some_and(|c| c < 0) {
+                    return Err(AppError::bad("count must be 0 or more"));
+                }
+                if where_.len() > 20 {
+                    return Err(AppError::bad("an object condition takes at most 20 field rules"));
+                }
+                if relationship.as_deref().is_some_and(|r| r.trim().is_empty() || r.chars().count() > 50) {
+                    return Err(AppError::bad("relationship is 1-50 characters (e.g. guest)"));
+                }
+                check_filters(where_)?;
+            }
             Condition::Random { percent, .. } => {
                 if !(percent.is_finite() && *percent > 0.0 && *percent <= 100.0) {
                     return Err(AppError::bad("random sample percent must be more than 0 and at most 100"));
@@ -639,12 +674,15 @@ fn check_filter(field: &str, op: PropOp, value: &Option<Value>) -> AppResult<()>
     if field.trim().is_empty() {
         return Err(AppError::bad("condition needs a field"));
     }
-    let needs_value = !matches!(op, PropOp::Exists | PropOp::NotExists);
+    let needs_value = !matches!(op, PropOp::Exists | PropOp::NotExists | PropOp::InFuture | PropOp::InPast);
     if needs_value && value.as_ref().is_none_or(|v| v.is_null()) {
         return Err(AppError::bad(format!("condition on {field:?} needs a value")));
     }
     if matches!(op, PropOp::WithinLastDays | PropOp::MoreThanDaysAgo) && value.as_ref().and_then(as_f64).is_none() {
         return Err(AppError::bad("day-based conditions need a number of days"));
+    }
+    if op == PropOp::WithinNextDays && !value.as_ref().and_then(as_f64).is_some_and(|d| (0.0..=3650.0).contains(&d)) {
+        return Err(AppError::bad("within_next_days needs a number of days from 0 to 3650"));
     }
     if op == PropOp::AnniversaryWithinDays && !value.as_ref().and_then(as_f64).is_some_and(|d| (0.0..=366.0).contains(&d)) {
         return Err(AppError::bad("anniversary_within_days needs a number of days from 0 to 366"));
@@ -675,6 +713,8 @@ const ACCOUNT_TZ: &str = "(SELECT a.timezone FROM accounts a WHERE a.id = p.acco
 enum Source {
     Profile,
     Event,
+    /// An object's fields (`o`, inside an object condition).
+    Object,
 }
 
 fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str) {
@@ -694,6 +734,9 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         Source::Event => {
             qb.push("(e.properties->>").push_bind(field.to_string()).push(")");
         }
+        Source::Object => {
+            qb.push("(o.fields->>").push_bind(field.to_string()).push(")");
+        }
     }
 }
 
@@ -705,6 +748,10 @@ fn push_json_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         }
         Source::Event if field != "value" => {
             qb.push("(e.properties->").push_bind(field.to_string()).push(")");
+            true
+        }
+        Source::Object => {
+            qb.push("(o.fields->").push_bind(field.to_string()).push(")");
             true
         }
         _ => false,
@@ -890,6 +937,35 @@ fn push_filter(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str, op
             push_time_field(qb, src, field);
             qb.push(if op == PropOp::WithinLastDays { " >= " } else { " < " });
             qb.push("now() - make_interval(secs => ").push_bind(days * 86400.0).push(")");
+        }
+        PropOp::WithinNextDays | PropOp::InFuture | PropOp::InPast => {
+            // A plain date by calendar day in the account's time zone; a date-time against now.
+            let today = format!("(now() AT TIME ZONE {ACCOUNT_TZ})::date");
+            qb.push("(CASE WHEN ");
+            push_text_field(qb, src, field);
+            qb.push(" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN pl_ts(");
+            push_text_field(qb, src, field);
+            qb.push(")::date");
+            match op {
+                PropOp::WithinNextDays => {
+                    let days = as_f64(&v).unwrap_or(0.0).clamp(0.0, 3650.0);
+                    qb.push(format!(" BETWEEN {today} AND {today} + ")).push_bind(days.floor() as i32);
+                    qb.push(" ELSE ");
+                    push_time_field(qb, src, field);
+                    qb.push(" BETWEEN now() AND now() + make_interval(secs => ").push_bind(days * 86400.0).push(")");
+                }
+                PropOp::InFuture => {
+                    qb.push(format!(" >= {today} ELSE "));
+                    push_time_field(qb, src, field);
+                    qb.push(" > now()");
+                }
+                _ => {
+                    qb.push(format!(" < {today} ELSE "));
+                    push_time_field(qb, src, field);
+                    qb.push(" <= now()");
+                }
+            }
+            qb.push(" END)");
         }
         PropOp::AnniversaryWithinDays => {
             // Month and day of the date, compared with today and the next N days in the account's time zone.
@@ -1219,6 +1295,26 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             };
             qb.push(")");
         }
+        Condition::Object { object_type, op, count, where_, relationship } => {
+            qb.push("((SELECT count(DISTINCT o.id) FROM object_links ol JOIN objects o ON o.id = ol.object_id JOIN object_types ot ON ot.id = o.type_id");
+            qb.push(" WHERE ol.profile_id = p.id AND ot.account_id = p.account_id AND o.account_id = p.account_id AND ot.key = ").push_bind(object_type.trim().to_string());
+            if let Some(r) = relationship {
+                qb.push(" AND ol.relationship = ").push_bind(r.trim().to_lowercase());
+            }
+            for f in where_ {
+                qb.push(" AND (");
+                push_filter(qb, Source::Object, &f.field, f.op, &f.value);
+                qb.push(")");
+            }
+            let n = count.unwrap_or(1);
+            match op {
+                EventOp::AtLeast => qb.push(") >= ").push_bind(n),
+                EventOp::AtMost => qb.push(") <= ").push_bind(n),
+                EventOp::Exactly => qb.push(") = ").push_bind(n),
+                EventOp::Zero => qb.push(") = 0"),
+            };
+            qb.push(")");
+        }
         Condition::Random { percent, seed } => {
             // Stable per profile and seed: hash into 0..9999 and keep the lowest `percent` share.
             qb.push("(((hashtextextended(p.id::text || ").push_bind(seed.clone().unwrap_or_default()).push(", 0) % 10000) + 10000) % 10000 < ");
@@ -1349,7 +1445,7 @@ pub fn json_filter_matches(obj: &Value, f: &Filter) -> bool {
         },
         PropOp::In => in_list(&want),
         PropOp::NotIn => !in_list(&want),
-        PropOp::WithinLastDays | PropOp::MoreThanDaysAgo | PropOp::AnniversaryWithinDays => false,
+        PropOp::WithinLastDays | PropOp::MoreThanDaysAgo | PropOp::AnniversaryWithinDays | PropOp::WithinNextDays | PropOp::InFuture | PropOp::InPast => false,
     }
 }
 
@@ -1451,6 +1547,33 @@ mod tests {
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "bought"}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "category": " "}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "within_days": 0}]})).is_err());
+    }
+
+    #[test]
+    fn object_rules_compile_with_bound_values() {
+        let def = parse(&json!({"match": "all", "conditions": [
+            {"type": "object", "object_type": "reservation", "relationship": "guest", "where": [
+                {"field": "status", "op": "eq", "value": "confirmed"},
+                {"field": "check_in", "op": "within_next_days", "value": 14}]},
+            {"type": "object", "object_type": "subscription", "op": "zero", "where": [{"field": "renews_on", "op": "in_future"}]},
+            {"type": "object", "object_type": "pet", "op": "at_least", "count": 2, "where": [{"field": "kind", "op": "in", "value": ["dog", "cat"]}]}
+        ]}))
+        .unwrap();
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT 1 FROM profiles p WHERE ");
+        push_definition(&mut qb, &def);
+        let sql = qb.sql();
+        assert!(sql.contains("FROM object_links ol JOIN objects o ON o.id = ol.object_id"), "{sql}");
+        assert!(sql.contains("ot.account_id = p.account_id"), "objects are read only from the person's own account");
+        assert!(sql.contains("(o.fields->>$"), "{sql}");
+        assert!(sql.contains(") = 0"), "{sql}");
+        for leaked in ["reservation", "guest", "confirmed", "check_in", "renews_on", "dog"] {
+            assert!(!sql.contains(leaked), "{leaked} must be bound, not inlined");
+        }
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "Reservation"}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "where": [{"field": "check_in", "op": "within_next_days"}]}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "where": [{"field": "check_in", "op": "within_next_days", "value": 5000}]}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "count": -1}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "property", "field": "renews_on", "op": "in_past"}]})).is_ok(), "no value needed");
     }
 
     #[test]

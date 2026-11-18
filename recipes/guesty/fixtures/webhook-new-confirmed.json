@@ -14,6 +14,32 @@
       "type": "upsert_profile"
     },
     {
+      "as_of": "2026-11-15T19:04:11.000Z",
+      "external_id": "66f1c4a1246e7d9f0f8da88a",
+      "fields": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "GY-h5SdcsBL",
+        "currency": "USD",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "source_channel": "manual",
+        "status": "confirmed",
+        "total": 1312.5
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "email": "dana.whitfield@example.com",
+          "relationship": "guest"
+        }
+      ],
+      "type": "upsert_object"
+    },
+    {
       "metric": "Reservation Booked",
       "profile": {
         "email": "dana.whitfield@example.com"

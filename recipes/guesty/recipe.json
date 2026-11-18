@@ -2,7 +2,7 @@
   "key": "guesty",
   "name": "Guesty",
   "category": "Vacation rentals",
-  "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once), Reservation Total (the booking's value, once, when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Reservations import through Guesty's current Open API.",
+  "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once), Reservation Total (the booking's value, once, when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Each reservation is also kept as a reservation object (status, dates, listing, guests) linked to the guest, so flows can follow its dates and segments can ask about upcoming stays. Reservations import through Guesty's current Open API.",
   "metrics": [
     "Reservation Booked",
     "Reservation Total",
@@ -73,8 +73,8 @@
     "Save the webhook signing secret (GET https://open-api.guesty.com/v1/webhooks-v2/secret, starts with whsec_) as the integration's signing secret.",
     "Test the pull (Pull tab → Test pull, or test_integration with pull: true) to see the first page of reservations and exactly what would be written.",
     "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
-    "Guests are held back from marketing: the three suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
-    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on.",
+    "Guests are held back from marketing: the suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
+    "Review the draft flows (booking confirmation, pre-arrival, review request, and a pre-arrival that follows the reservation object; use one of the two pre-arrival flows), edit the emails, and turn them on.",
     "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile."
   ],
   "flows": [
@@ -218,6 +218,57 @@
           }
         ]
       }
+    },
+    {
+      "name": "Guesty: pre-arrival from the reservation",
+      "description": "Two days before check-in at 10am, sends arrival details, from the reservation object: it follows the newest dates and skips cancelled bookings and inquiries without any event keys. A service message. Turn on this one or the event-based pre-arrival flow, not both.",
+      "trigger": {
+        "type": "object_date",
+        "object_type": "reservation",
+        "field": "check_in",
+        "offset_days": -2,
+        "hour": 10,
+        "relationship": "guest",
+        "filters": [
+          {
+            "field": "status",
+            "op": "in",
+            "value": [
+              "confirmed",
+              "checked_in",
+              "alteration"
+            ]
+          }
+        ]
+      },
+      "definition": {
+        "entry": "o1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "o1",
+            "type": "email",
+            "name": "Arrival details",
+            "next": null,
+            "content": {
+              "subject": "See you soon at {{ object.listing_name|default('our place') }}",
+              "preheader": "Check-in is {{ object.check_in|date }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your stay starts in two days"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, we're getting <strong>{{ object.listing_name|default('the place') }}</strong> ready for you.</p><p>Check-in: {{ object.check_in|date }}<br>Check-out: {{ object.check_out|date }}<br>Confirmation code: {{ object.confirmation_code|default('') }}</p><p>Reply to this email if you have any questions before you arrive.</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "message_id": {
@@ -233,5 +284,75 @@
     "**.checkInInstructions",
     "**.guestContact",
     "**.wifiPassword"
+  ],
+  "object_types": [
+    {
+      "key": "reservation",
+      "name": "Reservation",
+      "plural": "Reservations",
+      "title_field": "confirmation_code",
+      "fields": [
+        {
+          "key": "status",
+          "label": "Status",
+          "type": "text"
+        },
+        {
+          "key": "confirmation_code",
+          "label": "Confirmation code",
+          "type": "text"
+        },
+        {
+          "key": "listing_id",
+          "label": "Listing ID",
+          "type": "text"
+        },
+        {
+          "key": "listing_name",
+          "label": "Listing",
+          "type": "text"
+        },
+        {
+          "key": "check_in",
+          "label": "Check-in",
+          "type": "date"
+        },
+        {
+          "key": "check_out",
+          "label": "Check-out",
+          "type": "date"
+        },
+        {
+          "key": "nights",
+          "label": "Nights",
+          "type": "number"
+        },
+        {
+          "key": "guests",
+          "label": "Guests",
+          "type": "number"
+        },
+        {
+          "key": "total",
+          "label": "Total",
+          "type": "number"
+        },
+        {
+          "key": "currency",
+          "label": "Currency",
+          "type": "text"
+        },
+        {
+          "key": "source_channel",
+          "label": "Channel",
+          "type": "text"
+        },
+        {
+          "key": "guest_id",
+          "label": "Guesty guest ID",
+          "type": "text"
+        }
+      ]
+    }
   ]
 }

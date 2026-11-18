@@ -498,7 +498,7 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     let mut h = integ_harness!();
     h.signup().await;
     let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
-    assert_eq!(created["flows"].as_array().unwrap().len(), 3);
+    assert_eq!(created["flows"].as_array().unwrap().len(), 4);
     assert_eq!(created["flows"][0]["status"], "draft", "suggested flows never start on their own");
     let integ = &created["integration"];
     let id = integ["id"].as_str().unwrap().to_string();

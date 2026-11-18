@@ -44,7 +44,7 @@ pub const JOB_DELIVERY: &str = "integrations_delivery";
 pub const JOB_PULL: &str = "integrations_pull";
 
 fn source_of(i: &Integration, delivery: Option<Uuid>, ledger: Option<Uuid>) -> Source {
-    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger }
+    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger, redact: i.redact.clone() }
 }
 
 /// Everything secret about this integration, to scrub from what is stored or shown.
@@ -227,6 +227,11 @@ pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value>
         .enumerate()
         .map(|(i, a)| {
             let mut a = a.clone();
+            // An object without its own id gets one from the delivery, so a retry updates the same one.
+            if a["type"] == "upsert_object" && a.get("external_id").is_none_or(Value::is_null) {
+                let print = actions::fingerprint(&a);
+                a["external_id"] = json!(format!("delivery:{root}:{i}:{print}"));
+            }
             if a["type"] == "track_event" {
                 if a.get("unique_id").is_none_or(Value::is_null) {
                     let print = actions::fingerprint(&a);

@@ -22,6 +22,10 @@
 // - Reservation Cancelled: timed by Guesty's own update time, so a late, older cancellation never
 //   undoes a newer reinstatement.
 // - Inquiry Received.
+// Each reservation is also kept as a `reservation` object (see dumbmail://docs/objects) with its
+// current status, dates, listing, nights, guests and channel, linked to the guest, written with
+// Guesty's own time as `as_of` so a late, older message never undoes a newer one. Object-date
+// flows (the pre-arrival flow) follow it when its dates move or it's cancelled.
 // A webhook without any Guesty time can't be ordered, so it writes no events; the next pull (every
 // 15 minutes) records the change with Guesty's time. A v2 event for a guest DumbMail doesn't know
 // yet is retried until the pull has added them.
@@ -179,6 +183,8 @@ function reservationActions(r, guest, who, version, input, versioned) {
   if (historical) props.historical = true;
   props.version = version;
 
+  out.push(reservationObject(d, who, version));
+
   var status = String(r.status || "").toLowerCase();
   if (BOOKED.indexOf(status) >= 0) {
     var booked = {};
@@ -223,6 +229,20 @@ function reservationActions(r, guest, who, version, input, versioned) {
     out.push({ type: "log", message: "reservation " + d.reservation_id + " is " + (status || "without a status") + "; nothing to record yet" });
   }
   return out;
+}
+
+// The reservation as it is now. Only what this message says is written (a v2 webhook without the
+// listing's name leaves the stored name alone); door codes and notes are never among the fields.
+function reservationObject(d, who, version) {
+  var fields = clean({
+    status: d.status ? d.status.toLowerCase() : null, confirmation_code: d.confirmation_code, listing_id: d.listing_id, listing_name: d.listing_name,
+    check_in: d.check_in, check_out: d.check_out, nights: d.nights, guests: d.guests, total: d.total, currency: d.currency,
+    source_channel: d.source_channel, guest_id: d.guest_id,
+  });
+  var link = {};
+  for (var k in who) link[k] = who[k];
+  link.relationship = "guest";
+  return { type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: fields, profiles: [link], as_of: version };
 }
 
 function clean(o) {
