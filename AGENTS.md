@@ -39,7 +39,7 @@ TEST_DATABASE_URL=postgres://postgres@localhost:5432/postgres cargo test --locke
 pnpm -C web typecheck && pnpm -C web lint && pnpm -C web build
 ```
 
-Run clippy and the web checks before you push. Leave the full test run to CI.
+Before you push, run clippy and the web checks, and at most the one test file your change touches (`cargo test --test <name>`, or `--lib` with a filter). Never run the whole suite (`cargo test` with no `--test` or filter, or `cargo build --tests`) on the agent host: it links every test binary, and several sessions doing it at once stalled the host's disk and T3 on 2026-11-17. Push and let CI run it; read a failure with `gh run view <run> --log-failed`. The host's `cargo` refuses a whole-suite run, shares one target folder across dumbmail worktrees (one build at a time) and stops the whole build on a timeout.
 
 The deploy image is built from only the paths the `Dockerfile` copies (`src`, `migrations`, `docs`, the built dashboard). If the server embeds a file from any other folder (`include_str!`, `include_bytes!`, rust-embed), add a `COPY` for that folder to the `Dockerfile` in the same PR. CI runs `scripts/check-docker-context.sh` to catch a miss; a missed folder took a deploy down on 2026-11-17.
 
