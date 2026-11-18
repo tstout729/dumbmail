@@ -6,6 +6,7 @@ import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../.
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Notice, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
 import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { ProfileObjects } from "../../features/objects/ProfileObjects";
 
 export function ProfileDetailPage() {
   const { id = "" } = useParams();
@@ -142,6 +143,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
               </ul>
             )}
           </Card>
+          <ProfileObjects profileId={profile.id} />
         </div>
         <div className="space-y-4">
           <Card title="Activity" padded={false}>

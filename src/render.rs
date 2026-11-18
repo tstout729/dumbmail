@@ -401,7 +401,35 @@ fn env(auto_escape: bool) -> Environment<'static> {
     } else {
         env.set_auto_escape_callback(|_| AutoEscape::None);
     }
+    env.add_filter("date", date_filter);
     env
+}
+
+/// `{{ object.check_in|date }}` → "November 20, 2026"; `|date('%a %b %-d, %-I:%M %p')` takes a
+/// strftime format. A date-time is shown in the account's time zone. Anything that isn't a date
+/// comes out as it was.
+fn date_filter(state: &minijinja::State, value: minijinja::Value, format: Option<String>) -> String {
+    use std::fmt::Write;
+    let Some(s) = value.as_str().map(str::trim) else { return value.to_string() };
+    let tz: chrono_tz::Tz = state
+        .lookup("organization")
+        .and_then(|o| o.get_attr("timezone").ok())
+        .and_then(|t| t.as_str().and_then(|t| t.parse().ok()))
+        .unwrap_or(chrono_tz::America::Los_Angeles);
+    let at = if s.len() == 10 {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().and_then(|d| d.and_hms_opt(12, 0, 0)).and_then(|d| d.and_local_timezone(tz).single())
+    } else {
+        chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&tz))
+    };
+    let Some(at) = at else { return s.to_string() };
+    let fmt = format.filter(|f| !f.is_empty() && f.len() <= 64).unwrap_or_else(|| "%B %-d, %Y".to_string());
+    let items: Vec<chrono::format::Item<'_>> = chrono::format::StrftimeItems::new(&fmt).collect();
+    let mut out = String::new();
+    if items.iter().any(|i| matches!(i, chrono::format::Item::Error)) || write!(out, "{}", at.format_with_items(items.iter())).is_err() {
+        out.clear();
+        let _ = write!(out, "{}", at.format("%B %-d, %Y"));
+    }
+    out
 }
 
 pub fn render_str(source: &str, ctx: &Value, html: bool) -> AppResult<String> {
@@ -451,9 +479,12 @@ pub fn context(account: &Account, profile: Option<&Profile>, event: Option<&Valu
         root.insert("person".into(), json!({"properties": {}}));
     }
     root.insert("event".into(), event.cloned().unwrap_or(json!({})));
+    // A flow run that belongs to a custom object passes it here (see features::objects); like
+    // `event`, it's always there, empty elsewhere.
+    root.insert("object".into(), event.and_then(|e| e.get("object")).cloned().unwrap_or(json!({})));
     root.insert(
         "organization".into(),
-        json!({"name": account.name, "address": account.address, "website": account.website}),
+        json!({"name": account.name, "address": account.address, "website": account.website, "timezone": account.timezone}),
     );
     root.insert("unsubscribe_url".into(), json!(unsubscribe_url));
     Value::Object(root)

@@ -62,6 +62,43 @@ pub enum Trigger {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cancelled_by: Vec<String>,
     },
+    /// An object of a type was created or updated (see `features::objects`), for each person
+    /// linked to it. Re-entry counts runs for the same object only.
+    Object {
+        object_type: String,
+        /// `created`, `updated` or `any` (default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<String>,
+        /// Only when this field changed ...
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+        /// ... to this value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Value>,
+        /// On the object's fields; checked again before each step.
+        #[serde(default)]
+        filters: Vec<Filter>,
+        /// Only people linked this way (e.g. `guest`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relationship: Option<String>,
+    },
+    /// N days (at a local hour) or N hours before or after a date field of each object of a type,
+    /// for each person linked to it. Follows the date when it moves; filters are checked when it
+    /// fires and before each step.
+    ObjectDate {
+        object_type: String,
+        field: String,
+        #[serde(default)]
+        offset_days: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_hours: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hour: Option<u32>,
+        #[serde(default)]
+        filters: Vec<Filter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relationship: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +182,7 @@ pub fn parse_trigger(v: &Value) -> AppResult<Trigger> {
             return Err(AppError::bad("cancelled_by needs a key (the property both events share, e.g. reservation_id)"));
         }
     }
+    crate::features::objects::flow::validate_trigger(&t)?;
     Ok(t)
 }
 
@@ -254,6 +292,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
+                crate::features::objects::flow::validate_condition(n)?;
             }
             "random_split" => {
                 if split_percent(n).is_none() {
@@ -466,7 +505,7 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
     // The cheap rejection first, with no lock or transaction: most repeat triggers stop here.
     // Event-date flows start once per event (a guest with two bookings gets both), so re-entry
     // doesn't apply to them.
-    let (blocked, days) = reentry_rule(flow, &def, 3);
+    let (blocked, days) = reentry_rule(flow, &def, 3, None);
     let sql = format!("SELECT {blocked}");
     let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(flow.id).bind(profile_id);
     if let Some(d) = days {
@@ -489,18 +528,27 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
 /// The re-entry rule as an SQL condition that is true when person $2 may not enter flow $1 now,
 /// and the seconds to bind as `$window` when the rule has a window (then bind it last). Event-date
 /// flows have none: they start once per event.
-fn reentry_rule(flow: &FlowRow, def: &FlowDef, window: usize) -> (String, Option<f64>) {
-    if matches!(parse_trigger(&flow.trigger), Ok(Trigger::EventDate { .. })) {
+/// Object-triggered flows (see `features::objects`) count runs for the same object only: `context`
+/// names the bound run context (`$n`) whose `object.id` they compare; without it (the cheap check in
+/// [`start`]) nothing is rejected and [`enter`] decides.
+fn reentry_rule(flow: &FlowRow, def: &FlowDef, window: usize, context: Option<&str>) -> (String, Option<f64>) {
+    let trigger = parse_trigger(&flow.trigger);
+    if matches!(trigger, Ok(Trigger::EventDate { .. } | Trigger::ObjectDate { .. })) {
         return ("FALSE".into(), None);
     }
+    let same_object = match (&trigger, context) {
+        (Ok(Trigger::Object { .. }), Some(c)) => format!(" AND context->'object'->>'id' = ({c}::jsonb)->'object'->>'id'"),
+        (Ok(Trigger::Object { .. }), None) => return ("FALSE".into(), None),
+        _ => String::new(),
+    };
     let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
     match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
-        (Value::String(s), _) if s == "always" => ("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')".into(), None),
+        (Value::String(s), _) if s == "always" => (format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active'{same_object})"), None),
         (_, Some(days)) => (
-            format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => ${window})))"),
+            format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => ${window})){same_object})"),
             Some(days * 86400.0),
         ),
-        _ => ("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2)".into(), None),
+        _ => (format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2{same_object})"), None),
     }
 }
 
@@ -517,7 +565,7 @@ pub async fn enter(
     run_at: Option<chrono::DateTime<Utc>>,
 ) -> AppResult<Option<Uuid>> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(profile_id).execute(&mut *tx).await?;
-    let (blocked, days) = reentry_rule(flow, def, 9);
+    let (blocked, days) = reentry_rule(flow, def, 9, Some("$6"));
     let sql = format!(
         "WITH r AS (
             INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context)
@@ -702,7 +750,7 @@ fn event_date_insert() -> String {
 const EVENT_DATE_SEED_BUDGET: i64 = 20_000;
 
 /// Catch-up window: a fire due within this long ago still starts; older ones are marked missed.
-const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
+pub const EVENT_DATE_CATCH_UP_HOURS: i64 = 24;
 
 async fn event_date_tz(db: &PgPool, account_id: Uuid) -> anyhow::Result<String> {
     let tz: Option<String> = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?;
@@ -740,6 +788,7 @@ pub async fn schedule_event_dates(db: &PgPool, event_id: Uuid) -> anyhow::Result
 /// The account's time zone changed: due times computed in the old one move to the new one (a
 /// date-only check-in is "2 days before, at 10:00" wherever the account now is).
 pub async fn reschedule_event_dates(db: &PgPool, account_id: Uuid) -> anyhow::Result<()> {
+    crate::features::objects::flow::reschedule(db, account_id).await?;
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 AND trigger->>'type' = 'event_date'").bind(account_id).fetch_all(db).await?;
     if flows.is_empty() {
         return Ok(());
@@ -784,13 +833,20 @@ pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Resu
     .bind(EVENT_DATE_CATCH_UP_HOURS as i32)
     .execute(&state.db)
     .await?;
+    // Object-date fires (features::objects) follow the same rules on their own rows.
+    crate::features::objects::flow::mark_missed(&state.db, EVENT_DATE_CATCH_UP_HOURS).await?;
     for _ in 0..2000 {
         if !fire_one_event_date(state).await? {
             break;
         }
     }
+    crate::features::objects::flow::fire_due(state, 2000).await?;
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
-    let mut budget = seed_budget;
+    // With live object-date flows too, event dates get half the budget and object dates (seeded
+    // below) the rest, so neither starves; otherwise event dates have all of it, as before.
+    let objects_too: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flows WHERE status = 'live' AND trigger->>'type' = 'object_date')").fetch_one(&state.db).await?;
+    let event_share = if objects_too { (seed_budget + 1) / 2 } else { seed_budget };
+    let mut budget = event_share;
     for f in &flows {
         if budget <= 0 {
             break;
@@ -854,12 +910,15 @@ pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Resu
             }
         }
     }
+    // Objects that existed before a live object-date flow, within what's left of the budget.
+    crate::features::objects::flow::seed(state, seed_budget - (event_share - budget.max(0))).await?;
     // Fires the seeding just found due start now (fires due later wait for their tick).
     for _ in 0..2000 {
         if !fire_one_event_date(state).await? {
             break;
         }
     }
+    crate::features::objects::flow::fire_due(state, 2000).await?;
     Ok(())
 }
 
@@ -1171,6 +1230,13 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 return finish(&state.db, &hold, "exited").await;
             }
         }
+        // Runs that belong to an object: leave when it's gone, moved or no longer matches (no
+        // query for other runs); its current fields are `object.*` in messages.
+        let object = match crate::features::objects::flow::check_run(&state.db, &flow, &context, run.profile_id).await? {
+            crate::features::objects::flow::Check::NotObject => None,
+            crate::features::objects::flow::Check::Exit(_) => return finish(&state.db, &hold, "exited").await,
+            crate::features::objects::flow::Check::Live { view, rules } => Some((view, rules)),
+        };
         let waited = context.get("_waited").and_then(|v| v.as_str()) == Some(node_id.as_str());
         // A step that reaches people outside (a message, a notification, a webhook), decided as it
         // runs, takes an exclusive claim first: a fresh claim id with an expiry, written only if
@@ -1243,7 +1309,10 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 let recent: bool = hours > 0 && crate::features::sendtime::recently_messaged(&state.db, run.profile_id, &node.kind, hours).await?;
                 if !recent {
-                    let event = context.get("event").cloned();
+                    let event = match &object {
+                        Some((view, _)) => Some(json!({"object": view})),
+                        None => context.get("event").cloned(),
+                    };
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
                     let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
                     // A push step's message id is stored with the run (under its claim) before it's sent, so
@@ -1295,9 +1364,13 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
             }
             "condition" => {
                 let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-                // A trigger split also tests the event that started the run (see features::flows_plus::split).
-                let yes = crate::features::flows_plus::split::event_matches(&node, &context)
+                // A trigger split also tests the event that started the run (see features::flows_plus::split),
+                // and object rules test the run's object (see features::objects).
+                let mut yes = crate::features::flows_plus::split::event_matches(&node, &context)
                     && segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                if let Some(ok) = crate::features::objects::flow::condition(&node, object.as_ref().map(|(_, r)| r)) {
+                    yes = yes && ok;
+                }
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }
             // Wait until they text back (yes) or the time runs out (no); see `features::inbox`. The

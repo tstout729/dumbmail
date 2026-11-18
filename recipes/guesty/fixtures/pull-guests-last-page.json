@@ -14,6 +14,34 @@
       "type": "upsert_profile"
     },
     {
+      "as_of": "2026-11-17T10:00:00.000Z",
+      "external_id": "6a0000000000000000000000",
+      "fields": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "paid_checked_at": null,
+        "paid_in_full": null,
+        "source_channel": "airbnb2",
+        "status": "confirmed"
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "email": "dana.whitfield@example.com",
+          "relationship": "guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
       "metric": "Reservation Booked",
       "profile": {
         "email": "dana.whitfield@example.com"
@@ -66,6 +94,25 @@
         "pending": null,
         "skip": 0
       }
+    },
+    {
+      "query": {
+        "columns": null,
+        "filter[checkInDate][gte]": "2026-11-16",
+        "filter[checkInDate][lt]": "2027-01-01",
+        "filter[lastUpdatedAt][gte]": null,
+        "filter[status]": "confirmed",
+        "filters": null,
+        "limit": 100,
+        "skip": 0,
+        "sort": "_id"
+      },
+      "type": "next_request",
+      "url": "/v1/reservations-reports/reservations/search"
+    },
+    {
+      "message": "checking payment for confirmed arrivals in the next 45 days",
+      "type": "log"
     },
     {
       "message": "page 4: wrote 1 reservations",
