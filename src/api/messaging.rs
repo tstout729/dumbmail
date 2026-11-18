@@ -907,8 +907,10 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             return Err(AppError::bad("set an SMS sending number in Settings → SMS before turning on a flow with texts"));
         }
         let pushes: Vec<&Value> = def.nodes.iter().filter(|n| n.kind == "push").filter_map(|n| n.data.get("content")).collect();
-        if let Some(p) = crate::features::push::setup_problems(state, account_id, &pushes).await?.into_iter().next() {
-            return Err(AppError::bad(format!("push step: {p}")));
+        if !pushes.is_empty() {
+            if let Some(p) = crate::features::push::setup_problems(state, account_id, &pushes).await?.into_iter().next() {
+                return Err(AppError::bad(format!("push step: {p}")));
+            }
         }
         for n in &def.nodes {
             if n.kind == "email" || n.kind == "sms" || n.kind == "push" {
