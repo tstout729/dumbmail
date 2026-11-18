@@ -565,6 +565,7 @@ async fn date_and_metric_flows_are_not_back_populated() {
     for (trigger, words) in [
         (json!({"type": "date_property", "field": "birthday", "offset_days": -7}), "people whose date is still ahead will enter on their own"),
         (json!({"type": "metric", "metric": "Placed Order"}), "past events don't start flows"),
+        (json!({"type": "event_date", "metric": "Booked Stay", "field": "check_in", "offset_days": -2}), "people whose date is still ahead will enter on their own"),
     ] {
         let fid = live_flow(&mut h, trigger, def.clone()).await;
         for body in [json!({}), json!({"confirm": true})] {

@@ -124,7 +124,7 @@ async fn rules(state: &AppState, flow: &FlowRow, def: &FlowDef) -> AppResult<Rul
     let trigger = crate::flows::parse_trigger(&flow.trigger)?;
     let segment = match &trigger {
         Trigger::Metric { .. } => return Err(AppError::bad(METRIC_REFUSED)),
-        Trigger::DateProperty { .. } => return Err(AppError::bad(DATE_REFUSED)),
+        Trigger::DateProperty { .. } | Trigger::EventDate { .. } => return Err(AppError::bad(DATE_REFUSED)),
         Trigger::List { .. } => None,
         Trigger::Segment { segment_id } => {
             let raw: Value = sqlx::query_scalar("SELECT definition FROM segments WHERE id = $1 AND account_id = $2")
@@ -181,6 +181,7 @@ fn trigger_kind(flow: &FlowRow) -> &'static str {
         Ok(Trigger::List { .. }) => "list",
         Ok(Trigger::Segment { .. }) => "segment",
         Ok(Trigger::DateProperty { .. }) => "date_property",
+        Ok(Trigger::EventDate { .. }) => "event_date",
         _ => "metric",
     }
 }
