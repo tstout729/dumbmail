@@ -1084,3 +1084,39 @@ async fn roles_content_and_analyst_stay_within_their_lines() {
     }
     h.cleanup().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_and_deleting_a_started_resend_at_once_keeps_its_slot() {
+    let mut h = harness!();
+    let (acct, _list, orig, _) = sent_original(&mut h, &["a@x.test", "b@x.test"]).await;
+    let orig_u: Uuid = orig.parse().unwrap();
+    for round in 0..4 {
+        // A resend mid-send: its audience is fixed and its batches haven't run.
+        let rid = make_resend(&mut h, &orig).await;
+        let rid_u: Uuid = rid.parse().unwrap();
+        h.ok("POST", &format!("/api/campaigns/{rid}/send"), None).await;
+        dumbmail::campaigns::prepare_send(&h.state, rid_u).await.unwrap();
+        let (s1, s2) = (h.state.clone(), h.state.clone());
+        let stop = tokio::spawn(async move { dumbmail::api::messaging::cancel(&s1, acct, rid_u).await.is_ok() });
+        let del = tokio::spawn(async move {
+            // Keep trying for a moment, so some attempts land after the cancel.
+            for _ in 0..20 {
+                if dumbmail::api::messaging::delete_campaign(&s2, acct, rid_u).await.is_ok() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        });
+        assert!(stop.await.unwrap(), "round {round}");
+        assert!(!del.await.unwrap(), "round {round}: a resend that started can't be deleted");
+        let held: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_resends WHERE original_id = $1 AND (campaign_id IS NOT NULL OR started_at IS NOT NULL)").bind(orig_u).fetch_one(&h.state.db).await.unwrap();
+        assert!(held >= 1 && held <= 2, "round {round}: {held}");
+        if held == 2 {
+            let (st, _) = h.req("POST", &format!("/api/campaigns/{orig}/resend"), None).await;
+            assert_eq!(st, StatusCode::CONFLICT, "round {round}: the stopped resend still holds its slot");
+            break;
+        }
+    }
+    h.cleanup().await;
+}
