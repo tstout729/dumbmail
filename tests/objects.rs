@@ -1092,3 +1092,63 @@ async fn guesty_payment_evidence_older_than_the_last_change_does_not_count() {
     assert!(pre_arrivals(&h).is_empty(), "paid evidence from before the last change doesn't count");
     h.cleanup().await;
 }
+
+/// A stand-in for the Guesty endpoints the recipe's pull uses, shaped as Guesty's public docs
+/// describe them: OAuth, the v3 reservation search (no money), guests, and the reservations reports
+/// search (money.balanceDue, money.totalPaid). Reservation R2 changed in Guesty after any check
+/// DumbMail could make (its version is far in the future).
+async fn mock_guesty_reports() -> String {
+    use axum::routing::{get, post};
+    let reservation = |id: &str, guest: &str, updated: &str| {
+        json!({"reservationId": id, "status": "confirmed", "source": "manual", "channel": "manual", "confirmationCode": format!("C-{id}"), "guestId": guest,
+               "checkIn": format!("{}T23:00:00.000Z", day(2)), "checkOut": format!("{}T18:00:00.000Z", day(4)), "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4),
+               "createdAt": "2026-11-17T09:00:00.000Z", "lastUpdatedAt": updated, "notes": {},
+               "stay": [{"listingId": "L1", "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "guestsCount": 2}]})
+    };
+    let search = json!({"results": [reservation("R1", "gA", "2026-11-17T09:00:00.000Z"), reservation("R2", "gB", "2099-01-01T00:00:00.000Z")], "pagination": {"skip": 0, "limit": 50, "hasMore": false}});
+    let reports = json!({"results": [
+        {"reservationId": "R1", "status": "confirmed", "checkInDate": day(2), "money": {"currency": "USD", "balanceDue": 0, "totalPaid": 640, "isFullyPaid": true}, "keyCode": "5512"},
+        {"reservationId": "R2", "status": "confirmed", "checkInDate": day(2), "money": {"currency": "USD", "balanceDue": 0, "totalPaid": 640, "isFullyPaid": true}}],
+        "pagination": {"skip": 0, "limit": 100, "hasMore": false}});
+    let guests = json!({"results": [{"_id": "gA", "email": "ana@example.com", "fullName": "Ana A"}, {"_id": "gB", "email": "ben@example.com", "fullName": "Ben B"}], "total": 2});
+    let app = axum::Router::new()
+        .route("/oauth2/token", post(|| async { axum::Json(json!({"token_type": "Bearer", "expires_in": 86400, "access_token": "tok-1", "scope": "open-api"})) }))
+        .route("/v1/reservations-v3/search", get(move || async move { axum::Json(search) }))
+        .route("/v1/guests-crud", get(move || async move { axum::Json(guests) }))
+        .route("/v1/reservations-reports/reservations/search", get(move || async move { axum::Json(reports) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn guesty_payment_check_through_the_reports_search() {
+    let base = mock_guesty_reports().await;
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    guesty_live(&mut h, None).await;
+    let id: String = sqlx::query_scalar("SELECT id::text FROM integrations").fetch_one(&h.state.db).await.unwrap();
+    let integ = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    let mut pull = integ["pull"].clone();
+    pull["url"] = json!(format!("{base}/v1/reservations-v3/search"));
+    pull["auth"]["token_url"] = json!(format!("{base}/oauth2/token"));
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"pull": pull, "credentials": {"client_id": "cid", "client_secret": "cs"}}))).await;
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    let paid: Vec<(String, Option<bool>)> = sqlx::query_as("SELECT external_id, (fields->>'paid_in_full')::boolean FROM objects ORDER BY external_id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(paid, vec![("R1".to_string(), Some(true)), ("R2".to_string(), None)], "R2 changed after the check, so its evidence didn't land");
+    let state: Value = sqlx::query_scalar("SELECT state FROM integrations").fetch_one(&h.state.db).await.unwrap();
+    assert!(state["payment_checked_at"].is_string(), "the check is remembered (at most hourly): {state}");
+    let stored: String = sqlx::query_scalar("SELECT string_agg(coalesce(body, ''), ' ') FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert!(!stored.contains("5512"), "the report's key code is redacted from stored payloads");
+    fire(&h).await;
+    assert_eq!(pre_arrivals(&h), vec!["ana@example.com"]);
+    // A second pull within the hour doesn't check payment again.
+    h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE request->>'url' LIKE '%reservations-reports%'").await, 1);
+    h.cleanup().await;
+}

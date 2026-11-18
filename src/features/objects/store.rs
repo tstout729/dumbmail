@@ -94,6 +94,10 @@ pub struct UpsertInput {
     /// type. A write older than or equal to the newest one stored is ignored.
     #[serde(default)]
     pub as_of: Option<Value>,
+    /// For evidence about an object as of a moment (e.g. a payment checked at 10:00): written only
+    /// if the object exists and its stored version isn't newer than this. Never creates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_if_as_of_at_most: Option<Value>,
 }
 
 /// Who a link is to.
@@ -131,6 +135,9 @@ pub struct Write<'a> {
     pub links: Vec<LinkReq>,
     pub replace: Vec<String>,
     pub as_of: Option<Version>,
+    /// Evidence about an existing object as of a moment: written only if the object exists and
+    /// nothing newer than this has been written to it (it never creates one or moves its version).
+    pub at_most: Option<Version>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,6 +238,10 @@ pub fn check_input(b: &UpsertInput) -> AppResult<()> {
         relationship(Some(r))?;
     }
     Version::parse(b.as_of.as_ref().unwrap_or(&Value::Null))?;
+    Version::parse(b.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null))?;
+    if b.as_of.as_ref().is_some_and(|v| !v.is_null()) && b.only_if_as_of_at_most.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(AppError::bad("give as_of (a new version) or only_if_as_of_at_most (evidence about the current one), not both"));
+    }
     Ok(())
 }
 
@@ -429,6 +440,28 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
         }
     }
     let version_text = req.as_of.as_ref().map(|v| v.text().to_string());
+    // Evidence as of a moment: only onto an object that exists and hasn't changed since.
+    if let Some(limit) = &req.at_most {
+        let found: Option<(Uuid, i64, Option<String>)> =
+            sqlx::query_as("SELECT id, version, as_of FROM objects WHERE type_id = $1 AND external_id = $2 FOR UPDATE").bind(t.id).bind(&external_id).fetch_optional(&mut *tx).await?;
+        let stale = match &found {
+            None => Some("not_found"),
+            Some((_, _, Some(stored))) if t.version_kind.as_deref().is_some_and(|k| k != limit.kind()) => {
+                return Err(AppError::bad(format!("{}'s versions are {}s; only_if_as_of_at_most must be one too", t.key, t.version_kind.as_deref().unwrap_or("time"))));
+            }
+            Some((_, _, Some(stored))) if limit.cmp_stored(stored) == Ordering::Less => Some("stale"),
+            _ => None,
+        };
+        if let Some(why) = stale {
+            let (id, version) = found.map(|(id, v, _)| (id, v)).unwrap_or((Uuid::nil(), 0));
+            let out = Upserted { id, type_key: t.key.clone(), external_id: external_id.clone(), result: why, changed: Vec::new(), version, linked: 0, unlinked: 0, not_found: 0, created_profiles: Vec::new() };
+            if !record_receipt(&mut tx, receipt, why).await? {
+                return Ok(Upserted { result: "already_applied", ..out });
+            }
+            tx.commit().await?;
+            return Ok(out);
+        }
+    }
     let fresh: Map<String, Value> = norm.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())).collect();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO objects (id, account_id, type_id, external_id, fields, source, as_of) VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -631,7 +664,15 @@ pub async fn upsert(state: &AppState, w: &Writer, b: &UpsertInput) -> AppResult<
 pub async fn upsert_with(state: &AppState, w: &Writer, b: &UpsertInput, receipt: Receipt<'_>) -> AppResult<Upserted> {
     check_input(b)?;
     let replace = b.replace_links.iter().map(|r| relationship(Some(r))).collect::<AppResult<Vec<_>>>()?;
-    let req = Write { type_key: &b.type_key, external_id: &b.external_id, fields: &b.fields, links: links_for(&b.profiles)?, replace, as_of: Version::parse(b.as_of.as_ref().unwrap_or(&Value::Null))? };
+    let req = Write {
+        type_key: &b.type_key,
+        external_id: &b.external_id,
+        fields: &b.fields,
+        links: links_for(&b.profiles)?,
+        replace,
+        as_of: Version::parse(b.as_of.as_ref().unwrap_or(&Value::Null))?,
+        at_most: Version::parse(b.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null))?,
+    };
     write(state, w, &req, receipt).await
 }
 
@@ -921,7 +962,7 @@ mod tests {
 
     #[test]
     fn inputs_are_bounded() {
-        let mut b = UpsertInput { type_key: "reservation".into(), external_id: "R1".into(), fields: Map::new(), profiles: Vec::new(), replace_links: Vec::new(), as_of: None };
+        let mut b = UpsertInput { type_key: "reservation".into(), external_id: "R1".into(), fields: Map::new(), profiles: Vec::new(), replace_links: Vec::new(), as_of: None, only_if_as_of_at_most: None };
         assert!(check_input(&b).is_ok());
         b.profiles = (0..=MAX_LINKS).map(|i| LinkInput { email: Some(format!("p{i}@x.co")), ..Default::default() }).collect();
         assert!(check_input(&b).is_err());

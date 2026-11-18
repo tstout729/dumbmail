@@ -19,7 +19,8 @@
     "https://open-api-docs.guesty.com/docs/fields-for-guest-reports",
     "https://open-api-docs.guesty.com/changelog/2026-11-05",
     "https://open-api-docs.guesty.com/docs/authentication",
-    "https://open-api-docs.guesty.com/docs/webhooks"
+    "https://open-api-docs.guesty.com/docs/webhooks",
+    "https://open-api-docs.guesty.com/reference/reservationsreportsopenapicontroller_searchreservations"
   ],
   "signature": {
     "type": "hmac",
@@ -43,7 +44,8 @@
     }
   ],
   "settings": {
-    "skip_owner_stays": true
+    "skip_owner_stays": true,
+    "payment_check_days": 45
   },
   "pull": {
     "method": "GET",
@@ -249,7 +251,12 @@
     "**.accessCodes",
     "**.checkInInstructions",
     "**.guestContact",
-    "**.wifiPassword"
+    "**.wifiPassword",
+    "**.guestNotes",
+    "**.cleaningNotes",
+    "**.otherNotes",
+    "**.specialRequests",
+    "**.cancellationNote"
   ],
   "object_types": [
     {

@@ -96,6 +96,25 @@
       }
     },
     {
+      "query": {
+        "columns": null,
+        "filter[checkInDate][gte]": "2026-11-16",
+        "filter[checkInDate][lt]": "2027-01-01",
+        "filter[lastUpdatedAt][gte]": null,
+        "filter[status]": "confirmed",
+        "filters": null,
+        "limit": 100,
+        "skip": 0,
+        "sort": "_id"
+      },
+      "type": "next_request",
+      "url": "/v1/reservations-reports/reservations/search"
+    },
+    {
+      "message": "checking payment for confirmed arrivals in the next 45 days",
+      "type": "log"
+    },
+    {
       "message": "page 4: wrote 1 reservations",
       "type": "log"
     }

@@ -37,6 +37,13 @@
 // from marketing unless the owner says they opted in; booking-site relay addresses are suppressed.
 
 var SEARCH_PATH = "/v1/reservations-v3/search";
+// Payment evidence for upcoming arrivals: Guesty's reservations reports search documents
+// money.balanceDue and money.totalPaid (the v3 search and v2 webhooks carry no money, and the legacy
+// webhooks retire on 1 March 2027). Checked against Guesty's public documentation only.
+var REPORTS_PATH = "/v1/reservations-reports/reservations/search";
+// At most this often, and at most this many pages (of 100) per check.
+var SWEEP_EVERY_MS = 3600000;
+var SWEEP_MAX_PAGES = 10;
 var GUESTS_PATH = "/v1/guests-crud";
 // 50 a page keeps the reservations waiting for their guests well inside the 64 KB saved state.
 var PAGE_SIZE = 50;
@@ -439,12 +446,78 @@ function fromGuests(input) {
   if (st.page_more) {
     var q = { limit: PAGE_SIZE, sort: "lastUpdatedAt", "filter[lastUpdatedAt][gte]": cursor, skip: skip, columns: null, filters: null };
     out.push({ type: "next_request", url: SEARCH_PATH, query: q });
+  } else if (sweepDue(input)) {
+    out.push(sweepRequest(input, 0));
+    out.push({ type: "log", message: "checking payment for confirmed arrivals in the next " + sweepDays(input) + " days" });
   }
   out.push({ type: "log", message: "page " + input.page + ": wrote " + pending.length + " reservations" });
   return out;
 }
 
+function sweepDays(input) {
+  var n = Number((input.settings || {}).payment_check_days);
+  return n >= 1 && n <= 90 ? Math.floor(n) : 45;
+}
+
+function sweepDue(input) {
+  var last = (input.state || {}).payment_checked_at;
+  return !last || Date.parse(input.now) - Date.parse(last) >= SWEEP_EVERY_MS;
+}
+
+function isoDay(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// The reports search for confirmed reservations arriving from yesterday (listing time zones run
+// behind UTC) to `days` ahead, oldest id first, a page of 100.
+function sweepRequest(input, skip) {
+  var now = Date.parse(input.now);
+  return {
+    type: "next_request", url: REPORTS_PATH,
+    query: {
+      "filter[checkInDate][gte]": isoDay(now - 86400000), "filter[checkInDate][lt]": isoDay(now + sweepDays(input) * 86400000),
+      "filter[status]": "confirmed", sort: "_id", limit: 100, skip: skip,
+      "filter[lastUpdatedAt][gte]": null, columns: null, filters: null,
+    },
+  };
+}
+
+// A page of the payment check: each reservation's payment, as evidence taken now. It's written
+// only onto a reservation DumbMail has and that hasn't changed since (only_if_as_of_at_most), so
+// older evidence never lands on a newer version. A reservation whose money is missing is left as it is.
+function fromReports(input) {
+  var page = input.payload || {};
+  var results = Array.isArray(page.results) ? page.results : [];
+  var st = input.state || {};
+  var pages = (Number(st.payment_check_pages) || 0) + 1;
+  var out = [];
+  results.forEach(function (r) {
+    var id = str(r.reservationId);
+    var m = r.money;
+    if (!id || !m) return;
+    var due = num(m.balanceDue);
+    var paid = num(m.totalPaid);
+    if (due === null || paid === null) return;
+    out.push({
+      type: "upsert_object", object_type: "reservation", external_id: id,
+      fields: { paid_in_full: due === 0 && paid + due > 0, paid_checked_at: input.now },
+      only_if_as_of_at_most: input.now,
+    });
+  });
+  var more = !!(page.pagination && page.pagination.hasMore) && pages < SWEEP_MAX_PAGES;
+  if (more) {
+    out.push({ type: "set_state", values: { payment_check_pages: pages } });
+    out.push(sweepRequest(input, pages * 100));
+  } else {
+    out.push({ type: "set_state", values: { payment_check_pages: null, payment_checked_at: input.now } });
+  }
+  out.push({ type: "log", message: "payment check page " + pages + ": " + results.length + " reservations" });
+  return out;
+}
+
 function handle(input) {
   if (input.source !== "pull") return fromWebhook(input);
-  return requestPath(input).indexOf(GUESTS_PATH) === 0 ? fromGuests(input) : fromSearch(input);
+  var path = requestPath(input);
+  if (path.indexOf(REPORTS_PATH) === 0) return fromReports(input);
+  return path.indexOf(GUESTS_PATH) === 0 ? fromGuests(input) : fromSearch(input);
 }

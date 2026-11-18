@@ -67,6 +67,12 @@ Upsert by type and `external_id` (the object's id in your system):
   optional `relationship` (`guest`, `owner` ...). They're added to the people already linked. An
   existing profile is found, never changed. Someone new is created with only those identifiers and
   has never subscribed to anything (objects never change anyone's consent).
+- `only_if_as_of_at_most`: for evidence about an object as of a moment (a payment checked at
+  10:00, say): written only if the object exists and nothing newer than that moment has been written
+  to it. It never creates the object or moves its version. Give this or `as_of`, not both.
+- Object flow filters can compare one field with another: `{"field": "paid_checked_at", "op": "gte",
+  "value": {"field": "$as_of"}}` holds only when the payment evidence is at least as new as the
+  object's last version (`$as_of`).
 - `as_of`: the change's time (or version number) in your system. An upsert older than the newest
   one written is ignored, so a late message never undoes a newer one.
 - Every change is recorded: what changed, from what to what, when and by whom (`api`, `mcp` or

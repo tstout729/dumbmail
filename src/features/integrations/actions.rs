@@ -223,6 +223,10 @@ pub struct UpsertObject {
     /// equal one never overwrites what's stored.
     #[serde(default)]
     pub as_of: Option<Value>,
+    /// Evidence about the object as of a moment (e.g. when a payment was checked): written only if
+    /// the object exists and its stored version isn't newer. Never creates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_if_as_of_at_most: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -463,6 +467,10 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     return Err(format!("action {i} ({k}): replace at most 10 relationships"));
                 }
                 crate::features::objects::store::Version::parse(a.as_of.as_ref().unwrap_or(&Value::Null)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                crate::features::objects::store::Version::parse(a.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null)).map_err(|e| format!("action {i} ({k}): {}", e.public_message()))?;
+                if a.as_of.as_ref().is_some_and(|v| !v.is_null()) && a.only_if_as_of_at_most.as_ref().is_some_and(|v| !v.is_null()) {
+                    return Err(format!("action {i} ({k}): give as_of or only_if_as_of_at_most, not both"));
+                }
                 Action::UpsertObject(a)
             }
             "delete_object" => {
@@ -1177,7 +1185,15 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
         return Ok(());
     }
     let w = Writer { account_id: src.account_id, source: src.tag(), redact, creator: store::Creator::Integration { tag: src.tag(), opted_in: src.contacts_opted_in } };
-    let req = Write { type_key: key, external_id: &external_id, fields: &fields, links, replace, as_of: Version::parse(o.as_of.as_ref().unwrap_or(&Value::Null))? };
+    let req = Write {
+        type_key: key,
+        external_id: &external_id,
+        fields: &fields,
+        links,
+        replace,
+        as_of: Version::parse(o.as_of.as_ref().unwrap_or(&Value::Null))?,
+        at_most: Version::parse(o.only_if_as_of_at_most.as_ref().unwrap_or(&Value::Null))?,
+    };
     // The write and this action's ledger entry commit together: a retry resumes after it.
     let receipt = match src.ledger {
         Some(delivery) => Receipt::Ledger { delivery, index: i, print },
@@ -1202,6 +1218,8 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
             out.effect(i, format!("{} {key} {}{detail}{people}{links_line}", r.result, r.external_id));
         }
         "older" | "duplicate" => out.effect(i, format!("kept {key} {}: this state is {} the one stored", r.external_id, if r.result == "older" { "older than" } else { "the same version as" })),
+        "stale" => out.effect(i, format!("kept {key} {}: it changed after this was checked", r.external_id)),
+        "not_found" => out.effect(i, format!("skipped {key} {}: there's no such object yet", r.external_id)),
         _ => out.effect(i, format!("{key} {} unchanged{people}{links_line}", r.external_id)),
     }
     Ok(())
