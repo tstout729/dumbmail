@@ -16,10 +16,11 @@ pub const MISSES_PER_MINUTE: u32 = 30;
 /// Requests whose address the proxy didn't tell us share one, larger, allowance.
 pub const UNKNOWN_MISSES_PER_MINUTE: u32 = 600;
 pub const MAX_CONCURRENT: usize = 32;
-/// Addresses tracked in one minute; past that, new addresses share one overflow allowance (memory
-/// stays bounded and the limit still holds).
+/// Addresses tracked in one minute; past that, new addresses share [`OVERFLOW_BUCKETS`] overflow
+/// allowances, picked by a hash of the address (memory stays bounded, the limit still holds, and one
+/// visitor can't use up everyone's).
 const MAX_ADDRESSES: usize = 50_000;
-const OVERFLOW: &str = "overflow";
+const OVERFLOW_BUCKETS: u64 = 256;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -48,6 +49,9 @@ pub struct Admitted {
     _slot: OwnedSemaphorePermit,
     key: Option<(String, u64)>,
 }
+
+/// Keyed per process, so which addresses share an overflow allowance can't be chosen from outside.
+static OVERFLOW_HASH: Lazy<std::collections::hash_map::RandomState> = Lazy::new(std::collections::hash_map::RandomState::new);
 
 pub static LIMITER: Lazy<Limiter> = Lazy::new(|| Limiter::new(MISSES_PER_MINUTE, UNKNOWN_MISSES_PER_MINUTE, MAX_CONCURRENT));
 
@@ -89,7 +93,10 @@ impl Limiter {
                 c.by_address.clear();
             }
             if c.by_address.len() >= MAX_ADDRESSES && !c.by_address.contains_key(&k) {
-                k = OVERFLOW.to_string();
+                use std::hash::{BuildHasher, Hasher};
+                let mut hasher = OVERFLOW_HASH.build_hasher();
+                hasher.write(k.as_bytes());
+                k = format!("overflow:{}", hasher.finish() % OVERFLOW_BUCKETS);
                 allowance = self.unknown_per_minute;
             }
             let n = c.by_address.entry(k.clone()).or_insert(0);
@@ -114,6 +121,10 @@ impl Limiter {
         if c.minute == *at {
             if let Some(n) = c.by_address.get_mut(k) {
                 *n = n.saturating_sub(1);
+                // Valid clicks leave no entry behind.
+                if *n == 0 {
+                    c.by_address.remove(k);
+                }
             }
         }
     }
@@ -156,7 +167,7 @@ mod tests {
 
     #[test]
     fn past_the_address_cap_new_addresses_share_one_allowance() {
-        let l = Limiter::new(1, 2, 10);
+        let l = Limiter::new(1, 2, 100);
         // Counts reset each clock minute: stay clear of a minute's last seconds.
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         if secs % 60 >= 57 {
@@ -167,10 +178,17 @@ mod tests {
             c.minute = minute();
             c.by_address = (0..MAX_ADDRESSES).map(|i| (format!("10.0.{}.{}", i / 256, i % 256), 0)).collect();
         }
+        // One new address uses up its overflow bucket's allowance (2 here), not everyone's.
         assert!(l.admit(Some("203.0.113.1")).is_ok());
-        assert!(l.admit(Some("203.0.113.2")).is_ok());
-        assert_eq!(l.admit(Some("203.0.113.3")).err(), Some(Refused::TooMany), "the overflow allowance is shared, not unlimited");
-        assert_eq!(l.counts.lock().unwrap().by_address.len(), MAX_ADDRESSES + 1);
+        assert!(l.admit(Some("203.0.113.1")).is_ok());
+        assert_eq!(l.admit(Some("203.0.113.1")).err(), Some(Refused::TooMany), "the overflow allowance is limited, not unlimited");
+        let others = (2..40).filter(|i| l.admit(Some(&format!("203.0.113.{i}"))).is_ok()).count();
+        assert!(others >= 30, "other new addresses mostly land in other buckets: {others}");
+        assert!(l.counts.lock().unwrap().by_address.len() <= MAX_ADDRESSES + OVERFLOW_BUCKETS as usize);
+        // A valid click frees its address's entry.
+        let fresh = Limiter::new(5, 5, 5);
+        fresh.admit(Some("192.0.2.1")).unwrap().valid(&fresh);
+        assert!(fresh.counts.lock().unwrap().by_address.is_empty());
     }
 
     #[test]
