@@ -623,7 +623,8 @@ async fn the_send_and_every_estimate_decide_the_same_way() {
     assert_eq!(sent.chars().count(), r["body"].as_str().unwrap().chars().count());
     assert_eq!(click(&h, &p[0]).await.1.as_deref(), Some(near.as_str()), "untagged: the tags didn't fit");
 
-    // The launch check counts the short link: one segment each, not the raw template's two.
+    // The launch check counts the longer of each text's forms: a worker that doesn't issue short
+    // links yet sends the long one (two segments here), so one segment each isn't enough credit.
     let list2 = h.ok("POST", "/api/lists", Some(json!({"name": "Two"}))).await["id"].as_str().unwrap().to_string();
     texter(&mut h, &list2, 8102).await;
     texter(&mut h, &list2, 8103).await;
@@ -631,10 +632,23 @@ async fn the_send_and_every_estimate_decide_the_same_way() {
     let body = format!("Acme Goods: new arrivals {link}");
     assert_eq!(dumbmail::providers::sms::segment_count(&format!("Acme Goods: {body} Reply STOP to opt out.")).1, 2);
     let id = sms_campaign(&mut h, &list2, &body).await;
-    let one_segment_each = 2 * dumbmail::billing::to_micros(0.0099);
-    sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(one_segment_each).execute(&h.state.db).await.unwrap();
+    let segment = dumbmail::billing::to_micros(0.0099);
+    sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(2 * segment).execute(&h.state.db).await.unwrap();
     let (s, v) = h.req("POST", &format!("/api/campaigns/{id}/send"), None).await;
-    assert!(s.is_success(), "{s}: {v}");
+    assert!(!s.is_success(), "one segment each isn't enough: {s}: {v}");
+    assert!(v.to_string().contains("balance"), "{v}");
+    sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(4 * segment).execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{id}/send"), None).await;
+    assert!(s.is_success(), "two segments each is: {s}: {v}");
+    // And a short link longer than the link it replaces counts too.
+    let tiny = "Acme Goods: ".to_string() + &"x".repeat(90) + " https://t.co/a";
+    assert_eq!(dumbmail::providers::sms::segment_count(&format!("Acme Goods: {tiny} Reply STOP to opt out.")).1, 1);
+    let list3 = h.ok("POST", "/api/lists", Some(json!({"name": "Three"}))).await["id"].as_str().unwrap().to_string();
+    texter(&mut h, &list3, 8104).await;
+    let id = sms_campaign(&mut h, &list3, &tiny).await;
+    sqlx::query("UPDATE accounts SET balance_micros = $2 WHERE id = $1").bind(acct).bind(segment).execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", &format!("/api/campaigns/{id}/send"), None).await;
+    assert!(!s.is_success(), "with its short link the text is two segments: {s}: {v}");
     h.cleanup().await;
 }
 
