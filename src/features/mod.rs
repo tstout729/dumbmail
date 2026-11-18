@@ -11,6 +11,7 @@ pub mod campaigns_plus;
 pub mod catalog;
 pub mod content;
 pub mod coupons;
+pub mod flows_plus;
 pub mod hub;
 pub mod inbox;
 pub mod integrations;
@@ -114,6 +115,7 @@ pub static ALL: &[&dyn Feature] = &[
     &catalog::Module,
     &content::Module,
     &coupons::Module,
+    &flows_plus::Module,
     &hub::Module,
     &inbox::Module,
     &integrations::Module,
