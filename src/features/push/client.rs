@@ -708,7 +708,7 @@ var window = { isSecureContext: true, PushManager: function () {}, Notification:
             &["window.dumbmail.notifications.identify({type: 'external_id', value: 'c1', grant: 'v1.9999999999.abcd'})", "window.dumbmail.notifications.signOut()"],
         );
         assert!(!v["ls"].to_string().contains("v1.9999999999"), "{v}");
-        let subscribe = v["log"].as_array().unwrap().iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).last().cloned().unwrap();
+        let subscribe = v["log"].as_array().unwrap().iter().rfind(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).cloned().unwrap();
         assert_eq!(subscribe["body"]["identity"]["grant"], "v1.9999999999.abcd");
         assert!(v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/sign-out"))), "{v}");
     }
