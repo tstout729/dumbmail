@@ -220,18 +220,30 @@ pub struct Subject {
     pub name: String,
     pub image_url: Option<String>,
     pub url: Option<String>,
-    pub trusted: bool,
+    /// Each field is trusted only when the catalog, the API, an integration or a server-recorded
+    /// event supplied it (never a browser).
+    pub name_trusted: bool,
+    pub image_trusted: bool,
+    pub url_trusted: bool,
     pub review_count: i32,
     pub rating_sum: i64,
     pub rating_counts: Vec<i32>,
+    /// Published reviews collected here (not imported).
+    pub native_count: i32,
+    pub native_sum: i64,
     pub updated_at: DateTime<Utc>,
 }
 
-pub const SUBJECT_COLS: &str = "s.id, s.external_id, s.kind, s.name, s.image_url, s.url, s.trusted, s.review_count, s.rating_sum, s.rating_counts, s.updated_at";
+pub const SUBJECT_COLS: &str = "s.id, s.external_id, s.kind, s.name, s.image_url, s.url, s.name_trusted, s.image_trusted, s.url_trusted, s.review_count, s.rating_sum, s.rating_counts, s.native_count, s.native_sum, s.updated_at";
 
 impl Subject {
     pub fn average(&self) -> Option<f64> {
         (self.review_count > 0).then(|| (self.rating_sum as f64 / f64::from(self.review_count) * 10.0).round() / 10.0)
+    }
+
+    /// The average of the reviews collected here (what structured data may mark up).
+    pub fn native_average(&self) -> Option<f64> {
+        (self.native_count > 0).then(|| (self.native_sum as f64 / f64::from(self.native_count) * 10.0).round() / 10.0)
     }
 
     /// The published summary, as widgets and emails show it.
@@ -239,13 +251,24 @@ impl Subject {
         json!({"average": self.average(), "count": self.review_count, "histogram": {"5": self.rating_counts.get(4), "4": self.rating_counts.get(3), "3": self.rating_counts.get(2), "2": self.rating_counts.get(1), "1": self.rating_counts.first()}})
     }
 
-    /// Name, image and address only when they came from the account, never from a browser.
+    /// The name, for others to see: only when a trusted source supplied it.
+    pub fn trusted_name(&self) -> Option<&str> {
+        self.name_trusted.then_some(self.name.as_str())
+    }
+
+    /// The image, to load anywhere: only when a trusted source supplied it.
+    pub fn trusted_image(&self) -> Option<&str> {
+        self.image_url.as_deref().filter(|_| self.image_trusted)
+    }
+
+    /// The page address, to link anywhere: only when a trusted source supplied it.
+    pub fn trusted_url(&self) -> Option<&str> {
+        self.url.as_deref().filter(|_| self.url_trusted)
+    }
+
+    /// What the public sees about it: each field only when a trusted source supplied it.
     pub fn public_card(&self) -> Value {
-        if self.trusted {
-            json!({"product_id": self.external_id, "name": self.name, "image_url": self.image_url, "url": self.url, "kind": self.kind})
-        } else {
-            json!({"product_id": self.external_id, "kind": self.kind})
-        }
+        json!({"product_id": self.external_id, "kind": self.kind, "name": self.trusted_name(), "image_url": self.trusted_image(), "url": self.trusted_url()})
     }
 }
 
@@ -256,7 +279,9 @@ pub struct Hint {
     pub image_url: Option<String>,
     pub url: Option<String>,
     pub kind: Option<String>,
-    /// Came from the account (API, integration, server event); browser input never overwrites it.
+    /// Came from the account (catalog, API, integration, server event): the fields it supplies are
+    /// trusted. Browser input never overwrites a trusted field, and a trusted hint only vouches
+    /// for the fields it actually supplies.
     pub trusted: bool,
 }
 
@@ -273,10 +298,11 @@ pub fn valid_key(key: &str) -> Option<String> {
     (!k.is_empty() && k.chars().count() <= 255 && !k.chars().any(char::is_control)).then(|| k.to_string())
 }
 
-/// The subject for `key` (the store's product id or the account's own key), created or refreshed.
-/// A published catalog product with that id supplies the name, image and address (trusted when
-/// the catalog has verified it). Otherwise `hint` does, and untrusted input never overwrites
-/// trusted details.
+/// The subject for `key` (the store's product id or the account's own key), created or refreshed,
+/// field by field. A published catalog product with that id supplies the name, image and address
+/// (trusted when the catalog has verified it). Otherwise `hint` does. A field is replaced by an
+/// untrusted value only while it isn't trusted, and becomes trusted only when a trusted source
+/// supplies that field itself.
 pub async fn subject_for(db: &PgPool, account_id: Uuid, key: &str, hint: &Hint) -> AppResult<Subject> {
     let key = valid_key(key).ok_or_else(|| AppError::bad("product_id must be 1 to 255 characters"))?;
     let product: Option<(String, Option<String>, Option<String>, bool)> =
@@ -287,24 +313,22 @@ pub async fn subject_for(db: &PgPool, account_id: Uuid, key: &str, hint: &Hint) 
             .await?;
     let kind = hint.kind.as_deref().filter(|k| ["product", "listing", "service"].contains(k)).unwrap_or("product");
     let (name, image, url, trusted) = match &product {
-        Some((t, i, u, v)) => (Some(t.clone()), i.clone(), u.clone(), *v),
-        // Trusted only with a real name: an id alone never becomes a public product name.
-        None => {
-            let name = clean(hint.name.as_deref(), 200);
-            let trusted = hint.trusted && name.is_some();
-            (name, http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), trusted)
-        }
+        Some((t, i, u, v)) => (clean(Some(t), 200), http_url(i.as_deref()), http_url(u.as_deref()), *v),
+        None => (clean(hint.name.as_deref(), 200), http_url(hint.image_url.as_deref()), http_url(hint.url.as_deref()), hint.trusted),
     };
     let id = Uuid::now_v7();
+    // $5..$7: the values (NULL: not supplied). $8: whether this source is trusted.
     let q = format!(
-        "INSERT INTO review_subjects AS s (id, account_id, external_id, kind, name, image_url, url, trusted)
-         VALUES ($1, $2, $3, $4, COALESCE($5, $3), $6, $7, $8)
+        "INSERT INTO review_subjects AS s (id, account_id, external_id, kind, name, image_url, url, name_trusted, image_trusted, url_trusted)
+         VALUES ($1, $2, $3, $4, COALESCE($5, $3), $6, $7, $8 AND $5::text IS NOT NULL, $8 AND $6::text IS NOT NULL, $8 AND $7::text IS NOT NULL)
          ON CONFLICT (account_id, external_id) DO UPDATE SET
-            name = CASE WHEN EXCLUDED.trusted OR NOT s.trusted THEN COALESCE($5, s.name) ELSE s.name END,
-            image_url = CASE WHEN EXCLUDED.trusted OR NOT s.trusted THEN COALESCE($6, s.image_url) ELSE s.image_url END,
-            url = CASE WHEN EXCLUDED.trusted OR NOT s.trusted THEN COALESCE($7, s.url) ELSE s.url END,
+            name = CASE WHEN $5::text IS NOT NULL AND ($8 OR NOT s.name_trusted) THEN $5 ELSE s.name END,
+            image_url = CASE WHEN $6::text IS NOT NULL AND ($8 OR NOT s.image_trusted) THEN $6 ELSE s.image_url END,
+            url = CASE WHEN $7::text IS NOT NULL AND ($8 OR NOT s.url_trusted) THEN $7 ELSE s.url END,
+            name_trusted = s.name_trusted OR ($8 AND $5::text IS NOT NULL),
+            image_trusted = s.image_trusted OR ($8 AND $6::text IS NOT NULL),
+            url_trusted = s.url_trusted OR ($8 AND $7::text IS NOT NULL),
             kind = CASE WHEN $9 THEN EXCLUDED.kind ELSE s.kind END,
-            trusted = s.trusted OR EXCLUDED.trusted,
             updated_at = now()
          RETURNING {SUBJECT_COLS}"
     );
@@ -436,6 +460,8 @@ pub struct Review {
     pub recommend: Option<bool>,
     pub answers: Value,
     pub verified: bool,
+    /// Imports: the source said it was verified (shown in the dashboard only, never as a badge).
+    pub source_verified: bool,
     pub source: String,
     pub incentivized: bool,
     pub flags: Vec<String>,
@@ -452,7 +478,7 @@ pub struct Review {
 }
 
 pub const REVIEW_COLS: &str = "r.id, r.account_id, r.subject_id, r.profile_id, r.request_id, r.status, r.reject_reason, r.rating, r.title, r.body, r.display_name,
-    r.recommend, r.answers, r.verified, r.source, r.incentivized, r.flags, r.featured, r.reply, r.replied_at, r.confirmed_at, r.reviewed_at, r.created_at,
+    r.recommend, r.answers, r.verified, r.source_verified, r.source, r.incentivized, r.flags, r.featured, r.reply, r.replied_at, r.confirmed_at, r.reviewed_at, r.created_at,
     r.edited_at, r.published_at, r.moderated_at, r.import_id";
 
 pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Review> {
@@ -460,17 +486,28 @@ pub async fn get(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Review> {
     sqlx::query_as(&q).bind(id).bind(account_id).fetch_optional(db).await?.ok_or_else(|| AppError::not_found("review"))
 }
 
-/// Add `sign` (+1 or -1) reviews of `rating` stars to a subject's published summary.
-async fn bump(conn: &mut PgConnection, subject_id: Uuid, rating: i16, sign: i32) -> sqlx::Result<()> {
+/// Add `sign` (+1 or -1) reviews of `rating` stars to a subject's published summary (and to the
+/// summary of reviews collected here, for a `native` one).
+async fn bump(conn: &mut PgConnection, subject_id: Uuid, rating: i16, sign: i32, native: bool) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE review_subjects SET review_count = review_count + $2, rating_sum = rating_sum + $2 * $3,
-            rating_counts[$3] = rating_counts[$3] + $2, updated_at = now() WHERE id = $1",
+            rating_counts[$3] = rating_counts[$3] + $2,
+            native_count = native_count + CASE WHEN $4 THEN $2 ELSE 0 END, native_sum = native_sum + CASE WHEN $4 THEN $2 * $3 ELSE 0 END,
+            updated_at = now() WHERE id = $1",
     )
     .bind(subject_id)
     .bind(sign)
     .bind(i32::from(rating))
+    .bind(native)
     .execute(conn)
     .await?;
+    Ok(())
+}
+
+/// Something shown about a published review changed (a reply, a photo, featuring): the product's
+/// widgets must not answer from a stale cache.
+pub async fn touch(conn: &mut PgConnection, review_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("UPDATE review_subjects SET updated_at = now() WHERE id = (SELECT subject_id FROM reviews WHERE id = $1)").bind(review_id).execute(conn).await?;
     Ok(())
 }
 
@@ -478,15 +515,15 @@ async fn bump(conn: &mut PgConnection, subject_id: Uuid, rating: i16, sign: i32)
 /// transaction: the rows are locked, and only those whose status changes are written. Returns
 /// the ids that changed. A review waiting for its email confirmation can't be published.
 pub async fn set_status(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid], status: &str, reason: Option<&str>) -> AppResult<Vec<Uuid>> {
-    let rows: Vec<(Uuid, Uuid, i16, String, bool)> = sqlx::query_as(
-        "SELECT id, subject_id, rating, status, confirmed_at IS NOT NULL FROM reviews WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE",
+    let rows: Vec<(Uuid, Uuid, i16, String, bool, String)> = sqlx::query_as(
+        "SELECT id, subject_id, rating, status, confirmed_at IS NOT NULL, source FROM reviews WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE",
     )
     .bind(account_id)
     .bind(ids)
     .fetch_all(&mut *conn)
     .await?;
     let mut changed = Vec::new();
-    for (id, subject, rating, was, confirmed) in rows {
+    for (id, subject, rating, was, confirmed, source) in rows {
         if was == status || was == "removed" || (status == "published" && !confirmed) {
             continue;
         }
@@ -499,11 +536,12 @@ pub async fn set_status(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid],
         .bind(if status == "rejected" { reason } else { None })
         .execute(&mut *conn)
         .await?;
+        let native = source != "import";
         if was == "published" {
-            bump(conn, subject, rating, -1).await?;
+            bump(conn, subject, rating, -1, native).await?;
         }
         if status == "published" {
-            bump(conn, subject, rating, 1).await?;
+            bump(conn, subject, rating, 1, native).await?;
         }
         changed.push(id);
     }
@@ -515,37 +553,53 @@ pub async fn set_status(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid],
 pub async fn replace_rating(conn: &mut PgConnection, old: (&str, i16, Uuid), new_status: &str, new_rating: i16) -> sqlx::Result<()> {
     let (was, old_rating, subject) = old;
     if was == "published" {
-        bump(conn, subject, old_rating, -1).await?;
+        bump(conn, subject, old_rating, -1, true).await?;
     }
     if new_status == "published" {
-        bump(conn, subject, new_rating, 1).await?;
+        bump(conn, subject, new_rating, 1, true).await?;
     }
     Ok(())
 }
 
-/// Delete reviews (and their photos) for good, keeping the summaries right.
+/// Delete reviews (and their photos) for good, keeping the summaries right. Their links stay used
+/// up (`submitted_at` is kept): deleting a review never lets its link write another.
 pub async fn delete_reviews(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) -> sqlx::Result<u64> {
-    let rows: Vec<(Uuid, Uuid, i16, String)> =
-        sqlx::query_as("SELECT id, subject_id, rating, status FROM reviews WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE").bind(account_id).bind(ids).fetch_all(&mut *conn).await?;
-    for (_, subject, rating, status) in &rows {
+    let rows: Vec<(Uuid, Uuid, i16, String, String)> = sqlx::query_as("SELECT id, subject_id, rating, status, source FROM reviews WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE")
+        .bind(account_id)
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    for (_, subject, rating, status, source) in &rows {
         if status == "published" {
-            bump(conn, *subject, *rating, -1).await?;
+            bump(conn, *subject, *rating, -1, source != "import").await?;
         }
     }
     let gone: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
-    sqlx::query("UPDATE review_requests SET review_id = NULL WHERE review_id = ANY($1)").bind(&gone).execute(&mut *conn).await?;
+    sqlx::query("UPDATE review_requests SET review_id = NULL, submitted_at = COALESCE(submitted_at, now()) WHERE review_id = ANY($1)").bind(&gone).execute(&mut *conn).await?;
     Ok(sqlx::query("DELETE FROM reviews WHERE id = ANY($1)").bind(&gone).execute(&mut *conn).await?.rows_affected())
 }
 
-/// Delete everything a person wrote here (reviews and photos), for the privacy tools. Their
-/// summaries are corrected in the same transaction. Returns how many reviews were deleted.
-pub async fn delete_for_profile(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> AppResult<u64> {
+/// What a deleted profile held (for the callers' webhooks and audit entries).
+pub type DeletedProfile = (Option<String>, Option<String>, Option<String>);
+
+/// Delete a person and everything they wrote here, for the privacy tools and profile deletion:
+/// the profile row is locked first (which also holds back any new review or request for them),
+/// then their reviews and photos go with the product summaries corrected, then the profile, all in
+/// one transaction. None when there's no such profile in this account.
+pub async fn delete_person(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> AppResult<Option<DeletedProfile>> {
     let mut tx = db.begin().await?;
+    let found: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
+    if found.is_none() {
+        return Ok(None);
+    }
+    super::hooks::point("delete_person", account_id).await.map_err(AppError::Internal)?;
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM reviews WHERE account_id = $1 AND profile_id = $2").bind(account_id).bind(profile_id).fetch_all(&mut *tx).await?;
-    let n = delete_reviews(&mut tx, account_id, &ids).await?;
+    delete_reviews(&mut tx, account_id, &ids).await?;
     sqlx::query("DELETE FROM review_photos WHERE request_id IN (SELECT id FROM review_requests WHERE profile_id = $1)").bind(profile_id).execute(&mut *tx).await?;
+    let gone: Option<DeletedProfile> =
+        sqlx::query_as("DELETE FROM profiles WHERE id = $1 AND account_id = $2 RETURNING email, phone_number, external_id").bind(profile_id).bind(account_id).fetch_optional(&mut *tx).await?;
     tx.commit().await?;
-    Ok(n)
+    Ok(gone)
 }
 
 /// Recompute the published summaries of an account's subjects from their reviews. Each subject
@@ -559,14 +613,17 @@ pub async fn rebuild_summaries(db: &PgPool, account_id: Uuid) -> AppResult<u64> 
         sqlx::query("SELECT id FROM review_subjects WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(chunk).execute(&mut *tx).await?;
         n += sqlx::query(
             "UPDATE review_subjects s SET review_count = COALESCE(x.n, 0), rating_sum = COALESCE(x.total, 0),
-                rating_counts = ARRAY[COALESCE(x.c1, 0), COALESCE(x.c2, 0), COALESCE(x.c3, 0), COALESCE(x.c4, 0), COALESCE(x.c5, 0)], updated_at = now()
-             FROM (SELECT sid AS subject_id, n, total, c1, c2, c3, c4, c5 FROM unnest($1::uuid[]) sid LEFT JOIN LATERAL (
+                rating_counts = ARRAY[COALESCE(x.c1, 0), COALESCE(x.c2, 0), COALESCE(x.c3, 0), COALESCE(x.c4, 0), COALESCE(x.c5, 0)],
+                native_count = COALESCE(x.nn, 0), native_sum = COALESCE(x.ns, 0), updated_at = now()
+             FROM (SELECT sid AS subject_id, n, total, c1, c2, c3, c4, c5, nn, ns FROM unnest($1::uuid[]) sid LEFT JOIN LATERAL (
                      SELECT count(*)::int AS n, sum(rating)::bigint AS total,
                         count(*) FILTER (WHERE rating = 1)::int AS c1, count(*) FILTER (WHERE rating = 2)::int AS c2, count(*) FILTER (WHERE rating = 3)::int AS c3,
-                        count(*) FILTER (WHERE rating = 4)::int AS c4, count(*) FILTER (WHERE rating = 5)::int AS c5
+                        count(*) FILTER (WHERE rating = 4)::int AS c4, count(*) FILTER (WHERE rating = 5)::int AS c5,
+                        count(*) FILTER (WHERE source <> 'import')::int AS nn, COALESCE(sum(rating) FILTER (WHERE source <> 'import'), 0)::bigint AS ns
                      FROM reviews r WHERE r.subject_id = sid AND r.status = 'published') agg ON true) x
-             WHERE s.id = x.subject_id AND (s.review_count, s.rating_sum, s.rating_counts) IS DISTINCT FROM
-                (COALESCE(x.n, 0), COALESCE(x.total, 0)::bigint, ARRAY[COALESCE(x.c1, 0), COALESCE(x.c2, 0), COALESCE(x.c3, 0), COALESCE(x.c4, 0), COALESCE(x.c5, 0)])",
+             WHERE s.id = x.subject_id AND (s.review_count, s.rating_sum, s.rating_counts, s.native_count, s.native_sum) IS DISTINCT FROM
+                (COALESCE(x.n, 0), COALESCE(x.total, 0)::bigint, ARRAY[COALESCE(x.c1, 0), COALESCE(x.c2, 0), COALESCE(x.c3, 0), COALESCE(x.c4, 0), COALESCE(x.c5, 0)],
+                 COALESCE(x.nn, 0), COALESCE(x.ns, 0)::bigint)",
         )
         .bind(chunk)
         .execute(&mut *tx)

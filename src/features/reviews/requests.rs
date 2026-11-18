@@ -72,8 +72,10 @@ pub struct Request {
 pub const REQUEST_COLS: &str = "q.id, q.account_id, q.profile_id, q.subject_id, q.batch_id, q.source, q.verified, q.item, q.created_at, q.expires_at, q.sent_at, q.reminded_at, q.review_id, q.submitted_at";
 
 impl Request {
+    /// Not used yet (a link is used up by its first review for good, even if that review is
+    /// deleted later) and not expired.
     pub fn open(&self) -> bool {
-        self.review_id.is_none() && self.expires_at > Utc::now()
+        self.review_id.is_none() && self.submitted_at.is_none() && self.expires_at > Utc::now()
     }
     pub fn name(&self) -> &str {
         self.item["name"].as_str().unwrap_or("your purchase")
@@ -135,10 +137,17 @@ pub fn items_from_event(event: Option<&Value>) -> Vec<Item> {
 
 pub struct Make<'a> {
     pub source: &'a str,
-    /// The purchase came from a trusted source (not a browser).
-    pub verified: bool,
+    /// What proves the purchase or stay (`event:<id>` or `api:<order ref>`): the request is
+    /// verified only with one.
+    pub verified_ref: Option<String>,
+    /// The item's name, image and address came from a trusted source (the catalog, the API, an
+    /// integration or a server-recorded event), so the fields it supplies may be shown to others.
+    pub fields_trusted: bool,
     pub batch_id: Uuid,
     pub flow_run_id: Option<Uuid>,
+    /// The email or text that carries it, when a block or tag made it: it counts as sent once that
+    /// message is.
+    pub message_id: Option<Uuid>,
 }
 
 pub enum Made {
@@ -148,11 +157,33 @@ pub enum Made {
     Skipped(&'static str),
 }
 
+/// Whether nothing has reached the person with this request yet and nothing is about to: never
+/// sent, not carried by a message that was handed over or may still be on its way, not waiting in a
+/// send intent, and never used. Such a request doesn't hold its order line.
+async fn never_reached(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT q.sent_at IS NULL AND q.submitted_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM review_sends rs WHERE rs.status = 'pending' AND q.id = ANY(rs.request_ids))
+            AND (q.message_id IS NULL
+                 OR EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id AND m.sent_at IS NULL AND m.status IN ('skipped', 'failed'))
+                 OR (NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id) AND q.created_at < now() - interval '30 minutes'))
+         FROM review_requests q WHERE q.id = $1",
+    )
+    .bind(id)
+    .fetch_one(conn)
+    .await
+}
+
 /// A request for one person and one item, or the open one they already have. Checked and written
 /// under a lock on the person and the item, so two sends at once can't both ask.
+///
+/// An order line is asked about once, unless nothing ever reached the person (see
+/// [`never_reached`]); and a request that isn't verified gives way to a verified one for the same
+/// line or item (its link stops working).
 pub async fn make(state: &AppState, account: &Account, profile_id: Uuid, item: &Item, m: &Make<'_>) -> AppResult<Made> {
     let db = &state.db;
-    let hint = Hint { name: item.name.clone(), image_url: item.image_url.clone(), url: item.url.clone(), kind: item.kind.clone(), trusted: m.verified };
+    let verified = m.verified_ref.is_some();
+    let hint = Hint { name: item.name.clone(), image_url: item.image_url.clone(), url: item.url.clone(), kind: item.kind.clone(), trusted: m.fields_trusted };
     let subject = store::subject_for(db, account.id, &item.key, &hint).await?;
     let s = store::settings(db, account.id).await?;
     let line_key = item.order_id.as_deref().map(|o| format!("{}:{}:{}", profile_id.simple(), o.chars().take(200).collect::<String>(), subject.id.simple()));
@@ -167,53 +198,75 @@ pub async fn make(state: &AppState, account: &Account, profile_id: Uuid, item: &
     if reviewed {
         return Ok(Made::Skipped("reviewed"));
     }
-    let q = format!("SELECT {REQUEST_COLS} FROM review_requests q WHERE q.account_id = $1 AND q.line_key = $2");
     if let Some(k) = &line_key {
-        let asked: Option<Request> = sqlx::query_as(&q).bind(account.id).bind(k).fetch_optional(&mut *tx).await?;
-        if let Some(r) = asked {
-            let same_run: Option<Uuid> = sqlx::query_scalar("SELECT flow_run_id FROM review_requests WHERE id = $1").bind(r.id).fetch_one(&mut *tx).await?;
-            tx.commit().await?;
+        let q = format!("SELECT {REQUEST_COLS}, q.flow_run_id FROM review_requests q WHERE q.account_id = $1 AND q.line_key = $2");
+        let asked: Option<(Request, Option<Uuid>)> = sqlx::query_as::<_, RequestRun>(&q).bind(account.id).bind(k).fetch_optional(&mut *tx).await?.map(|r| (r.request, r.flow_run_id));
+        if let Some((r, run)) = asked {
             // The same flow run asking again (a retried step) gets its own request back.
-            return Ok(if m.flow_run_id.is_some() && same_run == m.flow_run_id && r.open() { Made::Existing(r) } else { Made::Skipped("asked") });
+            if m.flow_run_id.is_some() && run == m.flow_run_id && r.open() {
+                tx.commit().await?;
+                return Ok(Made::Existing(r));
+            }
+            let replace = (verified && !r.verified && r.submitted_at.is_none() && r.review_id.is_none()) || never_reached(&mut tx, r.id).await?;
+            if !replace {
+                return Ok(Made::Skipped("asked"));
+            }
+            sqlx::query("DELETE FROM review_requests WHERE id = $1").bind(r.id).execute(&mut *tx).await?;
         }
     }
-    let q = format!("SELECT {REQUEST_COLS} FROM review_requests q WHERE q.profile_id = $1 AND q.subject_id = $2 AND q.review_id IS NULL AND q.expires_at > now() ORDER BY q.created_at DESC LIMIT 1");
+    let q = format!(
+        "SELECT {REQUEST_COLS} FROM review_requests q WHERE q.profile_id = $1 AND q.subject_id = $2 AND q.review_id IS NULL AND q.submitted_at IS NULL AND q.expires_at > now()
+         ORDER BY q.created_at DESC LIMIT 1"
+    );
     let open: Option<Request> = sqlx::query_as(&q).bind(profile_id).bind(subject.id).fetch_optional(&mut *tx).await?;
     if let Some(r) = open {
-        if let Some(k) = &line_key {
-            sqlx::query("UPDATE review_requests SET line_key = $2 WHERE id = $1 AND line_key IS NULL").bind(r.id).bind(k).execute(&mut *tx).await?;
+        if verified && !r.verified {
+            // A verified ask takes the place of an unverified one: its link stops working.
+            sqlx::query("DELETE FROM review_requests WHERE id = $1").bind(r.id).execute(&mut *tx).await?;
+        } else {
+            if let Some(k) = &line_key {
+                sqlx::query("UPDATE review_requests SET line_key = $2 WHERE id = $1 AND line_key IS NULL").bind(r.id).bind(k).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            return Ok(Made::Existing(r));
         }
-        tx.commit().await?;
-        return Ok(Made::Existing(r));
     }
-    // What this person sees: their own item's name and image, or the subject's when trusted.
+    // What this person sees: the trusted name, or the one their own item gave (text only, and only
+    // to them); an image only when a trusted source supplied it.
     let fallback = if subject.kind == "listing" || item.kind.as_deref() == Some("listing") { "your stay" } else { "your purchase" };
     let shown = json!({
-        "name": if subject.trusted { subject.name.clone() } else { item.name.clone().unwrap_or_else(|| fallback.to_string()) },
-        "image_url": if subject.trusted { subject.image_url.clone() } else { item.image_url.clone().filter(|u| u.starts_with("https://") || u.starts_with("http://")) },
+        "name": subject.trusted_name().map(String::from).or_else(|| item.name.clone()).unwrap_or_else(|| fallback.to_string()),
+        "image_url": subject.trusted_image(),
         "product_id": subject.external_id,
     });
-    let id = Uuid::now_v7();
-    let q = 
-        "INSERT INTO review_requests (id, account_id, profile_id, subject_id, batch_id, line_key, source, verified, item, flow_run_id, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now() + make_interval(days => $11))
+    let q = "INSERT INTO review_requests (id, account_id, profile_id, subject_id, batch_id, line_key, source, verified, verified_ref, item, flow_run_id, message_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now() + make_interval(days => $13))
          RETURNING id, account_id, profile_id, subject_id, batch_id, source, verified, item, created_at, expires_at, sent_at, reminded_at, review_id, submitted_at";
     let r: Request = sqlx::query_as(q)
-        .bind(id)
+        .bind(Uuid::now_v7())
         .bind(account.id)
         .bind(profile_id)
         .bind(subject.id)
         .bind(m.batch_id)
         .bind(&line_key)
         .bind(m.source)
-        .bind(m.verified)
+        .bind(verified)
+        .bind(&m.verified_ref)
         .bind(&shown)
         .bind(m.flow_run_id)
+        .bind(m.message_id)
         .bind(s.request_days)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(Made::New(r))
+}
+
+#[derive(sqlx::FromRow)]
+struct RequestRun {
+    #[sqlx(flatten)]
+    request: Request,
+    flow_run_id: Option<Uuid>,
 }
 
 /// "Ready To Review": the person was asked about an item (once per request).
@@ -224,7 +277,7 @@ pub async fn ready_event(state: &AppState, r: &Request, subject: &Subject) -> Ap
             account_id: r.account_id,
             profile_id: r.profile_id,
             metric: READY_METRIC,
-            properties: json!({"product_id": subject.external_id, "product_name": r.item["name"], "request_id": r.id, "verified": r.verified, "source": r.source}),
+            properties: json!({"product_id": subject.external_id, "product_name": subject.trusted_name(), "request_id": r.id, "verified": r.verified, "source": r.source}),
             value: None,
             occurred_at: None,
             unique_id: Some(format!("rtr:{}", r.id.simple())),
@@ -235,23 +288,54 @@ pub async fn ready_event(state: &AppState, r: &Request, subject: &Subject) -> Ap
     Ok(())
 }
 
+/// Metrics that mean a purchase or stay wherever they're recorded by a server. Integrations'
+/// server-only metrics (bookings, orders) and the account's own `purchase_metrics` count too.
+pub const PURCHASE_METRICS: [&str; 4] = ["Placed Order", "Fulfilled Order", "Delivered", "Delivered Order"];
+
+/// What the event proves, for a verified review: `event:<id>` when a trusted source (the API, an
+/// integration, DumbMail) recorded it for this account and it's one of the account's purchase or
+/// stay metrics. Browser events and other metrics prove nothing.
+pub async fn proof_of_purchase(db: &PgPool, account_id: Uuid, event: Option<&Value>) -> AppResult<Option<String>> {
+    let Some(id) = event.and_then(|e| e.get("id")).and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(None) };
+    let row: Option<(Option<bool>, String, bool, Vec<String>)> = sqlx::query_as(
+        "SELECT e.from_browser, m.name, m.server_only, COALESCE((SELECT purchase_metrics FROM review_settings WHERE account_id = $2), '{}')
+         FROM events e JOIN metrics m ON m.id = e.metric_id WHERE e.id = $1 AND e.account_id = $2",
+    )
+    .bind(id)
+    .bind(account_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((from_browser, metric, server_only, extra)) = row else { return Ok(None) };
+    let purchase = server_only || PURCHASE_METRICS.iter().any(|m| m.eq_ignore_ascii_case(&metric)) || extra.iter().any(|m| m.eq_ignore_ascii_case(&metric));
+    Ok((from_browser == Some(false) && purchase).then(|| format!("event:{}", id.simple())))
+}
+
 /// Whether the event that started this came from a trusted source (the API, an integration,
-/// DumbMail itself), not a browser. A flow's event says so; otherwise its row is read. Unknown is
-/// untrusted.
+/// DumbMail itself), not a browser, so the item details it carries may be shown to others. Read
+/// from the event's row; unknown is untrusted.
 async fn event_trusted(db: &PgPool, event: Option<&Value>) -> AppResult<bool> {
     let Some(e) = event else { return Ok(false) };
-    if let Some(b) = e.get("from_browser").and_then(|v| v.as_bool()) {
-        return Ok(!b);
-    }
     let Some(id) = e.get("id").and_then(|v| v.as_str()).and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(false) };
     Ok(sqlx::query_scalar::<_, Option<bool>>("SELECT from_browser FROM events WHERE id = $1").bind(id).fetch_optional(db).await?.flatten() == Some(false))
 }
 
-fn may_receive(p: &Profile, channel: &str) -> bool {
-    match channel {
-        "sms" => p.sms_consent == "subscribed" && p.phone_number.is_some(),
-        _ => p.email_consent == "subscribed" && p.email.is_some(),
-    }
+/// The reviews module's own check, against the current row, before any ask goes out: a review
+/// ask is marketing, so the person must be subscribed on that channel, have an address, not be
+/// suppressed and not be held back from marketing. No exception for service-message flows or
+/// alerts. The shared sender's own checks run after this, unchanged.
+pub async fn may_ask(db: &PgPool, profile_id: Uuid, channel: &str) -> AppResult<bool> {
+    let row: Option<(Option<String>, String, bool, Option<String>, String, bool)> = sqlx::query_as(
+        "SELECT email, email_consent, email_suppressed_reason IS NOT NULL, phone_number, sms_consent, marketing_hold FROM profiles WHERE id = $1",
+    )
+    .bind(profile_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((email, email_consent, suppressed, phone, sms_consent, held)) = row else { return Ok(false) };
+    Ok(!held
+        && match channel {
+            "sms" => phone.is_some() && sms_consent == "subscribed",
+            _ => email.is_some() && email_consent == "subscribed" && !suppressed,
+        })
 }
 
 async fn by_ids(db: &PgPool, account_id: Uuid, profile_id: Uuid, ids: &[Uuid]) -> AppResult<Vec<Request>> {
@@ -262,6 +346,232 @@ async fn by_ids(db: &PgPool, account_id: Uuid, profile_id: Uuid, ids: &[Uuid]) -
 fn ids_in(v: Option<&Value>) -> Vec<Uuid> {
     v.and_then(|v| v.as_array()).into_iter().flatten().filter_map(|x| x.as_str()?.parse().ok()).take(MAX_ITEMS * 2).collect()
 }
+
+// ---------- Send intents ----------
+
+/// How long a worker holds an intent before another may take it over (longer than any send).
+const LEASE_SECS: i64 = 600;
+
+/// One ask, reminder or API ask, recorded before anything is sent. Its id is the message's id.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Intent {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub profile_id: Uuid,
+    pub kind: String,
+    pub channel: String,
+    pub request_ids: Vec<Uuid>,
+    pub created_ids: Vec<Uuid>,
+    pub status: String,
+}
+
+const INTENT_COLS: &str = "id, account_id, profile_id, kind, channel, request_ids, created_ids, status";
+
+pub struct NewIntent<'a> {
+    pub account: &'a Account,
+    pub person: &'a Profile,
+    pub kind: &'a str,
+    pub channel: &'a str,
+    pub request_ids: &'a [Uuid],
+    pub created_ids: &'a [Uuid],
+    pub flow: Option<(Uuid, Uuid, &'a str)>,
+}
+
+/// Record a send intent and its queued message row together (the step's own, for a flow).
+/// Returns the intent, or the one the same flow step already recorded.
+pub async fn record_intent(conn: &mut sqlx::PgConnection, n: &NewIntent<'_>) -> AppResult<Intent> {
+    let id = Uuid::now_v7();
+    let (flow_id, run_id, node_id) = match n.flow {
+        Some((f, r, node)) => (Some(f), Some(r), Some(node)),
+        None => (None, None, None),
+    };
+    let q = format!(
+        "INSERT INTO review_sends (id, account_id, profile_id, flow_run_id, node_id, kind, channel, request_ids, created_ids)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING RETURNING {INTENT_COLS}"
+    );
+    let made: Option<Intent> = sqlx::query_as(&q)
+        .bind(id)
+        .bind(n.account.id)
+        .bind(n.person.id)
+        .bind(run_id)
+        .bind(node_id)
+        .bind(n.kind)
+        .bind(n.channel)
+        .bind(n.request_ids)
+        .bind(n.created_ids)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(intent) = made else {
+        let q = format!("SELECT {INTENT_COLS} FROM review_sends WHERE flow_run_id = $1 AND node_id = $2");
+        return Ok(sqlx::query_as(&q).bind(run_id).bind(node_id).fetch_one(&mut *conn).await?);
+    };
+    let to = if n.channel == "sms" { n.person.phone_number.clone() } else { n.person.email.clone() };
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, flow_id, flow_node_id, to_address, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued')")
+        .bind(intent.id)
+        .bind(n.account.id)
+        .bind(n.person.id)
+        .bind(n.channel)
+        .bind(flow_id)
+        .bind(node_id)
+        .bind(to.unwrap_or_default())
+        .execute(&mut *conn)
+        .await?;
+    Ok(intent)
+}
+
+async fn intent_for_step(db: &PgPool, run_id: Uuid, node_id: &str) -> AppResult<Option<Intent>> {
+    let q = format!("SELECT {INTENT_COLS} FROM review_sends WHERE flow_run_id = $1 AND node_id = $2");
+    Ok(sqlx::query_as(&q).bind(run_id).bind(node_id).fetch_optional(db).await?)
+}
+
+pub async fn intent_by_id(db: &PgPool, id: Uuid) -> AppResult<Option<Intent>> {
+    let q = format!("SELECT {INTENT_COLS} FROM review_sends WHERE id = $1");
+    Ok(sqlx::query_as(&q).bind(id).fetch_optional(db).await?)
+}
+
+/// Settle an intent once. `sent`: its asks count as sent (and "Ready To Review" is recorded).
+/// Otherwise nothing reached the person: the requests it made are dropped (the order lines may be
+/// asked again), a reminder may go again, and its queued message is marked skipped.
+async fn finish(state: &AppState, intent: &Intent, status: &str, why: &str) -> AppResult<()> {
+    let db = &state.db;
+    let mut tx = db.begin().await?;
+    let settled = sqlx::query("UPDATE review_sends SET status = $2, finished_at = now(), claimed_at = NULL WHERE id = $1 AND status = 'pending'")
+        .bind(intent.id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        == 1;
+    if !settled {
+        return Ok(());
+    }
+    let mut ready = Vec::new();
+    if status == "sent" {
+        if intent.kind != "reminder" {
+            ready = sqlx::query_scalar("UPDATE review_requests SET sent_at = now() WHERE id = ANY($1) AND sent_at IS NULL RETURNING id").bind(&intent.request_ids).fetch_all(&mut *tx).await?;
+        }
+    } else {
+        sqlx::query("DELETE FROM review_requests WHERE id = ANY($1) AND sent_at IS NULL AND submitted_at IS NULL AND review_id IS NULL").bind(&intent.created_ids).execute(&mut *tx).await?;
+        if intent.kind == "reminder" {
+            sqlx::query("UPDATE review_requests SET reminded_at = NULL WHERE id = ANY($1)").bind(&intent.request_ids).execute(&mut *tx).await?;
+        }
+        let unsent = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status = 'queued'").bind(intent.id).bind(why).execute(&mut *tx).await?.rows_affected() == 1;
+        if unsent {
+            crate::features::messages_unsent_in(&mut tx, db, intent.account_id, &[intent.id]).await;
+        }
+    }
+    tx.commit().await?;
+    if !ready.is_empty() {
+        for r in by_ids(db, intent.account_id, intent.profile_id, &ready).await? {
+            if let Ok(s) = store::subject_by_id(db, r.subject_id).await {
+                ready_event(state, &r, &s).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a dispatch came to.
+pub enum Dispatch {
+    /// Settled: sent, skipped or failed.
+    Done(&'static str),
+    /// Try again then (quiet hours, warm-up, or another worker holds it).
+    Later(DateTime<Utc>),
+}
+
+/// Hand one intent's message to the sender, at most once: the intent is claimed (with a lease, so
+/// a worker that dies is replaced later), a message an earlier attempt already handed over is
+/// recognised by its id and not sent again, the reviews module's own marketing check runs against
+/// the current row, and requests answered since (a review arrived) are left out; with none left,
+/// nothing is sent at all.
+pub async fn dispatch(state: &AppState, account: &Account, intent: &Intent, content: &Value, event: Option<&Value>, flow: Option<(Uuid, &str)>) -> AppResult<Dispatch> {
+    let db = &state.db;
+    let claimed: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE review_sends SET claimed_at = now() WHERE id = $1 AND status = 'pending' AND (claimed_at IS NULL OR claimed_at < now() - make_interval(secs => $2)) RETURNING id",
+    )
+    .bind(intent.id)
+    .bind(LEASE_SECS as f64)
+    .fetch_optional(db)
+    .await?;
+    if claimed.is_none() {
+        let held: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as("SELECT status, claimed_at FROM review_sends WHERE id = $1").bind(intent.id).fetch_optional(db).await?;
+        return Ok(match held {
+            Some((s, Some(at))) if s == "pending" => Dispatch::Later(at + chrono::Duration::seconds(LEASE_SECS)),
+            _ => Dispatch::Done("settled"),
+        });
+    }
+    super::hooks::point("review_send", account.id).await.map_err(AppError::Internal)?;
+    let handed: Option<bool> = sqlx::query_scalar("SELECT sent_at IS NOT NULL FROM messages WHERE id = $1").bind(intent.id).fetch_optional(db).await?;
+    if handed == Some(true) {
+        finish(state, intent, "sent", "").await?;
+        return Ok(Dispatch::Done("sent"));
+    }
+    let q = format!("SELECT {} FROM profiles p WHERE p.id = $1", crate::models::PROFILE_COLS);
+    let Some(person) = sqlx::query_as::<_, Profile>(&q).bind(intent.profile_id).fetch_optional(db).await? else {
+        finish(state, intent, "skipped", "profile deleted").await?;
+        return Ok(Dispatch::Done("skipped"));
+    };
+    if !may_ask(db, person.id, &intent.channel).await? {
+        finish(state, intent, "skipped", "no marketing consent").await?;
+        return Ok(Dispatch::Done("skipped"));
+    }
+    let open: Vec<Uuid> = by_ids(db, account.id, person.id, &intent.request_ids).await?.into_iter().filter(Request::open).map(|r| r.id).collect();
+    if open.is_empty() {
+        finish(state, intent, "skipped", "already reviewed").await?;
+        return Ok(Dispatch::Done("skipped"));
+    }
+    let mut ev = event.cloned().unwrap_or(json!({}));
+    ev["_review_requests"] = json!(open);
+    let out = sending::send(
+        state,
+        SendSpec {
+            account,
+            profile: &person,
+            channel: &intent.channel,
+            content,
+            campaign_id: None,
+            flow_id: flow.map(|f| f.0),
+            flow_node_id: flow.map(|f| f.1),
+            event: Some(&ev),
+            is_test: false,
+            message_id: Some(intent.id),
+            to_override: None,
+        },
+    )
+    .await;
+    match out {
+        Ok(Outcome::Deferred(until)) => {
+            sqlx::query("UPDATE review_sends SET claimed_at = NULL WHERE id = $1").bind(intent.id).execute(db).await?;
+            Ok(Dispatch::Later(until))
+        }
+        Ok(Outcome::Sent(_)) => {
+            finish(state, intent, "sent", "").await?;
+            Ok(Dispatch::Done("sent"))
+        }
+        Ok(Outcome::Skipped(why)) => {
+            finish(state, intent, "skipped", why).await?;
+            Ok(Dispatch::Done("skipped"))
+        }
+        Ok(Outcome::Failed(why)) => {
+            tracing::warn!(intent = %intent.id, error = %why, "review ask failed");
+            finish(state, intent, "failed", "send failed").await?;
+            Ok(Dispatch::Done("failed"))
+        }
+        Err(e) => {
+            let why = if matches!(&e, AppError::Conflict(m) if m == ALL_REVIEWED) { "already reviewed" } else { "send failed" };
+            if why == "send failed" {
+                tracing::warn!(intent = %intent.id, error = %e.public_message(), "review ask failed");
+            }
+            let status = if why == "already reviewed" { "skipped" } else { "failed" };
+            finish(state, intent, status, why).await?;
+            Ok(Dispatch::Done(status))
+        }
+    }
+}
+
+/// The error a render gives when every request it was handed was answered in the meantime: the
+/// message must not go at all.
+const ALL_REVIEWED: &str = "every item in this ask has been reviewed";
 
 // ---------- Flow step ----------
 
@@ -280,8 +590,9 @@ pub fn check_step(id: &str, data: &Map<String, Value>) -> AppResult<()> {
 }
 
 /// Run a `review_request` step for one person. Returns when to try again if the message had to
-/// wait (quiet hours, warm-up). Requests made here are kept in the run's context, so a retry asks
-/// about the same ones and a later reminder step can find them.
+/// wait (quiet hours, warm-up, another worker). The step's send intent (one per run and step)
+/// makes a retried step find what it already did: the same requests, and the message it already
+/// handed over, which is never sent twice.
 #[allow(clippy::too_many_arguments)]
 pub async fn flow_step(
     state: &AppState,
@@ -297,111 +608,76 @@ pub async fn flow_step(
     let err = |e: AppError| anyhow::anyhow!(e.public_message());
     let channel = if data.get("channel").and_then(|v| v.as_str()) == Some("sms") { "sms" } else { "email" };
     let reminder = data.get("reminder").and_then(|v| v.as_bool()) == Some(true);
-    let pending_key = format!("_review_pending_{node_id}");
-    let pending = ids_in(context.get(&pending_key));
-    // A review request is marketing: subscribed people only (checked again on a retry), and smart sending applies.
-    if !may_receive(person, channel) {
-        if let Some(o) = context.as_object_mut() {
-            o.remove(&pending_key);
-        }
-        return Ok(None);
-    }
-    if pending.is_empty() && smart_hours > 0 && crate::features::sendtime::recently_messaged(&state.db, person.id, channel, smart_hours).await? {
-        return Ok(None);
-    }
-    let mut created: Vec<Uuid> = Vec::new();
-    let requests: Vec<Request> = if !pending.is_empty() {
-        by_ids(&state.db, account.id, person.id, &pending).await.map_err(err)?.into_iter().filter(Request::open).collect()
-    } else if reminder {
-        let earlier = ids_in(context.get("review_requests"));
-        // Claimed before sending, so a reminder goes at most once per request.
-        let claimed: Vec<Uuid> = sqlx::query_scalar(
-            "UPDATE review_requests SET reminded_at = now() WHERE account_id = $1 AND profile_id = $2 AND id = ANY($3)
-               AND review_id IS NULL AND expires_at > now() AND reminded_at IS NULL AND sent_at IS NOT NULL RETURNING id",
-        )
-        .bind(account.id)
-        .bind(person.id)
-        .bind(&earlier)
-        .fetch_all(&state.db)
-        .await?;
-        by_ids(&state.db, account.id, person.id, &claimed).await.map_err(err)?
-    } else {
-        let event = context.get("event");
-        let verified = event_trusted(&state.db, event).await?;
-        let m = Make { source: "flow", verified, batch_id: Uuid::now_v7(), flow_run_id: Some(run_id) };
-        let mut out = Vec::new();
-        for item in items_from_event(event) {
-            match make(state, account, person.id, &item, &m).await {
-                Ok(Made::New(r)) => {
-                    created.push(r.id);
-                    out.push(r);
-                }
-                Ok(Made::Existing(r)) => out.push(r),
-                Ok(Made::Skipped(_)) => {}
-                Err(e) => tracing::warn!(run = %run_id, node = %node_id, error = %e.public_message(), "review request item skipped"),
+    let intent = match intent_for_step(&state.db, run_id, node_id).await.map_err(err)? {
+        Some(i) if i.status != "pending" => return Ok(None),
+        Some(i) => i,
+        None => {
+            if !may_ask(&state.db, person.id, channel).await.map_err(err)? {
+                return Ok(None);
             }
+            if smart_hours > 0 && crate::features::sendtime::recently_messaged(&state.db, person.id, channel, smart_hours).await? {
+                return Ok(None);
+            }
+            let mut tx = state.db.begin().await?;
+            let (requests, created): (Vec<Uuid>, Vec<Uuid>) = if reminder {
+                let earlier = ids_in(context.get("review_requests"));
+                // Claimed with the intent: a reminder goes at most once per request.
+                let claimed: Vec<Uuid> = sqlx::query_scalar(
+                    "UPDATE review_requests SET reminded_at = now() WHERE account_id = $1 AND profile_id = $2 AND id = ANY($3)
+                       AND review_id IS NULL AND submitted_at IS NULL AND expires_at > now() AND reminded_at IS NULL AND sent_at IS NOT NULL RETURNING id",
+                )
+                .bind(account.id)
+                .bind(person.id)
+                .bind(&earlier)
+                .fetch_all(&mut *tx)
+                .await?;
+                (claimed, Vec::new())
+            } else {
+                let event = context.get("event");
+                let proof = proof_of_purchase(&state.db, account.id, event).await.map_err(err)?;
+                let trusted = event_trusted(&state.db, event).await.map_err(err)?;
+                let m = Make { source: "flow", verified_ref: proof, fields_trusted: trusted, batch_id: Uuid::now_v7(), flow_run_id: Some(run_id), message_id: None };
+                let (mut all, mut new) = (Vec::new(), Vec::new());
+                for item in items_from_event(event) {
+                    match make(state, account, person.id, &item, &m).await {
+                        Ok(Made::New(r)) => {
+                            new.push(r.id);
+                            all.push(r.id);
+                        }
+                        Ok(Made::Existing(r)) => all.push(r.id),
+                        Ok(Made::Skipped(_)) => {}
+                        Err(e) => tracing::warn!(run = %run_id, node = %node_id, error = %e.public_message(), "review request item skipped"),
+                    }
+                }
+                (all, new)
+            };
+            if requests.is_empty() {
+                return Ok(None);
+            }
+            let intent = record_intent(
+                &mut tx,
+                &NewIntent { account, person, kind: if reminder { "reminder" } else { "ask" }, channel, request_ids: &requests, created_ids: &created, flow: Some((flow.id, run_id, node_id)) },
+            )
+            .await
+            .map_err(err)?;
+            tx.commit().await?;
+            if !reminder {
+                let mut all = ids_in(context.get("review_requests"));
+                for i in &intent.request_ids {
+                    if !all.contains(i) {
+                        all.push(*i);
+                    }
+                }
+                context["review_requests"] = json!(all);
+            }
+            intent
         }
-        out
     };
-    if requests.is_empty() {
-        if let Some(o) = context.as_object_mut() {
-            o.remove(&pending_key);
-        }
-        return Ok(None);
-    }
-    let ids: Vec<Uuid> = requests.iter().map(|r| r.id).collect();
-    if !reminder {
-        let mut all = ids_in(context.get("review_requests"));
-        for i in &ids {
-            if !all.contains(i) {
-                all.push(*i);
-            }
-        }
-        context["review_requests"] = json!(all);
-    }
-    context[&pending_key] = json!(ids);
-    let mut event = context.get("event").cloned().unwrap_or(json!({}));
-    event["_review_requests"] = json!(ids);
     let content = data.get("content").cloned().unwrap_or(json!({}));
-    let out = sending::send(
-        state,
-        SendSpec {
-            account,
-            profile: person,
-            channel,
-            content: &content,
-            campaign_id: None,
-            flow_id: Some(flow.id),
-            flow_node_id: Some(node_id),
-            event: Some(&event),
-            is_test: false,
-            message_id: None,
-            to_override: None,
-        },
-    )
-    .await;
-    match out {
-        Ok(Outcome::Deferred(until)) => return Ok(Some(until)),
-        Ok(Outcome::Sent(_)) => {
-            sqlx::query("UPDATE review_requests SET sent_at = COALESCE(sent_at, now()) WHERE id = ANY($1)").bind(&ids).execute(&state.db).await?;
-            for r in &requests {
-                if let Ok(s) = store::subject_by_id(&state.db, r.subject_id).await {
-                    ready_event(state, r, &s).await.map_err(err)?;
-                }
-            }
-        }
-        Ok(Outcome::Skipped(_)) | Ok(Outcome::Failed(_)) | Err(_) => {
-            if let Err(e) = &out {
-                tracing::warn!(run = %run_id, node = %node_id, error = %e.public_message(), "review request message failed");
-            }
-            // Nothing reached them: the order lines may be asked again later.
-            sqlx::query("DELETE FROM review_requests WHERE id = ANY($1) AND sent_at IS NULL AND review_id IS NULL").bind(&created).execute(&state.db).await?;
-        }
+    match dispatch(state, account, &intent, &content, context.get("event"), Some((flow.id, node_id))).await.map_err(err)? {
+        Dispatch::Later(at) => Ok(Some(at)),
+        Dispatch::Done(_) => Ok(None),
     }
-    if let Some(o) = context.as_object_mut() {
-        o.remove(&pending_key);
-    }
-    Ok(None)
 }
 
 // ---------- Email blocks and the review_link tag ----------
@@ -424,7 +700,7 @@ fn uses_reviews(content: &Value) -> bool {
     walk(content)
 }
 
-/// Requests for one message, made on demand (or handed over by the flow step).
+/// Requests for one message, made on demand (or handed over by a send intent).
 struct Asker<'a> {
     state: &'a AppState,
     account: &'a Account,
@@ -435,6 +711,8 @@ struct Asker<'a> {
     given: Option<Vec<Request>>,
     made: Vec<Request>,
     batch: Uuid,
+    /// The message being rendered: requests made here count as sent once it is.
+    message_id: Option<Uuid>,
 }
 
 impl Asker<'_> {
@@ -449,13 +727,15 @@ impl Asker<'_> {
         }
         let Some(profile) = self.profile.filter(|_| self.allowed && !self.preview) else { return Ok(Vec::new()) };
         let event_items = items_from_event(self.event);
+        let proof = proof_of_purchase(&self.state.db, self.account.id, self.event).await?;
         let trusted = event_trusted(&self.state.db, self.event).await?;
-        let (items, verified) = match product {
+        // A product named by the block or tag itself proves no purchase, and supplies no details.
+        let (items, proof, trusted) = match product {
             Some(p) => match event_items.iter().find(|i| i.key == p) {
-                Some(i) => (vec![i.clone()], trusted),
-                None => (vec![Item { key: p.to_string(), ..Default::default() }], false),
+                Some(i) => (vec![i.clone()], proof, trusted),
+                None => (vec![Item { key: p.to_string(), ..Default::default() }], None, false),
             },
-            None => (event_items, trusted),
+            None => (event_items, proof, trusted),
         };
         let mut out = Vec::new();
         for item in items {
@@ -463,17 +743,10 @@ impl Asker<'_> {
                 out.push(r.clone());
                 continue;
             }
-            let m = Make { source: "email", verified, batch_id: self.batch, flow_run_id: None };
+            let m = Make { source: "email", verified_ref: proof.clone(), fields_trusted: trusted, batch_id: self.batch, flow_run_id: None, message_id: self.message_id };
             match make(self.state, self.account, profile.id, &item, &m).await? {
-                Made::New(r) => {
-                    if let Ok(s) = store::subject_by_id(&self.state.db, r.subject_id).await {
-                        ready_event(self.state, &r, &s).await?;
-                    }
-                    sqlx::query("UPDATE review_requests SET sent_at = now() WHERE id = $1").bind(r.id).execute(&self.state.db).await?;
-                    self.made.push(r.clone());
-                    out.push(r);
-                }
-                Made::Existing(r) => {
+                // Counted as sent (and "Ready To Review" recorded) once its message is handed over.
+                Made::New(r) | Made::Existing(r) => {
                     self.made.push(r.clone());
                     out.push(r);
                 }
@@ -482,8 +755,6 @@ impl Asker<'_> {
         }
         Ok(out)
     }
-
-
 }
 
 fn star_cells(href: Option<&str>, color: &str, size: u32) -> String {
@@ -553,7 +824,7 @@ async fn reviews_block_html(state: &AppState, account: &Account, b: &Value, even
         let avg = subject.average().unwrap_or(0.0);
         let full = avg.round() as i64;
         let stars: String = (1..=5).map(|n| if n <= full { "&#9733;" } else { "&#9734;" }).collect();
-        let name = if subject.trusted { format!("{} · ", inert(&subject.name)) } else { String::new() };
+        let name = subject.trusted_name().map(|n| format!("{} · ", inert(n))).unwrap_or_default();
         html.push_str(&format!(
             r#"<p style="margin:0 0 14px;font-family:{font};font-size:15px;color:#111827;"><span style="color:{star_color};font-size:20px;">{stars}</span><br>{name}{avg:.1} out of 5 from {} review{}</p>"#,
             subject.review_count,
@@ -612,17 +883,39 @@ fn tag_products(v: &Value, out: &mut Vec<Option<String>>) {
 /// through untouched. `preview` (dashboard previews, test sends) shows sample links and makes
 /// nothing. People not subscribed on the message's channel get no review ask: the blocks are left
 /// out and the tags are empty.
-pub async fn personalize<'c>(state: &AppState, account: &Account, profile: Option<&Profile>, event: Option<&Value>, content: &'c Value, preview: bool) -> AppResult<Cow<'c, Value>> {
-    if !uses_reviews(content) {
+#[allow(clippy::too_many_arguments)]
+pub async fn personalize<'c>(
+    state: &AppState,
+    account: &Account,
+    profile: Option<&Profile>,
+    event: Option<&Value>,
+    content: &'c Value,
+    preview: bool,
+    message_id: Option<Uuid>,
+) -> AppResult<Cow<'c, Value>> {
+    let handed = event.map(|e| ids_in(e.get("_review_requests"))).unwrap_or_default();
+    // A review ask's own message always gets its links, even a text without the tag.
+    if !uses_reviews(content) && handed.is_empty() {
         return Ok(Cow::Borrowed(content));
     }
     let sms = content.get("body").is_some() && content.get("blocks").is_none() && content.get("html").is_none();
-    let allowed = profile.is_some_and(|p| may_receive(p, if sms { "sms" } else { "email" }));
-    let given = match (event.map(|e| ids_in(e.get("_review_requests"))), profile) {
-        (Some(ids), Some(p)) if !ids.is_empty() => Some(by_ids(&state.db, account.id, p.id, &ids).await?.into_iter().filter(Request::open).collect()),
+    let allowed = match profile {
+        Some(p) if !preview => may_ask(&state.db, p.id, if sms { "sms" } else { "email" }).await?,
+        _ => false,
+    };
+    let given = match profile {
+        Some(p) if !handed.is_empty() => {
+            // Checked again here, as the message is rendered: requests answered since are left out,
+            // and when none is left the message doesn't go at all.
+            let open: Vec<Request> = by_ids(&state.db, account.id, p.id, &handed).await?.into_iter().filter(Request::open).collect();
+            if open.is_empty() && !preview {
+                return Err(AppError::Conflict(ALL_REVIEWED.into()));
+            }
+            Some(open)
+        }
         _ => None,
     };
-    let mut asker = Asker { state, account, profile, event, allowed, preview, given, made: Vec::new(), batch: Uuid::now_v7() };
+    let mut asker = Asker { state, account, profile, event, allowed, preview, given, made: Vec::new(), batch: Uuid::now_v7(), message_id };
     let mut out = content.clone();
     let brand = crate::render::safe_color(out.pointer("/theme/brand_color").and_then(|v| v.as_str()).unwrap_or(&account.brand_color), "#1f6f5c");
     if let Some(blocks) = out.get_mut("blocks").and_then(|b| b.as_array_mut()) {
@@ -718,23 +1011,77 @@ pub fn ask_content(channel: &str, product_name: &str) -> Value {
     }
 }
 
-/// Send the ask for requests made through the API, through the normal send path.
-pub async fn send_ask(state: &AppState, account: &Account, person: &Profile, channel: &str, requests: &[Request]) -> AppResult<Outcome> {
-    if !may_receive(person, channel) {
-        return Ok(Outcome::Skipped("not subscribed"));
+/// Send the ask for requests made through the API: a send intent like a flow's (one message, sent
+/// at most once), smart sending over `smart_hours` (0: off), and the sender's quiet hours and
+/// warm-up: a message that has to wait goes later from a job.
+pub async fn send_ask(state: &AppState, account: &Account, person: &Profile, channel: &str, requests: &[Request], smart_hours: i64) -> AppResult<&'static str> {
+    if !may_ask(&state.db, person.id, channel).await? {
+        return Ok("not subscribed");
+    }
+    if smart_hours > 0 && crate::features::sendtime::recently_messaged(&state.db, person.id, channel, smart_hours).await? {
+        return Ok("smart sending");
     }
     let ids: Vec<Uuid> = requests.iter().map(|r| r.id).collect();
-    let event = json!({"_review_requests": ids, "from_browser": false});
-    let content = ask_content(channel, requests.first().map(|r| r.name()).unwrap_or("your purchase"));
-    let out = sending::send(
-        state,
-        SendSpec { account, profile: person, channel, content: &content, campaign_id: None, flow_id: None, flow_node_id: None, event: Some(&event), is_test: false, message_id: None, to_override: None },
-    )
-    .await?;
-    if matches!(out, Outcome::Sent(_)) {
-        sqlx::query("UPDATE review_requests SET sent_at = COALESCE(sent_at, now()) WHERE id = ANY($1)").bind(&ids).execute(&state.db).await?;
+    let mut tx = state.db.begin().await?;
+    let intent = record_intent(&mut tx, &NewIntent { account, person, kind: "api", channel, request_ids: &ids, created_ids: &[], flow: None }).await?;
+    tx.commit().await?;
+    run_api_intent(state, account, &intent).await
+}
+
+/// Dispatch an API ask (now, or from its job when it had to wait).
+pub async fn run_api_intent(state: &AppState, account: &Account, intent: &Intent) -> AppResult<&'static str> {
+    let first = by_ids(&state.db, account.id, intent.profile_id, &intent.request_ids).await?;
+    let content = ask_content(&intent.channel, first.first().map(|r| r.name()).unwrap_or("your purchase"));
+    match dispatch(state, account, intent, &content, None, None).await? {
+        Dispatch::Done(s) => Ok(s),
+        Dispatch::Later(at) => {
+            crate::jobs::enqueue(&state.db, "reviews_send", json!({"intent_id": intent.id}), Some(at)).await?;
+            Ok("waiting")
+        }
     }
-    Ok(out)
+}
+
+/// Job: an API ask that had to wait.
+pub async fn run_send_job(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let err = |e: AppError| anyhow::anyhow!(e.public_message());
+    let Some(id) = payload["intent_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let Some(intent) = intent_by_id(&state.db, id).await.map_err(err)? else { return Ok(()) };
+    if intent.status != "pending" {
+        return Ok(());
+    }
+    let account = crate::campaigns::load_account(&state.db, intent.account_id).await.map_err(err)?;
+    run_api_intent(state, &account, &intent).await.map_err(err)?;
+    Ok(())
+}
+
+/// Requests a block or tag made count as sent once the message carrying them was handed over:
+/// mark them and record "Ready To Review". Requests whose message didn't go are dropped (their
+/// order lines may be asked again). Runs from the scheduler, a batch at a time.
+pub async fn settle_carried(state: &AppState) -> anyhow::Result<()> {
+    let sent: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "UPDATE review_requests q SET sent_at = m.sent_at FROM messages m
+         WHERE q.id IN (SELECT q2.id FROM review_requests q2 JOIN messages m2 ON m2.id = q2.message_id
+                        WHERE q2.sent_at IS NULL AND q2.message_id IS NOT NULL AND m2.sent_at IS NOT NULL LIMIT 500)
+           AND m.id = q.message_id
+         RETURNING q.id, q.account_id, q.profile_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (id, account_id, profile_id) in sent {
+        let rs = by_ids(&state.db, account_id, profile_id, &[id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        for r in rs {
+            if let Ok(s) = store::subject_by_id(&state.db, r.subject_id).await {
+                ready_event(state, &r, &s).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+            }
+        }
+    }
+    sqlx::query(
+        "DELETE FROM review_requests q WHERE q.id IN (SELECT q2.id FROM review_requests q2 JOIN messages m ON m.id = q2.message_id
+            WHERE q2.sent_at IS NULL AND q2.submitted_at IS NULL AND q2.message_id IS NOT NULL AND m.sent_at IS NULL AND m.status IN ('skipped', 'failed') LIMIT 500)",
+    )
+    .execute(&state.db)
+    .await?;
+    Ok(())
 }
 
 /// The starter flow: ask after an order (or a delivery, when the account records one), and remind

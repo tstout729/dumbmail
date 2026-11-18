@@ -45,7 +45,7 @@ pub async fn report(db: &PgPool, account_id: Uuid, tz: &str, days: i64) -> AppRe
     .fetch_one(db)
     .await?;
     let products: Vec<(String, String, bool, i32, i64, i64, Option<f64>)> = sqlx::query_as(
-        "SELECT s.external_id, s.name, s.trusted, s.review_count, s.rating_sum, count(r.id), avg(r.rating)::float8
+        "SELECT s.external_id, s.name, s.name_trusted, s.review_count, s.rating_sum, count(r.id), avg(r.rating)::float8
          FROM review_subjects s LEFT JOIN reviews r ON r.subject_id = s.id AND r.confirmed_at IS NOT NULL AND r.status <> 'removed'
          WHERE s.account_id = $1 GROUP BY s.id ORDER BY count(r.id) DESC, s.name LIMIT 50",
     )

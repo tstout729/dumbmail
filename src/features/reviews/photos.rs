@@ -28,14 +28,64 @@ pub struct Encoded {
     pub height: u32,
 }
 
-/// Decode a PNG, JPEG, GIF or WebP upload (its first frame), shrink it to at most 1600 pixels a
-/// side and encode it again as JPEG. Runs off the async threads, with decode limits.
+/// The most pixels a photo may declare (checked from its header, before decoding).
+pub const MAX_PIXELS: u64 = 40_000_000;
+/// Photo decodes running at once on this server, and for one account.
+const DECODES: usize = 4;
+const DECODES_PER_ACCOUNT: usize = 2;
+/// How long an upload waits for a decode slot before it's turned away.
+const DECODE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+static DECODE_SLOTS: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> = once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(DECODES)));
+static ACCOUNT_SLOTS: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Semaphore>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn account_slots(account_id: Uuid) -> std::sync::Arc<tokio::sync::Semaphore> {
+    let mut m = ACCOUNT_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() > 10_000 {
+        m.retain(|_, s| s.available_permits() < DECODES_PER_ACCOUNT);
+    }
+    m.entry(account_id).or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(DECODES_PER_ACCOUNT))).clone()
+}
+
+fn busy() -> AppError {
+    AppError::Busy("Too many photos are being processed right now. Please try again in a moment.".into())
+}
+
+/// The size an image file says it is, read from its header without decoding it.
+pub fn declared_size(bytes: &[u8]) -> AppResult<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .ok_or_else(|| AppError::bad("that photo couldn't be read"))
+}
+
+/// [`reencode`] for one account: waits for a free decode slot, at most [`DECODES_PER_ACCOUNT`] for
+/// the account and [`DECODES`] on the server at once.
+pub async fn reencode_for(account_id: Uuid, bytes: Vec<u8>) -> AppResult<Encoded> {
+    let mine = tokio::time::timeout(DECODE_WAIT, account_slots(account_id).acquire_owned()).await.map_err(|_| busy())?.map_err(|_| busy())?;
+    let all = tokio::time::timeout(DECODE_WAIT, DECODE_SLOTS.clone().acquire_owned()).await.map_err(|_| busy())?.map_err(|_| busy())?;
+    let out = reencode(bytes).await;
+    drop(all);
+    drop(mine);
+    out
+}
+
+/// Check a PNG, JPEG, GIF or WebP upload, then decode it (its first frame), shrink it to at most
+/// 1600 pixels a side and encode it again as JPEG. Its declared size is checked against
+/// [`MAX_PIXELS`] before anything is decoded. Runs off the async threads, with decode limits. Use
+/// [`reencode_for`] so decodes are bounded.
 pub async fn reencode(bytes: Vec<u8>) -> AppResult<Encoded> {
     if bytes.len() > MAX_UPLOAD {
         return Err(AppError::bad("photos can be at most 10 MB"));
     }
     if crate::api::images::sniff(&bytes).is_none() {
         return Err(AppError::bad("photos must be PNG, JPEG, GIF or WebP images"));
+    }
+    let (w, h) = declared_size(&bytes)?;
+    if u64::from(w) * u64::from(h) > MAX_PIXELS || w > MAX_DECODE_SIDE || h > MAX_DECODE_SIDE {
+        return Err(AppError::bad(format!("that photo is too large ({w} × {h} pixels); photos can be at most 40 million pixels")));
     }
     tokio::task::spawn_blocking(move || -> AppResult<Encoded> {
         let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().map_err(|_| AppError::bad("that photo couldn't be read"))?;
@@ -122,5 +172,50 @@ mod tests {
         assert!(!e.bytes.windows(4).any(|w| w == b"Exif"));
         assert!(reencode(b"<svg/>".to_vec()).await.is_err());
         assert!(reencode(b"\x89PNG\r\n\x1a\nnot really".to_vec()).await.is_err());
+    }
+
+    /// A PNG header that claims `w` × `h` pixels, with no image data behind it.
+    fn claims(w: u32, h: u32) -> Vec<u8> {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&ihdr);
+        let mut crc_in = b"IHDR".to_vec();
+        crc_in.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
+        out
+    }
+
+    fn crc32(b: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for &x in b {
+            c ^= u32::from(x);
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+
+    #[tokio::test]
+    async fn huge_declared_images_are_refused_before_decoding() {
+        assert_eq!(declared_size(&claims(9000, 9000)).unwrap(), (9000, 9000));
+        let e = reencode(claims(9000, 9000)).await.err().unwrap();
+        assert!(e.public_message().contains("too large"), "{}", e.public_message());
+    }
+
+    #[tokio::test]
+    async fn decodes_per_account_are_bounded() {
+        let acct = Uuid::now_v7();
+        let a = account_slots(acct).try_acquire_owned().unwrap();
+        let b = account_slots(acct).try_acquire_owned().unwrap();
+        assert!(account_slots(acct).try_acquire_owned().is_err(), "a third decode for one account waits");
+        assert!(account_slots(Uuid::now_v7()).try_acquire_owned().is_ok(), "other accounts aren't held up");
+        drop((a, b));
+        assert!(account_slots(acct).try_acquire_owned().is_ok());
     }
 }

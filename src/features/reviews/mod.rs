@@ -9,6 +9,7 @@
 //! - `segment`, `report`, `io`: the segment condition, reports, CSV import and export.
 
 pub mod api;
+pub mod hooks;
 pub mod io;
 pub mod page;
 pub mod photos;
@@ -152,13 +153,14 @@ fn tools() -> Vec<Value> {
             obj(json!({"product_id": {"type": "string"}, "name": {"type": "string"}, "image_url": {"type": "string"}, "url": {"type": "string"}, "kind": {"enum": ["product", "listing", "service"]}}), &["product_id"]), false, false),
         tool("rebuild_review_summaries", "Recount star summaries", "Recount every product's published average and histogram from its reviews, in the background.", obj(json!({}), &[]), false, false),
         tool("create_review_request", "Make a review link",
-            "Make a signed review link for one person and one or more things they bought or booked (reviews from it are marked verified unless verified=false). Returns the links. With send=email or sms it also sends the ask now, only if they're subscribed on that channel; that needs confirm=true.",
+            "Make a signed review link for one person and one or more things they bought or booked. Returns the links (it needs permission to see profiles). Reviews from it are verified only when you pass order_id, your reference for the order or booking; without one the request is unverified. With send=email or sms it also sends the ask now, only if they're subscribed on that channel (smart sending over smart_sending_hours, default 16, and quiet hours apply; a text that must wait goes later); that needs confirm=true.",
             obj(json!({
                 "profile_id": {"type": "string"}, "email": {"type": "string"},
                 "product_id": {"type": "string"}, "name": {"type": "string"}, "image_url": {"type": "string"}, "url": {"type": "string"}, "kind": {"enum": ["product", "listing", "service"]},
                 "items": {"type": "array", "maxItems": 6, "items": {"type": "object"}, "description": "Instead of product_id: items like {product_id, name, image_url}."},
-                "order_id": {"type": "string", "description": "Each order line is only ever asked about once."},
-                "verified": {"type": "boolean"}, "send": {"enum": ["email", "sms"]}, "confirm": {"type": "boolean"}
+                "order_id": {"type": "string", "description": "Your reference for the order or booking: it makes the request verified, and each order line is only ever asked about once."},
+                "verified": {"type": "boolean", "description": "false: unverified even with an order_id."}, "send": {"enum": ["email", "sms"]},
+                "smart_sending_hours": {"type": "integer", "minimum": 0, "maximum": 168}, "confirm": {"type": "boolean"}
             }), &[]), false, false),
         tool("get_review_report", "Review report", "Requests sent, response rate, average rating over time (account time zone) and rating by product.",
             obj(json!({"days": {"type": "integer", "minimum": 1, "maximum": 730}}), &[]), true, false),
@@ -167,7 +169,8 @@ fn tools() -> Vec<Value> {
             obj(json!({"csv": {"type": "string"}, "mapping": {"type": "object", "description": "Our field -> your column name. Fields: product_id, product_handle, rating, title, body, name, email, date, verified, photos, reply."},
                 "publish": {"type": "boolean", "description": "Publish them (default true) or hold them for moderation."}, "confirm": {"type": "boolean"}}), &["csv"]), false, true),
         tool("get_review_import", "Check a review import", "How far an import got, with the rows it skipped and why.", obj(json!({"id": {"type": "string"}}), &["id"]), true, false),
-        tool("export_reviews_csv", "Export reviews as CSV", "Reviews matching the filters as CSV text (at most 50,000). Reviewers' emails are included only for callers who may read profiles.", obj(filter_props(), &[]), true, false),
+        tool("export_reviews_csv", "Export reviews as CSV", "Reviews matching the filters as CSV text (at most 50,000). with_people=true adds each reviewer's email, which needs an Admin or Owner (exports.manage) and permission to see profiles.",
+            obj({ let mut p = filter_props(); p["with_people"] = json!({"type": "boolean"}); p }, &[]), true, false),
         tool("create_review_flow", "Set up the review request flow", "Create the starter flow as a draft. kind=order (default): ask 14 days after Placed Order (5 days after Fulfilled Order or Delivered, when you record those). kind=stay: ask the day after check-out, from the Guesty recipe's Reservation Confirmed events (a cancelled booking leaves the flow). Both remind once a week later if they haven't reviewed.",
             obj(json!({"kind": {"enum": ["order", "stay"]}}), &[]), false, false),
     ]
@@ -197,7 +200,11 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
         }
         "import_reviews_csv" => api::import(state, ctx, from(a.clone())?).await,
         "get_review_import" => io::get_import(state, ctx.account_id, id_arg(a, "id")?).await,
-        "export_reviews_csv" => Ok(json!({"csv": api::export(state, ctx, &from(a.clone())?).await?})),
+        "export_reviews_csv" => {
+            let mut q = a.clone();
+            let with_people = q.as_object_mut().and_then(|o| o.remove("with_people")).and_then(|v| v.as_bool()) == Some(true);
+            Ok(json!({"csv": api::export(state, ctx, &from(q)?, with_people).await?}))
+        }
         "create_review_flow" => api::create_flow(state, ctx, from(a.clone())?).await,
         _ => Err(AppError::not_found("tool")),
     }
@@ -240,6 +247,8 @@ impl Feature for Module {
     async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
         Some(match kind {
             "reviews_submitted" => page::after_submit(state, payload).await,
+            "reviews_send" => requests::run_send_job(state, payload).await,
+            "reviews_confirm" => page::send_confirmation(state, payload).await,
             "reviews_import" => io::run_import(state, payload).await,
             "reviews_rebuild" => match payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
                 Some(a) => store::rebuild_summaries(&state.db, a).await.map(|_| ()).map_err(|e| anyhow::anyhow!(e.public_message())),
@@ -250,6 +259,10 @@ impl Feature for Module {
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
+        // Requests carried by a block or tag count as sent once their message was handed over.
+        if tick.is_multiple_of(3) {
+            requests::settle_carried(state).await?;
+        }
         if tick.is_multiple_of(180) {
             // Public reviews nobody confirmed, and photos uploaded for reviews never sent.
             sqlx::query("DELETE FROM reviews WHERE confirmed_at IS NULL AND source = 'public' AND created_at < now() - make_interval(days => $1)")

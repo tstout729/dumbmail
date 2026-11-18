@@ -86,22 +86,28 @@
     box.querySelector("button").focus();
   }
 
-  function injectLd(product) {
-    if (ldDone[product]) return;
+  // The structured data comes with the first page and describes exactly the reviews shown there.
+  function injectLd(product, ld) {
+    if (!ld || ldDone[product]) return;
     ldDone[product] = 1;
-    get("/client/reviews/jsonld", { product_id: product }).then(function (ld) {
-      var s = document.createElement("script");
-      s.type = "application/ld+json"; s.setAttribute("data-dumbmail-reviews-ld", product);
-      s.textContent = JSON.stringify(ld).replace(/</g, "\\u003c");
-      document.head.appendChild(s);
-    }).catch(function () {});
+    var s = document.createElement("script");
+    s.type = "application/ld+json"; s.setAttribute("data-dumbmail-reviews-ld", product);
+    s.textContent = JSON.stringify(ld).replace(/</g, "\\u003c");
+    document.head.appendChild(s);
   }
 
   function productWidget(host, root) {
-    var product = productOf(host, "data-dumbmail-reviews"), state = { page: 1, sort: "", rating: "", photos: false }, writing = false, last = null;
+    var product = productOf(host, "data-dumbmail-reviews"), state = { sort: "", rating: "", photos: false }, writing = false, last = null, shown = [];
     if (!product) return;
     function load() {
-      get("/client/reviews", { product_id: product, page: state.page, sort: state.sort, rating: state.rating, photos: state.photos ? "true" : "" }).then(function (d) { last = d; draw(d); if (d.summary.count > 0 && host.getAttribute("data-structured-data") !== "false") injectLd(product); })
+      shown = [];
+      more(null);
+    }
+    function more(after) {
+      get("/client/reviews", { product_id: product, after: after, sort: state.sort, rating: state.rating, photos: state.photos ? "true" : "" }).then(function (d) {
+        shown = shown.concat(d.reviews); d.reviews = shown; last = d; draw(d);
+        if (host.getAttribute("data-structured-data") !== "false") injectLd(product, d.structured_data);
+      })
         .catch(function () { root.innerHTML = ""; host.style.minHeight = ""; });
     }
     function draw(d) {
@@ -113,7 +119,7 @@
           h += '<button type="button" data-rating="' + n + '" aria-pressed="' + (String(state.rating) === String(n)) + '" aria-label="' + n + " stars: " + plural(c, "review") + '"><span>' + n + '★</span><span class="bar"><i style="width:' + pct + '%"></i></span><span>' + c + "</span></button>";
         }
         h += "</div></div>";
-        h += '<div class="tools"><label class="sr" for="sort">Sort reviews</label><select id="sort"><option value="">Most relevant</option><option value="recent"' + (state.sort === "recent" ? " selected" : "") + '>Newest</option><option value="highest"' + (state.sort === "highest" ? " selected" : "") + '>Highest rated</option><option value="lowest"' + (state.sort === "lowest" ? " selected" : "") + '>Lowest rated</option><option value="photos"' + (state.sort === "photos" ? " selected" : "") + '>With photos first</option></select>' +
+        h += '<div class="tools"><label class="sr" for="sort">Sort reviews</label><select id="sort"><option value="">Most relevant</option><option value="recent"' + (state.sort === "recent" ? " selected" : "") + '>Newest</option><option value="highest"' + (state.sort === "highest" ? " selected" : "") + '>Highest rated</option><option value="lowest"' + (state.sort === "lowest" ? " selected" : "") + '>Lowest rated</option></select>' +
           '<button type="button" class="btn" data-a="photos" aria-pressed="' + state.photos + '">With photos</button>' + (state.rating ? '<button type="button" class="btn" data-a="clear">Show all ratings</button>' : "") + (d.can_write ? '<button type="button" class="btn p" data-a="write">Write a review</button>' : "") + "</div>";
       } else if (d.can_write) {
         h += '<p class="empty">No reviews yet.</p><div class="tools"><button type="button" class="btn p" data-a="write">Be the first to write one</button></div>';
@@ -125,7 +131,7 @@
       if (s.count > 0 && !d.reviews.length) h += '<p class="empty">No reviews match.</p>';
       d.reviews.forEach(function (r) { h += reviewHtml(r, false); });
       h += "</div>";
-      if (d.pages > 1) h += '<nav class="pg" aria-label="Review pages"><button type="button" class="btn" data-a="prev"' + (state.page <= 1 ? " disabled" : "") + '>Previous</button><span>Page ' + state.page + " of " + d.pages + '</span><button type="button" class="btn" data-a="next"' + (state.page >= d.pages ? " disabled" : "") + ">Next</button></nav>";
+      if (d.next) h += '<nav class="pg"><button type="button" class="btn" data-a="more" data-after="' + esc(d.next) + '">Show more reviews</button></nav>';
       root.innerHTML = h + "</section>";
       host.style.minHeight = "";
       if (writing) wireForm(d);
@@ -158,15 +164,14 @@
       if (!t) return;
       var ph = t.getAttribute("data-photo"), r = t.getAttribute("data-rating"), a = t.getAttribute("data-a");
       if (ph) return lightbox(root, ph, t);
-      if (r) { state.rating = String(state.rating) === r ? "" : r; state.page = 1; return load(); }
-      if (a === "photos") { state.photos = !state.photos; state.page = 1; return load(); }
-      if (a === "clear") { state.rating = ""; state.page = 1; return load(); }
-      if (a === "prev" && state.page > 1) { state.page--; return load(); }
-      if (a === "next") { state.page++; return load(); }
+      if (r) { state.rating = String(state.rating) === r ? "" : r; return load(); }
+      if (a === "photos") { state.photos = !state.photos; return load(); }
+      if (a === "clear") { state.rating = ""; return load(); }
+      if (a === "more") return more(t.getAttribute("data-after"));
       if (a === "write") { writing = true; return draw(last); }
       if (a === "cancel") { writing = false; return draw(last); }
     });
-    root.addEventListener("change", function (e) { if (e.target.id === "sort") { state.sort = e.target.value; state.page = 1; load(); } });
+    root.addEventListener("change", function (e) { if (e.target.id === "sort") { state.sort = e.target.value; load(); } });
     load();
   }
 
@@ -212,16 +217,17 @@
   }
 
   function allReviews(host, root) {
-    var page = 1;
-    function load() {
-      get("/client/reviews/all", { page: page }).then(function (d) {
+    var shown = [];
+    function load(after) {
+      get("/client/reviews/all", { after: after }).then(function (d) {
+        shown = shown.concat(d.reviews); d.reviews = shown;
         var h = css(d.widget) + '<section aria-label="' + esc(d.widget.heading) + '"><h2>' + esc(d.widget.heading) + "</h2>";
         if (d.summary.count) h += '<div class="sum"><div class="avg">' + Number(d.summary.average).toFixed(1) + "</div><div>" + stars(d.summary.average, 18) + '<div class="meta">' + plural(d.summary.count, "review") + "</div></div></div>";
         else h += '<p class="empty">No reviews yet.</p>';
         h += '<div aria-live="polite">';
         d.reviews.forEach(function (r) { h += reviewHtml(r, true); });
         h += "</div>";
-        if (d.pages > 1) h += '<nav class="pg" aria-label="Review pages"><button type="button" class="btn" data-a="prev"' + (page <= 1 ? " disabled" : "") + '>Previous</button><span>Page ' + page + " of " + d.pages + '</span><button type="button" class="btn" data-a="next"' + (page >= d.pages ? " disabled" : "") + ">Next</button></nav>";
+        if (d.next) h += '<nav class="pg"><button type="button" class="btn" data-a="more" data-after="' + esc(d.next) + '">Show more reviews</button></nav>';
         root.innerHTML = h + "</section>";
         host.style.minHeight = "";
       }).catch(function () { root.innerHTML = ""; });
@@ -231,8 +237,7 @@
       if (!t) return;
       var ph = t.getAttribute("data-photo"), a = t.getAttribute("data-a");
       if (ph) return lightbox(root, ph, t);
-      if (a === "prev" && page > 1) { page--; load(); }
-      if (a === "next") { page++; load(); }
+      if (a === "more") load(t.getAttribute("data-after"));
     });
     load();
   }

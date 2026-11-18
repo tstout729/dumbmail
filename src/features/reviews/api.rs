@@ -62,10 +62,10 @@ fn tz(account: &crate::models::Account) -> String {
 pub async fn review_json(state: &AppState, ctx: &Ctx, r: &Review, s: &Subject, photo_ids: &[(Uuid, i32, i32)]) -> AppResult<Value> {
     let mut v = json!({
         "id": r.id, "status": r.status, "reject_reason": r.reject_reason, "rating": r.rating, "title": r.title, "body": r.body, "display_name": r.display_name,
-        "recommend": r.recommend, "answers": r.answers, "verified": r.verified, "source": r.source, "imported": r.source == "import", "incentivized": r.incentivized,
+        "recommend": r.recommend, "answers": r.answers, "verified": r.verified, "verified_by_source": r.source_verified, "source": r.source, "imported": r.source == "import", "incentivized": r.incentivized,
         "flags": r.flags, "featured": r.featured, "reply": r.reply, "replied_at": r.replied_at, "awaiting_confirmation": r.confirmed_at.is_none(),
         "reviewed_at": r.reviewed_at, "created_at": r.created_at, "edited_at": r.edited_at, "published_at": r.published_at, "moderated_at": r.moderated_at,
-        "product": {"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.image_url, "url": s.url, "kind": s.kind},
+        "product": {"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.trusted_image(), "url": s.trusted_url(), "kind": s.kind},
         "photos": photo_ids.iter().map(|(id, w, h)| json!({"id": id, "url": photos::signed_url(state, *id), "width": w, "height": h})).collect::<Vec<_>>(),
     });
     if ctx.can(Perm::ProfilesRead) {
@@ -95,6 +95,37 @@ pub async fn list(state: &AppState, ctx: &Ctx, q: &store::ListQuery) -> AppResul
     }
     by.insert("awaiting_confirmation".into(), json!(unconfirmed));
     Ok(json!({"data": data, "total": total, "counts": by, "note": HONESTY}))
+}
+
+/// Write an audit entry inside the caller's transaction, so the change and its record commit
+/// together (or neither does). The same fields as `team::audit`.
+pub async fn audit_in(conn: &mut sqlx::PgConnection, ctx: &Ctx, action: &str, target: Option<&str>, details: Value) -> sqlx::Result<()> {
+    let actor_type = if ctx.api_key_id.is_some() {
+        "api_key"
+    } else if ctx.user_id.is_some() {
+        "user"
+    } else {
+        "system"
+    };
+    sqlx::query(
+        "INSERT INTO audit_log (id, account_id, actor_type, actor_user_id, actor_key_id, actor_label, action, target, details, ip, user_agent)
+         VALUES ($1, $2, $3, $4, $5,
+            COALESCE((SELECT name || ' (' || prefix || '…)' FROM api_keys WHERE id = $5), (SELECT email FROM users WHERE id = $4)),
+            $6, $7, $8, $9, $10)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ctx.account_id)
+    .bind(actor_type)
+    .bind(ctx.user_id)
+    .bind(ctx.api_key_id)
+    .bind(action.chars().take(80).collect::<String>())
+    .bind(target.map(|t| t.chars().take(300).collect::<String>()))
+    .bind(crate::features::team::audit::scrub(details))
+    .bind(ctx.ip.as_deref().map(|s| s.chars().take(64).collect::<String>()))
+    .bind(ctx.user_agent.as_deref().map(|s| s.chars().take(300).collect::<String>()))
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Shown with the moderation queue.
@@ -165,9 +196,14 @@ pub async fn moderate(state: &AppState, ctx: &Ctx, b: ModerateBody) -> AppResult
             .fetch_all(&mut *tx)
             .await?,
     };
-    tx.commit().await?;
+    if status.is_none() {
+        for id in &changed {
+            store::touch(&mut tx, *id).await?;
+        }
+    }
     let target = if ids.len() == 1 { Some(ids[0].to_string()) } else { None };
-    audit(state, ctx, &format!("review.{}", b.action), target.as_deref(), json!({"reviews": ids.len(), "changed": changed.len(), "reason": reason})).await;
+    audit_in(&mut tx, ctx, &format!("review.{}", b.action), target.as_deref(), json!({"reviews": ids.len(), "changed_ids": changed, "reason": reason})).await?;
+    tx.commit().await?;
     let skipped = ids.len() - changed.len();
     Ok(json!({"ok": true, "changed": changed, "unchanged": skipped,
         "note": if skipped > 0 { Some("Some reviews were already like that, were deleted by their author, or are still waiting for their email confirmation.") } else { None }}))
@@ -186,17 +222,20 @@ pub struct ReplyBody {
 /// The business's public reply under a review (empty text removes it). The review itself can't be edited.
 pub async fn reply(state: &AppState, ctx: &Ctx, id: Uuid, text: &str) -> AppResult<Value> {
     let t = store::plain(text, store::MAX_REPLY);
+    let mut tx = state.db.begin().await?;
     let n = sqlx::query("UPDATE reviews SET reply = $3, replied_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END, updated_at = now() WHERE id = $1 AND account_id = $2 AND status <> 'removed'")
         .bind(id)
         .bind(ctx.account_id)
         .bind(if t.is_empty() { None } else { Some(&t) })
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     if n == 0 {
         return Err(AppError::not_found("review"));
     }
-    audit(state, ctx, if t.is_empty() { "review.reply_remove" } else { "review.reply" }, Some(&id.to_string()), json!({"chars": t.chars().count()})).await;
+    store::touch(&mut tx, id).await?;
+    audit_in(&mut tx, ctx, if t.is_empty() { "review.reply_remove" } else { "review.reply" }, Some(&id.to_string()), json!({"chars": t.chars().count()})).await?;
+    tx.commit().await?;
     get_one(state, ctx, id).await
 }
 
@@ -205,11 +244,14 @@ async fn reply_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, 
 }
 
 pub async fn remove_photo(state: &AppState, ctx: &Ctx, id: Uuid, photo: Uuid) -> AppResult<Value> {
-    let n = sqlx::query("DELETE FROM review_photos WHERE id = $1 AND review_id = $2 AND account_id = $3").bind(photo).bind(id).bind(ctx.account_id).execute(&state.db).await?.rows_affected();
+    let mut tx = state.db.begin().await?;
+    let n = sqlx::query("DELETE FROM review_photos WHERE id = $1 AND review_id = $2 AND account_id = $3").bind(photo).bind(id).bind(ctx.account_id).execute(&mut *tx).await?.rows_affected();
     if n == 0 {
         return Err(AppError::not_found("photo"));
     }
-    audit(state, ctx, "review.photo_remove", Some(&id.to_string()), json!({"photo": photo})).await;
+    store::touch(&mut tx, id).await?;
+    audit_in(&mut tx, ctx, "review.photo_remove", Some(&id.to_string()), json!({"photo": photo})).await?;
+    tx.commit().await?;
     Ok(json!({"ok": true}))
 }
 
@@ -224,8 +266,8 @@ pub async fn delete_review(state: &AppState, ctx: &Ctx, id: Uuid, confirm: bool)
     }
     let mut tx = state.db.begin().await?;
     store::delete_reviews(&mut tx, ctx.account_id, &[id]).await?;
+    audit_in(&mut tx, ctx, "review.delete", Some(&id.to_string()), json!({"rating": r.rating, "status": r.status})).await?;
     tx.commit().await?;
-    audit(state, ctx, "review.delete", Some(&id.to_string()), json!({"rating": r.rating, "status": r.status})).await;
     Ok(json!({"ok": true, "deleted": id}))
 }
 
@@ -298,7 +340,7 @@ pub async fn products(state: &AppState, account_id: Uuid, q: &ProductsQuery) -> 
         total = row.try_get("total")?;
         let s = <Subject as sqlx::FromRow<sqlx::postgres::PgRow>>::from_row(row)?;
         let pending: i64 = row.try_get("pending")?;
-        data.push(json!({"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.image_url, "url": s.url, "kind": s.kind, "summary": s.summary(), "pending": pending}));
+        data.push(json!({"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.trusted_image(), "url": s.trusted_url(), "kind": s.kind, "summary": s.summary(), "pending": pending}));
     }
     Ok(json!({"data": data, "total": total}))
 }
@@ -329,7 +371,7 @@ pub async fn save_product(state: &AppState, ctx: &Ctx, b: ProductBody) -> AppRes
     }
     let s = store::subject_for(&state.db, ctx.account_id, &b.product_id, &store::Hint { name: b.name, image_url: b.image_url, url: b.url, kind: b.kind, trusted: true }).await?;
     audit(state, ctx, "review_product.save", Some(&s.id.to_string()), json!({"product_id": s.external_id})).await;
-    Ok(json!({"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.image_url, "url": s.url, "kind": s.kind, "summary": s.summary()}))
+    Ok(json!({"id": s.id, "product_id": s.external_id, "name": s.name, "image_url": s.trusted_image(), "url": s.trusted_url(), "kind": s.kind, "summary": s.summary()}))
 }
 
 async fn save_product_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ProductBody>) -> AppResult<Json<Value>> {
@@ -367,20 +409,28 @@ pub struct RequestBody {
     /// ... or up to 6 items in the catalog's item shape.
     #[serde(default)]
     pub items: Option<Vec<Value>>,
+    /// Your reference for the order or booking. Each order line is only ever asked about once, and
+    /// only a request with one is verified (reviews from it get the "Verified buyer" badge).
     #[serde(default)]
     pub order_id: Option<String>,
-    /// The purchase is real (default true: you're telling us through the API).
+    /// false: not verified even with an order reference.
     #[serde(default)]
     pub verified: Option<bool>,
     /// "email" or "sms": also send the ask now (needs confirm).
     #[serde(default)]
     pub send: Option<String>,
+    /// With `send`: skip it if they got a message on that channel in the last this many hours
+    /// (default 16; 0 turns it off).
+    #[serde(default)]
+    pub smart_sending_hours: Option<i64>,
     #[serde(default)]
     pub confirm: bool,
 }
 
 /// Review links for one person (made, or the open ones they have), optionally sent now.
 pub async fn create_request(state: &AppState, ctx: &Ctx, b: RequestBody) -> AppResult<Value> {
+    // It returns a link tied to a named person, so it needs permission to see people too.
+    ctx.require(Perm::ProfilesRead)?;
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
     let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.account_id = $1 AND (p.id = $2 OR ($3::text IS NOT NULL AND p.email = $3)) LIMIT 1");
     let email = b.email.as_deref().map(|e| crate::models::normalize_email(e).ok_or_else(|| AppError::bad("email isn't valid"))).transpose()?;
@@ -415,7 +465,14 @@ pub async fn create_request(state: &AppState, ctx: &Ctx, b: RequestBody) -> AppR
                 items.len(), person.email.as_deref().or(person.phone_number.as_deref()).unwrap_or("this person"), channel.unwrap_or("email"))}));
         }
     }
-    let m = requests::Make { source: "api", verified: b.verified.unwrap_or(true), batch_id: Uuid::now_v7(), flow_run_id: None };
+    // Verified only with the caller's own reference for the order or booking.
+    let order_ref = b.order_id.as_deref().map(str::trim).filter(|o| !o.is_empty()).map(|o| o.chars().take(200).collect::<String>());
+    let verified_ref = order_ref.filter(|_| b.verified != Some(false)).map(|o| format!("api:{o}"));
+    let smart = b.smart_sending_hours.unwrap_or(16);
+    if !(0..=168).contains(&smart) {
+        return Err(AppError::bad("smart_sending_hours must be 0 to 168"));
+    }
+    let m = requests::Make { source: "api", verified_ref, fields_trusted: true, batch_id: Uuid::now_v7(), flow_run_id: None, message_id: None };
     let mut out = Vec::new();
     let mut made = Vec::new();
     for item in &items {
@@ -429,15 +486,7 @@ pub async fn create_request(state: &AppState, ctx: &Ctx, b: RequestBody) -> AppR
     }
     let mut sent = Value::Null;
     if let (Some(ch), false) = (channel, made.is_empty()) {
-        let o = requests::send_ask(state, &account, &person, ch, &made).await?;
-        sent = json!(format!("{o:?}"));
-        if matches!(o, crate::sending::Outcome::Sent(_)) {
-            for r in &made {
-                if let Ok(s) = store::subject_by_id(&state.db, r.subject_id).await {
-                    requests::ready_event(state, r, &s).await?;
-                }
-            }
-        }
+        sent = json!(requests::send_ask(state, &account, &person, ch, &made, smart).await?);
     } else {
         for r in &made {
             if let Ok(s) = store::subject_by_id(&state.db, r.subject_id).await {
@@ -480,15 +529,28 @@ async fn get_import_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uu
     Ok(Json(io::get_import(&state, ctx.account_id, id).await?))
 }
 
-pub async fn export(state: &AppState, ctx: &Ctx, q: &store::ListQuery) -> AppResult<String> {
+/// Reviews as CSV. `with_people` adds each reviewer's email: that copies people's data out, so it
+/// also needs an Admin-or-Owner permission (`exports.manage`) and profiles read; without it,
+/// `export` is enough.
+pub async fn export(state: &AppState, ctx: &Ctx, q: &store::ListQuery, with_people: bool) -> AppResult<String> {
+    if with_people {
+        ctx.require(Perm::ExportsManage)?;
+        ctx.require(Perm::ProfilesRead)?;
+    }
     let account = crate::campaigns::load_account(&state.db, ctx.account_id).await?;
-    let csv = io::export(state, ctx.account_id, &tz(&account), q, ctx.can(Perm::ProfilesRead)).await?;
-    audit(state, ctx, "reviews.export", None, json!({"status": q.status, "product_id": q.product_id})).await;
+    let csv = io::export(state, ctx.account_id, &tz(&account), q, with_people).await?;
+    audit(state, ctx, "reviews.export", None, json!({"status": q.status, "product_id": q.product_id, "with_people": with_people})).await;
     Ok(csv)
 }
 
-async fn export_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<store::ListQuery>) -> AppResult<axum::response::Response> {
-    let csv = export(&state, &ctx, &q).await?;
+#[derive(Deserialize)]
+struct WithPeople {
+    #[serde(default)]
+    with_people: bool,
+}
+
+async fn export_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<store::ListQuery>, Query(w): Query<WithPeople>) -> AppResult<axum::response::Response> {
+    let csv = export(&state, &ctx, &q, w.with_people).await?;
     Ok(([(header::CONTENT_TYPE, "text/csv; charset=utf-8"), (header::CONTENT_DISPOSITION, "attachment; filename=\"reviews.csv\"")], Bytes::from(csv)).into_response())
 }
 

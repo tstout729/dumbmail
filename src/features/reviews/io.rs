@@ -279,8 +279,9 @@ pub async fn run_import(state: &AppState, payload: &Value) -> anyhow::Result<()>
     let end = (start + BATCH).min(rows.len());
     let deadline = tokio::time::Instant::now() + BATCH_DEADLINE;
     let mut fetched = 0usize;
-    let (mut imported, mut skipped) = (0i32, 0i32);
+    let mut skipped = 0i32;
     let mut errors: Vec<Value> = Vec::new();
+    let s = store::settings(&state.db, account_id).await.map_err(err)?;
     for (i, rec) in rows.iter().enumerate().take(end).skip(start) {
         let line = i as i32 + 2;
         let r = match parse_row(&headers, &mapping, rec) {
@@ -291,8 +292,14 @@ pub async fn run_import(state: &AppState, payload: &Value) -> anyhow::Result<()>
                 continue;
             }
         };
+        // Already in (an earlier run of this batch got this far): skip it, photos and all.
+        let done: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM reviews WHERE import_id = $1 AND import_row = $2)").bind(id).bind(line).fetch_one(&state.db).await?;
+        if done {
+            continue;
+        }
         let key = if r.by_handle { by_handle(state, account_id, &r.product).await.map_err(err)?.unwrap_or(r.product.clone()) } else { r.product.clone() };
-        let subject = match store::subject_for(&state.db, account_id, &key, &store::Hint { trusted: true, ..Default::default() }).await {
+        // An import vouches only for the product id: no name, image or address comes from the file.
+        let subject = match store::subject_for(&state.db, account_id, &key, &store::Hint::default()).await {
             Ok(s) => s,
             Err(e) => {
                 skipped += 1;
@@ -300,47 +307,9 @@ pub async fn run_import(state: &AppState, payload: &Value) -> anyhow::Result<()>
                 continue;
             }
         };
-        let profile_id: Option<Uuid> = match &r.email {
-            Some(e) => sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND email = $2").bind(account_id).bind(e).fetch_optional(&state.db).await?,
-            None => None,
-        };
-        let s = store::settings(&state.db, account_id).await.map_err(err)?;
-        let flags = store::flags(&format!("{}\n{}\n{}", r.title, r.body, r.name), &s.flag_words);
-        let rid = Uuid::now_v7();
-        let mut tx = state.db.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO reviews (id, account_id, subject_id, profile_id, status, rating, title, body, display_name, verified, source, flags, reply, replied_at,
-                confirmed_at, reviewed_at, import_id, import_row)
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, 'import', $10, $11, CASE WHEN $11::text IS NULL THEN NULL ELSE now() END, now(), COALESCE($12, now()), $13, $14)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(rid)
-        .bind(account_id)
-        .bind(subject.id)
-        .bind(profile_id)
-        .bind(r.rating)
-        .bind(&r.title)
-        .bind(&r.body)
-        .bind(&r.name)
-        .bind(r.verified)
-        .bind(&flags)
-        .bind(&r.reply)
-        .bind(r.date)
-        .bind(id)
-        .bind(line)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-        if inserted && publish {
-            store::set_status(&mut tx, account_id, &[rid], "published", None).await.map_err(err)?;
-        }
-        tx.commit().await?;
-        if !inserted {
-            continue;
-        }
-        imported += 1;
-        for (pos, url) in r.photos.iter().enumerate() {
+        // Photos first, with no transaction held: fetched through the checked path, then re-encoded.
+        let mut photos_ok: Vec<photos::Encoded> = Vec::new();
+        for url in &r.photos {
             if fetched >= PHOTOS_PER_BATCH || tokio::time::Instant::now() >= deadline {
                 errors.push(json!({"row": line, "error": "photo skipped: this batch's photo time ran out"}));
                 break;
@@ -363,29 +332,75 @@ pub async fn run_import(state: &AppState, payload: &Value) -> anyhow::Result<()>
                     continue;
                 }
             };
-            match photos::reencode(bytes).await {
-                Ok(enc) => {
-                    sqlx::query("INSERT INTO review_photos (id, account_id, review_id, position, width, height, size, bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
-                        .bind(Uuid::new_v4())
-                        .bind(account_id)
-                        .bind(rid)
-                        .bind(pos as i16)
-                        .bind(enc.width as i32)
-                        .bind(enc.height as i32)
-                        .bind(enc.bytes.len() as i32)
-                        .bind(&enc.bytes)
-                        .execute(&state.db)
-                        .await?;
-                }
+            match photos::reencode_for(account_id, bytes).await {
+                Ok(enc) => photos_ok.push(enc),
                 Err(e) => errors.push(json!({"row": line, "error": format!("photo skipped: {}", e.public_message())})),
             }
         }
+        let profile_id: Option<Uuid> = match &r.email {
+            Some(e) => sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND email = $2").bind(account_id).bind(e).fetch_optional(&state.db).await?,
+            None => None,
+        };
+        let flags = store::flags(&format!("{}\n{}\n{}", r.title, r.body, r.name), &s.flag_words);
+        let rid = Uuid::now_v7();
+        // The row and its photos are saved together, or not at all (a crash retries both).
+        let mut tx = state.db.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO reviews (id, account_id, subject_id, profile_id, status, rating, title, body, display_name, verified, source_verified, source, flags, reply, replied_at,
+                confirmed_at, reviewed_at, import_id, import_row)
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, false, $9, 'import', $10, $11, CASE WHEN $11::text IS NULL THEN NULL ELSE now() END, now(), COALESCE($12, now()), $13, $14)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(rid)
+        .bind(account_id)
+        .bind(subject.id)
+        .bind(profile_id)
+        .bind(r.rating)
+        .bind(&r.title)
+        .bind(&r.body)
+        .bind(&r.name)
+        .bind(r.verified)
+        .bind(&flags)
+        .bind(&r.reply)
+        .bind(r.date)
+        .bind(id)
+        .bind(line)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            continue;
+        }
+        for (pos, enc) in photos_ok.iter().enumerate() {
+            sqlx::query("INSERT INTO review_photos (id, account_id, review_id, position, width, height, size, bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+                .bind(Uuid::new_v4())
+                .bind(account_id)
+                .bind(rid)
+                .bind(pos as i16)
+                .bind(enc.width as i32)
+                .bind(enc.height as i32)
+                .bind(enc.bytes.len() as i32)
+                .bind(&enc.bytes)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if publish {
+            store::set_status(&mut tx, account_id, &[rid], "published", None).await.map_err(err)?;
+        }
+        super::hooks::point("import_row", account_id).await?;
+        tx.commit().await?;
     }
     let finished = end >= rows.len();
+    // Counted from what's saved, so a batch run again after a crash counts each row once.
+    let imported: i32 = sqlx::query_scalar("SELECT count(*)::int FROM reviews WHERE import_id = $1").bind(id).fetch_one(&state.db).await?;
+    // Progress and the next batch's job are saved together: a crash can't strand the import.
+    let mut tx = state.db.begin().await?;
     sqlx::query(
-        "UPDATE review_imports SET next_row = $2, imported = imported + $3, skipped = skipped + $4,
+        "UPDATE review_imports SET next_row = $2, imported = $3, skipped = skipped + $4,
             errors = (SELECT COALESCE(jsonb_agg(e), '[]') FROM (SELECT e FROM jsonb_array_elements(errors || $5::jsonb) e LIMIT 200) x),
-            status = CASE WHEN $6 THEN 'done' ELSE 'running' END, finished_at = CASE WHEN $6 THEN now() END WHERE id = $1",
+            status = CASE WHEN $6 THEN 'done' ELSE 'running' END, finished_at = CASE WHEN $6 THEN now() END,
+            csv = CASE WHEN $6 THEN '' ELSE csv END WHERE id = $1",
     )
     .bind(id)
     .bind(end as i32)
@@ -393,14 +408,12 @@ pub async fn run_import(state: &AppState, payload: &Value) -> anyhow::Result<()>
     .bind(skipped)
     .bind(json!(errors))
     .bind(finished)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
     if !finished {
-        crate::jobs::enqueue_background(&state.db, "reviews_import", payload.clone(), None).await?;
-    } else {
-        // The CSV isn't needed once it's in.
-        sqlx::query("UPDATE review_imports SET csv = '' WHERE id = $1").bind(id).execute(&state.db).await?;
+        crate::jobs::enqueue_background(&mut *tx, "reviews_import", payload.clone(), None).await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -417,7 +430,7 @@ fn cell(s: &str) -> String {
 /// reviewer's email (only for callers who may read profiles).
 pub async fn export(state: &AppState, account_id: Uuid, tz: &str, q: &store::ListQuery, with_people: bool) -> AppResult<String> {
     let mut w = csv::Writer::from_writer(Vec::new());
-    let mut head = vec!["review_id", "product_id", "product_name", "status", "rating", "title", "body", "name", "date", "verified", "source", "incentivized", "recommend", "reply", "photos", "flags"];
+    let mut head = vec!["review_id", "product_id", "product_name", "status", "rating", "title", "body", "name", "date", "verified", "verified_by_source", "source", "incentivized", "recommend", "reply", "photos", "flags"];
     if with_people {
         head.push("email");
     }
@@ -447,15 +460,17 @@ pub async fn export(state: &AppState, account_id: Uuid, tz: &str, q: &store::Lis
                 cell(&r.display_name),
                 r.reviewed_at.to_rfc3339(),
                 r.verified.to_string(),
+                r.source_verified.to_string(),
                 r.source.clone(),
                 r.incentivized.to_string(),
                 r.recommend.map(|b| b.to_string()).unwrap_or_default(),
                 cell(r.reply.as_deref().unwrap_or("")),
                 photos.to_string(),
-                r.flags.join(" "),
+                cell(&r.flags.join(" ")),
             ];
             if with_people {
-                rec.push(r.profile_id.and_then(|p| emails.get(&p).cloned()).unwrap_or_default());
+                // An address is typed by a person too: guarded like every other typed cell.
+                rec.push(cell(&r.profile_id.and_then(|p| emails.get(&p).cloned()).unwrap_or_default()));
             }
             w.write_record(&rec).map_err(|e| AppError::Internal(e.into()))?;
         }

@@ -7,7 +7,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
@@ -94,7 +94,38 @@ fn message(account: &Account, heading: &str, text: &str) -> Response {
 }
 
 fn not_found() -> Response {
-    (StatusCode::NOT_FOUND, Html("<!doctype html><title>Link not found</title><p style=\"font-family:sans-serif;padding:24px\">This review link isn't valid.</p>")).into_response()
+    private((StatusCode::NOT_FOUND, Html("<!doctype html><title>Link not found</title><p style=\"font-family:sans-serif;padding:24px\">This review link isn't valid.</p>")).into_response())
+}
+
+/// Every answer about a review link: never cached anywhere, and never sent on as a referrer.
+pub fn private(mut r: Response) -> Response {
+    let h = r.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    r
+}
+
+/// The cookie that lets the browser that wrote a review see and change it during the edit window.
+fn edit_cookie_name(request_id: Uuid) -> String {
+    format!("rv_{}", request_id.simple())
+}
+
+fn edit_cookie_value(state: &AppState, review_id: Uuid) -> String {
+    crate::auth::sign(&state.cfg.secret_key, &format!("rve{}", review_id.simple()))
+}
+
+/// Whether this browser wrote the review (it holds the cookie set when it was submitted).
+fn wrote_it(state: &AppState, headers: &HeaderMap, request_id: Uuid, review_id: Uuid) -> bool {
+    let name = edit_cookie_name(request_id);
+    let want = format!("rve{}", review_id.simple());
+    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).filter_map(|c| c.trim().split_once('=')).any(|(k, v)| {
+        k == name && crate::auth::verify(&state.cfg.secret_key, v).as_deref() == Some(want.as_str())
+    })
+}
+
+fn edit_cookie(state: &AppState, account: &Account, request_id: Uuid, review_id: Uuid) -> String {
+    let secure = if crate::domains::link_base(state, account).starts_with("https://") { "; Secure" } else { "" };
+    format!("{}={}; Path=/e/review/; Max-Age={}; HttpOnly; SameSite=Lax{secure}", edit_cookie_name(request_id), edit_cookie_value(state, review_id), EDIT_HOURS * 3600)
 }
 
 #[derive(Deserialize)]
@@ -111,13 +142,14 @@ pub async fn page(State(state): State<AppState>, Path(token): Path<String>, Quer
         Err(AppError::NotFound(_)) => return not_found(),
         Err(e) => return json_err(e),
     };
-    match render_form(&state, &token, &r, &account, review.as_ref(), q.rating).await {
+    let mine = review.as_ref().is_some_and(|rv| wrote_it(&state, &headers, r.id, rv.id));
+    private(match render_form(&state, &token, &r, &account, review.as_ref(), mine, q.rating).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(error = %e.public_message(), "review page failed");
             message(&account, "Something went wrong", "Please try the link again in a minute.")
         }
-    }
+    })
 }
 
 async fn preview_page(state: &AppState, headers: &HeaderMap) -> Response {
@@ -125,30 +157,34 @@ async fn preview_page(state: &AppState, headers: &HeaderMap) -> Response {
     let host = crate::site::request_host(headers);
     let account: Option<Account> = sqlx::query_as("SELECT * FROM accounts WHERE link_domain = $1").bind(&host).fetch_optional(&state.db).await.ok().flatten();
     let body = r#"<div class="card"><h1 style="font-size:22px;margin:0 0 8px">This is a preview</h1><p style="color:#4b5563;line-height:1.5;margin:0">In a real email this link opens the review form for the person's own purchase.</p></div>"#;
-    match account {
+    private(match account {
         Some(a) => page_html(&a, "Review preview", body).into_response(),
         None => Html(format!("<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>{PAGE_CSS}</style><main>{body}</main>")).into_response(),
-    }
+    })
 }
 
-async fn render_form(state: &AppState, token: &str, r: &Request, account: &Account, review: Option<&Review>, rating: Option<i16>) -> AppResult<Response> {
+/// The form. It shows the item's name and (trusted) image, nothing about the person. During the
+/// edit window the review's own answers show only to the browser that submitted it (`mine`);
+/// anyone else holding the link sees that it was reviewed, and may delete it.
+#[allow(clippy::too_many_arguments)]
+async fn render_form(state: &AppState, token: &str, r: &Request, account: &Account, review: Option<&Review>, mine: bool, rating: Option<i16>) -> AppResult<Response> {
     let s = store::settings(&state.db, account.id).await?;
-    let person = profile(state, r.profile_id).await?;
+    let delete_form = format!(
+        r#"<form method="post" action="{}/e/review/{}/delete" onsubmit="return confirm('Delete your review? This can\'t be undone.')"><button class="link" type="submit">Delete my review</button></form>"#,
+        esc(&crate::domains::link_base(state, account)),
+        esc(token)
+    );
     if let Some(rv) = review {
         if rv.status == "removed" {
-            return Ok(message(account, "Review deleted", "You deleted this review. Thanks for letting us know what you thought."));
+            return Ok(message(account, "Review deleted", "This review was deleted. Thanks for letting us know what you thought."));
         }
-        if !editable(rv) {
-            let body = format!(
-                r#"<div class="card"><h1 style="font-size:22px;margin:0 0 8px">Thanks for your review</h1><p style="color:#4b5563;line-height:1.5">You gave {} {} star{}.</p><form method="post" action="{base}/e/review/{t}/delete" onsubmit="return confirm('Delete your review? This can\'t be undone.')"><button class="link" type="submit">Delete my review</button></form></div>"#,
-                esc(r.name()),
-                rv.rating,
-                if rv.rating == 1 { "" } else { "s" },
-                base = esc(&crate::domains::link_base(state, account)),
-                t = esc(token),
-            );
+        if !editable(rv) || !mine {
+            let body = format!(r#"<div class="card"><h1 style="font-size:22px;margin:0 0 8px">Thanks for your review</h1><p style="color:#4b5563;line-height:1.5">{} has been reviewed with this link.</p>{delete_form}</div>"#, esc(r.name()));
             return Ok(page_html(account, "Your review", &body).into_response());
         }
+    } else if r.submitted_at.is_some() {
+        // Used up for good: a deleted review doesn't free its link.
+        return Ok(message(account, "This link has been used", "A review was already written with this link."));
     } else if r.expires_at <= Utc::now() {
         return Ok(message(account, "This link has expired", "Thanks for thinking of us. This review link is no longer open."));
     }
@@ -157,17 +193,15 @@ async fn render_form(state: &AppState, token: &str, r: &Request, account: &Accou
         Some(rv) => sqlx::query_as("SELECT id FROM review_photos WHERE review_id = $1 ORDER BY position, created_at").bind(rv.id).fetch_all(&state.db).await?,
         None => sqlx::query_as("SELECT id FROM review_photos WHERE request_id = $1 AND review_id IS NULL ORDER BY position, created_at").bind(r.id).fetch_all(&state.db).await?,
     };
-    let subscribed = person.as_ref().is_some_and(|p| p.email_consent == "subscribed");
-    let offer_signup = s.subscribe_form_id.is_some() && !subscribed && person.as_ref().is_some_and(|p| p.email.is_some());
-    // The thank-you code is offered (and the review labelled) only where it can be emailed.
-    let incentive = s.thank_you_coupon.is_some() && subscribed && review.is_none();
-    let default_name = person.as_ref().map(|p| store::default_name(p.first_name.as_deref(), p.last_name.as_deref())).unwrap_or_else(|| "A customer".into());
+    // Nothing here depends on who the person is or what they agreed to.
+    let offer_signup = s.subscribe_form_id.is_some() && review.is_none();
+    let incentive = s.thank_you_coupon.is_some() && review.is_none();
     let data = json!({
         "base": format!("{base}/e/review/{token}"),
         "rating": review.map(|x| x.rating).or(rating.filter(|n| (1..=5).contains(n))),
         "title": review.map(|x| x.title.clone()),
         "body": review.map(|x| x.body.clone()),
-        "name": review.map(|x| x.display_name.clone()).unwrap_or(default_name),
+        "name": review.map(|x| x.display_name.clone()),
         "recommend": review.and_then(|x| x.recommend),
         "answers": review.map(|x| x.answers.clone()).unwrap_or(json!([])),
         "questions": s.questions,
@@ -177,9 +211,10 @@ async fn render_form(state: &AppState, token: &str, r: &Request, account: &Accou
         "max_photos": photos::MAX_PER_REVIEW,
         "max_body": store::MAX_BODY,
     });
+    // The image only when a trusted source supplied it (requests store no other).
     let img = r.item["image_url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")).map(|u| format!(r#"<img src="{}" alt="">"#, esc(u))).unwrap_or_default();
     let incentive_note = if incentive {
-        r#"<p class="note">As a thank-you, we'll email you a discount code for leaving a review, whatever you rate us. Your review will say you received it.</p>"#
+        r#"<p class="note">If you get our emails, we'll email you a discount code as a thank-you for your review, whatever you rate us. Reviews that got one say so.</p>"#
     } else {
         ""
     };
@@ -192,7 +227,7 @@ async fn render_form(state: &AppState, token: &str, r: &Request, account: &Accou
 <div id="q"></div>
 <div class="label" id="rec-l">Would you recommend it?</div><div class="choices" role="radiogroup" aria-labelledby="rec-l"><label><input type="radio" name="rec" value="yes">Yes</label><label><input type="radio" name="rec" value="no">No</label></div>
 <div class="label">Photos <span class="hint">(up to {mp}, optional)</span></div><input type="file" id="ph" accept="image/png,image/jpeg,image/gif,image/webp" multiple aria-label="Add photos"><div class="photos" id="phl"></div>
-<label for="name">Name shown with your review</label><input type="text" id="name" maxlength="{mn}" autocomplete="off">
+<label for="name">Name shown with your review <span class="hint">(leave empty for your first name and last initial)</span></label><input type="text" id="name" maxlength="{mn}" autocomplete="off">
 <div id="su"></div>{incentive_note}
 <p class="note">Reviews are shown as written. We don't publish your email address.</p>
 <button class="primary" type="submit" id="go">{button}</button><div class="err" id="err" role="alert"></div></form>
@@ -205,11 +240,7 @@ async fn render_form(state: &AppState, token: &str, r: &Request, account: &Accou
         mn = store::MAX_NAME,
         mp = photos::MAX_PER_REVIEW,
         button = if review.is_some() { "Save changes" } else { "Submit review" },
-        delete = if review.is_some() {
-            format!(r#"<form method="post" action="{}/e/review/{}/delete" onsubmit="return confirm('Delete your review? This can\'t be undone.')"><button class="link" type="submit">Delete my review</button></form>"#, esc(&base), esc(token))
-        } else {
-            String::new()
-        },
+        delete = if review.is_some() { delete_form.clone() } else { String::new() },
         data = script_json(&data),
         js = PAGE_JS,
     );
@@ -272,17 +303,34 @@ async fn limit_link(state: &AppState, id: Uuid, ip: Option<&str>) -> AppResult<(
 
 pub async fn submit(State(state): State<AppState>, Path(token): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
     let ip = crate::public::client_ip(&headers);
-    let res: AppResult<Value> = async {
+    let res: AppResult<(Value, Option<String>)> = async {
         let (r, account, review) = load(&state, &token).await?;
         limit_link(&state, r.id, ip.as_deref()).await?;
         let b: SubmitBody = serde_json::from_slice(&body).map_err(|_| AppError::bad("send the review as JSON with a rating from 1 to 5"))?;
-        save(&state, &account, &r, review.as_ref(), &b).await
+        // Only the browser that wrote a review may change it.
+        let editing = match &review {
+            Some(rv) if wrote_it(&state, &headers, r.id, rv.id) => Some(rv),
+            Some(_) => return Err(AppError::Conflict("You've already reviewed this. Thank you!".into())),
+            None => None,
+        };
+        let v = save(&state, &account, &r, editing, &b).await?;
+        let cookie = match (editing, v["review_id"].as_str().and_then(|x| x.parse::<Uuid>().ok())) {
+            (None, Some(id)) => Some(edit_cookie(&state, &account, r.id, id)),
+            _ => None,
+        };
+        Ok((v, cookie))
     }
     .await;
-    match res {
-        Ok(v) => Json(v).into_response(),
+    private(match res {
+        Ok((v, cookie)) => {
+            let mut resp = Json(v).into_response();
+            if let Some(c) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+                resp.headers_mut().insert(header::SET_COOKIE, c);
+            }
+            resp
+        }
         Err(e) => e.into_response(),
-    }
+    })
 }
 
 struct Written {
@@ -303,7 +351,9 @@ fn written(s: &store::Settings, b: &SubmitBody, default_name: &str) -> AppResult
     let name = store::plain(b.name.as_deref().unwrap_or(""), store::MAX_NAME).replace('\n', " ");
     let name = if name.is_empty() { default_name.to_string() } else { name };
     let answers = store::check_answers(&s.questions, b.answers.as_ref().unwrap_or(&json!({})))?;
-    let flags = store::flags(&format!("{title}\n{body}\n{name}"), &s.flag_words);
+    // Everything that will be shown is scanned: the title, the text, the name and the answers.
+    let answer_text: Vec<&str> = answers.as_array().into_iter().flatten().filter_map(|a| a["answer"].as_str()).collect();
+    let flags = store::flags(&format!("{title}\n{body}\n{name}\n{}", answer_text.join("\n")), &s.flag_words);
     Ok(Written { rating: b.rating, title, body, name, answers, flags })
 }
 
@@ -316,14 +366,17 @@ async fn save(state: &AppState, account: &Account, r: &Request, existing: Option
     let publish = store::auto_publishes(&s, r.verified, w.rating, &w.flags);
     let mut tx = state.db.begin().await?;
     // The request row is the lock: two submissions with one link can't both write a review.
-    let current: Option<Uuid> = sqlx::query_scalar("SELECT review_id FROM review_requests WHERE id = $1 FOR UPDATE").bind(r.id).fetch_one(&mut *tx).await?;
+    let (current, used): (Option<Uuid>, bool) = sqlx::query_as("SELECT review_id, submitted_at IS NOT NULL FROM review_requests WHERE id = $1 FOR UPDATE").bind(r.id).fetch_one(&mut *tx).await?;
     let review_id = match (current, existing) {
+        // A link writes one review, ever: deleting it doesn't free the link.
+        (None, _) if used => return Err(AppError::Conflict("A review was already written with this link.".into())),
         (None, _) => {
             if r.expires_at <= Utc::now() {
                 return Err(AppError::Conflict("This review link has expired.".into()));
             }
             let id = Uuid::now_v7();
-            let incentivized = s.thank_you_coupon.is_some() && person.email_consent == "subscribed";
+            // Labelled when the thank-you code can actually go to them (they get our emails).
+            let incentivized = s.thank_you_coupon.is_some() && requests::may_ask(&state.db, person.id, "email").await?;
             sqlx::query(
                 "INSERT INTO reviews (id, account_id, subject_id, profile_id, request_id, status, rating, title, body, display_name, recommend, answers, verified,
                     source, incentivized, flags, wants_marketing, confirmed_at)
@@ -400,7 +453,7 @@ async fn save(state: &AppState, account: &Account, r: &Request, existing: Option
 
 /// The person's other open requests from the same ask, with their links.
 async fn other_items(state: &AppState, account: &Account, r: &Request) -> AppResult<Vec<Value>> {
-    let q = format!("SELECT {} FROM review_requests q WHERE q.batch_id = $1 AND q.profile_id = $2 AND q.id <> $3 AND q.review_id IS NULL AND q.expires_at > now() ORDER BY q.created_at LIMIT 6", requests::REQUEST_COLS);
+    let q = format!("SELECT {} FROM review_requests q WHERE q.batch_id = $1 AND q.profile_id = $2 AND q.id <> $3 AND q.submitted_at IS NULL AND q.expires_at > now() ORDER BY q.created_at LIMIT 6", requests::REQUEST_COLS);
     let rows: Vec<Request> = sqlx::query_as(&q).bind(r.batch_id).bind(r.profile_id).bind(r.id).fetch_all(&state.db).await?;
     Ok(rows.iter().map(|o| json!({"name": o.name(), "url": requests::link(state, account, o.id)})).collect())
 }
@@ -411,11 +464,16 @@ pub async fn upload_photo(State(state): State<AppState>, Path(token): Path<Strin
         let (r, _account, review) = load(&state, &token).await?;
         limit_link(&state, r.id, ip.as_deref()).await?;
         match &review {
-            Some(rv) if !editable(rv) => return Err(AppError::Conflict("This review can't be changed any more.".into())),
-            None if r.expires_at <= Utc::now() => return Err(AppError::Conflict("This review link has expired.".into())),
+            Some(rv) if !editable(rv) || !wrote_it(&state, &headers, r.id, rv.id) => return Err(AppError::Conflict("This review can't be changed any more.".into())),
+            None if r.submitted_at.is_some() || r.expires_at <= Utc::now() => return Err(AppError::Conflict("This review link can't take photos any more.".into())),
             _ => {}
         }
-        let enc = photos::reencode(body.to_vec()).await?;
+        // The cap is checked before anything is decoded (and again when the photo is saved).
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM review_photos WHERE request_id = $1").bind(r.id).fetch_one(&state.db).await?;
+        if n >= photos::MAX_PER_REVIEW {
+            return Err(AppError::Conflict(format!("You can add up to {} photos.", photos::MAX_PER_REVIEW)));
+        }
+        let enc = photos::reencode_for(r.account_id, body.to_vec()).await?;
         let id = Uuid::new_v4();
         // Counted and saved under the request's lock, so parallel uploads can't pass the limit.
         let mut tx = state.db.begin().await?;
@@ -439,10 +497,10 @@ pub async fn upload_photo(State(state): State<AppState>, Path(token): Path<Strin
         Ok(json!({"id": id, "url": photos::signed_url(&state, id)}))
     }
     .await;
-    match res {
+    private(match res {
         Ok(v) => Json(v).into_response(),
         Err(e) => e.into_response(),
-    }
+    })
 }
 
 pub async fn delete_photo(State(state): State<AppState>, Path((token, photo)): Path<(String, Uuid)>, headers: HeaderMap) -> Response {
@@ -450,17 +508,17 @@ pub async fn delete_photo(State(state): State<AppState>, Path((token, photo)): P
     let res: AppResult<()> = async {
         let (r, _a, review) = load(&state, &token).await?;
         limit_link(&state, r.id, ip.as_deref()).await?;
-        if review.as_ref().is_some_and(|rv| !editable(rv)) {
+        if review.as_ref().is_some_and(|rv| !editable(rv) || !wrote_it(&state, &headers, r.id, rv.id)) {
             return Err(AppError::Conflict("This review can't be changed any more.".into()));
         }
         sqlx::query("DELETE FROM review_photos WHERE id = $1 AND request_id = $2").bind(photo).bind(r.id).execute(&state.db).await?;
         Ok(())
     }
     .await;
-    match res {
+    private(match res {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
-    }
+    })
 }
 
 /// The author deletes their own review from their link: it's taken down, its words and photos
@@ -479,11 +537,11 @@ pub async fn delete_own(State(state): State<AppState>, Path(token): Path<String>
         Ok(account)
     }
     .await;
-    match res {
+    private(match res {
         Ok(account) => message(&account, "Review deleted", "Your review has been deleted."),
         Err(AppError::NotFound(_)) => not_found(),
         Err(e) => e.into_response(),
-    }
+    })
 }
 
 // ---------- After a review is in ----------
@@ -506,7 +564,7 @@ pub async fn after_submit(state: &AppState, payload: &Value) -> anyhow::Result<(
             account_id,
             profile_id,
             metric: SUBMITTED_METRIC,
-            properties: json!({"rating": rv.rating, "product_id": subject.external_id, "product_name": subject.trusted.then_some(&subject.name), "has_photos": has_photos,
+            properties: json!({"rating": rv.rating, "product_id": subject.external_id, "product_name": subject.trusted_name(), "has_photos": has_photos,
                 "verified": rv.verified, "review_id": rv.id, "source": rv.source}),
             value: None,
             occurred_at: None,
@@ -532,7 +590,7 @@ pub async fn after_submit(state: &AppState, payload: &Value) -> anyhow::Result<(
         if let (Some(coupon), Some(p)) = (s.thank_you_coupon.as_deref(), person.as_ref()) {
             // Claimed before sending: the thank-you goes at most once.
             let claimed: Option<bool> = sqlx::query_scalar("UPDATE reviews SET thanked_at = now() WHERE id = $1 AND thanked_at IS NULL RETURNING true").bind(id).fetch_optional(&state.db).await?;
-            if claimed.is_some() && p.email_consent == "subscribed" {
+            if claimed.is_some() && requests::may_ask(&state.db, p.id, "email").await.map_err(err)? {
                 let content = json!({"subject": format!("Thanks for your review, {}", "{{ first_name|default('friend') }}"), "preheader": "A little thank-you from us", "blocks": [
                     {"type": "heading", "text": "Thank you for your review"},
                     {"type": "text", "html": "<p>We read every review. Here's a thank-you code for your next order.</p>"},
@@ -579,8 +637,18 @@ fn confirm_id(state: &AppState, token: &str) -> Option<Uuid> {
     crate::auth::verify(&state.cfg.secret_key, token)?.strip_prefix("rvc")?.parse().ok()
 }
 
+/// Confirmation emails one address gets a day for public reviews, across every account.
+const ADDRESS_CONFIRMS_PER_DAY: i32 = 3;
+
 /// A review from the website without a link. Off unless the account turns it on. It is unverified,
 /// counts only after the writer confirms their address by email, and is always held for a person.
+///
+/// Nothing here says anything about the address: whether it belongs to a customer, is suppressed,
+/// already has a review waiting, or the account can send email right now, the answer is the same.
+/// At most one review per (normalised) address waits for confirmation per account, and an address
+/// gets at most [`ADDRESS_CONFIRMS_PER_DAY`] confirmation emails a day across all accounts; both
+/// are enforced in the insert. No profile is created or changed until the link is used; the email
+/// goes from a job.
 pub async fn write_public(state: &AppState, account: &Account, b: &WriteBody, ip: Option<&str>) -> AppResult<Value> {
     let s = store::settings(&state.db, account.id).await?;
     if !s.public_reviews {
@@ -599,19 +667,19 @@ pub async fn write_public(state: &AppState, account: &Account, b: &WriteBody, ip
     if !known {
         return Err(AppError::not_found("product"));
     }
-    let email_key = crate::optin::email_key(&email);
-    let rl = crate::features::team::ratelimit::hit;
-    crate::features::team::ratelimit::hit_ip(state, "review-write", ip, 5, 3600).await?;
-    rl(state, &format!("review-write-email:{}:{email_key}", account.id), 3, 86_400).await?;
-    rl(state, &format!("review-write-product:{}:{key}", account.id), 30, 3600).await?;
-    rl(state, &format!("review-write-account:{}", account.id), 500, 3600).await?;
-    let subject = store::subject_for(&state.db, account.id, &key, &store::Hint::default()).await?;
     let sb = SubmitBody { rating: b.rating, title: b.title.clone(), body: b.body.clone(), name: b.name.clone(), recommend: b.recommend, answers: b.answers.clone(), photos: None, subscribe: false };
     let w = written(&s, &sb, "A customer")?;
+    // Limits by visitor and product (nothing about the address).
+    crate::features::team::ratelimit::hit_ip(state, "review-write", ip, 5, 3600).await?;
+    crate::features::team::ratelimit::hit(state, &format!("review-write-product:{}:{key}", account.id), 30, 3600).await?;
+    let subject = store::subject_for(&state.db, account.id, &key, &store::Hint::default()).await?;
+    let email_key = crate::optin::email_key(&email);
+    let done = json!({"ok": true, "confirm": true, "message": "Almost done! Check your inbox and tap the link to confirm your review."});
     let id = Uuid::now_v7();
-    sqlx::query(
+    let mut tx = state.db.begin().await?;
+    let inserted = sqlx::query(
         "INSERT INTO reviews (id, account_id, subject_id, status, rating, title, body, display_name, recommend, answers, verified, source, flags, pending_email, email_key, ip_hash)
-         VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, false, 'public', $10, $11, $12, $13)",
+         VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, false, 'public', $10, $11, $12, $13) ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(account.id)
@@ -626,27 +694,62 @@ pub async fn write_public(state: &AppState, account: &Account, b: &WriteBody, ip
     .bind(&email)
     .bind(&email_key)
     .bind(ip.map(crate::auth::sha256_hex))
-    .execute(&state.db)
-    .await?;
-    // Confirmation emails are capped per inbox and per account, counting every one sent.
-    let capped = rl(state, &format!("review-confirm-inbox:{}:{email_key}", account.id), 3, 86_400).await.is_err() || rl(state, &format!("review-confirm-account:{}", account.id), 200, 3600).await.is_err();
-    if capped {
-        sqlx::query("DELETE FROM reviews WHERE id = $1 AND confirmed_at IS NULL").bind(id).execute(&state.db).await?;
-        return Err(AppError::Busy("We can't take another review from this address right now. Please try again tomorrow.".into()));
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if !inserted {
+        // A review from this address is already waiting for its confirmation here.
+        return Ok(done);
     }
-    let suppressed: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND lower(email) = lower($2) AND email_suppressed_reason IS NOT NULL)")
-        .bind(account.id)
+    // The address's daily allowance across all accounts, taken in the same transaction.
+    let allowed: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO review_address_limits (email_key, day, sent) VALUES ($1, (now() AT TIME ZONE 'America/Los_Angeles')::date, 1)
+         ON CONFLICT (email_key, day) DO UPDATE SET sent = review_address_limits.sent + 1 WHERE review_address_limits.sent < $2 RETURNING sent",
+    )
+    .bind(crate::auth::sha256_hex(&format!("rv-addr:{email_key}")))
+    .bind(ADDRESS_CONFIRMS_PER_DAY)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if allowed.is_none() {
+        return Ok(done);
+    }
+    crate::jobs::enqueue(&mut *tx, "reviews_confirm", json!({"review_id": id}), None).await?;
+    tx.commit().await?;
+    Ok(done)
+}
+
+/// Job: email a public review's confirmation link, once. Nothing goes to a suppressed address, from
+/// a paused account, or past the account's hourly cap; the writer is never told which. No profile
+/// is made for the address: the send is kept for bounce and complaint counts only.
+pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let err = |e: AppError| anyhow::anyhow!(e.public_message());
+    let Some(id) = payload["review_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "UPDATE reviews SET confirm_sent_at = now() WHERE id = $1 AND source = 'public' AND confirmed_at IS NULL AND confirm_sent_at IS NULL RETURNING account_id, pending_email",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((account_id, Some(email))) = claimed else { return Ok(()) };
+    let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(err)?;
+    let suppressed: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND email = $2 AND email_suppressed_reason IS NOT NULL)")
+        .bind(account_id)
         .bind(&email)
         .fetch_one(&state.db)
         .await?;
-    let done = json!({"ok": true, "confirm": true, "message": "Almost done! Check your inbox and tap the link to confirm your review."});
-    if suppressed {
-        return Ok(done);
+    if suppressed || account.sending_paused_at.is_some() {
+        return Ok(());
     }
-    // The confirmation email is kept against a profile, as every sent email is; the review is
-    // attached to it only once the address is confirmed.
-    let p = crate::audience::upsert_profile_public(&state.db, account.id, &ProfileInput { email: Some(email.clone()), ..Default::default() }).await?.profile;
-    let url = format!("{}/e/review-confirm/{}", crate::domains::link_base(state, account), confirm_token(state, id));
+    if crate::features::team::ratelimit::hit(state, &format!("review-confirm-account:{account_id}"), 200, 3600).await.is_err() {
+        tracing::warn!(account = %account_id, "public review confirmations for the hour used up; one not sent");
+        return Ok(());
+    }
+    let Some(from_email) = account.from_email.clone() else { return Ok(()) };
+    if state.email.name() == "ses" && crate::sending::check_sender_domain_name(&account, &from_email).is_err() {
+        return Ok(());
+    }
+    let url = format!("{}/e/review-confirm/{}", crate::domains::link_base(state, &account), confirm_token(state, id));
     let copy = crate::optin::ConfirmCopy {
         subject: &format!("Confirm your review for {}", account.name),
         heading: "Confirm your review",
@@ -655,14 +758,25 @@ pub async fn write_public(state: &AppState, account: &Account, b: &WriteBody, ip
         button: "Confirm my review",
         didnt: "write a review",
     };
-    match crate::optin::deliver(state, account, p.id, &email, crate::optin::confirm_email(account, &url, &copy)).await? {
-        Ok(()) => Ok(done),
-        Err(why) => {
-            tracing::warn!(account = %account.id, reason = %why, "review confirmation couldn't be sent; review dropped");
-            sqlx::query("DELETE FROM reviews WHERE id = $1 AND confirmed_at IS NULL").bind(id).execute(&state.db).await?;
-            Err(AppError::Conflict("We couldn't send your confirmation email right now. Please try again later.".into()))
-        }
+    let (subject, html, text) = crate::optin::confirm_email(&account, &url, &copy);
+    let message_id = Uuid::now_v7();
+    let out = crate::providers::email::OutgoingEmail {
+        message_id,
+        to: email,
+        from_name: account.from_name.clone().unwrap_or_else(|| account.name.clone()),
+        from_email,
+        reply_to: account.reply_to.clone(),
+        subject,
+        html,
+        text,
+        unsubscribe_url: None,
+    };
+    crate::sending::throttle_email(state).await;
+    match state.email.send(&out).await {
+        Ok(provider_id) => crate::deliverability::record_confirmation_send(&state.db, message_id, &provider_id, account_id).await?,
+        Err(e) => tracing::warn!(account = %account_id, error = %format!("{e:#}"), "public review confirmation not sent"),
     }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -685,11 +799,11 @@ pub async fn write_public_h(State(state): State<AppState>, Query(q): Query<KeyQu
 }
 
 pub async fn confirm_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, false).await
+    private(confirm_response(&state, &token, false).await)
 }
 
 pub async fn confirm_post(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, true).await
+    private(confirm_response(&state, &token, true).await)
 }
 
 /// Like double opt-in, confirming takes a button press (a POST), so link scanners can't confirm.
