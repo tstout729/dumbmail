@@ -333,6 +333,8 @@ struct Calls {
     /// When set, the stand-in hands the run to another worker while answering (as if this worker's
     /// lease had run out and someone else picked the run up).
     steal: Option<(sqlx::PgPool, Uuid)>,
+    /// When set, the run's lease runs out while the stand-in answers (nobody else takes it).
+    expire: Option<(sqlx::PgPool, Uuid)>,
 }
 
 /// A stand-in for `POST /v1/messages`: answers each string with "DE:" in front of it, keeping its
@@ -348,15 +350,21 @@ async fn mock_anthropic() -> (Arc<Mutex<Calls>>, String) {
             axum::routing::post(|State(c): State<Arc<Mutex<Calls>>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
                 let key = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                 let version = headers.get("anthropic-version").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                let steal = {
+                let (steal, expire) = {
                     let mut c = c.lock().unwrap();
                     c.requests.push((body.clone(), key, version));
-                    c.steal.clone()
+                    (c.steal.clone(), c.expire.clone())
                 };
                 if let Some((db, job)) = steal {
                     sqlx::query("UPDATE translation_jobs SET lease_owner = gen_random_uuid() WHERE id = $1").bind(job).execute(&db).await.unwrap();
                 }
+                if let Some((db, job)) = expire {
+                    sqlx::query("UPDATE translation_jobs SET lease_until = now() - interval '1 second' WHERE id = $1").bind(job).execute(&db).await.unwrap();
+                }
                 let text = body["messages"][0]["content"].as_str().unwrap().to_string();
+                if text.contains("SLOW") {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
                 if text.contains("FAIL500") {
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, [("retry-after", "0")], axum::Json(json!({"type": "error"}))).into_response();
                 }
@@ -1140,7 +1148,10 @@ async fn one_worker_owns_a_draft_run_and_a_failed_run_still_counts() {
     assert_eq!(strings, json!([]));
     assert_eq!(calls.lock().unwrap().requests.len(), 3, "tried three times");
     assert_eq!(sent, chars, "everything was sent");
-    assert_eq!(used_today(&h).await, i64::from(chars), "and it counts against today's allowance");
+    assert_eq!(chars, 16, "counted in the original text's characters");
+    let again: i32 = sqlx::query_scalar("SELECT retry_chars FROM translation_jobs WHERE id = $1::uuid").bind(&job).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(again, 2 * chars, "each try after the first counts again");
+    assert_eq!(used_today(&h).await, i64::from(3 * chars), "every try counts against today's allowance");
     // A failure that won't pass isn't tried again.
     let before = calls.lock().unwrap().requests.len();
     let (_, job) = start_draft_run(&mut h, "FAIL400 now").await;
@@ -1434,5 +1445,48 @@ async fn system_texts_are_read_for_exactly_the_language_needed() {
     let m = h.state.email.sent().into_iter().find(|m| m.to == "ann@x.test").unwrap();
     let (_, _, page) = h.raw("GET", m.unsubscribe_url.unwrap().trim_start_matches("https://pl.test"), &[], "").await;
     assert!(page.contains("Ciao les mails"), "{page}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_expired_lease_cant_do_anything() {
+    let Some((mut h, calls)) = draft_harness(0.0).await else { return };
+    // The lease runs out while the model answers (nobody else has taken the run): the worker can't
+    // save the drafts or end the run.
+    let (cid, job) = start_draft_run(&mut h, "Expired").await;
+    calls.lock().unwrap().expire = Some((h.state.db.clone(), job.parse().unwrap()));
+    h.drain().await;
+    calls.lock().unwrap().expire = None;
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    assert!(v["strings"].as_array().unwrap().iter().all(|s| s["status"] == "missing"), "{v}");
+    let (status, ..) = job_row(&h, &job).await;
+    assert_eq!(status, "running", "an expired worker can't end it");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM translation_jobs WHERE id = $1::uuid AND translated = 0 AND sent_chars = 0").bind(&job).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(n, 1, "and wrote no progress");
+    sqlx::query("UPDATE translation_jobs SET status = 'failed', strings = '[]', lease_owner = NULL WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+
+    // A request gets only the time left in the run: with five seconds left, a model that takes 30
+    // isn't waited for, and the run ends failed.
+    let (cid, job) = start_draft_run(&mut h, "SLOW one").await;
+    sqlx::query("UPDATE translation_jobs SET started_at = now() - interval '595 seconds' WHERE id = $1::uuid").bind(&job).execute(&h.state.db).await.unwrap();
+    let t = std::time::Instant::now();
+    h.drain().await;
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    let (status, error, strings, ..) = job_row(&h, &job).await;
+    assert_eq!((status.as_str(), strings), ("failed", json!([])), "{error:?}");
+    let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
+    assert!(v["strings"].as_array().unwrap().iter().all(|s| s["status"] == "missing"), "{v}");
+
+    // The worker itself fails (here: the glossary can't be read): the run ends failed and its
+    // copied text is cleared at once, not left for the queue.
+    let (_, job) = start_draft_run(&mut h, "Broken").await;
+    sqlx::query("ALTER TABLE translation_glossary RENAME TO translation_glossary_away").execute(&h.state.db).await.unwrap();
+    let res = dumbmail::features::translations::draft::run(&h.state, &json!({"job_id": job})).await;
+    sqlx::query("ALTER TABLE translation_glossary_away RENAME TO translation_glossary").execute(&h.state.db).await.unwrap();
+    assert!(res.is_ok(), "{res:?}");
+    let (status, error, strings, ..) = job_row(&h, &job).await;
+    assert_eq!((status.as_str(), strings), ("failed", json!([])));
+    assert!(error.unwrap().contains("went wrong"));
+    h.drain().await;
     h.cleanup().await;
 }

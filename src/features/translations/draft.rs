@@ -6,14 +6,17 @@
 //! transaction. At most one run per account is queued or running (a unique index).
 //!
 //! One worker owns a run at a time: it takes a lease (owner and expiry) and renews it between
-//! batches, and every write (drafts, charge, progress) happens in one transaction that first
-//! checks it still holds the lease and the run is still running. A run has [`MAX_RUN`] in all;
-//! past that it ends failed. The model is called with no database connection held; failures that
-//! may pass (busy, a server problem, no answer in time) are tried again within that bound,
-//! honouring `Retry-After`; others end the run, saying how many texts weren't drafted.
-//! Characters count against the daily limit once they're sent, whether or not what came back was
-//! usable; only characters never sent are given back. The copied text is cleared whenever a run
-//! ends. Drafts are written only where the default text is still the one that was translated and
+//! batches. Every renewal, write (drafts, progress) and the run's end is conditional, in the same
+//! statement, on this worker holding the lease and the lease not having run out, so a worker that
+//! lost track of time can't do anything. A run has [`MAX_RUN`] in all; past that it ends failed,
+//! and each request to the model may take only the time left in the run and the lease. The model
+//! is called with no database connection held; failures that may pass (busy, a server problem, no
+//! answer in time) are tried again within that bound, honouring `Retry-After` (the lease is kept
+//! renewed while waiting); others end the run, saying how many texts weren't drafted. Every try's
+//! characters count against the daily limit as they're sent, whether or not what came back was
+//! usable; only characters never sent are given back. If the worker itself fails, the run is
+//! marked failed and its copied text cleared (conditional on the lease) rather than left for the
+//! queue. The copied text is cleared whenever a run ends. Drafts are written only where the default text is still the one that was translated and
 //! nobody has put a reviewed translation there meanwhile.
 
 use std::collections::BTreeMap;
@@ -191,7 +194,7 @@ async fn finish(state: &AppState, id: Uuid, owner: Uuid, status: &str, error: Op
     let mut tx = state.db.begin().await?;
     let row: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "UPDATE translation_jobs SET status = $3, error = $4, strings = '[]', lease_owner = NULL, finished_at = now()
-         WHERE id = $1 AND lease_owner = $2 AND status = 'running' RETURNING account_id, created_at",
+         WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() RETURNING account_id, created_at",
     )
     .bind(id)
     .bind(owner)
@@ -216,7 +219,7 @@ async fn finish(state: &AppState, id: Uuid, owner: Uuid, status: &str, error: Op
 
 /// Renew this worker's lease. False: it no longer holds the run (it must stop).
 async fn renew(state: &AppState, id: Uuid, owner: Uuid) -> sqlx::Result<bool> {
-    let n = sqlx::query("UPDATE translation_jobs SET lease_until = now() + make_interval(secs => $3) WHERE id = $1 AND lease_owner = $2 AND status = 'running'")
+    let n = sqlx::query("UPDATE translation_jobs SET lease_until = now() + make_interval(secs => $3) WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now()")
         .bind(id)
         .bind(owner)
         .bind(LEASE_SECS as f64)
@@ -250,7 +253,7 @@ enum Written {
 #[allow(clippy::too_many_arguments)]
 async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, target: &Target, scheduled_ok: bool, lang: &str, default_lang: &str, hashes: &BTreeMap<String, String>, batch_no: usize, b: &BatchResult) -> anyhow::Result<Written> {
     let mut tx = state.db.begin().await?;
-    let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM translation_jobs WHERE id = $1 AND lease_owner = $2 AND status = 'running' FOR UPDATE").bind(id).bind(owner).fetch_optional(&mut *tx).await?;
+    let held: Option<Uuid> = sqlx::query_scalar("SELECT id FROM translation_jobs WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() FOR UPDATE").bind(id).bind(owner).fetch_optional(&mut *tx).await?;
     if held.is_none() {
         return Ok(Written::Lost);
     }
@@ -310,11 +313,47 @@ async fn write_batch(state: &AppState, id: Uuid, owner: Uuid, account_id: Uuid, 
     Ok(Written::Ok)
 }
 
-/// One request, tried again within the run's bound when the failure may pass.
-async fn translate_with_retries(state: &AppState, id: Uuid, owner: Uuid, deadline: std::time::Instant, req: &ai::Request<'_>) -> anyhow::Result<Result<BTreeMap<String, String>, ai::Failure>> {
+/// The time a request may take: what's left of the run, and of a freshly renewed lease (with room
+/// to write the answer).
+fn request_time(deadline: std::time::Instant) -> std::time::Duration {
+    deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs((LEASE_SECS - 20) as u64))
+}
+
+/// Count `chars` more characters (a text sent again) against today's limit, if this worker still
+/// holds the run. Err(why) when it can't go on.
+async fn count_again(state: &AppState, id: Uuid, owner: Uuid, chars: i64) -> anyhow::Result<Result<(), &'static str>> {
+    let mut tx = state.db.begin().await?;
+    let held: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM translation_jobs WHERE id = $1 AND lease_owner = $2 AND status = 'running' AND lease_until > now() FOR UPDATE").bind(id).bind(owner).fetch_optional(&mut *tx).await?;
+    let Some(account_id) = held else { return Ok(Err("the run was taken over")) };
+    let counted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO translation_usage AS u (account_id, day, chars)
+         SELECT a.id, (now() AT TIME ZONE a.timezone)::date, $2 FROM accounts a WHERE a.id = $1 AND $2 <= $3
+         ON CONFLICT (account_id, day) DO UPDATE SET chars = u.chars + EXCLUDED.chars WHERE u.chars + EXCLUDED.chars <= $3
+         RETURNING chars",
+    )
+    .bind(account_id)
+    .bind(chars)
+    .bind(state.cfg.translation_daily_chars)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if counted.is_none() {
+        return Ok(Err("today's machine translation allowance is used up"));
+    }
+    sqlx::query("UPDATE translation_jobs SET retry_chars = retry_chars + $2 WHERE id = $1").bind(id).bind(chars as i32).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Ok(()))
+}
+
+/// One request (of `chars` source characters), tried again within the run's bound when the
+/// failure may pass. Each try after the first counts against the daily limit before it's sent.
+async fn translate_with_retries(state: &AppState, id: Uuid, owner: Uuid, deadline: std::time::Instant, chars: i64, req: &mut ai::Request<'_>) -> anyhow::Result<Result<BTreeMap<String, String>, ai::Failure>> {
     let mut tries = 0;
     loop {
         tries += 1;
+        req.timeout = request_time(deadline);
+        if req.timeout < std::time::Duration::from_secs(1) {
+            return Ok(Err(ai::Failure::fatal("it took longer than 10 minutes")));
+        }
         match ai::translate(req).await {
             Ok(out) => return Ok(Ok(out)),
             Err(f) if f.transient && tries < TRIES => {
@@ -323,9 +362,20 @@ async fn translate_with_retries(state: &AppState, id: Uuid, owner: Uuid, deadlin
                     return Ok(Err(f));
                 }
                 tracing::info!(job = %id, error = %f, "machine translation will be tried again");
-                tokio::time::sleep(wait).await;
-                if !renew(state, id, owner).await? {
-                    return Ok(Err(ai::Failure::fatal("the run was taken over")));
+                // Wait in steps, keeping the lease.
+                let until = std::time::Instant::now() + wait;
+                loop {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    tokio::time::sleep(left.min(std::time::Duration::from_secs(30))).await;
+                    if !renew(state, id, owner).await? {
+                        return Ok(Err(ai::Failure::fatal("the run was taken over")));
+                    }
+                    if left <= std::time::Duration::from_secs(30) {
+                        break;
+                    }
+                }
+                if let Err(why) = count_again(state, id, owner, chars).await? {
+                    return Ok(Err(ai::Failure::fatal(why)));
                 }
             }
             Err(f) => return Ok(Err(f)),
@@ -334,8 +384,22 @@ async fn translate_with_retries(state: &AppState, id: Uuid, owner: Uuid, deadlin
 }
 
 /// The background job: translate batch by batch, writing each batch's drafts, charge and progress
-/// together, and record the outcome.
+/// together, and record the outcome. A failure of the worker itself ends the run failed (if this
+/// worker still holds it), giving back what was never sent.
 pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let mut held = None;
+    match drive(state, payload, &mut held).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let Some((id, owner, unsent)) = held else { return Err(e) };
+            tracing::error!(job = %id, error = %format!("{e:#}"), "a translation run failed");
+            finish(state, id, owner, "failed", Some("something went wrong while drafting; what was drafted so far is kept"), unsent).await
+        }
+    }
+}
+
+/// [`run`]'s work. `held` is (run, owner, characters not yet sent) once this worker holds the run.
+async fn drive(state: &AppState, payload: &Value, held: &mut Option<(Uuid, Uuid, i64)>) -> anyhow::Result<()> {
     let Some(id) = payload.get("job_id").and_then(|v| v.as_str()).and_then(|v| v.parse::<Uuid>().ok()) else { return Ok(()) };
     let scheduled_ok = payload.get("scheduled_ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let owner = Uuid::now_v7();
@@ -353,6 +417,7 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     .await?;
     let Some((account_id, kind, target_id, part, lang, strings, chars, elapsed, done_ids, sent_before)) = row else { return Ok(()) };
     let unsent = |sent: i64| (i64::from(chars) - sent).max(0);
+    *held = Some((id, owner, unsent(i64::from(sent_before))));
     let elapsed = std::time::Duration::from_secs_f64(elapsed.max(0.0));
     if elapsed >= MAX_RUN {
         return finish(state, id, owner, "failed", Some("it took longer than 10 minutes"), unsent(i64::from(sent_before))).await;
@@ -436,10 +501,12 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         if !renew(state, id, owner).await? {
             return Ok(());
         }
-        let sent: i64 = batch.values().map(|t| t.chars().count() as i64).sum();
-        let req = ai::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch };
-        let answer = translate_with_retries(state, id, owner, deadline, &req).await?;
+        // Counted in the original text's characters, the same as what was reserved.
+        let sent: i64 = batch.keys().map(|fid| source_of(fid).chars().count() as i64).sum();
+        let mut req = ai::Request { base_url: state.cfg.anthropic_api_base.as_deref(), api_key: &key, source_lang: &source_lang, target_lang: &lang, glossary: &glossary, strings: batch, timeout: request_time(deadline) };
         sent_total += sent;
+        *held = Some((id, owner, unsent(sent_total)));
+        let answer = translate_with_retries(state, id, owner, deadline, sent, &mut req).await?;
         let out = match answer {
             Ok(out) => out,
             Err(f) => {

@@ -154,6 +154,8 @@ pub struct Request<'a> {
     pub glossary: &'a [Term],
     /// id → protected text
     pub strings: &'a BTreeMap<String, String>,
+    /// How long this request may take (the time left in the run and its lease).
+    pub timeout: Duration,
 }
 
 fn system_prompt(r: &Request<'_>) -> String {
@@ -263,6 +265,7 @@ pub async fn translate(r: &Request<'_>) -> Result<BTreeMap<String, String>, Fail
         .header("anthropic-version", API_VERSION)
         .header("anthropic-beta", FALLBACK_BETA)
         .header("content-type", "application/json")
+        .timeout(r.timeout.min(TIMEOUT))
         .body(body)
         .send()
         .await
