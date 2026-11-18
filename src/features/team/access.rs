@@ -196,6 +196,9 @@ pub enum Perm {
     /// The account's two-factor requirement. Browser sessions only.
     Security,
     AuditRead,
+    /// Bring in a whole customer list and its consent from another platform (connect it, start, pause,
+    /// resume or cancel an import, choose how people who never subscribed are treated). Admins and owners.
+    Import,
     /// Owners only, in a browser: single sign-on settings. Ownership changes also need a fresh
     /// password or code (see [`require_fresh_sign_in`]).
     Ownership,
@@ -258,6 +261,7 @@ impl Perm {
         Perm::ApiKeys,
         Perm::Security,
         Perm::AuditRead,
+        Perm::Import,
         Perm::Ownership,
         Perm::WebhooksRead,
         Perm::WebhooksManage,
@@ -308,6 +312,7 @@ impl Perm {
             ApiKeys => "api_keys.manage",
             Security => "security.manage",
             AuditRead => "audit.read",
+            Import => "imports.manage",
             Ownership => "ownership.transfer",
             WebhooksRead => "webhooks.read",
             WebhooksManage => "webhooks.manage",
@@ -325,7 +330,7 @@ impl Perm {
             Public | Me | Mcp | OwnLogin | TwoFactorStep | SwitchAccount | ConfirmIdentity | Security | Ownership | TransactionalSend => return None,
             AudienceRead | ProfilesRead => (Area::Audience, false),
             // An export copies people's data out, so a read-only key can't start or fetch one.
-            AudienceWrite | Export => (Area::Audience, true),
+            AudienceWrite | Export | Import => (Area::Audience, true),
             MessagingRead => (Area::Messaging, false),
             CampaignDraft | TestSend | CampaignManage | CampaignSend | FlowEdit | FlowLive => (Area::Messaging, true),
             ContentRead => (Area::Content, false),

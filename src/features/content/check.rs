@@ -893,6 +893,7 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
             ab_test_ends_at: None,
             ab_winner: None,
             send_options: None,
+            import_review: None,
         },
     };
     if !may_read_people {
