@@ -671,18 +671,58 @@ fn merge_keys(current: &Map<String, Value>, add: &Map<String, Value>) -> Map<Str
     out
 }
 
-/// Add an action's `keys` to an existing profile (under a row lock, so two deliveries can't lose
-/// each other's values).
-async fn add_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<()> {
+/// Take each key value for this account (in a fixed order, so two deliveries never wait on each
+/// other), for the rest of the transaction: while it's held, no other delivery can give the same
+/// value to another profile.
+async fn lock_key_values(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid, keys: &Map<String, Value>) -> AppResult<()> {
+    let mut names: Vec<String> = keys.iter().map(|(k, v)| format!("{account_id}\n{k}\n{}", key_text(v))).collect();
+    names.sort();
+    for n in names {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7031))").bind(n).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// The keys of `add` whose value another profile in the account already holds.
+async fn keys_held_elsewhere(db: &mut sqlx::PgConnection, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<Vec<String>> {
+    let mut taken = Vec::new();
+    for (k, v) in add {
+        let Some(v) = v.as_str() else { continue };
+        let other: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM profiles WHERE account_id = $1 AND id <> $2 AND integration_keys <> '{}' AND (integration_keys @> $3 OR integration_keys @> $4) LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(profile_id)
+        .bind(json!({k: v}))
+        .bind(json!({k: [v]}))
+        .fetch_optional(&mut *db)
+        .await?;
+        if other.is_some() {
+            taken.push(k.clone());
+        }
+    }
+    Ok(taken)
+}
+
+/// Add an action's `keys` to an existing profile, each value for one profile only: a value another
+/// profile already holds is refused (and returned), never shared. The values are taken under an
+/// account-wide lock and the profile's row lock, so two deliveries can't both claim a value or
+/// lose each other's.
+async fn add_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, add: &Map<String, Value>) -> AppResult<Vec<String>> {
     if add.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = state.db.begin().await?;
+    lock_key_values(&mut tx, account_id, add).await?;
     let cur: Value = sqlx::query_scalar("SELECT integration_keys FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(profile_id).bind(account_id).fetch_one(&mut *tx).await?;
-    let merged = merge_keys(cur.as_object().unwrap_or(&Map::new()), add);
-    sqlx::query("UPDATE profiles SET integration_keys = $3 WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).bind(Value::Object(merged)).execute(&mut *tx).await?;
+    let taken = keys_held_elsewhere(&mut tx, account_id, profile_id, add).await?;
+    let kept: Map<String, Value> = add.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    if !kept.is_empty() {
+        let merged = merge_keys(cur.as_object().unwrap_or(&Map::new()), &kept);
+        sqlx::query("UPDATE profiles SET integration_keys = $3 WHERE id = $1 AND account_id = $2").bind(profile_id).bind(account_id).bind(Value::Object(merged)).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(taken)
 }
 
 /// Remember the plain property values an integration wrote, so later lookups by them can trust them.
@@ -691,12 +731,16 @@ async fn save_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, props: 
     if keys.is_empty() {
         return Ok(());
     }
+    // Under the same per-value locks as `add_keys`, so its check for another holder sees this write.
+    let mut tx = state.db.begin().await?;
+    lock_key_values(&mut tx, account_id, &keys).await?;
     sqlx::query("UPDATE profiles SET integration_keys = integration_keys || $3 WHERE id = $1 AND account_id = $2")
         .bind(profile_id)
         .bind(account_id)
         .bind(Value::Object(keys))
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -992,13 +1036,16 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     out.effect(i, format!("skipped adding keys: no profile has {}", who_label(&k.profile)));
                     continue;
                 };
-                let names: Vec<&str> = k.keys.keys().map(String::as_str).collect();
-                if dry {
-                    out.effect(i, format!("would add {} to {}", names.join(", "), who_label(&k.profile)));
+                let taken = if dry { keys_held_elsewhere(&mut *state.db.acquire().await?, src.account_id, found.id, &k.keys).await? } else { add_keys(state, src.account_id, found.id, &k.keys).await? };
+                let names: Vec<&str> = k.keys.keys().map(String::as_str).filter(|n| !taken.iter().any(|t| t == n)).collect();
+                if !taken.is_empty() {
+                    out.effect(i, format!("{} {} to {}: another profile already has that value", if dry { "wouldn't add" } else { "didn't add" }, taken.join(", "), who_label(&k.profile)));
+                }
+                if names.is_empty() {
+                    out.counts.skipped += 1;
                     continue;
                 }
-                add_keys(state, src.account_id, found.id, &k.keys).await?;
-                out.effect(i, format!("added {} to {}", names.join(", "), who_label(&k.profile)));
+                out.effect(i, format!("{} {} to {}", if dry { "would add" } else { "added" }, names.join(", "), who_label(&k.profile)));
             }
             Action::Unsubscribe(u) => {
                 let Some(found) = resolve(state, src, &u.profile, dry, out).await? else {

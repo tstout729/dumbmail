@@ -1389,6 +1389,43 @@ async fn one_fetch_per_record_waits_for_its_due_time_and_keeps_its_room() {
     h.cleanup().await;
 }
 
+// ---------- Framework: an integration key belongs to one profile ----------
+
+#[tokio::test]
+async fn add_keys_gives_a_value_to_one_profile_only() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "Keys", "script": "function handle(i) { return i.payload.actions }", "metrics": ["Signed Contract"]}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    let send = |actions: Value| {
+        let (h, path) = (&h, path.clone());
+        async move {
+            h.raw("POST", &path, &[("content-type", "application/json")], &json!({"actions": actions}).to_string()).await;
+            h.drain().await;
+        }
+    };
+    send(json!([
+        {"type": "upsert_profile", "email": "kim.example@example.com"},
+        {"type": "upsert_profile", "email": "lee.example@example.com"},
+        {"type": "add_keys", "profile": {"email": "kim.example@example.com"}, "keys": {"crm_id": "c-1"}},
+    ]))
+    .await;
+    // Another profile claims the same value: refused and noted, the delivery still succeeds.
+    send(json!([{"type": "add_keys", "profile": {"email": "lee.example@example.com"}, "keys": {"crm_id": "c-1", "crm_alias": "lee-1"}}])).await;
+    let holders: Vec<String> = sqlx::query_scalar("SELECT email FROM profiles WHERE integration_keys @> '{\"crm_id\": [\"c-1\"]}' ORDER BY email").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(holders, vec!["kim.example@example.com"]);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'lee.example@example.com' AND integration_keys @> '{\"crm_alias\": [\"lee-1\"]}'").await, 1, "the other key still goes on");
+    let (status, error, effects): (String, Option<String>, String) =
+        sqlx::query_as("SELECT status, error, COALESCE(result::text, '') FROM integration_deliveries ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), error), ("ok", None));
+    assert!(effects.contains("another profile already has that value"), "{effects}");
+    // Lookups by the value still find the one owner.
+    send(json!([{"type": "track_event", "metric": "Signed Contract", "profile": {"property": "crm_id", "value": "c-1"}}])).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id JOIN profiles p ON p.id = e.profile_id WHERE m.name = 'Signed Contract' AND p.email = 'kim.example@example.com'").await, 1);
+    h.cleanup().await;
+}
+
 // ---------- Shared: a new phone number hasn't agreed to texts ----------
 
 #[tokio::test]
