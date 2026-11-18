@@ -371,6 +371,13 @@ pub struct TypeInput {
     /// remove the rest (without it, the edit is refused with a count).
     #[serde(default)]
     pub convert: bool,
+    /// Fields to stop treating as sensitive. Their stored values and history are deleted first, so
+    /// nothing private becomes visible; needs `confirm: true`. (Resaving a field with
+    /// `sensitive: false` never un-marks it.)
+    #[serde(default)]
+    pub unmark_sensitive: Vec<String>,
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 /// Most objects one type edit checks or converts for a field whose type changed.
@@ -479,10 +486,18 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
     // Sensitivity can't be lost: a field named like a sensitive one taken off this type is sensitive
     // again, and a sensitive field's options (never shown) are kept when an edit sends none.
     let mut removed: Vec<String> = Vec::new();
+    let mut unmark: Vec<String> = Vec::new();
     if let Some(c) = &cur {
         for f in fields.iter_mut() {
-            if c.removed_sensitive.contains(&f.key) {
-                f.sensitive = true;
+            // Only an explicit, confirmed un-mark turns a sensitive field (or the name of one taken
+            // off the type, whose values may not be purged yet) into an ordinary one.
+            let was = c.removed_sensitive.contains(&f.key) || c.field(&f.key).is_some_and(|o| o.sensitive);
+            if was && !f.sensitive {
+                if b.unmark_sensitive.contains(&f.key) {
+                    unmark.push(f.key.clone());
+                } else {
+                    f.sensitive = true;
+                }
             }
             if let Some(old) = c.field(&f.key).filter(|o| o.sensitive && o.kind == Kind::Enum) {
                 if f.kind == Kind::Enum && f.options.is_empty() {
@@ -501,6 +516,15 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
     let created = cur.is_none();
     if let Some(c) = &cur {
         check_stored(&mut tx, c, &fields, b.convert).await?;
+        if !unmark.is_empty() {
+            if !b.confirm {
+                return Err(AppError::bad(format!(
+                    "Un-marking {} as sensitive deletes its stored values and history first, so nothing private becomes visible. Send confirm: true to do it.",
+                    unmark.join(", ")
+                )));
+            }
+            erase_field_values(&mut tx, c.id, &unmark).await?;
+        }
     }
     let row: ObjectType = match cur {
         Some(c) => {
@@ -617,6 +641,28 @@ fn add_inferred(fields: &mut Vec<FieldDef>, values: &Map<String, Value>, removed
         f.sensitive = removed_sensitive.contains(k);
         fields.push(f);
     }
+    Ok(())
+}
+
+/// Delete fields' stored values and their history on every object of a type, in the caller's
+/// transaction (before a sensitive field is un-marked). Bounded like a type edit.
+async fn erase_field_values(conn: &mut PgConnection, type_id: Uuid, keys: &[String]) -> AppResult<()> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE type_id = $1 AND fields ?| $2").bind(type_id).bind(keys).fetch_one(&mut *conn).await?;
+    if n > MAX_CONVERT {
+        return Err(AppError::bad(format!("more than {MAX_CONVERT} objects hold these fields: too many to erase in one edit")));
+    }
+    sqlx::query("SET LOCAL statement_timeout = '60s'").execute(&mut *conn).await?;
+    sqlx::query("UPDATE objects SET fields = fields - $2::text[] WHERE type_id = $1 AND fields ?| $2").bind(type_id).bind(keys).execute(&mut *conn).await?;
+    sqlx::query(
+        "UPDATE object_changes c SET before = c.before - $2::text[], after = c.after - $2::text[],
+            changed = ARRAY(SELECT x FROM unnest(c.changed) x WHERE NOT x = ANY($2))
+         FROM objects o WHERE o.id = c.object_id AND o.type_id = $1 AND (c.before ?| $2 OR c.after ?| $2 OR c.changed && $2)",
+    )
+    .bind(type_id)
+    .bind(keys)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("UPDATE object_types SET removed_sensitive = ARRAY(SELECT x FROM unnest(removed_sensitive) x WHERE NOT x = ANY($2)) WHERE id = $1").bind(type_id).bind(keys).execute(&mut *conn).await?;
     Ok(())
 }
 

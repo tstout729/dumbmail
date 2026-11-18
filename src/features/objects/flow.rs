@@ -485,12 +485,11 @@ pub async fn seed(state: &AppState, mut budget: i64) -> anyhow::Result<()> {
 
 /// Object-date flows: fires waiting, started, filtered and missed, and the next one due.
 pub async fn report(db: &PgPool, f: &FlowRow) -> AppResult<Value> {
-    // Checked against the type as it is now: a date field that's sensitive or gone shows nothing.
+    // Checked against the type as it is now: a date field or filter that's sensitive or gone shows
+    // nothing (counts of fires filtered out would say what a hidden value is).
     if let Ok(t) = flows::parse_trigger(&f.trigger) {
-        if let Some((key, a)) = date_args(&t) {
-            if super::types::check_rule_fields(db, f.account_id, &key, &[a.field.as_str()]).await.is_err() {
-                return Ok(json!({"counts": {}, "next_due_at": null, "hidden": true, "note": "This flow's date field is sensitive or no longer on its type, so it starts nothing and shows nothing."}));
-            }
+        if date_args(&t).is_some() && check_trigger_refs(db, f.account_id, &t).await.is_err() {
+            return Ok(json!({"counts": {}, "next_due_at": null, "hidden": true, "note": "This flow's date field or a filter is sensitive or no longer on its type, so it starts nothing and shows nothing."}));
         }
     }
     let flow_id = f.id;

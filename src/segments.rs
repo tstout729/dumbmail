@@ -28,6 +28,14 @@ pub struct Definition {
     pub match_: Match,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Set by `load` when any rule in it (or in a segment it uses) can't be tested now: the whole
+    /// definition then matches nobody, so no negation ("not in segment") can turn it into everyone.
+    #[serde(skip)]
+    pub blocked: bool,
+    /// Set by `load`: lets the query check each object rule's fields against the type as it is when
+    /// the query runs (a field made sensitive after loading).
+    #[serde(skip)]
+    pub account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,6 +428,8 @@ pub async fn load(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Optio
     // Object rules are checked against each type as it is now: one that names a field the type
     // doesn't define, or marks sensitive, matches nobody (a count would tell who has which value).
     block_object_rules(db, account_id, &mut def.conditions).await?;
+    def.blocked = contains_blocked(&def.conditions);
+    def.account_id = Some(account_id);
     Ok(def)
 }
 
@@ -445,6 +455,16 @@ fn blocked_rules(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
     }
 }
 
+/// Whether any rule here, in a group or in a segment used here, is blocked.
+fn contains_blocked(conds: &[Condition]) -> bool {
+    conds.iter().any(|c| match c {
+        Condition::Object { blocked, .. } => *blocked,
+        Condition::Group { conditions, .. } => contains_blocked(conditions),
+        Condition::Segment { resolved: Some(d), .. } => d.blocked || contains_blocked(&d.conditions),
+        _ => false,
+    })
+}
+
 /// Mark each object condition (in groups and other segments too) whose rules can't be tested now.
 fn block_object_rules<'a>(db: &'a sqlx::PgPool, account_id: Uuid, conds: &'a mut [Condition]) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<()>> + Send + 'a>> {
     Box::pin(async move {
@@ -459,7 +479,10 @@ fn block_object_rules<'a>(db: &'a sqlx::PgPool, account_id: Uuid, conds: &'a mut
                     };
                 }
                 Condition::Group { conditions, .. } => block_object_rules(db, account_id, conditions).await?,
-                Condition::Segment { resolved: Some(d), .. } => block_object_rules(db, account_id, &mut d.conditions).await?,
+                Condition::Segment { resolved: Some(d), .. } => {
+                    block_object_rules(db, account_id, &mut d.conditions).await?;
+                    d.blocked = contains_blocked(&d.conditions);
+                }
                 _ => {}
             }
         }
@@ -1409,7 +1432,44 @@ fn push_conditions(qb: &mut QueryBuilder<'_, Postgres>, m: Match, conds: &[Condi
 
 /// Push a boolean SQL expression for the definition, referencing profile alias `p`.
 pub fn push_definition(qb: &mut QueryBuilder<'_, Postgres>, def: &Definition) {
+    if def.blocked {
+        qb.push("FALSE");
+        return;
+    }
+    let mut rules = Vec::new();
+    object_rule_fields(&def.conditions, &mut rules);
+    rules.retain(|(_, fields)| !fields.is_empty());
+    let Some(account_id) = def.account_id.filter(|_| !rules.is_empty()) else {
+        push_conditions(qb, def.match_, &def.conditions);
+        return;
+    };
+    // The whole definition holds only while every field its object rules test is still on its type
+    // and not sensitive (checked once per query, at its start), so a type edit made after loading
+    // can't make a negated rule match everyone.
+    qb.push("(NOT EXISTS (SELECT 1 FROM object_types gt WHERE gt.account_id = ").push_bind(account_id).push(" AND (");
+    for (i, (key, fields)) in rules.into_iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        qb.push("(gt.key = ").push_bind(key).push(" AND EXISTS (SELECT 1 FROM unnest(").push_bind(fields).push(
+            "::text[]) x WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(gt.fields) e WHERE e->>'key' = x AND e->>'sensitive' IS DISTINCT FROM 'true')))",
+        );
+    }
+    qb.push(")) AND (");
     push_conditions(qb, def.match_, &def.conditions);
+    qb.push("))");
+}
+
+/// Each object rule's type and the fields it tests, in groups and used segments too.
+fn object_rule_fields(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
+    for c in conds {
+        match c {
+            Condition::Object { object_type, where_, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.trim().to_string()).collect())),
+            Condition::Group { conditions, .. } => object_rule_fields(conditions, out),
+            Condition::Segment { resolved: Some(d), .. } => object_rule_fields(&d.conditions, out),
+            _ => {}
+        }
+    }
 }
 
 /// Count profiles in an account matching a definition, plus a sample.

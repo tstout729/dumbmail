@@ -162,11 +162,15 @@ struct TypePatch {
     title_field: Option<String>,
     #[serde(default)]
     convert: bool,
+    #[serde(default)]
+    unmark_sensitive: Vec<String>,
+    #[serde(default)]
+    confirm: bool,
 }
 
 async fn patch_type_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path<String>, ApiJson(b): ApiJson<TypePatch>) -> AppResult<Json<Value>> {
     types::require(&state.db, ctx.account_id, &key).await?;
-    let input = TypeInput { key, name: b.name, plural: b.plural, fields: b.fields, title_field: b.title_field, convert: b.convert };
+    let input = TypeInput { key, name: b.name, plural: b.plural, fields: b.fields, title_field: b.title_field, convert: b.convert, unmark_sensitive: b.unmark_sensitive, confirm: b.confirm };
     Ok(Json(upsert_type(&state, &ctx, input).await?))
 }
 

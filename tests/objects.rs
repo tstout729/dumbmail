@@ -1230,3 +1230,60 @@ async fn sensitive_values_are_never_stored_readable_in_deliveries() {
     assert_eq!(pin.as_deref(), Some("PIN-4417"), "the retry wrote it from the sealed copy");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn sensitive_stays_sensitive_and_rules_on_it_never_match_everyone() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [
+        {"key": "status", "type": "text"}, {"key": "check_in", "type": "date"}, {"key": "pin", "type": "text", "sensitive": true}]}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"status": "confirmed", "check_in": day(5), "pin": "4417"}, "profiles": [{"email": "a@example.com"}]}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"pin": "5512"}}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "nobody@example.com"}))).await;
+    let mut fields: Vec<Value> = h.ok("GET", "/api/object-types/stay", None).await["fields"].as_array().unwrap().clone();
+    let pin_sensitive = |t: &Value| t["fields"].as_array().unwrap().iter().find(|f| f["key"] == "pin").unwrap()["sensitive"].clone();
+    // Resaving it as not sensitive leaves it sensitive.
+    for f in fields.iter_mut() {
+        if f["key"] == "pin" {
+            f["sensitive"] = json!(false);
+        }
+    }
+    let t = h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone()}))).await;
+    assert_eq!(pin_sensitive(&t), true, "{t}");
+    assert!(!h.ok("GET", "/api/object-types/stay/objects", None).await.to_string().contains("5512"));
+    // Un-marking needs confirm, and deletes its values and history first.
+    let (s, _) = h.req("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone(), "unmark_sensitive": ["pin"]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let t = h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone(), "unmark_sensitive": ["pin"], "confirm": true}))).await;
+    assert_eq!(pin_sensitive(&t), Value::Null, "an ordinary field now: {t}");
+    let left: String = sqlx::query_scalar("SELECT concat_ws(' ', (SELECT string_agg(fields::text, ' ') FROM objects), (SELECT string_agg(concat_ws(' ', before::text, after::text), ' ') FROM object_changes))").fetch_one(&h.state.db).await.unwrap();
+    assert!(!left.contains("4417") && !left.contains("5512"), "{left}");
+    // "Not in a segment" whose rule becomes untestable matches nobody, not everyone.
+    let a = h.ok("POST", "/api/segments", Some(json!({"name": "Confirmed", "definition": {"conditions": [{"type": "object", "object_type": "stay", "where": [{"field": "status", "op": "eq", "value": "confirmed"}]}]}}))).await;
+    let b = h.ok("POST", "/api/segments", Some(json!({"name": "Not confirmed", "definition": {"conditions": [{"type": "segment", "segment_id": a["id"], "op": "not_in"}]}}))).await;
+    let b_id: uuid::Uuid = b["id"].as_str().unwrap().parse().unwrap();
+    let members = |id: uuid::Uuid| format!("SELECT count(*) FROM segment_members WHERE segment_id = '{id}'");
+    dumbmail::flows::refresh_segment(&h.state, b_id).await.unwrap();
+    assert_eq!(count(&h, &members(b_id)).await, 1, "just nobody@, while status is testable");
+    let acct = account_of(&h).await;
+    let loaded = dumbmail::segments::load(&h.state.db, acct, &b["definition"], Some(b_id)).await.unwrap();
+    let date_flow = h.ok("POST", "/api/flows", Some(email_flow("Dated", json!({"type": "object_date", "object_type": "stay", "field": "check_in", "offset_days": -1,
+        "filters": [{"field": "status", "op": "eq", "value": "confirmed"}]}), "x"))).await;
+    let report_path = format!("/api/flows/{}/report", date_flow["id"].as_str().unwrap());
+    assert_ne!(h.ok("GET", &report_path, None).await["object_dates"]["hidden"], true);
+    for f in fields.iter_mut() {
+        if f["key"] == "status" {
+            f["sensitive"] = json!(true);
+        }
+    }
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields}))).await;
+    dumbmail::flows::refresh_segment(&h.state, b_id).await.unwrap();
+    assert_eq!(count(&h, &members(b_id)).await, 0, "the negation of an untestable rule matches nobody");
+    // A definition loaded before the edit is checked against the type when its query runs.
+    let (n, _) = dumbmail::segments::preview(&h.state.db, acct, &loaded, 0).await.unwrap();
+    assert_eq!(n, 0, "loaded before status became sensitive");
+    // The date report hides itself when a filter's field becomes sensitive, not just the date's.
+    let report = h.ok("GET", &report_path, None).await;
+    assert_eq!(report["object_dates"]["hidden"], true, "{report}");
+    h.cleanup().await;
+}
