@@ -1,0 +1,15 @@
+{
+	"url": "/api/hooks",
+	"method": "POST",
+	"body": {
+		"url": "{{webhook.url}}",
+		"topic": "{{parameters.topic}}",
+		"metric": "{{parameters.metric}}",
+		"source": "make"
+	},
+	"response": {
+		"data": {
+			"externalHookId": "{{body.id}}"
+		}
+	}
+}

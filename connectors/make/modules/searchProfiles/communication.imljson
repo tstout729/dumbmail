@@ -1,0 +1,19 @@
+{
+	"url": "/api/profiles",
+	"method": "GET",
+	"qs": {
+		"q": "{{parameters.query}}",
+		"limit": 100
+	},
+	"response": {
+		"iterate": "{{body.data}}",
+		"output": "{{item}}",
+		"limit": "{{ifempty(parameters.limit, 10)}}"
+	},
+	"pagination": {
+		"qs": {
+			"offset": "{{(pagination.page - 1) * 100}}"
+		},
+		"condition": "{{length(body.data) == 100}}"
+	}
+}

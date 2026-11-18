@@ -1,0 +1,65 @@
+{
+  "description": "A free (fully discounted) checkout needs no payment: the buyer is updated, but it isn't an order",
+  "expect": [
+    {
+      "email": "casey@example.net",
+      "first_name": "Casey",
+      "type": "upsert_profile"
+    },
+    {
+      "message": "checkout cs_test_free1 needed no payment, so it isn't recorded as an order",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount_subtotal": 4800,
+          "amount_total": 0,
+          "consent": null,
+          "consent_collection": null,
+          "created": 1763402300,
+          "currency": "usd",
+          "customer": null,
+          "customer_creation": "if_required",
+          "customer_details": {
+            "address": {
+              "city": "Portland",
+              "country": "US",
+              "line1": "1 Main St",
+              "line2": null,
+              "postal_code": "97201",
+              "state": "OR"
+            },
+            "email": "casey@example.net",
+            "name": "Casey",
+            "phone": null,
+            "tax_exempt": "none",
+            "tax_ids": []
+          },
+          "customer_email": null,
+          "id": "cs_test_free1",
+          "livemode": false,
+          "metadata": {},
+          "mode": "payment",
+          "object": "checkout.session",
+          "payment_intent": null,
+          "payment_status": "no_payment_required",
+          "status": "complete"
+        }
+      },
+      "id": "evt_cs_free1",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "checkout.session.completed"
+    }
+  }
+}

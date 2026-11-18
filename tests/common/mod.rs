@@ -47,6 +47,7 @@ impl Harness {
             sms_provider: "log".into(),
             telnyx_api_key: None,
             telnyx_messaging_profile_id: None,
+            telnyx_public_key: None,
             twilio_account_sid: None,
             twilio_auth_token: None,
             webhook_secret: "hooksecret".into(),
@@ -56,6 +57,7 @@ impl Harness {
             // Most tests send more than a new account's first-day limit; the warm-up test sets its own.
             warmup_start_daily: 1_000_000,
             workers: 1,
+            background_workers: 1,
             secure_cookies: false,
             stripe_secret_key: None,
             stripe_webhook_secret: Some("whsec_test".into()),
@@ -89,11 +91,29 @@ impl Harness {
         Some(Self { state, router, cookie: None, admin, dbname })
     }
 
-    pub async fn req(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let mut b = Request::builder().method(method).uri(path);
-        if let Some(c) = &self.cookie {
-            b = b.header(header::COOKIE, c);
+    /// What the dashboard adds to a write made with the session cookie: the app's own `Origin`
+    /// and the account the page shows (here: the one the session has open, as after a reload).
+    pub async fn page_headers(&self, method: &str, mut b: axum::http::request::Builder) -> axum::http::request::Builder {
+        let Some(c) = &self.cookie else { return b };
+        b = b.header(header::COOKIE, c);
+        if method == "GET" || method == "HEAD" {
+            return b;
         }
+        b = b.header(header::ORIGIN, self.state.cfg.public_url());
+        let token = c.strip_prefix("pl_session=").unwrap_or("");
+        let open: Option<uuid::Uuid> = sqlx::query_scalar("SELECT account_id FROM sessions WHERE token_hash = $1")
+            .bind(dumbmail::auth::sha256_hex(token))
+            .fetch_optional(&self.state.db)
+            .await
+            .unwrap();
+        match open {
+            Some(a) => b.header("x-dumbmail-account", a.to_string()),
+            None => b,
+        }
+    }
+
+    pub async fn req(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let b = self.page_headers(method, Request::builder().method(method).uri(path)).await;
         let req = match body {
             Some(v) => b.header(header::CONTENT_TYPE, "application/json").body(Body::from(v.to_string())).unwrap(),
             None => b.body(Body::empty()).unwrap(),
@@ -129,10 +149,7 @@ impl Harness {
 
     /// A request with a binary body, sent with this harness's session cookie.
     pub async fn bytes(&self, method: &str, path: &str, content_type: &str, body: Vec<u8>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
-        let mut b = Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, content_type);
-        if let Some(c) = &self.cookie {
-            b = b.header(header::COOKIE, c);
-        }
+        let b = self.page_headers(method, Request::builder().method(method).uri(path).header(header::CONTENT_TYPE, content_type)).await;
         let res = self.router.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
         let status = res.status();
         let h = res.headers().clone();

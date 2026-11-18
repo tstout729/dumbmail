@@ -1,0 +1,103 @@
+{
+  "description": "A delayed payment succeeded: the order is recorded now, keyed by the same Checkout Session id",
+  "expect": [
+    {
+      "consent": [
+        {
+          "channel": "email",
+          "source": "Stripe Checkout promotional emails checkbox",
+          "subscribed": true
+        }
+      ],
+      "email": "jordan@example.com",
+      "first_name": "Jordan",
+      "keys": {
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
+      "last_name": "Lee Park",
+      "phone_number": "+15035550199",
+      "properties": {
+        "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Placed Order",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "currency": "usd",
+        "metadata": {
+          "cart_id": "c_1029"
+        },
+        "order_id": "cs_test_unpaid",
+        "payment_intent": "pi_3QabCdEfGh1234",
+        "source": "stripe_checkout"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:checkout:cs_test_unpaid",
+      "value": 51.84
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount_subtotal": 4800,
+          "amount_total": 5184,
+          "consent": {
+            "promotions": "opt_in",
+            "terms_of_service": null
+          },
+          "consent_collection": {
+            "promotions": "auto",
+            "terms_of_service": "none"
+          },
+          "created": 1763402300,
+          "currency": "usd",
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "customer_creation": "if_required",
+          "customer_details": {
+            "address": {
+              "city": "Portland",
+              "country": "US",
+              "line1": "1 Main St",
+              "line2": null,
+              "postal_code": "97201",
+              "state": "OR"
+            },
+            "email": "jordan@example.com",
+            "name": "Jordan Lee Park",
+            "phone": "+15035550199",
+            "tax_exempt": "none",
+            "tax_ids": []
+          },
+          "customer_email": null,
+          "id": "cs_test_unpaid",
+          "livemode": false,
+          "metadata": {
+            "cart_id": "c_1029"
+          },
+          "mode": "payment",
+          "object": "checkout.session",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "payment_status": "paid",
+          "status": "complete"
+        }
+      },
+      "id": "evt_async_1",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "checkout.session.async_payment_succeeded"
+    }
+  }
+}

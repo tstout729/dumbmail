@@ -18,11 +18,13 @@ import {
 } from "../../api";
 import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
+import { CouponSendCheck } from "../../features/coupons/CouponSendCheck";
 import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
 import {
   addVersion,
@@ -312,6 +314,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
                 defaultTo={campaign.channel === "email" ? user.email : ""}
@@ -351,7 +354,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
       {confirmSend ? (
         <ConfirmDialog
           title="Send this campaign now?"
-          body={localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+          body={
+            <>
+              {localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+              <CouponSendCheck campaignId={campaign.id} />
+            </>
+          }
           confirmLabel="Send now"
           loading={send.isPending || update.isPending}
           onConfirm={async () => {

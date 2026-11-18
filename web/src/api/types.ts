@@ -1,6 +1,8 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+import type { BlockOptions, ContentBlock } from "../features/content/types";
+import type { CouponBlock, CouponCondition } from "../features/coupons/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
@@ -14,6 +16,8 @@ export type ApiErrorCode =
   | "forbidden"
   | "conflict"
   | "limit_reached"
+  | "busy"
+  | "account_changed"
   | "internal";
 
 export type Profile = {
@@ -207,6 +211,7 @@ export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: 
 
 export type Condition =
   | ProductCondition
+  | CouponCondition
   | PropertyCondition
   | EventCondition
   | EventValueCondition
@@ -232,17 +237,21 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock =
+export type EmailBlock = BlockOptions &
+  (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
-  | { type: "image"; src: string; alt?: string; href?: string; width?: number }
+  | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }
   | { type: "button"; text: string; href: string; color?: string; align?: Align }
   | { type: "divider" }
   | { type: "spacer"; height?: number }
   | { type: "columns"; columns: EmailBlock[][] }
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
   | { type: "html"; html: string }
-  | ProductsBlock;
+  | ProductsBlock
+  | ContentBlock
+  | CouponBlock
+  );
 
 export type EmailBlockType = EmailBlock["type"];
 
@@ -314,6 +323,8 @@ export type Campaign = {
   /** When the test slice's wait ends (set once the test slice has gone out). */
   ab_test_ends_at: string | null;
   ab_winner: VersionId | null;
+  /** Why a campaign failed, or (while sending) why it's paused, e.g. a coupon ran out of codes. */
+  error?: string | null;
 };
 
 export type CampaignAbReport = {
@@ -338,11 +349,15 @@ export type CampaignReport = {
 
 // ---- Flows ----
 
+/** With `cancelled_by`, people leave the flow when a later event of those metrics has the same `key` property value. */
+type CancelledBy = { key?: string; cancelled_by?: string[] };
+
 export type FlowTrigger =
-  | { type: "metric"; metric: string; filters?: FieldFilter[] }
+  | ({ type: "metric"; metric: string; filters?: FieldFilter[] } & CancelledBy)
   | { type: "list"; list_id: string }
   | { type: "segment"; segment_id: string }
-  | { type: "date_property"; field: string; offset_days?: number };
+  | { type: "date_property"; field: string; offset_days?: number }
+  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy);
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
@@ -361,6 +376,15 @@ export type RandomSplitNode = {
   id: string;
   type: "random_split";
   percent: number;
+  yes: string | null;
+  no: string | null;
+};
+/** Waits up to `amount` `unit` for the person to text back: `yes` if they did, `no` if not. */
+export type WaitForReplyNode = {
+  id: string;
+  type: "wait_for_reply";
+  amount: number;
+  unit: DelayUnit;
   yes: string | null;
   no: string | null;
 };
@@ -391,6 +415,7 @@ export type FlowNode =
   | SmsNode
   | ConditionNode
   | RandomSplitNode
+  | WaitForReplyNode
   | UpdateProfileNode
   | ListActionNode
   | WebhookNode;
@@ -404,6 +429,8 @@ export type FlowSettings = {
   exit_condition?: SegmentDefinition;
   profile_filter?: SegmentDefinition;
   smart_sending_hours?: number;
+  /** Also send to people held back from marketing (added by an integration without an opt-in). */
+  service_messages?: boolean;
 };
 
 export type FlowDefinition = { entry: string | null; nodes: FlowNode[]; settings?: FlowSettings };
@@ -480,6 +507,12 @@ export type ProfileDetail = {
   segments: Segment[];
   events: EventRow[];
   messages: ProfileMessage[];
+  /** Why email to this profile is suppressed: hard_bounce, complaint, booking_relay or no_marketing. */
+  email_suppressed_reason?: string | null;
+  /** Held back from marketing: added (e.g. by an integration) without agreeing to it. */
+  marketing_hold?: boolean;
+  /** Set when an integration created the profile. */
+  source?: { kind: string; id: string | null; name: string | null } | null;
 };
 
 export type ProfileInput = Partial<
@@ -615,6 +648,8 @@ export type FormConfig = {
   success_body?: string | null;
   discount_code?: string | null;
   // Shared by every version
+  /** A coupon's name: each new sign-up gets their own code from it instead of `discount_code`. */
+  coupon?: string | null;
   legal_text?: string | null;
   success_button_text?: string | null;
   success_button_url?: string | null;

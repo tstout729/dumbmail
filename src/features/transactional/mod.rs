@@ -26,6 +26,34 @@ use crate::state::AppState;
 
 pub struct Module;
 
+use crate::features::team::access::{public, rule, Access, Perm, RouteRule, ToolRule};
+
+/// Sending needs `Perm::TransactionalSend` (keys: the `transactional.send` scope). The log reads
+/// like messages; templates like content. Turning it on is checked again in the handler (the
+/// owner, signed in). The `/admin/` routes check the operator's token themselves.
+static ROUTE_RULES: &[RouteRule] = &[
+    rule("POST", "/api/transactional/send", Perm::TransactionalSend),
+    rule("GET", "/api/transactional/sends", Perm::MessagingRead),
+    rule("GET", "/api/transactional/sends/{id}", Perm::MessagingRead),
+    rule("GET", "/api/transactional/templates", Perm::ContentRead),
+    rule("POST", "/api/transactional/templates", Perm::ContentWrite),
+    rule("POST", "/api/transactional/review", Perm::ContentRead),
+    rule("GET", "/api/transactional/settings", Perm::MessagingRead),
+    rule("PATCH", "/api/transactional/settings", Perm::SettingsWrite),
+    public("POST", "/admin/transactional/unpause"),
+    public("POST", "/admin/transactional/limits"),
+    public("POST", "/admin/transactional/mode"),
+];
+
+static TOOL_RULES: &[ToolRule] = &[
+    ToolRule { name: "send_transactional_email", perm: Perm::TransactionalSend },
+    ToolRule { name: "list_transactional_sends", perm: Perm::MessagingRead },
+    ToolRule { name: "get_transactional_send", perm: Perm::MessagingRead },
+    ToolRule { name: "create_transactional_template", perm: Perm::ContentWrite },
+    ToolRule { name: "list_transactional_templates", perm: Perm::ContentRead },
+    ToolRule { name: "get_transactional_settings", perm: Perm::MessagingRead },
+];
+
 pub const RETRY_JOB: &str = "transactional_retry";
 
 /// Built in the background after startup (see `reports::indexes`), since `messages` is big: hard
@@ -117,6 +145,11 @@ fn check_template_content(content: &Value) -> AppResult<()> {
     if !content.is_object() || serde_json::to_string(content)?.len() > 600 * 1024 {
         return Err(AppError::bad("content must be an email content object (at most 600 KB)"));
     }
+    if let Some(p) = crate::features::content::prepare::transactional_problem(content) {
+        return Err(AppError::bad(p));
+    }
+    // Coupon codes are marketing: not supported in transactional email (see docs/COUPONS.md).
+    crate::features::coupons::template::forbid(content)?;
     let r = review::review(content);
     if r.blocked {
         return Err(AppError::bad(review::blocked_message(&r)));
@@ -230,6 +263,10 @@ fn uuid_arg(a: &Value, k: &str) -> AppResult<Uuid> {
 impl Feature for Module {
     fn name(&self) -> &'static str {
         "transactional"
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTE_RULES, tools: TOOL_RULES }
     }
 
     fn routes(&self) -> Router<AppState> {

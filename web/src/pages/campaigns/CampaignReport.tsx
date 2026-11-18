@@ -65,6 +65,13 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           </>
         }
       />
+      {campaign.status === "sending" && campaign.error ? (
+        <div className="mb-4">
+          <Notice tone="amber" title="Paused">
+            {campaign.error}
+          </Notice>
+        </div>
+      ) : null}
       {ab ? <AbTestResults campaign={campaign} ab={ab} totalRecipients={stats.recipients} timezone={tz} /> : null}
       <SendProgressCard campaignId={campaign.id} live={campaign.status === "sending"} timezone={tz} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">

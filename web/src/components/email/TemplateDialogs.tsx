@@ -1,23 +1,51 @@
-import { type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { LayoutTemplate } from "lucide-react";
 import type { Channel, EmailContent, SmsContent, Template } from "../../api";
 import { useCreateTemplate, useTemplates } from "../../api";
 import { toast } from "../../lib/toast";
 import { formatRelative } from "../../lib/format";
-import { Button, EmptyState, Field, Input, Modal, Skeleton } from "../ui";
+import { Button, EmptyState, Field, Input, Modal, Skeleton, Tabs, cx } from "../ui";
+import { StarterGallery, starterAsTemplate } from "../../features/content/StarterGallery";
 
 export function LoadTemplateDialog({ channel, onPick, onClose }: { channel: Channel; onPick: (t: Template) => void; onClose: () => void }) {
   const templates = useTemplates(channel);
+  const [tab, setTab] = useState<"mine" | "starters">("mine");
+  const [loading, setLoading] = useState(false);
   return (
     <Modal title="Load from template" description="This replaces the current content." onClose={onClose} size="lg">
-      {templates.isPending ? (
+      {channel === "email" ? (
+        <Tabs
+          value={tab}
+          onChange={setTab}
+          tabs={[
+            { value: "mine", label: "Your templates" },
+            { value: "starters", label: "Starter designs" },
+          ]}
+        />
+      ) : null}
+      {tab === "starters" ? (
+        <div className={cx("max-h-[60vh] overflow-y-auto", loading && "pointer-events-none opacity-60")}>
+          <StarterGallery
+            onPick={(s) => {
+              setLoading(true);
+              starterAsTemplate(s.key)
+                .then((t) => {
+                  onPick(t);
+                  onClose();
+                })
+                .catch((e: unknown) => toast.error(e instanceof Error ? e.message : "Couldn't load that design"))
+                .finally(() => setLoading(false));
+            }}
+          />
+        </div>
+      ) : templates.isPending ? (
         <div className="space-y-2">
           {[0, 1, 2].map((i) => (
             <Skeleton key={i} className="h-12 w-full" />
           ))}
         </div>
       ) : (templates.data ?? []).length === 0 ? (
-        <EmptyState icon={<LayoutTemplate className="size-5" />} title="No templates yet" description="Save any message as a template to reuse it here." />
+        <EmptyState icon={<LayoutTemplate className="size-5" />} title="No templates yet" description="Save any message as a template to reuse it here, or start from a starter design." />
       ) : (
         <ul className="max-h-[60vh] divide-y divide-zinc-100 overflow-y-auto rounded-lg border border-zinc-200">
           {(templates.data ?? []).map((t) => (

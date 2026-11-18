@@ -50,6 +50,8 @@ const TOP: &[(&str, Rule)] = &[
     ("success_message", Text(200)),
     ("success_body", Text(1000)),
     ("discount_code", Text(60)),
+    // A coupon's name: each new sign-up gets its own code from it instead of `discount_code`.
+    ("coupon", Text(64)),
     ("legal_text", Text(1000)),
     ("success_button_text", Text(60)),
     ("success_button_url", Url),

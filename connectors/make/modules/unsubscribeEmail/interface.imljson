@@ -1,0 +1,13 @@
+[
+	{ "name": "id", "type": "text", "label": "Profile ID" },
+	{ "name": "email", "type": "email", "label": "Email" },
+	{ "name": "phone_number", "type": "text", "label": "Phone number" },
+	{ "name": "external_id", "type": "text", "label": "External ID" },
+	{ "name": "first_name", "type": "text", "label": "First name" },
+	{ "name": "last_name", "type": "text", "label": "Last name" },
+	{ "name": "properties", "type": "any", "label": "Properties" },
+	{ "name": "email_consent", "type": "text", "label": "Email consent" },
+	{ "name": "sms_consent", "type": "text", "label": "SMS consent" },
+	{ "name": "created_at", "type": "date", "label": "Created at" },
+	{ "name": "updated_at", "type": "date", "label": "Updated at" }
+]

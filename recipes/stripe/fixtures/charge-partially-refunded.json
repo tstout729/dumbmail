@@ -1,0 +1,58 @@
+{
+  "description": "partial refund",
+  "expect": [
+    {
+      "email": "jordan@example.com",
+      "first_name": "Jordan",
+      "keys": {
+        "stripe_charge": "ch_3QabCdEfGh1234",
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
+      "last_name": "Lee Park",
+      "properties": {
+        "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "message": "charge ch_3QabCdEfGh1234 doesn't list its refunds; each refund is recorded from refund.created or refund.updated",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount": 5184,
+          "amount_captured": 5184,
+          "amount_refunded": 2000,
+          "billing_details": {
+            "address": {},
+            "email": "jordan@example.com",
+            "name": "Jordan Lee Park",
+            "phone": null
+          },
+          "currency": "usd",
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "id": "ch_3QabCdEfGh1234",
+          "object": "charge",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "receipt_email": "jordan@example.com",
+          "refunded": false,
+          "status": "succeeded"
+        }
+      },
+      "id": "evt_1QaFFF",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "charge.refunded"
+    }
+  }
+}

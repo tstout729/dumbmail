@@ -1,0 +1,42 @@
+{
+  "description": "An empty search page ends the run",
+  "expect": [
+    {
+      "message": "page 1: no changed reservations",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "page": 1,
+    "payload": {
+      "pagination": {
+        "hasMore": false,
+        "limit": 50,
+        "skip": 0
+      },
+      "results": []
+    },
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "limit",
+          "50"
+        ],
+        [
+          "sort",
+          "lastUpdatedAt"
+        ],
+        [
+          "filter[lastUpdatedAt][gte]",
+          "2026-11-16T18:00:00.000Z"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/reservations-v3/search"
+    },
+    "source": "pull",
+    "state": {}
+  }
+}

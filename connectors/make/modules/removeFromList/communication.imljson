@@ -1,0 +1,14 @@
+{
+	"url": "/api/lists/{{parameters.list_id}}/members",
+	"method": "DELETE",
+	"body": {
+		"profile_ids": ["{{parameters.profile_id}}"]
+	},
+	"response": {
+		"output": {
+			"list_id": "{{parameters.list_id}}",
+			"profile_id": "{{parameters.profile_id}}",
+			"removed": "{{body.removed}}"
+		}
+	}
+}
