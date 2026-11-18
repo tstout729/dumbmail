@@ -28,6 +28,8 @@ const SHOP: &str = "acme-goods.myshopify.com";
 struct Shopify {
     /// Current valid access token (requests with another get 401).
     token: String,
+    /// The app was uninstalled: the refresh token no longer works either.
+    uninstalled: bool,
     tokens_issued: u32,
     refreshes: u32,
     expires_in: Option<i64>,
@@ -107,6 +109,13 @@ fn refund(id: i64, at: &str, txs: &[(&str, &str)], lines: &[(i64, &str)]) -> Val
 
 fn gql_order(id: i64, updated: &str, refunds: Vec<Value>) -> Value {
     json!({"id": format!("gid://shopify/Order/{id}"), "updatedAt": updated, "refunds": refunds})
+}
+
+/// Shopify revokes the app's tokens when it's uninstalled.
+fn uninstall_in_shopify(m: &Mock) {
+    let mut m = m.lock().unwrap();
+    m.token = "revoked-by-uninstall".into();
+    m.uninstalled = true;
 }
 
 fn gql_ok(data: Value) -> (StatusCode, axum::Json<Value>) {
@@ -239,9 +248,15 @@ async fn token(State(m): State<Mock>, axum::Form(f): axum::Form<HashMap<String, 
     let ok = match f.get("grant_type").map(String::as_str) {
         Some("refresh_token") => {
             m.refreshes += 1;
-            f.get("refresh_token").is_some_and(|r| r.starts_with("shprt_"))
+            !m.uninstalled && f.get("refresh_token").is_some_and(|r| r.starts_with("shprt_"))
         }
-        _ => f.get("code").map(String::as_str) == Some("good-code"),
+        _ => {
+            let ok = f.get("code").map(String::as_str) == Some("good-code");
+            if ok {
+                m.uninstalled = false;
+            }
+            ok
+        }
     };
     if !ok {
         return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "invalid_request"})));
@@ -1583,7 +1598,7 @@ async fn discount_codes_belong_to_one_shop_and_grant() {
 
 #[tokio::test]
 async fn privacy_webhooks() {
-    let (_mock, base) = mock_shopify().await;
+    let (mock, base) = mock_shopify().await;
     let mut h = shopify_harness!(base);
     h.signup().await;
     connect(&mut h).await;
@@ -1630,6 +1645,7 @@ async fn privacy_webhooks() {
     h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_shops").await, 1);
     // Uninstalled from Shopify's side: the token goes at once.
+    uninstall_in_shopify(&mock);
     hook(&h, "app/uninstalled", "u1", &json!({"id": 1, "domain": SHOP})).await;
     let (status, tok): (String, Option<String>) = sqlx::query_as("SELECT status, access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((status.as_str(), tok), ("uninstalled", None));
@@ -1716,6 +1732,7 @@ async fn privacy_requests_use_shopify_ids() {
     hook(&h, "products/update", "pu", &json!({"id": 101})).await;
     hook(&h, "orders/create", "o4", &order_body(5006, 2, "bob@example.com", chrono::Utc::now())).await;
     h.drain().await;
+    uninstall_in_shopify(&mock);
     hook(&h, "app/uninstalled", "u1", &json!({})).await;
     sqlx::query("DELETE FROM shopify_shops").execute(&h.state.db).await.unwrap();
     // A body left unprocessed for 30 days is deleted and counted.
@@ -2411,6 +2428,7 @@ async fn closed_accounts_only_get_privacy_requests() {
     h.drain().await;
     assert!(mock.lock().unwrap().consent_updates.iter().any(|u| u["customerId"] == "gid://shopify/Customer/2"), "opt-outs still reach the store");
     // Uninstalling the app still forgets the token and releases the store.
+    uninstall_in_shopify(&mock);
     hook(&h, "app/uninstalled", "u1", &json!({})).await;
     let (status, tok): (String, Option<String>) = sqlx::query_as("SELECT status, access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
     assert_eq!((status.as_str(), tok), ("uninstalled", None));
@@ -2589,5 +2607,58 @@ async fn erasure_waits_for_a_write_in_flight() {
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_customers WHERE customer_id = 7").await, 0, "erased after the write landed");
     // A later write for that customer gets no fence.
     assert!(dumbmail::features::shopify::fence::open(&h.state.db, acct, SHOP, generation, Some(7), None).await.unwrap().is_none());
+    h.cleanup().await;
+}
+
+/// Item 8: old work can't write into a new install; an uninstall counts as handled only once the
+/// disconnect committed; one without a trigger time is checked against the store.
+#[tokio::test]
+async fn old_work_cannot_write_into_a_new_install() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    let gen1: i32 = sqlx::query_scalar("SELECT generation FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    // An Admin API answer read for install 1 lands after the store was reinstalled.
+    let answer = dumbmail::features::shopify::customers::Customer::from_graphql(&customer(9, Some("inflight@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")).unwrap();
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect(&mut h).await;
+    let written = dumbmail::features::shopify::customers::apply(&h.state.db, acct, SHOP, gen1, &answer).await.unwrap();
+    assert!(written.is_none() && profile_id_of(&h, "inflight@example.com").await.is_none(), "install 1's answer wrote nothing");
+    // A worker job queued for install 1 does nothing for install 2.
+    mock.lock().unwrap().customers.insert(9, customer(9, Some("inflight@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    sqlx::query("INSERT INTO shopify_refresh (account_id, kind, shopify_id) VALUES ($1, 'customer', 9)").bind(acct).execute(&h.state.db).await.unwrap();
+    let reads = mock.lock().unwrap().node_reads.len();
+    dumbmail::jobs::enqueue_background(&h.state.db, "shopify_work", json!({"account_id": acct, "generation": gen1}), None).await.unwrap();
+    dumbmail::features::run_job(&h.state, "shopify_work", &json!({"account_id": acct, "generation": gen1})).await.unwrap().unwrap();
+    assert_eq!(mock.lock().unwrap().node_reads.len(), reads, "an old job can't pick up the new install");
+    sqlx::query("DELETE FROM shopify_refresh").execute(&h.state.db).await.unwrap();
+
+    // An uninstall whose disconnect fails is tried again when Shopify delivers it again.
+    sqlx::query("CREATE TABLE fail_forget (n int)").execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO fail_forget VALUES (1)").execute(&h.state.db).await.unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_forget() RETURNS trigger AS $$ BEGIN
+           IF NEW.status = 'uninstalled' AND EXISTS (SELECT 1 FROM fail_forget) THEN RAISE EXCEPTION 'disconnect failed'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER fail_forget BEFORE UPDATE ON shopify_shops FOR EACH ROW EXECUTE FUNCTION fail_forget()").execute(&h.state.db).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    assert_eq!(hook_with(&h, "app/uninstalled", "u1", &json!({}), &[("x-shopify-triggered-at", &now)]).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], true);
+    sqlx::query("DELETE FROM fail_forget").execute(&h.state.db).await.unwrap();
+    assert_eq!(hook_with(&h, "app/uninstalled", "u1", &json!({}), &[("x-shopify-triggered-at", &now)]).await, StatusCode::OK);
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], false, "the redelivery disconnected it");
+    connect(&mut h).await;
+
+    // No trigger time: while the store still accepts this install's token, it's an earlier install's.
+    assert_eq!(hook(&h, "app/uninstalled", "u2", &json!({})).await, StatusCode::OK);
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], true, "a stale uninstall without a time is ignored");
+    uninstall_in_shopify(&mock);
+    assert_eq!(hook(&h, "app/uninstalled", "u3", &json!({})).await, StatusCode::OK);
+    assert_eq!(h.ok("GET", "/api/shopify", None).await["connected"], false, "the store refused the token: really uninstalled");
     h.cleanup().await;
 }

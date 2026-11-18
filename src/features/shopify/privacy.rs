@@ -406,7 +406,7 @@ async fn redact_shop(db: &PgPool, account_id: Uuid, shop: &str) -> anyhow::Resul
     delete_all(
         db,
         "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE account_id = $1 AND metric_id = ANY($5) AND properties->>'shopify_shop' = $2
-            AND COALESCE((properties->>'shopify_generation')::int, 0) <= $4 LIMIT $3)",
+            AND (CASE WHEN properties->>'shopify_generation' ~ '^[0-9]{1,9}$' THEN (properties->>'shopify_generation')::int ELSE 0 END) <= $4 LIMIT $3)",
         account_id,
         shop,
         upto,

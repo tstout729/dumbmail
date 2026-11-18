@@ -12,7 +12,9 @@
 //!   this write waits, sees the marker and writes nothing.
 //!
 //! The item's own writes run on other connections while the fence is open; non-key updates of the
-//! store row (last order time, lease) don't conflict with the share lock.
+//! store row (last order time, lease) don't conflict with the share lock. Fences are never nested
+//! (a second shared request could queue behind a privacy request's exclusive one and wait on its own
+//! first), and a wait times out rather than hangs.
 
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -37,6 +39,8 @@ fn key(account_id: Uuid, shop: &str, kind: &str, id: i64) -> String {
 /// was erased by a privacy request; write nothing.
 pub async fn open(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, customer_id: Option<i64>, order_id: Option<i64>) -> sqlx::Result<Option<Fence>> {
     let mut tx = db.begin().await?;
+    // Fences are never nested; a wait that runs this long is an error, not a hang.
+    sqlx::query("SET LOCAL lock_timeout = '30s'").execute(&mut *tx).await?;
     let current: Option<i32> = sqlx::query_scalar(
         "SELECT generation FROM shopify_shops WHERE account_id = $1 AND shop_domain = $2 AND status = 'connected' FOR KEY SHARE",
     )
@@ -80,6 +84,7 @@ pub async fn open(db: &PgPool, account_id: Uuid, shop: &str, generation: i32, cu
 /// inside a fence finish first; later ones see the markers.
 pub async fn erasing(db: &PgPool, account_id: Uuid, shop: &str, whole_shop: bool, customer_id: Option<i64>, orders: &[i64]) -> sqlx::Result<Transaction<'static, Postgres>> {
     let mut tx = db.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '60s'").execute(&mut *tx).await?;
     let mut keys = Vec::new();
     if whole_shop {
         keys.push(key(account_id, shop, "shop", 0));

@@ -278,9 +278,15 @@ pub async fn refresh(state: &AppState, shop: &ShopRow, ids: &[i64]) -> Result<()
         });
     }
     save(&state.db, shop, &nodes, SaveMode::default()).await.map_err(|_| ApiError::Network("database"))?;
-    for id in ids.iter().filter(|i| !found.contains(i)) {
-        mark_deleted(&state.db, shop, *id).await.map_err(|_| ApiError::Network("database"))?;
+    let gone: Vec<i64> = ids.iter().filter(|i| !found.contains(i)).copied().collect();
+    if gone.is_empty() {
+        return Ok(());
     }
+    let Some(fence) = super::fence::open(&state.db, shop.account_id, &shop.shop_domain, shop.generation, None, None).await.map_err(|_| ApiError::Network("database"))? else { return Ok(()) };
+    for id in gone {
+        mark_deleted(&state.db, shop, id).await.map_err(|_| ApiError::Network("database"))?;
+    }
+    fence.done().await.map_err(|_| ApiError::Network("database"))?;
     Ok(())
 }
 

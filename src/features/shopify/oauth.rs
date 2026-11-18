@@ -326,7 +326,7 @@ async fn save_connection(state: &AppState, account_id: Uuid, user_id: Option<Uui
         .map_err(|_| "failed")?;
     // Work queued for the previous install goes: deliveries (privacy requests stay), items to read,
     // imports.
-    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact')")
+    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact', 'app/uninstalled')")
         .bind(account_id)
         .execute(&mut *tx)
         .await
@@ -630,7 +630,7 @@ pub async fn forget(db: &sqlx::PgPool, account_id: Uuid, status: &str, generatio
     super::events::close_history(&mut tx, account_id).await?;
     sqlx::query("DELETE FROM shopify_refresh WHERE account_id = $1").bind(account_id).execute(&mut *tx).await?;
     // Unprocessed deliveries: privacy requests still get done; the rest is dropped with its data.
-    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact')")
+    sqlx::query("DELETE FROM shopify_webhooks WHERE account_id = $1 AND done_at IS NULL AND topic NOT IN ('customers/data_request', 'customers/redact', 'shop/redact', 'app/uninstalled')")
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
