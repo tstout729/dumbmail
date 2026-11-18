@@ -1,13 +1,15 @@
-import { useState, type FormEvent } from "react";
+import { useDeferredValue, useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { ArrowLeft, Copy, MoreHorizontal, PenLine, Plus, Search, Sparkles, Trash2, Workflow } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, Copy, MoreHorizontal, PenLine, Plus, Search, Sparkles, Tag, Trash2, Workflow } from "lucide-react";
+import { ITEMS_PAGE, useArchive, useItems } from "../../features/campaignsPlus/api";
+import { Pager, TagChips, TagsDialog } from "../../features/campaignsPlus/TagsDialog";
+import type { TagRef } from "../../features/campaignsPlus/types";
 import type { Flow, FlowBlueprint } from "../../api";
 import {
   useBlueprints,
   useCreateFlow,
   useCreateFlowFromBlueprint,
   useDeleteFlow,
-  useFlows,
   useLists,
   useMetrics,
   useSegments,
@@ -18,6 +20,7 @@ import { FlowsSummary } from "../../components/flows/FlowsSummary";
 import { triggerKind, triggerSummary } from "../../components/flows/graph";
 import {
   Button,
+  Checkbox,
   ConfirmDialog,
   EmptyRow,
   EmptyState,
@@ -39,18 +42,24 @@ import {
 import { formatCurrency, formatNumber, formatRelative } from "../../lib/format";
 
 export function FlowsPage() {
-  const flows = useFlows();
+  const [showArchived, setShowArchived] = useState(false);
+  const [q, setQ] = useState("");
+  const search = useDeferredValue(q.trim());
+  const [offset, setOffset] = useState(0);
+  const page = useItems<Flow>("flows", { archived: showArchived, q: search, offset });
+  const flows = { ...page, data: page.data?.data };
+  const archive = useArchive("flows");
+  const [tagging, setTagging] = useState<(Flow & { tags: TagRef[] }) | null>(null);
   const lists = useLists();
   const segments = useSegments();
   const [params, setParams] = useSearchParams();
   const creating = params.get("create") === "1";
   const days = parseRange(params.get("days"));
-  const [q, setQ] = useState("");
   const [deleting, setDeleting] = useState<Flow | null>(null);
   const remove = useDeleteFlow();
   const duplicate = useCreateFlow();
   const navigate = useNavigate();
-  const rows = (flows.data ?? []).filter((f) => f.name.toLowerCase().includes(q.toLowerCase()));
+  const rows = flows.data ?? [];
 
   const openCreate = (on: boolean) => {
     const next = new URLSearchParams(params);
@@ -77,11 +86,27 @@ export function FlowsPage() {
           </Button>
         }
       />
-      {(flows.data ?? []).length > 0 ? <FlowsSummary days={days} onDaysChange={setDays} /> : null}
-      <div className="mb-4 flex justify-end">
+      {!showArchived && (flows.data ?? []).length > 0 ? <FlowsSummary days={days} onDaysChange={setDays} /> : null}
+      <div className="mb-4 flex items-center justify-end gap-3">
+        <Checkbox
+          label="Archived"
+          checked={showArchived}
+          onChange={(e) => {
+            setShowArchived(e.target.checked);
+            setOffset(0);
+          }}
+        />
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-2.5 size-3.5 text-zinc-400" />
-          <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search flows" className="w-56 pl-8" />
+          <Input
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setOffset(0);
+            }}
+            placeholder="Search flows"
+            className="w-56 pl-8"
+          />
         </div>
       </div>
       <Table>
@@ -103,7 +128,7 @@ export function FlowsPage() {
             <EmptyRow cols={7}>
               <EmptyState
                 icon={<Workflow className="size-5" />}
-                title={(flows.data ?? []).length === 0 ? "No flows yet" : "No matches"}
+                title={showArchived ? "No archived flows" : search ? "No matches" : "No flows yet"}
                 description="Start from a proven blueprint like a welcome series or abandoned cart."
                 action={
                   <Button variant="primary" onClick={() => openCreate(true)}>
@@ -118,6 +143,7 @@ export function FlowsPage() {
                 <Td>
                   <div className="font-medium text-zinc-900">{f.name}</div>
                   <div className="text-xs text-zinc-500">Updated {formatRelative(f.updated_at)}</div>
+                  <TagChips tags={f.tags} />
                 </Td>
                 <Td>
                   <StatusBadge status={f.status} />
@@ -146,6 +172,13 @@ export function FlowsPage() {
                             { onSuccess: (d) => navigate(`/flows/${d.id}`) },
                           ),
                       },
+                      { label: "Tags…", icon: <Tag className="size-3.5" />, onSelect: () => setTagging(f) },
+                      {
+                        label: f.archived_at ? "Unarchive" : "Archive",
+                        icon: f.archived_at ? <ArchiveRestore className="size-3.5" /> : <Archive className="size-3.5" />,
+                        disabled: !f.archived_at && f.status === "live",
+                        onSelect: () => archive.mutate({ ids: [f.id], archived: !f.archived_at }),
+                      },
                       { label: "Delete", icon: <Trash2 className="size-3.5" />, danger: true, onSelect: () => setDeleting(f) },
                     ]}
                   />
@@ -155,7 +188,9 @@ export function FlowsPage() {
           )}
         </tbody>
       </Table>
+      <Pager offset={offset} total={page.data?.total ?? 0} page={ITEMS_PAGE} onChange={setOffset} />
       {creating ? <CreateFlowDialog onClose={() => openCreate(false)} /> : null}
+      {tagging ? <TagsDialog kind="flows" id={tagging.id} name={tagging.name} tags={tagging.tags} onClose={() => setTagging(null)} /> : null}
       {deleting ? (
         <ConfirmDialog
           title={`Delete "${deleting.name}"?`}
