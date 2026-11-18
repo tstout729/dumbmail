@@ -83,6 +83,13 @@ impl Harness {
             site_url: None,
             cookie_domain: None,
             google_redirect_base: None,
+            meta_app_id: None,
+            meta_app_secret: None,
+            google_ads_client_id: None,
+            google_ads_client_secret: None,
+            tiktok_app_id: None,
+            tiktok_app_secret: None,
+            ad_platform_api_base: None,
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();
@@ -167,6 +174,15 @@ impl Harness {
 
     pub async fn signup(&mut self) -> Value {
         let v = self.ok("POST", "/api/auth/signup", Some(json!({"email": "owner@acme.test", "password": "correct horse", "company": "Acme Goods"}))).await;
+        // Sign-up emails a link to confirm the address in the background; tests that count the
+        // emails they send start from none.
+        for _ in 0..200 {
+            if self.state.email.sent().iter().any(|e| e.to == "owner@acme.test" && e.text.contains("/confirm-email?token=")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.state.email.clear_sent();
         self.ok("PATCH", "/api/account", Some(json!({"address": "1 Main St, Portland, OR 97201", "from_email": "hello@acme.test", "website": "acme.test"}))).await;
         v
     }

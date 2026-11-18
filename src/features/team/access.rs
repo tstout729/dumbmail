@@ -217,10 +217,13 @@ pub enum Perm {
     /// replay and backfill them, install recipes, and read stored payloads and script output
     /// (personal data). Admins and owners.
     IntegrationsManage,
+    /// Connect and disconnect ad platforms, and create, change, run and delete ad audience syncs
+    /// (they send customer data to Meta, Google and TikTok). Admins and owners.
+    AdAudiencesManage,
 }
 
 impl Perm {
-    pub const ALL: [Perm; 44] = [
+    pub const ALL: [Perm; 45] = [
         Perm::Public,
         Perm::Me,
         Perm::Mcp,
@@ -265,6 +268,7 @@ impl Perm {
         Perm::ExportsManage,
         Perm::IntegrationsRead,
         Perm::IntegrationsManage,
+        Perm::AdAudiencesManage,
     ];
 
     /// Stable name used in the API (`me.permissions`) and docs.
@@ -315,6 +319,7 @@ impl Perm {
             ExportsManage => "exports.manage",
             IntegrationsRead => "integrations.read",
             IntegrationsManage => "integrations.manage",
+            AdAudiencesManage => "ad_audiences.manage",
         }
     }
 
@@ -333,7 +338,7 @@ impl Perm {
             AnalyticsRead => (Area::Analytics, false),
             ReportsManage => (Area::Analytics, true),
             AccountRead | BillingRead | TeamRead | TeamSecurityRead | AuditRead | WebhooksRead | IntegrationsRead => (Area::Account, false),
-            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage => (Area::Account, true),
+            SettingsWrite | Domains | BillingWrite | TeamManage | ApiKeys | WebhooksManage | ExportsManage | IntegrationsManage | AdAudiencesManage => (Area::Account, true),
         })
     }
 
@@ -569,6 +574,9 @@ pub static PUBLIC_ROUTES: &[RouteRule] = &[
     public("OPTIONS", "/client/back-in-stock"),
     public("GET", "/client/back-in-stock/confirm/{token}"),
     public("POST", "/client/back-in-stock/confirm/{token}"),
+    // Ad audiences (src/features/audiences/api.rs): the ad platform's sign-in returns here. The
+    // handler finishes it only for the signed-in member who started it, if they may still connect.
+    public("GET", "/api/ad-audiences/oauth/{platform}/callback"),
 ];
 
 /// Every signed-in route outside the feature modules.
