@@ -219,10 +219,10 @@ pub fn literals(text: &str) -> Vec<String> {
     // full stop, which is ordinary punctuation in Chinese and Japanese text).
     // A host is taken whole: labels of any character a host may hold (letters and digits in any
     // script, marks, joiners, `-` and `_`), starting at the text's start or after a character
-    // that can't be in one, the last label two characters or more with a letter in it.
+    // that can't be in a label (a dot can come before one: the earliest start is still taken), the last label two characters or more with a letter in it.
     static BARE: Lazy<Regex> = Lazy::new(|| {
         let c = r"[\p{L}\p{M}\p{N}_\u{200C}\u{200D}-]";
-        Regex::new(&format!(r#"(?i)(?:^|[^\p{{L}}\p{{M}}\p{{N}}_\u{{200C}}\u{{200D}}.．｡-])(?P<h>www[.．｡][^\s<>"']+|(?:{c}+[.．｡])+(?:\p{{L}}{c}+|{c}+\p{{L}}{c}*)(?:/[^\s<>"']*)?)"#)).unwrap()
+        Regex::new(&format!(r#"(?i)(?:^|[^\p{{L}}\p{{M}}\p{{N}}_\u{{200C}}\u{{200D}}-])(?P<h>www[.．｡][^\s<>"']+|(?:{c}+[.．｡])+(?:\p{{L}}{c}+|{c}+\p{{L}}{c}*)(?:/[^\s<>"']*)?)"#)).unwrap()
     });
     static NUMBER: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+(?:(?:[.,:/\-'’]|\s)\d+)*").unwrap());
     let mut out: Vec<String> = SCHEMED.find_iter(text).map(|m| url_key(m.as_str())).collect();
@@ -428,6 +428,8 @@ mod tests {
         // A host is read whole, `_` and all.
         assert!(!same_literals("Visit il.test", "Besuche ev_il.test"));
         assert!(!same_literals("Visit il.test", "Besuche il.test_x"));
+        assert!(!same_literals("Visit", "Besuche .evil.test"));
+        assert!(!same_literals("Visit", "Besuche ..evil.test"));
         assert!(same_literals("Visit acme.test and shop.acme.test/sale.", "Besuche acme.test und shop.acme.test/sale"));
     }
 
