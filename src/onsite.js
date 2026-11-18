@@ -14,6 +14,14 @@
   function attr(n) { try { return ME && ME.getAttribute(n); } catch (e) { return null; } }
   var AUTO = !ONLY_FORM && CFG.autoTrack !== false && attr("data-auto-track") !== "false";
   var CAPTURE = !ONLY_FORM && CFG.captureEmails !== false && attr("data-capture-emails") !== "false";
+  // The visitor's consent as the page knows it (a consent banner, Shopify's Customer Privacy API):
+  // `window.dumbmailConsent = {analytics, marketing, withdrawn}`. Read when the script starts, so a
+  // withdrawal between the script being added and it running isn't missed. Without marketing
+  // consent the script never recognises the visitor (no identify, nothing tracked against a stored
+  // profile); without analytics consent, or once consent was withdrawn, it stops (see stop()).
+  var CONSENT = window.dumbmailConsent || null;
+  var NO_IDENTITY = !!(CONSENT && CONSENT.marketing === false);
+  if (NO_IDENTITY) CAPTURE = false;
   var noop = function () {};
   var now = function () { return Date.now(); };
 
@@ -23,7 +31,7 @@
     del: function (k, s) { try { (s ? sessionStorage : localStorage).removeItem(k); } catch (e) {} }
   };
   var PROFILE = "pl_profile";
-  function profile() { return store.get(PROFILE) || {}; }
+  function profile() { return NO_IDENTITY ? {} : store.get(PROFILE) || {}; }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
   // Set by dumbmail.stop(): nothing more is sent from this page, and nothing about the visitor's
   // activity is written to the browser's storage either.
@@ -83,7 +91,7 @@
   var EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i;
   var api = {
     identify: function (props, how) {
-      if (STOPPED || !props || typeof props !== "object") return api;
+      if (STOPPED || NO_IDENTITY || !props || typeof props !== "object") return api;
       var p = profile(), before = identified(p);
       var em = props.email && String(props.email).trim().toLowerCase();
       // A different email is a different person: start a fresh profile instead of merging into theirs.
@@ -121,6 +129,8 @@
 
   // Events from visitors the browser doesn't know yet wait here (for up to 3 days) and are sent once they're recognized.
   var BUFFER = "pl_buffer";
+  // Consent withdrawn (or never given for analytics) before the script started: stop now.
+  if (CONSENT && (CONSENT.analytics === false || CONSENT.withdrawn)) api.stop();
   function buffer(ev) {
     if (STOPPED) return;
     var b = (store.get(BUFFER) || []).filter(function (e) { return e && now() - e.time < 3 * 86400000; });
