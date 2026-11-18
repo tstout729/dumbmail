@@ -169,6 +169,30 @@ fn notes_to(h: &Harness, to: &str) -> Vec<dumbmail::providers::email::OutgoingEm
     h.state.email.sent().into_iter().filter(|e| e.to == to && e.subject.starts_with("New lead")).collect()
 }
 
+async fn account_id(h: &Harness) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at LIMIT 1").fetch_one(&h.state.db).await.unwrap()
+}
+
+/// Confirm `email` through the link it was sent (the newest one).
+async fn confirm_link(h: &Harness, email: &str) {
+    let asks: Vec<_> = h.state.email.sent().into_iter().filter(|e| e.to == email && e.subject.starts_with("Confirm notifications")).collect();
+    let text = &asks.last().unwrap_or_else(|| panic!("no confirmation email to {email}")).text;
+    let link = &text[text.find("/flow-notify/confirm?t=").unwrap()..];
+    let token = link.split_whitespace().next().unwrap().trim_start_matches("/flow-notify/confirm?t=").to_string();
+    let (s, _, page) = h.raw("GET", &format!("/flow-notify/confirm?t={token}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("Confirm notifications") && page.contains(email));
+    let (s, _, page) = h.raw("POST", "/flow-notify/confirm", &[("content-type", "application/x-www-form-urlencoded")], &format!("t={token}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(page.contains("You're set"), "{page}");
+    let (_, _, again) = h.raw("POST", "/flow-notify/confirm", &[("content-type", "application/x-www-form-urlencoded")], &format!("t={token}")).await;
+    assert!(again.contains("doesn't work"), "a link works once");
+}
+
+fn confirm_emails(h: &Harness, to: &str) -> usize {
+    h.state.email.sent().into_iter().filter(|e| e.to == to && e.subject.starts_with("Confirm notifications")).count()
+}
+
 #[tokio::test]
 async fn notification_steps_reach_the_team_and_confirmed_addresses_once() {
     let mut h = harness!();
@@ -189,13 +213,11 @@ async fn notification_steps_reach_the_team_and_confirmed_addresses_once() {
     def["settings"] = json!({"notify_daily_cap": 3});
     let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Lead"}), def).await;
     h.drain().await;
-    // The outside address was asked to confirm; the team member wasn't.
-    let asks: Vec<_> = h.state.email.sent().into_iter().filter(|e| e.subject.starts_with("Confirm notifications")).collect();
-    assert_eq!(asks.len(), 1);
-    assert_eq!(asks[0].to, "pm@outside.test");
+    // Saving only recorded the outside address: nobody was emailed.
+    assert_eq!(confirm_emails(&h, "pm@outside.test"), 0, "saving a flow never emails a stranger");
     let st = h.ok("GET", "/api/flows-plus/notify-addresses?emails=owner@acme.test,pm@outside.test,new@outside.test", None).await;
     let status = |e: &str| st["statuses"].as_array().unwrap().iter().find(|s| s["email"] == e).unwrap()["status"].as_str().unwrap().to_string();
-    assert_eq!((status("owner@acme.test").as_str(), status("pm@outside.test").as_str(), status("new@outside.test").as_str()), ("team", "pending", "new"));
+    assert_eq!((status("owner@acme.test").as_str(), status("pm@outside.test").as_str(), status("new@outside.test").as_str()), ("team", "unconfirmed", "new"));
 
     event(&mut h, "Lead", "guest1@x.test", json!({"nights": 3})).await;
     h.drain().await;
@@ -207,18 +229,18 @@ async fn notification_steps_reach_the_team_and_confirmed_addresses_once() {
     assert_eq!(owner[0].from_email, "hello@acme.test");
     assert!(notes_to(&h, "pm@outside.test").is_empty(), "unconfirmed addresses get nothing");
 
-    // The link shows a button; only the POST confirms.
-    let link = &asks[0].text[asks[0].text.find("/flow-notify/confirm?t=").unwrap()..];
-    let token = link.split_whitespace().next().unwrap().trim_start_matches("/flow-notify/confirm?t=").to_string();
-    let (s, _, page) = h.raw("GET", &format!("/flow-notify/confirm?t={token}"), &[], "").await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(page.contains("Confirm notifications") && page.contains("pm@outside.test"));
-    assert_eq!(h.ok("GET", "/api/flows-plus/notify-addresses?emails=pm@outside.test", None).await["statuses"][0]["status"], "pending");
-    let (s, _, page) = h.raw("POST", "/flow-notify/confirm", &[("content-type", "application/x-www-form-urlencoded")], &format!("t={token}")).await;
-    assert_eq!(s, StatusCode::OK);
-    assert!(page.contains("You're set"), "{page}");
-    let (_, _, again) = h.raw("POST", "/flow-notify/confirm", &[("content-type", "application/x-www-form-urlencoded")], &format!("t={token}")).await;
-    assert!(again.contains("doesn't work"), "a link works once");
+    // Asking it to confirm is its own action: a dry run first, then confirm: true.
+    let dry = h.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "pm@outside.test"}))).await;
+    assert_eq!(dry["dry_run"], true);
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "pm@outside.test"), 0);
+    h.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "pm@outside.test", "confirm": true}))).await;
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "pm@outside.test"), 1);
+    // One a day per address.
+    let (s, _) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "pm@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    confirm_link(&h, "pm@outside.test").await;
 
     event(&mut h, "Lead", "guest2@x.test", json!({"nights": 5})).await;
     h.drain().await;
@@ -264,20 +286,192 @@ async fn notification_steps_reach_the_team_and_confirmed_addresses_once() {
     event(&mut h, "Lead", "guest9@x.test", json!({"nights": 1})).await;
     h.drain().await;
     assert_eq!(notes_to(&h, "pm@outside.test").len(), 1, "removed addresses get nothing");
-    // Removing and adding again can't be used to send link after link: one an hour per address.
-    let asks = |h: &Harness| h.state.email.sent().into_iter().filter(|e| e.to == "pm@outside.test" && e.subject.starts_with("Confirm")).count();
-    for _ in 0..3 {
-        let v = h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": "pm@outside.test"}))).await;
-        assert_eq!(v["status"], "waiting", "{v}");
-        h.ok("POST", "/api/flows-plus/notify-addresses/remove", Some(json!({"email": "pm@outside.test"}))).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn confirmation_emails_need_settings_rights_and_respect_pause_and_limits() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    // An API key that can edit flows but not account settings.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "flows", "scopes": ["messaging"]}))).await["key"].as_str().unwrap().to_string();
+    let bearer = |path: &str, body: Value| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
+    use tower::ServiceExt;
+    let res = h.router.clone().oneshot(bearer("/api/flows-plus/notify-addresses", json!({"email": "a@outside.test"}))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "recording needs only flow editing");
+    let res = h.router.clone().oneshot(bearer("/api/flows-plus/notify-addresses/send-confirmation", json!({"email": "a@outside.test", "confirm": true}))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "emailing an outside address needs account settings");
+
+    // Refused while sending is paused.
+    sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let (s, _) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+
+    // Asked, then paused before it went out: checked again at the handoff, so nothing is sent.
+    h.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "a@outside.test"), 0);
+    sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+
+    // Each account's first request to an address goes, so another account can't block it; repeats
+    // within a day are refused, from either account.
+    let mut other = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
+    other.ok("POST", "/api/auth/signup", Some(json!({"email": "else@other.test", "password": "correct horse", "company": "Other"}))).await;
+    other.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    let (s, v) = other.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+
+    // Two requests racing for the same address and account: exactly one is recorded.
+    let (a, b) = tokio::join!(
+        dumbmail::features::flows_plus::notify::send_confirmation_request(&h.state, acct, "race@outside.test", true),
+        dumbmail::features::flows_plus::notify::send_confirmation_request(&h.state, acct, "race@outside.test", true),
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1, "{a:?} {b:?}");
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_confirm_sends WHERE email = 'race@outside.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(recorded, 1);
+
+    // 50 a day per account.
+    for i in 0..60 {
+        sqlx::query("INSERT INTO flow_notify_confirm_sends (account_id, email) VALUES ($1, $2)").bind(acct).bind(format!("filler{i}@outside.test")).execute(&h.state.db).await.unwrap();
     }
+    let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "late@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    // Asking a removed address again counts against the 20 waiting.
+    // Waiting now: a@, race@ and late@. 16 more makes 19; removing race@ makes 18; two more fill it.
+    for i in 0..16 {
+        h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": format!("wait{i}@outside.test")}))).await;
+    }
+    h.ok("POST", "/api/flows-plus/notify-addresses/remove", Some(json!({"email": "race@outside.test"}))).await;
+    for i in 16..18 {
+        h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": format!("wait{i}@outside.test")}))).await;
+    }
+    let (s, _) = h.req("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": "one-too-many@outside.test"}))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    sqlx::query("UPDATE flow_notify_confirm_sends SET sent_at = sent_at - interval '2 days'").execute(&h.state.db).await.unwrap();
+    let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "race@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn notifications_count_against_the_daily_allowance_and_stop_after_a_bounce() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Lead"}), notify_flow(json!(["owner@acme.test"]), json!({}))).await;
+    // The account's daily allowance is used up: the step waits, nothing is sent.
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = 0 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+    event(&mut h, "Lead", "g1@x.test", json!({"nights": 1})).await;
     h.drain().await;
-    assert_eq!(asks(&h), 1);
-    sqlx::query("UPDATE flow_notify_confirm_sends SET sent_at = sent_at - interval '2 hours'").execute(&h.state.db).await.unwrap();
-    let v = h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": "pm@outside.test"}))).await;
-    assert_eq!(v["status"], "pending", "{v}");
+    assert!(notes_to(&h, "owner@acme.test").is_empty());
+    let (run, status, node, _) = run_of(&h, &fid, "g1@x.test").await;
+    assert_eq!((status.as_str(), node.as_deref()), ("active", Some("n")));
+    assert!(job_at(&h, run).await > Utc::now(), "it waits for the allowance");
+    let pending: String = sqlx::query_scalar("SELECT status FROM flow_notifications WHERE run_id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pending, "pending");
+    // Room again: it goes out, once.
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+    h.fast_forward().await;
+    assert_eq!(notes_to(&h, "owner@acme.test").len(), 1);
+    let counted: i64 = sqlx::query_scalar("SELECT count(*) FROM email_sends WHERE account_id = $1 AND counts_toward_limit").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(counted, 1, "it counts toward the warm-up limit");
+
+    // The provider reports a hard bounce for it: the address gets no more.
+    let pid: String = sqlx::query_scalar("SELECT provider_message_id FROM flow_notifications WHERE run_id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    let ses = |m: Value| json!({"Type": "Notification", "Message": m.to_string()}).to_string();
+    let (s, _, _) = h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &ses(json!({"eventType": "Bounce", "mail": {"messageId": pid}, "bounce": {"bounceType": "Permanent", "bounceSubType": "General"}}))).await;
+    assert!(s.is_success());
+    let st = h.ok("GET", "/api/flows-plus/notify-addresses?emails=owner@acme.test", None).await;
+    assert_eq!(st["statuses"][0]["status"], "bounced", "{st}");
+    event(&mut h, "Lead", "g2@x.test", json!({"nights": 1})).await;
     h.drain().await;
-    assert_eq!(asks(&h), 2);
+    assert_eq!(notes_to(&h, "owner@acme.test").len(), 1);
+    let why: String = sqlx::query_scalar("SELECT n.error FROM flow_notifications n JOIN flow_runs r ON r.id = n.run_id JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'g2@x.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(why, "address bounced or complained");
+
+    // A Manager can't clear a bounce; an Admin or the owner can.
+    let inv = h.ok("POST", "/api/team/invites", Some(json!({"email": "mgr@acme.test", "role": "manager"}))).await;
+    assert_eq!(inv["email_sent"], true, "{inv}");
+    let invite = h.state.email.sent().into_iter().rev().find(|e| e.to == "mgr@acme.test").unwrap().text;
+    let token = invite[invite.find("/invite/").unwrap() + "/invite/".len()..].split_whitespace().next().unwrap().to_string();
+    let mut mgr = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
+    mgr.ok("POST", &format!("/api/invites/{token}/accept"), Some(json!({"name": "Mgr", "password": "member pass 1"}))).await;
+    let (s, v) = mgr.req("POST", "/api/flows-plus/notify-addresses/clear-bounce", Some(json!({"email": "owner@acme.test"}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    h.ok("POST", "/api/flows-plus/notify-addresses/clear-bounce", Some(json!({"email": "owner@acme.test"}))).await;
+    event(&mut h, "Lead", "g3@x.test", json!({"nights": 1})).await;
+    h.drain().await;
+    assert_eq!(notes_to(&h, "owner@acme.test").len(), 2);
+
+    // A complaint blocks it for good.
+    let pid: String = sqlx::query_scalar("SELECT n.provider_message_id FROM flow_notifications n JOIN flow_runs r ON r.id = n.run_id JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'g3@x.test'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    h.raw("POST", "/webhooks/ses/hooksecret", &[("content-type", "text/plain")], &ses(json!({"notificationType": "Complaint", "mail": {"messageId": pid}, "complaint": {}}))).await;
+    let st = h.ok("GET", "/api/flows-plus/notify-addresses?emails=owner@acme.test", None).await;
+    assert_eq!(st["statuses"][0]["status"], "complained");
+    let (s, _) = h.req("POST", "/api/flows-plus/notify-addresses/clear-bounce", Some(json!({"email": "owner@acme.test"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn notification_recipients_are_fixed_the_first_time_and_handoffs_are_never_repeated() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    // Two confirmed outside addresses; the step emails the one in the person's `manager` property.
+    for e in ["first@outside.test", "second@outside.test"] {
+        h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": e}))).await;
+    }
+    sqlx::query("UPDATE flow_notify_addresses SET confirmed_at = now()").execute(&h.state.db).await.unwrap();
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Lead"}), notify_flow(json!([]), json!({"to_property": "manager"}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "g@x.test", "properties": {"manager": "first@outside.test"}}))).await;
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = 0 WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+    event(&mut h, "Lead", "g@x.test", json!({"nights": 2})).await;
+    h.drain().await;
+    // The property changes before the retry: the stored recipient is used.
+    sqlx::query("UPDATE profiles SET properties = '{\"manager\": \"second@outside.test\"}' WHERE email = 'g@x.test'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE accounts SET email_daily_limit_override = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    dumbmail::deliverability::forget_daily_limit(&h.state, acct);
+    h.fast_forward().await;
+    let sent_to: Vec<String> = h.state.email.sent().into_iter().filter(|e| e.subject.starts_with("New lead")).map(|e| e.to).collect();
+    assert_eq!(sent_to, vec!["first@outside.test"]);
+
+    // A handoff cut off before its result was recorded: never sent again, marked unconfirmed, billed.
+    let (run, ..) = run_of(&h, &fid, "g@x.test").await;
+    sqlx::query("UPDATE flow_notifications SET status = 'handing', handed_at = now() - interval '1 hour', provider_message_id = NULL, cost_micros = NULL WHERE run_id = $1")
+        .bind(run)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE flow_runs SET status = 'active', current_node = 'n', finished_at = NULL WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    dumbmail::features::flows_plus::notify::sweep(&h.state).await.unwrap();
+    let (status, cost): (String, Option<i64>) = sqlx::query_as("SELECT status, cost_micros FROM flow_notifications WHERE run_id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "unconfirmed");
+    assert!(cost.is_some(), "billed, since it may have gone out");
+    assert_eq!(h.state.email.sent().into_iter().filter(|e| e.subject.starts_with("New lead")).count(), 1);
+    let r = h.ok("GET", &format!("/api/flows/{fid}/results"), None).await;
+    assert_eq!(r["steps"][0]["notifications"]["unconfirmed"], 1, "{r}");
     h.cleanup().await;
 }
 
@@ -357,36 +551,23 @@ async fn back_populate_segment_flows_once() {
 }
 
 #[tokio::test]
-async fn back_populate_date_flows_places_people_mid_flow() {
+async fn date_and_metric_flows_are_not_back_populated() {
     let mut h = harness!();
     h.signup().await;
-    let tz = chrono_tz::America::Los_Angeles;
-    let today = Utc::now().with_timezone(&tz).date_naive();
-    // Trigger 7 days before the birthday; email; wait 5 days; email.
-    let def = json!({"entry": "e1", "settings": {"reentry": "always"}, "nodes": [
-        {"id": "e1", "type": "email", "content": {"subject": "A week to go", "blocks": [{"type": "text", "html": "<p>x</p>"}]}, "next": "d1"},
-        {"id": "d1", "type": "delay", "amount": 5, "unit": "days", "next": "e2"},
-        {"id": "e2", "type": "email", "content": {"subject": "Two days", "blocks": [{"type": "text", "html": "<p>y</p>"}]}, "next": null}]});
-    let bday = |d: chrono::NaiveDate| format!("1990-{}", d.format("%m-%d"));
-    // In 4 days: triggered 3 days ago, 2 days left in the delay. In 1 day: triggered 6 days ago, past everything but... the delay ended yesterday, so e2 passed too.
-    for (email, d) in [("soon@x.test", today + Duration::days(4)), ("tomorrow@x.test", today + Duration::days(1)), ("later@x.test", today + Duration::days(30))] {
-        h.ok("POST", "/api/profiles", Some(json!({"email": email, "properties": {"birthday": bday(d)}}))).await;
+    let def = json!({"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]});
+    for (trigger, words) in [
+        (json!({"type": "date_property", "field": "birthday", "offset_days": -7}), "people whose date is still ahead will enter on their own"),
+        (json!({"type": "metric", "metric": "Placed Order"}), "past events don't start flows"),
+    ] {
+        let fid = live_flow(&mut h, trigger, def.clone()).await;
+        for body in [json!({}), json!({"confirm": true})] {
+            let (s, v) = h.req("POST", &format!("/api/flows/{fid}/backfill"), Some(body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+            assert!(v.to_string().contains(words), "{v}");
+        }
     }
-    let fid = live_flow(&mut h, json!({"type": "date_property", "field": "birthday", "offset_days": -7}), def).await;
-    let dry = h.ok("POST", &format!("/api/flows/{fid}/backfill"), Some(json!({}))).await;
-    assert!(dry["would_add"].as_i64().unwrap() >= 1, "{dry}");
-    h.ok("POST", &format!("/api/flows/{fid}/backfill"), Some(json!({"confirm": true}))).await;
-    h.drain().await;
-    let (run, status, node, ctx) = run_of(&h, &fid, "soon@x.test").await;
-    assert_eq!((status.as_str(), node.as_deref()), ("active", Some("d1")), "{ctx}");
-    assert_eq!(ctx["_waited"], "d1");
-    let at = job_at(&h, run).await;
-    assert!(at > Utc::now() + Duration::days(1) && at < Utc::now() + Duration::days(3), "{at}");
-    let started: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE r.flow_id = $1::uuid AND p.email <> 'soon@x.test'").bind(&fid).fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(started, 0, "nothing ahead for the others (or their trigger hasn't come)");
-    // The first email's time had passed: it was skipped, not sent late.
-    let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE flow_id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(sent, 0);
+    let started: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_backfills").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(started, 0);
     h.cleanup().await;
 }
 
@@ -465,32 +646,29 @@ async fn results_waiting_list_and_removing_people() {
 }
 
 #[tokio::test]
-async fn a_zone_change_moves_the_wait_only_when_the_step_says_so() {
+async fn a_wait_keeps_its_moment_when_the_person_moves() {
     let mut h = harness!();
     h.signup().await;
-    let mut ids = Vec::new();
-    for (metric, recompute) in [("Keep", false), ("Move", true)] {
-        ids.push(live_flow(&mut h, json!({"type": "metric", "metric": metric}), json!({"entry": "d", "nodes": [
-            {"id": "d", "type": "delay", "amount": 1, "unit": "days", "at": "10:00", "recompute_zone": recompute, "next": null}]})).await);
-    }
+    let fid = live_flow(&mut h, json!({"type": "metric", "metric": "Keep"}), json!({"entry": "d", "nodes": [
+        {"id": "d", "type": "delay", "amount": 1, "unit": "days", "at": "10:00", "next": null}]})).await;
     h.ok("POST", "/api/profiles", Some(json!({"email": "mover@x.test", "properties": {"timezone": "America/New_York"}}))).await;
     event(&mut h, "Keep", "mover@x.test", json!({})).await;
-    event(&mut h, "Move", "mover@x.test", json!({})).await;
     h.drain().await;
     let until = |ctx: &Value| serde_json::from_value::<chrono::DateTime<Utc>>(ctx["_wait_until"].clone()).unwrap();
-    let ny = until(&run_of(&h, &ids[0], "mover@x.test").await.3);
+    let (run, _, _, ctx) = run_of(&h, &fid, "mover@x.test").await;
+    let ny = until(&ctx);
     assert_eq!(ny.with_timezone(&chrono_tz::America::New_York).format("%H:%M").to_string(), "10:00");
-    // They move to Los Angeles; both jobs wake (early).
+    assert!(ctx.get("_wait_from").is_none(), "{ctx}");
+    // They move to Los Angeles and the job wakes early: the moment worked out on arrival is kept.
     sqlx::query("UPDATE profiles SET properties = properties || '{\"timezone\": \"America/Los_Angeles\"}' WHERE email = 'mover@x.test'").execute(&h.state.db).await.unwrap();
     h.fast_forward().await;
-    let (keep_run, _, _, keep) = run_of(&h, &ids[0], "mover@x.test").await;
-    assert_eq!(until(&keep), ny, "the scheduled instant is kept");
-    assert_eq!(job_at(&h, keep_run).await, ny);
-    let (move_run, status, _, moved) = run_of(&h, &ids[1], "mover@x.test").await;
+    let (_, status, _, ctx) = run_of(&h, &fid, "mover@x.test").await;
     assert_eq!(status, "active");
-    let la = until(&moved);
-    assert_eq!(la.with_timezone(&chrono_tz::America::Los_Angeles).format("%H:%M").to_string(), "10:00");
-    assert_eq!(la - ny, Duration::hours(3));
-    assert_eq!(job_at(&h, move_run).await, la);
+    assert_eq!(until(&ctx), ny);
+    assert_eq!(job_at(&h, run).await, ny);
+    // The option to move it is gone: saving it is ignored.
+    let f = h.ok("POST", "/api/flows", Some(json!({"name": "x", "trigger": {"type": "metric", "metric": "M"}, "definition": {"entry": "d", "nodes": [
+        {"id": "d", "type": "delay", "amount": 1, "unit": "days", "at": "10:00", "recompute_zone": true, "next": null}]}}))).await;
+    assert!(f["id"].is_string());
     h.cleanup().await;
 }

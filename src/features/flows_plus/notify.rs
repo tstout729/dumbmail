@@ -167,7 +167,7 @@ pub async fn record_addresses(state: &AppState, account_id: Uuid, emails: &[Stri
             .fetch_one(&mut *tx)
             .await?;
         if new > 0 && pending + new > MAX_PENDING {
-            return Err(AppError::LimitReached(format!("at most {MAX_PENDING} outside addresses can wait to confirm; remove some first")));
+            return Err(AppError::Conflict(format!("at most {MAX_PENDING} outside addresses can wait to confirm; remove some first")));
         }
         sqlx::query("INSERT INTO flow_notify_addresses (account_id, email) SELECT $1, e FROM unnest($2::text[]) e ON CONFLICT DO NOTHING").bind(account_id).bind(&outside).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -177,8 +177,9 @@ pub async fn record_addresses(state: &AppState, account_id: Uuid, emails: &[Stri
 
 /// Ask an outside address to confirm: without `confirm`, says whether a link would go out. Refused
 /// while the account's sending is paused, for team members (they need none), for confirmed,
-/// bounced or complaining addresses; one per address per day (across all accounts) and
-/// [`MAX_CONFIRMATIONS_PER_DAY`] per account, enforced in the insert that records it.
+/// bounced or complaining addresses. Limits, enforced in the insert that records it: one per
+/// address per day across all accounts, except that each account's first request to an address
+/// always goes (so another account can't block it), and [`MAX_CONFIRMATIONS_PER_DAY`] per account.
 pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email: &str, confirm: bool) -> AppResult<Value> {
     let e = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
     if !team_addresses(&state.db, account_id, std::slice::from_ref(&e)).await?.is_empty() {
@@ -209,9 +210,25 @@ pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email
     sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     // One per address a day across all accounts: serialize on the address.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 11))").bind(&e).execute(&mut *tx).await?;
+    // Asking a removed address again brings it back: it counts against the addresses waiting.
+    let reviving: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_addresses WHERE account_id = $1 AND email = $2 AND removed_at IS NOT NULL)")
+        .bind(account_id)
+        .bind(&e)
+        .fetch_one(&mut *tx)
+        .await?;
+    if reviving {
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_addresses WHERE account_id = $1 AND confirmed_at IS NULL AND removed_at IS NULL AND blocked_reason IS NULL")
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if pending >= MAX_PENDING {
+            return Err(AppError::Conflict(format!("at most {MAX_PENDING} outside addresses can wait to confirm; remove some first")));
+        }
+    }
     let sent: Option<i64> = sqlx::query_scalar(
         "INSERT INTO flow_notify_confirm_sends (account_id, email) SELECT $1, $2
-         WHERE NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours')
+         WHERE (NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours')
+                OR NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2))
            AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours') < $3
          RETURNING id",
     )
@@ -221,11 +238,12 @@ pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email
     .fetch_optional(&mut *tx)
     .await?;
     if sent.is_none() {
-        let address_today: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $1 AND sent_at > now() - interval '24 hours')")
+        let address_today: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') AND EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2)")
+            .bind(account_id)
             .bind(&e)
             .fetch_one(&mut *tx)
             .await?;
-        return Err(AppError::LimitReached(if address_today {
+        return Err(AppError::Busy(if address_today {
             format!("{e} was sent a confirmation link in the last 24 hours; try again tomorrow")
         } else {
             format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow")
@@ -480,7 +498,17 @@ async fn record_recipients(state: &AppState, account: &Account, flow: &FlowRow, 
     let day = Utc::now().with_timezone(&crate::sending::account_tz(account)).date_naive();
     let mut tx = state.db.begin().await?;
     for e in &to {
-        let status = if skip.is_some() { "skipped" } else { "pending" };
+        // Only addresses that may get it now are pending (and use the day's count); checked again
+        // when each is sent.
+        let (allowed, bad): (bool, bool) = sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}")).bind(account.id).bind(e).fetch_one(&mut *tx).await?;
+        let why = skip.or(if !allowed {
+            Some("address not confirmed")
+        } else if bad {
+            Some("address bounced or complained")
+        } else {
+            None
+        });
+        let status = if why.is_some() { "skipped" } else { "pending" };
         let id: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO flow_notifications (id, account_id, flow_id, run_id, node_id, to_email, status, error, subject, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (run_id, node_id, to_email) DO NOTHING RETURNING id",
@@ -492,7 +520,7 @@ async fn record_recipients(state: &AppState, account: &Account, flow: &FlowRow, 
         .bind(node_id)
         .bind(e)
         .bind(status)
-        .bind(skip)
+        .bind(why)
         .bind(&subject)
         .bind(&body)
         .fetch_optional(&mut *tx)
