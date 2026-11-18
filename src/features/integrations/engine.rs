@@ -361,7 +361,7 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
     if integ.status != "enabled" {
         // Turned off while it waited: nothing is written, and its payload isn't kept.
-        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now(), body = NULL, headers = '{}', query = '{}', body_bytes = 0 WHERE id = $1")
+        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now(), body = NULL, headers = '{}', query = '{}', body_bytes = 0, sealed_fields = NULL WHERE id = $1")
             .bind(delivery_id)
             .execute(&state.db)
             .await?;
@@ -412,7 +412,12 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
     let src = source_of(&integ, Some(root), Some(delivery_id));
     let res = match list {
         // Applied with the sealed fields put back; fingerprints come from the stored list.
-        Ok(list) => match actions::parse(&Value::Array(unsealed(state, &list, sealed.as_deref())?), true) {
+        // A sealed list that can't be opened fails like any other bad delivery (and its seal is
+        // dropped once no retry is left), rather than erroring the job forever.
+        Ok(list) => match unsealed(state, &list, sealed.as_deref())
+            .map_err(|_| "the delivery's hidden fields couldn't be read".to_string())
+            .and_then(|full| actions::parse(&Value::Array(full), true))
+        {
             Ok(acts) => {
                 let (o, err) = actions::apply(state, &src, &acts, &list, &skip, &integ.state_map(), false).await;
                 match err {
@@ -627,7 +632,7 @@ const FREE_OLDEST_SQL: &str = "WITH ranked AS (
         WHERE account_id = $1 AND body IS NOT NULL AND status <> 'pending' AND NOT (status = 'error' AND next_attempt_at IS NOT NULL)
         ORDER BY created_at, id LIMIT 1000),
      pick AS (SELECT id, body_bytes FROM ranked WHERE running - body_bytes < $2),
-     cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0 FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
+     cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0, sealed_fields = NULL FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
      SELECT sum(body_bytes)::bigint FROM cleared";
 
 /// Store a pull page's delivery (never deduplicated, never queued). Over the payload budget, the
@@ -1035,7 +1040,7 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 .await?;
             if current.is_none() {
                 guard.rollback().await?;
-                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1 WHERE id = $1")
+                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1, sealed_fields = NULL WHERE id = $1")
                     .bind(delivery)
                     .execute(&state.db)
                     .await?;
