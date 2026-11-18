@@ -133,6 +133,10 @@ mod tests {
             }
             if !m["pull"].is_null() {
                 super::super::pull::PullConfig::parse(&m["pull"]).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
+                // A recipe's lookups name the part of the vendor's API they stay in.
+                if !m["pull"]["fetch"].is_null() {
+                    assert!(m["pull"]["fetch"]["prefix"].as_str().is_some_and(|p| p.len() > 1), "{}: fetch needs a prefix narrower than /", r.key);
+                }
             }
             for f in m["flows"].as_array().into_iter().flatten() {
                 crate::flows::parse_trigger(&f["trigger"]).unwrap_or_else(|e| panic!("{} flow {}: {}", r.key, f["name"], e.public_message()));

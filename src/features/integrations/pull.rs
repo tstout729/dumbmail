@@ -80,6 +80,11 @@ pub struct FetchRules {
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<String>,
+    /// Every lookup stays under this path (it starts and ends with `/`, and may name settings,
+    /// like `/stores/{{settings.store_hash}}/`): each declared path must start with it, and a
+    /// lookup is refused unless its path, once rendered and normalised, does too. Default `/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 fn default_fetch_id() -> String {
@@ -91,9 +96,16 @@ impl FetchRules {
         if self.paths.is_empty() || self.paths.len() > 20 || self.query.len() > 10 || self.context.len() > 10 {
             return Err(AppError::bad("fetch takes 1 to 20 paths, up to 10 query keys and up to 10 context keys"));
         }
+        let prefix = self.prefix.as_deref().unwrap_or("/");
+        if !prefix.starts_with('/') || !prefix.ends_with('/') || prefix.len() > 200 || prefix.contains(['?', '#', '%', '\\']) || prefix.contains("..") || prefix.contains("//") {
+            return Err(AppError::bad(format!("fetch prefix {prefix:?} must be a plain path that starts and ends with /")));
+        }
         for p in &self.paths {
             if !p.starts_with('/') || p.len() > 300 || p.contains('?') || p.contains('#') || p.contains("..") || p.contains("//") {
                 return Err(AppError::bad(format!("fetch path {p:?} must be a plain path starting with /")));
+            }
+            if !p.starts_with(prefix) {
+                return Err(AppError::bad(format!("fetch path {p:?} must be under the fetch prefix {prefix:?}")));
             }
         }
         if self.id.len() > 100 || !self.id.starts_with('^') || !self.id.ends_with('$') || regex::Regex::new(&self.id).is_err() {
@@ -113,6 +125,15 @@ impl FetchRules {
         let segs: Vec<&str> = url.split('/').collect();
         if !url.starts_with('/') || url.contains('?') || url.contains('#') || url.contains('%') || url.contains('\\') || segs.iter().skip(1).any(|s| s.is_empty() || *s == "." || *s == "..") {
             return Err(format!("fetch path {:?} isn't a plain path", url.chars().take(100).collect::<String>()));
+        }
+        // The prefix, rendered, must itself be a plain path, and the lookup must sit under it.
+        let prefix = vars.render_with(self.prefix.as_deref().unwrap_or("/"), true)?;
+        let pre: Vec<&str> = prefix.split('/').collect();
+        if !prefix.starts_with('/') || !prefix.ends_with('/') || prefix.contains(['%', '\\', '?', '#']) || pre[1..pre.len() - 1].iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+            return Err("the fetch prefix doesn't render to a plain path (check the integration's settings)".into());
+        }
+        if !url.starts_with(&prefix) {
+            return Err(format!("fetch path {:?} is outside {prefix:?}", url.chars().take(100).collect::<String>()));
         }
         let mut matched = false;
         for t in &self.paths {
@@ -138,6 +159,14 @@ impl FetchRules {
             Value::Object(c.iter().filter(|(k, _)| self.context.iter().any(|x| x == *k)).map(|(k, v)| (k.clone(), v.clone())).collect())
         });
         Ok(NextRequest { url: Some(url.to_string()), method: None, query: (!query.is_empty()).then_some(query), headers: None, body: None, context })
+    }
+}
+
+impl FetchRules {
+    /// Whether the request as built (its URL parsed and normalised) is still under the prefix.
+    pub fn within(&self, built: &str, vars: &Vars<'_>) -> bool {
+        let Ok(prefix) = vars.render_with(self.prefix.as_deref().unwrap_or("/"), true) else { return false };
+        url::Url::parse(built).is_ok_and(|u| u.path().starts_with(&prefix))
     }
 }
 

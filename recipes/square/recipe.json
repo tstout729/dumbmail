@@ -50,6 +50,7 @@
       "token": "{{secret.access_token}}"
     },
     "fetch": {
+      "prefix": "/v2/",
       "paths": [
         "/v2/orders/{id}"
       ],

@@ -56,6 +56,7 @@
     },
     "max_pages": 20,
     "fetch": {
+      "prefix": "/stores/{{settings.store_hash}}/",
       "paths": [
         "/stores/{{settings.store_hash}}/v2/orders/{id}",
         "/stores/{{settings.store_hash}}/v3/orders/{id}/payment_actions/refunds/{id}",

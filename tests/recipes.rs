@@ -1306,6 +1306,22 @@ async fn webhook_fetches_are_read_only_lookups_of_declared_paths() {
     h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
     h.drain().await;
     assert_eq!(store.seen.lock().unwrap().iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), vec!["/stores/abc123/v3/customers?id%3Ain=32"]);
+    // Lookups stay under the declared prefix: a path outside it can't be saved, and a lookup
+    // outside it is refused even on the same origin.
+    let id = i["id"].as_str().unwrap();
+    let mut narrow = pull.clone();
+    narrow["fetch"]["prefix"] = json!("/stores/{{settings.store_hash}}/v3/");
+    let (s, e) = h.req("PATCH", &format!("/api/integrations/{id}"), Some(json!({"pull": narrow}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    assert!(e.to_string().contains("under the fetch prefix"), "{e}");
+    narrow["fetch"]["paths"] = json!(["/stores/{{settings.store_hash}}/v3/customers"]);
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"pull": narrow}))).await;
+    let (p, body) = send(json!({"url": "/stores/abc123/v2/orders/218"})).await;
+    h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
+    h.drain().await;
+    let last: Option<String> = sqlx::query_scalar("SELECT error FROM integration_deliveries WHERE source = 'webhook' ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!(last.as_deref().is_some_and(|e| e.contains("outside")), "{last:?}");
+    assert_eq!(store.seen.lock().unwrap().len(), 1, "no request outside the prefix");
     h.cleanup().await;
 }
 
