@@ -30,6 +30,7 @@ import {
   useDisableTwoFactor,
   useNewRecoveryCodes,
   useRemoveSso,
+  useRequestEmailConfirmation,
   useRevokeOtherSessions,
   useRevokeSession,
   useSaveSso,
@@ -44,7 +45,7 @@ import { RecoveryCodes, TwoFactorSetupFlow } from "./TwoFactor";
 import { roleLabels, type Role, type SsoSettings } from "./types";
 
 export function SecurityPage() {
-  const { sign_in_method } = useTeamSession();
+  const { sign_in_method, email_confirmed } = useTeamSession();
   const canSecurity = useCan("security.manage");
   const isOwner = useCan("ownership.transfer");
   const canAudit = useCan("audit.read");
@@ -52,6 +53,7 @@ export function SecurityPage() {
   return (
     <div className="space-y-4">
       <p className="text-sm text-zinc-500">How you sign in, where you're signed in, and the account's sign-in rules and activity log.</p>
+      {!email_confirmed && !sso ? <EmailConfirmationLine /> : null}
       {sso ? (
         <Notice tone="blue" icon={<ShieldCheck />} title="You signed in with single sign-on">
           Your company's identity provider handles your password and two-factor login.
@@ -67,6 +69,24 @@ export function SecurityPage() {
       {isOwner ? <SsoCard /> : null}
       {canAudit ? <AuditLogCard /> : null}
     </div>
+  );
+}
+
+/** A quiet reminder while the login's email address isn't confirmed. */
+function EmailConfirmationLine() {
+  const send = useRequestEmailConfirmation();
+  return (
+    <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-zinc-600">
+      <span>Your email address isn't confirmed yet.</span>
+      {send.isSuccess ? (
+        <span className="text-accent-800">{send.data.message}</span>
+      ) : (
+        <button type="button" className="font-medium text-accent-700 hover:underline disabled:opacity-60" disabled={send.isPending} onClick={() => send.mutate()}>
+          Send the link again
+        </button>
+      )}
+      {send.error ? <span className="text-red-700">{errorMessage(send.error)}</span> : null}
+    </p>
   );
 }
 

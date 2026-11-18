@@ -16,5 +16,7 @@ export const feature: DashboardFeature = {
     { path: "invite/:token", lazy: () => import("./PublicPages").then((m) => ({ Component: m.InvitePage })) },
     { path: "forgot-password", lazy: () => import("./PublicPages").then((m) => ({ Component: m.ForgotPasswordPage })) },
     { path: "reset-password", lazy: () => import("./PublicPages").then((m) => ({ Component: m.ResetPasswordPage })) },
+    { path: "confirm-email", lazy: () => import("./PublicPages").then((m) => ({ Component: m.ConfirmEmailPage })) },
+    { path: "link-google", lazy: () => import("./PublicPages").then((m) => ({ Component: m.LinkGooglePage })) },
   ],
 };
