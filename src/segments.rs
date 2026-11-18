@@ -630,6 +630,9 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 if where_.len() > 20 {
                     return Err(AppError::bad("an object condition takes at most 20 field rules"));
                 }
+                if where_.iter().any(|f| f.value.as_ref().is_some_and(|v| v.is_object())) {
+                    return Err(AppError::bad("comparing one field with another is only for object flows, not segments"));
+                }
                 if relationship.as_deref().is_some_and(|r| r.trim().is_empty() || r.chars().count() > 50) {
                     return Err(AppError::bad("relationship is 1-50 characters (e.g. guest)"));
                 }

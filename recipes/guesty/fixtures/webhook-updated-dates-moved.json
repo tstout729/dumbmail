@@ -26,6 +26,7 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_checked_at": "2026-11-16T10:00:00.000Z",
         "paid_in_full": false,
         "source_channel": "manual",
         "status": "confirmed",

@@ -25,6 +25,8 @@
         "listing_id": "66054019764cbb000f37c450",
         "listing_name": "Winery Villa",
         "nights": 4,
+        "paid_checked_at": null,
+        "paid_in_full": null,
         "source_channel": "direct",
         "status": "inquiry",
         "total": 900

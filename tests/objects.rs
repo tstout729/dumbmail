@@ -436,7 +436,7 @@ async fn guesty_keeps_reservations_as_objects_without_door_codes() {
     h.signup().await;
     let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
     let id = created["integration"]["id"].as_str().unwrap().to_string();
-    assert!(created["flows"].as_array().unwrap().iter().any(|f| f["name"].as_str().unwrap().contains("from the reservation")), "{created}");
+    assert_eq!(created["flows"].as_array().unwrap().iter().filter(|f| f["name"].as_str().unwrap().contains("pre-arrival")).count(), 1, "{created}");
     let t = h.ok("GET", "/api/object-types/reservation", None).await;
     assert_eq!(t["fields"].as_array().unwrap().iter().find(|f| f["key"] == "check_in").unwrap()["type"], "date");
     // Signatures are tested elsewhere; this one checks what's kept.
@@ -769,67 +769,104 @@ async fn a_time_zone_change_never_leaves_a_fire_at_its_old_moment() {
     h.cleanup().await;
 }
 
+/// The Guesty recipe with its one pre-arrival flow live (at midnight, or after `delay_hours`), and
+/// a way to post legacy reservation webhooks to it.
+struct Guesty {
+    path: String,
+}
+
+async fn guesty_live(h: &mut Harness, delay_hours: Option<f64>) -> Guesty {
+    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
+    let pre: Vec<&Value> = created["flows"].as_array().unwrap().iter().filter(|f| f["name"].as_str().unwrap().contains("pre-arrival")).collect();
+    assert_eq!(pre.len(), 1, "one pre-arrival suggestion");
+    let id = created["integration"]["id"].as_str().unwrap().to_string();
+    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "none"}}))).await;
+    let fid = pre[0]["id"].as_str().unwrap().to_string();
+    let f = h.ok("GET", &format!("/api/flows/{fid}"), None).await;
+    assert_eq!(f["trigger"]["type"], "object_date");
+    let mut trigger = f["trigger"].clone();
+    trigger["hour"] = json!(0);
+    let mut def = f["definition"].clone();
+    if let Some(hours) = delay_hours {
+        let entry = def["entry"].as_str().unwrap().to_string();
+        def["nodes"].as_array_mut().unwrap().insert(0, json!({"id": "wait", "type": "delay", "amount": hours, "unit": "hours", "next": entry}));
+        def["entry"] = json!("wait");
+    }
+    h.ok("PATCH", &format!("/api/flows/{fid}"), Some(json!({"trigger": trigger, "definition": def}))).await;
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
+    let i = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    Guesty { path: url[url.find("/webhooks/in/").unwrap()..].to_string() }
+}
+
+/// A legacy Guesty reservation webhook: `due` of a 600 total still owed (None: no money in it).
+fn legacy(res: &str, guest: (&str, &str), status: &str, due: Option<f64>, at: &str) -> String {
+    let mut r = json!({"_id": res, "status": status, "guestId": guest.0, "lastUpdatedAt": at, "confirmedAt": "2026-11-17T09:00:00.000Z",
+        "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "listing": {"nickname": "Dune Cottage"},
+        "guest": {"_id": guest.0, "email": guest.1, "firstName": "G"}});
+    if let Some(d) = due {
+        r["money"] = json!({"totalPaid": 600.0 - d, "balanceDue": d, "currency": "USD"});
+    }
+    json!({"event": "reservation.updated", "reservation": r}).to_string()
+}
+
+impl Guesty {
+    async fn post(&self, h: &Harness, body: String) {
+        let (s, _, r) = h.raw("POST", &self.path, &[("content-type", "application/json")], &body).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        h.drain().await;
+    }
+}
+
+fn pre_arrivals(h: &Harness) -> Vec<String> {
+    h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).map(|m| m.to).collect()
+}
+
+async fn fire(h: &Harness) {
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+}
+
 #[tokio::test]
-async fn guesty_pre_arrival_waits_until_the_booking_is_paid_in_full() {
+async fn guesty_pre_arrival_needs_a_confirmed_paid_reservation_and_its_guest() {
     let mut h = integ_harness!();
     h.signup().await;
     h.credit(5.0).await;
-    let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
-    let id = created["integration"]["id"].as_str().unwrap().to_string();
-    h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"signature": {"type": "none"}}))).await;
-    let i = h.ok("GET", &format!("/api/integrations/{id}"), None).await;
-    let url = i["inbound_url"].as_str().unwrap();
-    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
-    // Both suggested pre-arrival flows (event-based and object-based), firing at midnight.
-    for f in created["flows"].as_array().unwrap().iter().filter(|f| f["name"].as_str().unwrap().contains("pre-arrival")) {
-        let fid = f["id"].as_str().unwrap();
-        let mut trigger = h.ok("GET", &format!("/api/flows/{fid}"), None).await["trigger"].clone();
-        trigger["hour"] = json!(0);
-        h.ok("PATCH", &format!("/api/flows/{fid}"), Some(json!({"trigger": trigger}))).await;
-        h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
-    }
-    let legacy = |ev: &str, due: f64, at: &str, msg: &str| {
-        let r = json!({"_id": "R1", "status": "confirmed", "guestId": "gA", "lastUpdatedAt": at, "confirmedAt": "2026-11-17T09:00:00.000Z",
-            "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "listing": {"nickname": "Dune Cottage"},
-            "guest": {"_id": "gA", "email": "ana@example.com", "firstName": "Ana"},
-            "money": {"totalPaid": 600.0 - due, "balanceDue": due, "currency": "USD"}});
-        (json!({"event": ev, "reservation": r}).to_string(), msg.to_string())
-    };
-    let post = |(body, msg): (String, String)| {
-        let path = path.clone();
-        let h = &h;
-        async move {
-            let (s, _, r) = h.raw("POST", &path, &[("content-type", "application/json"), ("svix-id", &msg)], &body).await;
-            assert_eq!(s, StatusCode::OK, "{r}");
-            h.drain().await;
-        }
-    };
-    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).map(|m| m.to).collect::<Vec<_>>();
-    // Confirmed, money still due: nothing.
-    post(legacy("reservation.new", 120.0, "2026-11-17T10:00:00.000Z", "m1")).await;
+    let g = guesty_live(&mut h, None).await;
+    let ana = ("gA", "ana@example.com");
+    // Unpaid: never starts.
+    g.post(&h, legacy("R1", ana, "confirmed", Some(120.0), "2026-11-17T10:00:00.000Z")).await;
+    // Paid, then a newer unpaid version: nothing. And the same two delivered the other way round.
+    g.post(&h, legacy("R2", ana, "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    g.post(&h, legacy("R2", ana, "confirmed", Some(50.0), "2026-11-17T11:00:00.000Z")).await;
+    g.post(&h, legacy("R3", ana, "confirmed", Some(50.0), "2026-11-17T11:00:00.000Z")).await;
+    g.post(&h, legacy("R3", ana, "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    // Paid but not confirmed (checked in already counts as not confirmed): nothing.
+    g.post(&h, legacy("R4", ana, "checked_in", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    // Paid, then moved to another guest: the former guest gets nothing; the new one does.
+    g.post(&h, legacy("R5", ("gB", "ben@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    g.post(&h, legacy("R5", ("gC", "cara@example.com"), "confirmed", Some(0.0), "2026-11-17T11:00:00.000Z")).await;
+    fire(&h).await;
+    assert_eq!(pre_arrivals(&h), vec!["cara@example.com"], "only the confirmed, paid reservation, to its current guest");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn guesty_pre_arrival_stops_when_payment_becomes_unknown_before_a_step() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    // A wait before the email, so the run is in the flow when the reservation changes.
+    let g = guesty_live(&mut h, Some(1.0)).await;
+    g.post(&h, legacy("R1", ("gA", "ana@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    g.post(&h, legacy("R2", ("gB", "ben@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
     dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs WHERE status = 'active'").await, 2, "both paid: both started");
+    // A newer version without money: Ana's payment is unknown now. Ben's stays paid.
+    g.post(&h, legacy("R1", ("gA", "ana@example.com"), "confirmed", None, "2026-11-17T12:00:00.000Z")).await;
     h.fast_forward().await;
-    assert!(sent(&h).is_empty(), "confirmed but not paid: no pre-arrival");
-    let paid: Option<bool> = sqlx::query_scalar("SELECT (fields->>'paid_in_full')::boolean FROM objects WHERE external_id = 'R1'").fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(paid, Some(false));
-    // Paid in full later: each pre-arrival flow sends once.
-    post(legacy("reservation.updated", 0.0, "2026-11-17T11:00:00.000Z", "m2")).await;
-    dumbmail::flows::date_triggers(&h.state).await.unwrap();
-    h.fast_forward().await;
-    assert_eq!(sent(&h), vec!["ana@example.com", "ana@example.com"], "the event-based and the object-based flow");
-    // A booking whose payment Guesty never reported (v2 webhooks carry no money): never.
-    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) SELECT $1, account_id, 'ben@example.com', '{\"guesty_guest_id\": \"gB\"}' FROM integrations")
-        .bind(uuid::Uuid::now_v7())
-        .execute(&h.state.db)
-        .await
-        .unwrap();
-    let v2 = json!({"event": "reservation.created.v2", "meta": {"eventId": "m3", "publishedAt": "2026-11-17T12:00:00.000Z"},
-        "data": {"reservationId": "R2", "guestId": "gB", "status": "confirmed", "checkInDateLocalized": day(2), "checkOutDateLocalized": day(4), "guestsCount": 2}});
-    post((v2.to_string(), "m3".into())).await;
-    dumbmail::flows::date_triggers(&h.state).await.unwrap();
-    h.fast_forward().await;
-    assert_eq!(sent(&h).len(), 2, "unknown payment never sends");
-    assert_eq!(count(&h, "SELECT count(*) FROM objects WHERE external_id = 'R2' AND fields ? 'paid_in_full'").await, 0);
+    assert_eq!(pre_arrivals(&h), vec!["ben@example.com"]);
     h.cleanup().await;
 }
 

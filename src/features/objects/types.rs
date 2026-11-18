@@ -248,7 +248,7 @@ pub fn normalize(def: &FieldDef, v: &Value) -> Result<Value, String> {
         }
         Kind::Datetime => {
             let d = v.as_str().and_then(datetime).ok_or_else(|| format!("{k} must be a date and time with its offset, like 2026-11-20T16:00:00Z"))?;
-            json!(d.to_rfc3339_opts(SecondsFormat::Secs, true))
+            json!(d.to_rfc3339_opts(SecondsFormat::AutoSi, true))
         }
         Kind::Enum => {
             let s = match v {

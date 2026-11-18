@@ -52,6 +52,13 @@ pub fn validate_trigger(t: &Trigger) -> AppResult<()> {
         if f.iter().any(|x| !field_ok(&x.field)) {
             return Err(AppError::bad("object trigger filters name one of the type's fields"));
         }
+        for x in f {
+            if let Some(r) = field_ref(x) {
+                if !(r == AS_OF || field_ok(r)) || !matches!(x.op, PropOp::Eq | PropOp::Neq | PropOp::Gt | PropOp::Gte | PropOp::Lt | PropOp::Lte) {
+                    return Err(AppError::bad("a filter can compare with another field ({\"field\": \"name\"}, or \"$as_of\" for the object's version) only with eq, neq, gt, gte, lt or lte"));
+                }
+            }
+        }
         segments::parse(&json!({"conditions": f.iter().map(|x| json!({"type": "property", "field": x.field, "op": x.op, "value": x.value})).collect::<Vec<_>>()}))?;
         Ok(())
     };
@@ -113,6 +120,7 @@ pub async fn check_trigger_refs(db: &PgPool, account_id: Uuid, t: &Trigger) -> A
     };
     let ty = super::types::require(db, account_id, key).await?;
     let mut tested: Vec<&str> = filters.iter().map(|f| f.field.as_str()).collect();
+    tested.extend(filters.iter().filter_map(field_ref).filter(|r| *r != AS_OF));
     tested.extend(changed);
     tested.extend(date_field.map(String::as_str));
     super::types::check_rule_fields(db, account_id, &ty.key, &tested).await?;
@@ -322,15 +330,17 @@ struct Obj {
 }
 
 async fn load_obj(conn: &mut PgConnection, account_id: Uuid, object_id: Uuid) -> AppResult<Option<Obj>> {
-    let row: Option<(Uuid, String, Value)> = sqlx::query_as("SELECT o.type_id, o.external_id, o.fields FROM objects o WHERE o.id = $1 AND o.account_id = $2")
+    // FOR SHARE: a write to this object waits until the run that reads it here is entered.
+    let row: Option<(Uuid, String, Value, Option<String>)> = sqlx::query_as("SELECT o.type_id, o.external_id, o.fields, o.as_of FROM objects o WHERE o.id = $1 AND o.account_id = $2 FOR SHARE")
         .bind(object_id)
         .bind(account_id)
         .fetch_optional(&mut *conn)
         .await?;
-    let Some((type_id, external_id, fields)) = row else { return Ok(None) };
+    let Some((type_id, external_id, fields, as_of)) = row else { return Ok(None) };
     let Some(t) = super::types::by_id(&mut *conn, account_id, type_id).await? else { return Ok(None) };
-    let fields = super::types::rule_fields(&t, fields.as_object().unwrap_or(&Map::new()));
-    let rule_keys = t.fields.iter().filter(|f| !f.sensitive).map(|f| f.key.clone()).collect();
+    let mut fields = super::types::rule_fields(&t, fields.as_object().unwrap_or(&Map::new()));
+    let mut rule_keys: Vec<String> = t.fields.iter().filter(|f| !f.sensitive).map(|f| f.key.clone()).collect();
+    with_as_of(&mut fields, &mut rule_keys, as_of);
     Ok(Some(Obj { type_key: t.key, external_id, fields, rule_keys }))
 }
 
@@ -611,9 +621,9 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
         Ok(Trigger::ObjectDate { relationship, .. } | Trigger::Object { relationship, .. }) => relationship.as_deref().map(|r| r.trim().to_lowercase()),
         _ => None,
     };
-    let row: Option<(String, String, Value, bool, Option<String>, Value)> = sqlx::query_as(
+    let row: Option<(String, String, Value, bool, Option<String>, Value, Option<String>)> = sqlx::query_as(
         "SELECT t.key, o.external_id, o.fields, EXISTS (SELECT 1 FROM object_links l WHERE l.object_id = o.id AND l.profile_id = $3 AND ($4::text IS NULL OR l.relationship = $4)),
-                (SELECT a.timezone FROM accounts a WHERE a.id = o.account_id), t.fields
+                (SELECT a.timezone FROM accounts a WHERE a.id = o.account_id), t.fields, o.as_of
          FROM objects o JOIN object_types t ON t.id = o.type_id WHERE o.id = $1 AND o.account_id = $2",
     )
     .bind(object_id)
@@ -622,14 +632,16 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     .bind(&rel)
     .fetch_optional(db)
     .await?;
-    let Some((key, external_id, all, is_linked, tz, defs)) = row else { return Ok(Check::Exit("object deleted")) };
+    let Some((key, external_id, all, is_linked, tz, defs, as_of)) = row else { return Ok(Check::Exit("object deleted")) };
     if !is_linked {
         return Ok(Check::Exit("no longer linked to the object that way"));
     }
     let all = all.as_object().cloned().unwrap_or_default();
     let defs: Vec<super::types::FieldDef> = serde_json::from_value(defs).unwrap_or_default();
-    let keys: Vec<String> = defs.iter().filter(|d| !d.sensitive).map(|d| d.key.clone()).collect();
-    let fields: Map<String, Value> = all.iter().filter(|(k, _)| keys.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut keys: Vec<String> = defs.iter().filter(|d| !d.sensitive).map(|d| d.key.clone()).collect();
+    let mut fields: Map<String, Value> = all.iter().filter(|(k, _)| keys.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let view_fields = fields.clone();
+    with_as_of(&mut fields, &mut keys, as_of);
     let tz = tz.and_then(|t| t.parse::<chrono_tz::Tz>().ok()).unwrap_or(chrono_tz::America::Los_Angeles).name().to_string();
     let started_under = context["object"].get("trigger_key").and_then(Value::as_str);
     let filters = match trigger {
@@ -652,7 +664,7 @@ pub async fn check_run(db: &PgPool, f: &FlowRow, context: &Value, profile_id: Uu
     if !filters.iter().all(|flt| rule_matches(&fields, &keys, flt, &tz, Utc::now())) {
         return Ok(Check::Exit("no longer matches the trigger"));
     }
-    let mut view = fields.clone();
+    let mut view = view_fields;
     view.entry("external_id").or_insert(json!(external_id));
     view.entry("type").or_insert(json!(key));
     Ok(Check::Live { view: Value::Object(view), rules: RuleCtx { fields, keys, tz } })
@@ -699,10 +711,37 @@ fn days(v: &Option<Value>) -> f64 {
     v.as_ref().and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0.0)
 }
 
+/// The pseudo-field rules use for the object's stored version (the newest `as_of` written), e.g.
+/// `{"field": "paid_checked_at", "op": "gte", "value": {"field": "$as_of"}}`.
+pub const AS_OF: &str = "$as_of";
+
+/// The field a filter's value refers to (`{"field": "name"}`), if it does.
+pub fn field_ref(f: &Filter) -> Option<&str> {
+    f.value.as_ref()?.as_object()?.get("field")?.as_str().map(str::trim)
+}
+
+fn with_as_of(fields: &mut Map<String, Value>, keys: &mut Vec<String>, as_of: Option<String>) {
+    if let Some(v) = as_of {
+        fields.insert(AS_OF.into(), json!(v));
+    }
+    keys.push(AS_OF.into());
+}
+
 /// [`filter_matches`] that fails closed: a rule on a field the type doesn't define, or marks
-/// sensitive, never holds (whatever its operator, `not_exists` and `neq` included).
+/// sensitive, never holds (whatever its operator, `not_exists` and `neq` included); a value that
+/// refers to another field (`{"field": "name"}`) is that field's value, and never holds when it is
+/// missing or can't be tested.
 pub fn rule_matches(fields: &Map<String, Value>, keys: &[String], f: &Filter, tz: &str, now: DateTime<Utc>) -> bool {
-    keys.iter().any(|k| k == f.field.trim()) && filter_matches(fields, f, tz, now)
+    if !keys.iter().any(|k| k == f.field.trim()) {
+        return false;
+    }
+    match field_ref(f) {
+        Some(r) => match (keys.iter().any(|k| k == r), fields.get(r)) {
+            (true, Some(v)) if !v.is_null() => filter_matches(fields, &Filter { field: f.field.clone(), op: f.op, value: Some(v.clone()) }, tz, now),
+            _ => false,
+        },
+        None => filter_matches(fields, f, tz, now),
+    }
 }
 
 /// One field rule on an object's fields. Dates are compared as dates: a plain date by calendar day

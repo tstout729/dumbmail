@@ -505,7 +505,7 @@ async fn guesty_pull_reuses_its_token_and_backfills() {
     let mut h = integ_harness!();
     h.signup().await;
     let created = h.ok("POST", "/api/integrations/from-recipe", Some(json!({"recipe": "guesty"}))).await;
-    assert_eq!(created["flows"].as_array().unwrap().len(), 4);
+    assert_eq!(created["flows"].as_array().unwrap().len(), 3);
     assert_eq!(created["flows"][0]["status"], "draft", "suggested flows never start on their own");
     let integ = &created["integration"];
     let id = integ["id"].as_str().unwrap().to_string();
@@ -1313,9 +1313,6 @@ async fn guesty_reminders_follow_the_newest_version_and_stop_on_cancellation() {
     let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
     let mut trigger = f["trigger"].clone();
     trigger["hour"] = json!(0);
-    // This test is about ordering versions; v2 webhooks carry no payment, so the payment rule (tested
-    // in tests/objects.rs) is taken off here.
-    trigger["filters"] = json!([]);
     h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
     assert_eq!(f["definition"]["settings"]["service_messages"], true, "booking messages reach guests who haven't agreed to marketing");
     h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
@@ -1355,15 +1352,29 @@ async fn guesty_reminders_follow_the_newest_version_and_stop_on_cancellation() {
     let dl: Vec<(String, Option<String>, Option<Value>)> = sqlx::query_as("SELECT status, error, result FROM integration_deliveries").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 4, "three distinct versions for Ana, one for Ben: {evs:?} {dl:?}");
     assert_eq!(count(&h, &metric("Reservation Booked")).await, 2, "booked once per reservation");
+    // The pre-arrival flow's payment gate is on: v2 webhooks carry no money, so nothing goes yet.
     dumbmail::flows::date_triggers(&h.state).await.unwrap();
     h.fast_forward().await;
-    let sent: Vec<String> = h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).map(|m| m.to).collect();
-    assert_eq!(sent, vec!["ana@example.com"], "one reminder, from the newest version (A); none for the cancelled booking");
+    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).map(|m| m.to).collect::<Vec<_>>();
+    assert!(sent(&h).is_empty(), "payment unknown: no reminder");
+    // Payment evidence newer than everything above (a legacy webhook with the money), for both.
+    for (res, guest, email, status, msg) in [("R1", "gA", "ana@example.com", "confirmed", "msg-p1"), ("R2", "gB", "ben@example.com", "canceled", "msg-p2")] {
+        let body = json!({"event": "reservation.updated", "reservation": {"_id": res, "status": status, "guestId": guest, "lastUpdatedAt": "2026-11-17T13:00:00.000Z",
+            "checkInDateLocalized": day(2), "checkOutDateLocalized": day(2), "guest": {"_id": guest, "email": email}, "money": {"totalPaid": 500, "balanceDue": 0, "currency": "USD"}}})
+        .to_string();
+        let hdrs = svix(key, msg, &body);
+        let hdrs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (s, _, r) = h.raw("POST", &path, &hdrs, &body).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        h.drain().await;
+    }
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
+    assert_eq!(sent(&h), vec!["ana@example.com"], "one reminder, for the newest version (A, in two days); none for the cancelled booking");
     let report = h.ok("GET", &format!("/api/flows/{pre}/report"), None).await;
-    assert_eq!(report["event_dates"]["counts"]["started"], 1, "{report}");
-    assert_eq!(report["event_dates"]["counts"]["superseded"], 1, "the first A (same date) was replaced: {report}");
-    assert_eq!(report["event_dates"]["counts"]["cancelled"], 1, "{report}");
-    assert_eq!(report["event_dates"]["counts"]["pending"], 1, "B's date, five days out, still waits (and will be skipped as replaced): {report}");
+    assert_eq!(report["object_dates"]["counts"]["started"], 1, "{report}");
+    assert_eq!(report["object_dates"]["counts"]["filtered"], 1, "the cancelled booking: {report}");
+    assert!(report["object_dates"]["counts"]["pending"].is_null(), "no fire left for B's date (the older versions were ignored): {report}");
     h.cleanup().await;
 }
 
@@ -2148,9 +2159,6 @@ async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
     let f = h.ok("GET", &format!("/api/flows/{pre}"), None).await;
     let mut trigger = f["trigger"].clone();
     trigger["hour"] = json!(0);
-    // This test is about ordering versions; v2 webhooks carry no payment, so the payment rule (tested
-    // in tests/objects.rs) is taken off here.
-    trigger["filters"] = json!([]);
     h.ok("PATCH", &format!("/api/flows/{pre}"), Some(json!({"trigger": trigger}))).await;
     h.ok("POST", &format!("/api/flows/{pre}/status"), Some(json!({"status": "live"}))).await;
     h.ok("POST", "/api/profiles", Some(json!({"email": "ana@example.com"}))).await;
@@ -2180,9 +2188,17 @@ async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
     // Only the notes changed: no new version.
     send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "confirmed", Some("2026-11-17T13:00:00.000Z"), Some(vec!["notes"]), "m4")).await;
     assert_eq!(count(&h, &metric("Reservation Confirmed")).await, 2, "10:00 and the reinstatement; nothing for the notes");
+    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).count();
     dumbmail::flows::date_triggers(&h.state).await.unwrap();
     h.fast_forward().await;
-    let sent = |h: &Harness| h.state.email.sent().into_iter().filter(|m| m.subject.starts_with("See you soon")).count();
+    assert_eq!(sent(&h), 0, "the payment gate is on and v2 webhooks carry no money");
+    // Payment evidence newer than the reinstatement (a legacy webhook with the money).
+    let paid = json!({"event": "reservation.updated", "reservation": {"_id": "R1", "status": "confirmed", "guestId": "gA", "lastUpdatedAt": "2026-11-17T13:30:00.000Z",
+        "checkInDateLocalized": in2, "checkOutDateLocalized": in2, "guest": {"_id": "gA", "email": "ana@example.com"}, "money": {"totalPaid": 500, "balanceDue": 0, "currency": "USD"}}})
+    .to_string();
+    send_signed(&h, &path, (svix(key, "m-paid", &paid), paid)).await;
+    dumbmail::flows::date_triggers(&h.state).await.unwrap();
+    h.fast_forward().await;
     assert_eq!(sent(&h), 1, "the late, older cancellation didn't undo the reinstatement");
     // A later version that didn't move the date (as a pull sees it) doesn't send the reminder again.
     send_signed(&h, &path, post("reservation.updated.v2", "R1", "gA", "confirmed", Some("2026-11-17T14:00:00.000Z"), Some(vec!["checkIn"]), "m5")).await;
@@ -2190,7 +2206,7 @@ async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
     h.fast_forward().await;
     assert_eq!(sent(&h), 1);
     let report = h.ok("GET", &format!("/api/flows/{pre}/report"), None).await;
-    assert_eq!(report["event_dates"]["counts"]["already_sent"], 1, "{report}");
+    assert_eq!(report["object_dates"]["counts"]["started"], 1, "one start for the one date: {report}");
     // A guest DumbMail doesn't know yet: the webhook waits (retried) instead of being dropped.
     send_signed(&h, &path, post("reservation.created.v2", "R9", "gNew", "confirmed", Some("2026-11-17T15:00:00.000Z"), None, "m9")).await;
     let d = &h.ok("GET", &format!("/api/integrations/{gid}/deliveries"), None).await["data"][0];
@@ -2217,7 +2233,7 @@ async fn guesty_orders_versions_by_its_own_time_and_waits_for_unknown_guests() {
         h.drain().await;
     }
     assert_eq!(count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked' AND e.properties->>'reservation_id' = 'R7'").await, 1);
-    let totals: Vec<f64> = sqlx::query_scalar("SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Total'").fetch_all(&h.state.db).await.unwrap();
+    let totals: Vec<f64> = sqlx::query_scalar("SELECT e.value FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Total' AND e.properties->>'reservation_id' = 'R7'").fetch_all(&h.state.db).await.unwrap();
     assert_eq!(totals, vec![480.0]);
     h.cleanup().await;
 }

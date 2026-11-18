@@ -12,6 +12,8 @@
         "guests": 2,
         "listing_id": "66054019764cbb000f37c450",
         "nights": 3,
+        "paid_checked_at": null,
+        "paid_in_full": null,
         "source_channel": "direct",
         "status": "canceled"
       },

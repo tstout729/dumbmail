@@ -74,9 +74,9 @@
     "Test the pull (Pull tab → Test pull, or test_integration with pull: true) to see the first page of reservations and exactly what would be written.",
     "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
     "Guests are held back from marketing: the suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
-    "Review the draft flows (booking confirmation, pre-arrival, review request, and a pre-arrival that follows the reservation object; use one of the two pre-arrival flows), edit the emails, and turn them on.",
+    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on.",
     "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile.",
-    "Pre-arrival messages wait for payment: they go only to bookings Guesty reports as paid in full. Guesty reports money only in its legacy reservation webhooks (until 1 March 2027), so subscribe to those too; without them no pre-arrival message is sent."
+    "Pre-arrival messages wait for payment: they go only to confirmed reservations Guesty reports as paid in full, with that evidence at least as new as the reservation's last change. Payment comes from Guesty's legacy reservation webhooks (until 1 March 2027) and from an hourly check of upcoming arrivals through Guesty's reservations reports search (part of the scheduled pull)."
   ],
   "flows": [
     {
@@ -135,56 +135,6 @@
       }
     },
     {
-      "name": "Guesty: pre-arrival",
-      "description": "Two days before check-in at 10am, sends arrival details. Skipped if the booking was cancelled; follows the newest dates if they changed. A service message. Only for bookings Guesty reports paid in full (nothing due on a total above zero); a booking whose payment Guesty hasn't reported never gets it.",
-      "trigger": {
-        "type": "event_date",
-        "metric": "Reservation Confirmed",
-        "field": "check_in",
-        "offset_days": -2,
-        "hour": 10,
-        "key": "reservation_id",
-        "cancelled_by": [
-          "Reservation Cancelled"
-        ],
-        "filters": [
-          {
-            "field": "paid_in_full",
-            "op": "eq",
-            "value": true
-          }
-        ]
-      },
-      "definition": {
-        "entry": "p1",
-        "settings": {
-          "service_messages": true
-        },
-        "nodes": [
-          {
-            "id": "p1",
-            "type": "email",
-            "name": "Arrival details",
-            "next": null,
-            "content": {
-              "subject": "See you soon at {{ event.properties.listing_name|default('our place') }}",
-              "preheader": "Check-in is {{ event.properties.check_in }}",
-              "blocks": [
-                {
-                  "type": "heading",
-                  "text": "Your stay starts in two days"
-                },
-                {
-                  "type": "text",
-                  "html": "<p>Hi {{ first_name|default('there') }}, we're getting <strong>{{ event.properties.listing_name|default('the place') }}</strong> ready for you.</p><p>Check-in: {{ event.properties.check_in }}<br>Check-out: {{ event.properties.check_out }}</p><p>Reply to this email if you have any questions before you arrive.</p>"
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
       "name": "Guesty: review request",
       "description": "The day after check-out at 11am, thanks the guest and asks for a review. Skipped for cancelled bookings. A service message about their stay.",
       "trigger": {
@@ -228,8 +178,8 @@
       }
     },
     {
-      "name": "Guesty: pre-arrival from the reservation",
-      "description": "Two days before check-in at 10am, sends arrival details, from the reservation object: it follows the newest dates and skips cancelled bookings and inquiries without any event keys. A service message. Turn on this one or the event-based pre-arrival flow, not both. Only for bookings Guesty reports paid in full (nothing due on a total above zero); a booking whose payment Guesty hasn't reported never gets it.",
+      "name": "Guesty: pre-arrival",
+      "description": "Two days before check-in at 10am, sends arrival details. Only while the reservation is confirmed, Guesty has reported it paid in full with evidence at least as new as its last change, and the person is still its guest: checked when it's due and before each step. It follows the newest dates. A service message.",
       "trigger": {
         "type": "object_date",
         "object_type": "reservation",
@@ -240,17 +190,20 @@
         "filters": [
           {
             "field": "status",
-            "op": "in",
-            "value": [
-              "confirmed",
-              "checked_in",
-              "alteration"
-            ]
+            "op": "eq",
+            "value": "confirmed"
           },
           {
             "field": "paid_in_full",
             "op": "eq",
             "value": true
+          },
+          {
+            "field": "paid_checked_at",
+            "op": "gte",
+            "value": {
+              "field": "$as_of"
+            }
           }
         ]
       },
@@ -369,6 +322,11 @@
           "key": "paid_in_full",
           "label": "Paid in full",
           "type": "boolean"
+        },
+        {
+          "key": "paid_checked_at",
+          "label": "Payment checked at",
+          "type": "datetime"
         }
       ]
     }

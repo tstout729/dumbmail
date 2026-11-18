@@ -244,12 +244,22 @@ function reservationActions(r, guest, who, version, input, versioned) {
 // The reservation as it is now. Only what this message says is written (a v2 webhook without the
 // listing's name leaves the stored name alone); door codes and notes are never among the fields.
 // `who` may be null (no guest, or one DumbMail can't find yet): the old guest is unlinked anyway.
+// Payment: a version that carries money records `paid_in_full` with the time of that evidence
+// (`paid_checked_at`, Guesty's own time for the version); a version without money makes payment
+// unknown (both cleared), so evidence is never older than the reservation's last change.
 function reservationObject(d, who, version) {
   var fields = clean({
     status: d.status ? d.status.toLowerCase() : null, confirmation_code: d.confirmation_code, listing_id: d.listing_id, listing_name: d.listing_name,
     check_in: d.check_in, check_out: d.check_out, nights: d.nights, guests: d.guests, total: d.total, currency: d.currency,
-    source_channel: d.source_channel, guest_id: d.guest_id, paid_in_full: d.paid_in_full,
+    source_channel: d.source_channel, guest_id: d.guest_id,
   });
+  if (d.paid_in_full !== null) {
+    fields.paid_in_full = d.paid_in_full;
+    fields.paid_checked_at = version;
+  } else {
+    fields.paid_in_full = null;
+    fields.paid_checked_at = null;
+  }
   var profiles = [];
   if (who) {
     var link = {};
