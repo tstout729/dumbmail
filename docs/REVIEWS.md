@@ -85,8 +85,9 @@ trusted source recorded for that person and that item:
 
 - the flow's (or email's) triggering event was recorded by your server, the API or an integration
   (never the browser), and is a purchase or stay metric: `Placed Order`, `Fulfilled Order`,
-  `Delivered`, `Delivered Order`, an integration's server-only metrics (bookings, orders), or one you
-  list in `purchase_metrics`; or
+  `Delivered`, a metric an integration recipe declares as a purchase (Guesty's `Reservation
+  Confirmed`, Stripe's `Placed Order`), or one you list in `purchase_metrics`. Other server-only
+  metrics (an inquiry, a subscription) prove nothing; or
 - `create_review_request` was given your `order_id` (and not `verified: false`). Without one the
   request is unverified.
 
@@ -116,14 +117,19 @@ carries `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
 ### One ask, one message
 
 Each ask, reminder or API "send now" is recorded before anything is sent, and its id is the
-message's id. A step that runs again (a retry, a worker that stopped) finds the message it already
+message's id. Each request is in at most one ask and one reminder, however many sends race for it
+(a unique key decides), and an API "send now" queues the job that sends it in the same step that
+records it, so a call that stops right after still sends, once. A step that runs again (a retry, a worker that stopped) finds the message it already
 handed over and doesn't send another; a worker that stopped before the hand-off is replaced after
 10 minutes, and the ask goes once. A request counts as sent only once its message was handed over.
 If the message is skipped or fails, its new requests are dropped, so the order line can be asked
 about later. Right before an ask goes, DumbMail checks again that the person is subscribed on that
 channel, not suppressed and not held back from marketing, with no exception for service-message
 flows, and leaves out items reviewed in the meantime; a reminder whose items were all reviewed
-isn't sent at all.
+isn't sent at all. The sender's own last check, right before the hand-off to the provider, applies
+the same strict rules again (email needs subscribed; a hold has no exception), and refuses a
+reminder once any of its items has been reviewed. A step resumed after a stop reads its requests
+back from its record, so the reminder still follows.
 
 ## The review page
 
