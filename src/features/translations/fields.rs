@@ -418,7 +418,7 @@ pub fn check_text(kind: Kind, source: &str, text: &str) -> Result<(), String> {
     }
     super::structure::hidden_controls(text)?;
     // Only words change: the same template tags in the same places, the same markup (see `structure`).
-    super::structure::compare(source, text)?;
+    super::structure::compare_as(source, text, kind != Kind::Html)?;
     if text.contains("{{") || text.contains("{%") {
         let (hidden, _) = crate::features::coupons::template::hide_tags(text);
         if let Err(e) = minijinja::Environment::new().template_from_str(&hidden) {

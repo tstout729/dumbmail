@@ -794,6 +794,10 @@ async fn translations_change_only_words_on_every_path() {
         // A changed filter argument.
         ("subject", "Hallo {{ first_name|default('du') }}"),
     ];
+    // In a plain-text field a < that starts no tag is ordinary text.
+    let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": "subject", "text": "Hallo x<y {{ first_name|default('there') }}"}]}))).await;
+    assert_eq!(s, StatusCode::OK, "{e}");
+    h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": "subject", "text": null}]}))).await;
     for (id, text) in bad {
         let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": id, "text": text}]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "API {id} {text}: {e}");

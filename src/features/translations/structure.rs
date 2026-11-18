@@ -9,7 +9,8 @@
 //!   people (`alt`, `title`, `aria-label`, `placeholder`), whose words may change but whose
 //!   template tags may not. No element, link, image, style or attribute can be added, removed or
 //!   changed. A plain-text field gets the same treatment, so it can contain no markup beyond what
-//!   the original has.
+//!   the original has. There a `<` or `>` that doesn't start a real tag (`x<y`) is ordinary
+//!   text; only real markup counts.
 //! - **Output tags in text** (`{{ first_name }}`) must be the same multiset, expression for
 //!   expression and filter argument for filter argument (quoted strings exactly), and may move
 //!   anywhere within the text, but never into or out of an attribute.
@@ -275,7 +276,7 @@ fn word_tokens(s: &str, base: usize, out: &mut Vec<(usize, Tok)>) {
 
 /// Read a string into tokens with where each starts: text, template tags, HTML elements and the
 /// contents of raw-text elements.
-fn tokens_at(s: &str) -> Vec<(usize, Tok)> {
+fn tokens_at(s: &str, plain: bool) -> Vec<(usize, Tok)> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let (mut i, mut ts) = (0, 0);
@@ -318,6 +319,8 @@ fn tokens_at(s: &str) -> Vec<(usize, Tok)> {
                     }
                     continue;
                 }
+                // Plain text: a `<` that doesn't start a real tag is just a character.
+                None if plain => {}
                 None => {
                     out.push((i, Tok::Bad(s[i..].to_string())));
                     return out;
@@ -330,15 +333,15 @@ fn tokens_at(s: &str) -> Vec<(usize, Tok)> {
     out
 }
 
-fn tokens(s: &str) -> Vec<Tok> {
-    tokens_at(s).into_iter().map(|(_, t)| t).collect()
+fn tokens(s: &str, plain: bool) -> Vec<Tok> {
+    tokens_at(s, plain).into_iter().map(|(_, t)| t).collect()
 }
 
 /// Where a browser closes the document's body: the first real `</body>` end tag (not inside an
 /// attribute, a comment, a `title` or a stylesheet), else the first real `</html>`. None when
 /// there's neither.
 pub fn body_close(html: &str) -> Option<usize> {
-    let toks = tokens_at(html);
+    let toks = tokens_at(html, false);
     let at = |n: &str| toks.iter().find(|(_, t)| matches!(t, Tok::Elem(e) if e.name == n)).map(|(p, _)| *p);
     at("/body").or_else(|| at("/html"))
 }
@@ -353,7 +356,7 @@ pub fn visible(s: &str) -> bool {
 pub fn link_words(s: &str, pick: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur: Option<String> = None;
-    for t in tokens(s) {
+    for t in tokens(s, false) {
         match t {
             Tok::Elem(e) if e.name == "a" => {
                 if let Some(w) = cur.take() {
@@ -544,9 +547,14 @@ pub fn without_tags(s: &str, with: &str) -> String {
     out
 }
 
-/// Whether `translation` changes only words of `original` (see the module docs).
+/// Whether `translation` changes only words of `original` (see the module docs), for HTML.
 pub fn compare(original: &str, translation: &str) -> Result<(), String> {
-    let (o, t) = (tokens(original), tokens(translation));
+    compare_as(original, translation, false)
+}
+
+/// [`compare`] for a plain-text field (`plain`), where only real tags are markup, or HTML.
+pub fn compare_as(original: &str, translation: &str, plain: bool) -> Result<(), String> {
+    let (o, t) = (tokens(original, plain), tokens(translation, plain));
     let structural = |v: &[Tok]| v.iter().filter(|x| matches!(x, Tok::Ctl(_) | Tok::Elem(_) | Tok::Bad(_) | Tok::Raw(_))).cloned().collect::<Vec<_>>();
     let (os, ts) = (structural(&o), structural(&t));
     for (i, (a, b)) in os.iter().zip(&ts).enumerate() {
@@ -632,6 +640,16 @@ mod tests {
             let _ = compare(weird, weird);
             let _ = compare("x", weird);
         }
+    }
+
+    #[test]
+    fn plain_text_stays_plain() {
+        assert!(compare_as("x<y", "a<b", true).is_ok(), "a < that starts no tag is text");
+        assert!(compare_as("Win <SAVE", "Gagnez <SAVE x", true).is_ok());
+        assert!(compare_as("5 > 3 and 2<4", "5 > 3 et 2<4!", true).is_ok());
+        assert!(compare_as("Sale", "Soldes <b>x</b>", true).is_err(), "real markup still counts");
+        assert!(compare_as("a<b", "a<b><img src=x onerror=alert(1)>", true).is_err());
+        assert!(compare("x<y", "a<b").is_err(), "in HTML an unreadable tag must match");
     }
 
     #[test]
