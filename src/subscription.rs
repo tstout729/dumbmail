@@ -101,7 +101,7 @@ pub async fn emails_remaining(db: &PgPool, account_id: Uuid) -> AppResult<i64> {
 }
 
 /// Take one email from the plan. False when there's no active plan or it's used up.
-pub async fn use_email(db: &PgPool, account_id: Uuid) -> AppResult<bool> {
+pub async fn use_email<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid) -> AppResult<bool> {
     let n = sqlx::query(
         "UPDATE accounts SET email_plan_emails_used = email_plan_emails_used + 1
          WHERE id = $1 AND email_plan_tier IS NOT NULL AND email_plan_period_end > now()
@@ -296,10 +296,15 @@ pub async fn apply_checkout(db: &PgPool, account_id: Uuid, session: &Value) -> A
     .fetch_optional(&mut *tx)
     .await?;
     let Some(payment_id) = inserted else { return Ok(()) };
-    let (cur, end): (Option<i16>, Option<DateTime<Utc>>) =
-        sqlx::query_as("SELECT email_plan_tier, email_plan_period_end FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
+    let (cur, end, closed): (Option<i16>, Option<DateTime<Utc>>, bool) =
+        sqlx::query_as("SELECT email_plan_tier, email_plan_period_end, closed_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
     let active = cur.is_some() && end.is_some_and(|e| e > Utc::now());
-    if from_tier == 0 && !active {
+    // A closed account's plan never restarts; the payment is kept as credit for reconciliation.
+    if closed {
+        tracing::warn!(account = %account_id, session = session_id, "plan payment for a closed account; adding it as credit");
+        billing::post_entry_tx(&mut tx, account_id, "plan_credit", cents * 10_000, &format!("Plan payment added as credit (${:.2})", cents as f64 / 100.0), session_id).await?;
+        sqlx::query("UPDATE plan_payments SET credited_to_balance = true WHERE id = $1").bind(payment_id).execute(&mut *tx).await?;
+    } else if from_tier == 0 && !active {
         let now = Utc::now();
         sqlx::query(
             "UPDATE accounts SET email_plan_tier = $2, email_plan_next_tier = NULL, email_plan_cancel_at_period_end = false,
@@ -385,7 +390,7 @@ pub async fn run_renewals(state: &AppState) -> anyhow::Result<()> {
     //    while a failed renewal is waiting for its retry.
     let due: Vec<Uuid> = sqlx::query_scalar(
         "SELECT a.id FROM accounts a
-         WHERE a.email_plan_tier IS NOT NULL AND a.email_plan_period_end <= now()
+         WHERE a.email_plan_tier IS NOT NULL AND a.email_plan_period_end <= now() AND a.closed_at IS NULL
            AND (a.email_plan_cancel_at_period_end OR a.email_plan_renewal_failed_at IS NULL OR a.email_plan_renewal_failed_at < now() - interval '1 day')
            AND NOT EXISTS (SELECT 1 FROM plan_renewals r WHERE r.account_id = a.id AND r.period_end = a.email_plan_period_end AND r.status = 'pending')
          ORDER BY a.email_plan_period_end LIMIT 50",
@@ -414,7 +419,7 @@ async fn start_attempt(db: &PgPool, account_id: Uuid) -> anyhow::Result<Option<U
         "SELECT email_plan_tier, email_plan_next_tier, email_plan_cancel_at_period_end, email_plan_period_end, email_plan_renewal_attempts,
                 stripe_customer_id, stripe_payment_method_id
          FROM accounts
-         WHERE id = $1 AND email_plan_tier IS NOT NULL AND email_plan_period_end <= now()
+         WHERE id = $1 AND email_plan_tier IS NOT NULL AND email_plan_period_end <= now() AND closed_at IS NULL
            AND (email_plan_cancel_at_period_end OR email_plan_renewal_failed_at IS NULL OR email_plan_renewal_failed_at < now() - interval '1 day')
          FOR UPDATE SKIP LOCKED",
     )
@@ -626,9 +631,10 @@ pub async fn renewal_succeeded(db: &PgPool, renewal_id: Uuid, payment_intent: &s
         tx.commit().await?;
         return Ok(());
     };
-    let cur: (Option<i16>, Option<DateTime<Utc>>) =
-        sqlx::query_as("SELECT email_plan_tier, email_plan_period_end FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
-    if cur.0.is_some() && cur.1 == Some(period_end) {
+    let cur: (Option<i16>, Option<DateTime<Utc>>, bool) =
+        sqlx::query_as("SELECT email_plan_tier, email_plan_period_end, closed_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
+    // A closed account's plan never restarts; the payment becomes credit below.
+    if cur.0.is_some() && cur.1 == Some(period_end) && !cur.2 {
         // On time, the new month starts where the old one ended; after retries, it starts now so the
         // customer gets a full month for what they paid.
         let now = Utc::now();

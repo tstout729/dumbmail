@@ -1,0 +1,52 @@
+{
+  "description": "The pending refund succeeds (refund.updated): recorded once, by refund id, found through its PaymentIntent",
+  "expect": [
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "if_missing": "retry",
+        "property": "stripe_payment_intent",
+        "value": "pi_3QabCdEfGh1234"
+      },
+      "properties": {
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "payment_intent": "pi_3QabCdEfGh1234",
+        "reason": "requested_by_customer",
+        "refund_id": "re_2P"
+      },
+      "time": "2025-11-17T17:20:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:re_2P",
+      "value": 10
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2026-09-30.clover",
+      "created": 1763400000,
+      "data": {
+        "object": {
+          "amount": 1000,
+          "charge": "ch_3QabCdEfGh1234",
+          "created": 1763400000,
+          "currency": "usd",
+          "id": "re_2P",
+          "metadata": {},
+          "object": "refund",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "reason": "requested_by_customer",
+          "status": "succeeded"
+        },
+        "previous_attributes": {
+          "status": "pending"
+        }
+      },
+      "id": "evt_re_2P_u",
+      "livemode": false,
+      "object": "event",
+      "type": "refund.updated"
+    },
+    "source": "webhook"
+  }
+}

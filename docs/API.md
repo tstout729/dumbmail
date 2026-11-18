@@ -58,6 +58,7 @@ type Condition =
   | { type: "segment"; segment_id: string; op: "in" | "not_in" } // the other segment's rules, evaluated live
   | { type: "consent"; channel: "email" | "sms"; status: Consent }
   | { type: "can_receive"; channel: "email" | "sms"; value?: boolean } // a send would reach them now
+  | { type: "coupon"; coupon_id: string; action?: "given" | "redeemed"; op?: "has" | "has_not"; within_days?: number } // see COUPONS.md
   | { type: "suppressed"; value?: boolean } // email or texts suppressed (a hard bounce, complaint or manual suppression)
   | ({ type: "form"; form_id?: string; op?: "has" | "has_not" } & Window) // signed up through a form (any form without form_id)
   | { type: "engagement"; channel: "email" | "sms" | "any"; engaged?: boolean; within_days: number }
@@ -155,18 +156,23 @@ type EventRow = { id: string; metric: string; profile_id: string; properties: Re
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | POST | `/api/auth/signup` | `{email, password, name?, company}` | `{user, account}` + cookie |
-| POST | `/api/auth/login` | `{email, password}` | `{user, account}` + cookie |
+| POST | `/api/auth/login` | `{email, password}` | Same as `/api/me`, + cookie. When two-factor or single sign-on isn't finished, `restriction` says what's left (see docs/TEAM.md) |
 | POST | `/api/auth/logout` | – | `{ok: true}` |
 | GET | `/api/auth/options` | – | `{google, signup, site_url}`: which sign-in methods this server offers, and the marketing site's base URL when SITE_URL puts it on its own host (else `null`) |
-| GET | `/api/auth/google?next=/path` | – | Redirects to Google ("Continue with Google"). The callback (`/api/auth/google/callback`) signs in, joins an existing user with the same email (turning its password off and ending older sessions), or creates a new account and sends it to `/onboarding`. Failures redirect to `/login?error=<code>`. With GOOGLE_REDIRECT_BASE on another host, Google returns to that host and the callback sends people on to PUBLIC_URL |
-| GET | `/api/me` | – | `{user, account, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too |
+| GET | `/api/auth/google?next=/path` | – | Redirects to Google ("Continue with Google"). The callback (`/api/auth/google/callback`) signs in, or creates a new account and sends it to `/onboarding`. An existing login with the same email is matched only when Google is the authority for the address (Gmail, or a Workspace `hd` on its domain; otherwise `/login?error=use_password`). A confirmed login is signed in and Google is linked once the sign-in is complete, two-factor included; an unconfirmed one sends the browser to `/link-google` to choose (see the next rows and docs/TEAM.md). Failures redirect to `/login?error=<code>`. With GOOGLE_REDIRECT_BASE on another host, Google returns to that host and the callback sends people on to PUBLIC_URL |
+| GET | `/api/auth/google/link` | – | For the `/link-google` page, with the cookie the Google sign-in left: `{email, login_created_at, login_created_on, has_password, can_start_fresh, expires_in_minutes}`. 404 when it expired (10 minutes), was used, or this browser doesn't hold one |
+| POST | `/api/auth/google/link/password` | `{password}` | "That was me": checks the existing login's password like `/api/auth/login` (same limits and error). Right: answers like `/api/auth/login` plus `next`, + cookie; Google is linked and the email confirmed once the sign-in is complete (after `POST /api/auth/two-factor` when `restriction` says so) |
+| POST | `/api/auth/google/link/fresh` | – | "That wasn't me, start fresh": empties and disables the old login, closes accounts it alone owned, and makes a new login and account for the Google user. Answers like `/api/auth/login` plus `next: "/onboarding"`, + cookie |
+| POST | `/api/auth/confirm-email` | `{token, password}` | `{ok, message}`. Opens an email confirmation link (single use, 24 hours) with the login's password, checked like `/api/auth/login`. Signs nobody in |
+| POST | `/api/me/email-confirmation` | – | `{ok, already_confirmed, message}`. Emails the signed-in login a new confirmation link (dashboard sessions only, 3 an hour) |
+| GET | `/api/me` | – | `{user, account, role, permissions, restriction, accounts, two_factor_enabled, email_confirmed, support_email}` (401 if signed out). `support_email` is the server's SUPPORT_EMAIL or null; signup and login return it too. Team fields: docs/TEAM.md |
 | PATCH | `/api/account` | any `Account` editable fields, plus `onboarding` partial. `social_links` is `{instagram\|facebook\|tiktok\|x\|youtube\|pinterest\|linkedin\|threads: https URL}`; a blank value removes that network. Social links appear in email footers | `Account` |
 | POST | `/api/brand/import` | `{url, apply?}` | `{brand: {website, name, logo_url, brand_color, colors[], address, from_email, from_email_found, social_links}}`. Reads the public website (and its stylesheets and logo) for brand suggestions. With `apply: true`, also saves website, logo, brand color and social links, plus name and address when the account has none, and returns `account` |
 | GET | `/api/account/sending` | – | `{email: {provider, domain, status: "not_started"\|"pending"\|"verified"\|"failed", dns_records: {type, name, value, status}[]}, sms: {provider, from_number, status}, email_limit?: {limit, sent_last_24h, remaining, fixed, start}, unengaged_skip: {enabled, days, min_emails}}`. `email_limit` is the hosted service's 24-hour warm-up limit (see "Sending guardrails") |
 | POST | `/api/account/domain` | `{domain}` | same as GET sending |
 | POST | `/api/account/domain/verify` | – | same as GET sending |
-| GET | `/api/api-keys` | – | `{data: {id, name, prefix, created_at, last_used_at}[]}` |
-| POST | `/api/api-keys` | `{name}` | `{id, name, prefix, key}` (key shown once) |
+| GET | `/api/api-keys` | – | `{data: {id, name, prefix, scopes, expires_at, expired, created_by, created_at, last_used_at}[], scopes}` (owners and admins) |
+| POST | `/api/api-keys` | `{name, scopes?, expires_in_days?}` | `{id, name, prefix, scopes, expires_at, key}` (key shown once; scopes default to `full`, see docs/TEAM.md) |
 | DELETE | `/api/api-keys/:id` | – | `{ok: true}` |
 | GET | `/api/billing` | – | `{plan, limits: {profiles, emails_per_month, sms_per_month}, usage: {profiles, emails_this_month, sms_this_month}}` |
 
@@ -252,7 +258,7 @@ Attribution: by default a conversion event (`Placed Order`) is credited to the n
 - `GET /client/form-render.js` – the shared form renderer as `window.DumbMailFormRenderer` (CORS open, cached 5 minutes).
 - `GET /i/:image_id` – an uploaded image, cached for a year (`immutable`), with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'`.
 - `GET /t/o/:token` open pixel, `GET /t/c/:token?u=<url>` click redirect, `GET|POST /u/:token` unsubscribe (RFC 8058 one-click). For email, when the account has lists with `show_on_preferences`, GET shows a preference page instead: a checkbox per list, "Save preferences" (`action=save` with a `list` field per checked list; leaving a list records "Unsubscribed from List") and "Unsubscribe from all emails". Any POST without `action=save`, including one-click, unsubscribes from all email.
-- `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound STOP.
+- `POST /webhooks/ses/:secret`, `POST /webhooks/telnyx/:secret`, `POST /webhooks/twilio/:secret` – delivery, bounce, complaint and inbound texts. Telnyx and Twilio webhooks are signature-checked when a key is configured (`TELNYX_PUBLIC_KEY`, `TWILIO_AUTH_TOKEN`, or the account's own connection) and refused with 403 when the check fails or when the webhook uses the route of a provider that connection doesn't use; see `docs/SMS_INBOX.md`.
 - `POST /mcp` – Model Context Protocol (Streamable HTTP), `Authorization: Bearer pl_sk_...`.
 - `GET /healthz` – `{ok: true, git_sha}` (the deployed commit; empty for local builds).
 
@@ -416,7 +422,7 @@ type SmsSetup = {
   provider: string;                  // provider that will send: telnyx | twilio | log
   from_number: string | null;        // the account's active sending number
   can_send: boolean;                 // number exists and is verified (or connected)
-  inbound_webhook_url: string;       // BYO: paste into the provider's messaging webhook so STOP replies are recorded
+  inbound_webhook_url: string;       // BYO: paste into the provider's messaging webhook so replies and STOP reach the inbox
   platform_available: boolean;       // server has a platform Telnyx key (else only BYO)
 };
 type TollFreeVerification = {

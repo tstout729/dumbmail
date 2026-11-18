@@ -17,6 +17,17 @@ The code lives at https://github.com/tstout729/dumbmail. Work in `~/projects/dum
 - Build new features as feature modules (see Layout). Change the shared files only for what a module can't do from its own.
 - Values in SQL are always bound (`push_bind`), never formatted into the query.
 - Dates people see, and day boundaries, use the account's time zone.
+- **Marketing hold** (`profiles.marketing_hold`, helpers in `src/marketing_hold.rs`). It means "we have this person's details for service reasons (a booking, an order), but they haven't agreed to marketing". Only code that *creates* a profile from a source without an opt-in may set it, and only on the profile it just created (`marketing_hold::hold_new_profile`): an integration whose owner hasn't confirmed its contacts opted in, or an import of people who never agreed. Never set it on a profile that already existed. It's enforced in two places: campaign audiences (`marketing_hold::push_campaign_filter`, called from `campaigns::push_eligible`) and the final email gate in `sending::send` (`marketing_hold::blocks_email`), which lets a held person get email only from a flow with `settings.service_messages: true`. Segments' `can_receive` email rule is false for held people. Unsubscribes and suppressions are checked first and always win. The hold clears on a real opt-in: a database trigger keeps a profile whose `email_consent` is `subscribed` from ever being held, whatever path subscribed them.
+- Every route and MCP tool needs a permission rule, or it's refused (403 naming the route or tool and where to add it). One guard checks them for every request, keyed on the matched route and method (`src/features/team/guard.rs`), so a handler never checks roles itself. A feature declares its rules in `access()`, with paths exactly as registered:
+
+  ```rust
+  use crate::features::team::access::{public, rule, Access, Perm, RouteRule, ToolRule};
+  static ROUTES: &[RouteRule] = &[rule("GET", "/api/things", Perm::ContentRead), rule("POST", "/api/things/{id}/send", Perm::CampaignSend), public("POST", "/webhooks/things")];
+  static TOOLS: &[ToolRule] = &[ToolRule { name: "list_things", perm: Perm::ContentRead }];
+  fn access(&self) -> Access { Access { routes: ROUTES, tools: TOOLS } }
+  ```
+
+  Pick the narrowest `Perm` in `src/features/team/access.rs` (roles and API key scopes follow from it; `Perm::TransactionalSend` is reserved for transactional sending). `public` is only for routes with no sign-in (webhooks, public pages); their handlers get no permission check. Checks that depend on data (only drafts, only teammates) go in the write itself. Record changes with `features::team::audit(state, ctx, action, target, details)` right after they commit, with fixed fields, never request bodies. `tests/team.rs` checks every rule against the real router.
 
 ## Checks
 
@@ -28,7 +39,7 @@ TEST_DATABASE_URL=postgres://postgres@localhost:5432/postgres cargo test --locke
 pnpm -C web typecheck && pnpm -C web lint && pnpm -C web build
 ```
 
-Run clippy and the web checks before you push. Leave the full test run to CI.
+Before you push, run clippy and the web checks, and at most the one test file your change touches (`cargo test --test <name>`, or `--lib` with a filter). Never run the whole suite (`cargo test` with no `--test` or filter, or `cargo build --tests`) on the agent host: it links every test binary, and several sessions doing it at once stalled the host's disk and T3 on 2026-11-17. Push and let CI run it; read a failure with `gh run view <run> --log-failed`. The host's `cargo` refuses a whole-suite run, shares one target folder across dumbmail worktrees (one build at a time) and stops the whole build on a timeout.
 
 The deploy image is built from only the paths the `Dockerfile` copies (`src`, `migrations`, `docs`, the built dashboard). If the server embeds a file from any other folder (`include_str!`, `include_bytes!`, rust-embed), add a `COPY` for that folder to the `Dockerfile` in the same PR. CI runs `scripts/check-docker-context.sh` to catch a miss; a missed folder took a deploy down on 2026-11-17.
 

@@ -44,6 +44,21 @@ impl std::fmt::Display for ProviderBusy {
 
 impl std::error::Error for ProviderBusy {}
 
+/// The provider may have accepted the message: the call timed out, the connection dropped, or the
+/// answer was lost or a server error. Sending it again could deliver it twice.
+#[derive(Debug)]
+pub struct ProviderMaybeSent {
+    pub reason: String,
+}
+
+impl std::fmt::Display for ProviderMaybeSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the email provider may have accepted it: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ProviderMaybeSent {}
+
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
     fn name(&self) -> &'static str;
@@ -57,6 +72,12 @@ pub trait EmailProvider: Send + Sync {
     }
     /// Sends the message and returns the provider's message id.
     async fn send(&self, email: &OutgoingEmail) -> anyhow::Result<String>;
+    /// One hand-off and no retries of any kind, for mail that must never go twice (transactional).
+    /// Errors are a [`ProviderBusy`] (it refused for now), a [`ProviderMaybeSent`] (it may have
+    /// accepted), or anything else (it refused this message).
+    async fn send_once(&self, email: &OutgoingEmail) -> anyhow::Result<String> {
+        self.send(email).await
+    }
     async fn add_domain(&self, domain: &str) -> anyhow::Result<DomainState>;
     async fn domain_state(&self, domain: &str) -> anyhow::Result<DomainState>;
     /// Use a custom MAIL FROM subdomain so SPF aligns with the sending domain (DMARC).
@@ -70,6 +91,8 @@ pub trait EmailProvider: Send + Sync {
     fn sent(&self) -> Vec<OutgoingEmail> {
         Vec::new()
     }
+    /// Forget the messages kept in memory (log provider only; for tests).
+    fn clear_sent(&self) {}
 }
 
 /// Build an RFC 5322 MIME message with text and HTML parts.
@@ -158,6 +181,11 @@ impl EmailProvider for LogEmail {
     fn sent(&self) -> Vec<OutgoingEmail> {
         self.sent.lock().map(|s| s.clone()).unwrap_or_default()
     }
+    fn clear_sent(&self) {
+        if let Ok(mut s) = self.sent.lock() {
+            s.clear();
+        }
+    }
 }
 
 /// Dev stand-in for DKIM records: deterministic CNAMEs that look like SES's.
@@ -218,6 +246,11 @@ impl SesEmail {
             tracing::warn!(error = %format!("{e:#}"), "couldn't read the SES sending rate; using SEND_RATE_PER_SEC");
         }
         ses
+    }
+
+    /// Around a client built elsewhere (tests point one at a stand-in for SES).
+    pub fn with_client(client: aws_sdk_sesv2::Client, configuration_set: Option<String>) -> Self {
+        Self { client, configuration_set, max_rate: AtomicU64::new(0) }
     }
 
     fn records_from(domain: &str, tokens: &[String], dkim_status: &str) -> Vec<DnsRecord> {
@@ -301,6 +334,45 @@ impl EmailProvider for SesEmail {
                     return Err(ProviderBusy { retry_after: SES_BUSY_WAIT, reason: format!("{}: {message}", code.unwrap_or_default()) }.into());
                 }
                 SesFailure::Fail => return Err(anyhow::Error::new(err).context("SES SendEmail failed")),
+            }
+        }
+    }
+
+    async fn send_once(&self, email: &OutgoingEmail) -> anyhow::Result<String> {
+        use aws_sdk_sesv2::error::{ProvideErrorMetadata, SdkError};
+        use aws_sdk_sesv2::primitives::Blob;
+        use aws_sdk_sesv2::types::{Destination, EmailContent, RawMessage};
+        let raw = build_mime(email, None).into_bytes();
+        let mut req = self
+            .client
+            .send_email()
+            .from_email_address(format!("{} <{}>", encode_header(&email.from_name), email.from_email))
+            .destination(Destination::builder().to_addresses(email.to.clone()).build())
+            .content(EmailContent::builder().raw(RawMessage::builder().data(Blob::new(raw)).build()?).build());
+        if let Some(cs) = &self.configuration_set {
+            req = req.configuration_set_name(cs);
+        }
+        // The SDK retries timeouts and server errors by default, which could deliver twice.
+        let no_retries = aws_sdk_sesv2::config::Builder::default().retry_config(aws_sdk_sesv2::config::retry::RetryConfig::disabled());
+        let err = match req.customize().config_override(no_retries).send().await {
+            Ok(out) => return Ok(out.message_id().unwrap_or_default().to_string()),
+            Err(e) => e,
+        };
+        let maybe = |what: &str| -> anyhow::Error { ProviderMaybeSent { reason: what.into() }.into() };
+        match &err {
+            SdkError::ConstructionFailure(_) => Err(anyhow::Error::new(err).context("SES SendEmail failed")),
+            SdkError::TimeoutError(_) => Err(maybe("SES didn't answer in time")),
+            SdkError::DispatchFailure(_) => Err(maybe("the connection to SES failed")),
+            SdkError::ResponseError(_) => Err(maybe("SES's answer couldn't be read")),
+            _ if err.raw_response().is_some_and(|r| r.status().as_u16() >= 500) => Err(maybe("SES had a server error")),
+            _ => {
+                let (code, message) = (err.code().map(str::to_string), err.message().unwrap_or_default().to_string());
+                match classify_ses_error(code.as_deref(), &message) {
+                    // Refused for now, so nothing went out: the caller waits and tries again.
+                    SesFailure::SlowDown => Err(ProviderBusy { retry_after: Duration::from_secs(60), reason: format!("SES is throttling: {message}") }.into()),
+                    SesFailure::Busy => Err(ProviderBusy { retry_after: SES_BUSY_WAIT, reason: format!("{}: {message}", code.unwrap_or_default()) }.into()),
+                    SesFailure::Fail => Err(anyhow::Error::new(err).context("SES SendEmail failed")),
+                }
             }
         }
     }

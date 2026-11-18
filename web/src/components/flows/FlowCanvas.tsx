@@ -1,5 +1,7 @@
 import {
   AlertTriangle,
+  BellRing,
+  Bell,
   Clock,
   CornerDownRight,
   GitBranch,
@@ -7,16 +9,20 @@ import {
   ListPlus,
   Mail,
   MessageSquare,
+  MessageSquareReply,
   Plus,
   Shuffle,
+  Star,
   UserCog,
   Webhook,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode } from "../../api";
+import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode, WaitForReplyNode } from "../../api";
+import { delaySummary, eventSplitSummary, notifySummary, StepResultLine, type StepResult } from "../../features/flowsPlus";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
+import { reviewStepSummary } from "../../features/reviews/StepEditor";
 import { Menu, cx } from "../ui";
 import { getSlot, insertableTypes, isBranch, nodeLabels, type Slot } from "./graph";
 import { PanZoom } from "./PanZoom";
@@ -25,12 +31,16 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   delay: { icon: Clock, tone: "bg-zinc-100 text-zinc-600" },
   email: { icon: Mail, tone: "bg-sky-50 text-sky-700" },
   sms: { icon: MessageSquare, tone: "bg-violet-50 text-violet-700" },
+  push: { icon: BellRing, tone: "bg-orange-50 text-orange-700" },
   condition: { icon: GitBranch, tone: "bg-amber-50 text-amber-700" },
   random_split: { icon: Shuffle, tone: "bg-fuchsia-50 text-fuchsia-700" },
+  wait_for_reply: { icon: MessageSquareReply, tone: "bg-violet-50 text-violet-700" },
   update_profile: { icon: UserCog, tone: "bg-zinc-100 text-zinc-600" },
   add_to_list: { icon: ListPlus, tone: "bg-accent-50 text-accent-700" },
   remove_from_list: { icon: ListMinus, tone: "bg-red-50 text-red-700" },
   webhook: { icon: Webhook, tone: "bg-zinc-100 text-zinc-600" },
+  notify: { icon: Bell, tone: "bg-amber-50 text-amber-700" },
+  review_request: { icon: Star, tone: "bg-amber-50 text-amber-700" },
 };
 
 type NodeStats = Map<string, { entered: number; stats: MessageStats }>;
@@ -41,6 +51,10 @@ type CanvasProps = {
   triggerLabel: string;
   lists: List[];
   report: FlowReport | undefined;
+  /** Per-step results (features/flowsPlus); shown instead of `report` when present. */
+  results?: StepResult[];
+  /** Open the list of people waiting at a step. */
+  onWaiting?: (nodeId: string) => void;
   selected: string | null;
   readOnly?: boolean;
   onSelectTrigger: () => void;
@@ -172,14 +186,15 @@ function Chain({ slot, ctx, seen }: { slot: Slot; ctx: ChainCtx; seen: Set<strin
   );
 }
 
-/** "yes"/"no" for a conditional split; "A · 50%"/"B · 50%" for a random split. */
-function branchLabel(node: ConditionNode | RandomSplitNode, branch: "yes" | "no"): string {
+/** "yes"/"no" for a conditional split; "A · 50%"/"B · 50%" for a random split; "replied"/"no reply" for a wait. */
+function branchLabel(node: ConditionNode | RandomSplitNode | WaitForReplyNode, branch: "yes" | "no"): string {
   if (node.type === "condition") return branch;
+  if (node.type === "wait_for_reply") return branch === "yes" ? "replied" : "no reply";
   return branch === "yes" ? `A · ${node.percent}%` : `B · ${100 - node.percent}%`;
 }
 
 function nodeTitle(node: FlowNode): string {
-  if ((node.type === "email" || node.type === "sms") && node.name) return node.name;
+  if ((node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "notify" || node.type === "review_request") && node.name) return node.name;
   return nodeLabels[node.type];
 }
 
@@ -187,17 +202,22 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
   const listName = (id: string) => lists.find((l) => l.id === id)?.name ?? "a list";
   switch (node.type) {
     case "delay":
-      return { text: `Wait ${node.amount} ${node.amount === 1 ? node.unit.replace(/s$/, "") : node.unit}` };
+      return { text: delaySummary(node) };
     case "email":
       return node.content.subject ? { text: node.content.subject } : { text: "No subject", warning: "Add a subject line" };
     case "sms":
       return node.content.body ? { text: node.content.body } : { text: "Empty message", warning: "Write a message" };
-    case "condition":
-      return node.condition.conditions.length
-        ? { text: definitionSummary(node.condition, listName) }
-        : { text: "No conditions", warning: "Add a condition" };
+    case "push":
+      return node.content.title || node.content.body ? { text: node.content.title || node.content.body } : { text: "Empty notification", warning: "Write a title or message" };
+    case "condition": {
+      const event = eventSplitSummary(node.event_condition);
+      if (node.condition.conditions.length) return { text: [definitionSummary(node.condition, listName), event].filter(Boolean).join("; ") };
+      return event ? { text: event } : { text: "No conditions", warning: "Add a condition" };
+    }
     case "random_split":
       return { text: `${node.percent}% A / ${100 - node.percent}% B` };
+    case "wait_for_reply":
+      return { text: `Up to ${node.amount} ${node.amount === 1 ? node.unit.replace(/s$/, "") : node.unit} for them to text back` };
     case "update_profile": {
       const keys = Object.keys(node.properties);
       return keys.length ? { text: `Set ${keys.join(", ")}` } : { text: "No properties", warning: "Add a property" };
@@ -207,6 +227,10 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return node.list_id ? { text: listName(node.list_id) } : { text: "No list", warning: "Choose a list" };
     case "webhook":
       return { text: `${node.method ?? "POST"} ${node.url}` };
+    case "notify":
+      return notifySummary(node);
+    case "review_request":
+      return reviewStepSummary(node);
   }
 }
 
@@ -215,7 +239,8 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
   const Icon = meta.icon;
   const summary = nodeSummary(node, ctx.lists);
   const s = ctx.stats.get(node.id);
-  const isMessage = node.type === "email" || node.type === "sms";
+  const r = ctx.results?.find((x) => x.node_id === node.id);
+  const isMessage = node.type === "email" || node.type === "sms" || node.type === "push" || node.type === "review_request";
   const selected = ctx.selected === node.id;
   return (
     <button
@@ -238,7 +263,9 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
           <span className="line-clamp-2 text-xs text-zinc-500">{summary.text}</span>
         </span>
       </div>
-      {s ? (
+      {r ? (
+        <StepResultLine result={r} onWaiting={ctx.onWaiting ? () => ctx.onWaiting?.(node.id) : undefined} />
+      ) : s ? (
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-zinc-100 pt-2 text-[11px] tabular-nums text-zinc-600">
           <span>{formatNumber(s.entered)} entered</span>
           {isMessage ? (

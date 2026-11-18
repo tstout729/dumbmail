@@ -66,10 +66,11 @@ struct Msg {
     campaign_id: Option<Uuid>,
     flow_id: Option<Uuid>,
     is_test: bool,
+    transactional: bool,
 }
 
 async fn load_msg(state: &AppState, id: Uuid) -> AppResult<Option<Msg>> {
-    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test FROM messages WHERE id = $1")
+    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test, transactional FROM messages WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await?)
@@ -129,8 +130,18 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
     if auth::link_sig(&state.cfg.secret_key, id, &q.u) != q.s || !(q.u.starts_with("https://") || q.u.starts_with("http://")) {
         return (StatusCode::BAD_REQUEST, "invalid link").into_response();
     }
-    if let Ok(Some(m)) = load_msg(&state, id).await {
-        let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&q.u).execute(&state.db).await;
+    record_click(&state, id, &q.u).await
+}
+
+/// Record a click on message `id` and redirect to `url`, which the caller has verified is a link
+/// DumbMail put in that message. Shared by `/t/c/` and short links (`features::short_links`).
+pub(crate) async fn record_click(state: &AppState, id: Uuid, url: &str) -> Response {
+    if let Ok(Some(m)) = load_msg(state, id).await {
+        // A transactional link can carry a secret (a password-reset token): keep only that a click
+        // happened, when, and the site it went to.
+        // A marketing link keeps the URL, without the person's own coupon codes (the redirect keeps them).
+        let recorded = if m.transactional { url::Url::parse(url).ok().map_or_else(String::new, |u| u.origin().ascii_serialization()) } else { crate::features::coupons::assign::mask_link(&state.db, m.profile_id, url).await };
+        let _ = sqlx::query("INSERT INTO message_clicks (message_id, url) VALUES ($1, $2)").bind(id).bind(&recorded).execute(&state.db).await;
         let first: Result<Option<Uuid>, _> = sqlx::query_scalar(
             "UPDATE messages SET clicked_at = COALESCE(clicked_at, now()), opened_at = CASE WHEN channel = 'email' THEN COALESCE(opened_at, now()) ELSE opened_at END
              WHERE id = $1 AND clicked_at IS NULL RETURNING id",
@@ -139,21 +150,21 @@ async fn click(State(state): State<AppState>, Path(token): Path<String>, Query(q
         .fetch_optional(&state.db)
         .await;
         let metric = if m.channel == "sms" { "Clicked SMS" } else { "Clicked Email" };
-        let _ = msg_event(&state, &m, metric, json!({"url": q.u}), None).await;
+        let _ = msg_event(state, &m, metric, json!({"url": recorded}), None).await;
         if matches!(first, Ok(Some(_))) && m.channel == "email" {
-            let _ = msg_event(&state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
+            let _ = msg_event(state, &m, "Opened Email", json!({}), Some(format!("open:{id}"))).await;
         }
         if !m.is_test {
             // Lets the onsite script recognize the person on the brand's own site.
-            if let (Ok(mut dest), Some(account)) = (url::Url::parse(&q.u), account_for_msg(&state, &m).await) {
+            if let (Ok(mut dest), Some(account)) = (url::Url::parse(url), account_for_msg(state, &m).await) {
                 if is_own_site(&account, &dest) {
-                    dest.query_pairs_mut().append_pair("_pl", &profile_token(&state, m.account_id, m.profile_id));
+                    dest.query_pairs_mut().append_pair("_pl", &profile_token(state, m.account_id, m.profile_id));
                     return Redirect::to(dest.as_str()).into_response();
                 }
             }
         }
     }
-    Redirect::to(&q.u).into_response()
+    Redirect::to(url).into_response()
 }
 
 /// A small branded page (confirmations, unsubscribes) around `body`, which must already be escaped HTML.
@@ -177,19 +188,26 @@ async fn account_for_msg(state: &AppState, m: &Msg) -> Option<Account> {
     crate::campaigns::load_account(&state.db, m.account_id).await.ok()
 }
 
-async fn unsubscribe_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+/// A page in the person's language (see features::translations::texts).
+fn page_in(t: &crate::features::translations::texts::Texts, title: &str, body: &str, color: &str) -> Html<String> {
+    Html(t.page(page(title, body, color).0))
+}
+
+async fn unsubscribe_page(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+    let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
     // Email with preference lists: let them choose lists instead of only leaving everything.
     if let Some(lists) = preference_lists(&state, &m).await {
-        return page("Email preferences", &crate::preferences::form_html(&name, &lists, None), &color).into_response();
+        return page_in(&t, &t.get("prefs.title", ""), &crate::preferences::form_html_in(&t, &name, &lists, None), &color).into_response();
     }
-    let what = if m.channel == "sms" { "text messages" } else { "marketing emails" };
-    page(
-        "Unsubscribe",
-        &format!(r#"<h1>Unsubscribe</h1><p>Stop receiving {what} from {n}?</p><form method="post"><button type="submit">Unsubscribe</button></form>"#, n = esc(&name)),
+    let question = if m.channel == "sms" { "unsub.sms_question" } else { "unsub.email_question" };
+    page_in(
+        &t,
+        &t.get("unsub.title", ""),
+        &format!(r#"<h1>{}</h1><p>{}</p><form method="post"><button type="submit">{}</button></form>"#, t.html("unsub.title", ""), t.html(question, &name), t.html("unsub.button", "")),
         &color,
     )
     .into_response()
@@ -209,21 +227,22 @@ async fn preference_lists(state: &AppState, m: &Msg) -> Option<Vec<crate::prefer
     (!lists.is_empty()).then_some(lists)
 }
 
-async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+async fn unsubscribe_post(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     if let (crate::preferences::Choice::Save(keep), "email") = (crate::preferences::parse_choice(&body), m.channel.as_str()) {
         let a = account_for_msg(&state, &m).await;
         let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+        let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
         let notice = if m.is_test {
-            "This was a test email, so nothing changed."
+            "prefs.test"
         } else if crate::preferences::save(&state.db, m.account_id, m.profile_id, &keep, Some((m.id, m.campaign_id, m.flow_id))).await.is_ok() {
-            "Saved. Your preferences are updated."
+            "prefs.saved"
         } else {
-            "Something went wrong. Please try again."
+            "prefs.error"
         };
         let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.unwrap_or_default();
-        return page("Email preferences", &crate::preferences::form_html(&name, &lists, Some(notice)), &color).into_response();
+        return page_in(&t, &t.get("prefs.title", ""), &crate::preferences::form_html_in(&t, &name, &lists, Some(&t.get(notice, ""))), &color).into_response();
     }
     // Mail apps' one-click unsubscribe (RFC 8058), "Unsubscribe from all" on the preference page, or the plain page.
     let method = match (String::from_utf8_lossy(&body).contains("List-Unsubscribe=One-Click"), crate::preferences::parse_choice(&body), body.is_empty()) {
@@ -246,17 +265,20 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
         }
     };
     let _ = sqlx::query("UPDATE messages SET unsubscribed_at = COALESCE(unsubscribed_at, now()) WHERE id = $1").bind(id).execute(&state.db).await;
-    if changed.is_some() {
+    if let Some(before) = changed {
         let metric = if m.channel == "sms" { "Unsubscribed from SMS" } else { "Unsubscribed" };
         let _ = msg_event(&state, &m, metric, json!({"method": "link"}), None).await;
+        let channel = if m.channel == "sms" { "sms" } else { "email" };
+        crate::features::webhooks::consent_changed(&state.db, m.account_id, m.profile_id, channel, &before, "unsubscribed", "unsubscribe_link", Some(m.id)).await;
     }
-    page("Unsubscribed", &format!("<h1>You're unsubscribed</h1><p>You won't get marketing messages from {} anymore.</p>", esc(&name)), &color).into_response()
+    let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
+    page_in(&t, &t.get("unsub.done_page", ""), &format!("<h1>{}</h1><p>{}</p>", t.html("unsub.done_title", ""), t.html("unsub.done_body", &name)), &color).into_response()
 }
 
 /// The visitor's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For entry (the
 /// one the proxy added; earlier entries come from the visitor and can be made up). Only a valid IP counts.
 /// The per-visitor limit is a second line of defense; the per-inbox and per-account limits don't use it.
-fn client_ip(headers: &HeaderMap) -> Option<String> {
+pub fn client_ip(headers: &HeaderMap) -> Option<String> {
     let get = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
     let ip = |v: &str| v.trim().parse::<std::net::IpAddr>().ok().map(|a| a.to_string());
     get("x-real-ip").and_then(ip).or_else(|| get("x-forwarded-for").and_then(|v| v.rsplit(',').next()).and_then(ip))
@@ -273,15 +295,15 @@ fn gpc_header(headers: &HeaderMap) -> bool {
 
 /// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
 /// scanners that open every link in an email can't subscribe anyone.
-async fn confirm_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, false).await
+async fn confirm_page(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &headers, &token, false).await
 }
 
-async fn confirm_post(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, true).await
+async fn confirm_post(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &headers, &token, true).await
 }
 
-async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Response {
+async fn confirm_response(state: &AppState, headers: &HeaderMap, token: &str, confirm: bool) -> Response {
     use crate::optin::Confirmed;
     let Some(id) = crate::optin::id_from_token(state, token) else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let res = if confirm { crate::optin::confirm(state, id).await } else { crate::optin::status(state, id).await };
@@ -293,23 +315,35 @@ async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Respo
         }
     };
     let account_of = |a: Uuid| async move { crate::campaigns::load_account(&state.db, a).await.ok() };
-    let (account, body) = match outcome {
+    // In the person's language (see features::translations::texts).
+    let profile: Option<Uuid> = sqlx::query_scalar("SELECT profile_id FROM optin_confirmations WHERE id = $1").bind(id).fetch_optional(&state.db).await.ok().flatten();
+    let texts_for = |a: Uuid| async move { crate::features::translations::texts::for_page(&state.db, a, profile, headers).await };
+    let (account, t, body) = match outcome {
         Confirmed::NotFound => return (StatusCode::NOT_FOUND, "link not found").into_response(),
         Confirmed::Waiting(a) => {
             let acct = account_of(a).await;
+            let t = texts_for(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
-            let body = format!(r#"<h1>Confirm your subscription</h1><p>Start getting emails from {}?</p><form method="post"><button type="submit">Yes, subscribe me</button></form>"#, esc(&name));
-            (acct, body)
+            let body = format!(r#"<h1>{}</h1><p>{}</p><form method="post"><button type="submit">{}</button></form>"#, t.html("confirm.title", ""), t.html("confirm.question", &name), t.html("confirm.button", ""));
+            (acct, t, body)
         }
         Confirmed::Joined(a) | Confirmed::Already(a) => {
             let acct = account_of(a).await;
+            let t = texts_for(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
-            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>", esc(&name)))
+            // A sign-up that earned a coupon code gets it once confirmed (shown for 24 hours, see features::coupons).
+            let code = crate::features::coupons::assign::confirmation_code(state, id).await.map(|c| format!("<p>{} <strong>{}</strong></p>", t.html("confirm.code", ""), esc(&c))).unwrap_or_default();
+            let body = format!("<h1>{}</h1><p>{}</p>{code}", t.html("confirm.done_title", ""), t.html("confirm.done_body", &name));
+            (acct, t, body)
         }
-        Confirmed::Expired(a) => (account_of(a).await, "<h1>This link has expired</h1><p>Sign up again and we'll send you a new one.</p>".to_string()),
+        Confirmed::Expired(a) => {
+            let t = texts_for(a).await;
+            let body = format!("<h1>{}</h1><p>{}</p>", t.html("confirm.expired_title", ""), t.html("confirm.expired_body", ""));
+            (account_of(a).await, t, body)
+        }
     };
     let color = account.map(|a| a.brand_color).unwrap_or_else(|| "#1f6f5c".into());
-    page("Confirm your subscription", &body, &color).into_response()
+    page_in(&t, &t.get("confirm.title", ""), &body, &color).into_response()
 }
 
 // ---------- Browser tracking ----------
@@ -319,8 +353,9 @@ struct KeyQuery {
     k: String,
 }
 
+/// The account a site key belongs to. A closed account answers like an unknown key.
 async fn account_by_public_key(state: &AppState, k: &str) -> AppResult<Account> {
-    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1")
+    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1 AND closed_at IS NULL")
         .bind(k)
         .fetch_optional(&state.db)
         .await?
@@ -362,9 +397,10 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
-        // Message, consent and alert events come only from DumbMail itself: flows trust them.
-        if audience::is_reserved_metric(metric) {
-            return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", metric.trim())));
+        // Message, consent and alert events come only from DumbMail itself, and an account's
+        // integration events (bookings, orders) only from a server: flows trust them.
+        if audience::is_reserved_metric(metric) || audience::is_account_server_only_metric(&state.db, a.id, metric).await? {
+            return Err(AppError::bad(format!("{:?} is recorded by DumbMail or a server and can't be sent from a browser", metric.trim())));
         }
         let input = public_profile(&state, a.id, &b["profile"])?;
         let p = match input.id {
@@ -477,7 +513,7 @@ async fn client_test(State(state): State<AppState>, Query(q): Query<KeyQuery>, b
         }
         let test: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM site_tests WHERE code = $1 AND expires_at > now()").bind(code).fetch_optional(&state.db).await?;
         let Some(account_id) = test else { return Err(AppError::not_found("test")) };
-        let key_account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1").bind(&q.k).fetch_optional(&state.db).await?;
+        let key_account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1 AND closed_at IS NULL").bind(&q.k).fetch_optional(&state.db).await?;
         let (check, mut detail) = if key_account == Some(account_id) {
             (check.to_string(), test_detail(&b["detail"]))
         } else {
@@ -657,6 +693,9 @@ pub struct SubscribeBody {
     /// The browser's IANA time zone; fills the profile's `timezone` and `country` when they're missing.
     #[serde(default)]
     timezone: Option<String>,
+    /// The browser's language (`navigator.language`); fills the profile's language when it's empty.
+    #[serde(default)]
+    locale: Option<String>,
     /// Answers to birthday and custom fields by field key (the standard keys may be sent here too).
     #[serde(default)]
     fields: Option<Map<String, Value>>,
@@ -745,12 +784,15 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
         (Some(l), Some(_)) => sqlx::query_scalar::<_, bool>("SELECT double_opt_in FROM lists WHERE id = $1").bind(l).fetch_optional(&state.db).await?.unwrap_or(false),
         _ => false,
     };
+    // A language answer is only a hint (see features::translations), never a custom property.
+    let mut answer_props = answers.properties;
+    let language_answer = crate::features::translations::take_language_answers(&mut answer_props);
     let input = ProfileInput {
         email: email.clone(),
         phone_number: phone.clone(),
         first_name: answers.first_name,
         last_name: answers.last_name,
-        properties: (!answers.properties.is_empty()).then_some(answers.properties),
+        properties: (!answer_props.is_empty()).then_some(answer_props),
         email_consent: email.as_ref().filter(|_| !double_opt_in).map(|_| "subscribed".to_string()),
         sms_consent: if b.sms_consent && phone.is_some() { Some("subscribed".into()) } else { None },
         ..Default::default()
@@ -766,6 +808,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(tz) = &b.timezone {
         audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
     }
+    // A language field on the form, else the browser's language: fills an empty profile language only.
+    crate::features::translations::fill_from_form(&state.db, p.id, language_answer, b.locale.as_deref()).await?;
     if b.gpc {
         people_consent::set_ads_opt_out(&state.db, account.id, p.id, true, &people_consent::current_source().method("gpc")).await?;
     }
@@ -774,10 +818,13 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(v) = count_variant(state, &form, b.variant.as_deref(), true).await? {
         props["form_version"] = json!(v);
     }
+    crate::features::webhooks::form_submitted(&state.db, account.id, form.id, p.id, props["form_version"].as_str()).await;
     // Already subscribed to email (they confirmed or opted in before): no need to ask again.
     if let (true, Some(list_id), Some(addr)) = (double_opt_in && p.email_consent != "subscribed", form.list_id, p.email.as_deref()) {
         match crate::optin::start(state, account, p.id, addr, list_id, form.id, props.clone(), ip).await? {
             crate::optin::Started::Pending => {
+                // A form with a coupon: its code is given once the address is confirmed (see features::coupons).
+                crate::features::coupons::assign::form_pending(state, account, &form, p.id, upserted.created).await;
                 let msg = form.config["confirm_message"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("Almost done! Check your inbox and tap the link to confirm.");
                 return Ok(json!({"ok": true, "confirm": true, "message": msg}));
             }
@@ -807,6 +854,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(code) = crate::forms::discount_code(&form.config, version) {
         out["discount_code"] = json!(code);
     }
+    // A form with a coupon gives each person it signed up their own code instead (see features::coupons).
+    crate::features::coupons::assign::form_sign_up(state, account, &form, p.id, upserted.created, ip, &mut out).await;
     Ok(out)
 }
 
@@ -864,7 +913,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
             // Everything else is a field answer; a key sent more than once (ticked checkboxes) becomes a list.
             let mut fields = Map::new();
             for (k, v) in &pairs {
-                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone" | "gpc") {
+                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone" | "locale" | "gpc") {
                     continue;
                 }
                 match fields.get_mut(k) {
@@ -888,6 +937,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 phone_token: one("phone_token"),
                 timezone: one("timezone"),
                 gpc: false,
+                locale: one("locale"),
             }
         } else {
             serde_json::from_slice(&body)?
@@ -1137,7 +1187,7 @@ async fn webhook_scope(state: &AppState, s: &str) -> AppResult<Option<Uuid>> {
 }
 
 async fn msg_by_provider_id(state: &AppState, pid: &str) -> AppResult<Option<Msg>> {
-    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test FROM messages WHERE provider_message_id = $1")
+    Ok(sqlx::query_as("SELECT id, account_id, profile_id, channel, campaign_id, flow_id, is_test, transactional FROM messages WHERE provider_message_id = $1")
         .bind(pid)
         .fetch_optional(&state.db)
         .await?)
@@ -1162,6 +1212,16 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     let msg: Value = env["Message"].as_str().map(serde_json::from_str).transpose()?.unwrap_or(Value::Null);
     let kind = msg["eventType"].as_str().or(msg["notificationType"].as_str()).unwrap_or("");
     let Some(pid) = msg["mail"]["messageId"].as_str() else { return Ok(StatusCode::OK) };
+    // A flow notification's hard bounce or complaint only blocks that address (see
+    // features::flows_plus): it's found first, so it never counts toward pausing the account.
+    let blocks = match kind {
+        "Bounce" => msg["bounce"]["bounceType"].as_str() == Some("Permanent"),
+        "Complaint" => true,
+        _ => false,
+    };
+    if blocks && crate::features::flows_plus::notify::provider_strike(&state.db, pid, kind == "Complaint").await? {
+        return Ok(StatusCode::OK);
+    }
     // Hard bounces and complaints count toward the automatic sending pause through the send record,
     // which outlives the message (deleting a profile deletes its messages). Addresses already on the
     // SES account suppression list don't count toward AWS's bounce rate.
@@ -1178,7 +1238,18 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     let Some(m) = msg_by_provider_id(&state, pid).await? else { return Ok(StatusCode::OK) };
     match kind {
         "Delivery" => {
-            sqlx::query("UPDATE messages SET status = CASE WHEN status = 'sent' THEN 'delivered' ELSE status END, delivered_at = now() WHERE id = $1").bind(m.id).execute(&state.db).await?;
+            // `first`: this is the first delivery notice (SNS repeats them), so it's told once.
+            let first: Option<bool> = sqlx::query_scalar(
+                "UPDATE messages x SET status = CASE WHEN x.status = 'sent' THEN 'delivered' ELSE x.status END, delivered_at = now()
+                 FROM (SELECT id, delivered_at IS NULL AS first FROM messages WHERE id = $1 FOR UPDATE) old WHERE x.id = old.id RETURNING old.first",
+            )
+            .bind(m.id)
+            .fetch_optional(&state.db)
+            .await?;
+            crate::features::warehouse::changed(&state.db, m.account_id, "messages", m.id).await;
+            if first == Some(true) && !m.is_test {
+                crate::features::webhooks::message_delivered(&state.db, m.account_id, m.id).await;
+            }
         }
         "Bounce" => {
             let permanent = msg["bounce"]["bounceType"].as_str() == Some("Permanent");
@@ -1190,14 +1261,23 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
                 .await?;
             if permanent {
                 let src = ConsentSource::new("hard_bounce", "public").with_message(m.id).with_detail("bounce_sub_type", msg["bounce"]["bounceSubType"].clone());
-                people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "hard_bounce", true, false, &src).await?;
+                let before = people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "hard_bounce", true, false, &src).await?;
+                if before.is_some_and(|b| b.email_suppressed_reason.as_deref() != Some("hard_bounce")) && !m.is_test {
+                    crate::features::webhooks::suppressed(&state.db, m.account_id, m.profile_id, "hard_bounce", m.id).await;
+                }
             }
             msg_event(&state, &m, "Bounced Email", json!({"bounce_type": msg["bounce"]["bounceType"]}), Some(format!("bounce:{}", m.id))).await?;
         }
         "Complaint" => {
             sqlx::query("UPDATE messages SET status = 'complained' WHERE id = $1").bind(m.id).execute(&state.db).await?;
             let src = ConsentSource::new("spam_complaint", "public").with_message(m.id);
-            people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "complaint", true, true, &src).await?;
+            let before = people_consent::suppress(&state.db, m.account_id, m.profile_id, Channel::Email, "complaint", true, true, &src).await?;
+            if let (Some(b), false) = (before, m.is_test) {
+                if b.email_suppressed_reason.as_deref() != Some("complaint") {
+                    crate::features::webhooks::suppressed(&state.db, m.account_id, m.profile_id, "complaint", m.id).await;
+                }
+                crate::features::webhooks::consent_changed(&state.db, m.account_id, m.profile_id, "email", &b.email_consent, "unsubscribed", "spam_complaint", Some(m.id)).await;
+            }
             msg_event(&state, &m, "Marked Email as Spam", json!({}), Some(format!("complaint:{}", m.id))).await?;
         }
         _ => {}
@@ -1205,65 +1285,41 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
     Ok(StatusCode::OK)
 }
 
-const STOP_WORDS: &[&str] = &["stop", "stopall", "unsubscribe", "cancel", "end", "quit", "optout", "revoke"];
-const START_WORDS: &[&str] = &["start", "unstop", "yes", "subscribe"];
-
-/// Inbound text: STOP/START keywords update SMS consent for the matching profile.
-async fn inbound_sms(state: &AppState, scope: Option<Uuid>, from: &str, to: &str, text: &str) -> AppResult<()> {
-    let (Some(from), Some(to)) = (normalize_phone(from), normalize_phone(to)) else { return Ok(()) };
-    let accounts: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT a.id FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
-         WHERE (a.sms_from = $1 OR n.phone_number = $1) AND ($2::uuid IS NULL OR a.id = $2)",
+async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, delivered: bool) -> AppResult<()> {
+    let status = if delivered { "delivered" } else { "failed" };
+    // `first`: this callback changed the status (providers repeat them), so it's told once.
+    let rows: Vec<(Uuid, Uuid, bool, bool)> = sqlx::query_as(
+        "UPDATE messages x SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE x.delivered_at END
+         FROM (SELECT id, status IS DISTINCT FROM $2 AS first FROM messages WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3) FOR UPDATE) old
+         WHERE x.id = old.id RETURNING x.id, x.account_id, old.first, x.is_test",
     )
-    .bind(&to)
+    .bind(provider_id)
+    .bind(status)
     .bind(scope)
     .fetch_all(&state.db)
     .await?;
-    let word: String = text.trim().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
-    for account_id in accounts {
-        let pid: Option<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(&from).fetch_optional(&state.db).await?;
-        let Some(pid) = pid else { continue };
-        let (consent, metric) = if STOP_WORDS.contains(&word.as_str()) {
-            ("unsubscribed", "Unsubscribed from SMS")
-        } else if START_WORDS.contains(&word.as_str()) {
-            ("subscribed", "Subscribed to SMS")
-        } else {
-            audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric: "Received SMS Reply", properties: json!({"text": text}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
-            continue;
-        };
-        let src = ConsentSource::new("sms_keyword", "public").with_detail("keyword", json!(word)).with_detail("to", json!(to));
-        if consent == "subscribed" {
-            // START from the number itself: the person's own opt-in for that number.
-            let mut tx = state.db.begin().await?;
-            people_consent::opt_in_verified_in(&mut tx, account_id, pid, Channel::Sms, &src).await?;
-            tx.commit().await?;
-        } else {
-            people_consent::set_consent(&state.db, account_id, pid, Channel::Sms, consent, None, &src).await?;
+    for (id, account_id, first, is_test) in rows {
+        match (delivered, first && !is_test) {
+            (true, true) => {
+                crate::features::warehouse::changed(&state.db, account_id, "messages", id).await;
+                crate::features::webhooks::message_delivered(&state.db, account_id, id).await;
+            }
+            // The carrier failed it after the provider accepted it: `message.failed`, once.
+            (false, true) => crate::features::messages_unsent(&state.db, account_id, &[id]).await,
+            _ => crate::features::warehouse::changed(&state.db, account_id, "messages", id).await,
         }
-        audience::record_event(&state.db, NewEvent { account_id, profile_id: pid, metric, properties: json!({"keyword": word}), value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
     }
     Ok(())
 }
 
-async fn sms_status(state: &AppState, scope: Option<Uuid>, provider_id: &str, delivered: bool) -> AppResult<()> {
-    let status = if delivered { "delivered" } else { "failed" };
-    sqlx::query("UPDATE messages SET status = $2, delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END WHERE provider_message_id = $1 AND channel = 'sms' AND ($3::uuid IS NULL OR account_id = $3)")
-        .bind(provider_id)
-        .bind(status)
-        .bind(scope)
-        .execute(&state.db)
-        .await?;
-    Ok(())
-}
-
-async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String>, Json(v): Json<Value>) -> AppResult<StatusCode> {
+/// Telnyx webhooks. The signature (when a key is configured) is checked on the raw body first.
+async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String>, headers: HeaderMap, body: Bytes) -> AppResult<StatusCode> {
     let scope = webhook_scope(&state, &secret).await?;
+    let proof = crate::features::inbox::verify::telnyx(&state, scope, &headers, &body).await?;
+    let v: Value = serde_json::from_slice(&body)?;
     let p = &v["data"]["payload"];
     match v["data"]["event_type"].as_str().unwrap_or("") {
-        "message.received" => {
-            let to = p["to"][0]["phone_number"].as_str().unwrap_or_default();
-            inbound_sms(&state, scope, p["from"]["phone_number"].as_str().unwrap_or_default(), to, p["text"].as_str().unwrap_or_default()).await?;
-        }
+        "message.received" => crate::features::inbox::inbound(&state, scope, &crate::features::inbox::Inbound::from_telnyx(p), proof).await?,
         "message.finalized" => {
             let st = p["to"][0]["status"].as_str().unwrap_or_default();
             if let Some(id) = p["id"].as_str() {
@@ -1275,13 +1331,17 @@ async fn telnyx_webhook(State(state): State<AppState>, Path(secret): Path<String
     Ok(StatusCode::OK)
 }
 
-async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, body: Bytes) -> AppResult<Response> {
+/// Twilio webhooks. The signature (when an auth token is known) covers the exact URL and every parameter.
+async fn twilio_webhook(State(state): State<AppState>, Path(secret): Path<String>, uri: axum::http::Uri, headers: HeaderMap, body: Bytes) -> AppResult<Response> {
     let scope = webhook_scope(&state, &secret).await?;
-    let f: std::collections::HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-    if let (Some(from), Some(to), Some(text)) = (f.get("From"), f.get("To"), f.get("Body")) {
-        inbound_sms(&state, scope, from, to, text).await?;
-    } else if let (Some(sid), Some(st)) = (f.get("MessageSid"), f.get("MessageStatus")) {
-        match st.as_str() {
+    let f: Vec<(String, String)> = url::form_urlencoded::parse(&body).into_owned().collect();
+    let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
+    let proof = crate::features::inbox::verify::twilio(&state, scope, &headers, path, &f).await?;
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Some(msg) = crate::features::inbox::Inbound::from_twilio(&f) {
+        crate::features::inbox::inbound(&state, scope, &msg, proof).await?;
+    } else if let (Some(sid), Some(st)) = (get("MessageSid"), get("MessageStatus")) {
+        match st {
             "delivered" => sms_status(&state, scope, sid, true).await?,
             "failed" | "undelivered" => sms_status(&state, scope, sid, false).await?,
             _ => {}
@@ -1302,7 +1362,7 @@ async fn stripe_webhook(State(state): State<AppState>, headers: HeaderMap, body:
 }
 
 /// Operator endpoints need `Authorization: Bearer ADMIN_TOKEN`; they don't exist when it's unset or short.
-fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
+pub fn check_admin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     let want = state.cfg.admin_token.as_deref().filter(|t| t.len() >= 32).ok_or_else(|| AppError::NotFound("not found".into()))?;
     let got = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     if got.len() != want.len() || got.bytes().zip(want.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) != 0 {

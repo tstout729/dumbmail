@@ -1,0 +1,67 @@
+{
+  "key": "typeform",
+  "name": "Typeform",
+  "category": "Forms",
+  "description": "Typeform responses become Form Submitted events on the respondent's profile, with the answers you choose to copy. Only the email, a consent question you map and those answers are kept; everything else in a response is dropped before it's stored. A response never subscribes anyone.",
+  "metrics": [
+    "Form Submitted"
+  ],
+  "docs": [
+    "https://www.typeform.com/developers/webhooks/secure-your-webhooks/",
+    "https://www.typeform.com/developers/webhooks/example-payload/",
+    "https://www.typeform.com/developers/webhooks/"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "Typeform-Signature",
+    "prefix": "sha256=",
+    "encoding": "base64"
+  },
+  "signature_secret": {
+    "label": "Typeform webhook secret",
+    "help": "A random value you choose, for example the output of: openssl rand -hex 20. Set the same value as the webhook's secret in Typeform."
+  },
+  "message_id": {
+    "field": "event_id"
+  },
+  "credentials": [],
+  "settings": {
+    "email_field": "",
+    "consent_field": "",
+    "copy_fields": []
+  },
+  "pull": null,
+  "redact": [
+    "keep:event_id",
+    "keep:event_type",
+    "keep:form_response.form_id",
+    "keep:form_response.token",
+    "keep:form_response.submitted_at",
+    "keep:form_response.definition.title",
+    "keep:form_response.answers[type=email].type",
+    "keep:form_response.answers[type=email].email",
+    "keep:form_response.answers[type=email].field.ref",
+    "keep:form_response.answers[field/ref={setting:consent_field}].type",
+    "keep:form_response.answers[field/ref={setting:consent_field}].boolean",
+    "keep:form_response.answers[field/ref={setting:consent_field}].field.ref",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].type",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].field.ref",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].choice.label",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].choices.labels",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].boolean",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].number",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].date",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].text",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].email",
+    "keep:form_response.answers[field/ref={setting:copy_fields}].url"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Pick a random secret and save it as the integration's signing secret.",
+    "In Typeform, open the form \u2192 Connect \u2192 Webhooks \u2192 Add a webhook. Paste the webhook URL, open Edit, turn on Secret and paste the same secret, and turn the webhook on.",
+    "If the form has more than one email question, set email_field in the integration's settings to the ref of the one to use. If it has a yes/no or legal question asking for marketing consent, set consent_field to that question's ref; the answer is recorded on each Form Submitted event as marketing_consent. Set copy_fields to the refs of the answers worth keeping on the event, for example [\"readable_ref_choice\"]. Nothing else from a response is stored: hidden fields, other answers and typed \"Other\" choices are dropped.",
+    "Send a test response (Typeform's View deliveries \u2192 Send test request) and check the delivery log.",
+    "People this adds are held back from marketing. A form submission isn't an opt-in, so nobody is subscribed. To add people who ticked the consent question to your marketing, send them a confirmation (double opt-in) first."
+  ],
+  "flows": []
+}

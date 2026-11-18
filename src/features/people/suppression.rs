@@ -261,7 +261,7 @@ pub async fn suppress_address_in(state: &AppState, conn: &mut sqlx::PgConnection
         Some(p) => p,
         None => consent::with_source(src.clone(), crate::audience::upsert_profile(&state.db, account_id, &input)).await?.profile,
     };
-    Ok(consent::suppress_in(conn, account_id, profile.id, ch, "manual", false, false, src).await?)
+    Ok(consent::suppress_in(conn, account_id, profile.id, ch, "manual", false, false, src).await?.is_some())
 }
 
 /// Suppress many addresses: a few at once, more in a background job.

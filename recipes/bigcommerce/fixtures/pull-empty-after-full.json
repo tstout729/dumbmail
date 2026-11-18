@@ -1,0 +1,31 @@
+{
+  "description": "an empty page after a full one (the last page was exactly full): the run ends, the cursor moves to the full page's newest change and paging starts over from page 1",
+  "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-orders (a page of orders)",
+  "expect": [
+    {
+      "type": "set_state",
+      "values": {
+        "cursor": "2019-03-12T08:00:00.000Z",
+        "page": "1",
+        "pending": null
+      }
+    },
+    {
+      "message": "no changed orders",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "backfill": null,
+    "payload": null,
+    "settings": {
+      "store_hash": "abc123"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2019-03-01T00:00:00.000Z",
+      "page": "3",
+      "pending": "2019-03-12T08:00:00.000Z"
+    }
+  }
+}

@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use super::ApiJson;
 use crate::auth::{self, Ctx, API_KEY_PREFIX, SESSION_COOKIE};
+use crate::features::team::{self, login::ReqMeta};
+use axum::http::HeaderMap;
 use crate::campaigns::load_account;
 use crate::error::{AppError, AppResult};
 use crate::models::{normalize_email, normalize_phone, Account, User};
@@ -29,8 +31,6 @@ pub fn routes() -> Router<AppState> {
         .route("/api/account/domains/{domain}/verify", post(verify_one_domain))
         .route("/api/account/link-domain", post(add_link_domain).delete(remove_link_domain))
         .route("/api/account/link-domain/verify", post(verify_link_domain))
-        .route("/api/api-keys", get(list_keys).post(create_key))
-        .route("/api/api-keys/{id}", delete(revoke_key))
         .route("/api/billing", get(billing))
         .route("/api/billing/checkout", post(checkout))
         .route("/api/billing/auto-recharge", axum::routing::patch(auto_recharge))
@@ -76,42 +76,57 @@ fn time_days(d: i64) -> time::Duration {
     time::Duration::days(d)
 }
 
-pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid) -> AppResult<String> {
-    let token = auth::random_token(32);
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, account_id, expires_at) VALUES ($1, $2, $3, now() + interval '30 days')")
-        .bind(auth::sha256_hex(&token))
-        .bind(user_id)
-        .bind(account_id)
-        .execute(&state.db)
-        .await?;
-    Ok(token)
+/// Start a browser session (`method`: password or google). See `features::team::login`.
+pub(crate) async fn new_session(state: &AppState, user_id: Uuid, account_id: Uuid, method: &str, meta: &ReqMeta) -> AppResult<String> {
+    team::login::start_session(state, user_id, account_id, method, None, meta).await
 }
 
 /// Create an account and its owner. Shared by the signup route and the `create-account` command.
 pub async fn create_account(state: &AppState, email: &str, password: &str, name: Option<String>, company: &str) -> AppResult<(User, Account)> {
     let email = normalize_email(email).ok_or_else(|| AppError::bad("enter a valid email"))?;
-    if password.len() < 8 {
-        return Err(AppError::bad("use a password of at least 8 characters"));
-    }
+    team::login::check_new_password(password)?;
     let hash = auth::hash_password(password)?;
-    insert_owner(state, &email, Some(hash), None, name, company, None).await
+    insert_owner(state, &email, Some(hash), None, false, name, company, None).await
 }
 
 /// Insert a new account and its owner (with a password hash, a Google subject id, or both).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_owner(
     state: &AppState,
     email: &str,
     password_hash: Option<String>,
     google_sub: Option<&str>,
+    email_confirmed: bool,
     name: Option<String>,
     company: &str,
     website: Option<String>,
 ) -> AppResult<(User, Account)> {
+    let mut tx = state.db.begin().await?;
+    let made = insert_owner_tx(&mut tx, email, password_hash, google_sub, email_confirmed, name, company, website).await?;
+    tx.commit().await?;
+    Ok(made)
+}
+
+/// [`insert_owner`] inside a transaction the caller commits. `email_confirmed`: the address is
+/// proven to be theirs (a Google sign-in Google is the authority for).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_owner_tx(
+    tx: &mut sqlx::PgConnection,
+    email: &str,
+    password_hash: Option<String>,
+    google_sub: Option<&str>,
+    email_confirmed: bool,
+    name: Option<String>,
+    company: &str,
+    website: Option<String>,
+) -> AppResult<(User, Account)> {
+    if team::google_link::reserved_login_email(email) {
+        return Err(AppError::bad("use another email address"));
+    }
     let company = company.trim();
     if company.is_empty() {
         return Err(AppError::bad("enter your company or brand name"));
     }
-    let mut tx = state.db.begin().await?;
     let account: Account = sqlx::query_as("INSERT INTO accounts (id, public_key, name, from_name, website) VALUES ($1, $2, $3, $3, $4) RETURNING *")
         .bind(Uuid::now_v7())
         .bind(format!("pk_{}", auth::random_token(12)))
@@ -119,12 +134,16 @@ pub(crate) async fn insert_owner(
         .bind(website)
         .fetch_one(&mut *tx)
         .await?;
-    let user: User = sqlx::query_as("INSERT INTO users (id, email, name, password_hash, google_sub) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name")
+    let user: User = sqlx::query_as(
+        "INSERT INTO users (id, email, name, password_hash, google_sub, email_confirmed_at) VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() END)
+         RETURNING id, email, name",
+    )
         .bind(Uuid::now_v7())
         .bind(email)
         .bind(name.filter(|n| !n.trim().is_empty()))
         .bind(password_hash)
         .bind(google_sub)
+        .bind(email_confirmed)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match AppError::from(e) {
@@ -132,17 +151,24 @@ pub(crate) async fn insert_owner(
             other => other,
         })?;
     sqlx::query("INSERT INTO memberships (user_id, account_id) VALUES ($1, $2)").bind(user.id).bind(account.id).execute(&mut *tx).await?;
-    tx.commit().await?;
     Ok((user, account))
 }
 
-async fn signup(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJson<SignupBody>) -> AppResult<(CookieJar, Json<Value>)> {
+async fn signup(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar, ApiJson(b): ApiJson<SignupBody>) -> AppResult<(CookieJar, Json<Value>)> {
     if !state.cfg.allow_signup {
         return Err(AppError::Forbidden("sign-ups are turned off on this server".into()));
     }
+    let meta = ReqMeta::from_headers(&headers);
+    team::login::signup_guard(&state, &meta).await?;
     let (user, account) = create_account(&state, &b.email, &b.password, b.name, &b.company).await?;
-    let token = new_session(&state, user.id, account.id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email}))))
+    // They just typed their password.
+    let how = team::login::SessionStart { entered_password: true, ..Default::default() };
+    let token = team::login::start_session_with(&state, user.id, account.id, "password", None, &meta, how).await?;
+    team::audit::record(&state, account.id, &meta.actor(Some(user.id)), "account.signup", None, json!({})).await;
+    // Signing up doesn't prove the address is theirs; the link does (see `team::confirm`).
+    team::confirm::send_link_later(&state, user.id);
+    let me = team::login::me_for_token(&state, &token, &meta).await?;
+    Ok((jar.add(session_cookie(&state, token)), Json(me)))
 }
 
 #[derive(Deserialize)]
@@ -151,27 +177,13 @@ struct LoginBody {
     password: String,
 }
 
-async fn login(State(state): State<AppState>, jar: CookieJar, ApiJson(b): ApiJson<LoginBody>) -> AppResult<(CookieJar, Json<Value>)> {
-    let email = b.email.trim().to_lowercase();
-    let row: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as("SELECT id, email, name, password_hash FROM users WHERE email = $1")
-        .bind(&email)
-        .fetch_optional(&state.db)
-        .await?;
-    let bad = || AppError::BadRequest("that email and password don't match".into());
-    let (id, email, name, hash) = row.ok_or_else(bad)?;
-    let Some(hash) = hash else {
-        return Err(AppError::BadRequest("this account signs in with Google; use Continue with Google".into()));
-    };
-    if !auth::verify_password(&b.password, &hash) {
-        return Err(bad());
-    }
-    let account_id: Uuid = sqlx::query_scalar("SELECT account_id FROM memberships WHERE user_id = $1 ORDER BY created_at LIMIT 1")
-        .bind(id)
-        .fetch_one(&state.db)
-        .await?;
-    let account = load_account(&state.db, account_id).await?;
-    let token = new_session(&state, id, account_id).await?;
-    Ok((jar.add(session_cookie(&state, token)), Json(json!({"user": User { id, email, name }, "account": account, "support_email": state.cfg.support_email}))))
+/// Password sign-in. When the person has two-factor login on (or the account requires it), the
+/// session starts restricted and `restriction` says what's left (see `features::team::login`).
+async fn login(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar, ApiJson(b): ApiJson<LoginBody>) -> AppResult<(CookieJar, Json<Value>)> {
+    let meta = ReqMeta::from_headers(&headers);
+    let token = team::login::password_login(&state, &b.email, &b.password, &meta).await?;
+    let me = team::login::me_for_token(&state, &token, &meta).await?;
+    Ok((jar.add(session_cookie(&state, token)), Json(me)))
 }
 
 async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(CookieJar, Json<Value>)> {
@@ -182,12 +194,7 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> AppResult<(Coo
 }
 
 async fn me(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let account = load_account(&state.db, ctx.account_id).await?;
-    let user: Option<User> = match ctx.user_id {
-        Some(uid) => sqlx::query_as("SELECT id, email, name FROM users WHERE id = $1").bind(uid).fetch_optional(&state.db).await?,
-        None => None,
-    };
-    Ok(Json(json!({"user": user, "account": account, "support_email": state.cfg.support_email})))
+    Ok(Json(team::login::me_json(&state, &ctx).await?))
 }
 
 #[derive(Deserialize)]
@@ -216,6 +223,7 @@ fn blank_to_none(v: Option<String>) -> Option<Option<String>> {
 
 pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) -> AppResult<Account> {
     let mut account = load_account(&state.db, account_id).await?;
+    let old_tz = account.timezone.clone();
     if let Some(n) = b.name.filter(|n| !n.trim().is_empty()) {
         account.name = n.trim().to_string();
     }
@@ -316,6 +324,10 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     .bind(account.email_sunset_enabled)
     .fetch_one(&state.db)
     .await?;
+    // Event-date reminders are due at a local hour: move them to the new time zone.
+    if saved.timezone != old_tz {
+        crate::flows::reschedule_event_dates(&state.db, account_id).await.map_err(AppError::Internal)?;
+    }
     Ok(saved)
 }
 
@@ -361,11 +373,17 @@ pub async fn import_brand(state: &AppState, account_id: Uuid, url: &str, apply: 
 }
 
 async fn brand_import(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<BrandImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(import_brand(&state, ctx.account_id, &b.url, b.apply).await?))
+    let v = import_brand(&state, ctx.account_id, &b.url, b.apply).await?;
+    if b.apply {
+        team::audit(&state, &ctx, "account.brand_import", None, json!({})).await;
+    }
+    Ok(Json(v))
 }
 
 async fn update_account(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AccountPatch>) -> AppResult<Json<Account>> {
-    Ok(Json(patch_account(&state, ctx.account_id, b).await?))
+    let a = patch_account(&state, ctx.account_id, b).await?;
+    team::audit(&state, &ctx, "account.settings_change", None, json!({})).await;
+    Ok(Json(a))
 }
 
 pub async fn sending_json(state: &AppState, a: &Account) -> AppResult<Value> {
@@ -409,7 +427,9 @@ pub async fn set_domain(state: &AppState, account_id: Uuid, domain: &str) -> App
 }
 
 async fn add_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
-    Ok(Json(set_domain(&state, ctx.account_id, &b.domain).await?))
+    let v = set_domain(&state, ctx.account_id, &b.domain).await?;
+    team::audit(&state, &ctx, "domain.add", Some(&b.domain), json!({})).await;
+    Ok(Json(v))
 }
 
 /// Re-checks every sending domain.
@@ -425,6 +445,7 @@ async fn verify_one_domain(State(state): State<AppState>, ctx: Ctx, Path(domain)
 
 async fn remove_domain(State(state): State<AppState>, ctx: Ctx, Path(domain): Path<String>) -> AppResult<Json<Value>> {
     crate::domains::remove_sending_domain(&state, ctx.account_id, &domain).await?;
+    team::audit(&state, &ctx, "domain.remove", Some(&domain), json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
@@ -433,7 +454,10 @@ async fn remove_only_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
     let domains: Vec<String> = sqlx::query_scalar("SELECT domain FROM sending_domains WHERE account_id = $1").bind(ctx.account_id).fetch_all(&state.db).await?;
     match domains.as_slice() {
         [] => {}
-        [only] => crate::domains::remove_sending_domain(&state, ctx.account_id, only).await?,
+        [only] => {
+            crate::domains::remove_sending_domain(&state, ctx.account_id, only).await?;
+            team::audit(&state, &ctx, "domain.remove", Some(only), json!({})).await;
+        }
         _ => return Err(AppError::bad("this account has several sending domains; use DELETE /api/account/domains/{domain}")),
     }
     sending_now(&state, ctx.account_id).await
@@ -441,6 +465,7 @@ async fn remove_only_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
 
 async fn add_link_domain(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<DomainBody>) -> AppResult<Json<Value>> {
     crate::domains::set_link_domain(&state, ctx.account_id, &b.domain).await?;
+    team::audit(&state, &ctx, "link_domain.set", Some(&b.domain), json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
@@ -451,28 +476,12 @@ async fn verify_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResul
 
 async fn remove_link_domain(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     crate::domains::remove_link_domain(&state, ctx.account_id).await?;
+    team::audit(&state, &ctx, "link_domain.remove", None, json!({})).await;
     sending_now(&state, ctx.account_id).await
 }
 
-async fn list_keys(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let rows: Vec<(Uuid, String, String, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-        "SELECT id, name, prefix, created_at, last_used_at FROM api_keys WHERE account_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC",
-    )
-    .bind(ctx.account_id)
-    .fetch_all(&state.db)
-    .await?;
-    let data: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, name, prefix, created_at, last_used_at)| json!({"id": id, "name": name, "prefix": prefix, "created_at": created_at, "last_used_at": last_used_at}))
-        .collect();
-    Ok(Json(json!({"data": data})))
-}
-
-#[derive(Deserialize)]
-struct KeyBody {
-    name: Option<String>,
-}
-
+/// A full-access API key with no member behind it (acts as an owner). The dashboard and API make
+/// keys through `features::team::keys`, with scopes and the member who made them.
 pub async fn new_api_key(state: &AppState, account_id: Uuid, name: &str) -> AppResult<Value> {
     let key = format!("{API_KEY_PREFIX}{}", auth::random_token(24));
     let prefix: String = key.chars().take(12).collect();
@@ -486,27 +495,6 @@ pub async fn new_api_key(state: &AppState, account_id: Uuid, name: &str) -> AppR
         .execute(&state.db)
         .await?;
     Ok(json!({"id": id, "name": name, "prefix": prefix, "key": key}))
-}
-
-async fn create_key(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<KeyBody>) -> AppResult<Json<Value>> {
-    if ctx.via_api_key {
-        return Err(AppError::Forbidden("create API keys from the dashboard".into()));
-    }
-    let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "API key".into());
-    Ok(Json(new_api_key(&state, ctx.account_id, &name).await?))
-}
-
-async fn revoke_key(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let n = sqlx::query("UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL")
-        .bind(id)
-        .bind(ctx.account_id)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
-    if n == 0 {
-        return Err(AppError::not_found("API key"));
-    }
-    Ok(Json(json!({"ok": true})))
 }
 
 pub async fn billing_json(state: &AppState, account_id: Uuid) -> AppResult<Value> {
@@ -526,7 +514,9 @@ async fn checkout(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<C
     if ctx.via_api_key {
         return Err(AppError::Forbidden("add credit from the dashboard".into()));
     }
-    Ok(Json(json!({"url": crate::billing::checkout(&state, ctx.account_id, b.amount).await?})))
+    let url = crate::billing::checkout(&state, ctx.account_id, b.amount).await?;
+    team::audit(&state, &ctx, "billing.checkout", None, json!({"amount": b.amount})).await;
+    Ok(Json(json!({"url": url})))
 }
 
 #[derive(Deserialize)]
@@ -541,6 +531,7 @@ async fn auto_recharge(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
         return Err(AppError::Forbidden("change auto-recharge from the dashboard".into()));
     }
     crate::billing::set_auto_recharge(&state, ctx.account_id, b.enabled, b.threshold, b.amount).await?;
+    team::audit(&state, &ctx, "billing.auto_recharge_change", None, json!({"enabled": b.enabled, "threshold": b.threshold, "amount": b.amount})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -556,6 +547,7 @@ async fn choose_plan(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJso
         return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
     }
     let url = crate::subscription::choose(&state, ctx.account_id, b.tier).await?;
+    team::audit(&state, &ctx, "billing.plan_change", None, json!({"tier": b.tier})).await;
     Ok(Json(json!({"url": url, "billing": billing_json(&state, ctx.account_id).await?})))
 }
 
@@ -564,6 +556,7 @@ async fn cancel_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<
         return Err(AppError::Forbidden("cancel the email plan from the dashboard".into()));
     }
     crate::subscription::cancel(&state.db, ctx.account_id).await?;
+    team::audit(&state, &ctx, "billing.plan_cancel", None, json!({})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -572,6 +565,7 @@ async fn resume_plan(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<
         return Err(AppError::Forbidden("change the email plan from the dashboard".into()));
     }
     crate::subscription::resume(&state.db, ctx.account_id).await?;
+    team::audit(&state, &ctx, "billing.plan_resume", None, json!({})).await;
     Ok(Json(billing_json(&state, ctx.account_id).await?))
 }
 
@@ -603,26 +597,31 @@ struct ClaimBody {
 
 async fn claim_number(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ClaimBody>) -> AppResult<Json<Value>> {
     let row = crate::phone::claim(&state, ctx.account_id, &b.phone_number).await?;
+    team::audit(&state, &ctx, "phone_number.claim", Some(&b.phone_number), json!({})).await;
     Ok(Json(crate::phone::row_json(&row)))
 }
 
 async fn release_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     crate::phone::release(&state, ctx.account_id, id).await?;
+    team::audit(&state, &ctx, "phone_number.release", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn verify_number(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<crate::phone::TollFreeVerification>) -> AppResult<Json<Value>> {
     let row = crate::phone::submit_verification(&state, ctx.account_id, id, b).await?;
+    team::audit(&state, &ctx, "phone_number.verification_submit", Some(&id.to_string()), json!({})).await;
     Ok(Json(crate::phone::row_json(&row)))
 }
 
 async fn connect_sms(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<crate::phone::ConnectBody>) -> AppResult<Json<Value>> {
     crate::phone::connect(&state, ctx.account_id, b).await?;
+    team::audit(&state, &ctx, "sms_provider.connect", None, json!({})).await;
     Ok(Json(numbers_json(&state, ctx.account_id).await?))
 }
 
 async fn disconnect_sms(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
     crate::phone::disconnect(&state, ctx.account_id).await?;
+    team::audit(&state, &ctx, "sms_provider.disconnect", None, json!({})).await;
     Ok(Json(numbers_json(&state, ctx.account_id).await?))
 }
 

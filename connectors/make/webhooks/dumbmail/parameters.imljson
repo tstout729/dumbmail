@@ -1,0 +1,38 @@
+[
+	{
+		"name": "topic",
+		"type": "select",
+		"label": "Event",
+		"required": true,
+		"options": [
+			{ "label": "Event tracked", "value": "event.tracked" },
+			{ "label": "Profile created", "value": "profile.created" },
+			{ "label": "Profile updated", "value": "profile.updated" },
+			{ "label": "Profile deleted", "value": "profile.deleted" },
+			{ "label": "Subscribed (email or SMS)", "value": "profile.subscribed" },
+			{ "label": "Unsubscribed (email or SMS)", "value": "profile.unsubscribed" },
+			{ "label": "Address suppressed", "value": "profile.suppressed" },
+			{ "label": "Added to a list", "value": "list.member_added" },
+			{ "label": "Removed from a list", "value": "list.member_removed" },
+			{ "label": "Entered a segment", "value": "segment.entered" },
+			{ "label": "Left a segment", "value": "segment.left" },
+			{ "label": "Message sent", "value": "message.sent" },
+			{ "label": "Message delivered", "value": "message.delivered" },
+			{ "label": "Email opened", "value": "message.opened" },
+			{ "label": "Link clicked", "value": "message.clicked" },
+			{ "label": "Email bounced", "value": "message.bounced" },
+			{ "label": "Marked as spam", "value": "message.complained" },
+			{ "label": "Form submitted", "value": "form.submitted" },
+			{ "label": "Campaign started sending", "value": "campaign.sent" },
+			{ "label": "Campaign finished sending", "value": "campaign.finished" },
+			{ "label": "Flow turned on, paused or set to draft", "value": "flow.status_changed" },
+			{ "label": "Import finished", "value": "import.finished" }
+		]
+	},
+	{
+		"name": "metric",
+		"type": "text",
+		"label": "Metric",
+		"help": "For \"Event tracked\": only this metric, e.g. Placed Order. Leave empty for every event."
+	}
+]

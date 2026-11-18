@@ -477,11 +477,11 @@ pub async fn set_consent(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch: Ch
 
 /// Suppress a channel for a reason (hard_bounce, complaint, manual), in the caller's transaction.
 /// `overwrite` replaces another reason (a bounce or complaint does; a manual suppression never
-/// replaces one). `unsubscribe` also sets the channel's consent to unsubscribed. Returns whether
-/// anything changed.
+/// replaces one). `unsubscribe` also sets the channel's consent to unsubscribed. Returns the state
+/// before, when anything changed.
 #[allow(clippy::too_many_arguments)]
-pub async fn suppress_in(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, ch: Channel, reason: &str, overwrite: bool, unsubscribe: bool, src: &ConsentSource) -> sqlx::Result<bool> {
-    let Some(before) = lock(conn, account_id, profile_id).await? else { return Ok(false) };
+pub async fn suppress_in(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, ch: Channel, reason: &str, overwrite: bool, unsubscribe: bool, src: &ConsentSource) -> sqlx::Result<Option<ConsentState>> {
+    let Some(before) = lock(conn, account_id, profile_id).await? else { return Ok(None) };
     let mut after = before.clone();
     let current = before.suppressed(ch);
     if current.is_none() || (overwrite && current != Some(reason)) {
@@ -494,12 +494,12 @@ pub async fn suppress_in(conn: &mut PgConnection, account_id: Uuid, profile_id: 
     if !changed {
         touch(conn, profile_id).await?;
     }
-    Ok(changed)
+    Ok(changed.then_some(before))
 }
 
 /// [`suppress_in`] in a transaction of its own; it's committed before this returns.
 #[allow(clippy::too_many_arguments)]
-pub async fn suppress(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch: Channel, reason: &str, overwrite: bool, unsubscribe: bool, src: &ConsentSource) -> AppResult<bool> {
+pub async fn suppress(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch: Channel, reason: &str, overwrite: bool, unsubscribe: bool, src: &ConsentSource) -> AppResult<Option<ConsentState>> {
     let mut tx = db.begin().await?;
     let changed = suppress_in(&mut tx, account_id, profile_id, ch, reason, overwrite, unsubscribe, src).await?;
     tx.commit().await?;
@@ -510,8 +510,9 @@ pub async fn suppress(db: &PgPool, account_id: Uuid, profile_id: Uuid, ch: Chann
 /// address, or texted START from this number): subscribe them and let go of a deleted person's
 /// retained unsubscribe for that address, which nothing else can lift. Suppressions (a bounce, a
 /// complaint, a manual one) stay. In the caller's transaction; a failed history write fails it.
-pub async fn opt_in_verified_in(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, ch: Channel, src: &ConsentSource) -> AppResult<bool> {
-    let Some(before) = lock(conn, account_id, profile_id).await? else { return Ok(false) };
+/// Returns the channel's consent before, when it changed.
+pub async fn opt_in_verified_in(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, ch: Channel, src: &ConsentSource) -> AppResult<Option<String>> {
+    let Some(before) = lock(conn, account_id, profile_id).await? else { return Ok(None) };
     if let Some(addr) = before.address(ch) {
         super::privacy::forget_tombstone_in(conn, account_id, ch, addr, "unsubscribed").await?;
     }
@@ -521,7 +522,7 @@ pub async fn opt_in_verified_in(conn: &mut PgConnection, account_id: Uuid, profi
     if !changed {
         touch(conn, profile_id).await?;
     }
-    Ok(changed)
+    Ok(changed.then(|| before.consent(ch).to_string()))
 }
 
 /// Why a suppression can't be lifted from the suppression list, in words for the person asking.
@@ -602,19 +603,15 @@ async fn reload(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid) -> 
 /// deleted person with the profile's final email or phone number, on every create and update. A
 /// retained unsubscribe gives way only to [`opt_in_verified_in`], never to an upsert. Returns the
 /// profile as it now is.
-pub async fn after_upsert(conn: &mut PgConnection, account_id: Uuid, before: Option<&Profile>, up: Upserted) -> AppResult<Upserted> {
+pub async fn after_upsert(conn: &mut PgConnection, account_id: Uuid, before: Option<&ConsentState>, up: Upserted) -> AppResult<Upserted> {
     let src = current_source();
     let id = up.profile.id;
     let after = load_state(conn, account_id, id, false).await?.ok_or_else(|| AppError::not_found("profile"))?;
-    // The upsert writes consent and identifiers, never suppression or the opt-out.
-    let prev = before.filter(|_| !up.created).map(|b| ConsentState {
-        email: b.email.clone(),
-        phone_number: b.phone_number.clone(),
-        email_consent: b.email_consent.clone(),
-        sms_consent: b.sms_consent.clone(),
-        ..after.clone()
-    });
-    record_diff(conn, account_id, id, prev.as_ref(), &after, &src).await?;
+    let prev = before.filter(|_| !up.created);
+    if let Some(b) = prev {
+        note_address_change(conn, account_id, id, b, &after, &src).await?;
+    }
+    record_diff(conn, account_id, id, prev, &after, &src).await?;
     if super::privacy::apply_tombstones_in(conn, account_id, id, &src).await? {
         let profile = reload(conn, account_id, id).await?;
         return Ok(Upserted { profile, created: up.created });
@@ -622,11 +619,38 @@ pub async fn after_upsert(conn: &mut PgConnection, account_id: Uuid, before: Opt
     Ok(up)
 }
 
+/// A profile's email or phone number changed (`before` was read with [`lock`] in this transaction):
+/// record the old and new address, and void double opt-in confirmations waiting for an email address
+/// the profile no longer has (a confirmation is for the address it was sent to).
+async fn note_address_change(conn: &mut PgConnection, account_id: Uuid, profile_id: Uuid, before: &ConsentState, after: &ConsentState, src: &ConsentSource) -> sqlx::Result<()> {
+    let mut rows = Vec::new();
+    for ch in [Channel::Email, Channel::Sms] {
+        if before.address(ch) != after.address(ch) {
+            rows.push(history_row(&Change { account_id, profile_id, channel: ch.as_str(), field: "address", old: before.address(ch), new: after.address(ch), address: after.address(ch) }, src));
+        }
+    }
+    if before.email != after.email {
+        let key = after.email.as_deref().map(crate::optin::email_key);
+        sqlx::query("UPDATE optin_confirmations SET voided_at = now() WHERE profile_id = $1 AND confirmed_at IS NULL AND voided_at IS NULL AND email_key IS DISTINCT FROM $2")
+            .bind(profile_id)
+            .bind(&key)
+            .execute(&mut *conn)
+            .await?;
+    }
+    // An address change on its own makes nobody more reachable (consent rows decide that).
+    save_rows(conn, rows, true).await
+}
+
 /// After an email or phone number on a profile was changed directly (not through the upsert), in the
-/// same transaction: a deleted person's suppression record for the new address applies. Returns the
-/// profile as it now is.
-pub async fn after_address_change(conn: &mut PgConnection, account_id: Uuid, profile: Profile) -> AppResult<Profile> {
-    if super::privacy::apply_tombstones_in(conn, account_id, profile.id, &current_source()).await? {
+/// same transaction (`before` read with [`lock`] before the change): records the consent changes and
+/// the old and new addresses, voids confirmations for an old email address, and applies a deleted
+/// person's suppression record for the new address. Returns the profile as it now is.
+pub async fn after_address_change(conn: &mut PgConnection, account_id: Uuid, before: &ConsentState, profile: Profile) -> AppResult<Profile> {
+    let src = current_source();
+    let after = load_state(conn, account_id, profile.id, false).await?.ok_or_else(|| AppError::not_found("profile"))?;
+    note_address_change(conn, account_id, profile.id, before, &after, &src).await?;
+    record_diff(conn, account_id, profile.id, Some(before), &after, &src).await?;
+    if super::privacy::apply_tombstones_in(conn, account_id, profile.id, &src).await? {
         return Ok(reload(conn, account_id, profile.id).await?);
     }
     Ok(profile)

@@ -1,0 +1,4 @@
+[
+	{ "name": "list_id", "type": "select", "label": "List", "required": true, "options": "rpc://listLists" },
+	{ "name": "email", "type": "email", "label": "Email", "required": true, "help": "The profile is created if it's new." }
+]

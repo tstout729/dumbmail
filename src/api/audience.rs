@@ -141,30 +141,54 @@ pub async fn profile_detail(state: &AppState, account_id: Uuid, id: Uuid) -> App
     .bind(id)
     .fetch_all(&state.db)
     .await?;
-    let messages: Vec<(Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at FROM messages WHERE profile_id = $1 AND NOT is_test ORDER BY created_at DESC LIMIT 50",
+    #[allow(clippy::type_complexity)]
+    let messages: Vec<(Uuid, String, Option<String>, String, Option<Uuid>, Option<Uuid>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
+        "SELECT id, channel, subject, status, campaign_id, flow_id, sent_at, opened_at, clicked_at, send_note FROM messages WHERE profile_id = $1 AND NOT is_test ORDER BY created_at DESC LIMIT 50",
     )
     .bind(id)
     .fetch_all(&state.db)
     .await?;
     let messages: Vec<Value> = messages
         .into_iter()
-        .map(|m| json!({"id": m.0, "channel": m.1, "subject": m.2, "status": m.3, "campaign_id": m.4, "flow_id": m.5, "sent_at": m.6, "opened_at": m.7, "clicked_at": m.8}))
+        .map(|m| json!({"id": m.0, "channel": m.1, "subject": m.2, "status": m.3, "campaign_id": m.4, "flow_id": m.5, "sent_at": m.6, "opened_at": m.7, "clicked_at": m.8, "note": m.9}))
         .collect();
-    Ok(json!({"profile": profile, "lists": lists, "segments": segs, "events": events, "messages": messages}))
+    // Why email is suppressed, and which integration created the profile, if any.
+    let (suppressed, source, source_name, hold): (Option<String>, Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT p.email_suppressed_reason, p.source, i.name, p.marketing_hold FROM profiles p
+         LEFT JOIN integrations i ON p.source = 'integration:' || i.id::text AND i.account_id = p.account_id
+         WHERE p.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(json!({"profile": profile, "lists": lists, "segments": segs, "events": events, "messages": messages,
+        "email_suppressed_reason": suppressed, "marketing_hold": hold, "source": source.map(|s| json!({"kind": s.split(':').next().unwrap_or(""), "id": s.split_once(':').map(|x| x.1), "name": source_name}))}))
 }
 
 async fn get_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     Ok(Json(profile_detail(&state, ctx.account_id, id).await?))
 }
 
+/// A profile as an identity write saved it, with the consent that write replaced.
+#[derive(sqlx::FromRow)]
+struct IdentitySaved {
+    #[sqlx(flatten)]
+    profile: Profile,
+    old_email_consent: String,
+    old_sms_consent: String,
+}
+
 pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut body: Value) -> AppResult<Profile> {
-    load_profile(state, account_id, id).await?;
+    let before = load_profile(state, account_id, id).await?;
     body["id"] = json!(id);
     let input: ProfileInput = serde_json::from_value(body)?;
-    // Updating by id: identity fields in the body change this profile rather than selecting another.
-    let up = core::upsert_profile(&state.db, account_id, &ProfileInput { email: None, phone_number: None, external_id: None, ..input.clone() }).await?;
-    let p = up.profile;
+    // Everything is checked before anything is written: the consent values, the new email and
+    // number, and that no other profile already uses them.
+    for c in [&input.email_consent, &input.sms_consent].into_iter().flatten() {
+        if !crate::models::valid_consent(c) {
+            return Err(AppError::bad("consent must be subscribed, unsubscribed or never_subscribed"));
+        }
+    }
     let email = match input.email.as_deref() {
         Some("") => Some(None),
         Some(e) => Some(Some(crate::models::normalize_email(e).ok_or_else(|| AppError::bad("invalid email"))?)),
@@ -175,31 +199,66 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
         Some(ph) => Some(Some(crate::models::normalize_phone(ph).ok_or_else(|| AppError::bad("invalid phone number"))?)),
         None => None,
     };
-    if email.is_some() || phone.is_some() || input.external_id.is_some() {
+    let taken = || AppError::Conflict("another profile already uses that email, phone number or external id".into());
+    let identity = email.is_some() || phone.is_some() || input.external_id.is_some();
+    if identity {
+        let used: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND id <> $2 AND (email = $3 OR phone_number = $4 OR external_id = $5))")
+            .bind(account_id)
+            .bind(id)
+            .bind(email.clone().flatten())
+            .bind(phone.clone().flatten())
+            .bind(&input.external_id)
+            .fetch_one(&state.db)
+            .await?;
+        if used {
+            return Err(taken());
+        }
+        // The identity, and the consent that goes with the address, in one statement: a different
+        // number or email (or a first one) hasn't agreed to anything, so a subscription doesn't carry
+        // over to it unless this request sets that consent itself (unsubscribed and pending stay).
+        // A hard bounce belonged to the old email address; a complaint stays (as in the upsert).
+        let new_email = "($2 AND p.email IS NOT NULL AND p.email IS DISTINCT FROM $3)";
         let q = format!(
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
-               external_id = COALESCE($6, p.external_id), updated_at = now() WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+               sms_consent = CASE WHEN $7::text IS NOT NULL THEN $7
+                                  WHEN $4 AND p.phone_number IS DISTINCT FROM $5 AND p.sms_consent = 'subscribed' THEN 'never_subscribed'
+                                  ELSE p.sms_consent END,
+               email_consent = CASE WHEN $9::text IS NULL AND {new_email} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END,
+               email_suppressed_reason = CASE WHEN {new_email} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
+               external_id = COALESCE($6, p.external_id), updated_at = now()
+             FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 AND account_id = $8 FOR UPDATE) old
+             WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
         );
-        // In one transaction with the address change: a deleted person's suppression record for the new address applies.
+        // In one transaction with the address change, the row locked first: the consent history sees
+        // the exact before and after, and a deleted person's suppression record for the new address applies.
         let mut tx = state.db.begin().await?;
-        let p = sqlx::query_as::<_, Profile>(&q)
+        let consent_before = crate::features::people::consent::lock(&mut tx, account_id, id).await?.ok_or_else(|| AppError::not_found("profile"))?;
+        let saved = sqlx::query_as::<_, IdentitySaved>(&q)
             .bind(id)
             .bind(email.is_some())
             .bind(email.flatten())
             .bind(phone.is_some())
             .bind(phone.flatten())
             .bind(&input.external_id)
+            .bind(&input.sms_consent)
+            .bind(account_id)
+            .bind(&input.email_consent)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| match AppError::from(e) {
-                AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
+                AppError::Conflict(_) => taken(),
                 other => other,
             })?;
-        let p = crate::features::people::consent::after_address_change(&mut tx, account_id, p).await?;
+        let p = crate::features::people::consent::after_address_change(&mut tx, account_id, &consent_before, saved.profile).await?;
         tx.commit().await?;
-        return Ok(p);
+        // The consent this write replaced, as the write itself read it.
+        let consent = (saved.old_email_consent.as_str(), saved.old_sms_consent.as_str());
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&before), Some(consent), &p, core::EventSource::Api).await;
     }
-    Ok(p)
+    // The rest (names, properties, email consent, and the SMS consent when no identity changed).
+    // Updating by id: identity fields in the body change this profile rather than selecting another.
+    let rest = ProfileInput { email: None, phone_number: None, external_id: None, sms_consent: if identity { None } else { input.sms_consent.clone() }, ..input };
+    Ok(core::upsert_profile(&state.db, account_id, &rest).await?.profile)
 }
 
 async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<Value>) -> AppResult<Json<Profile>> {
@@ -207,10 +266,13 @@ async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path
 }
 
 async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    // Every profile-keyed row goes; someone who had unsubscribed stays suppressed if re-imported.
-    if crate::features::people::privacy::delete_profile_fully(&state.db, ctx.account_id, id).await?.is_none() {
-        return Err(AppError::not_found("profile"));
-    }
+    // One erasure for every delete path (features::people::privacy): every profile-keyed row, reviews
+    // and photos with the star summaries they counted in, push devices, stored exports; someone who
+    // had unsubscribed stays suppressed if re-imported.
+    let gone = crate::features::people::privacy::delete_profile_fully(&state.db, ctx.account_id, id).await?;
+    let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found("profile")) };
+    crate::features::webhooks::profile_deleted(&state.db, ctx.account_id, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
+    crate::features::team::audit(&state, &ctx, "profile.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -257,11 +319,14 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
     if r.created + r.updated > 0 {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"contacts\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
+    crate::features::webhooks::import_finished(&state.db, account_id, json!({"list_id": b.list_id, "created": r.created, "updated": r.updated, "skipped": r.skipped, "errors": r.errors.len()})).await;
     Ok(json!({"created": r.created, "updated": r.updated, "skipped": r.skipped, "errors": r.errors}))
 }
 
 async fn import_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ImportBody>) -> AppResult<Json<Value>> {
-    Ok(Json(with_source(ConsentSource::from_ctx(&ctx), import(&state, ctx.account_id, b)).await?))
+    let v = with_source(ConsentSource::from_ctx(&ctx), import(&state, ctx.account_id, b)).await?;
+    crate::features::team::audit(&state, &ctx, "profiles.import", None, json!({"created": v["created"], "updated": v["updated"], "skipped": v["skipped"]})).await;
+    Ok(Json(v))
 }
 
 // ---------- Lists ----------
@@ -348,6 +413,7 @@ async fn delete_list_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
     if n == 0 {
         return Err(AppError::not_found("list"));
     }
+    crate::features::team::audit(&state, &ctx, "list.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -375,7 +441,8 @@ async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
 
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
     core::list_belongs(&state.db, ctx.account_id, id).await?;
-    let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(id).bind(&b.profile_ids).execute(&state.db).await?.rows_affected();
+    let n = core::remove_from_list(&state.db, ctx.account_id, id, &b.profile_ids).await?;
+    crate::features::team::audit(&state, &ctx, "list.members_remove", Some(&id.to_string()), json!({"removed": n})).await;
     Ok(Json(json!({"removed": n})))
 }
 
@@ -415,7 +482,7 @@ async fn count_into(state: &AppState, account_id: Uuid, id: Uuid, def: &segments
 pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the segment a name"))?;
     let raw = b.definition.unwrap_or(json!({"match": "all", "conditions": []}));
-    let def = segments::load(&state.db, account_id, &raw, None).await?;
+    let def = segments::load_checked(&state.db, account_id, &raw, None).await?;
     let id = Uuid::now_v7();
     sqlx::query("INSERT INTO segments (id, account_id, name, definition) VALUES ($1, $2, $3, $4)")
         .bind(id)
@@ -429,7 +496,7 @@ pub async fn create_segment(state: &AppState, account_id: Uuid, b: SegmentBody) 
 
 pub async fn update_segment(state: &AppState, account_id: Uuid, id: Uuid, b: SegmentBody) -> AppResult<Segment> {
     let cur = get_segment(state, account_id, id).await?;
-    let def = segments::load(&state.db, account_id, &b.definition.unwrap_or(cur.definition), Some(id)).await?;
+    let def = segments::load_checked(&state.db, account_id, &b.definition.unwrap_or(cur.definition), Some(id)).await?;
     sqlx::query("UPDATE segments SET name = COALESCE($2, name), definition = $3, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(b.name.filter(|n| !n.trim().is_empty()))
@@ -484,11 +551,12 @@ async fn delete_segment_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
     if n == 0 {
         return Err(AppError::not_found("segment"));
     }
+    crate::features::team::audit(&state, &ctx, "segment.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
 pub async fn preview(state: &AppState, account_id: Uuid, definition: &Value) -> AppResult<Value> {
-    let def = segments::load(&state.db, account_id, definition, None).await?;
+    let def = segments::load_checked(&state.db, account_id, definition, None).await?;
     let (count, sample) = segments::preview(&state.db, account_id, &def, 10).await?;
     Ok(json!({"count": count, "sample": sample}))
 }
@@ -533,7 +601,7 @@ pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResul
     if !props.is_object() {
         return Err(AppError::bad("properties must be an object"));
     }
-    let id = core::record_event(
+    let id = core::record_api_event(
         &state.db,
         NewEvent {
             account_id,
@@ -695,6 +763,18 @@ pub async fn query_metric(state: &AppState, account_id: Uuid, q: MetricQuery) ->
     Ok(json!({"metric": q.metric, "interval": interval, "start": start, "end": end, "series": series, "total": total}))
 }
 
+impl MetricQuery {
+    /// Grouping by an event property shows people's own values, so it needs permission to read
+    /// profiles; totals and the campaign and flow groupings don't.
+    pub fn check_access(&self, ctx: &Ctx) -> AppResult<()> {
+        match self.group_by.as_deref().filter(|g| !g.is_empty()) {
+            None | Some("campaign" | "flow") => Ok(()),
+            Some(_) => crate::features::team::access::require_people_values(ctx, "an event property"),
+        }
+    }
+}
+
 async fn query_metric_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<MetricQuery>) -> AppResult<Json<Value>> {
+    b.check_access(&ctx)?;
     Ok(Json(query_metric(&state, ctx.account_id, b).await?))
 }

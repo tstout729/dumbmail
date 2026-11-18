@@ -1,3 +1,6 @@
+import { PushReportCard } from "../../features/push/PushReportCard";
+import { PushPreview } from "../../features/push/PushEditor";
+import type { PushContent } from "../../features/push/types";
 import { useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { Copy, Eye, FlaskConical, Trophy } from "lucide-react";
@@ -11,6 +14,10 @@ import { formatCurrency, formatDateTime, formatNumber, formatPercent, pluralize 
 import { toast } from "../../lib/toast";
 import { contentSnippet, metricLabels, versionContent, versionIds, versionLabel, versionName } from "./abTest";
 import { ChannelIcon } from "./CampaignsPage";
+import { SendProgressCard } from "../../features/sendtime/SendProgressCard";
+import { LanguageResults } from "../../features/translations/LanguageResults";
+import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
+import { ResendPanel } from "../../features/campaignsPlus/ResendPanel";
 
 export function CampaignReportView({ campaign }: { campaign: Campaign }) {
   const { account } = useSession();
@@ -53,9 +60,9 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
             <Button variant="ghost" icon={<Eye className="size-3.5" />} onClick={() => setViewing("a")}>
               {viewVersions.length > 1 ? "View versions" : "View message"}
             </Button>
-            {campaign.status === "testing" ? (
+            {campaign.status === "testing" || campaign.status === "sending" ? (
               <Button variant="secondary" onClick={() => setConfirmCancel(true)}>
-                Cancel the rest
+                {campaign.status === "testing" ? "Cancel the rest" : "Stop sending"}
               </Button>
             ) : null}
             <Button icon={<Copy className="size-3.5" />} loading={duplicate.isPending} onClick={() => duplicate.mutate(campaign.id, { onSuccess: (d) => navigate(`/campaigns/${d.id}`) })}>
@@ -64,7 +71,16 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           </>
         }
       />
+      {campaign.status === "sending" && campaign.error ? (
+        <div className="mb-4">
+          <Notice tone="amber" title="Paused">
+            {campaign.error}
+          </Notice>
+        </div>
+      ) : null}
+      <ResendPanel campaign={campaign} />
       {ab ? <AbTestResults campaign={campaign} ab={ab} totalRecipients={stats.recipients} timezone={tz} /> : null}
+      <SendProgressCard campaignId={campaign.id} live={campaign.status === "sending"} timezone={tz} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Stat label="Recipients" value={formatNumber(stats.recipients)} sub={`${formatNumber(stats.delivered)} delivered`} />
         {campaign.channel === "email" ? (
@@ -79,6 +95,11 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
         <Stat label="Spam complaints" value={formatNumber(stats.complaints)} />
         <Stat label="Failed" value={formatNumber(stats.failed)} />
       </div>
+      {campaign.channel === "push" ? (
+        <div className="mt-4">
+          <PushReportCard campaignId={campaign.id} />
+        </div>
+      ) : null}
       <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Card title={campaign.channel === "email" ? "Opens and clicks over time" : "Clicks over time"}>
           <TimeSeriesChart
@@ -126,7 +147,13 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           )}
         </Card>
       </div>
+      <div className="mt-4">
+        <LanguageResults campaignId={campaign.id} sent={campaign.status === "sent" || campaign.status === "sending"} />
+      </div>
       {report.error ? <p className="mt-3 text-sm text-red-600">{report.error.message}</p> : null}
+      <div className="mt-4">
+        <LinkTagsPanel kind="campaign" id={campaign.id} disabled />
+      </div>
       {viewing && viewed ? (
         <Modal title={viewVersions.length > 1 ? versionLabel(viewing) : "Message"} onClose={() => setViewing(null)} size="lg">
           {viewVersions.length > 1 ? (
@@ -136,6 +163,8 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           ) : null}
           {campaign.channel === "email" ? (
             <EmailPreview key={viewing} content={viewed as EmailContent} className="h-[70vh]" />
+          ) : campaign.channel === "push" ? (
+            <PushPreview content={viewed as PushContent} rendered={null} platforms={(viewed as PushContent).platforms?.length ? ((viewed as PushContent).platforms ?? []) : ["web", "ios", "android"]} />
           ) : (
             <PhonePreview body={(viewed as SmsContent).body} mediaUrl={(viewed as SmsContent).media_url} from={account.sms_from ?? account.name} />
           )}
@@ -143,8 +172,12 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
       ) : null}
       {confirmCancel ? (
         <ConfirmDialog
-          title="Cancel the rest of this campaign?"
-          body="Nobody else gets it. The people in the test already got their version."
+          title={campaign.status === "testing" ? "Cancel the rest of this campaign?" : "Stop sending this campaign?"}
+          body={
+            campaign.status === "testing"
+              ? "Nobody else gets it. The people in the test already got their version."
+              : "Nobody who hasn't got it yet will get it, including time zones still waiting. People who already got it keep it."
+          }
           confirmLabel="Cancel campaign"
           danger
           loading={cancel.isPending}

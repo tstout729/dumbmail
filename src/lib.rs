@@ -15,7 +15,9 @@ pub mod error;
 pub mod features;
 pub mod flows;
 pub mod forms;
+pub mod import_review;
 pub mod jobs;
+pub mod marketing_hold;
 pub mod mcp;
 pub mod models;
 pub mod optin;
@@ -47,7 +49,7 @@ fn stays_on_old_host(path: &str) -> bool {
     if path.starts_with("/api/auth/google") {
         return false;
     }
-    ["/api/", "/webhooks/", "/mcp", "/healthz", "/t/", "/o/", "/u/", "/c/", "/f/", "/i/", "/client/", "/onsite.js", "/google"].iter().any(|p| path.starts_with(p))
+    ["/api/", "/webhooks/", "/mcp", "/healthz", "/t/", "/s/", "/o/", "/u/", "/c/", "/f/", "/i/", "/e/", "/client/", "/onsite.js", "/google"].iter().any(|p| path.starts_with(p))
 }
 
 /// Visits to a retired hostname (REDIRECT_HOSTS) move permanently to PUBLIC_URL.
@@ -78,7 +80,7 @@ async fn link_domain_guard(
     use axum::response::IntoResponse;
     let host = req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").split(':').next().unwrap_or("").to_lowercase();
     let path = req.uri().path().to_string();
-    let public_ok = ["/t/", "/u/", "/c/", "/f/", "/i/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
+    let public_ok = ["/t/", "/s/", "/u/", "/c/", "/f/", "/i/", "/e/", "/client/", "/onsite.js", "/healthz", "/webhooks/"].iter().any(|p| path.starts_with(p));
     if public_ok || host.is_empty() {
         return next.run(req).await;
     }
@@ -96,18 +98,33 @@ async fn link_domain_guard(
 }
 
 pub fn app(state: AppState) -> Router {
+    app_with(state, Router::new())
+}
+
+/// The app with `extra` routes merged in like a feature's, behind the same permission check.
+/// Tests use it to prove a route without a permission rule is refused.
+#[doc(hidden)]
+pub fn app_with(state: AppState, extra: Router<AppState>) -> Router {
     Router::new()
         .merge(api::router())
         .merge(public::routes())
         .merge(mcp::routes())
         .merge(features::routes())
         .merge(site::routes())
+        .merge(extra)
+        // Every matched route is checked against its permission rule before its handler runs
+        // (features::team::access); routes without a rule are refused.
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), features::team::guard::layer))
         .fallback(web::serve)
         .layer(axum::middleware::from_fn_with_state(state.clone(), site::host_split))
         .layer(axum::middleware::from_fn_with_state(state.clone(), link_domain_guard))
         .layer(axum::middleware::from_fn_with_state(state.clone(), legacy_host_redirect))
         .layer(axum::extract::DefaultBodyLimit::max(60 * 1024 * 1024))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        // Request spans carry the path only: query strings can hold OAuth codes and states. Short
+        // links' codes are left out too (features::short_links::log_path).
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+            tracing::debug_span!("request", method = %req.method(), path = %features::short_links::log_path(req.uri().path()), version = ?req.version())
+        }))
         .with_state(state)
 }

@@ -17,8 +17,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock REVISION* ./
 COPY src ./src
 COPY migrations ./migrations
-# The MCP server embeds docs/FORMS.md (include_str!).
+# The MCP server embeds docs/*.md (include_str!); integration recipes are embedded from recipes/.
 COPY docs ./docs
+COPY recipes ./recipes
 COPY --from=web /web/dist ./web/dist
 RUN GIT_SHA="$(cat REVISION 2>/dev/null || true)" cargo build --release --locked
 

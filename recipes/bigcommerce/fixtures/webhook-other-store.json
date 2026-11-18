@@ -1,0 +1,26 @@
+{
+  "description": "a webhook from another store is ignored",
+  "doc": "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events (example payloads; store hash filled in)",
+  "expect": [
+    {
+      "message": "this webhook is from another store (stores/zzz999)",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "created_at": 1561479335,
+      "data": {
+        "id": 218,
+        "type": "order"
+      },
+      "hash": "x",
+      "producer": "stores/zzz999",
+      "scope": "store/order/created",
+      "store_id": "1025646"
+    },
+    "settings": {
+      "store_hash": "abc123"
+    }
+  }
+}

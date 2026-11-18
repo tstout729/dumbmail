@@ -1,0 +1,71 @@
+{
+  "description": "subscription.created, active: Subscription Started once",
+  "doc": "https://developer.paddle.com/webhooks/subscriptions/subscription-created (example, trimmed)",
+  "expect": [
+    {
+      "metric": "Subscription Started",
+      "profile": {
+        "if_missing": "retry",
+        "property": "paddle_customer",
+        "value": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4"
+      },
+      "properties": {
+        "amount": 30,
+        "currency": "USD",
+        "frequency": 1,
+        "interval": "month",
+        "next_billed_at": "2024-05-12T10:18:47.635628Z",
+        "plan": "Monthly (per seat)",
+        "price_id": "pri_01gsz8x8sawmvhz1pv30nge1ke",
+        "quantity": 10,
+        "status": "active",
+        "subscription_id": "sub_01hv8x29kz0t586xy6zn1a62ny"
+      },
+      "time": "2024-04-12T10:18:47.635628Z",
+      "type": "track_event",
+      "unique_id": "paddle:subscription:sub_01hv8x29kz0t586xy6zn1a62ny:started"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "address_id": "add_01hv8gq3318ktkfengj2r75gfx",
+        "collection_mode": "automatic",
+        "created_at": "2024-04-12T10:18:48.831Z",
+        "currency_code": "USD",
+        "customer_id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
+        "first_billed_at": "2024-04-12T10:18:47.635628Z",
+        "id": "sub_01hv8x29kz0t586xy6zn1a62ny",
+        "items": [
+          {
+            "price": {
+              "billing_cycle": {
+                "frequency": 1,
+                "interval": "month"
+              },
+              "description": "Monthly",
+              "id": "pri_01gsz8x8sawmvhz1pv30nge1ke",
+              "name": "Monthly (per seat)",
+              "unit_price": {
+                "amount": "3000",
+                "currency_code": "USD"
+              }
+            },
+            "quantity": 10,
+            "status": "active"
+          }
+        ],
+        "next_billed_at": "2024-05-12T10:18:47.635628Z",
+        "scheduled_change": null,
+        "started_at": "2024-04-12T10:18:47.635628Z",
+        "status": "active",
+        "transaction_id": "txn_01hv8wptq8987qeep44cyrewp9",
+        "updated_at": "2024-04-12T10:18:48.831Z"
+      },
+      "event_id": "evt_01hv8x2acma2gz7he8kg2s0hna",
+      "event_type": "subscription.created",
+      "notification_id": "ntf_01hv8x2af22vrrz7k67g06x1kq",
+      "occurred_at": "2024-04-12T10:18:49.621022Z"
+    }
+  }
+}

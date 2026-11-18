@@ -1,6 +1,13 @@
+import type { PushContent } from "../features/push/types";
+
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+import type { BlockOptions, ContentBlock } from "../features/content/types";
+import type { CouponBlock, CouponCondition } from "../features/coupons/types";
+import type { ObjectCondition, ObjectDateTrigger, ObjectTrigger } from "../features/objects/types";
+import type { ReviewCondition, ReviewRequestBlock, ReviewRequestNode, ReviewsBlock } from "../features/reviews/types";
+import type { LanguageCondition } from "../features/translations/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
@@ -14,6 +21,8 @@ export type ApiErrorCode =
   | "forbidden"
   | "conflict"
   | "limit_reached"
+  | "busy"
+  | "account_changed"
   | "internal";
 
 export type Profile = {
@@ -29,6 +38,8 @@ export type Profile = {
   created_at: string;
   updated_at: string;
   last_event_at: string | null;
+  /** The person's language, a tag like fr or pt-BR (see features/translations). */
+  locale?: string | null;
 };
 
 export type Plan = "free" | "pro" | "scale" | "self_hosted";
@@ -134,7 +145,10 @@ export type PropOp =
   | "not_in"
   | "within_last_days"
   | "more_than_days_ago"
-  | "anniversary_within_days";
+  | "anniversary_within_days"
+  | "within_next_days"
+  | "in_future"
+  | "in_past";
 
 export type FieldFilter = { field: string; op: PropOp; value?: unknown };
 
@@ -183,7 +197,7 @@ export type EventTimeCondition = {
 export type ListCondition = { type: "list"; list_id: string; op: "in" | "not_in" };
 export type SegmentRefCondition = { type: "segment"; segment_id: string; op: "in" | "not_in" };
 export type ConsentCondition = { type: "consent"; channel: "email" | "sms"; status: Consent };
-export type CanReceiveCondition = { type: "can_receive"; channel: "email" | "sms"; value: boolean };
+export type CanReceiveCondition = { type: "can_receive"; channel: "email" | "sms" | "push"; value: boolean };
 export type SuppressedCondition = { type: "suppressed"; value: boolean };
 export type FormCondition = { type: "form"; form_id?: string; op: HasOp } & EventWindow;
 export type EngagementCondition = { type: "engagement"; channel: "email" | "sms" | "any"; engaged: boolean; within_days: number };
@@ -207,6 +221,9 @@ export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: 
 
 export type Condition =
   | ProductCondition
+  | CouponCondition
+  | ObjectCondition
+  | ReviewCondition
   | PropertyCondition
   | EventCondition
   | EventValueCondition
@@ -216,6 +233,7 @@ export type Condition =
   | ConsentCondition
   | CanReceiveCondition
   | SuppressedCondition
+  | LanguageCondition
   | FormCondition
   | EngagementCondition
   | MessageCondition
@@ -232,17 +250,25 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock =
+export type EmailBlock = BlockOptions & {
+  /** The block's stable key (translations refer to it), given when the block is created. */
+  key?: string;
+} & (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
-  | { type: "image"; src: string; alt?: string; href?: string; width?: number }
+  | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }
   | { type: "button"; text: string; href: string; color?: string; align?: Align }
   | { type: "divider" }
   | { type: "spacer"; height?: number }
   | { type: "columns"; columns: EmailBlock[][] }
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
   | { type: "html"; html: string }
-  | ProductsBlock;
+  | ProductsBlock
+  | ContentBlock
+  | CouponBlock
+  | ReviewsBlock
+  | ReviewRequestBlock
+  );
 
 export type EmailBlockType = EmailBlock["type"];
 
@@ -261,7 +287,7 @@ export type EmailContent = {
 
 export type SmsContent = { body: string; media_url?: string };
 
-export type Channel = "email" | "sms";
+export type Channel = "email" | "sms" | "push";
 
 export type MessageStats = {
   recipients: number;
@@ -287,7 +313,7 @@ export type VersionId = "a" | "b" | "c" | "d";
 export type AbMetric = "open_rate" | "click_rate" | "revenue";
 
 export type AbTest = {
-  variants: { id: Exclude<VersionId, "a">; content: EmailContent | SmsContent }[];
+  variants: { id: Exclude<VersionId, "a">; content: EmailContent | SmsContent | PushContent }[];
   /** Share of the audience that gets the test, split evenly across versions (5-100, default 20). */
   test_percent?: number;
   /** Hours to wait before picking the winner (1-168, default 4). */
@@ -304,7 +330,7 @@ export type Campaign = {
   channel: Channel;
   status: CampaignStatus;
   audience: Audience;
-  content: EmailContent | SmsContent;
+  content: EmailContent | SmsContent | PushContent;
   send_at: string | null;
   sent_at: string | null;
   created_at: string;
@@ -314,6 +340,8 @@ export type Campaign = {
   /** When the test slice's wait ends (set once the test slice has gone out). */
   ab_test_ends_at: string | null;
   ab_winner: VersionId | null;
+  /** Why a campaign failed, or (while sending) why it's paused, e.g. a coupon ran out of codes. */
+  error?: string | null;
 };
 
 export type CampaignAbReport = {
@@ -338,21 +366,34 @@ export type CampaignReport = {
 
 // ---- Flows ----
 
+import type { DelayOptions, EventSplit, NotifyNode } from "../features/flowsPlus/types";
+/** With `cancelled_by`, people leave the flow when a later event of those metrics has the same `key` property value. */
+type CancelledBy = { key?: string; cancelled_by?: string[] };
+
 export type FlowTrigger =
-  | { type: "metric"; metric: string; filters?: FieldFilter[] }
+  | ({ type: "metric"; metric: string; filters?: FieldFilter[] } & CancelledBy)
   | { type: "list"; list_id: string }
   | { type: "segment"; segment_id: string }
-  | { type: "date_property"; field: string; offset_days?: number };
+  | { type: "date_property"; field: string; offset_days?: number }
+  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy)
+  | ObjectTrigger
+  | ObjectDateTrigger;
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
-export type DelayNode = { id: string; type: "delay"; amount: number; unit: DelayUnit; next: string | null };
+/** Options for waiting until a time of day, weekdays or a date: see features/flowsPlus. */
+export type DelayNode = { id: string; type: "delay"; amount: number; unit: DelayUnit; next: string | null } & DelayOptions;
 export type EmailNode = { id: string; type: "email"; name?: string; content: EmailContent; next: string | null };
 export type SmsNode = { id: string; type: "sms"; name?: string; content: SmsContent; next: string | null };
+export type PushNode = { id: string; type: "push"; name?: string; content: PushContent; next: string | null };
 export type ConditionNode = {
   id: string;
   type: "condition";
   condition: SegmentDefinition;
+  /** A trigger split: filters on the event that started the run. */
+  event_condition?: EventSplit;
+  /** In object flows: rules on the run's object's fields (all must hold too). */
+  object_filters?: FieldFilter[];
   yes: string | null;
   no: string | null;
 };
@@ -361,6 +402,15 @@ export type RandomSplitNode = {
   id: string;
   type: "random_split";
   percent: number;
+  yes: string | null;
+  no: string | null;
+};
+/** Waits up to `amount` `unit` for the person to text back: `yes` if they did, `no` if not. */
+export type WaitForReplyNode = {
+  id: string;
+  type: "wait_for_reply";
+  amount: number;
+  unit: DelayUnit;
   yes: string | null;
   no: string | null;
 };
@@ -386,14 +436,18 @@ export type WebhookNode = {
 };
 
 export type FlowNode =
+  | ReviewRequestNode
   | DelayNode
   | EmailNode
   | SmsNode
+  | PushNode
   | ConditionNode
   | RandomSplitNode
+  | WaitForReplyNode
   | UpdateProfileNode
   | ListActionNode
-  | WebhookNode;
+  | WebhookNode
+  | NotifyNode;
 
 export type FlowNodeType = FlowNode["type"];
 
@@ -404,6 +458,10 @@ export type FlowSettings = {
   exit_condition?: SegmentDefinition;
   profile_filter?: SegmentDefinition;
   smart_sending_hours?: number;
+  /** Most notification emails a day (default 200, at most 2,000). */
+  notify_daily_cap?: number;
+  /** Also send to people held back from marketing (added by an integration without an opt-in). */
+  service_messages?: boolean;
 };
 
 export type FlowDefinition = { entry: string | null; nodes: FlowNode[]; settings?: FlowSettings };
@@ -470,6 +528,8 @@ export type ProfileMessage = {
   sent_at: string | null;
   opened_at: string | null;
   clicked_at: string | null;
+  /** How it was sent, when worth telling (SMS: the phone's and the profile's time zones disagreed). */
+  note: string | null;
 };
 
 export type ProfileDetail = {
@@ -478,6 +538,12 @@ export type ProfileDetail = {
   segments: Segment[];
   events: EventRow[];
   messages: ProfileMessage[];
+  /** Why email to this profile is suppressed: hard_bounce, complaint, booking_relay or no_marketing. */
+  email_suppressed_reason?: string | null;
+  /** Held back from marketing: added (e.g. by an integration) without agreeing to it. */
+  marketing_hold?: boolean;
+  /** Set when an integration created the profile. */
+  source?: { kind: string; id: string | null; name: string | null } | null;
 };
 
 export type ProfileInput = Partial<
@@ -491,6 +557,7 @@ export type ProfileInput = Partial<
     | "properties"
     | "email_consent"
     | "sms_consent"
+    | "locale"
   >
 > & { list_ids?: string[] };
 
@@ -508,7 +575,8 @@ export type Template = {
 };
 
 export type EmailRender = { subject: string; preheader: string; html: string; text: string };
-export type SmsRender = { body: string; segments: number; characters: number };
+/** `short_links`: how many links the send will shorten (see features/shortLinks). */
+export type SmsRender = { body: string; segments: number; characters: number; short_links?: number };
 
 // ---- Forms ----
 // Mirrors docs/FORMS.md. Every config key is optional (left out = the default); `null` resets a key on update.
@@ -613,6 +681,8 @@ export type FormConfig = {
   success_body?: string | null;
   discount_code?: string | null;
   // Shared by every version
+  /** A coupon's name: each new sign-up gets their own code from it instead of `discount_code`. */
+  coupon?: string | null;
   legal_text?: string | null;
   success_button_text?: string | null;
   success_button_url?: string | null;

@@ -142,33 +142,44 @@ pub async fn apply_tombstones_in(conn: &mut PgConnection, account_id: Uuid, prof
 #[derive(sqlx::FromRow)]
 struct Doomed {
     id: Uuid,
+    external_id: Option<String>,
     #[sqlx(flatten)]
     state: ConsentState,
 }
+
+/// Who an erasure removed: (id, email, phone number, external id), for the callers' webhooks.
+pub type ErasedPerson = (Uuid, Option<String>, Option<String>, Option<String>);
 
 /// Erase profiles of this account fully, in the caller's transaction: every row keyed by them (see
 /// `merge::PROFILE_TABLES`), their personal exports, the account's stored multi-person exports, and
 /// background work holding their details, keeping only the minimal suppression record. Returns the
 /// rows removed per table (empty when none of the profiles exist).
 pub async fn erase_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) -> AppResult<Map<String, Value>> {
+    Ok(erase_people_in(conn, account_id, ids).await?.0)
+}
+
+/// [`erase_in`], also returning who was removed.
+pub async fn erase_people_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) -> AppResult<(Map<String, Value>, Vec<ErasedPerson>)> {
     let mut removed = Map::new();
     if ids.is_empty() {
-        return Ok(removed);
+        return Ok((removed, Vec::new()));
     }
     // First, so an export job publishing its file waits for this and then sees it (see `erased_since`).
     sqlx::query("INSERT INTO privacy_erasures (account_id, erased_at) VALUES ($1, clock_timestamp()) ON CONFLICT (account_id) DO UPDATE SET erased_at = clock_timestamp()")
         .bind(account_id)
         .execute(&mut *conn)
         .await?;
-    let doomed: Vec<Doomed> = sqlx::query_as(&format!("SELECT id, {} FROM profiles WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE", consent::STATE_COLS))
+    let doomed: Vec<Doomed> = sqlx::query_as(&format!("SELECT id, external_id, {} FROM profiles WHERE account_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE", consent::STATE_COLS))
         .bind(account_id)
         .bind(ids)
         .fetch_all(&mut *conn)
         .await?;
     if doomed.is_empty() {
-        return Ok(removed);
+        return Ok((removed, Vec::new()));
     }
     let ids: Vec<Uuid> = doomed.iter().map(|d| d.id).collect();
+    // Reviews and photos first, with the star summaries they counted in (features::reviews).
+    let reviews = crate::features::reviews::store::erase_reviews_in(conn, account_id, &ids).await?;
     let id_text: Vec<String> = ids.iter().map(Uuid::to_string).collect();
     let salt = salt_in(conn, account_id).await?;
     let mut kept = 0;
@@ -234,17 +245,20 @@ pub async fn erase_in(conn: &mut PgConnection, account_id: Uuid, ids: &[Uuid]) -
         count(t.table, n);
     }
     sqlx::query("DELETE FROM profiles WHERE account_id = $1 AND id = ANY($2)").bind(account_id).bind(&ids).execute(&mut *conn).await?;
+    count("reviews", reviews);
     removed.insert("profiles".into(), json!(ids.len()));
     removed.insert("suppression_records_kept".into(), json!(kept));
-    Ok(removed)
+    let people = doomed.into_iter().map(|d| (d.id, d.state.email, d.state.phone_number, d.external_id)).collect();
+    Ok((removed, people))
 }
 
-/// Erase one profile in a transaction of its own. None when there's no such profile.
-pub async fn delete_profile_fully(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> AppResult<Option<Map<String, Value>>> {
+/// Erase one profile in a transaction of its own. Returns what it held (email, phone number,
+/// external id), or None when there's no such profile.
+pub async fn delete_profile_fully(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> AppResult<Option<(Option<String>, Option<String>, Option<String>)>> {
     let mut tx = db.begin().await?;
-    let removed = erase_in(&mut tx, account_id, &[profile_id]).await?;
+    let (_, people) = erase_people_in(&mut tx, account_id, &[profile_id]).await?;
     tx.commit().await?;
-    Ok((!removed.is_empty()).then_some(removed))
+    Ok(people.into_iter().next().map(|(_, e, p, x)| (e, p, x)))
 }
 
 /// Make sure this account has an erasure marker row, so a job can lock it (see [`erased_since`]).

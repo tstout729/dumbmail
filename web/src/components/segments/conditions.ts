@@ -1,3 +1,7 @@
+import { isCouponConditionComplete, newCouponCondition } from "../../features/coupons/CouponConditionFields";
+import { isObjectConditionComplete, newObjectCondition, objectConditionSummary } from "../../features/objects/conditionRules";
+import { isReviewConditionComplete, newReviewCondition, reviewConditionSummary } from "../../features/reviews/ReviewConditionFields";
+import { isLanguageConditionComplete, languageConditionSummary, newLanguageCondition } from "../../features/translations/LanguageConditionFields";
 import type { CmpOp, Condition, EventCountOp, EventWindow, FieldFilter, Prediction, PropOp, SegmentDefinition, TimeOp } from "../../api";
 
 export const conditionLabels: Record<Condition["type"], string> = {
@@ -9,11 +13,15 @@ export const conditionLabels: Record<Condition["type"], string> = {
   message: "Got, opened or clicked a message",
   form: "Signed up through a form",
   product: "Viewed, carted or bought a product",
+  coupon: "Got or used a coupon code",
+  object: "Has objects (reservations, subscriptions …)",
+  review: "Wrote a review",
   list: "List membership",
   segment: "In another segment",
   consent: "Consent",
   can_receive: "Can receive email or SMS",
   suppressed: "Email suppressed",
+  language: "Language",
   prediction: "Prediction",
   random: "Random sample",
   group: "Group (AND / OR)",
@@ -21,9 +29,10 @@ export const conditionLabels: Record<Condition["type"], string> = {
 
 /** Condition types grouped for the pickers. */
 export const conditionGroups: { label: string; types: Condition["type"][] }[] = [
-  { label: "Profile", types: ["property"] },
-  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form"] },
+  { label: "Profile", types: ["property", "language"] },
+  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form", "coupon", "review"] },
   { label: "Membership", types: ["list", "segment"] },
+  { label: "Objects", types: ["object"] },
   { label: "Reachability", types: ["consent", "can_receive", "suppressed"] },
   { label: "Predictive", types: ["prediction", "random"] },
   { label: "Logic", types: ["group"] },
@@ -48,6 +57,9 @@ export const propOps: { value: PropOp; label: string }[] = [
   { value: "within_last_days", label: "is within the last" },
   { value: "more_than_days_ago", label: "is more than … days ago" },
   { value: "anniversary_within_days", label: "anniversary is in the next" },
+  { value: "within_next_days", label: "is today or in the next" },
+  { value: "in_future", label: "is today or later" },
+  { value: "in_past", label: "is before today" },
 ];
 
 export const eventOps: { value: EventCountOp; label: string }[] = [
@@ -93,10 +105,13 @@ export const predictions: { value: Prediction; label: string; money?: boolean; d
   { value: "churn_risk", label: "Churn risk" },
 ];
 
-export const numericOps = new Set<PropOp>(["gt", "gte", "lt", "lte", "within_last_days", "more_than_days_ago", "anniversary_within_days"]);
+export const numericOps = new Set<PropOp>(["gt", "gte", "lt", "lte", "within_last_days", "more_than_days_ago", "anniversary_within_days", "within_next_days"]);
+
+/** Operators that count days (shown with "days" after the number). */
+export const dayOps = new Set<PropOp>(["within_last_days", "more_than_days_ago", "anniversary_within_days", "within_next_days"]);
 
 export function isValuelessOp(op: PropOp): boolean {
-  return op === "exists" || op === "not_exists";
+  return op === "exists" || op === "not_exists" || op === "in_future" || op === "in_past";
 }
 
 export function conditionDefaults(type: Condition["type"], firstListId?: string): Condition {
@@ -117,6 +132,12 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return { type, op: "has" };
     case "product":
       return { type, action: "ordered", op: "at_least", count: 1, within_days: 90 };
+    case "coupon":
+      return newCouponCondition();
+    case "object":
+      return newObjectCondition();
+    case "review":
+      return newReviewCondition();
     case "list":
       return { type, list_id: firstListId ?? "", op: "in" };
     case "segment":
@@ -127,6 +148,8 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return { type, channel: "email", value: true };
     case "suppressed":
       return { type, value: true };
+    case "language":
+      return newLanguageCondition();
     case "prediction":
       return { type, measure: "churn_risk", op: "in", value: ["high"] };
     case "random":
@@ -176,6 +199,12 @@ export function isConditionComplete(c: Condition): boolean {
       return windowComplete(c);
     case "product":
       return (c.op === "zero" || isNum(c.count)) && windowComplete(c) && [c.product_id, c.category, c.tag, c.brand].every((v) => v === undefined || v.trim() !== "");
+    case "coupon":
+      return isCouponConditionComplete(c);
+    case "object":
+      return isObjectConditionComplete(c, filterComplete);
+    case "review":
+      return isReviewConditionComplete(c);
     case "list":
       return c.list_id !== "";
     case "segment":
@@ -184,6 +213,8 @@ export function isConditionComplete(c: Condition): boolean {
     case "can_receive":
     case "suppressed":
       return true;
+    case "language":
+      return isLanguageConditionComplete(c);
     case "prediction":
       if (c.measure === "churn_risk") return c.op === "in" ? Array.isArray(c.value) && c.value.length > 0 : typeof c.value === "string";
       return c.op === "between" ? isPair(c.value, isNum) : isNum(c.value);
@@ -211,7 +242,7 @@ function formatValue(v: unknown): string {
 export function filterSummary(f: FieldFilter): string {
   if (isValuelessOp(f.op)) return `${f.field || "?"} ${opLabel(f.op)}`;
   if (f.op === "between" && Array.isArray(f.value)) return `${f.field || "?"} is between ${formatValue(f.value[0])} and ${formatValue(f.value[1])}`;
-  const suffix = f.op === "within_last_days" || f.op === "more_than_days_ago" || f.op === "anniversary_within_days" ? " days" : "";
+  const suffix = dayOps.has(f.op) ? " days" : "";
   return `${f.field || "?"} ${opLabel(f.op)} ${formatValue(f.value)}${suffix}`;
 }
 
@@ -262,6 +293,12 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
       const count = c.op === "zero" ? "zero times" : `${eventOps.find((o) => o.value === c.op)?.label} ${c.count ?? 1}×`;
       return `${productActions.find((a) => a.value === c.action)?.label ?? c.action} ${what} ${count}${windowSummary(c)}`;
     }
+    case "coupon":
+      return `${c.op === "has" ? "" : "not "}${c.action === "redeemed" ? "redeemed" : "got"} a coupon code${c.within_days ? ` in the last ${c.within_days}d` : ""}`;
+    case "object":
+      return objectConditionSummary(c, filterSummary);
+    case "review":
+      return reviewConditionSummary(c);
     case "list":
       return `${c.op === "in" ? "in" : "not in"} list ${list(c.list_id)}`;
     case "segment":
@@ -269,9 +306,11 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
     case "consent":
       return `${c.channel} consent is ${c.status.replace("_", " ")}`;
     case "can_receive":
-      return `${c.value ? "can" : "can't"} receive ${c.channel === "sms" ? "SMS" : "email"}`;
+      return `${c.value ? "can" : "can't"} receive ${c.channel === "sms" ? "SMS" : c.channel === "push" ? "push" : "email"}`;
     case "suppressed":
       return c.value ? "email suppressed" : "email not suppressed";
+    case "language":
+      return languageConditionSummary(c);
     case "prediction":
       return `${predictions.find((p) => p.value === c.measure)?.label ?? c.measure} ${cmpSummary(c.op, c.value)}`;
     case "random":

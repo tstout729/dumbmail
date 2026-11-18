@@ -1,13 +1,15 @@
-import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowTrigger, List, RandomSplitNode, Segment } from "../../api";
+import { objectTriggerSummary } from "../../features/objects/conditionRules";
+import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowTrigger, List, RandomSplitNode, Segment, WaitForReplyNode } from "../../api";
 import { shortId } from "../../lib/id";
 import { starterEmail } from "../email/blocks";
+import { newReviewRequestNode } from "../../features/reviews/StepEditor";
 
 /** A pointer in the graph that can hold a node id: the entry, a node's `next`, or a split's yes/no. */
 export type Slot = { kind: "entry" } | { kind: "next" | "yes" | "no"; nodeId: string };
 
-/** Nodes with two paths (yes/no) instead of a single `next`: conditional and random splits. */
-export function isBranch(node: FlowNode): node is ConditionNode | RandomSplitNode {
-  return node.type === "condition" || node.type === "random_split";
+/** Nodes with two paths (yes/no) instead of a single `next`: conditional and random splits, and waiting for a reply. */
+export function isBranch(node: FlowNode): node is ConditionNode | RandomSplitNode | WaitForReplyNode {
+  return node.type === "condition" || node.type === "random_split" || node.type === "wait_for_reply";
 }
 
 export function getSlot(def: FlowDefinition, slot: Slot): string | null {
@@ -37,10 +39,14 @@ export function newNode(type: FlowNodeType, brandColor?: string, firstListId?: s
       return { id, type, name: "Email", content: { ...starterEmail(brandColor), subject: "" }, next: null };
     case "sms":
       return { id, type, name: "SMS", content: { body: "" }, next: null };
+    case "push":
+      return { id, type, name: "Push", content: { title: "", body: "" }, next: null };
     case "condition":
       return { id, type, condition: { match: "all", conditions: [] }, yes: null, no: null };
     case "random_split":
       return { id, type, percent: 50, yes: null, no: null };
+    case "wait_for_reply":
+      return { id, type, amount: 1, unit: "days", yes: null, no: null };
     case "update_profile":
       return { id, type, properties: {}, next: null };
     case "add_to_list":
@@ -48,6 +54,10 @@ export function newNode(type: FlowNodeType, brandColor?: string, firstListId?: s
       return { id, type, list_id: firstListId ?? "", next: null };
     case "webhook":
       return { id, type, url: "https://", method: "POST", next: null };
+    case "notify":
+      return { id, type, to: [], subject: "", body: "", next: null };
+    case "review_request":
+      return newReviewRequestNode(id, brandColor);
   }
 }
 
@@ -102,15 +112,19 @@ export const nodeLabels: Record<FlowNodeType, string> = {
   delay: "Time delay",
   email: "Email",
   sms: "SMS",
+  push: "Push notification",
   condition: "Conditional split",
   random_split: "Random split",
+  wait_for_reply: "Wait for a reply",
   update_profile: "Update profile",
   add_to_list: "Add to list",
   remove_from_list: "Remove from list",
   webhook: "Webhook",
+  notify: "Notify the team",
+  review_request: "Ask for a review",
 };
 
-export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "condition", "random_split", "update_profile", "add_to_list", "remove_from_list", "webhook"];
+export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "push", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook", "notify", "review_request"];
 
 export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Segment[] = []): string {
   switch (t.type) {
@@ -122,9 +136,17 @@ export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Seg
       return `Enters ${segments.find((s) => s.id === t.segment_id)?.name ?? "a segment"}`;
     case "date_property":
       return `On ${t.field || "a date property"}${t.offset_days ? ` ${t.offset_days > 0 ? "+" : ""}${t.offset_days}d` : ""}`;
+    case "event_date": {
+      const n = t.offset_days ?? 0;
+      const when = n === 0 ? "On" : `${Math.abs(n)} ${Math.abs(n) === 1 ? "day" : "days"} ${n < 0 ? "before" : "after"}`;
+      return `${when} ${t.field || "a date"} in ${t.metric || "an event"}`;
+    }
+    case "object":
+    case "object_date":
+      return objectTriggerSummary(t);
   }
 }
 
 export function triggerKind(t: FlowTrigger): string {
-  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date" }[t.type];
+  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date", event_date: "Event date", object: "Object", object_date: "Object date" }[t.type];
 }

@@ -1,0 +1,341 @@
+{
+  "key": "guesty",
+  "name": "Guesty",
+  "category": "Vacation rentals",
+  "description": "Guesty reservations become events on each guest's profile: Reservation Booked (once), Reservation Total (the booking's value, once, when Guesty sends it), Reservation Confirmed (each version of the booking's dates), Reservation Cancelled, Reservation Updated and Inquiry Received, with the listing, dates, nights, guests and booking channel. Guests are held back from marketing (they booked; they didn't sign up), and Airbnb, Booking.com and Vrbo relay addresses are never sent marketing. Each reservation is also kept as a reservation object (status, dates, listing, guests) linked to the guest, so flows can follow its dates and segments can ask about upcoming stays. Reservations import through Guesty's current Open API.",
+  "metrics": [
+    "Reservation Booked",
+    "Reservation Total",
+    { "name": "Reservation Confirmed", "purchase": true },
+    "Reservation Cancelled",
+    "Reservation Updated",
+    "Inquiry Received"
+  ],
+  "docs": [
+    "https://open-api-docs.guesty.com/docs/reservation-webhooks-migration-guide",
+    "https://open-api-docs.guesty.com/docs/reservation-migration",
+    "https://open-api-docs.guesty.com/reference/reservationsopenapicontroller_searchreservations",
+    "https://open-api-docs.guesty.com/reference/guestsopenapicontroller_getguestslist",
+    "https://open-api-docs.guesty.com/docs/fields-for-guest-reports",
+    "https://open-api-docs.guesty.com/changelog/2026-11-05",
+    "https://open-api-docs.guesty.com/docs/authentication",
+    "https://open-api-docs.guesty.com/docs/webhooks",
+    "https://open-api-docs.guesty.com/reference/reservationsreportsopenapicontroller_searchreservations"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "svix-signature",
+    "format": "svix"
+  },
+  "signature_secret": {
+    "label": "Guesty webhook signing secret",
+    "help": "Starts with whsec_. Get it from GET https://open-api.guesty.com/v1/webhooks-v2/secret, or from the webhooks page of Guesty's developer dashboard."
+  },
+  "credentials": [
+    {
+      "name": "client_id",
+      "label": "Open API client ID",
+      "help": "In Guesty: Integrations → API & Webhooks (Open API) → create an API key. Used only to import reservations."
+    },
+    {
+      "name": "client_secret",
+      "label": "Open API client secret",
+      "help": "Shown once when you create the API key."
+    }
+  ],
+  "settings": {
+    "skip_owner_stays": true,
+    "payment_check_days": 45
+  },
+  "pull": {
+    "method": "GET",
+    "url": "https://open-api.guesty.com/v1/reservations-v3/search",
+    "query": {
+      "limit": 50,
+      "sort": "lastUpdatedAt",
+      "filter[lastUpdatedAt][gte]": "{{state.cursor|since}}",
+      "skip": "{{state.skip|'0'}}"
+    },
+    "auth": {
+      "type": "oauth2_client_credentials",
+      "token_url": "https://open-api.guesty.com/oauth2/token",
+      "client_id": "{{secret.client_id}}",
+      "client_secret": "{{secret.client_secret}}",
+      "scope": "open-api",
+      "max_tokens_per_day": 4
+    },
+    "interval_minutes": 15,
+    "max_pages": 20
+  },
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "In Guesty, create an Open API key (Integrations → API & Webhooks) and save its client ID and secret as the credentials client_id and client_secret. DumbMail asks Guesty for an access token at most 4 times a day (Guesty allows 5) and reuses it until it expires.",
+    "Subscribe the webhook URL to Guesty's current reservation webhooks: POST https://open-api.guesty.com/v1/webhooks with {\"url\": \"<webhook URL>\", \"events\": [\"reservation.created.v2\", \"reservation.updated.v2\"]}. They update guests DumbMail already knows at once (cancellations included); the 15-minute pull adds new guests, because these events don't carry the guest's email.",
+    "Optional, until 1 March 2027 only: also subscribe reservation.new and reservation.updated. Guesty retires them on that date; until then they are the only source of booking totals (recorded as Reservation Total) (the current reservation API has no money fields).",
+    "Save the webhook signing secret (GET https://open-api.guesty.com/v1/webhooks-v2/secret, starts with whsec_) as the integration's signing secret.",
+    "Test the pull (Pull tab → Test pull, or test_integration with pull: true) to see the first page of reservations and exactly what would be written.",
+    "Import history from a start date, for example a year ago (Pull tab → Import history, or run_integration_pull with backfill_since). Old bookings are marked historical, so the booking confirmation flow skips them; pre-arrival and review flows still use future and recent stays.",
+    "Guests are held back from marketing: the suggested flows are service messages about the guest's own booking, so they still reach them. Only tick \"Everyone this integration adds has agreed to get marketing email from us\" if that is true for every guest.",
+    "Review the three draft flows (booking confirmation, pre-arrival, review request), edit the emails, and turn them on.",
+    "Door codes and access notes Guesty puts on reservations are removed from payloads before anything is stored or shown (the integration's redact list). Never copy them into an email or a profile.",
+    "Pre-arrival messages wait for payment: they go only to confirmed reservations Guesty reports as paid in full, with that evidence at least as new as the reservation's last change. Payment comes from Guesty's legacy reservation webhooks (until 1 March 2027) and from an hourly check of upcoming arrivals through Guesty's reservations reports search (part of the scheduled pull)."
+  ],
+  "flows": [
+    {
+      "name": "Guesty: booking confirmation",
+      "description": "Thanks the guest ten minutes after a booking is first confirmed. Skips imported history, and stops if the booking is cancelled first. A service message, so it reaches guests who haven't agreed to marketing.",
+      "trigger": {
+        "type": "metric",
+        "metric": "Reservation Booked",
+        "filters": [
+          {
+            "field": "historical",
+            "op": "neq",
+            "value": true
+          }
+        ],
+        "key": "reservation_id",
+        "cancelled_by": [
+          "Reservation Cancelled"
+        ]
+      },
+      "definition": {
+        "entry": "c1",
+        "settings": {
+          "reentry": "always",
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "c1",
+            "type": "delay",
+            "amount": 10,
+            "unit": "minutes",
+            "next": "c2"
+          },
+          {
+            "id": "c2",
+            "type": "email",
+            "name": "Booking confirmed",
+            "next": null,
+            "content": {
+              "subject": "You're booked at {{ event.properties.listing_name|default('our place') }}",
+              "preheader": "{{ event.properties.check_in }} to {{ event.properties.check_out }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Thanks for booking, {{ first_name|default('there') }}!"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Your stay at <strong>{{ event.properties.listing_name|default('our place') }}</strong> is confirmed.</p><p>Check-in: {{ event.properties.check_in }}<br>Check-out: {{ event.properties.check_out }}<br>Guests: {{ event.properties.guests|default('') }}<br>Confirmation code: {{ event.properties.confirmation_code|default('') }}</p><p>We'll send arrival details a couple of days before you come.</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Guesty: review request",
+      "description": "The day after check-out at 11am, thanks the guest and asks for a review. Skipped for cancelled bookings. A service message about their stay.",
+      "trigger": {
+        "type": "event_date",
+        "metric": "Reservation Confirmed",
+        "field": "check_out",
+        "offset_days": 1,
+        "hour": 11,
+        "key": "reservation_id",
+        "cancelled_by": [
+          "Reservation Cancelled"
+        ]
+      },
+      "definition": {
+        "entry": "r1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "r1",
+            "type": "email",
+            "name": "Review request",
+            "next": null,
+            "content": {
+              "subject": "How was your stay at {{ event.properties.listing_name|default('our place') }}?",
+              "preheader": "Thanks for staying with us",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Thanks for staying with us, {{ first_name|default('there') }}"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>We hope you enjoyed <strong>{{ event.properties.listing_name|default('your stay') }}</strong>. A short review helps other guests find us and helps us keep improving.</p><p>Just reply to this email and tell us how it went.</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Guesty: pre-arrival",
+      "description": "Two days before check-in at 10am, sends arrival details. Only while the reservation is confirmed, Guesty has reported it paid in full with evidence at least as new as its last change, and the person is still its guest: checked when it's due and before each step. It follows the newest dates. A service message.",
+      "trigger": {
+        "type": "object_date",
+        "object_type": "reservation",
+        "field": "check_in",
+        "offset_days": -2,
+        "hour": 10,
+        "relationship": "guest",
+        "filters": [
+          {
+            "field": "status",
+            "op": "eq",
+            "value": "confirmed"
+          },
+          {
+            "field": "paid_in_full",
+            "op": "eq",
+            "value": true
+          },
+          {
+            "field": "paid_checked_at",
+            "op": "gte",
+            "value": {
+              "field": "$as_of"
+            }
+          }
+        ]
+      },
+      "definition": {
+        "entry": "o1",
+        "settings": {
+          "service_messages": true
+        },
+        "nodes": [
+          {
+            "id": "o1",
+            "type": "email",
+            "name": "Arrival details",
+            "next": null,
+            "content": {
+              "subject": "See you soon at {{ object.listing_name|default('our place') }}",
+              "preheader": "Check-in is {{ object.check_in|date }}",
+              "blocks": [
+                {
+                  "type": "heading",
+                  "text": "Your stay starts in two days"
+                },
+                {
+                  "type": "text",
+                  "html": "<p>Hi {{ first_name|default('there') }}, we're getting <strong>{{ object.listing_name|default('the place') }}</strong> ready for you.</p><p>Check-in: {{ object.check_in|date }}<br>Check-out: {{ object.check_out|date }}<br>Confirmation code: {{ object.confirmation_code|default('') }}</p><p>Reply to this email if you have any questions before you arrive.</p>"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "message_id": {
+    "header": "svix-id"
+  },
+  "redact": [
+    "**.notes",
+    "**.keyCode",
+    "**.doorCode",
+    "**.lockCode",
+    "**.accessCode",
+    "**.accessCodes",
+    "**.checkInInstructions",
+    "**.guestContact",
+    "**.wifiPassword",
+    "**.guestNotes",
+    "**.cleaningNotes",
+    "**.otherNotes",
+    "**.specialRequests",
+    "**.cancellationNote"
+  ],
+  "object_types": [
+    {
+      "key": "reservation",
+      "name": "Reservation",
+      "plural": "Reservations",
+      "title_field": "confirmation_code",
+      "fields": [
+        {
+          "key": "status",
+          "label": "Status",
+          "type": "text"
+        },
+        {
+          "key": "confirmation_code",
+          "label": "Confirmation code",
+          "type": "text"
+        },
+        {
+          "key": "listing_id",
+          "label": "Listing ID",
+          "type": "text"
+        },
+        {
+          "key": "listing_name",
+          "label": "Listing",
+          "type": "text"
+        },
+        {
+          "key": "check_in",
+          "label": "Check-in",
+          "type": "date"
+        },
+        {
+          "key": "check_out",
+          "label": "Check-out",
+          "type": "date"
+        },
+        {
+          "key": "nights",
+          "label": "Nights",
+          "type": "number"
+        },
+        {
+          "key": "guests",
+          "label": "Guests",
+          "type": "number"
+        },
+        {
+          "key": "total",
+          "label": "Total",
+          "type": "number"
+        },
+        {
+          "key": "currency",
+          "label": "Currency",
+          "type": "text"
+        },
+        {
+          "key": "source_channel",
+          "label": "Channel",
+          "type": "text"
+        },
+        {
+          "key": "guest_id",
+          "label": "Guesty guest ID",
+          "type": "text"
+        },
+        {
+          "key": "paid_in_full",
+          "label": "Paid in full",
+          "type": "boolean"
+        },
+        {
+          "key": "paid_checked_at",
+          "label": "Payment checked at",
+          "type": "datetime"
+        }
+      ]
+    }
+  ]
+}

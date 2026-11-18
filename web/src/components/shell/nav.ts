@@ -13,6 +13,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import type { ComponentType } from "react";
 import { featureNav, featureSettingsTabs } from "../../features/registry";
 
 export type NavItem = {
@@ -22,6 +23,8 @@ export type NavItem = {
   end?: boolean;
   /** Custom active check, for items whose section contains another item's route. */
   isActive?: (pathname: string) => boolean;
+  /** Shown after the label, e.g. an unread count. */
+  trailing?: ComponentType;
 };
 export type NavGroup = { label?: string; items: NavItem[] };
 

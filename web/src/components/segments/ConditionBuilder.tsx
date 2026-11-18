@@ -14,9 +14,13 @@ import type {
   SegmentDefinition,
   TimeOp,
 } from "../../api";
-import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, isValuelessOp, numericOps, predictions, productActions, propOps, timeOps } from "./conditions";
+import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, dayOps, eventOps, isValuelessOp, numericOps, predictions, productActions, propOps, timeOps } from "./conditions";
 import { useCatalogFacets } from "../../features/catalog/api";
 import type { ProductCondition } from "../../features/catalog/types";
+import { CouponConditionFields } from "../../features/coupons/CouponConditionFields";
+import { ObjectConditionFields } from "../../features/objects/ObjectConditionFields";
+import { ReviewConditionFields } from "../../features/reviews/ReviewConditionFields";
+import { LanguageConditionFields } from "../../features/translations/LanguageConditionFields";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
 import { IconButton, Input, Select, cx } from "../ui";
 
@@ -324,6 +328,12 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
       );
     case "product":
       return <ProductFields condition={c} onChange={onChange} />;
+    case "coupon":
+      return <CouponConditionFields condition={c} onChange={onChange} />;
+    case "object":
+      return <ObjectConditionFields condition={c} onChange={onChange} />;
+    case "review":
+      return <ReviewConditionFields condition={c} onChange={onChange} />;
     case "list":
       return (
         <>
@@ -369,11 +379,12 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
             <option value="no">can't</option>
           </Select>
           <Hint>receive</Hint>
-          <Select value={c.channel} onChange={(e) => onChange({ ...c, channel: e.target.value as "email" | "sms" })} className={small} aria-label="Channel">
+          <Select value={c.channel} onChange={(e) => onChange({ ...c, channel: e.target.value as "email" | "sms" | "push" })} className={small} aria-label="Channel">
             <option value="email">email</option>
             <option value="sms">SMS</option>
+            <option value="push">push</option>
           </Select>
-          <Hint>right now (address, consent and no suppression)</Hint>
+          <Hint>{c.channel === "push" ? "right now (a device that allowed notifications, push not turned off)" : "right now (address, consent and no suppression)"}</Hint>
         </>
       );
     case "suppressed":
@@ -387,6 +398,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
           <Hint>(hard bounce or spam complaint)</Hint>
         </>
       );
+    case "language":
+      return <LanguageConditionFields condition={c} onChange={onChange} />;
     case "prediction":
       return <PredictionFields condition={c} onChange={onChange} />;
     case "random":
@@ -773,7 +786,7 @@ export function FilterFields({ filter, onChange, fieldPlaceholder, fieldList }: 
         ))}
       </Select>
       <ValueInput filter={filter} onChange={(value) => onChange({ ...filter, value })} />
-      {filter.op === "within_last_days" || filter.op === "more_than_days_ago" || filter.op === "anniversary_within_days" ? <Hint>days</Hint> : null}
+      {dayOps.has(filter.op) ? <Hint>days</Hint> : null}
     </>
   );
 }

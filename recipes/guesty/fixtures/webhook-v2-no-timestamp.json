@@ -1,0 +1,49 @@
+{
+  "description": "A v2 webhook with no publishedAt (no Guesty time): it can't be put in order, so it writes no events; the next pull records the change",
+  "expect": [
+    {
+      "message": "reservation 69c0d1e2f3: the message has no Guesty time, so it can't be ordered; the next pull records it",
+      "type": "log"
+    },
+    {
+      "message": "a change without a Guesty time isn't recorded as Reservation Updated",
+      "type": "log"
+    },
+    {
+      "message": "reservation.updated.v2 ALTERATION for 69c0d1e2f3 (guest 69guest); retried until the guest is known",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "accountId": "5f1a",
+        "checkIn": "2026-12-03T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-03",
+        "checkOut": "2026-12-06T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-06",
+        "confirmationCode": "GY-zz",
+        "confirmedAt": "2026-11-17T17:59:30.000Z",
+        "createdAt": "2026-11-17T17:59:00.000Z",
+        "event": "reservation.updated.v2",
+        "guestId": "69guest",
+        "guestsCount": 2,
+        "platform": "direct",
+        "reservationId": "69c0d1e2f3",
+        "source": "manual",
+        "status": "confirmed",
+        "unitId": "66054019764cbb000f37c450"
+      },
+      "event": "reservation.updated.v2",
+      "meta": {
+        "changedFields": [
+          "checkIn",
+          "checkOut"
+        ],
+        "eventId": "e8",
+        "subType": "ALTERATION"
+      }
+    },
+    "source": "webhook"
+  }
+}

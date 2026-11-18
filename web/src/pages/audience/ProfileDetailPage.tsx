@@ -3,10 +3,11 @@ import { Link, useNavigate, useParams } from "react-router";
 import { Activity, ListChecks, Mail, MessageSquare, MousePointerClick, MailOpen, Pencil, PieChart, Plus, Trash2, X } from "lucide-react";
 import type { Consent, Profile, ProfileDetail } from "../../api";
 import { useDeleteProfile, useProfile, useSession, useUpdateProfile } from "../../api";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Notice, Page, PageHeader, Select, Skeleton, StatusBadge } from "../../components/ui";
 import { formatDateTime, formatPhone, formatRelative, fullName } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { ConsentTimeline, ProfileSidePanels } from "../../features/people/ProfilePanels";
+import { ProfileObjects } from "../../features/objects/ProfileObjects";
 
 export function ProfileDetailPage() {
   const { id = "" } = useParams();
@@ -33,6 +34,13 @@ export function ProfileDetailPage() {
   }
   return <ProfileView key={detail.data.profile.id} detail={detail.data} />;
 }
+
+const suppressionReasons: Record<string, string> = {
+  hard_bounce: "Email to this address bounced, so DumbMail won't send to it again.",
+  complaint: "This person marked an email as spam, so DumbMail won't email them again.",
+  booking_relay: "This is a booking-site relay address (Airbnb, Booking.com, Vrbo and the like). Those sites forbid marketing to it, so it never gets marketing email.",
+  no_marketing: "An integration marked this address as not for marketing, so it never gets marketing email.",
+};
 
 function ProfileView({ detail }: { detail: ProfileDetail }) {
   const { account } = useSession();
@@ -81,6 +89,36 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
           </>
         }
       />
+      {detail.email_suppressed_reason ? (
+        <div className="mb-4">
+          <Notice tone="amber" icon={<Mail />} title="No marketing email">
+            {suppressionReasons[detail.email_suppressed_reason] ?? `Email is suppressed (${detail.email_suppressed_reason}).`}
+          </Notice>
+        </div>
+      ) : null}
+      {detail.marketing_hold && !detail.email_suppressed_reason ? (
+        <div className="mb-4">
+          <Notice tone="gray" icon={<Mail />} title="Hasn't agreed to marketing">
+            {detail.source?.kind === "integration" && detail.source.name ? `Added by ${detail.source.name}. ` : ""}
+            Campaigns skip this person; only flows marked as service messages reach them. Signing up through a form clears this.
+          </Notice>
+        </div>
+      ) : null}
+      {detail.source?.kind === "integration" ? (
+        <p className="-mt-2 mb-4 text-xs text-zinc-500">
+          {detail.source.id && detail.source.name ? (
+            <>
+              Created by the{" "}
+              <Link to={`/integrations/${detail.source.id}`} className="font-medium text-accent-700 hover:underline">
+                {detail.source.name}
+              </Link>{" "}
+              integration.
+            </>
+          ) : (
+            "Created by an integration that has since been deleted."
+          )}
+        </p>
+      ) : null}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[360px_minmax(0,1fr)]">
         <div className="space-y-4">
           {editing ? <ProfileEditForm profile={profile} onDone={() => setEditing(false)} /> : <PropertiesCard profile={profile} tz={tz} />}
@@ -107,6 +145,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
             )}
           </Card>
           <ProfileSidePanels profileId={profile.id} email={profile.email} phone={profile.phone_number} tz={tz} />
+          <ProfileObjects profileId={profile.id} />
         </div>
         <div className="space-y-4">
           <ConsentTimeline profileId={profile.id} tz={tz} />
@@ -154,6 +193,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
                         <span className="block text-xs text-zinc-500">
                           {m.campaign_id ? "Campaign" : m.flow_id ? "Flow" : "Message"} · {formatDateTime(m.sent_at, tz)}
                         </span>
+                        {m.note ? <span className="mt-0.5 block text-xs text-amber-700">{m.note}</span> : null}
                       </span>
                       <span className="flex items-center gap-1.5">
                         {m.opened_at ? <MailOpen className="size-3.5 text-accent-600" aria-label="Opened" /> : null}
@@ -214,6 +254,7 @@ function PropertiesCard({ profile, tz }: { profile: Profile; tz: string }) {
     ["Email", profile.email],
     ["Phone", profile.phone_number ? formatPhone(profile.phone_number) : null],
     ["External ID", profile.external_id],
+    ["Language", profile.locale ?? null],
     ["Created", formatDateTime(profile.created_at, tz)],
     ["Last active", profile.last_event_at ? formatDateTime(profile.last_event_at, tz) : null],
   ];
@@ -268,6 +309,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
     email: profile.email ?? "",
     phone_number: profile.phone_number ?? "",
     external_id: profile.external_id ?? "",
+    locale: profile.locale ?? "",
     email_consent: profile.email_consent,
     sms_consent: profile.sms_consent,
   });
@@ -284,6 +326,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
         email: nullable(fields.email),
         phone_number: nullable(fields.phone_number),
         external_id: nullable(fields.external_id),
+        locale: nullable(fields.locale),
         email_consent: fields.email_consent,
         sms_consent: fields.sms_consent,
         properties,
@@ -297,7 +340,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
     );
   };
 
-  const text = (key: "first_name" | "last_name" | "email" | "phone_number" | "external_id", label: string) => (
+  const text = (key: "first_name" | "last_name" | "email" | "phone_number" | "external_id" | "locale", label: string) => (
     <Field label={label}>
       <Input value={fields[key]} onChange={(e) => setFields({ ...fields, [key]: e.target.value })} />
     </Field>
@@ -313,6 +356,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
         {text("email", "Email")}
         {text("phone_number", "Phone")}
         {text("external_id", "External ID")}
+        {text("locale", "Language (like fr or pt-BR)")}
         <div className="grid grid-cols-2 gap-3">
           <Field label="Email consent">
             <Select value={fields.email_consent} onChange={(e) => setFields({ ...fields, email_consent: e.target.value as Consent })}>

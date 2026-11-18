@@ -31,6 +31,8 @@ pub struct Prices {
     pub sms_segment: i64,
     pub mms: i64,
     pub number_monthly: i64,
+    /// Per push notification (one person, all their devices); 0 unless PRICE_PUSH is set.
+    pub push: i64,
 }
 
 pub fn prices(state: &AppState) -> Prices {
@@ -40,11 +42,12 @@ pub fn prices(state: &AppState) -> Prices {
         sms_segment: to_micros(c.price_sms_segment),
         mms: to_micros(c.price_mms),
         number_monthly: to_micros(c.price_number_monthly),
+        push: to_micros(c.price_push.max(0.0)),
     }
 }
 
 /// Calendar month key ("2026-11") in the account's time zone.
-async fn month_key(db: &PgPool, account_id: Uuid) -> AppResult<String> {
+async fn month_key<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid) -> AppResult<String> {
     let tz: String = sqlx::query_scalar("SELECT timezone FROM accounts WHERE id = $1").bind(account_id).fetch_one(db).await?;
     let tz: chrono_tz::Tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
     let now = Utc::now().with_timezone(&tz);
@@ -84,6 +87,7 @@ pub async fn quote(state: &AppState, account_id: Uuid, channel: &str, segments: 
                 p.email
             }
         }
+        "push" => p.push,
         _ if own_provider => 0,
         _ if mms => p.mms,
         _ => p.sms_segment * segments.max(1),
@@ -115,6 +119,8 @@ pub async fn check_campaign(state: &AppState, account_id: Uuid, channel: &str, r
     let cost = if channel == "email" {
         let covered = free_emails_remaining(state, account_id).await? + crate::subscription::emails_remaining(&state.db, account_id).await?;
         (recipients - covered).max(0) * p.email
+    } else if channel == "push" {
+        recipients * p.push
     } else if !sms_billed(state, account_id).await? {
         0
     } else if mms {
@@ -147,6 +153,11 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
         // Free allowance first, then the monthly plan, then prepaid credit.
         let covered = used as i64 <= state.cfg.free_emails_per_month || crate::subscription::use_email(&state.db, account_id).await?;
         ("email", 1i64, if covered { 0 } else { p.email })
+    } else if channel == "push" {
+        if p.push <= 0 {
+            return Ok(0);
+        }
+        ("push", 1, p.push)
     } else if own_provider {
         return Ok(0);
     } else if mms {
@@ -158,15 +169,44 @@ pub async fn charge_message(state: &AppState, account_id: Uuid, channel: &str, s
     Ok(amount)
 }
 
+/// [`charge_message`] for one email, inside the caller's transaction, so the caller can record the
+/// charge with its own row and charge it once (transactional email does).
+pub async fn charge_email_tx(state: &AppState, tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<i64> {
+    if !state.cfg.hosted {
+        return Ok(0);
+    }
+    let month = month_key(&mut *tx, account_id).await?;
+    let used: i32 = sqlx::query_scalar(
+        "UPDATE accounts SET free_emails_used = CASE WHEN free_month = $2 THEN free_emails_used + 1 ELSE 1 END, free_month = $2
+         WHERE id = $1 RETURNING free_emails_used",
+    )
+    .bind(account_id)
+    .bind(&month)
+    .fetch_one(&mut *tx)
+    .await?;
+    let covered = used as i64 <= state.cfg.free_emails_per_month || crate::subscription::use_email(&mut *tx, account_id).await?;
+    let amount = if covered { 0 } else { prices(state).email };
+    debit_usage_tx(tx, account_id, "email", 1, amount).await?;
+    Ok(amount)
+}
+
 /// Debit the balance and roll the charge into today's usage row for this kind.
 pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, amount: i64) -> AppResult<()> {
+    let mut tx = db.begin().await?;
+    debit_usage_tx(&mut tx, account_id, kind, qty, amount).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`debit_usage`] inside the caller's transaction.
+pub async fn debit_usage_tx(tx: &mut sqlx::PgConnection, account_id: Uuid, kind: &str, qty: i64, amount: i64) -> AppResult<()> {
     let label = match kind {
         "email" => "Emails sent",
         "sms" => "SMS segments sent",
         "mms" => "MMS sent",
+        "push" => "Push notifications sent",
         _ => "Usage",
     };
-    let mut tx = db.begin().await?;
     sqlx::query("UPDATE accounts SET balance_micros = balance_micros - $2 WHERE id = $1").bind(account_id).bind(amount).execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO ledger (id, account_id, kind, day, quantity, amount_micros, description)
@@ -182,7 +222,6 @@ pub async fn debit_usage(db: &PgPool, account_id: Uuid, kind: &str, qty: i64, am
     .bind(label)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -528,7 +567,7 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
     }
     let due: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
         "SELECT id, stripe_customer_id, stripe_payment_method_id, auto_recharge_amount_micros FROM accounts
-         WHERE auto_recharge_enabled AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
+         WHERE auto_recharge_enabled AND closed_at IS NULL AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
            AND balance_micros < auto_recharge_threshold_micros
            AND (auto_recharge_failed_at IS NULL OR auto_recharge_failed_at < now() - interval '1 day')
          LIMIT 50",
@@ -584,7 +623,7 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
         // period are skipped so they can't crowd newly due numbers out of the batch.
         "SELECT p.id, p.account_id, p.phone_number, p.monthly_price_micros, p.past_due_since, p.next_charge_at
          FROM phone_numbers p JOIN accounts a ON a.id = p.account_id
-         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now()
+         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now() AND a.closed_at IS NULL
            AND (p.past_due_since IS NULL
                 OR a.balance_micros >= p.monthly_price_micros
                 OR (p.past_due_since <= now() - make_interval(days => $1)
@@ -596,13 +635,21 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
     .await?;
     for (id, account_id, number, price, past_due_since, due_at) in due {
         if !state.cfg.hosted || balance(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? >= price {
+            // Under the account's row lock, taken before charging: an account closed a moment ago
+            // pays nothing (closing holds the same row).
+            let mut tx = state.db.begin().await?;
+            let closed: Option<bool> = sqlx::query_scalar("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_optional(&mut *tx).await?;
+            if closed != Some(false) {
+                continue;
+            }
             if state.cfg.hosted {
                 // Keyed by the billing period (not today's date), so a late payment can't make the
                 // next period's charge look like a duplicate.
                 let reference = format!("{id}:{}", due_at.format("%Y-%m-%d"));
-                post_entry(&state.db, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                post_entry_tx(&mut tx, account_id, "number", -price, &format!("Phone number {number} (monthly)"), &reference).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
             }
-            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&state.db).await?;
+            sqlx::query("UPDATE phone_numbers SET next_charge_at = next_charge_at + interval '1 month', past_due_since = NULL WHERE id = $1").bind(id).execute(&mut *tx).await?;
+            tx.commit().await?;
             continue;
         }
         match past_due_since {

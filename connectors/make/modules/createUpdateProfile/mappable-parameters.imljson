@@ -1,0 +1,27 @@
+[
+	{ "name": "email", "type": "email", "label": "Email", "help": "Give an email, phone number or external ID. A profile with the same one is updated." },
+	{ "name": "phone_number", "type": "text", "label": "Phone number", "help": "International format, e.g. +15035550100." },
+	{ "name": "external_id", "type": "text", "label": "External ID", "help": "Your own id for this person, e.g. a customer id." },
+	{ "name": "first_name", "type": "text", "label": "First name" },
+	{ "name": "last_name", "type": "text", "label": "Last name" },
+	{
+		"name": "properties",
+		"type": "array",
+		"label": "Custom properties",
+		"spec": [
+			{ "name": "key", "type": "text", "label": "Name", "required": true },
+			{ "name": "value", "type": "text", "label": "Value" }
+		]
+	},
+	{
+		"name": "email_consent",
+		"type": "select",
+		"label": "Email consent",
+		"help": "Only choose Subscribed if this person agreed to get marketing email from you.",
+		"options": [
+			{ "label": "Subscribed", "value": "subscribed" },
+			{ "label": "Unsubscribed", "value": "unsubscribed" }
+		]
+	},
+	{ "name": "list_ids", "type": "select", "label": "Add to lists", "multiple": true, "options": "rpc://listLists" }
+]

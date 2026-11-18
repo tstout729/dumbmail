@@ -391,8 +391,8 @@ async fn security_guards() {
     let (s, _) = h.req("POST", &format!("/api/campaigns/{}/test", c["id"].as_str().unwrap()), Some(json!({"to": ["nope@x.test"]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // API keys can't mint more keys; revoked keys stop working.
-    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await;
+    // Only keys with the account scope can mint more keys (tests/team.rs covers scopes); revoked keys stop working.
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k", "scopes": ["audience", "messaging"]}))).await;
     let k = key["key"].as_str().unwrap();
     let (s, _, _) = h.raw("POST", "/api/api-keys", &[("authorization", &format!("Bearer {k}")), ("content-type", "application/json")], "{}").await;
     assert_eq!(s, StatusCode::FORBIDDEN);
@@ -634,7 +634,7 @@ async fn billing_numbers_onsite_and_domains() {
 
 #[tokio::test]
 async fn brand_import_and_google_sign_in() {
-    use dumbmail::api::google::{google_user, GoogleClaims};
+    use dumbmail::api::google::{google_user, GoogleClaims, GoogleUser};
     let mut h = harness!();
     h.signup().await;
     let old_cookie = h.cookie.clone();
@@ -672,30 +672,35 @@ async fn brand_import_and_google_sign_in() {
     let (_, hdrs, _) = h.raw("GET", "/api/auth/google/callback?error=access_denied&state=x", &[], "").await;
     assert_eq!(hdrs.get(header::LOCATION).unwrap().to_str().unwrap(), "/login?error=cancelled");
 
-    // Google with the same email joins the existing account, turns its password off and ends old sessions.
-    let claims = |sub: &str, email: &str, given: Option<&str>| GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from) };
+    // Google with the same email matches an existing login only for an address Google is the
+    // authority for (a Workspace `hd` here), and never changes it on the spot: an unconfirmed login
+    // goes to the choice page, a confirmed one is linked once its sign-in is complete (see
+    // tests/login_link.rs). Without `hd` the login's password is the way in.
+    let claims = |sub: &str, email: &str, given: Option<&str>| {
+        let domain = email.rsplit('@').next().unwrap();
+        let hd = (domain != "gmail.com").then(|| domain.to_string());
+        GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from), hd }
+    };
     let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
-    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "planted"}))).await;
-    let key = key["key"].as_str().unwrap().to_string();
-    let (uid, acct, created) = google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap();
-    assert_eq!((acct, created), (account_id, false));
-    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), (uid, account_id, false));
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = 'owner@acme.test'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap(), GoogleUser::Unconfirmed(uid));
+    let mut no_hd = claims("g-owner", "owner@acme.test", None);
+    no_hd.hd = None;
+    assert_eq!(google_user(&h.state, &no_hd).await.unwrap(), GoogleUser::UsePassword);
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE id = $1").bind(uid).execute(&h.state.db).await.unwrap();
+    assert!(matches!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), GoogleUser::Link { user_id, account_id: a, .. } if user_id == uid && a == account_id));
+    let linked: Option<String> = sqlx::query_scalar("SELECT google_sub FROM users WHERE id = $1").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, None, "nothing is linked until the sign-in completes");
     h.cookie = old_cookie;
     let (s, _) = h.req("GET", "/api/me", None).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "old sessions end when Google is linked");
-    let (s, v) = h.req("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v.to_string().contains("Google"), "{v}");
-    assert!(google_user(&h.state, &claims("g-intruder", "owner@acme.test", None)).await.is_err(), "a second Google account can't take over the email");
-    let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {key}"))], "").await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "API keys made before Google proved the email are revoked");
+    assert_eq!(s, StatusCode::OK, "nothing about the login changed");
 
     // New people get a new account: named after them on free mail, after their domain on a work address.
-    let (_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap();
+    let GoogleUser::SignedIn(_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap() else { panic!("new Google user") };
     assert!(created);
     let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(ann_acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((name.as_str(), website), ("Ann's brand", None));
-    let (_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap();
+    let GoogleUser::SignedIn(_, bob_acct, _) = google_user(&h.state, &claims("g-bob", "bob@stayportland.com", Some("Bob"))).await.unwrap() else { panic!("new Google user") };
     let (name, website): (String, Option<String>) = sqlx::query_as("SELECT name, website FROM accounts WHERE id = $1").bind(bob_acct).fetch_one(&h.state.db).await.unwrap();
     assert_eq!((name.as_str(), website.as_deref()), ("stayportland.com", Some("https://stayportland.com")));
     h.cleanup().await;
@@ -845,16 +850,21 @@ async fn site_host_and_app_host_split() {
     assert_eq!(headers["location"], "https://app.pl.test/login?error=expired");
 
     // Session cookies cover both hosts, and logging out clears that same cookie.
-    let (s, headers, _) = h
+    let (s, headers, body) = h
         .raw("POST", "/api/auth/signup", &[("host", "app.pl.test"), ("content-type", "application/json")], r#"{"email":"split@acme.test","password":"correct horse","company":"Split"}"#)
         .await;
     assert_eq!(s, StatusCode::OK);
+    let account = serde_json::from_str::<Value>(&body).unwrap()["account"]["id"].as_str().unwrap().to_string();
     let set = headers[header::SET_COOKIE].to_str().unwrap().to_string();
     assert!(set.starts_with("pl_session=") && set.contains("Domain=pl.test"), "{set}");
     let session = set.split(';').next().unwrap().to_string();
     let (s, _, _) = h.raw("GET", "/api/me", &[("host", "pl.test"), ("cookie", &session)], "").await;
     assert_eq!(s, StatusCode::OK, "the session works on the site host's API too");
-    let (s, headers, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session)], "").await;
+    // Signing out is a write with the session cookie: the dashboard sends it from the app host,
+    // naming its account. From the marketing site it's refused.
+    let (s, _, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session), ("origin", "https://pl.test"), ("x-dumbmail-account", &account)], "").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, headers, _) = h.raw("POST", "/api/auth/logout", &[("host", "app.pl.test"), ("cookie", &session), ("origin", "https://app.pl.test"), ("x-dumbmail-account", &account)], "").await;
     assert_eq!(s, StatusCode::OK);
     let cleared = headers[header::SET_COOKIE].to_str().unwrap();
     assert!(cleared.starts_with("pl_session=;") && cleared.contains("Domain=pl.test") && cleared.contains("Max-Age=0"), "{cleared}");

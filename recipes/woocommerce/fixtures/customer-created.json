@@ -1,0 +1,64 @@
+{
+  "description": "customer.created (documented customer object, fake person): a held profile keyed by the WooCommerce customer id",
+  "doc": "https://woocommerce.github.io/woocommerce-rest-api-docs/#retrieve-an-order (example response, personal data replaced)",
+  "expect": [
+    {
+      "email": "morgan.example@example.com",
+      "first_name": "Morgan",
+      "keys": {
+        "woocommerce_customer": "25"
+      },
+      "last_name": "Example",
+      "phone_number": "+14155550177",
+      "type": "upsert_profile"
+    }
+  ],
+  "input": {
+    "headers": {
+      "x-wc-webhook-event": "created",
+      "x-wc-webhook-id": "142",
+      "x-wc-webhook-resource": "customer",
+      "x-wc-webhook-source": "https://shop.example.com/",
+      "x-wc-webhook-topic": "customer.created"
+    },
+    "payload": {
+      "avatar_url": "https://secure.gravatar.com/avatar/00000000000000000000000000000000?s=96",
+      "billing": {
+        "address_1": "2 Test Street",
+        "address_2": "",
+        "city": "San Francisco",
+        "company": "",
+        "country": "US",
+        "email": "morgan.example@example.com",
+        "first_name": "Morgan",
+        "last_name": "Example",
+        "phone": "(415) 555-0177",
+        "postcode": "94103",
+        "state": "CA"
+      },
+      "date_created": "2017-03-21T16:09:28",
+      "date_created_gmt": "2017-03-21T19:09:28",
+      "date_modified": "2017-03-21T16:09:30",
+      "date_modified_gmt": "2017-03-21T19:09:30",
+      "email": "morgan.example@example.com",
+      "first_name": "Morgan",
+      "id": 25,
+      "is_paying_customer": false,
+      "last_name": "Example",
+      "meta_data": [],
+      "role": "customer",
+      "shipping": {
+        "address_1": "2 Test Street",
+        "address_2": "",
+        "city": "San Francisco",
+        "company": "",
+        "country": "US",
+        "first_name": "Morgan",
+        "last_name": "Example",
+        "postcode": "94103",
+        "state": "CA"
+      },
+      "username": "morgan.example"
+    }
+  }
+}

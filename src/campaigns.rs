@@ -91,7 +91,7 @@ pub fn parse_ab_test(channel: &str, v: &Value) -> AppResult<AbTest> {
     }
     match (t.metric.as_str(), channel) {
         ("open_rate", "email") | ("click_rate", _) | ("revenue", _) => {}
-        ("open_rate", _) => return Err(AppError::bad("SMS has no opens; pick the winner by click_rate or revenue")),
+        ("open_rate", _) => return Err(AppError::bad("only email has opens; pick the winner by click_rate or revenue")),
         _ => return Err(AppError::bad("metric must be open_rate, click_rate or revenue")),
     }
     if !matches!(t.pick.as_str(), "auto" | "manual") {
@@ -116,6 +116,8 @@ pub fn version_content<'a>(c: &'a CampaignRow, ab: Option<&'a AbTest>, version: 
 enum Resolved {
     List(Uuid),
     Segment(Definition),
+    /// A resend's own recipients (see `features::campaigns_plus::resend`).
+    Resend(crate::features::campaigns_plus::resend::ResendAudience),
 }
 
 async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResult<Vec<Resolved>> {
@@ -135,6 +137,7 @@ async fn resolve(db: &PgPool, account_id: Uuid, refs: &[AudienceRef]) -> AppResu
                 let def = def.ok_or_else(|| AppError::not_found("segment"))?;
                 out.push(Resolved::Segment(segments::load(db, account_id, &def, Some(r.id)).await?));
             }
+            "resend" => out.push(Resolved::Resend(crate::features::campaigns_plus::resend::resolve(db, account_id, r.id).await?)),
             other => return Err(AppError::bad(format!("audience type must be list or segment, got {other:?}"))),
         }
     }
@@ -152,17 +155,59 @@ fn push_any(qb: &mut QueryBuilder<'_, Postgres>, items: &[Resolved]) {
                 qb.push("EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = ").push_bind(*id).push(" AND lm.profile_id = p.id)");
             }
             Resolved::Segment(def) => segments::push_definition(qb, def),
+            Resolved::Resend(r) => r.push(qb),
         }
     }
     qb.push(")");
 }
 
 pub fn push_eligible(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
-    if channel == "sms" {
+    if channel == "push" {
+        qb.push(" AND ").push(crate::features::push::send::REACHABLE_SQL);
+    } else if channel == "sms" {
         qb.push(" AND p.phone_number IS NOT NULL AND p.sms_consent = 'subscribed' AND p.sms_suppressed_reason IS NULL");
     } else {
         qb.push(" AND p.email IS NOT NULL AND p.email_consent NOT IN ('unsubscribed', 'pending') AND p.email_suppressed_reason IS NULL");
     }
+    crate::marketing_hold::push_campaign_filter(qb, channel);
+}
+
+/// [`push_eligible`], counting for a push campaign only devices on the platforms it targets.
+fn push_eligible_targeted(qb: &mut QueryBuilder<'_, Postgres>, channel: &str, push_platforms: Option<&[String]>) {
+    match (channel, push_platforms) {
+        ("push", Some(p)) => {
+            qb.push(" AND ");
+            crate::features::push::send::push_reachable(qb, Some(p));
+            crate::marketing_hold::push_campaign_filter(qb, channel);
+        }
+        _ => push_eligible(qb, channel),
+    }
+}
+
+/// The platforms a push campaign targets across its versions (None for other channels, or all).
+pub fn push_platforms(channel: &str, content: &Value, ab_test: Option<&Value>) -> Option<Vec<String>> {
+    if channel != "push" {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let versions = std::iter::once(content).chain(ab_test.and_then(|t| t.get("variants")).and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.get("content")));
+    for c in versions {
+        let p = crate::features::push::content::parse(c).map(|c| c.platforms()).unwrap_or_default();
+        for k in p {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// [`estimate`] for a push campaign's targeted platforms.
+pub async fn estimate_targeted(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience, push_platforms: Option<Vec<String>>) -> AppResult<i64> {
+    let mut qb = QueryBuilder::new("SELECT count(*)");
+    let r = resolve_audience(db, account_id, channel, audience).await?.with_push_platforms(push_platforms);
+    push_audience(&mut qb, account_id, channel, &r);
+    Ok(qb.build_query_scalar().fetch_one(db).await?)
 }
 
 pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<i64> {
@@ -172,26 +217,52 @@ pub async fn estimate(db: &PgPool, account_id: Uuid, channel: &str, audience: &A
 }
 
 /// Appends `FROM profiles p WHERE ...` selecting a campaign's reachable recipients.
-async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+pub async fn append_audience(qb: &mut QueryBuilder<'_, Postgres>, db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<()> {
+    let r = resolve_audience(db, account_id, channel, audience).await?;
+    push_audience(qb, account_id, channel, &r);
+    Ok(())
+}
+
+/// A campaign audience with its lists checked and segments loaded, ready to put into SQL with
+/// [`push_audience`] without another database round trip.
+pub struct ResolvedAudience {
+    include: Vec<Resolved>,
+    exclude: Vec<Resolved>,
+    sunset: bool,
+    /// A push campaign's targeted platforms (see [`push_platforms`]); None counts every platform.
+    push_platforms: Option<Vec<String>>,
+}
+
+impl ResolvedAudience {
+    pub fn with_push_platforms(mut self, p: Option<Vec<String>>) -> Self {
+        self.push_platforms = p;
+        self
+    }
+}
+
+pub async fn resolve_audience(db: &PgPool, account_id: Uuid, channel: &str, audience: &Audience) -> AppResult<ResolvedAudience> {
     if audience.include.is_empty() {
         return Err(AppError::bad("choose at least one list or segment to send to"));
     }
-    let inc = resolve(db, account_id, &audience.include).await?;
-    let exc = resolve(db, account_id, &audience.exclude).await?;
+    let include = resolve(db, account_id, &audience.include).await?;
+    let exclude = resolve(db, account_id, &audience.exclude).await?;
+    let sunset = channel == "email"
+        && sqlx::query_scalar::<_, bool>("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
+    Ok(ResolvedAudience { include, exclude, sunset, push_platforms: None })
+}
+
+/// Appends `FROM profiles p WHERE ...` for a resolved audience (see [`append_audience`]).
+pub fn push_audience(qb: &mut QueryBuilder<'_, Postgres>, account_id: Uuid, channel: &str, r: &ResolvedAudience) {
     qb.push(" FROM profiles p WHERE p.account_id = ").push_bind(account_id).push(" AND ");
-    push_any(qb, &inc);
-    if !exc.is_empty() {
+    push_any(qb, &r.include);
+    if !r.exclude.is_empty() {
         qb.push(" AND NOT ");
-        push_any(qb, &exc);
+        push_any(qb, &r.exclude);
     }
-    push_eligible(qb, channel);
-    if channel == "email" {
-        let sunset: bool = sqlx::query_scalar("SELECT email_sunset_enabled FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(true);
-        if sunset {
-            crate::deliverability::push_not_unengaged(qb);
-        }
+    push_eligible_targeted(qb, channel, r.push_platforms.as_deref());
+    if r.sunset {
+        crate::deliverability::push_not_unengaged(qb);
     }
-    Ok(())
 }
 
 pub async fn load(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<CampaignRow> {
@@ -222,7 +293,9 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
     if aud.include.is_empty() {
         problems.push("Pick at least one list or segment".to_string());
     }
+    problems.extend(crate::features::campaigns_plus::resend::audience_problems(c, &aud));
     problems.extend(content_problems(account, &c.channel, &c.content, verify_domain));
+    problems.extend(crate::import_review::campaign_problem(c));
     if let Some(v) = c.ab_test.as_ref().filter(|v| !v.is_null()) {
         match parse_ab_test(&c.channel, v) {
             Ok(t) => {
@@ -241,6 +314,8 @@ pub fn readiness(account: &Account, c: &CampaignRow, verify_domain: bool) -> Vec
         if account.address.as_deref().unwrap_or("").trim().is_empty() {
             problems.push("Add your mailing address in Settings (required by CAN-SPAM)".into());
         }
+    } else if c.channel == "push" {
+        // Push setup is checked when it launches (`features::push::setup_problems`).
     } else if account.sms_from.is_none() {
         problems.push("Set an SMS sending number in Settings → SMS".into());
     }
@@ -269,6 +344,8 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
                 problems.push(e);
             }
         }
+    } else if channel == "push" {
+        problems.extend(crate::features::push::content::problems(content));
     } else if content.get("body").and_then(|s| s.as_str()).unwrap_or("").trim().is_empty() {
         problems.push("Write the SMS message".into());
     }
@@ -279,11 +356,60 @@ fn content_problems(account: &Account, channel: &str, content: &Value, verify_do
 /// With an A/B test and no winner yet, only the test slice gets rows (each with its version);
 /// once a winner is picked this runs again and adds everyone else.
 pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result<()> {
+    let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
+    // Look up the audience's lists and segments first: everything below runs on the one connection
+    // that holds the campaign lock, so busy workers can't each hold a lock while waiting for another.
+    // With whether it's a resend and whether link tags need working out (see `features::campaigns_plus`),
+    // and (push) the content's targeted platforms.
+    let pre: Option<(Value, String, Uuid, String, bool, bool, Value, Option<Value>)> =
+        sqlx::query_as(&format!("SELECT audience, status, account_id, channel, {}, content, ab_test FROM campaigns c WHERE id = $1", crate::features::campaigns_plus::PREPARE_COLUMNS))
+            .bind(campaign_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((pre_audience, pre_status, account_id, channel, is_resend, link_tags, pre_content, pre_ab)) = pre else { return Ok(()) };
+    if pre_status != "sending" {
+        return Ok(());
+    }
+    let audience: Audience = serde_json::from_value(pre_audience.clone())?;
+    // A resend always goes to its own audience, whatever the editable one says.
+    let audience = crate::features::campaigns_plus::resend::send_audience(campaign_id, is_resend, audience);
+    // Only needed when this run adds recipients; a retry of a fixed audience mustn't fail on a list deleted since.
+    let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await.map(|r| r.with_push_platforms(push_platforms(&channel, &pre_content, pre_ab.as_ref())));
+
     // Lock the campaign while creating recipients, so two send jobs can't both draw a (random) test slice.
     let mut tx = state.db.begin().await?;
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1 FOR UPDATE").bind(campaign_id).fetch_one(&mut *tx).await?;
     if c.status != "sending" {
         return Ok(());
+    }
+    if c.audience != pre_audience || c.channel != channel {
+        anyhow::bail!("the campaign changed while its send was being prepared; retrying");
+    }
+    // Imported content still waiting for review never goes out (this also covers an A/B winner send).
+    if let Some(why) = crate::import_review::campaign_problem(&c) {
+        tx.commit().await?;
+        crate::deliverability::stop_campaign(&state.db, c.id, &format!("Not sent: {why}.")).await?;
+        return Ok(());
+    }
+    // Copy in the saved blocks it uses, in the same transaction that fixes the audience, so every
+    // recipient (also those held for their local or best time) gets this copy and editing a saved
+    // block later doesn't change what this campaign sends. A copy that can't be sent fails the
+    // campaign here, before anyone gets it.
+    if let Some(problem) = crate::features::content::prepare::freeze_campaign(state, &mut tx, &c).await? {
+        sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    // A resend's limits (original fully sent, 30-day window, two per original) are checked again here,
+    // and its slot is kept from now on.
+    if let Some(problem) = crate::features::campaigns_plus::resend::check_at_send(&mut tx, &c, is_resend).await? {
+        sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    // Link tags (UTM) are worked out once here, onto the content every recipient gets.
+    if link_tags {
+        crate::features::campaigns_plus::utm::freeze_campaign(&mut tx, c.id).await?;
     }
     if c.channel == "email" {
         if let Some(reason) = crate::deliverability::paused_reason(&mut *tx, c.account_id).await? {
@@ -292,74 +418,132 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
             return Ok(());
         }
     }
-    let audience: Audience = serde_json::from_value(c.audience.clone())?;
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+    let addr = recipient_column(&c.channel);
     let ab = ab_test(&c);
     let started: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)").bind(c.id).fetch_one(&mut *tx).await?;
-    let to_anyhow = |e: AppError| anyhow::anyhow!(e.public_message());
+    // Set once everyone who gets the campaign has a row (or a holdout row): a retried send job then adds
+    // nobody who joined the audience since.
+    let fixed: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut *tx).await?;
+    let mut fix = false;
     match (&ab, &c.ab_winner) {
         (Some(t), None) if !started => {
-            // Test slice: a random sample, dealt round-robin across the versions.
+            // One statement, so one consistent read: the audience, the test slice (a random sample dealt
+            // round-robin across the versions) and everyone else, who get the winner later even if they
+            // leave the list meanwhile.
+            let resolved = resolved.map_err(to_anyhow)?;
             let versions = t.versions();
             let n = versions.len() as i64;
-            let total = estimate(&state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
-            let size = if t.test_percent >= 100 { total } else { ((total * t.test_percent + 99) / 100).max(n).min(total) };
-            let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, variant) SELECT gen_random_uuid(), x.account_id, x.id, ");
-            qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", x.addr, (").push_bind(versions).push("::text[])[1 + ((row_number() OVER () - 1) % ").push_bind(n).push(")::int] FROM (SELECT p.account_id, p.id, ");
+            let mut qb = QueryBuilder::new("WITH aud AS (SELECT p.account_id, p.id, ");
             qb.push(addr).push(" AS addr");
-            append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await.map_err(to_anyhow)?;
-            qb.push(" ORDER BY random() LIMIT ").push_bind(size).push(") x");
-            qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
+            push_audience(&mut qb, c.account_id, &c.channel, &resolved);
+            qb.push("), ranked AS (SELECT a.*, row_number() OVER (ORDER BY random()) AS rn, count(*) OVER () AS total FROM aud a),
+                     sized AS (SELECT r.*, CASE WHEN ").push_bind(t.test_percent).push(" >= 100 THEN r.total ELSE LEAST(GREATEST((r.total * ").push_bind(t.test_percent).push(" + 99) / 100, ").push_bind(n).push("), r.total) END AS size FROM ranked r),
+                     ins AS (INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address, variant)
+                             SELECT gen_random_uuid(), x.account_id, x.id, ");
+            qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", x.addr, (").push_bind(versions).push("::text[])[1 + ((x.rn - 1) % ").push_bind(n).push(")::int]
+                             FROM sized x WHERE x.rn <= x.size
+                             ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING)
+                 INSERT INTO campaign_holdouts (campaign_id, profile_id) SELECT ");
+            qb.push_bind(c.id).push(", x.id FROM sized x WHERE x.rn > x.size ON CONFLICT DO NOTHING");
             qb.build().execute(&mut *tx).await?;
+            fix = true;
         }
         // The test slice was already created (this job is a retry): just send what's queued.
         (Some(_), None) => {}
-        // Everyone (no test), or everyone left after the test (a retry; pick_winner normally adds them).
-        _ => insert_rest(&mut tx, state, &c).await.map_err(to_anyhow)?,
+        // The audience was fixed when the send started (or the winner was picked): a retry adds nobody.
+        _ if fixed => {}
+        // Everyone (no test), or everyone left after a test that started before audiences were fixed.
+        _ => {
+            insert_rest(&mut tx, &c, resolved).await.map_err(to_anyhow)?;
+            fix = true;
+        }
     }
-    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), updated_at = now() WHERE id = $1").bind(c.id).execute(&mut *tx).await?;
+    // A text campaign's short links are set up with its audience, at every launch (see features::short_links).
+    if c.channel == "sms" && !fixed {
+        crate::features::short_links::freeze_campaign(state, &mut tx, c.id).await?;
+    }
+    sqlx::query("UPDATE campaigns SET sent_at = COALESCE(sent_at, now()), audience_fixed_at = CASE WHEN $2 THEN COALESCE(audience_fixed_at, now()) ELSE audience_fixed_at END, updated_at = now() WHERE id = $1")
+        .bind(c.id)
+        .bind(fix)
+        .execute(&mut *tx)
+        .await?;
+    if c.sent_at.is_none() {
+        crate::features::webhooks::campaign_sent_in(&mut tx, &state.db, c.account_id, c.id).await;
+    }
     tx.commit().await?;
 
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY id")
-        .bind(c.id)
-        .fetch_all(&state.db)
-        .await?;
-    if ids.is_empty() {
+    // Send options (local time, best time, gradual): give each new recipient a release time.
+    crate::features::sendtime::plan::plan_campaign(state, &c).await?;
+    // One batch job per release time, run when it comes; claims keep a re-run from sending twice.
+    let rows: Vec<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as("SELECT id, send_after FROM messages WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test ORDER BY send_after NULLS FIRST, id")
+            .bind(c.id)
+            .fetch_all(&state.db)
+            .await?;
+    if rows.is_empty() {
         finish_if_done(&state.db, c.id).await?;
     }
-    for chunk in ids.chunks(100) {
-        crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": chunk}), None).await?;
+    for group in rows.chunk_by(|a, b| a.1 == b.1) {
+        let at = group[0].1;
+        let ids: Vec<Uuid> = group.iter().map(|r| r.0).collect();
+        for chunk in ids.chunks(100) {
+            crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": chunk}), at).await?;
+        }
     }
     Ok(())
 }
 
 /// Queue a message (with no version: the winner, or the only content) for every audience member who has none yet.
-async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, state: &AppState, c: &CampaignRow) -> AppResult<()> {
-    let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
-    let addr = if c.channel == "sms" { "p.phone_number" } else { "p.email" };
+/// After an A/B test whose audience was fixed when it started, that's the holdouts who can still be messaged.
+/// Runs entirely on `tx`: the audience is resolved beforehand (and only used, so only has to have
+/// resolved, when there are no holdouts).
+async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, resolved: AppResult<ResolvedAudience>) -> AppResult<()> {
+    let addr = recipient_column(&c.channel);
     let mut qb = QueryBuilder::new("INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, to_address) SELECT gen_random_uuid(), p.account_id, p.id, ");
     qb.push_bind(c.channel.clone()).push(", ").push_bind(c.id).push(", ").push(addr);
-    append_audience(&mut qb, &state.db, c.account_id, &c.channel, &audience).await?;
+    let holdouts: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL AND ab_test IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut **tx).await?;
+    if holdouts {
+        qb.push(" FROM profiles p JOIN campaign_holdouts h ON h.profile_id = p.id AND h.campaign_id = ").push_bind(c.id);
+        qb.push(" WHERE p.account_id = ").push_bind(c.account_id);
+        push_eligible_targeted(&mut qb, &c.channel, push_platforms(&c.channel, &c.content, c.ab_test.as_ref()).as_deref());
+    } else {
+        push_audience(&mut qb, c.account_id, &c.channel, &resolved?);
+    }
     qb.push(" ON CONFLICT (campaign_id, profile_id) WHERE campaign_id IS NOT NULL AND NOT is_test DO NOTHING");
     qb.build().execute(&mut **tx).await?;
     Ok(())
 }
 
+/// What a campaign's queued message rows record as the recipient's address.
+fn recipient_column(channel: &str) -> &'static str {
+    match channel {
+        "sms" => "p.phone_number",
+        // Push goes to the person's devices, fixed when each message is claimed.
+        "push" => "'push'",
+        _ => "p.email",
+    }
+}
+
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
+    let done: Option<(String, Uuid)> = sqlx::query_as(
         // A test slice that has gone out waits for its results ('testing') before the winner send;
         // the wait starts when the last test message is handled (sends can be deferred, e.g. SMS quiet hours).
         "UPDATE campaigns SET
            status = CASE WHEN awaiting_winner THEN 'testing' ELSE 'sent' END,
            ab_test_ends_at = CASE WHEN awaiting_winner THEN now() + make_interval(hours => (ab_test->>'wait_hours')::int) ELSE ab_test_ends_at END,
+           finished_at = CASE WHEN awaiting_winner THEN finished_at ELSE now() END,
            updated_at = now()
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'
-         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)",
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)
+         RETURNING status, account_id",
     )
     .bind(campaign_id)
-    .execute(db)
+    .fetch_optional(db)
     .await?;
+    if let Some(("sent", account_id)) = done.as_ref().map(|(s, a)| (s.as_str(), *a)) {
+        crate::features::webhooks::campaign_finished(db, account_id, campaign_id).await;
+    }
     Ok(())
 }
 
@@ -367,10 +551,15 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
 pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> anyhow::Result<()> {
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1").bind(campaign_id).fetch_one(&state.db).await?;
     if c.status != "sending" {
-        sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued'")
-            .bind(ids)
-            .execute(&state.db)
-            .await?;
+        if crate::features::observes_unsent(&state.db, c.account_id) {
+            let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued' RETURNING id")
+                .bind(ids)
+                .fetch_all(&state.db)
+                .await?;
+            crate::features::messages_unsent(&state.db, c.account_id, &skipped).await;
+        } else {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued'").bind(ids).execute(&state.db).await?;
+        }
         return Ok(());
     }
     let account = load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -379,32 +568,54 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         return Ok(());
     }
     let ab = ab_test(&c);
-    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
+    // A text campaign's short links: the targets its launch set up (features::short_links).
+    let short_link_targets = if c.channel == "sms" { crate::features::short_links::send::campaign_targets(&state.db, c.id).await? } else { None };
+    let smart_hours = crate::features::sendtime::options::of(c.send_options.as_ref()).and_then(|o| o.smart_hours());
+    // One read against one cutoff: each queued message in the batch is either due now (sent below) or
+    // waits for a batch of its own at its release time, so none can fall between two reads.
+    let cutoff = chrono::Utc::now();
+    let queued: Vec<(Uuid, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as("SELECT id, send_after FROM messages WHERE id = ANY($1) AND status = 'queued' ORDER BY id")
         .bind(ids)
         .fetch_all(&state.db)
         .await?;
+    // Messages waiting for their release time or (texts) their recipient's quiet hours, by when each may go.
+    let mut held: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, Vec<Uuid>> = Default::default();
+    let mut rows: Vec<Uuid> = Vec::with_capacity(queued.len());
+    for (id, at) in queued {
+        match at {
+            Some(t) if t > cutoff => held.entry(t).or_default().push(id),
+            _ => rows.push(id),
+        }
+    }
     for (i, mid) in rows.iter().enumerate() {
         // Claim the message so a duplicate or retried batch can't send it again. A crash mid-send leaves it
         // 'sending'; release_abandoned_claims fails it later instead of retrying: at most once, never twice.
-        let claimed: Option<(Uuid, Option<String>)> = sqlx::query_as("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING profile_id, variant")
-            .bind(mid)
-            .fetch_optional(&state.db)
-            .await?;
-        let Some((pid, variant)) = claimed else { continue };
+        let Some((pid, variant)) = claim(&state.db, c.id, *mid, &c.channel, cutoff).await? else { continue };
+        // Smart sending: skip people who just got a message on this channel.
+        if let Some(hours) = smart_hours {
+            if crate::features::sendtime::recently_messaged(&state.db, pid, &c.channel, hours).await? {
+                sqlx::query("UPDATE messages SET status = 'skipped', error = 'smart sending' WHERE id = $1").bind(mid).execute(&state.db).await?;
+                crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
+                continue;
+            }
+        }
         let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
         let Some(profile) = sqlx::query_as::<_, Profile>(&q).bind(pid).fetch_optional(&state.db).await? else {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'profile deleted' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
             continue;
         };
         // Test-slice messages carry their version; everyone after the test gets the winner.
         let content = version_content(&c, ab.as_ref(), variant.as_deref().or(c.ab_winner.as_deref())).unwrap_or(&c.content);
-        let outcome = sending::send(
+        let content = crate::features::short_links::send::campaign_content(content, short_link_targets.as_ref());
+        // Inside this campaign's own send, the footer wording fixed at its start applies (see features::translations).
+        let outcome = crate::features::translations::in_campaign(c.id, sending::send(
             state,
             SendSpec {
                 account: &account,
                 profile: &profile,
                 channel: &c.channel,
-                content,
+                content: &content,
                 campaign_id: Some(c.id),
                 flow_id: None,
                 flow_node_id: None,
@@ -413,33 +624,120 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
                 message_id: Some(*mid),
                 to_override: None,
             },
-        )
+        ))
         .await;
         match outcome {
+            // A text or push outside its recipient's hours waits alone; everyone else in the batch goes on.
+            Ok(Outcome::Deferred(until)) if c.channel != "email" => {
+                if requeue_claimed(&state.db, c.id, *mid, &c.channel, Some(until)).await? {
+                    held.entry(until).or_default().push(*mid);
+                }
+            }
             Ok(Outcome::Deferred(until)) => {
-                sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(mid).execute(&state.db).await?;
+                if !requeue_claimed(&state.db, c.id, *mid, &c.channel, None).await? {
+                    // Cancelled or stopped meanwhile: the rest were skipped with it.
+                    return Ok(());
+                }
+                for (at, ids) in &held {
+                    crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(*at)).await?;
+                }
                 let rest: Vec<Uuid> = rows[i..].to_vec();
                 crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": rest}), Some(until)).await?;
                 return Ok(());
             }
             Ok(Outcome::Skipped(why)) => {
-                sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1").bind(mid).bind(why).execute(&state.db).await?;
+                // `sending::send` may have marked it skipped already (and reported it); only the
+                // write that changes the status reports it.
+                let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status <> 'skipped'").bind(mid).bind(why).execute(&state.db).await?.rows_affected();
+                if n > 0 {
+                    crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
+                }
             }
             Ok(_) => {}
             Err(e) => {
+                // The person was deleted while their message was being sent (the message row went with
+                // them): nothing wrong with the campaign, so everyone else still gets it.
+                let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM profiles WHERE id = $1)").bind(pid).fetch_one(&state.db).await?;
+                if gone {
+                    continue;
+                }
                 // A content problem affects every recipient: fail the campaign instead of retrying forever.
-                sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)")
-                    .bind(c.id)
-                    .bind(e.public_message())
-                    .bind(mid)
-                    .execute(&state.db)
-                    .await?;
+                const FAIL_REST: &str = "UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)";
+                if crate::features::observes_unsent(&state.db, c.account_id) {
+                    let failed: Vec<Uuid> = sqlx::query_scalar(&format!("{FAIL_REST} RETURNING id")).bind(c.id).bind(e.public_message()).bind(mid).fetch_all(&state.db).await?;
+                    crate::features::messages_unsent(&state.db, c.account_id, &failed).await;
+                } else {
+                    sqlx::query(FAIL_REST).bind(c.id).bind(e.public_message()).bind(mid).execute(&state.db).await?;
+                }
                 sqlx::query("UPDATE campaigns SET status = 'failed', error = $2 WHERE id = $1").bind(c.id).bind(e.public_message()).execute(&state.db).await?;
                 return Ok(());
             }
         }
     }
+    for (at, ids) in held {
+        crate::jobs::enqueue(&state.db, "campaign_batch", json!({"campaign_id": c.id, "message_ids": ids}), Some(at)).await?;
+    }
     finish_if_done(&state.db, c.id).await
+}
+
+/// Claim a due campaign message for sending: only while its campaign is still sending (and, for email,
+/// the account isn't paused). The campaign row is share-locked for the check, so a cancel or pause that
+/// is committing either lands first (no claim) or waits for the claim.
+pub async fn claim(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &str, cutoff: chrono::DateTime<chrono::Utc>) -> sqlx::Result<Option<(Uuid, Option<String>)>> {
+    sqlx::query_as(
+        "UPDATE messages m SET status = 'sending', claimed_at = now()
+         WHERE m.id = $1 AND m.status = 'queued' AND (m.send_after IS NULL OR m.send_after <= $2)
+           AND EXISTS (SELECT 1 FROM campaigns c JOIN accounts a ON a.id = c.account_id
+                       WHERE c.id = $3 AND c.status = 'sending' AND ($4 <> 'email' OR a.sending_paused_at IS NULL) FOR SHARE OF c)
+         RETURNING m.profile_id, m.variant",
+    )
+    .bind(message_id)
+    .bind(cutoff)
+    .bind(campaign_id)
+    .bind(channel)
+    .fetch_optional(db)
+    .await
+}
+
+/// Put a claimed message back in the queue (to go at `send_after`, or when its batch is re-run), unless
+/// its campaign was cancelled or stopped, or email was paused, since it was claimed: then it's skipped.
+/// Returns true when it's queued again. Locks the campaign row like [`claim`], so a cancel committing at
+/// the same moment can't leave it queued behind it.
+pub async fn requeue_claimed(db: &PgPool, campaign_id: Uuid, message_id: Uuid, channel: &str, send_after: Option<chrono::DateTime<chrono::Utc>>) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let st: Option<(String, bool)> = sqlx::query_as(
+        "SELECT c.status, a.sending_paused_at IS NOT NULL FROM campaigns c JOIN accounts a ON a.id = c.account_id WHERE c.id = $1 FOR SHARE OF c",
+    )
+    .bind(campaign_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let stop = match st.as_ref().map(|(s, p)| (s.as_str(), *p)) {
+        Some(("sending", true)) if channel == "email" => Some("sending paused"),
+        Some(("sending", _)) => None,
+        Some(("cancelled", _)) | None => Some("campaign cancelled"),
+        Some(_) => Some("campaign stopped"),
+    };
+    match stop {
+        None => {
+            sqlx::query("UPDATE messages SET status = 'queued', claimed_at = NULL, send_after = COALESCE($2, send_after) WHERE id = $1 AND status = 'sending'")
+                .bind(message_id)
+                .bind(send_after)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Some(why) => {
+            let account: Option<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = $2, claimed_at = NULL WHERE id = $1 AND status = 'sending' RETURNING account_id")
+                .bind(message_id)
+                .bind(why)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(account) = account {
+                crate::features::messages_unsent_in(&mut tx, db, account, &[message_id]).await;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(stop.is_none())
 }
 
 /// Attribution: each conversion credited to a message by the account's attribution settings (by
@@ -532,19 +830,40 @@ pub async fn pick_winner(state: &AppState, c: &CampaignRow, chosen: Option<&str>
             versions[leader(&t.metric, &stats).0].clone()
         }
     };
+    // Looked up before the transaction, which then holds the campaign row on one connection only.
+    let audience: Audience = serde_json::from_value(c.audience.clone()).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
+    let resolved = resolve_audience(&state.db, c.account_id, &c.channel, &audience).await.map(|r| r.with_push_platforms(push_platforms(&c.channel, &c.content, c.ab_test.as_ref())));
     // One transaction: record the winner, queue everyone else and the send job, so a crash can't leave
     // a campaign 'sending' with nothing queued, and no batch can mark it sent before the rest are queued.
     let mut tx = state.db.begin().await?;
-    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET ab_winner = $2, status = 'sending', updated_at = now() WHERE id = $1 AND status = 'testing' RETURNING *")
+    let row: Option<CampaignRow> = sqlx::query_as("UPDATE campaigns SET ab_winner = $2, ab_winner_at = now(), status = 'sending', updated_at = now() WHERE id = $1 AND status = 'testing' RETURNING *")
         .bind(c.id)
         .bind(&winner)
         .fetch_optional(&mut *tx)
         .await?;
     let row = row.ok_or_else(|| AppError::Conflict("the winner was already picked".into()))?;
-    insert_rest(&mut tx, state, &row).await?;
+    insert_rest(&mut tx, &row, resolved).await?;
     crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": c.id}), None).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// A failed or cancelled campaign that is edited goes back to draft: forget its last attempt, so the
+/// next send is planned afresh for the audience it has then. Messages that never reached the provider
+/// (queued, skipped, or failed without being claimed: a content error stops the rest unsent) are
+/// removed, with the fixed audience and A/B holdouts. Messages that went out, or may have (claimed and
+/// sent, failed or still sending), stay: those people are never sent the campaign again.
+pub async fn reset_for_relaunch(tx: &mut sqlx::Transaction<'_, Postgres>, campaign_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "DELETE FROM messages WHERE campaign_id = $1 AND NOT is_test
+           AND (status IN ('queued', 'skipped') OR (status = 'failed' AND claimed_at IS NULL))",
+    )
+    .bind(campaign_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM campaign_holdouts WHERE campaign_id = $1").bind(campaign_id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE campaigns SET audience_fixed_at = NULL WHERE id = $1").bind(campaign_id).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// How long a claimed campaign message can stay 'sending' before it counts as interrupted (a send takes seconds).
@@ -553,15 +872,32 @@ const CLAIM_TIMEOUT_MINUTES: i32 = 10;
 /// Scheduler: a worker that crashed mid-send leaves its message 'sending'. Mark those failed (they may or
 /// may not have gone out, so they're never resent) and let their campaigns finish.
 pub async fn release_abandoned_claims(state: &AppState) -> anyhow::Result<()> {
-    let campaigns: Vec<Uuid> = sqlx::query_scalar(
-        "WITH r AS (UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
-                    WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
-                    RETURNING campaign_id)
-         SELECT DISTINCT campaign_id FROM r",
-    )
-    .bind(CLAIM_TIMEOUT_MINUTES)
-    .fetch_all(&state.db)
-    .await?;
+    // Reporting the failures needs every message's id; with nothing watching, only the campaigns.
+    let campaigns: Vec<Uuid> = if crate::features::observes_any(&state.db) {
+        let failed: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
+             WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
+             RETURNING campaign_id, account_id, id",
+        )
+        .bind(CLAIM_TIMEOUT_MINUTES)
+        .fetch_all(&state.db)
+        .await?;
+        crate::features::messages_unsent_rows(&state.db, &failed.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>()).await;
+        let mut campaigns: Vec<Uuid> = failed.iter().map(|r| r.0).collect();
+        campaigns.sort();
+        campaigns.dedup();
+        campaigns
+    } else {
+        sqlx::query_scalar(
+            "WITH r AS (UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
+                        WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
+                        RETURNING campaign_id)
+             SELECT DISTINCT campaign_id FROM r",
+        )
+        .bind(CLAIM_TIMEOUT_MINUTES)
+        .fetch_all(&state.db)
+        .await?
+    };
     for id in campaigns {
         finish_if_done(&state.db, id).await?;
     }
@@ -581,21 +917,42 @@ pub async fn finish_due_tests(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>) -> AppResult<usize> {
+/// Send tests of `c`. `create_profiles`: an address with no profile gets one (for realistic
+/// personalization next time); without it such an address is refused. Callers check who may send
+/// tests where (`features::team::sends`).
+pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to: &[String], version: Option<&str>, create_profiles: bool) -> AppResult<usize> {
     if to.is_empty() || to.len() > 10 {
         return Err(AppError::bad("send tests to 1-10 addresses"));
     }
+    if let Some(why) = crate::import_review::campaign_problem(c) {
+        return Err(AppError::bad(format!("{why}. Test sends wait for the review too.")));
+    }
     let ab = ab_test(c);
     let content = version_content(c, ab.as_ref(), version).ok_or_else(|| AppError::bad("this campaign has no such version"))?;
-    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'")
-        .bind(account.id)
-        .fetch_one(&state.db)
-        .await?;
+    // With the campaign's link tag choice and the account's settings (see `features::campaigns_plus::utm`).
+    let (recent, link_override, link_defaults): (i64, Option<Value>, Option<Value>) = sqlx::query_as(&format!(
+        "SELECT count(*), (SELECT c.link_tags FROM campaigns c WHERE c.id = $2), {} FROM messages WHERE account_id = $1 AND is_test AND created_at > now() - interval '1 hour'",
+        crate::features::campaigns_plus::utm::DEFAULTS_FOR_ACCOUNT_1
+    ))
+    .bind(account.id)
+    .bind(c.id)
+    .fetch_one(&state.db)
+    .await?;
+    let content = &crate::features::campaigns_plus::utm::for_test(account, c, version, content, link_override.as_ref(), link_defaults.as_ref());
     if recent + to.len() as i64 > 50 {
         return Err(AppError::LimitReached("test sends are limited to 50 an hour".into()));
     }
+    if c.channel == "push" {
+        return crate::features::push::campaign_test(state, account, c, content, to, create_profiles).await;
+    }
     let mut sent = 0;
-    for addr in to {
+    for raw in to {
+        // A number is put in one form first, so the profile lookup, the opt-out check and the send agree.
+        let addr = if c.channel == "sms" {
+            &crate::models::normalize_phone(raw).ok_or_else(|| AppError::bad(format!("{raw:?} isn't a phone number (use +15035550100)")))?
+        } else {
+            raw
+        };
         let input = if c.channel == "email" {
             crate::audience::ProfileInput { email: Some(addr.clone()), ..Default::default() }
         } else {
@@ -611,7 +968,8 @@ pub async fn send_test(state: &AppState, account: &Account, c: &CampaignRow, to:
                 }
                 p
             }
-            None => crate::audience::upsert_profile(&state.db, account.id, &input).await?.profile,
+            None if create_profiles => crate::audience::upsert_profile(&state.db, account.id, &input).await?.profile,
+            None => return Err(AppError::bad(format!("{addr} isn't a profile in this account yet; ask a manager or admin to send it the first test"))),
         };
         let out = sending::send(
             state,

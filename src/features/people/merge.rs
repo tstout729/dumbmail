@@ -73,10 +73,53 @@ pub const PROFILE_TABLES: &[ProfileRef] = &[
     r("catalog_stock_subscriptions", "profile_id", OnMerge::Custom),
     // The most recent notice wins, so the cooldown never gets shorter.
     r("catalog_price_drop_notices", "profile_id", OnMerge::Custom),
+    // The record of what was sent stays with the person; erasure removes it (it holds the address).
+    r("transactional_sends", "profile_id", OnMerge::Move),
+    r("campaign_holdouts", "profile_id", OnMerge::MoveUnless(&["campaign_id"])),
+    // What a Klaviyo import last wrote: the kept profile's own record stays, the merged one's goes,
+    // so a later import never takes the merged consent for something it wrote itself.
+    r("klaviyo_consent_writes", "profile_id", OnMerge::Drop),
+    r("klaviyo_memberships", "profile_id", OnMerge::MoveUnless(&["list_id"])),
+    // One code per person and coupon: the merged profile's code for a coupon the kept one already has
+    // stays given out (never reused) but belongs to nobody. Erasure keeps codes the same way.
+    ProfileRef { table: "coupon_codes", column: "profile_id", on_merge: OnMerge::Custom, on_erase: OnErase::Forget },
+    r("coupon_signup_grants", "profile_id", OnMerge::Move),
+    r("object_links", "profile_id", OnMerge::MoveUnless(&["object_id", "relationship"])),
+    // One texting thread per person: the merged profile's texts join the kept profile's thread.
+    // Before sms_inbound and sms_auto_sends, which point at a thread.
+    r("sms_conversations", "profile_id", OnMerge::Custom),
+    r("sms_inbound", "profile_id", OnMerge::Move),
+    r("sms_auto_sends", "profile_id", OnMerge::Move),
+    // A keyword sign-up waiting for "Y" is for the number it was sent to (like an email confirmation).
+    r("sms_pending_optins", "profile_id", OnMerge::Custom),
+    // The proof of each keyword sign-up stays with the person.
+    r("sms_consents", "profile_id", OnMerge::Move),
+    // Devices follow the person (erasure deletes them: their tokens are personal data).
+    r("push_devices", "profile_id", OnMerge::Move),
+    // A push opt-out on either profile stays.
+    r("push_opt_outs", "profile_id", OnMerge::MoveUnless(&[])),
+    r("push_deliveries", "owner_profile_id", OnMerge::Move),
+    // Shopify's mapping of its customers to profiles (customers/redact reads it).
+    r("shopify_customers", "profile_id", OnMerge::Move),
+    ProfileRef { table: "shopify_discount_codes", column: "profile_id", on_merge: OnMerge::Move, on_erase: OnErase::Forget },
+    r("shopify_customer_profiles", "profile_id", OnMerge::MoveUnless(&["account_id", "shop_domain", "customer_id"])),
+    // "Shopify created this profile" is about the merged one, not the kept one: it goes.
+    r("shopify_created_profiles", "profile_id", OnMerge::Drop),
+    r("shopify_history_touched", "profile_id", OnMerge::MoveUnless(&["account_id"])),
+    // A sync's staged audience; the next run stages the kept profile from its merged state.
+    r("ad_audience_desired", "profile_id", OnMerge::Drop),
+    // Reviews follow the person (erasure goes through features::reviews to keep the star summaries right).
+    r("review_requests", "profile_id", OnMerge::Move),
+    r("reviews", "profile_id", OnMerge::Move),
+    r("review_sends", "profile_id", OnMerge::Move),
+    r("flow_backfill_members", "profile_id", OnMerge::MoveUnless(&["backfill_id"])),
 ];
 
 /// Tables whose `OnMerge::Custom` handling lives in [`merge`].
-pub const CUSTOM_MERGE: &[&str] = &["flow_runs", "messages", "optin_confirmations", "consent_events", "bulk_action_targets", "catalog_stock_subscriptions", "catalog_price_drop_notices"];
+pub const CUSTOM_MERGE: &[&str] = &[
+    "flow_runs", "messages", "optin_confirmations", "consent_events", "bulk_action_targets", "catalog_stock_subscriptions", "catalog_price_drop_notices", "coupon_codes",
+    "sms_conversations", "sms_pending_optins",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct MergeBody {
@@ -451,6 +494,53 @@ async fn custom_merge(tx: &mut sqlx::PgConnection, table: &str, keep: Uuid, othe
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE catalog_price_drop_notices SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "coupon_codes" => {
+            sqlx::query(
+                "UPDATE coupon_codes o SET profile_id = NULL WHERE o.profile_id = $2 AND EXISTS (
+                   SELECT 1 FROM coupon_codes k WHERE k.profile_id = $1 AND k.coupon_id = o.coupon_id AND k.send_key IS NOT DISTINCT FROM o.send_key)",
+            )
+            .bind(keep)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE coupon_codes SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
+        }
+        "sms_conversations" => {
+            let kept: Option<Uuid> = sqlx::query_scalar("SELECT id FROM sms_conversations WHERE profile_id = $1 FOR UPDATE").bind(keep).fetch_optional(&mut *tx).await?;
+            let merged: Option<Uuid> = sqlx::query_scalar("SELECT id FROM sms_conversations WHERE profile_id = $1 FOR UPDATE").bind(other).fetch_optional(&mut *tx).await?;
+            match (kept, merged) {
+                (Some(k), Some(m)) => {
+                    for t in ["sms_inbound", "sms_auto_sends"] {
+                        sqlx::query(&format!("UPDATE {t} SET conversation_id = $1 WHERE conversation_id = $2")).bind(k).bind(m).execute(&mut *tx).await?;
+                    }
+                    sqlx::query(
+                        "UPDATE sms_conversations k SET unread_count = k.unread_count + o.unread_count,
+                            last_message_at = GREATEST(k.last_message_at, o.last_message_at), last_inbound_at = GREATEST(k.last_inbound_at, o.last_inbound_at),
+                            last_direction = CASE WHEN o.last_message_at > k.last_message_at THEN o.last_direction ELSE k.last_direction END,
+                            last_preview = CASE WHEN o.last_message_at > k.last_message_at THEN o.last_preview ELSE k.last_preview END,
+                            status = CASE WHEN 'open' IN (k.status, o.status) THEN 'open' ELSE k.status END,
+                            last_default_reply_at = GREATEST(k.last_default_reply_at, o.last_default_reply_at),
+                            auto_window_start = GREATEST(k.auto_window_start, o.auto_window_start),
+                            auto_window_count = GREATEST(k.auto_window_count, o.auto_window_count)
+                         FROM sms_conversations o WHERE k.id = $1 AND o.id = $2",
+                    )
+                    .bind(k)
+                    .bind(m)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("DELETE FROM sms_conversations WHERE id = $1").bind(m).execute(&mut *tx).await?;
+                }
+                (None, Some(m)) => {
+                    sqlx::query("UPDATE sms_conversations SET profile_id = $1 WHERE id = $2").bind(keep).bind(m).execute(&mut *tx).await?;
+                }
+                _ => {}
+            }
+        }
+        "sms_pending_optins" => {
+            // A waiting "Y" for a number the merged profile won't have can't subscribe its number.
+            sqlx::query("DELETE FROM sms_pending_optins WHERE profile_id = ANY($1) AND phone_number IS DISTINCT FROM $2").bind([keep, other]).bind(merged_phone).execute(&mut *tx).await?;
+            sqlx::query("UPDATE sms_pending_optins SET profile_id = $1 WHERE profile_id = $2").bind(keep).bind(other).execute(&mut *tx).await?;
         }
         other_table => return Err(AppError::Internal(anyhow::anyhow!("no merge handling for {other_table}"))),
     }

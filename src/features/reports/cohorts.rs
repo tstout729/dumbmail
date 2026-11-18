@@ -171,6 +171,17 @@ pub struct FunnelQuery {
     pub split_by: Option<Split>,
 }
 
+impl FunnelQuery {
+    /// Refuse a split by a raw event or profile property unless `ctx` may read profiles.
+    pub fn check_access(&self, ctx: &crate::auth::Ctx) -> AppResult<()> {
+        match self.split_by.as_ref().map(|s| s.kind.as_str()) {
+            Some("event_property") => crate::features::team::access::require_people_values(ctx, "an event property"),
+            Some("profile_property") => crate::features::team::access::require_people_values(ctx, "a profile property"),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Splits shown; the rest are added up as "Other".
 const MAX_SPLITS: usize = 10;
 /// Longest split value kept, in characters.

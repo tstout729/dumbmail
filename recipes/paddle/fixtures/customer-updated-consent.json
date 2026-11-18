@@ -1,0 +1,43 @@
+{
+  "description": "a customer who ticked the marketing box (marketing_consent: true): subscribed to email for that address",
+  "doc": "https://developer.paddle.com/webhooks/customers/customer-created (example; name and email replaced)",
+  "expect": [
+    {
+      "consent": [
+        {
+          "as_of": "2024-04-12T09:00:00.000Z",
+          "channel": "email",
+          "source": "Paddle Checkout marketing consent box",
+          "subscribed": true
+        }
+      ],
+      "email": "sam.example@example.com",
+      "first_name": "Sam",
+      "keys": {
+        "paddle_customer": "ctm_01hv6y1consent00000000000"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "created_at": "2024-04-11T15:57:24.813Z",
+        "custom_data": null,
+        "email": "sam.example@example.com",
+        "id": "ctm_01hv6y1consent00000000000",
+        "import_meta": null,
+        "locale": "en",
+        "marketing_consent": true,
+        "name": "Sam Example",
+        "status": "active",
+        "updated_at": "2024-04-12T09:00:00.000Z"
+      },
+      "event_id": "evt_01hv6y1jconsent0000000000",
+      "event_type": "customer.updated",
+      "notification_id": "ntf_01hv6y1jk1ywdqqxd8sdtgxrsk",
+      "occurred_at": "2024-04-11T15:57:24.974080Z"
+    }
+  }
+}

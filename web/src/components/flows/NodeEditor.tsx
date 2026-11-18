@@ -1,9 +1,13 @@
 import { useState } from "react";
 import { Pencil, Plus, Trash2, X } from "lucide-react";
-import type { DelayUnit, FlowNode, List } from "../../api";
+import type { DelayUnit, FlowNode, FlowTrigger, List } from "../../api";
+import { DelayEditor, EventConditionEditor, NotifyEditor } from "../../features/flowsPlus";
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
+import { PushEditor } from "../../features/push/PushEditor";
+import { ReviewStepEditor } from "../../features/reviews/StepEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
+import { ObjectSplitFields } from "../../features/objects/ObjectSplitFields";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 
 type Props = {
@@ -12,24 +16,14 @@ type Props = {
   onChange: (n: FlowNode) => void;
   onEditEmail: () => void;
   readOnly?: boolean;
+  /** The flow's trigger (for trigger splits and dates from the event). */
+  trigger?: FlowTrigger;
 };
 
-export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Props) {
+export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigger }: Props) {
   switch (node.type) {
     case "delay":
-      return (
-        <fieldset disabled={readOnly} className="min-w-0 space-y-3">
-          <p className="text-sm text-zinc-600">Wait before moving to the next step.</p>
-          <div className="flex gap-2">
-            <Input type="number" min={1} value={node.amount} onChange={(e) => onChange({ ...node, amount: Math.max(1, Number(e.target.value) || 1) })} className="w-24" aria-label="Amount" />
-            <Select value={node.unit} onChange={(e) => onChange({ ...node, unit: e.target.value as DelayUnit })} className="w-32" aria-label="Unit">
-              <option value="minutes">minutes</option>
-              <option value="hours">hours</option>
-              <option value="days">days</option>
-            </Select>
-          </div>
-        </fieldset>
-      );
+      return <DelayEditor node={node} onChange={onChange} trigger={trigger} readOnly={readOnly} />;
     case "email":
       return (
         <div className="space-y-4">
@@ -56,6 +50,15 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
           <SmsEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} templateName={node.name} />
         </div>
       );
+    case "push":
+      return (
+        <div className="space-y-4">
+          <Field label="Step name">
+            <Input value={node.name ?? ""} onChange={(e) => onChange({ ...node, name: e.target.value || undefined })} disabled={readOnly} placeholder="Push" />
+          </Field>
+          <PushEditor value={node.content} onChange={(content) => onChange({ ...node, content })} readOnly={readOnly} />
+        </div>
+      );
     case "condition":
       return (
         <fieldset disabled={readOnly} className="min-w-0 space-y-3">
@@ -63,6 +66,35 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
             People who match go down <b>Yes</b>; everyone else goes down <b>No</b>.
           </p>
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
+          <EventConditionEditor node={node} onChange={onChange} trigger={trigger} />
+          {trigger?.type === "object" || trigger?.type === "object_date" ? (
+            <ObjectSplitFields
+              objectType={trigger.object_type}
+              filters={node.object_filters}
+              onChange={(object_filters) => {
+                const next = { ...node, object_filters };
+                if (!object_filters) delete next.object_filters;
+                onChange(next);
+              }}
+            />
+          ) : null}
+        </fieldset>
+      );
+    case "wait_for_reply":
+      return (
+        <fieldset disabled={readOnly} className="min-w-0 space-y-3">
+          <p className="text-sm text-zinc-600">
+            Wait for them to text back. If they reply in time they go down <b>replied</b> right away; otherwise <b>no reply</b> when the time is up. STOP and HELP don't
+            count as replies.
+          </p>
+          <div className="flex gap-2">
+            <Input type="number" min={1} value={node.amount} onChange={(e) => onChange({ ...node, amount: Math.max(1, Number(e.target.value) || 1) })} className="w-24" aria-label="Amount" />
+            <Select value={node.unit} onChange={(e) => onChange({ ...node, unit: e.target.value as DelayUnit })} className="w-32" aria-label="Unit">
+              <option value="minutes">minutes</option>
+              <option value="hours">hours</option>
+              <option value="days">days</option>
+            </Select>
+          </div>
         </fieldset>
       );
     case "random_split":
@@ -95,6 +127,10 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
       );
     case "webhook":
       return <WebhookEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
+    case "notify":
+      return <NotifyEditor node={node} onChange={onChange} readOnly={readOnly} />;
+    case "review_request":
+      return <ReviewStepEditor node={node} onChange={onChange} onEditEmail={onEditEmail} readOnly={readOnly} />;
   }
 }
 

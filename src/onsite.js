@@ -14,18 +14,41 @@
   function attr(n) { try { return ME && ME.getAttribute(n); } catch (e) { return null; } }
   var AUTO = !ONLY_FORM && CFG.autoTrack !== false && attr("data-auto-track") !== "false";
   var CAPTURE = !ONLY_FORM && CFG.captureEmails !== false && attr("data-capture-emails") !== "false";
+  // The visitor's consent as the page knows it (a consent banner, Shopify's Customer Privacy API):
+  // `window.dumbmailConsent = {analytics, marketing, withdrawn}`. Read when the script starts, so a
+  // withdrawal between the script being added and it running isn't missed. Without marketing
+  // consent the script never recognises the visitor (no identify, nothing tracked against a stored
+  // profile); without analytics consent, or once consent was withdrawn, it stops (see stop()).
+  var CONSENT = window.dumbmailConsent || null;
+  var NO_IDENTITY = !!(CONSENT && CONSENT.marketing === false);
+  if (NO_IDENTITY) CAPTURE = false;
   var noop = function () {};
   var now = function () { return Date.now(); };
 
   var store = {
     get: function (k, s) { try { return JSON.parse((s ? sessionStorage : localStorage).getItem(k)); } catch (e) { return null; } },
-    set: function (k, v, s) { try { (s ? sessionStorage : localStorage).setItem(k, JSON.stringify(v)); } catch (e) {} },
+    set: function (k, v, s) { if (STOPPED && TRACKING_KEYS.indexOf(k) >= 0) return; try { (s ? sessionStorage : localStorage).setItem(k, JSON.stringify(v)); } catch (e) {} },
     del: function (k, s) { try { (s ? sessionStorage : localStorage).removeItem(k); } catch (e) {} }
   };
   var PROFILE = "pl_profile";
-  function profile() { return store.get(PROFILE) || {}; }
+  function profile() { return NO_IDENTITY ? {} : store.get(PROFILE) || {}; }
+  // The visitor's browser language, sent with their events: only a hint for which language version
+  // of a message they get (it never overwrites a language set another way).
+  function withLocale(p) {
+    // A visitor who declined marketing has no identity here, and gets no hint either.
+    if (NO_IDENTITY) return p;
+    var q = {};
+    for (var k in p) if (Object.prototype.hasOwnProperty.call(p, k)) q[k] = p[k];
+    try { if (!q.locale && navigator.language) q.locale = navigator.language; } catch (e) {}
+    return q;
+  }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
+  // Set by dumbmail.stop(): nothing more is sent from this page, and nothing about the visitor's
+  // activity is written to the browser's storage either.
+  var STOPPED = false;
+  var TRACKING_KEYS = ["pl_profile", "pl_buffer", "pl_last_product", "pl_cart", "pl_sc", "pl_orders", "pl_active", "pl_page_views", "pl_first_seen"];
   function post(path, body) {
+    if (STOPPED && path !== "/client/subscribe") return Promise.resolve({ json: function () { return Promise.resolve({}); } });
     // Global Privacy Control: the visitor asked not to have their data sold or shared.
     if (navigator.globalPrivacyControl === true && body && typeof body === "object") body.gpc = true;
     try {
@@ -80,7 +103,7 @@
   var EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i;
   var api = {
     identify: function (props, how) {
-      if (!props || typeof props !== "object") return api;
+      if (STOPPED || NO_IDENTITY || !props || typeof props !== "object") return api;
       var p = profile(), before = identified(p);
       var em = props.email && String(props.email).trim().toLowerCase();
       // A different email is a different person: start a fresh profile instead of merging into theirs.
@@ -103,29 +126,44 @@
     addedToCart: function (p, cart) { addToCart(item(p), "manual", cart ? cartFrom(cart) : null); flushAdd(); return api; },
     startedCheckout: function (cart) { startCheckout(cartFrom(cart || {}), "manual", true); return api; },
     placedOrder: function (order) { placeOrder(order || {}, "manual"); return api; },
+    // The visitor withdrew consent (a cookie banner, Shopify's Customer Privacy API): from now on
+    // this page sends no events, pings or identification, and events waiting for the visitor to be
+    // recognised are deleted along with who the script thought they were. A sign-up form the visitor
+    // submits themselves still goes through.
+    stop: function () {
+      STOPPED = true;
+      store.del(BUFFER);
+      store.del(PROFILE);
+      return api;
+    },
     version: VERSION
   };
 
   // Events from visitors the browser doesn't know yet wait here (for up to 3 days) and are sent once they're recognized.
   var BUFFER = "pl_buffer";
+  // Consent withdrawn (or never given for analytics) before the script started: stop now.
+  if (CONSENT && (CONSENT.analytics === false || CONSENT.withdrawn)) api.stop();
   function buffer(ev) {
+    if (STOPPED) return;
     var b = (store.get(BUFFER) || []).filter(function (e) { return e && now() - e.time < 3 * 86400000; });
     b.push(ev);
     store.set(BUFFER, b.slice(-25));
   }
   function flushBuffer() {
+    if (STOPPED) return;
     var b = store.get(BUFFER) || [];
     store.del(BUFFER);
     var p = profile();
     b.forEach(function (e) {
-      if (now() - e.time < 3 * 86400000) post("/client/events", { metric: e.metric, profile: p, properties: e.properties, value: e.value, unique_id: e.unique_id, time: e.time });
+      if (now() - e.time < 3 * 86400000) post("/client/events", { metric: e.metric, profile: withLocale(p), properties: e.properties, value: e.value, unique_id: e.unique_id, time: e.time });
     });
   }
   function send(metric, properties, value, uniqueId) {
+    if (STOPPED) return;
     if (TEST) { test.event(metric, properties, value); return; }
     var ev = { metric: metric, properties: properties || {}, value: typeof value === "number" && isFinite(value) ? value : undefined, unique_id: uniqueId, time: now() };
     if (!identified()) { buffer(ev); return; }
-    post("/client/events", { metric: ev.metric, profile: profile(), properties: ev.properties, value: ev.value, unique_id: ev.unique_id, time: ev.time });
+    post("/client/events", { metric: ev.metric, profile: withLocale(profile()), properties: ev.properties, value: ev.value, unique_id: ev.unique_id, time: ev.time });
   }
 
   // ---------- Test mode ----------
@@ -824,6 +862,7 @@
     setTimeout(function () { if (!pv.cands.length) scanProduct(); }, 2500);
     countPageView();
     if (formsCache) runForms(formsCache);
+    setTimeout(loadReviews, 700);
   }
   function hookRoutes() {
     each(["pushState", "replaceState"], function (m) {
@@ -927,7 +966,7 @@
   }
 
   // Test-mode views aren't counted, so testing doesn't skew A/B results.
-  function view(f) { if (TEST) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
+  function view(f) { if (TEST || STOPPED) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
 
   function renderEmbeds(f) {
     var slots = document.querySelectorAll('[data-dumbmail-form="' + f.id + '"], [data-postlark-form="' + f.id + '"]');
@@ -1048,8 +1087,34 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  // Review widgets load their own code, and only on pages that have one (see the Reviews page in DumbMail).
+  var reviewsLoading = false;
+  function loadReviews() {
+    if (ONLY_FORM) return;
+    if (window.__dumbmailReviews) { window.__dumbmailReviews.scan(); return; }
+    if (reviewsLoading || !document.querySelector("[data-dumbmail-reviews],[data-dumbmail-stars],[data-dumbmail-reviews-carousel],[data-dumbmail-reviews-all]")) return;
+    reviewsLoading = true;
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = BASE + "/client/reviews.js?k=" + encodeURIComponent(KEY);
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  // Web push (when the account turned it on) lives in its own small script; browsers that can't
+  // show notifications never load it.
+  function loadPush() {
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.isSecureContext) return;
+      var s = document.createElement("script");
+      s.async = true;
+      s.src = BASE + "/client/push.js?k=" + encodeURIComponent(KEY);
+      (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+  }
+
   function start() {
     if (!ONLY_FORM) {
+      if (!TEST) loadPush();
       PLATFORM = platform();
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();
@@ -1057,6 +1122,7 @@
       hookOpeners();
       countPageView();
       if (AUTO) { hookLayer(); scanProduct(); scanCheckout(); }
+      loadReviews();
     }
     firstSeen();
     loadForms(function (forms) {

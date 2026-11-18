@@ -1,0 +1,164 @@
+{
+  "description": "reservation.new from Airbnb: the guest address is an Airbnb relay",
+  "expect": [
+    {
+      "email": "sam-abc123xyz@guest.airbnb.com",
+      "first_name": "Sam",
+      "last_name": "Rivera",
+      "phone_number": "+442079460958",
+      "properties": {
+        "guesty_guest_id": "67a0b1c2aaaa",
+        "last_check_in": "2026-12-17",
+        "last_listing": "Winery Villa"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "as_of": "2026-11-15T19:04:11.000Z",
+      "external_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+      "fields": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "HMABCD1234",
+        "currency": "USD",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "paid_checked_at": "2026-11-15T19:04:11.000Z",
+        "paid_in_full": true,
+        "source_channel": "airbnb2",
+        "status": "confirmed",
+        "total": 980
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "email": "sam-abc123xyz@guest.airbnb.com",
+          "relationship": "guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "sam-abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "HMABCD1234",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "paid_in_full": true,
+        "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "source_channel": "airbnb2",
+        "status": "confirmed"
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "sam-abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "currency": "USD",
+        "listing_id": "66054019764cbb000f37c450",
+        "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "total": 980
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:total",
+      "value": 980
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "sam-abc123xyz@guest.airbnb.com"
+      },
+      "properties": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "HMABCD1234",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "paid_in_full": true,
+        "reservation_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "source_channel": "airbnb2",
+        "status": "confirmed",
+        "version": "2026-11-15T19:04:11.000Z"
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:67a0b1c2d3e4f5a6b7c8d9e0:confirmed:2026-11-15T19:04:11.000Z"
+    }
+  ],
+  "input": {
+    "now": "2026-11-17T18:00:00.000Z",
+    "payload": {
+      "event": "reservation.new",
+      "meta": {
+        "eventId": "e2"
+      },
+      "reservation": {
+        "__v": 3,
+        "_id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "accountId": "5f1a2b3c4d5e6f7a8b9c0d1e",
+        "checkIn": "2026-12-17T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-17",
+        "checkOut": "2026-12-21T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-21",
+        "confirmationCode": "HMABCD1234",
+        "confirmedAt": "2026-11-15T19:04:11.000Z",
+        "createdAt": "2026-11-15T19:03:58.000Z",
+        "guest": {
+          "_id": "67a0b1c2aaaa",
+          "email": "sam-abc123xyz@guest.airbnb.com",
+          "fullName": "Sam Rivera",
+          "phone": "+44 20 7946 0958"
+        },
+        "guestId": "66f1c4a06100f639de7adab8",
+        "guestsCount": 3,
+        "id": "67a0b1c2d3e4f5a6b7c8d9e0",
+        "integration": {
+          "_id": "5e8f1a2b3c4d",
+          "platform": "airbnb2"
+        },
+        "lastUpdatedAt": "2026-11-15T19:04:11.000Z",
+        "listing": {
+          "_id": "66054019764cbb000f37c450",
+          "nickname": "Winery Villa",
+          "title": "Standalone French Villa at the Winery"
+        },
+        "listingId": "66054019764cbb000f37c450",
+        "money": {
+          "balanceDue": 0,
+          "currency": "USD",
+          "hostPayout": 845.0,
+          "totalPaid": 980.0
+        },
+        "nightsCount": 4,
+        "source": "airbnb2",
+        "status": "confirmed"
+      }
+    },
+    "source": "webhook"
+  }
+}

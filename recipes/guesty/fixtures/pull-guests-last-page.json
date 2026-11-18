@@ -1,0 +1,187 @@
+{
+  "description": "The last guests page: the cursor is saved and no further page is asked for (Guesty's real answer shape: _id, email, phone with the country code and no +.)",
+  "expect": [
+    {
+      "email": "dana.whitfield@example.com",
+      "first_name": "Dana",
+      "last_name": "Whitfield",
+      "phone_number": "+15035550142",
+      "properties": {
+        "guesty_guest_id": "6g0000000000000000000000",
+        "last_check_in": "2026-12-10",
+        "last_listing": null
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "as_of": "2026-11-17T10:00:00.000Z",
+      "external_id": "6a0000000000000000000000",
+      "fields": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "paid_checked_at": null,
+        "paid_in_full": null,
+        "source_channel": "airbnb2",
+        "status": "confirmed"
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "email": "dana.whitfield@example.com",
+          "relationship": "guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000000",
+        "source_channel": "airbnb2",
+        "status": "confirmed"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000000:booked"
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-10",
+        "check_out": "2026-12-14",
+        "confirmation_code": "GY-00000",
+        "guest_id": "6g0000000000000000000000",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 4,
+        "reservation_id": "6a0000000000000000000000",
+        "source_channel": "airbnb2",
+        "status": "confirmed",
+        "version": "2026-11-17T10:00:00.000Z"
+      },
+      "time": "2026-11-17T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:6a0000000000000000000000:confirmed:2026-11-17T10:00:00.000Z"
+    },
+    {
+      "type": "set_state",
+      "values": {
+        "cursor": "2026-11-17T11:00:00.000Z",
+        "page_last": null,
+        "page_more": null,
+        "page_skip": null,
+        "pending": null,
+        "skip": 0
+      }
+    },
+    {
+      "query": {
+        "columns": null,
+        "filter[checkInDate][gte]": "2026-11-16",
+        "filter[checkInDate][lt]": "2027-01-01",
+        "filter[lastUpdatedAt][gte]": null,
+        "filter[status]": "confirmed",
+        "filters": null,
+        "limit": 100,
+        "skip": 0,
+        "sort": "_id"
+      },
+      "type": "next_request",
+      "url": "/v1/reservations-reports/reservations/search"
+    },
+    {
+      "message": "checking payment for confirmed arrivals in the next 45 days",
+      "type": "log"
+    },
+    {
+      "message": "page 4: wrote 1 reservations",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "page": 4,
+    "payload": {
+      "results": [
+        {
+          "_id": "6g0000000000000000000000",
+          "email": "dana.whitfield@example.com",
+          "firstName": "Dana",
+          "fullName": "Dana Whitfield",
+          "lastName": "Whitfield",
+          "phone": "15035550142"
+        }
+      ],
+      "total": 1
+    },
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "limit",
+          "50"
+        ],
+        [
+          "columns",
+          "id firstName lastName fullName guestEmail guestPhone"
+        ],
+        [
+          "filters",
+          "{}"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/guests-crud"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-17T10:00:49.000Z",
+      "page_last": "2026-11-17T11:00:00.000Z",
+      "page_more": false,
+      "pending": [
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00000",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000000",
+          "guestsCount": 2,
+          "lastUpdatedAt": "2026-11-17T10:00:00.000Z",
+          "listingId": "66054019764cbb000f37c450",
+          "reservationId": "6a0000000000000000000000",
+          "source": "airbnb2",
+          "status": "confirmed"
+        }
+      ],
+      "skip": 0
+    }
+  }
+}

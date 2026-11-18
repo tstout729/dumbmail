@@ -73,7 +73,7 @@ pub async fn save(db: &PgPool, account_id: Uuid, profile_id: Uuid, keep: &HashSe
             audience::add_to_list(db, account_id, l.id, &[profile_id]).await?;
             changed += 1;
         } else if !want && l.member {
-            sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = $2").bind(l.id).bind(profile_id).execute(db).await?;
+            audience::remove_from_list(db, account_id, l.id, &[profile_id]).await?;
             let mut props = json!({"list_id": l.id, "list": l.name, "method": "preferences"});
             if let Some((message_id, campaign_id, flow_id)) = message {
                 props["message_id"] = json!(message_id);
@@ -97,12 +97,17 @@ fn esc(s: &str) -> String {
 
 /// The preference form: a checkbox per list, "Save" and "Unsubscribe from all".
 pub fn form_html(sender: &str, lists: &[PrefList], notice: Option<&str>) -> String {
+    form_html_in(&crate::features::translations::texts::Texts::english(), sender, lists, notice)
+}
+
+/// [`form_html`] in a language (see features::translations::texts).
+pub fn form_html_in(t: &crate::features::translations::texts::Texts, sender: &str, lists: &[PrefList], notice: Option<&str>) -> String {
     let mut h = String::new();
-    h.push_str("<h1>Email preferences</h1>");
+    h.push_str(&format!("<h1>{}</h1>", t.html("prefs.title", "")));
     if let Some(n) = notice {
         h.push_str(&format!(r#"<p style="background:#ecfdf5;color:#065f46;border-radius:8px;padding:10px 12px">{}</p>"#, esc(n)));
     }
-    h.push_str(&format!("<p>Choose what you'd like to get from {}.</p>", esc(sender)));
+    h.push_str(&format!("<p>{}</p>", t.html("prefs.intro", sender)));
     h.push_str(r#"<form method="post"><input type="hidden" name="action" value="save">"#);
     for l in lists {
         h.push_str(&format!(
@@ -113,10 +118,11 @@ pub fn form_html(sender: &str, lists: &[PrefList], notice: Option<&str>) -> Stri
             desc = if l.description.trim().is_empty() { String::new() } else { format!(r#"<br><span style="color:#6b7280;font-size:13px">{}</span>"#, esc(&l.description)) },
         ));
     }
-    h.push_str(r#"<button type="submit">Save preferences</button></form>"#);
-    h.push_str(
-        r#"<form method="post" style="margin-top:12px"><input type="hidden" name="action" value="all"><button type="submit" style="background:#fff;color:#374151;border:1px solid #d1d5db">Unsubscribe from all emails</button></form>"#,
-    );
+    h.push_str(&format!(r#"<button type="submit">{}</button></form>"#, t.html("prefs.save", "")));
+    h.push_str(&format!(
+        r#"<form method="post" style="margin-top:12px"><input type="hidden" name="action" value="all"><button type="submit" style="background:#fff;color:#374151;border:1px solid #d1d5db">{}</button></form>"#,
+        t.html("prefs.all", "")
+    ));
     h
 }
 

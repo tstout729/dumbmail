@@ -1,0 +1,113 @@
+{
+  "description": "v2 created: matched by Guesty guest id (no email in v2 events); a new guest is added by the next pull",
+  "expect": [
+    {
+      "as_of": "2026-11-17T17:59:58.000Z",
+      "external_id": "69c0d1e2f3",
+      "fields": {
+        "check_in": "2026-12-01",
+        "check_out": "2026-12-04",
+        "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 3,
+        "paid_checked_at": null,
+        "paid_in_full": null,
+        "source_channel": "direct",
+        "status": "confirmed"
+      },
+      "object_type": "reservation",
+      "profiles": [
+        {
+          "property": "guesty_guest_id",
+          "relationship": "guest",
+          "value": "69guest"
+        }
+      ],
+      "replace_links": [
+        "guest"
+      ],
+      "type": "upsert_object"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "if_missing": "retry",
+        "property": "guesty_guest_id",
+        "value": "69guest"
+      },
+      "properties": {
+        "check_in": "2026-12-01",
+        "check_out": "2026-12-04",
+        "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 3,
+        "reservation_id": "69c0d1e2f3",
+        "source_channel": "direct",
+        "status": "confirmed"
+      },
+      "time": "2026-11-17T17:59:30.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:69c0d1e2f3:booked"
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "if_missing": "retry",
+        "property": "guesty_guest_id",
+        "value": "69guest"
+      },
+      "properties": {
+        "check_in": "2026-12-01",
+        "check_out": "2026-12-04",
+        "confirmation_code": "GY-zz",
+        "guest_id": "69guest",
+        "guests": 2,
+        "listing_id": "66054019764cbb000f37c450",
+        "nights": 3,
+        "reservation_id": "69c0d1e2f3",
+        "source_channel": "direct",
+        "status": "confirmed",
+        "version": "2026-11-17T17:59:58.000Z"
+      },
+      "time": "2026-11-17T17:59:58.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:69c0d1e2f3:confirmed:2026-11-17T17:59:58.000Z"
+    },
+    {
+      "message": "reservation.created.v2  for 69c0d1e2f3 (guest 69guest); retried until the guest is known",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "data": {
+        "accountId": "5f1a",
+        "checkIn": "2026-12-01T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-01",
+        "checkOut": "2026-12-04T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-04",
+        "confirmationCode": "GY-zz",
+        "confirmedAt": "2026-11-17T17:59:30.000Z",
+        "createdAt": "2026-11-17T17:59:00.000Z",
+        "event": "reservation.created.v2",
+        "guestId": "69guest",
+        "guestsCount": 2,
+        "platform": "direct",
+        "reservationId": "69c0d1e2f3",
+        "source": "manual",
+        "status": "confirmed",
+        "unitId": "66054019764cbb000f37c450"
+      },
+      "event": "reservation.created.v2",
+      "meta": {
+        "eventId": "e7",
+        "publishedAt": "2026-11-17T17:59:58.000Z"
+      }
+    },
+    "source": "webhook"
+  }
+}

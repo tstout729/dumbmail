@@ -35,6 +35,10 @@ pub struct Config {
     pub telnyx_api_key: Option<String>,
     #[arg(long, env = "TELNYX_MESSAGING_PROFILE_ID")]
     pub telnyx_messaging_profile_id: Option<String>,
+    /// Telnyx's webhook signing public key (base64; Telnyx portal → Keys & Credentials → Public Key).
+    /// Set, inbound texts on the platform's Telnyx are verified and forged ones rejected.
+    #[arg(long, env = "TELNYX_PUBLIC_KEY")]
+    pub telnyx_public_key: Option<String>,
     #[arg(long, env = "TWILIO_ACCOUNT_SID")]
     pub twilio_account_sid: Option<String>,
     #[arg(long, env = "TWILIO_AUTH_TOKEN", hide_env_values = true)]
@@ -65,6 +69,11 @@ pub struct Config {
     #[arg(long, env = "WORKERS", default_value_t = 4)]
     pub workers: usize,
 
+    /// Worker tasks for background-lane jobs (webhooks, exports): these never take sending work,
+    /// and the main workers never take theirs.
+    #[arg(long, env = "BACKGROUND_WORKERS", default_value_t = 2)]
+    pub background_workers: usize,
+
     /// Stripe secret key for credit top-ups (hosted billing).
     #[arg(long, env = "STRIPE_SECRET_KEY", hide_env_values = true)]
     pub stripe_secret_key: Option<String>,
@@ -92,6 +101,14 @@ pub struct Config {
     /// Phone number per month (Telnyx charges about $1.00–1.10).
     #[arg(long, env = "PRICE_NUMBER_MONTHLY", default_value_t = 2.20)]
     pub price_number_monthly: f64,
+    /// Push notification per person (all their devices). Push costs DumbMail almost nothing, so it's
+    /// free unless this is set; a non-zero price is charged like texts, from the balance.
+    #[arg(long, env = "PRICE_PUSH", default_value_t = 0.0)]
+    pub price_push: f64,
+    /// Testing only: send web push, APNs and FCM requests (and Google sign-in) to this stand-in
+    /// instead of the real services. Never set in production.
+    #[arg(long, env = "PUSH_API_BASE")]
+    pub push_api_base: Option<String>,
     /// Free emails per account each month (costs at most ~$0.18 per account).
     #[arg(long, env = "FREE_EMAILS_PER_MONTH", default_value_t = 1000)]
     pub free_emails_per_month: i64,
@@ -163,6 +180,46 @@ pub struct Config {
     /// PUBLIC_URL. On a different host than PUBLIC_URL, set COOKIE_DOMAIN to a domain covering both.
     #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
     pub google_redirect_base: Option<String>,
+    /// Anthropic API key for machine-translated drafts ("Draft with AI", see
+    /// `features::translations`). Unset: the button is hidden; importing and exporting still work.
+    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
+    pub anthropic_api_key: Option<String>,
+    /// A loopback stand-in for the Anthropic API, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored: the key only ever goes to https://api.anthropic.com.
+    #[arg(skip)]
+    pub anthropic_api_base: Option<String>,
+    /// Most characters one account may send for machine translation per day (its time zone).
+    #[arg(long, env = "TRANSLATION_DAILY_CHARS", default_value_t = 200_000)]
+    pub translation_daily_chars: i64,
+    /// Price per 1,000 machine-translated characters on the hosted service, in dollars (0: free).
+    #[arg(long, env = "PRICE_TRANSLATION_PER_1000_CHARS", default_value_t = 0.0)]
+    pub price_translation_per_1000_chars: f64,
+
+    /// Ad audience sync (see docs/AD_AUDIENCES.md). A platform whose app credentials are unset shows
+    /// as "not available on this server". Meta app for Facebook Login with the ads_management permission.
+    #[arg(long, env = "META_APP_ID")]
+    pub meta_app_id: Option<String>,
+    #[arg(long, env = "META_APP_SECRET", hide_env_values = true)]
+    pub meta_app_secret: Option<String>,
+    /// Google OAuth web client for Google Ads Customer Match (Data Manager API).
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_ID")]
+    pub google_ads_client_id: Option<String>,
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_SECRET", hide_env_values = true)]
+    pub google_ads_client_secret: Option<String>,
+    /// TikTok API for Business app.
+    #[arg(long, env = "TIKTOK_APP_ID")]
+    pub tiktok_app_id: Option<String>,
+    #[arg(long, env = "TIKTOK_APP_SECRET", hide_env_values = true)]
+    pub tiktok_app_secret: Option<String>,
+    /// A loopback stand-in for every ad platform API host, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored.
+    #[arg(skip)]
+    pub ad_platform_api_base: Option<String>,
+    /// The Shopify app (SHOPIFY_API_KEY, SHOPIFY_API_SECRET; see docs/SHOPIFY.md).
+    #[command(flatten)]
+    pub shopify: crate::features::shopify::Settings,
 }
 
 impl Config {

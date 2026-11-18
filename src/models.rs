@@ -28,6 +28,10 @@ pub struct Account {
     /// `deliverability`); campaigns, flows and tests send no email until an operator lifts it.
     pub sending_paused_at: Option<DateTime<Utc>>,
     pub sending_paused_reason: Option<String>,
+    /// Set when the account was closed (its only owner's login was given up, see
+    /// `features::team::google_link`). A closed account sends, runs and pays for nothing.
+    #[serde(skip)]
+    pub closed_at: Option<DateTime<Utc>>,
     /// Operator-set 24-hour email limit in place of the automatic warm-up (see `deliverability`).
     #[serde(skip)]
     pub email_daily_limit_override: Option<i32>,
@@ -69,9 +73,18 @@ pub struct Profile {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_event_at: Option<DateTime<Utc>>,
+    /// The person's language, a BCP 47 tag (see `features::translations`).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub locale: Option<String>,
+    /// A browser's language, only for choosing a message's language version (see
+    /// `features::translations`). Not shown to templates or segments.
+    #[serde(default, skip_serializing)]
+    #[sqlx(default)]
+    pub locale_hint: Option<String>,
 }
 
-pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at";
+pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at, p.locale, p.locale_hint";
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct List {
@@ -126,6 +139,12 @@ pub struct CampaignRow {
     /// When the test slice's results are read and the winner goes to everyone else.
     pub ab_test_ends_at: Option<DateTime<Utc>>,
     pub ab_winner: Option<String>,
+    /// When each recipient's message goes out and smart sending; see `features::sendtime::SendOptions`.
+    #[sqlx(default)]
+    pub send_options: Option<Value>,
+    /// Imported (from Klaviyo) and needing a person's review before it can be sent; see `features::klaviyo_import::review`.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -138,6 +157,17 @@ pub struct FlowRow {
     pub definition: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Link tagging choice and, where messages are sent, the account's settings (see
+    /// `features::campaigns_plus::utm`). Not part of the flow the API returns.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tags: Option<Value>,
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tag_defaults: Option<Value>,
+    /// Imported and needing review before it can go live; see `features::klaviyo_import::review`.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -154,6 +184,9 @@ pub struct FormRow {
     pub submits: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Imported without a sign-up list it could be sure of; can't be published until a list is chosen.
+    #[sqlx(default)]
+    pub import_review: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -245,6 +278,12 @@ pub fn normalize_phone(p: &str) -> Option<String> {
 /// `pending`: signed up through a double opt-in form and hasn't confirmed yet; gets no email but the confirmation.
 pub fn valid_consent(s: &str) -> bool {
     matches!(s, "subscribed" | "unsubscribed" | "never_subscribed" | "pending")
+}
+
+/// Whether an account is closed. Every place that starts work for an account asks this (or reads
+/// [`Account::closed_at`] from a row it already has) and does nothing for a closed one.
+pub async fn account_closed<'e>(db: impl sqlx::PgExecutor<'e>, account_id: uuid::Uuid) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(false))
 }
 
 #[cfg(test)]

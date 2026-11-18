@@ -18,11 +18,17 @@ import {
 } from "../../api";
 import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
+import { PushEditor } from "../../features/push/PushEditor";
+import type { PushContent } from "../../features/push/types";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
+import { CouponSendCheck } from "../../features/coupons/CouponSendCheck";
+import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
+import { ResendAudience, isResendAudience } from "../../features/campaignsPlus/ResendPanel";
 import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
 import {
   addVersion,
@@ -39,6 +45,9 @@ import {
   withVersionContent,
 } from "./abTest";
 import { CampaignReportView } from "./CampaignReport";
+import { SendOptionsPanel, localTimeNote } from "../../features/sendtime/SendOptionsPanel";
+import { clockLabel, sendOptionsOf, timingLabel } from "../../features/sendtime/options";
+import type { SendOptions } from "../../features/sendtime/types";
 import { ChannelIcon } from "./CampaignsPage";
 
 export function CampaignPage() {
@@ -70,7 +79,7 @@ export function CampaignPage() {
   return <CampaignEditor key={c.id} campaign={c} />;
 }
 
-type Draft = Pick<Campaign, "name" | "audience" | "content" | "ab_test">;
+type Draft = Pick<Campaign, "name" | "audience" | "content" | "ab_test"> & { send_options: SendOptions | null };
 
 function isEmail(_content: Campaign["content"], channel: Campaign["channel"]): _content is EmailContent {
   return channel === "email";
@@ -93,7 +102,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const [tab, setTab] = useState<VersionId>("a");
   const [removing, setRemoving] = useState<VersionId | "test" | null>(null);
   const editable = campaign.status === "draft" || campaign.status === "scheduled";
-  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content, ab_test: campaign.ab_test };
+  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content, ab_test: campaign.ab_test, send_options: sendOptionsOf(campaign) };
   const test = current.ab_test;
   const versions = versionIds(test);
   // A removed version's tab falls back to A.
@@ -104,7 +113,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const blocker = useBlocker(({ currentLocation, nextLocation }) => dirty && currentLocation.pathname !== nextLocation.pathname);
 
   const edit = (patch: Partial<Draft>) => setDraft({ ...current, ...patch });
-  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience });
+  // Push: only devices on the platforms this campaign targets (across its versions).
+  const pushPlatforms =
+    campaign.channel === "push"
+      ? [...new Set(versionIds(current.ab_test).flatMap((v) => (versionContent(current, v) as PushContent).platforms ?? ["web", "ios", "android"]))]
+      : undefined;
+  const estimate = useEstimate({ channel: campaign.channel, audience: current.audience, platforms: pushPlatforms });
 
   const save = async () => {
     if (!draft) return true;
@@ -118,14 +132,15 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   };
 
   const email = isEmail(current.content, campaign.channel) ? current.content : null;
-  const sms = email ? null : (current.content as SmsContent);
+  const push = campaign.channel === "push" ? (current.content as PushContent) : null;
+  const sms = email || push ? null : (current.content as SmsContent);
   // Every version's sender must be on a verified domain.
   const domainVerified = versions.every((v) => {
     const c = versionContent(current, v);
     return isVerifiedSender(sending.data, (isEmail(c, campaign.channel) && c.from_email) || account.from_email);
   });
   const shown = versionContent(current, version);
-  const editVersion = (content: EmailContent | SmsContent) => setDraft(withVersionContent(current, version, content));
+  const editVersion = (content: EmailContent | SmsContent | PushContent) => setDraft(withVersionContent(current, version, content));
 
   // Each version's own checks; with a test they're labelled "Version B: …".
   const versionChecks = versions.flatMap((v) => {
@@ -136,6 +151,10 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
         { ok: (content.subject ?? "").trim() !== "", label: `${prefix}Add a subject line`, blocking: true },
         { ok: Boolean(content.from_email || account.from_email), label: `${prefix}Set a from email (here or in Settings)`, blocking: true },
       ];
+    }
+    if (campaign.channel === "push") {
+      const p = content as PushContent;
+      return [{ ok: (p.title ?? "").trim() !== "" || (p.body ?? "").trim() !== "", label: `${prefix}Write the notification's title or message`, blocking: true }];
     }
     const body = (content as SmsContent).body ?? "";
     return [
@@ -156,16 +175,26 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const ready = checks.every((c) => c.ok || !c.blocking);
   const contentDone = versions.every((v) => {
     const content = versionContent(current, v);
+    if (campaign.channel === "push") return Boolean((content as PushContent).title || (content as PushContent).body);
     return isEmail(content, campaign.channel) ? Boolean(content.subject) : Boolean((content as SmsContent).body);
   });
 
   const contentSummary = [
     test ? `A/B test, ${versions.length} versions` : null,
-    email ? (email.subject ? `Subject: ${email.subject}` : "No subject yet") : sms?.body ? sms.body.slice(0, 90) : "No message yet",
+    email
+      ? email.subject
+        ? `Subject: ${email.subject}`
+        : "No subject yet"
+      : push
+        ? push.title || push.body || "No notification yet"
+        : sms?.body
+          ? sms.body.slice(0, 90)
+          : "No message yet",
   ]
     .filter(Boolean)
     .join(" · ");
   const count = estimate.data?.count;
+  const resend = isResendAudience(campaign);
 
   return (
     <Page wide>
@@ -183,7 +212,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
             <StatusBadge status={campaign.status} />
           </span>
         }
-        description={campaign.status === "scheduled" ? `Scheduled for ${formatDateTime(campaign.send_at, tz)} ${tzAbbrev(tz)}` : undefined}
+        description={campaign.status === "scheduled" ? scheduledLine(campaign.send_at, sendOptionsOf(campaign), tz) : undefined}
         actions={
           <>
             <Button variant="ghost" icon={<Copy className="size-3.5" />} onClick={() => duplicate.mutate(campaign.id, { onSuccess: (d) => navigate(`/campaigns/${d.id}`) })}>
@@ -218,13 +247,15 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           open={open === 1}
           onToggle={() => setOpen(open === 1 ? null : 1)}
           summary={
-            current.audience.include.length > 0
+            resend
+              ? `People who didn't engage with the original · ${estimate.data ? pluralize(estimate.data.count, "reachable recipient") : "estimating…"}`
+              : current.audience.include.length > 0
               ? `${current.audience.include.length} included, ${current.audience.exclude.length} excluded · ${estimate.data ? pluralize(estimate.data.count, "reachable recipient") : "estimating…"}`
               : "Choose lists or segments"
           }
         >
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
-            <AudiencePicker value={current.audience} onChange={(audience: Audience) => edit({ audience })} disabled={!editable} />
+            {resend ? <ResendAudience campaignId={campaign.id} /> : <AudiencePicker value={current.audience} onChange={(audience: Audience) => edit({ audience })} disabled={!editable} />}
             <div className="rounded-lg bg-zinc-50 p-4">
               <div className="flex items-center gap-2 text-xs font-medium text-zinc-500">
                 <Users className="size-3.5" /> Reachable recipients
@@ -233,7 +264,9 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                 {current.audience.include.length === 0 ? "—" : estimate.data ? formatNumber(estimate.data.count) : <Skeleton className="h-7 w-20" />}
               </div>
               <p className="mt-1 text-xs text-zinc-500">
-                People with {campaign.channel === "email" ? "email" : "SMS"} consent, after exclusions and suppressions.
+                {campaign.channel === "push"
+                  ? "People with a device that allowed notifications and who haven't turned push off, after exclusions."
+                  : `People with ${campaign.channel === "email" ? "email" : "SMS"} consent, after exclusions and suppressions.`}
               </p>
               {estimate.error ? <p className="mt-2 text-xs text-red-600">{estimate.error.message}</p> : null}
             </div>
@@ -274,13 +307,27 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           ) : null}
           {/* Keyed by version so each tab's editor keeps its own UI state (open blocks, dialogs). */}
           {isEmail(shown, campaign.channel) ? (
-            <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} />
+            <EmailEditor key={version} value={shown} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
+          ) : campaign.channel === "push" ? (
+            <PushEditor key={version} value={shown as PushContent} onChange={editVersion} readOnly={!editable} />
           ) : (
-            <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} />
+            <SmsEditor key={version} value={shown as SmsContent} onChange={editVersion} readOnly={!editable} templateName={current.name} translationTarget={{ kind: "campaign", id: campaign.id, version: version === "a" ? undefined : version }} />
           )}
         </Step>
 
-        <Step index={3} title="Review & send" open={open === 3} onToggle={() => setOpen(open === 3 ? null : 3)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
+        <Step index={3} title="Timing" done={current.audience.include.length > 0} open={open === 3} onToggle={() => setOpen(open === 3 ? null : 3)} summary={`${timingLabel(current.send_options)}${current.send_options?.smart_sending ? " · smart sending on" : ""}`}>
+          <SendOptionsPanel
+            campaignId={campaign.id}
+            channel={campaign.channel}
+            audience={current.audience}
+            value={current.send_options}
+            onChange={(send_options) => edit({ send_options })}
+            disabled={!editable}
+            timezone={tz}
+          />
+        </Step>
+
+        <Step index={4} title="Review & send" open={open === 4} onToggle={() => setOpen(open === 4 ? null : 4)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
               <ul className="space-y-2">
@@ -297,9 +344,11 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              <LinkTagsPanel kind="campaign" id={campaign.id} disabled={!editable} />
+              {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
-                defaultTo={campaign.channel === "email" ? user.email : ""}
+                defaultTo={campaign.channel !== "sms" ? user.email : ""}
                 channel={campaign.channel}
                 versions={test ? versions : null}
                 loading={testSend.isPending}
@@ -320,6 +369,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                 disabled={!ready}
                 count={count}
                 test={test}
+                localTime={current.send_options?.timing === "local_time" ? (current.send_options.local_time ?? "10:00") : null}
                 scheduling={schedule.isPending || update.isPending}
                 onSchedule={async (sendAt) => {
                   if (!(await save())) return;
@@ -335,7 +385,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
       {confirmSend ? (
         <ConfirmDialog
           title="Send this campaign now?"
-          body={sendNowBody(test, count)}
+          body={
+            <>
+              {localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+              <CouponSendCheck campaignId={campaign.id} />
+            </>
+          }
           confirmLabel="Send now"
           loading={send.isPending || update.isPending}
           onConfirm={async () => {
@@ -410,9 +465,18 @@ function TestSend({ defaultTo, channel, versions, loading, disabled, onSend }: T
     .filter(Boolean);
   return (
     <div className="rounded-lg border border-zinc-200 p-3">
-      <Field label="Send a test" hint={channel === "email" ? "Comma-separated email addresses." : "Comma-separated phone numbers in +1… format."}>
+      <Field
+        label="Send a test"
+        hint={
+          channel === "email"
+            ? "Comma-separated email addresses."
+            : channel === "push"
+              ? "Email addresses of people whose devices get it. Yours includes the browsers you added in Settings → Push."
+              : "Comma-separated phone numbers in +1… format."
+        }
+      >
         <div className="flex gap-2">
-          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "email" ? "you@company.com" : "+15035550100"} disabled={disabled} />
+          <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder={channel === "sms" ? "+15035550100" : "you@company.com"} disabled={disabled} />
           {versions ? (
             <Select value={version} onChange={(e) => setPicked(e.target.value as VersionId)} disabled={disabled} aria-label="Version to test" className="w-32 shrink-0">
               {versions.map((v) => (
@@ -437,6 +501,8 @@ type SendPanelProps = {
   disabled: boolean;
   count: number | undefined;
   test: AbTest | null;
+  /** Set when it goes out at this hour on each person's clock: the schedule picks only the day. */
+  localTime: string | null;
   scheduling: boolean;
   onSchedule: (sendAt: string) => void;
   onSendNow: () => void;
@@ -447,11 +513,13 @@ function defaultSendTime(timezone: string) {
   return { date: utcToZoned(tomorrow, timezone).date, time: "10:00" };
 }
 
-function SendPanel({ timezone, initial, disabled, count, test, scheduling, onSchedule, onSendNow }: SendPanelProps) {
+function SendPanel({ timezone, initial, disabled, count, test, localTime, scheduling, onSchedule, onSendNow }: SendPanelProps) {
   const [when, setWhen] = useState(() => (initial ? utcToZoned(initial, timezone) : defaultSendTime(timezone)));
-  const sendAt = when.date && when.time ? zonedToUtc(when.date, when.time, timezone) : null;
+  const time = localTime ?? when.time;
+  const sendAt = when.date && time ? zonedToUtc(when.date, time, timezone) : null;
   const [openedAt] = useState(() => Date.now());
-  const inPast = sendAt !== null && new Date(sendAt).getTime() < openedAt;
+  // With local time, any day from today on works: zones whose hour already passed follow the late rule.
+  const inPast = sendAt !== null && (localTime ? when.date < utcToZoned(new Date(openedAt).toISOString(), timezone).date : new Date(sendAt).getTime() < openedAt);
   return (
     <div className="space-y-4 rounded-lg bg-zinc-50 p-4">
       <div>
@@ -466,23 +534,37 @@ function SendPanel({ timezone, initial, disabled, count, test, scheduling, onSch
       <div className="border-t border-zinc-200 pt-4">
         <div className="text-sm font-semibold text-zinc-900">Schedule</div>
         <p className="mb-2 text-xs text-zinc-500">
-          Times are in your account time zone ({timezone.replace(/_/g, " ")}, {tzAbbrev(timezone)}).
+          {localTime
+            ? `Pick the day. It goes out at ${clockLabel(localTime)} in each person's time zone, starting when the first time zone reaches it.`
+            : `Times are in your account time zone (${timezone.replace(/_/g, " ")}, ${tzAbbrev(timezone)}).`}
         </p>
         <div className="flex flex-wrap items-end gap-2">
           <Field label="Date">
             <Input type="date" value={when.date} onChange={(e) => setWhen({ ...when, date: e.target.value })} className="w-40" />
           </Field>
-          <Field label="Time">
-            <Input type="time" value={when.time} onChange={(e) => setWhen({ ...when, time: e.target.value })} className="w-32" />
-          </Field>
+          {localTime ? null : (
+            <Field label="Time">
+              <Input type="time" value={when.time} onChange={(e) => setWhen({ ...when, time: e.target.value })} className="w-32" />
+            </Field>
+          )}
           <Button icon={<CalendarClock className="size-3.5" />} disabled={disabled || !sendAt || inPast} loading={scheduling} onClick={() => sendAt && onSchedule(sendAt)}>
             Schedule
           </Button>
         </div>
-        {inPast ? <p className="mt-1 text-xs text-red-600">Pick a time in the future.</p> : null}
+        {inPast ? <p className="mt-1 text-xs text-red-600">{localTime ? "Pick today or a later day." : "Pick a time in the future."}</p> : null}
       </div>
     </div>
   );
+}
+
+/** The header line for a scheduled campaign. */
+function scheduledLine(sendAt: string | null, o: SendOptions | null, tz: string) {
+  if (o?.timing === "local_time" && o.local_date) {
+    const [y, m, d] = o.local_date.split("-").map(Number);
+    const day = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(y, m - 1, d)));
+    return `Goes out ${day} at ${clockLabel(o.local_time ?? "10:00")} in each person's time zone. Starts ${formatDateTime(sendAt, tz)} ${tzAbbrev(tz)}.`;
+  }
+  return `Scheduled for ${formatDateTime(sendAt, tz)} ${tzAbbrev(tz)}`;
 }
 
 /** The A/B test in one box on the review step. */

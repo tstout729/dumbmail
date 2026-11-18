@@ -24,44 +24,50 @@ pub const STATE_SQL: &str = "SELECT i.indisvalid AND i.indisready FROM pg_class 
 
 /// Check and build every index. Returns once all are in place, or another server is building them.
 pub async fn ensure(state: &AppState) -> anyhow::Result<()> {
+    build(state, LOCK_KEY, "report", INDEXES).await
+}
+
+/// The same for another module's `indexes` (name, `CREATE INDEX CONCURRENTLY ...`), under its own
+/// advisory lock `lock_key`; `what` names them in the logs ("report").
+pub async fn build(state: &AppState, lock_key: i64, what: &str, indexes: &[(&str, &str)]) -> anyhow::Result<()> {
     // A connection of its own, outside the pool, so a long build never holds one live sending needs.
     let mut conn = state.db.acquire().await?.detach();
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(LOCK_KEY).fetch_one(&mut conn).await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(lock_key).fetch_one(&mut conn).await?;
     if !got {
-        tracing::info!("another server is building the report indexes");
+        tracing::info!("another server is building the {what} indexes");
         return Ok(());
     }
     // No time limit on this connection: a cancelled build would only leave an invalid index.
     sqlx::query("SET statement_timeout = 0").execute(&mut conn).await?;
     let mut failed = Vec::new();
-    for (name, create) in INDEXES {
+    for (name, create) in indexes {
         let res: anyhow::Result<()> = async {
             let valid: Option<bool> = sqlx::query_scalar(STATE_SQL).bind(*name).fetch_optional(&mut conn).await?;
             match valid {
                 Some(true) => return Ok(()),
                 Some(false) => {
-                    tracing::warn!(index = name, "dropping an invalid report index left by an interrupted build");
-                    // `name` is one of the constants above, never input.
+                    tracing::warn!(index = name, "dropping an invalid {what} index left by an interrupted build");
+                    // `name` is one of the constants given (here or by another module), never input.
                     sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}")).execute(&mut conn).await?;
                 }
                 None => {}
             }
             let started = std::time::Instant::now();
             sqlx::query(create).execute(&mut conn).await?;
-            tracing::info!(index = name, seconds = started.elapsed().as_secs(), "built a report index");
+            tracing::info!(index = name, seconds = started.elapsed().as_secs(), "built a {what} index");
             Ok(())
         }
         .await;
         if let Err(e) = res {
-            tracing::error!(index = name, error = %format!("{e:#}"), "couldn't build a report index; trying again on the next start");
+            tracing::error!(index = name, error = %format!("{e:#}"), "couldn't build a {what} index; trying again on the next start");
             failed.push(*name);
         }
     }
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(LOCK_KEY).execute(&mut conn).await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)").bind(lock_key).execute(&mut conn).await;
     let _ = sqlx::Connection::close(conn).await;
     if failed.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("report indexes not built: {}", failed.join(", "))
+        anyhow::bail!("{what} indexes not built: {}", failed.join(", "))
     }
 }

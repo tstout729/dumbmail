@@ -480,7 +480,7 @@ async fn run_batch(state: &AppState, id: Uuid) -> AppResult<()> {
             for pid in &ids {
                 let mut changed = false;
                 for ch in &chans {
-                    changed |= consent::suppress_in(&mut tx, account_id, *pid, *ch, "manual", false, false, &src).await?;
+                    changed |= consent::suppress_in(&mut tx, account_id, *pid, *ch, "manual", false, false, &src).await?.is_some();
                 }
                 done += i64::from(changed);
             }

@@ -1,0 +1,19 @@
+{
+  "description": "the ping WooCommerce sends when a webhook is saved",
+  "doc": "https://woocommerce.github.io/woocommerce-rest-api-docs/#retrieve-an-order (example response, personal data replaced)",
+  "expect": [
+    {
+      "message": "WooCommerce's test ping for webhook 142",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "headers": {
+      "x-wc-webhook-id": "142",
+      "x-wc-webhook-source": "https://shop.example.com/"
+    },
+    "payload": {
+      "webhook_id": 142
+    }
+  }
+}
