@@ -128,7 +128,8 @@ pub fn paths(list: &[String]) -> Vec<Path> {
 pub fn paths_with(list: &[String], settings: &Map<String, Value>) -> Vec<Path> {
     static PH: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{setting:([A-Za-z0-9_-]{1,64})\}").unwrap());
     let values = |k: &str| -> Vec<String> {
-        let ok = |s: &str| !s.is_empty() && s.len() <= 100 && !s.contains(['.', '[', ']', '|', '=', '/']);
+        // A value can't hold another placeholder (no braces), so each pass removes one for good.
+        let ok = |s: &str| !s.is_empty() && s.len() <= 100 && !s.contains(['.', '[', ']', '|', '=', '/', '{', '}']);
         match settings.get(k) {
             Some(Value::String(s)) if ok(s) => vec![s.clone()],
             Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).filter(|s| ok(s)).map(String::from).take(50).collect(),
@@ -138,7 +139,10 @@ pub fn paths_with(list: &[String], settings: &Map<String, Value>) -> Vec<Path> {
     let mut out = Vec::new();
     'raw: for raw in list {
         let mut expanded = vec![raw.clone()];
-        while let Some(cap) = expanded.first().and_then(|r| PH.captures(r).map(|c| (c.get(0).unwrap().range(), c[1].to_string()))) {
+        let mut passes = 0;
+        while passes < 4 && expanded.len() <= 200 {
+            passes += 1;
+            let Some(cap) = expanded.first().and_then(|r| PH.captures(r).map(|c| (c.get(0).unwrap().range(), c[1].to_string()))) else { break };
             let (range, key) = cap;
             let vals = values(&key);
             if vals.is_empty() {
@@ -156,7 +160,13 @@ pub fn paths_with(list: &[String], settings: &Map<String, Value>) -> Vec<Path> {
             }
             expanded = next;
         }
+        if expanded.iter().any(|p| PH.is_match(p)) || expanded.len() > 200 {
+            continue;
+        }
         out.extend(expanded.iter().filter_map(|p| Path::parse(p).ok()));
+        if out.len() > 500 {
+            break;
+        }
     }
     out
 }
@@ -389,6 +399,10 @@ mod tests {
         let mut out = d.clone();
         apply(&mut out, &paths_with(&list, &settings));
         assert_eq!(out, json!({"payload": {"id": "s1", "data": {"Email": "a@example.com", "Interest": "x"}}}));
+        // A setting holding a placeholder is skipped, never expanded again.
+        let loopy = json!({"copy_fields": ["{setting:copy_fields}", "ok"]}).as_object().unwrap().clone();
+        let ps = paths_with(&["keep:a.{setting:copy_fields}".to_string()], &loopy);
+        assert_eq!(ps.len(), 1);
         assert!(Path::parse("keep:**.a").is_err());
         assert!(Path::parse("a[b]").is_err());
         assert!(Path::parse("answers[field/ref=a|b]").is_ok());
