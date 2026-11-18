@@ -582,25 +582,22 @@ fn rewrite_links(html: &str, t: &Tracking<'_>, links: Option<&dyn LinkHook>) -> 
 
 /// SMS: render the body, shorten links through click tracking and add opt-out language when needed.
 pub fn render_sms(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool) -> AppResult<String> {
-    render_sms_hooked(account, content, ctx, tracking, first_message, None)
-}
-
-/// [`render_sms`], with `links` changing each tracked link's destination first (the text keeps its length).
-pub fn render_sms_hooked(account: &Account, content: &SmsContent, ctx: &Value, tracking: Option<&Tracking<'_>>, first_message: bool, links: Option<&dyn LinkHook>) -> AppResult<String> {
     static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s]+"#).unwrap());
     let mut body = render_str(&content.body, ctx, false)?;
+    // The words the sender wrote, without links: a link that happens to contain "stop" isn't opt-out language.
+    let words = URL.replace_all(&body, " ").to_lowercase();
     if let Some(t) = tracking {
         body = URL
-            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &links.and_then(|h| h.destination(&c[0])).unwrap_or_else(|| c[0].to_string())))
+            .replace_all(&body, |c: &regex::Captures<'_>| tracked_url(t, &c[0]))
             .into_owned();
     }
     let lower = body.to_lowercase();
-    if first_message || !(lower.contains("stop") || lower.contains("opt out")) {
+    if first_message || !(words.contains("stop") || words.contains("opt out")) {
         // Carriers require the brand name and opt-out instructions.
         if !lower.starts_with(&account.name.to_lowercase()) {
             body = format!("{}: {body}", account.name);
         }
-        if !lower.contains("stop") {
+        if !words.contains("stop") {
             body.push_str(" Reply STOP to opt out.");
         }
     }
@@ -734,6 +731,20 @@ mod tests {
         let tricky: EmailContent = serde_json::from_value(json!({"subject": "s", "blocks": [{"type": "products", "items": [{"title": "{{{ 7*7 }}}{% if 1 %}x{% endif %}"}]}]})).unwrap();
         let out = render_email(&account(), &tricky, &json!({}), None).unwrap();
         assert!(!out.text.contains("49") && out.text.contains("7*7"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_link_with_stop_in_it_isnt_opt_out_language() {
+        let acct = account();
+        let t = Tracking { public_url: "https://pl.test", secret: "s", message_id: Uuid::nil(), unsubscribe_url: "https://pl.test/u/x".into() };
+        let content = SmsContent { body: "Acme: last day! https://shop.test/stop-the-sale".into(), media_url: None };
+        for tracking in [None, Some(&t)] {
+            let body = render_sms(&acct, &content, &json!({}), tracking, false).unwrap();
+            assert!(body.ends_with(" Reply STOP to opt out."), "{body}");
+        }
+        // Opt-out words the sender wrote still count.
+        let own = SmsContent { body: "Acme: sale! Text STOP to quit https://shop.test/x".into(), media_url: None };
+        assert!(!render_sms(&acct, &own, &json!({}), Some(&t), false).unwrap().ends_with("Reply STOP to opt out."));
     }
 
     #[test]

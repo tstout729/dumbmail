@@ -315,7 +315,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         message_id,
         unsubscribe_url: unsub.clone(),
     };
-    // Link tagging (UTM): resolved tags ride on the content; none renders as before (features::campaigns_plus::utm).
+    // Link tagging (UTM, email only): resolved tags ride on the content; none renders as before (features::campaigns_plus::utm).
     let link_tags = crate::features::campaigns_plus::utm::Tagger::from_content(state, spec.account, spec.content);
     let link_hook = link_tags.as_ref().map(|t| t as &dyn render::LinkHook);
 
@@ -358,7 +358,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(p.id)
             .fetch_one(&state.db)
             .await?;
-        let body = render::render_sms_hooked(spec.account, &content, &ctx, Some(&tracking), !prior_sms, link_hook)?;
+        let body = render::render_sms(spec.account, &content, &ctx, Some(&tracking), !prior_sms)?;
         (None, Rendered::Sms(OutgoingSms { message_id, to: to.clone(), from, body, media_url: content.media_url.clone() }, provider, own_provider))
     };
 
@@ -429,7 +429,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // skipped after it's handed over.
     let stop = match &rendered {
         Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational).await?,
-        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id, &to).await?,
         Rendered::Email(_) => None,
     };
     if let Some(stop) = stop {
@@ -559,22 +559,23 @@ enum Stop {
 /// The last check before the provider call, in one query against the current state: the person's
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
-async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>) -> AppResult<Option<Stop>> {
-    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>);
-    let row: Option<Row> = sqlx::query_as(
+async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>, to: &str) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<String>);
+    let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
                 CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
                 (SELECT c.status FROM campaigns c WHERE c.id = $2),
-                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, {}
          FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE p.id = $1",
-    )
+        crate::features::campaigns_plus::resend::HANDOFF_COLUMNS
+    ))
     .bind(profile_id)
     .bind(campaign_id)
     .bind(channel)
     .fetch_optional(&state.db)
     .await?;
-    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict)) = row else {
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, resend, original_to)) = row else {
         return Ok(Some(Stop::Skip("profile deleted", None)));
     };
     match campaign.as_deref() {
@@ -592,6 +593,10 @@ async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, chann
         }
         if paused {
             return Ok(Some(Stop::Skip("sending paused", None)));
+        }
+        // A resend: only to the address that got the original, and only while subscribed.
+        if let Some(why) = crate::features::campaigns_plus::resend::handoff_stop(resend, &email_consent, email.as_deref(), original_to.as_deref(), to) {
+            return Ok(Some(Stop::Skip(why, None)));
         }
         return Ok(None);
     }

@@ -1,12 +1,17 @@
 //! Resend to people who didn't open (or didn't click).
 //!
-//! A resend is an ordinary email campaign whose audience is `{"type": "resend", "id": <its own id>}`.
-//! That audience is the original's recipients whose email went out (sent or delivered, not bounced or
-//! failed), who haven't opened (or clicked) the original or an earlier resend of it, and who are
-//! subscribed to email now. Like every audience it's turned into recipients once, in the
-//! transaction that fixes the audience when the send starts (`campaigns::prepare_send`), and a retry
-//! adds nobody. Suppressions, unsubscribes, sunsetting, smart sending, billing and the last check
-//! before the hand-off apply as for any campaign. Lists and segments don't: who got the original decides.
+//! A resend is an ordinary email campaign with a row in `campaign_resends` naming its original. That
+//! row is the authority: a resend's audience and channel can't be changed through any path, and when
+//! it starts sending (`campaigns::prepare_send`) its audience is always the resend audience, and its
+//! limits are checked again in the transaction that fixes the audience ([`check_at_send`]).
+//!
+//! The audience: the original's recipients whose email went out (sent or delivered, not bounced,
+//! failed or skipped), at the same address they have now, who haven't opened (or clicked) the
+//! original or an earlier resend of it, and who are subscribed to email now. Like every audience it's
+//! turned into recipients once, when the send starts, and a retry adds nobody. Right before each email
+//! goes to the provider the address and consent are checked again ([`handoff_stop`]). Suppressions,
+//! unsubscribes, sunsetting, smart sending and billing apply as for any campaign. Lists and segments
+//! don't: who got the original decides.
 //!
 //! DumbMail doesn't record which opens came from mail privacy proxies (Apple Mail), so every recorded
 //! open counts as an open, and people whose opens we can't see may get the email again.
@@ -14,7 +19,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::campaigns::{Audience, AudienceRef};
@@ -24,12 +29,28 @@ use crate::state::AppState;
 
 /// How long after the original finished sending a resend can be made: opens need time to come in.
 pub const MIN_HOURS_AFTER: i64 = 4;
-/// How long after the original a resend can still be made or sent.
+/// How long after the original a resend can still be made or start sending.
 pub const MAX_DAYS_AFTER: i64 = 30;
 /// Resends per original.
 pub const MAX_RESENDS: i64 = 2;
 
 pub const UNDERCOUNT_NOTE: &str = "Opens are undercounted: some email apps (Apple Mail, for one) hide or fake opens, so some people who read the original will get it again. DumbMail can't tell those opens apart, so every recorded open counts.";
+
+/// When campaign `o` finished sending. Campaigns that finished before DumbMail recorded it fall back
+/// to their last message.
+const FINISHED: &str = "COALESCE(o.finished_at, GREATEST(o.sent_at, (SELECT max(fm.sent_at) FROM messages fm WHERE fm.campaign_id = o.id AND NOT fm.is_test)))";
+
+/// Slots that count against an original's limit: a resend that exists, or one that started sending.
+const HELD: &str = "(r.campaign_id IS NOT NULL OR r.started_at IS NOT NULL)";
+
+/// The conditions campaign `o` must meet to be resent, checked in the statements that create a
+/// resend and that start one. `min_hours`: how long since it finished.
+fn eligible_sql(min_hours: i64) -> String {
+    format!(
+        "o.status = 'sent' AND o.channel = 'email' AND NOT EXISTS (SELECT 1 FROM campaign_resends x WHERE x.campaign_id = o.id)
+         AND {FINISHED} <= now() - make_interval(hours => {min_hours}) AND {FINISHED} >= now() - make_interval(days => {MAX_DAYS_AFTER})"
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -69,9 +90,10 @@ pub struct ResendAudience {
 
 impl ResendAudience {
     /// A condition on `p` (a profile of the campaign's account). Driven from the original's messages
-    /// through `messages_campaign_profile_uq (campaign_id, profile_id)`.
+    /// through `messages_campaign_profile_uq (campaign_id, profile_id)`; only a person whose email
+    /// now is the address the original went to.
     pub fn push(&self, qb: &mut QueryBuilder<'_, Postgres>) {
-        qb.push("(p.email_consent = 'subscribed' AND p.id IN (SELECT m.profile_id FROM messages m WHERE m.campaign_id = ")
+        qb.push("(p.email_consent = 'subscribed' AND (p.id, lower(p.email)) IN (SELECT m.profile_id, lower(m.to_address) FROM messages m WHERE m.campaign_id = ")
             .push_bind(self.original_id)
             .push(" AND NOT m.is_test AND m.status IN ('sent', 'delivered')) AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.campaign_id = ANY(")
             .push_bind(self.family.clone())
@@ -84,33 +106,105 @@ impl ResendAudience {
     }
 }
 
-/// When the original finished sending: its last message, or when it started.
-async fn finished_at(db: &PgPool, account_id: Uuid, id: Uuid) -> AppResult<Option<DateTime<Utc>>> {
-    let row: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
-        "SELECT GREATEST(c.sent_at, (SELECT max(m.sent_at) FROM messages m WHERE m.campaign_id = c.id AND NOT m.is_test)) FROM campaigns c WHERE c.id = $1 AND c.account_id = $2",
-    )
-    .bind(id)
-    .bind(account_id)
-    .fetch_optional(db)
-    .await?;
-    row.ok_or_else(|| AppError::not_found("campaign"))
+async fn family(db: &mut PgConnection, original_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    let mut f: Vec<Uuid> = sqlx::query_scalar("SELECT campaign_id FROM campaign_resends WHERE original_id = $1 AND campaign_id IS NOT NULL").bind(original_id).fetch_all(&mut *db).await?;
+    f.push(original_id);
+    Ok(f)
 }
 
-fn too_late(finished: DateTime<Utc>) -> bool {
-    Utc::now() > finished + Duration::days(MAX_DAYS_AFTER)
-}
-
-/// The audience of resend `campaign_id`. Refused once the original is more than 30 days old.
+/// The audience of resend `campaign_id`. Refused once the original is more than 30 days old (unless
+/// the resend already started: then its audience is fixed and only reports read it).
 pub async fn resolve(db: &PgPool, account_id: Uuid, campaign_id: Uuid) -> AppResult<ResendAudience> {
-    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT original_id, target FROM campaign_resends WHERE campaign_id = $1 AND account_id = $2").bind(campaign_id).bind(account_id).fetch_optional(db).await?;
-    let (original_id, target) = row.ok_or_else(|| AppError::bad("this resend audience belongs to a resend campaign; use a list or segment"))?;
-    let finished = finished_at(db, account_id, original_id).await?;
-    if finished.is_some_and(too_late) {
-        return Err(AppError::bad(format!("the original went out more than {MAX_DAYS_AFTER} days ago; a resend must go out within {MAX_DAYS_AFTER} days of it")));
+    let row: Option<(Uuid, String, bool)> = sqlx::query_as("SELECT original_id, target, started_at IS NOT NULL FROM campaign_resends WHERE campaign_id = $1 AND account_id = $2")
+        .bind(campaign_id)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?;
+    let (original_id, target, started) = row.ok_or_else(|| AppError::bad("this resend audience belongs to a resend campaign; use a list or segment"))?;
+    if !started {
+        let fresh: bool = sqlx::query_scalar(&format!("SELECT {FINISHED} >= now() - make_interval(days => {MAX_DAYS_AFTER}) FROM campaigns o WHERE o.id = $1")).bind(original_id).fetch_one(db).await?;
+        if !fresh {
+            return Err(AppError::bad(format!("the original went out more than {MAX_DAYS_AFTER} days ago; a resend must go out within {MAX_DAYS_AFTER} days of it")));
+        }
     }
-    let mut family: Vec<Uuid> = sqlx::query_scalar("SELECT campaign_id FROM campaign_resends WHERE original_id = $1").bind(original_id).fetch_all(db).await?;
-    family.push(original_id);
-    Ok(ResendAudience { original_id, family, target: Target::parse(&target)? })
+    let mut conn = db.acquire().await?;
+    Ok(ResendAudience { original_id, family: family(&mut conn, original_id).await?, target: Target::parse(&target)? })
+}
+
+/// For sending: a resend's own audience in place of whatever its editable audience says; any other
+/// campaign's audience as it is.
+pub async fn send_audience(db: &PgPool, campaign_id: Uuid, audience: Audience) -> AppResult<Audience> {
+    let resend: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign_resends WHERE campaign_id = $1)").bind(campaign_id).fetch_one(db).await?;
+    Ok(if resend { Audience { include: vec![AudienceRef { kind: "resend".into(), id: campaign_id }], exclude: vec![] } } else { audience })
+}
+
+/// In the transaction that fixes a campaign's audience, on the connection holding its lock: for a
+/// resend whose audience isn't fixed yet, check its original is still fully sent and within 30 days and that
+/// it holds one of the two slots, then mark the slot started (kept for good). Returns why it can't
+/// go, or None (also for any campaign that isn't a resend).
+pub async fn check_at_send(db: &mut PgConnection, c: &CampaignRow) -> sqlx::Result<Option<String>> {
+    let slot: Option<Uuid> = sqlx::query_scalar("SELECT original_id FROM campaign_resends WHERE campaign_id = $1 FOR UPDATE").bind(c.id).fetch_optional(&mut *db).await?;
+    let Some(original_id) = slot else { return Ok(None) };
+    // Already fixed (a retried job, or the winner send after an A/B test): nobody is added.
+    let fixed: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL FROM campaigns WHERE id = $1").bind(c.id).fetch_one(&mut *db).await?;
+    if fixed {
+        return Ok(None);
+    }
+    if c.channel != "email" {
+        return Ok(Some("Resends are email only".into()));
+    }
+    let ok: bool = sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM campaigns o WHERE o.id = $1 AND {})", eligible_sql(MIN_HOURS_AFTER))).bind(original_id).fetch_one(&mut *db).await?;
+    if !ok {
+        return Ok(Some(format!(
+            "The original must have finished sending at least {MIN_HOURS_AFTER} hours and at most {MAX_DAYS_AFTER} days ago when a resend starts"
+        )));
+    }
+    let held: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM campaign_resends r WHERE r.original_id = $1 AND {HELD}")).bind(original_id).fetch_one(&mut *db).await?;
+    if held > MAX_RESENDS {
+        return Ok(Some(format!("The original already has {MAX_RESENDS} resends")));
+    }
+    sqlx::query("UPDATE campaign_resends SET started_at = COALESCE(started_at, now()) WHERE campaign_id = $1").bind(c.id).execute(&mut *db).await?;
+    Ok(None)
+}
+
+/// Columns added to the send path's last check before the hand-off (`sending::last_check`, where
+/// `$2` is the campaign and `p` the profile): whether it's a resend, and the address the original
+/// went to for this person.
+pub const HANDOFF_COLUMNS: &str = "EXISTS (SELECT 1 FROM campaign_resends hr WHERE hr.campaign_id = $2),
+    (SELECT ho.to_address FROM campaign_resends hr JOIN messages ho ON ho.campaign_id = hr.original_id AND ho.profile_id = p.id AND NOT ho.is_test WHERE hr.campaign_id = $2 LIMIT 1)";
+
+/// For a resend, why it mustn't go now: the person's address isn't the one the original went to (or
+/// isn't the one about to be used), or they aren't subscribed any more.
+pub fn handoff_stop(resend: bool, consent: &str, email: Option<&str>, original_to: Option<&str>, to: &str) -> Option<&'static str> {
+    if !resend {
+        return None;
+    }
+    if consent != "subscribed" {
+        return Some("not subscribed (resend)");
+    }
+    let same = |a: Option<&str>| a.is_some_and(|a| a.eq_ignore_ascii_case(to));
+    if !same(email) || !same(original_to) {
+        return Some("address changed since the original (resend)");
+    }
+    None
+}
+
+/// A resend's audience and channel stay as they were made. Refuses a change to either; the same
+/// value again (as the dashboard saves it) is fine.
+pub async fn refuse_audience_change(db: &PgPool, c: &CampaignRow, audience: Option<&Value>, channel: Option<&str>) -> AppResult<()> {
+    if audience.is_none() && channel.is_none() {
+        return Ok(());
+    }
+    let resend: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign_resends WHERE campaign_id = $1)").bind(c.id).fetch_one(db).await?;
+    if !resend {
+        return Ok(());
+    }
+    let norm = |v: &Value| serde_json::from_value::<Audience>(v.clone()).ok().map(|a| serde_json::to_value(a).unwrap_or_default());
+    let audience_changed = audience.is_some_and(|a| norm(a) != norm(&c.audience));
+    if audience_changed || channel.is_some_and(|ch| ch != c.channel) {
+        return Err(AppError::Conflict("a resend goes to the people who didn't engage with its original; its audience and channel can't be changed (duplicate it to send to a list instead)".into()));
+    }
+    Ok(())
 }
 
 /// Readiness: a resend audience only on its own campaign, alone, on email.
@@ -131,11 +225,16 @@ pub fn audience_problems(c: &CampaignRow, aud: &Audience) -> Vec<String> {
     problems
 }
 
-/// Whether `c` can be resent now, and why not.
+/// Whether `c` can be resent now, and why not (for the page; the insert checks again).
 async fn eligibility(db: &PgPool, account_id: Uuid, c: &CampaignRow) -> AppResult<Value> {
     let is_resend: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign_resends WHERE campaign_id = $1)").bind(c.id).fetch_one(db).await?;
-    let used: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_resends WHERE original_id = $1").bind(c.id).fetch_one(db).await?;
-    let finished = finished_at(db, account_id, c.id).await?;
+    let used: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM campaign_resends r WHERE r.original_id = $1 AND {HELD}")).bind(c.id).fetch_one(db).await?;
+    let finished: Option<DateTime<Utc>> = sqlx::query_scalar(&format!("SELECT {FINISHED} FROM campaigns o WHERE o.id = $1 AND o.account_id = $2 AND o.status = 'sent'"))
+        .bind(c.id)
+        .bind(account_id)
+        .fetch_optional(db)
+        .await?
+        .flatten();
     let earliest = finished.map(|f| f + Duration::hours(MIN_HOURS_AFTER));
     let latest = finished.map(|f| f + Duration::days(MAX_DAYS_AFTER));
     let now = Utc::now();
@@ -154,7 +253,7 @@ async fn eligibility(db: &PgPool, account_id: Uuid, c: &CampaignRow) -> AppResul
     } else {
         None
     };
-    Ok(json!({"ok": reason.is_none(), "reason": reason, "earliest_at": earliest, "latest_at": latest, "resends_used": used, "resends_allowed": MAX_RESENDS}))
+    Ok(json!({"ok": reason.is_none(), "reason": reason, "finished_at": finished, "earliest_at": earliest, "latest_at": latest, "resends_used": used, "resends_allowed": MAX_RESENDS}))
 }
 
 #[derive(Deserialize, Default)]
@@ -175,8 +274,9 @@ fn text(v: Option<String>, label: &str, max: usize) -> AppResult<Option<String>>
     Ok(v)
 }
 
-/// Make a draft resend of `original_id`. At most [`MAX_RESENDS`] per original, enforced by the
-/// unique slot in the insert, so two people clicking at once can't make a third.
+/// Make a draft resend of `original_id`. Every limit (original fully sent at least 4 hours and at
+/// most 30 days ago, not itself a resend, two per original) is a condition of the insert that takes
+/// the slot, so two people clicking at once can't make a third and nothing read earlier decides it.
 pub async fn create(state: &AppState, account_id: Uuid, original_id: Uuid, b: CreateBody) -> AppResult<CampaignRow> {
     let target = Target::parse(b.target.as_deref().unwrap_or("no_open"))?;
     let subject = text(b.subject, "subject", 300)?;
@@ -191,12 +291,12 @@ pub async fn create(state: &AppState, account_id: Uuid, original_id: Uuid, b: Cr
     let ab = crate::campaigns::ab_test(&o);
     let mut content = crate::campaigns::version_content(&o, ab.as_ref(), o.ab_winner.as_deref()).unwrap_or(&o.content).clone();
     super::utm::set_on(&mut content, None);
-    if let Some(o) = content.as_object_mut() {
+    if let Some(obj) = content.as_object_mut() {
         if let Some(s) = subject {
-            o.insert("subject".into(), json!(s));
+            obj.insert("subject".into(), json!(s));
         }
         if let Some(p) = preheader {
-            o.insert("preheader".into(), json!(p));
+            obj.insert("preheader".into(), json!(p));
         }
     }
     crate::features::coupons::template::check_campaign("email", &content, None)?;
@@ -215,33 +315,35 @@ pub async fn create(state: &AppState, account_id: Uuid, original_id: Uuid, b: Cr
         .bind(&over)
         .fetch_one(&mut *tx)
         .await?;
+    // Slots left by deleted drafts that never sent are free again.
+    sqlx::query("DELETE FROM campaign_resends WHERE original_id = $1 AND campaign_id IS NULL AND started_at IS NULL").bind(o.id).execute(&mut *tx).await?;
     // Take the first free slot. Two requests at once may both try slot 1: the loser's insert does
     // nothing and it tries again with a fresh view, so it gets slot 2 or finds none left.
+    let insert = format!(
+        "INSERT INTO campaign_resends (id, campaign_id, account_id, original_id, target, number)
+         SELECT $1, $2, $3, o.id, $5, v.n FROM campaigns o CROSS JOIN (VALUES (1::smallint), (2::smallint)) v(n)
+         WHERE o.id = $4 AND o.account_id = $3 AND {}
+           AND NOT EXISTS (SELECT 1 FROM campaign_resends r WHERE r.original_id = o.id AND r.number = v.n)
+         ORDER BY v.n LIMIT 1
+         ON CONFLICT (original_id, number) DO NOTHING RETURNING number",
+        eligible_sql(MIN_HOURS_AFTER)
+    );
     let mut slot: Option<i16> = None;
     for _ in 0..3 {
-        slot = sqlx::query_scalar(
-            "INSERT INTO campaign_resends (campaign_id, account_id, original_id, target, number)
-             SELECT $1, $2, $3, $4, v.n FROM (VALUES (1::smallint), (2::smallint)) v(n)
-             WHERE NOT EXISTS (SELECT 1 FROM campaign_resends r WHERE r.original_id = $3 AND r.number = v.n)
-             ORDER BY v.n LIMIT 1
-             ON CONFLICT (original_id, number) DO NOTHING RETURNING number",
-        )
-        .bind(id)
-        .bind(account_id)
-        .bind(o.id)
-        .bind(target.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
+        slot = sqlx::query_scalar(&insert).bind(Uuid::now_v7()).bind(id).bind(account_id).bind(o.id).bind(target.as_str()).fetch_optional(&mut *tx).await?;
         if slot.is_some() {
             break;
         }
-        let used: i64 = sqlx::query_scalar("SELECT count(*) FROM campaign_resends WHERE original_id = $1").bind(o.id).fetch_one(&mut *tx).await?;
+        let used: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM campaign_resends r WHERE r.original_id = $1 AND {HELD}")).bind(o.id).fetch_one(&mut *tx).await?;
         if used >= MAX_RESENDS {
             break;
         }
     }
     if slot.is_none() {
-        return Err(AppError::Conflict(format!("This campaign already has {MAX_RESENDS} resends, the most it can have.")));
+        drop(tx);
+        let e = eligibility(&state.db, account_id, &o).await?;
+        let reason = e["reason"].as_str().map(str::to_string).unwrap_or_else(|| format!("This campaign already has {MAX_RESENDS} resends, the most it can have."));
+        return Err(AppError::Conflict(reason));
     }
     tx.commit().await?;
     Ok(row)
@@ -272,7 +374,11 @@ pub async fn summary(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<
             "undercount_note": UNDERCOUNT_NOTE,
         }));
     }
-    let rows: Vec<ResendRow> = sqlx::query_as("SELECT campaign_id, target, number FROM campaign_resends WHERE original_id = $1 AND account_id = $2 ORDER BY number").bind(id).bind(account_id).fetch_all(&state.db).await?;
+    let rows: Vec<ResendRow> = sqlx::query_as("SELECT campaign_id, target, number FROM campaign_resends WHERE original_id = $1 AND account_id = $2 AND campaign_id IS NOT NULL ORDER BY number")
+        .bind(id)
+        .bind(account_id)
+        .fetch_all(&state.db)
+        .await?;
     let mut resends = Vec::with_capacity(rows.len());
     let mut family = vec![id];
     for r in &rows {
@@ -281,12 +387,15 @@ pub async fn summary(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<
         resends.push(json!({"id": rc.id, "name": rc.name, "status": rc.status, "target": r.target, "number": r.number, "send_at": rc.send_at, "sent_at": rc.sent_at, "stats": stats}));
         family.push(rc.id);
     }
+    // One population: the people the original or a resend reached. Opens and clicks count only for
+    // them, so a rate can't pass 100%.
     let (reached, opened, clicked, delivered): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT count(DISTINCT profile_id) FILTER (WHERE status IN ('sent', 'delivered', 'complained')),
-                count(DISTINCT profile_id) FILTER (WHERE opened_at IS NOT NULL OR clicked_at IS NOT NULL),
-                count(DISTINCT profile_id) FILTER (WHERE clicked_at IS NOT NULL),
-                count(*) FILTER (WHERE status IN ('sent', 'delivered', 'complained'))
-         FROM messages WHERE campaign_id = ANY($1) AND account_id = $2 AND NOT is_test",
+        "SELECT count(*) FILTER (WHERE reached), count(*) FILTER (WHERE reached AND opened), count(*) FILTER (WHERE reached AND clicked), COALESCE(sum(emails), 0)::bigint
+         FROM (SELECT bool_or(status IN ('sent', 'delivered', 'complained')) AS reached,
+                      bool_or(opened_at IS NOT NULL OR clicked_at IS NOT NULL) AS opened,
+                      bool_or(clicked_at IS NOT NULL) AS clicked,
+                      count(*) FILTER (WHERE status IN ('sent', 'delivered', 'complained')) AS emails
+               FROM messages WHERE campaign_id = ANY($1) AND account_id = $2 AND NOT is_test GROUP BY profile_id) per_person",
     )
     .bind(&family)
     .bind(account_id)
@@ -304,7 +413,7 @@ pub async fn summary(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<
 
 pub fn audience_note(t: Target) -> String {
     format!(
-        "Everyone the original went to who {} it (or an earlier resend) by the time this starts sending, and who is still subscribed. Lists and segments don't apply; unsubscribes and suppressions do.",
+        "Everyone the original went to who {} it (or an earlier resend) by the time this starts sending, at the same email address, and who is still subscribed. Lists and segments don't apply; unsubscribes and suppressions do.",
         t.label()
     )
 }

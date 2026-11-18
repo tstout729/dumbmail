@@ -310,6 +310,8 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         return Ok(());
     }
     let audience: Audience = serde_json::from_value(pre_audience.clone())?;
+    // A resend always goes to its own audience, whatever the editable one says.
+    let audience = crate::features::campaigns_plus::resend::send_audience(&state.db, campaign_id, audience).await?;
     // Only needed when this run adds recipients; a retry of a fixed audience mustn't fail on a list deleted since.
     let resolved = resolve_audience(&state.db, account_id, &channel, &audience).await;
 
@@ -327,6 +329,13 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
     // block later doesn't change what this campaign sends. A copy that can't be sent fails the
     // campaign here, before anyone gets it.
     if let Some(problem) = crate::features::content::prepare::freeze_campaign(state, &mut tx, &c).await? {
+        sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    // A resend's limits (original fully sent, 30-day window, two per original) are checked again here,
+    // and its slot is kept from now on.
+    if let Some(problem) = crate::features::campaigns_plus::resend::check_at_send(&mut tx, &c).await? {
         sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1").bind(c.id).bind(&problem).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(());
@@ -439,6 +448,7 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
         "UPDATE campaigns SET
            status = CASE WHEN awaiting_winner THEN 'testing' ELSE 'sent' END,
            ab_test_ends_at = CASE WHEN awaiting_winner THEN now() + make_interval(hours => (ab_test->>'wait_hours')::int) ELSE ab_test_ends_at END,
+           finished_at = CASE WHEN awaiting_winner THEN finished_at ELSE now() END,
            updated_at = now()
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'

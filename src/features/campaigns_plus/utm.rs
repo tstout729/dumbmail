@@ -1,4 +1,5 @@
-//! Link tagging: UTM parameters added to the web links in campaign and flow messages.
+//! Link tagging: UTM parameters added to the web links in campaign and flow emails. Text messages
+//! aren't tagged: a tracked link in a text carries the whole destination, so tags could add a segment.
 //!
 //! An account turns tagging on and sets default values (Settings → Tracking); a campaign or flow can
 //! use those, turn tagging off, or set its own values. Values may use a fixed set of variables
@@ -312,6 +313,10 @@ pub async fn load_defaults(db: &mut PgConnection, account_id: Uuid) -> sqlx::Res
 
 /// A campaign's resolved tags for one version (`{version}`), or None when its links aren't tagged.
 fn campaign_frozen(defaults: Option<&Defaults>, c: &CampaignRow, over: Option<&Override>, version: Option<&str>, send_date: &str) -> Option<Frozen> {
+    // Texts aren't tagged: a tracked link carries the whole destination, so tags could add a segment.
+    if c.channel != "email" {
+        return None;
+    }
     let (params, skip) = effective(defaults, over)?;
     let vars = Vars { campaign: Some((c.id, &c.name)), flow: None, message_name: &c.name, channel: &c.channel, send_date: send_date.to_string(), version };
     Some(Frozen { params: resolve(&params, &vars), skip_domains: skip })
@@ -370,7 +375,7 @@ pub async fn for_test(state: &AppState, c: &CampaignRow, version: Option<&str>, 
 /// A flow step's content with its tags, from the settings loaded with the flow row: no query.
 pub fn for_flow_step(account: &Account, flow: &FlowRow, node_name: Option<&str>, channel: &str, mut content: Value) -> Value {
     let defaults = parse_defaults(flow.link_tag_defaults.as_ref());
-    let frozen = effective(defaults.as_ref(), parse_override(flow.link_tags.as_ref()).as_ref()).map(|(params, skip)| {
+    let frozen = effective(defaults.as_ref(), parse_override(flow.link_tags.as_ref()).as_ref()).filter(|_| channel == "email").map(|(params, skip)| {
         let message_name = node_name.filter(|n| !n.trim().is_empty()).unwrap_or(&flow.name);
         let vars = Vars { campaign: None, flow: Some((flow.id, &flow.name)), message_name, channel, send_date: local_date(&account.timezone, Utc::now()), version: None };
         Frozen { params: resolve(&params, &vars), skip_domains: skip }
@@ -404,7 +409,7 @@ impl Tagger {
             return None;
         }
         // DumbMail's own links (tracking, unsubscribe, preferences, view online) are never tagged.
-        let mut own_hosts: Vec<String> = [Some(state.cfg.public_url()), Some(state.cfg.link_url()), state.cfg.site_url()].into_iter().flatten().filter_map(host_of).collect();
+        let mut own_hosts: Vec<String> = crate::features::content::check::configured_own_hosts(&state.cfg).into_iter().collect();
         own_hosts.extend(account.link_domain.as_deref().map(str::to_ascii_lowercase));
         Some(Tagger { params, skip_domains: f.skip_domains.into_iter().take(MAX_SKIP_DOMAINS).collect(), own_hosts })
     }
@@ -448,12 +453,11 @@ impl Tagger {
         if add.is_empty() {
             return None;
         }
-        let sep = if !base.contains('?') {
-            "?"
-        } else if base.ends_with('?') || base.ends_with('&') {
-            ""
-        } else {
-            "&"
+        // The query starts at the first `?`; later ones belong to its values (`?q=why?`).
+        let sep = match base.split_once('?') {
+            None => "?",
+            Some((_, q)) if q.is_empty() || q.ends_with('&') => "",
+            Some(_) => "&",
         };
         Some(format!("{base}{sep}{}{fragment}", add.join("&")))
     }
@@ -614,7 +618,7 @@ pub async fn flow_tags(state: &AppState, account_id: Uuid, id: Uuid) -> AppResul
         Frozen { params: resolve(&params, &vars), skip_domains: skip }
     });
     let mut v = tags_json(over.as_ref(), defaults.as_ref(), frozen);
-    v["note"] = json!("Shown for an email step named like the flow; each step uses its own name for {message_name} and its channel for {channel}.");
+    v["note"] = json!("Shown for an email step named like the flow; each email step uses its own name for {message_name}. Text message steps aren't tagged.");
     Ok(v)
 }
 
@@ -654,6 +658,8 @@ mod tests {
         assert_eq!(t.tag("https://shop.test/a?UTM_SOURCE=ig&utm_medium=x&utm_campaign=y"), None, "nothing to add");
         assert_eq!(t.tag("https://shop.test/?").unwrap(), "https://shop.test/?utm_source=dumbmail&utm_medium=email&utm_campaign=black+friday");
         assert_eq!(t.tag("https://shop.test/#/route?x=1").unwrap(), "https://shop.test/?utm_source=dumbmail&utm_medium=email&utm_campaign=black+friday#/route?x=1", "the fragment stays as is");
+        assert_eq!(t.tag("https://shop.test/s?q=why?").unwrap(), "https://shop.test/s?q=why?&utm_source=dumbmail&utm_medium=email&utm_campaign=black+friday", "a `?` inside a value isn't the start of the query");
+        assert_eq!(t.tag("https://shop.test/s?a=1&").unwrap(), "https://shop.test/s?a=1&utm_source=dumbmail&utm_medium=email&utm_campaign=black+friday");
         assert_eq!(t.tag("HTTPS://Shop.Test/x").unwrap(), "HTTPS://Shop.Test/x?utm_source=dumbmail&utm_medium=email&utm_campaign=black+friday");
     }
 

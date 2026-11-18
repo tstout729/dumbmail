@@ -321,6 +321,8 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     if !allowed.contains(&c.status.as_str()) {
         return Err(refused(&c.status));
     }
+    // A resend's audience and channel are fixed by what it resends (see `features::campaigns_plus::resend`).
+    crate::features::campaigns_plus::resend::refuse_audience_change(&state.db, &c, b.audience.as_ref(), b.channel.as_deref()).await?;
     let audience = b.audience.as_ref().map(normalize_audience).transpose()?;
     if let Some(ch) = &b.channel {
         check_channel(ch)?;
@@ -385,10 +387,19 @@ async fn patch_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
 
 /// Delete a campaign unless it has gone out (checked in the DELETE itself).
 pub async fn delete_campaign(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
-    let n = sqlx::query("DELETE FROM campaigns WHERE id = $1 AND account_id = $2 AND status NOT IN ('sending', 'testing', 'sent')").bind(id).bind(account_id).execute(&state.db).await?.rows_affected();
+    // A resend that started sending is kept too: it holds one of its original's two resend slots.
+    let n = sqlx::query(
+        "DELETE FROM campaigns WHERE id = $1 AND account_id = $2 AND status NOT IN ('sending', 'testing', 'sent')
+           AND NOT EXISTS (SELECT 1 FROM campaign_resends r WHERE r.campaign_id = campaigns.id AND r.started_at IS NOT NULL)",
+    )
+    .bind(id)
+    .bind(account_id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
     if n == 0 {
         campaigns::load(&state.db, account_id, id).await?;
-        return Err(AppError::Conflict("sent campaigns are kept for reporting and can't be deleted".into()));
+        return Err(AppError::Conflict("campaigns that went out (and resends that started) are kept for reporting and can't be deleted; archive it instead".into()));
     }
     Ok(())
 }
