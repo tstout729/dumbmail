@@ -2412,7 +2412,9 @@ ls.setItem("pl_buffer", JSON.stringify([{{ metric: "Held", time: Date.now() }}])
 listeners.visitorConsentCollected({{ detail: {{ analyticsAllowed: false, marketingAllowed: false }} }});
 window.dumbmail.track("After Stop", {{}});
 window.dumbmail.identify({{ email: "bob@example.com" }});
-setTimeout(() => console.log(JSON.stringify({{ added: added.length, before, after: posts.length - before, buffer: ls.getItem("pl_buffer"), profile: ls.getItem("pl_profile") }})), 20);
+// Scripts the embed added (the customer hub launcher the snippet loads itself doesn't count).
+const snippets = () => added.filter((s) => !String(s.src || "").includes("/client/hub.js")).length;
+setTimeout(() => console.log(JSON.stringify({{ added: snippets(), before, after: posts.length - before, buffer: ls.getItem("pl_buffer"), profile: ls.getItem("pl_profile") }})), 20);
 "#,
         onsite_json = serde_json::to_string(&onsite).unwrap()
     );
@@ -2963,7 +2965,7 @@ async fn storefront_consent_is_respected() {
     let Some(onsite) = served_snippet().await else { return };
     let run = |consent: &str, steps: &str| {
         let script = format!(
-            "{BROWSER}\nwindow.Shopify = {{ loadFeatures: (f, cb) => {{ window.Shopify.customerPrivacy = {consent}; cb(false); }} }};\n{embed}\nconst start = () => (new Function({onsite}))();\n{steps}\nsetTimeout(() => console.log(JSON.stringify({{ posts, profile: ls.getItem('pl_profile'), added: added.length }})), 20);",
+            "{BROWSER}\nwindow.Shopify = {{ loadFeatures: (f, cb) => {{ window.Shopify.customerPrivacy = {consent}; cb(false); }} }};\n{embed}\nconst start = () => (new Function({onsite}))();\n{steps}\nsetTimeout(() => console.log(JSON.stringify({{ posts, profile: ls.getItem('pl_profile'), added: added.filter((s) => !String(s.src || '').includes('/client/hub.js')).length }})), 20);",
             embed = embed_js(),
             onsite = serde_json::to_string(&onsite).unwrap()
         );
