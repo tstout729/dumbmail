@@ -190,7 +190,8 @@ fn limit_message(reason: &str, e: &str) -> String {
     match reason {
         "address_hour" => format!("{e} was sent a confirmation link in the last hour; try again later"),
         "account_day" => format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow"),
-        "address_day" => format!("{e} was sent {MAX_PER_ADDRESS_PER_DAY} confirmation links in the last 24 hours; try again tomorrow"),
+        // Doesn't say who else asked: other accounts' requests are theirs.
+        "address_day" => format!("{e} can't be sent another confirmation link today; try again tomorrow"),
         _ => format!("a confirmation link to {e} is already on its way"),
     }
 }
