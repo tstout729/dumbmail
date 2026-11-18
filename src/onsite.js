@@ -32,6 +32,16 @@
   };
   var PROFILE = "pl_profile";
   function profile() { return NO_IDENTITY ? {} : store.get(PROFILE) || {}; }
+  // The visitor's browser language, sent with their events: only a hint for which language version
+  // of a message they get (it never overwrites a language set another way).
+  function withLocale(p) {
+    // A visitor who declined marketing has no identity here, and gets no hint either.
+    if (NO_IDENTITY) return p;
+    var q = {};
+    for (var k in p) if (Object.prototype.hasOwnProperty.call(p, k)) q[k] = p[k];
+    try { if (!q.locale && navigator.language) q.locale = navigator.language; } catch (e) {}
+    return q;
+  }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
   // Set by dumbmail.stop(): nothing more is sent from this page, and nothing about the visitor's
   // activity is written to the browser's storage either.
@@ -143,7 +153,7 @@
     store.del(BUFFER);
     var p = profile();
     b.forEach(function (e) {
-      if (now() - e.time < 3 * 86400000) post("/client/events", { metric: e.metric, profile: p, properties: e.properties, value: e.value, unique_id: e.unique_id, time: e.time });
+      if (now() - e.time < 3 * 86400000) post("/client/events", { metric: e.metric, profile: withLocale(p), properties: e.properties, value: e.value, unique_id: e.unique_id, time: e.time });
     });
   }
   function send(metric, properties, value, uniqueId) {
@@ -151,7 +161,7 @@
     if (TEST) { test.event(metric, properties, value); return; }
     var ev = { metric: metric, properties: properties || {}, value: typeof value === "number" && isFinite(value) ? value : undefined, unique_id: uniqueId, time: now() };
     if (!identified()) { buffer(ev); return; }
-    post("/client/events", { metric: ev.metric, profile: profile(), properties: ev.properties, value: ev.value, unique_id: ev.unique_id, time: ev.time });
+    post("/client/events", { metric: ev.metric, profile: withLocale(profile()), properties: ev.properties, value: ev.value, unique_id: ev.unique_id, time: ev.time });
   }
 
   // ---------- Test mode ----------

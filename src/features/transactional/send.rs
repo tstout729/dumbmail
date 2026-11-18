@@ -395,6 +395,8 @@ fn unsaved_profile(account_id: Uuid, email: &str) -> Profile {
         created_at: now,
         updated_at: now,
         last_event_at: None,
+        locale: None,
+        locale_hint: None,
     }
 }
 

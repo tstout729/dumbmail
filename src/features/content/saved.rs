@@ -77,7 +77,10 @@ pub fn check_blocks(v: &Value) -> AppResult<Value> {
     walk(list, false)?;
     // Coupon tags follow the same rules as in an email (see features::coupons).
     crate::features::coupons::template::check_content("email", &serde_json::json!({"subject": "", "blocks": v}))?;
-    Ok(v.clone())
+    // Blocks get their stable keys (see features::translations::fields).
+    let mut keyed = serde_json::json!({ "blocks": v });
+    crate::features::translations::fields::assign_keys(&mut keyed);
+    Ok(keyed["blocks"].take())
 }
 
 pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {

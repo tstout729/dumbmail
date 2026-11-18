@@ -39,7 +39,22 @@ export const blockMeta: Record<EmailBlockType, { label: string; icon: LucideIcon
 
 export const blockOrder: EmailBlockType[] = ["heading", "text", "image", "button", "products", "product", "coupon", "review_request", "reviews", "columns", "divider", "spacer", "html", ...contentBlockOrder];
 
+/** A new stable key for a block ("k" and 10 hex digits): translations refer to blocks by it. */
+function newKey(): string {
+  return `k${crypto.randomUUID().replace(/-/g, "").slice(0, 10)}`;
+}
+
+/** `b` (and the blocks in its columns) with new keys: for a new block or a copy. */
+export function withKeys(b: EmailBlock): EmailBlock {
+  if (b.type === "columns") return { ...b, key: newKey(), columns: b.columns.map((col) => col.map(withKeys)) };
+  return { ...b, key: newKey() };
+}
+
 export function newBlock(type: EmailBlockType): EmailBlock {
+  return withKeys(blankBlock(type));
+}
+
+function blankBlock(type: EmailBlockType): EmailBlock {
   if (isContentType(type)) return newContentBlock(type);
   switch (type) {
     case "heading":
