@@ -104,6 +104,7 @@ export type AttributionTotals = {
   flow_revenue: number;
   email_revenue: number;
   sms_revenue: number;
+  push_revenue: number;
 };
 
 export type AttributionPreview = {

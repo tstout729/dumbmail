@@ -222,7 +222,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
+            "delay" | "email" | "sms" | "push" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -249,7 +249,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                     return Err(AppError::bad(format!("delay {} unit must be minutes, hours or days", n.id)));
                 }
             }
-            "email" | "sms" => need("content")?,
+            "email" | "sms" | "push" => need("content")?,
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
@@ -1061,6 +1061,27 @@ async fn finish(db: &PgPool, h: &Hold, status: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The message id of a push step in a run: made the first time and saved with the run, under this
+/// worker's claim (see [`Hold`]), before anything is sent; the same on every re-run of the visit.
+/// None: another worker moved the run meanwhile, so stop.
+async fn push_message_id(db: &PgPool, hold: &Hold, node_id: &str, context: &mut Value) -> anyhow::Result<Option<Uuid>> {
+    let key = format!("_push_message_{node_id}");
+    if let Some(id) = context.get(&key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        return Ok(Some(id));
+    }
+    let id = Uuid::now_v7();
+    context[key.as_str()] = json!(id);
+    let n = sqlx::query(&format!("UPDATE flow_runs SET context = $4 WHERE {HELD}"))
+        .bind(hold.run)
+        .bind(hold.claim)
+        .bind(&hold.node)
+        .bind(&*context)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok((n == 1).then_some(id))
+}
+
 /// Job: advance a run until it hits a delay or finishes. A wake-up job carries the wait it is for
 /// (`wake`, the claim id it parked the run with) and does nothing unless the run is still in that
 /// wait; a job without one does nothing while the run is waiting for its own wake-up.
@@ -1215,7 +1236,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     o.remove("_waited");
                 }
             }
-            "email" | "sms" => {
+            "email" | "sms" | "push" => {
                 // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
                 // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
@@ -1224,6 +1245,16 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                     let event = context.get("event").cloned();
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
                     let content = crate::features::campaigns_plus::utm::for_flow_step(&account, &flow, node.str("name"), &node.kind, content);
+                    // A push step's message id is stored with the run (under its claim) before it's sent, so
+                    // a re-run of the visit finds that message instead of sending a second one.
+                    let message_id = if node.kind == "push" {
+                        match push_message_id(&state.db, &hold, &node_id, &mut context).await? {
+                            Some(id) => Some(id),
+                            None => return Ok(()),
+                        }
+                    } else {
+                        None
+                    };
                     let out = sending::send(
                         state,
                         SendSpec {
@@ -1236,7 +1267,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
                             flow_node_id: Some(&node_id),
                             event: event.as_ref(),
                             is_test: false,
-                            message_id: None,
+                            message_id,
                             to_override: None,
                         },
                     )

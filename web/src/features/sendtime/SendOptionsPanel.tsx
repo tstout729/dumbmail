@@ -34,7 +34,7 @@ export function SendOptionsPanel({ campaignId, channel, audience, value, onChang
   const timing = value?.timing ?? "all_at_once";
   const set = (patch: Partial<SendOptions>) => value && onChange({ ...value, ...patch });
   const preview = useSendPreview({ campaign_id: campaignId, channel, audience, send_options: forPreview(value) });
-  const what = channel === "sms" ? "text" : "email";
+  const what = channel === "sms" ? "text" : channel === "push" ? "notification" : "email";
 
   return (
     <div className="space-y-5">
@@ -117,7 +117,7 @@ export function SendOptionsPanel({ campaignId, channel, audience, value, onChang
         <div className="min-w-0">
           <div className="text-sm font-medium text-zinc-900">Smart sending</div>
           <p className="text-xs text-zinc-500">
-            Skip people who got {channel === "sms" ? "a text" : "an email"} from any campaign or flow recently. They show as skipped in the report.
+            Skip people who got {channel === "sms" ? "a text" : channel === "push" ? "a push notification" : "an email"} from any campaign or flow recently. They show as skipped in the report.
           </p>
           {value?.smart_sending ? (
             <div className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
