@@ -1207,14 +1207,19 @@ async fn structured_data_matches_the_page() {
         let (_, v) = submit(&h, &t, json!({"rating": r, "body": "here"})).await;
         h.ok("POST", "/api/reviews/moderate", Some(json!({"ids": [v["review_id"]], "action": "publish"}))).await;
     }
+    // Before the import, the markup's rating is exactly the widget's.
+    let before = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG")).await;
+    assert_eq!(before["structured_data"]["aggregateRating"]["reviewCount"], before["summary"]["count"]);
+    assert_eq!(before["structured_data"]["aggregateRating"]["ratingValue"], before["summary"]["average"]);
     let csv = "product_id,rating,review_content,reviewer_name\nMUG,1,elsewhere,Old\n";
     h.ok("POST", "/api/reviews/import", Some(json!({"csv": csv, "confirm": true}))).await;
     h.drain().await;
     let w = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG")).await;
     assert_eq!(w["summary"]["count"], 3, "the widget shows all three");
     let ld = &w["structured_data"];
-    assert_eq!(ld["aggregateRating"]["reviewCount"], 2, "{ld}");
-    assert_eq!(ld["aggregateRating"]["ratingValue"], 4.0);
+    // Round 3, item 10: with imported reviews counted in the widget's rating, the markup has none
+    // (only the native reviews it may mark up).
+    assert!(ld.get("aggregateRating").is_none(), "{ld}");
     let shown: Vec<&str> = w["reviews"].as_array().unwrap().iter().map(|r| r["body"].as_str().unwrap()).collect();
     let marked: Vec<&str> = ld["review"].as_array().unwrap().iter().map(|r| r["reviewBody"].as_str().unwrap()).collect();
     assert_eq!(marked.len(), 2);

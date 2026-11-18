@@ -257,11 +257,6 @@ impl Subject {
         (self.review_count > 0).then(|| (self.rating_sum as f64 / f64::from(self.review_count) * 10.0).round() / 10.0)
     }
 
-    /// The average of the reviews collected here (what structured data may mark up).
-    pub fn native_average(&self) -> Option<f64> {
-        (self.native_count > 0).then(|| (self.native_sum as f64 / f64::from(self.native_count) * 10.0).round() / 10.0)
-    }
-
     /// The published summary, as widgets and emails show it.
     pub fn summary(&self) -> Value {
         json!({"average": self.average(), "count": self.review_count, "histogram": {"5": self.rating_counts.get(4), "4": self.rating_counts.get(3), "3": self.rating_counts.get(2), "2": self.rating_counts.get(1), "1": self.rating_counts.first()}})

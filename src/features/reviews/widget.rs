@@ -224,9 +224,11 @@ fn widget_settings(account: &Account, s: &store::Settings) -> Value {
 }
 
 /// Google's review snippet markup for a product page, built from the reviews the widget shows
-/// there: a `Product` with the `AggregateRating` of the reviews collected here and those of the
-/// shown reviews that were collected here (never imported ones: Google doesn't allow marking up
-/// reviews gathered on other sites). Products only, and only with a name a trusted source gave:
+/// there: a `Product` with the shown reviews that were collected here (never imported ones:
+/// Google doesn't allow marking up reviews gathered on other sites), and an `AggregateRating` only
+/// when it is exactly the rating the widget shows: a product with imported reviews has none (the
+/// widget's rating counts them, and markup may not), so its stars are never overstated or
+/// mismatched. Products only, and only with a name a trusted source gave:
 /// Google shows no stars for a business's reviews of itself (LocalBusiness, Organization), so
 /// listings and services get none.
 fn structured_data(s: &Subject, shown: &[Review], account: &Account) -> Option<Value> {
@@ -244,9 +246,14 @@ fn structured_data(s: &Subject, shown: &[Review], account: &Account) -> Option<V
                 "name": (!r.title.is_empty()).then_some(&r.title), "reviewBody": (!r.body.is_empty()).then_some(&r.body)})
         })
         .collect();
-    let mut v = json!({"@context": "https://schema.org", "@type": "Product", "name": name, "sku": s.external_id,
-        "aggregateRating": {"@type": "AggregateRating", "ratingValue": s.native_average(), "reviewCount": s.native_count, "bestRating": 5, "worstRating": 1},
-        "review": reviews});
+    let imported = s.review_count != s.native_count;
+    if imported && reviews.is_empty() {
+        return None;
+    }
+    let mut v = json!({"@context": "https://schema.org", "@type": "Product", "name": name, "sku": s.external_id, "review": reviews});
+    if !imported {
+        v["aggregateRating"] = json!({"@type": "AggregateRating", "ratingValue": s.average(), "reviewCount": s.review_count, "bestRating": 5, "worstRating": 1});
+    }
     if let Some(i) = s.trusted_image() {
         v["image"] = json!(i);
     }

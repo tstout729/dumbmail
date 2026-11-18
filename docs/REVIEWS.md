@@ -221,8 +221,11 @@ screen. Widget traffic isn't billed.
 On a product page, the product widget adds Google's review snippet markup (`Product` with
 `AggregateRating` and up to 10 `Review`s), built from the same answer as the reviews it shows (the
 first page, default order, no filters): the marked-up reviews are the ones shown there, and the
-rating counts only published reviews collected here. Imported reviews show in the widget but are
-never marked up: Google doesn't allow marking up reviews gathered on other sites. It's added only
+`AggregateRating` is exactly the rating the widget shows. Imported reviews show in the widget but are
+never marked up: Google doesn't allow marking up reviews gathered on other sites. So a product with
+imported reviews gets no `AggregateRating` at all (the widget's rating counts them); its reviews
+collected here are still marked up. The JSON-LD endpoint answers a matching `If-None-Match` from
+the product's summary version, before reading any review. It's added only
 when the product's name came from you (catalog, API or a server event) and it is a `product`. Listings and services get none:
 Google doesn't show stars for a business's reviews of itself. Turn it off with
 `data-structured-data="false"`, or fetch it for your own page template from
