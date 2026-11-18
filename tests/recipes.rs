@@ -463,6 +463,31 @@ async fn paddle_orders_refunds_and_its_marketing_consent_box() {
     h.fast_forward().await;
     h.fast_forward().await;
     assert_eq!(sent_to(&h, "We'd like you back"), vec!["sam.example@example.com"]);
+    // Sam turns marketing off in Paddle: the subscription Paddle made is withdrawn.
+    p.post(&h, "customer-updated-withdrawn.json").await;
+    assert_eq!(consent(&h, "sam.example@example.com").await.1, "unsubscribed");
+    // Lee subscribed through a sign-up form, not Paddle: Paddle's "off" leaves that consent alone.
+    h.ok("POST", "/api/profiles", Some(json!({"email": "lee.example@example.com", "email_consent": "subscribed"}))).await;
+    let mut lee = fixture("paddle", "customer-updated-withdrawn.json")["input"]["payload"].clone();
+    lee["event_id"] = json!("evt_lee_off");
+    lee["data"]["id"] = json!("ctm_lee");
+    lee["data"]["email"] = json!("lee.example@example.com");
+    p.post_as(&h, &lee.to_string(), &json!({}), &json!({}), &p.secret).await;
+    assert_eq!(consent(&h, "lee.example@example.com").await.1, "subscribed", "consent from elsewhere isn't Paddle's to withdraw");
+    // Kim: Paddle's newer "on" arrives first, then an older "off": Paddle's order wins.
+    let mut kim_on = fixture("paddle", "customer-updated-consent.json")["input"]["payload"].clone();
+    kim_on["event_id"] = json!("evt_kim_on");
+    kim_on["data"]["id"] = json!("ctm_kim");
+    kim_on["data"]["email"] = json!("kim.example@example.com");
+    kim_on["data"]["updated_at"] = json!("2024-05-02T10:00:00.000Z");
+    let mut kim_off = kim_on.clone();
+    kim_off["event_id"] = json!("evt_kim_off_old");
+    kim_off["data"]["marketing_consent"] = json!(false);
+    kim_off["data"]["updated_at"] = json!("2024-05-01T10:00:00.000Z");
+    for b in [kim_on, kim_off] {
+        p.post_as(&h, &b.to_string(), &json!({}), &json!({}), &p.secret).await;
+    }
+    assert_eq!(consent(&h, "kim.example@example.com").await, (false, "subscribed".into()), "an older 'off' doesn't undo a newer 'on'");
     let names = ["transaction-completed.json"];
     never_stored(&mut h, &p, &sensitive("paddle", &names), &names).await;
     h.cleanup().await;

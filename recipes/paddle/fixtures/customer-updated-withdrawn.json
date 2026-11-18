@@ -1,0 +1,44 @@
+{
+  "description": "the same customer turns marketing off in Paddle: unsubscribed, but only a subscription that came from Paddle, and only if no newer Paddle preference was applied",
+  "doc": "https://developer.paddle.com/webhooks/customers/customer-created (example; name and email replaced)",
+  "input": {
+    "payload": {
+      "event_id": "evt_01hv6y1jwithdrawn00000000",
+      "event_type": "customer.updated",
+      "occurred_at": "2024-04-20T10:00:00.000000Z",
+      "notification_id": "ntf_01hv6y1jk1ywdqqxd8sdtgxrsk",
+      "data": {
+        "id": "ctm_01hv6y1consent00000000000",
+        "name": "Sam Example",
+        "email": "sam.example@example.com",
+        "locale": "en",
+        "status": "active",
+        "custom_data": null,
+        "created_at": "2024-04-11T15:57:24.813Z",
+        "updated_at": "2024-04-20T10:00:00.000Z",
+        "import_meta": null,
+        "marketing_consent": false
+      }
+    }
+  },
+  "expect": [
+    {
+      "consent": [
+        {
+          "as_of": "2024-04-20T10:00:00.000Z",
+          "channel": "email",
+          "only_own": true,
+          "source": "Paddle marketing consent turned off",
+          "subscribed": false
+        }
+      ],
+      "email": "sam.example@example.com",
+      "first_name": "Sam",
+      "keys": {
+        "paddle_customer": "ctm_01hv6y1consent00000000000"
+      },
+      "last_name": "Example",
+      "type": "upsert_profile"
+    }
+  ]
+}

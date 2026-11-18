@@ -1,6 +1,51 @@
 {
   "description": "adjustment.updated: an approved refund of 1.00 USD, once by adjustment id",
   "doc": "https://developer.paddle.com/webhooks/adjustments/adjustment-updated (example; status set to approved, as the event fires when a refund is approved)",
+  "input": {
+    "payload": {
+      "event_id": "evt_01hvgfdfepj8eaevsjh5g4swbe",
+      "event_type": "adjustment.updated",
+      "occurred_at": "2024-04-15T08:54:10.646377Z",
+      "notification_id": "ntf_01hvgfdfhwncqrrjz1nz5eky9a",
+      "data": {
+        "id": "adj_01hvgf2s84dr6reszzg29zbvcm",
+        "action": "refund",
+        "transaction_id": "txn_01hv8wptq8987qeep44cyrewp9",
+        "subscription_id": "sub_01hv8x29kz0t586xy6zn1a62ny",
+        "customer_id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
+        "reason": "error",
+        "credit_applied_to_balance": null,
+        "currency_code": "USD",
+        "status": "approved",
+        "items": [
+          {
+            "id": "adjitm_01hvgf2s84dr6reszzg2gx70gj",
+            "item_id": "txnitm_01hvcc94b7qgz60qmrqmbm19zw",
+            "type": "partial",
+            "amount": "100",
+            "proration": null,
+            "totals": {
+              "subtotal": "92",
+              "tax": "8",
+              "total": "100"
+            }
+          }
+        ],
+        "totals": {
+          "subtotal": "92",
+          "tax": "8",
+          "total": "100",
+          "fee": "5",
+          "earnings": "87",
+          "currency_code": "USD",
+          "retained_fee": "5"
+        },
+        "payout_totals": null,
+        "created_at": "2024-04-15T08:48:20.239695Z",
+        "updated_at": "2024-04-15T08:54:10.646377Z"
+      }
+    }
+  },
   "expect": [
     {
       "metric": "Refunded Order",
@@ -21,50 +66,5 @@
       "unique_id": "paddle:refund:adj_01hvgf2s84dr6reszzg29zbvcm",
       "value": 1
     }
-  ],
-  "input": {
-    "payload": {
-      "data": {
-        "action": "refund",
-        "created_at": "2024-04-15T08:48:20.239695Z",
-        "credit_applied_to_balance": null,
-        "currency_code": "USD",
-        "customer_id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
-        "id": "adj_01hvgf2s84dr6reszzg29zbvcm",
-        "items": [
-          {
-            "amount": "100",
-            "id": "adjitm_01hvgf2s84dr6reszzg2gx70gj",
-            "item_id": "txnitm_01hvcc94b7qgz60qmrqmbm19zw",
-            "proration": null,
-            "totals": {
-              "subtotal": "92",
-              "tax": "8",
-              "total": "100"
-            },
-            "type": "partial"
-          }
-        ],
-        "payout_totals": null,
-        "reason": "error",
-        "status": "approved",
-        "subscription_id": "sub_01hv8x29kz0t586xy6zn1a62ny",
-        "totals": {
-          "currency_code": "USD",
-          "earnings": "87",
-          "fee": "5",
-          "retained_fee": "5",
-          "subtotal": "92",
-          "tax": "8",
-          "total": "100"
-        },
-        "transaction_id": "txn_01hv8wptq8987qeep44cyrewp9",
-        "updated_at": "2024-04-15T08:54:10.646377Z"
-      },
-      "event_id": "evt_01hvgfdfepj8eaevsjh5g4swbe",
-      "event_type": "adjustment.updated",
-      "notification_id": "ntf_01hvgfdfhwncqrrjz1nz5eky9a",
-      "occurred_at": "2024-04-15T08:54:10.646377Z"
-    }
-  }
+  ]
 }

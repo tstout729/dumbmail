@@ -1,8 +1,37 @@
 {
   "description": "customer.created without marketing consent: a held profile keyed by the Paddle customer id",
   "doc": "https://developer.paddle.com/webhooks/customers/customer-created (example; name and email replaced)",
+  "input": {
+    "payload": {
+      "event_id": "evt_01hv6y1jfh0h8ghnbm4z1fyzt7",
+      "event_type": "customer.created",
+      "occurred_at": "2024-04-11T15:57:24.974080Z",
+      "notification_id": "ntf_01hv6y1jk1ywdqqxd8sdtgxrsk",
+      "data": {
+        "id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
+        "name": "Jo Example",
+        "email": "jo.example@example.com",
+        "locale": "en",
+        "status": "active",
+        "custom_data": null,
+        "created_at": "2024-04-11T15:57:24.813Z",
+        "updated_at": "2024-04-11T15:57:24.813Z",
+        "import_meta": null,
+        "marketing_consent": false
+      }
+    }
+  },
   "expect": [
     {
+      "consent": [
+        {
+          "as_of": "2024-04-11T15:57:24.813Z",
+          "channel": "email",
+          "only_own": true,
+          "source": "Paddle marketing consent turned off",
+          "subscribed": false
+        }
+      ],
       "email": "jo.example@example.com",
       "first_name": "Jo",
       "keys": {
@@ -11,25 +40,5 @@
       "last_name": "Example",
       "type": "upsert_profile"
     }
-  ],
-  "input": {
-    "payload": {
-      "data": {
-        "created_at": "2024-04-11T15:57:24.813Z",
-        "custom_data": null,
-        "email": "jo.example@example.com",
-        "id": "ctm_01hv6y1jedq4p1n0yqn5ba3ky4",
-        "import_meta": null,
-        "locale": "en",
-        "marketing_consent": false,
-        "name": "Jo Example",
-        "status": "active",
-        "updated_at": "2024-04-11T15:57:24.813Z"
-      },
-      "event_id": "evt_01hv6y1jfh0h8ghnbm4z1fyzt7",
-      "event_type": "customer.created",
-      "notification_id": "ntf_01hv6y1jk1ywdqqxd8sdtgxrsk",
-      "occurred_at": "2024-04-11T15:57:24.974080Z"
-    }
-  }
+  ]
 }

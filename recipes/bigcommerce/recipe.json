@@ -2,7 +2,7 @@
   "key": "bigcommerce",
   "name": "BigCommerce",
   "category": "Ecommerce",
-  "description": "BigCommerce orders become events: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount). BigCommerce's webhooks only carry an id, so DumbMail fetches each order, refund and customer from your store's API. Shoppers who tick the checkout's email opt-in box are subscribed; everyone else is held back from marketing.",
+  "description": "BigCommerce orders become events: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount). BigCommerce's webhooks only carry an id, so DumbMail fetches each order, refund and customer from your store's API. Shoppers are held back from marketing unless you confirm that your checkout's email box is an unticked marketing opt-in.",
   "metrics": [
     "Placed Order",
     "Fulfilled Order",
@@ -34,7 +34,8 @@
     }
   ],
   "settings": {
-    "store_hash": ""
+    "store_hash": "",
+    "checkout_opt_in_is_marketing": false
   },
   "pull": {
     "method": "GET",
@@ -93,7 +94,8 @@
     "Pick a long random token and save it as the integration's signing secret.",
     "Create one webhook per scope with the API: POST https://api.bigcommerce.com/stores/<store_hash>/v3/hooks with {\"scope\": \"<scope>\", \"destination\": \"<webhook URL>\", \"is_active\": true, \"headers\": {\"X-Webhook-Token\": \"<the same token>\"}}. The scopes: store/order/created, store/order/updated, store/order/statusUpdated, store/order/refund/created, store/customer/created, store/customer/updated.",
     "Place a test order and check the delivery log: each webhook is followed by a fetch of the order.",
-    "To import past orders, use Import history in the Pull tab. Imported orders are marked historical."
+    "To import past orders, use Import history in the Pull tab. Imported orders are marked historical.",
+    "Shoppers are held back from marketing. BigCommerce's order records whether the shopper ticked the checkout's email box (is_email_opt_in), but that box can be pre-ticked and its wording is yours. Only if your checkout box starts unticked and clearly asks for marketing email, set checkout_opt_in_is_marketing to true in the settings: then shoppers who tick it are subscribed."
   ],
   "flows": []
 }

@@ -64,6 +64,14 @@ pub struct Consent {
     pub subscribed: bool,
     /// Where the opt-in (or opt-out) happened, e.g. "Stripe Checkout marketing checkbox".
     pub source: String,
+    /// The app's own time for this preference. A change older than the last one this integration
+    /// applied for the person is ignored, so preferences apply in the app's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// With `subscribed: false`: withdraw only a subscription this integration made (the person's
+    /// latest opt-in came from it); consent from anywhere else is left alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_own: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -308,6 +316,12 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                     return Err(format!("action {i} ({k}): needs an email, phone_number or external_id"));
                 }
                 for c in &a.consent {
+                    if c.as_of.as_deref().is_some_and(|t| parse_time(t).is_none()) {
+                        return Err(format!("action {i} ({k}): consent as_of must be an ISO 8601 date-time"));
+                    }
+                    if c.only_own && c.subscribed {
+                        return Err(format!("action {i} ({k}): consent only_own goes with subscribed: false"));
+                    }
                     if c.source.trim().is_empty() || c.source.len() > 200 {
                         return Err(format!("action {i} ({k}): each consent needs a `source` (1-200 characters) saying where they opted in"));
                     }
@@ -924,7 +938,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     out.effect(i, format!("would unsubscribe {} from {ch}", who_label(&u.profile)));
                     continue;
                 }
-                unsubscribe(state, src, found.id, u.channel).await?;
+                unsubscribe(state, src, found.id, u.channel, None).await?;
                 out.effect(i, format!("unsubscribed {} from {ch}", who_label(&u.profile)));
             }
             Action::Suppress(s) => {
@@ -939,7 +953,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     after_write(state, src, found.id, false, s.email.as_deref(), true, out).await?;
                 }
                 if s.phone_number.is_some() {
-                    unsubscribe(state, src, found.id, Channel::Sms).await?;
+                    unsubscribe(state, src, found.id, Channel::Sms, None).await?;
                 }
                 out.effect(i, format!("stopped all marketing to {}", who_label(&who)));
             }
@@ -1090,8 +1104,45 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
 /// Record a consent change the script vouches for. Subscribing never overrides an earlier unsubscribe.
 async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) -> AppResult<String> {
     let (col, label) = if c.channel == Channel::Email { ("email_consent", "email") } else { ("sms_consent", "SMS") };
+    let (sub_metric, unsub_metric) = if c.channel == Channel::Email { ("Subscribed to Email Marketing", "Unsubscribed") } else { ("Subscribed to SMS Marketing", "Unsubscribed from SMS") };
+    let as_of = c.as_of.as_deref().and_then(parse_time);
+    if let Some(t) = as_of {
+        // An older preference than one this integration already applied changes nothing.
+        let newer: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM events e JOIN metrics m ON m.id = e.metric_id
+              WHERE e.profile_id = $1 AND e.account_id = $2 AND m.name = ANY($3) AND e.properties->>'integration_id' = $4
+                AND (e.properties->>'as_of')::timestamptz >= $5)",
+        )
+        .bind(profile_id)
+        .bind(src.account_id)
+        .bind(vec![sub_metric, unsub_metric])
+        .bind(src.integration_id.to_string())
+        .bind(t)
+        .fetch_one(&state.db)
+        .await?;
+        if newer {
+            return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
+        }
+    }
     if !c.subscribed {
-        unsubscribe(state, src, profile_id, c.channel).await?;
+        if c.only_own {
+            // Only a subscription this integration made: the person's latest opt-in came from it.
+            let own: bool = sqlx::query_scalar(&format!(
+                "SELECT p.{col} = 'subscribed' AND COALESCE((SELECT e.properties->>'integration_id' FROM events e JOIN metrics m ON m.id = e.metric_id
+                   WHERE e.profile_id = p.id AND e.account_id = p.account_id AND m.name = $3 ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) = $4, false)
+                 FROM profiles p WHERE p.id = $1 AND p.account_id = $2"
+            ))
+            .bind(profile_id)
+            .bind(src.account_id)
+            .bind(sub_metric)
+            .bind(src.integration_id.to_string())
+            .fetch_one(&state.db)
+            .await?;
+            if !own {
+                return Ok(format!("; {label} consent left alone (it didn't come from this app)"));
+            }
+        }
+        unsubscribe(state, src, profile_id, c.channel, as_of).await?;
         return Ok(format!("; unsubscribed from {label}"));
     }
     // Only people who never subscribed (or are waiting to confirm) become subscribed.
@@ -1108,7 +1159,7 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
             account_id: src.account_id,
             profile_id,
             metric,
-            properties: json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id}),
+            properties: json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}),
             value: None,
             occurred_at: None,
             unique_id: None,
@@ -1119,7 +1170,7 @@ async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) 
     Ok(format!("; subscribed to {label} (source: {})", c.source))
 }
 
-async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel) -> AppResult<()> {
+async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel, as_of: Option<DateTime<Utc>>) -> AppResult<()> {
     let (col, metric) = if channel == Channel::Email { ("email_consent", "Unsubscribed") } else { ("sms_consent", "Unsubscribed from SMS") };
     let q = format!("UPDATE profiles SET {col} = 'unsubscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND {col} <> 'unsubscribed'");
     let n = sqlx::query(&q).bind(profile_id).bind(src.account_id).execute(&state.db).await?.rows_affected();
@@ -1130,7 +1181,7 @@ async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: 
                 account_id: src.account_id,
                 profile_id,
                 metric,
-                properties: json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id}),
+                properties: json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}),
                 value: None,
                 occurred_at: None,
                 unique_id: None,

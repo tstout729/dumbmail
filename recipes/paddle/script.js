@@ -8,7 +8,8 @@
 // Customers (customer.created, customer.updated) become profiles keyed by the Paddle customer id;
 // transactions, adjustments and subscriptions find them by it and wait (retry) when the customer
 // hasn't arrived yet. A customer whose marketing_consent is true ticked Paddle Checkout's marketing
-// box, so they're subscribed to email; nobody else is.
+// box, so they're subscribed to email; nobody else is. A later change to false unsubscribes a
+// subscription that came from Paddle (and leaves consent from anywhere else alone).
 // See README.md for the Paddle page behind each assumption.
 
 var ZERO_DECIMAL = ["JPY", "KRW"];
@@ -59,7 +60,11 @@ function handle(input) {
       p.first_name = parts.shift();
       if (parts.length) p.last_name = parts.join(" ");
     }
-    if (d.marketing_consent === true) p.consent = [{ channel: "email", subscribed: true, source: "Paddle Checkout marketing consent box" }];
+    // Preferences apply in Paddle's order (its updated_at); turning marketing off withdraws only a
+    // subscription that came from Paddle, never consent the person gave somewhere else.
+    var asOf = d.updated_at || e.occurred_at;
+    if (d.marketing_consent === true) p.consent = [{ channel: "email", subscribed: true, source: "Paddle Checkout marketing consent box", as_of: asOf }];
+    else if (d.marketing_consent === false) p.consent = [{ channel: "email", subscribed: false, source: "Paddle marketing consent turned off", as_of: asOf, only_own: true }];
     return [p];
   }
 

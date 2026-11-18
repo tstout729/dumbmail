@@ -9,7 +9,8 @@
 // Placed Order: once per order, when its status says it's been paid. Fulfilled Order: once, when
 // Shipped or Completed. Cancelled Order: once. Refunded Order: once per refund, with its own amount,
 // unless every payment in it was declined. A shopper who ticked the checkout's email opt-in box
-// (is_email_opt_in) is subscribed to email; nobody else is.
+// (is_email_opt_in) is subscribed to email only when settings.checkout_opt_in_is_marketing is true
+// (the installer confirms the box is an unticked marketing opt-in); otherwise everyone is held.
 
 // Order status ids (GET /v2/order_statuses).
 var PAID = [2, 3, 4, 8, 9, 10, 11, 13, 14]; // Shipped, Partially Shipped, Refunded, Awaiting Pickup, Awaiting Shipment, Completed, Awaiting Fulfillment, Disputed, Partially Refunded
@@ -46,6 +47,8 @@ function e164(phone, country) {
   return undefined;
 }
 
+var input_settings = {};
+
 function orderActions(o, ctx, historical) {
   if (!o || !o.id) return [{ type: "log", message: "no order in the answer" }];
   if (o.status_id === 0 || o.is_deleted) return [{ type: "log", message: "order " + o.id + " is incomplete or archived" }];
@@ -58,7 +61,9 @@ function orderActions(o, ctx, historical) {
   var ph = e164(b.phone, b.country_iso2);
   if (ph) p.phone_number = ph;
   if (o.customer_id > 0) p.keys = { bigcommerce_customer: String(o.customer_id) };
-  if (o.is_email_opt_in === true) p.consent = [{ channel: "email", subscribed: true, source: "BigCommerce checkout email opt-in" }];
+  // Only when the installer has confirmed the store's checkout box is an unticked, affirmative
+  // marketing opt-in: BigCommerce describes is_email_opt_in only as agreeing "to receive emails".
+  if (o.is_email_opt_in === true && input_settings.checkout_opt_in_is_marketing === true) p.consent = [{ channel: "email", subscribed: true, source: "BigCommerce checkout email opt-in" }];
   var out = [p];
   var currency = o.default_currency_code || o.currency_code;
   var base = clean({ order_id: o.id, status: o.status, currency: currency, channel_id: o.channel_id, historical: historical || undefined });
@@ -136,6 +141,7 @@ function idOf(v) {
 }
 
 function handle(input) {
+  input_settings = input.settings || {};
   if (input.source === "fetch") return fetched(input);
   if (input.source === "pull") return pulled(input);
   var e = input.payload || {};

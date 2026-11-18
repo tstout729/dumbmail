@@ -1,15 +1,8 @@
 {
-  "description": "Shipped, and the shopper ticked the checkout's email opt-in: Fulfilled Order, and subscribed to email",
+  "description": "Shipped, and the shopper ticked the checkout's email box, but the installer hasn't confirmed it's an unticked marketing opt-in: Fulfilled Order, not subscribed",
   "doc": "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order (example response, trimmed; personal data replaced)",
   "expect": [
     {
-      "consent": [
-        {
-          "channel": "email",
-          "source": "BigCommerce checkout email opt-in",
-          "subscribed": true
-        }
-      ],
       "email": "casey.example@example.com",
       "first_name": "Casey",
       "keys": {
