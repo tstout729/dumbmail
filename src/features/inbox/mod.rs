@@ -57,8 +57,8 @@ pub async fn inbound(state: &AppState, scope: Option<Uuid>, msg: &Inbound, proof
     };
     let stop = optout::classify(&msg.text, msg.provider_signal.as_deref()) == optout::Class::Stop;
     // Every account the number is assigned to (whatever the URL), and how it texts.
-    let claims: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT DISTINCT a.id, a.sms_mode, a.sms_byo_provider FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
+    let claims: Vec<(Uuid, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT DISTINCT a.id, a.sms_mode, a.sms_byo_provider, a.closed_at IS NOT NULL FROM accounts a LEFT JOIN phone_numbers n ON n.account_id = a.id AND n.status <> 'released'
          WHERE a.sms_from = $1 OR n.phone_number = $1",
     )
     .bind(&to)
@@ -74,15 +74,24 @@ pub async fn inbound(state: &AppState, scope: Option<Uuid>, msg: &Inbound, proof
         many => {
             tracing::error!(provider = msg.provider, message, to = %to, accounts = many.len(), "inbound text for a number several accounts claim; nothing stored in any");
             if stop {
-                let ids: Vec<Uuid> = many.iter().map(|(id, _, _)| *id).collect();
+                let ids: Vec<Uuid> = many.iter().map(|(id, ..)| *id).collect();
                 claim_conflict_alert(state, &to, &ids).await;
             }
             return Ok(());
         }
     };
-    let (account_id, mode, byo_provider) = owner;
+    let (account_id, mode, byo_provider, closed) = owner;
     // The URL used is the platform's or this account's own: only then may it write anything here.
     let url_fits = scope.is_none_or(|s| s == account_id);
+    // A closed account keeps only opt-outs: no conversation, keyword, reply or flow.
+    if closed {
+        if url_fits && stop {
+            tracing::info!(provider = msg.provider, to = %to, "opt-out for a closed account; recorded, text not stored");
+            return store::opt_out_only(&state.db, account_id, &from, &to).await;
+        }
+        tracing::info!(provider = msg.provider, to = %to, "inbound text for a closed account; not stored");
+        return Ok(());
+    }
     // And the connection that verified it is the one the number belongs to.
     let connection_fits = url_fits
         && match (scope, mode.as_str()) {

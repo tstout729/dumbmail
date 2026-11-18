@@ -462,6 +462,7 @@ mod tests {
             created_at: Utc::now(),
             sending_paused_at: None,
             sending_paused_reason: None,
+            closed_at: None,
             email_daily_limit_override: None,
             email_sunset_enabled: true,
             link_domain: None,

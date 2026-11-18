@@ -8,6 +8,7 @@ import { EmailEditor } from "../../components/email/EmailEditor";
 import { CheckPanel } from "../../features/content/CheckPanel";
 import { FlowCanvas, nodeIcons } from "../../components/flows/FlowCanvas";
 import { FlowSettingsEditor } from "../../components/flows/FlowSettingsEditor";
+import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
 import { countDescendants, insertAt, isBranch, newNode, nodeLabels, removeNode, replaceNode, triggerSummary, type Slot } from "../../components/flows/graph";
 import { DeleteStepButton, NodeEditor } from "../../components/flows/NodeEditor";
 import { TriggerEditor } from "../../components/flows/TriggerEditor";
@@ -174,6 +175,9 @@ function FlowBuilder({ flow }: { flow: Flow }) {
       {panel?.kind === "settings" ? (
         <Drawer title="Flow settings" onClose={() => setPanel(null)} width="w-[min(720px,100vw)]">
           <FlowSettingsEditor settings={def.settings ?? {}} onChange={(settings) => editDef({ ...def, settings })} />
+          <div className="mt-4">
+            <LinkTagsPanel kind="flow" id={flow.id} />
+          </div>
         </Drawer>
       ) : null}
       {selectedNode ? (

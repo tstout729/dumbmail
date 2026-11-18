@@ -13,6 +13,8 @@ import { contentSnippet, metricLabels, versionContent, versionIds, versionLabel,
 import { ChannelIcon } from "./CampaignsPage";
 import { SendProgressCard } from "../../features/sendtime/SendProgressCard";
 import { LanguageResults } from "../../features/translations/LanguageResults";
+import { LinkTagsPanel } from "../../features/campaignsPlus/LinkTagsPanel";
+import { ResendPanel } from "../../features/campaignsPlus/ResendPanel";
 
 export function CampaignReportView({ campaign }: { campaign: Campaign }) {
   const { account } = useSession();
@@ -73,6 +75,7 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
           </Notice>
         </div>
       ) : null}
+      <ResendPanel campaign={campaign} />
       {ab ? <AbTestResults campaign={campaign} ab={ab} totalRecipients={stats.recipients} timezone={tz} /> : null}
       <SendProgressCard campaignId={campaign.id} live={campaign.status === "sending"} timezone={tz} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -140,6 +143,9 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
         <LanguageResults campaignId={campaign.id} sent={campaign.status === "sent" || campaign.status === "sending"} />
       </div>
       {report.error ? <p className="mt-3 text-sm text-red-600">{report.error.message}</p> : null}
+      <div className="mt-4">
+        <LinkTagsPanel kind="campaign" id={campaign.id} disabled />
+      </div>
       {viewing && viewed ? (
         <Modal title={viewVersions.length > 1 ? versionLabel(viewing) : "Message"} onClose={() => setViewing(null)} size="lg">
           {viewVersions.length > 1 ? (

@@ -28,6 +28,10 @@ pub struct Account {
     /// `deliverability`); campaigns, flows and tests send no email until an operator lifts it.
     pub sending_paused_at: Option<DateTime<Utc>>,
     pub sending_paused_reason: Option<String>,
+    /// Set when the account was closed (its only owner's login was given up, see
+    /// `features::team::google_link`). A closed account sends, runs and pays for nothing.
+    #[serde(skip)]
+    pub closed_at: Option<DateTime<Utc>>,
     /// Operator-set 24-hour email limit in place of the automatic warm-up (see `deliverability`).
     #[serde(skip)]
     pub email_daily_limit_override: Option<i32>,
@@ -148,6 +152,14 @@ pub struct FlowRow {
     pub definition: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Link tagging choice and, where messages are sent, the account's settings (see
+    /// `features::campaigns_plus::utm`). Not part of the flow the API returns.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tags: Option<Value>,
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub link_tag_defaults: Option<Value>,
     /// Imported and needing review before it can go live; see `features::klaviyo_import::review`.
     #[sqlx(default)]
     pub import_review: Option<Value>,
@@ -261,6 +273,12 @@ pub fn normalize_phone(p: &str) -> Option<String> {
 /// `pending`: signed up through a double opt-in form and hasn't confirmed yet; gets no email but the confirmation.
 pub fn valid_consent(s: &str) -> bool {
     matches!(s, "subscribed" | "unsubscribed" | "never_subscribed" | "pending")
+}
+
+/// Whether an account is closed. Every place that starts work for an account asks this (or reads
+/// [`Account::closed_at`] from a row it already has) and does nothing for a closed one.
+pub async fn account_closed<'e>(db: impl sqlx::PgExecutor<'e>, account_id: uuid::Uuid) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT closed_at IS NOT NULL FROM accounts WHERE id = $1").bind(account_id).fetch_optional(db).await?.unwrap_or(false))
 }
 
 #[cfg(test)]

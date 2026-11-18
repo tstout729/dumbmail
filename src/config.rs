@@ -185,6 +185,28 @@ pub struct Config {
     /// Price per 1,000 machine-translated characters on the hosted service, in dollars (0: free).
     #[arg(long, env = "PRICE_TRANSLATION_PER_1000_CHARS", default_value_t = 0.0)]
     pub price_translation_per_1000_chars: f64,
+
+    /// Ad audience sync (see docs/AD_AUDIENCES.md). A platform whose app credentials are unset shows
+    /// as "not available on this server". Meta app for Facebook Login with the ads_management permission.
+    #[arg(long, env = "META_APP_ID")]
+    pub meta_app_id: Option<String>,
+    #[arg(long, env = "META_APP_SECRET", hide_env_values = true)]
+    pub meta_app_secret: Option<String>,
+    /// Google OAuth web client for Google Ads Customer Match (Data Manager API).
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_ID")]
+    pub google_ads_client_id: Option<String>,
+    #[arg(long, env = "GOOGLE_ADS_CLIENT_SECRET", hide_env_values = true)]
+    pub google_ads_client_secret: Option<String>,
+    /// TikTok API for Business app.
+    #[arg(long, env = "TIKTOK_APP_ID")]
+    pub tiktok_app_id: Option<String>,
+    #[arg(long, env = "TIKTOK_APP_SECRET", hide_env_values = true)]
+    pub tiktok_app_secret: Option<String>,
+    /// A loopback stand-in for every ad platform API host, for tests only. It can't be set from the
+    /// environment or the command line, and anything other than `http://127.0.0.1:…` or
+    /// `http://localhost:…` is ignored.
+    #[arg(skip)]
+    pub ad_platform_api_base: Option<String>,
 }
 
 impl Config {

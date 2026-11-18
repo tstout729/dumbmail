@@ -91,6 +91,8 @@ pub trait EmailProvider: Send + Sync {
     fn sent(&self) -> Vec<OutgoingEmail> {
         Vec::new()
     }
+    /// Forget the messages kept in memory (log provider only; for tests).
+    fn clear_sent(&self) {}
 }
 
 /// Build an RFC 5322 MIME message with text and HTML parts.
@@ -178,6 +180,11 @@ impl EmailProvider for LogEmail {
     }
     fn sent(&self) -> Vec<OutgoingEmail> {
         self.sent.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+    fn clear_sent(&self) {
+        if let Ok(mut s) = self.sent.lock() {
+            s.clear();
+        }
     }
 }
 

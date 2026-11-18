@@ -934,3 +934,25 @@ async fn translations_cost_no_statements_per_recipient_and_a_campaign_keeps_one_
     assert!(!p["html"].as_str().unwrap().contains("FORGED") && p["html"].as_str().unwrap().contains("Plus de messages"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_localized_link_gets_the_same_link_tags_as_the_original() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    set_languages(&mut h, json!(["fr"])).await;
+    h.ok("PUT", "/api/link-tags", Some(json!({"enabled": true, "params": {"source": "dumbmail", "medium": "email"}}))).await;
+    let ann = person(&mut h, "ann@x.test", Some("fr")).await;
+    let bob = person(&mut h, "bob@x.test", None).await;
+    let list = list_of(&mut h, &[ann, bob]).await;
+    let content = json!({"subject": "Hi", "blocks": [{"type": "button", "text": "Shop", "href": "https://acme.test/en"}]});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": content, "language": "fr", "strings": [{"id": "b0:href", "text": "https://acme.test/fr"}]}))).await;
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Tagged", "audience": {"include": [{"type": "list", "id": list}]}, "content": v["content"]}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let sent = h.state.email.sent();
+    let html = |to: &str| sent.iter().find(|m| m.to == to).unwrap().html.replace("%3F", "?").replace("%3D", "=").replace("%26", "&").replace("%2F", "/").replace("%3A", ":");
+    assert!(html("ann@x.test").contains("https://acme.test/fr?utm_source=dumbmail&utm_medium=email"), "{}", html("ann@x.test"));
+    assert!(html("bob@x.test").contains("https://acme.test/en?utm_source=dumbmail&utm_medium=email"));
+    h.cleanup().await;
+}

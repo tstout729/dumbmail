@@ -172,9 +172,7 @@ pub fn localize_saved(saved: &mut SavedMap, lang: &str, own: &[String]) {
 /// account's branded link domain): links there (unsubscribe, preferences, tracking) can't be
 /// localized, and no localized link can point there.
 pub fn own_hosts(state: &AppState, account: Option<&Account>) -> Vec<String> {
-    let host = |u: &str| url::Url::parse(u).ok().and_then(|p| p.host_str().map(str::to_ascii_lowercase));
-    let mut v: Vec<String> = [Some(state.cfg.public_url()), Some(state.cfg.link_url()), state.cfg.site_url()].into_iter().flatten().filter_map(host).collect();
-    v.extend(state.cfg.redirect_hosts.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()));
+    let mut v: Vec<String> = crate::features::content::check::configured_own_hosts(&state.cfg).into_iter().collect();
     if let Some(d) = account.and_then(|a| a.link_domain.as_deref()) {
         v.push(d.trim().to_ascii_lowercase());
     }

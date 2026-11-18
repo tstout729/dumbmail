@@ -35,8 +35,24 @@ export type TeamSessionInfo = {
   two_factor_enabled: boolean;
   /** How this login can sign in, for confirming it's you. */
   login_methods: { password: boolean; google: boolean };
+  /** Whether the login's email address is proven to be theirs. */
+  email_confirmed: boolean;
   accounts: AccountChoice[];
 };
+
+/** A Google sign-in waiting on the person's choice (`/link-google`). */
+export type GoogleLinkInfo = {
+  email: string;
+  login_created_at: string;
+  /** The day the existing login was made, ready to show. */
+  login_created_on: string;
+  has_password: boolean;
+  can_start_fresh: boolean;
+  expires_in_minutes: number;
+};
+
+/** What finishing a Google link answers: the new session, and where to go. */
+export type GoogleLinkSession = TeamSession & { next: string };
 
 export type TeamSession = Session & TeamSessionInfo;
 
