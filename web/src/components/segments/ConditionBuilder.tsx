@@ -19,6 +19,7 @@ import { useCatalogFacets } from "../../features/catalog/api";
 import type { ProductCondition } from "../../features/catalog/types";
 import { CouponConditionFields } from "../../features/coupons/CouponConditionFields";
 import { ObjectConditionFields } from "../../features/objects/ObjectConditionFields";
+import { ReviewConditionFields } from "../../features/reviews/ReviewConditionFields";
 import { LanguageConditionFields } from "../../features/translations/LanguageConditionFields";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
 import { IconButton, Input, Select, cx } from "../ui";
@@ -331,6 +332,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
       return <CouponConditionFields condition={c} onChange={onChange} />;
     case "object":
       return <ObjectConditionFields condition={c} onChange={onChange} />;
+    case "review":
+      return <ReviewConditionFields condition={c} onChange={onChange} />;
     case "list":
       return (
         <>

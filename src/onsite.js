@@ -860,6 +860,7 @@
     setTimeout(function () { if (!pv.cands.length) scanProduct(); }, 2500);
     countPageView();
     if (formsCache) runForms(formsCache);
+    setTimeout(loadReviews, 700);
   }
   function hookRoutes() {
     each(["pushState", "replaceState"], function (m) {
@@ -1084,6 +1085,19 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  // Review widgets load their own code, and only on pages that have one (see the Reviews page in DumbMail).
+  var reviewsLoading = false;
+  function loadReviews() {
+    if (ONLY_FORM) return;
+    if (window.__dumbmailReviews) { window.__dumbmailReviews.scan(); return; }
+    if (reviewsLoading || !document.querySelector("[data-dumbmail-reviews],[data-dumbmail-stars],[data-dumbmail-reviews-carousel],[data-dumbmail-reviews-all]")) return;
+    reviewsLoading = true;
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = BASE + "/client/reviews.js?k=" + encodeURIComponent(KEY);
+    (document.head || document.documentElement).appendChild(s);
+  }
+
   // Web push (when the account turned it on) lives in its own small script; browsers that can't
   // show notifications never load it.
   function loadPush() {
@@ -1106,6 +1120,7 @@
       hookOpeners();
       countPageView();
       if (AUTO) { hookLayer(); scanProduct(); scanCheckout(); }
+      loadReviews();
     }
     firstSeen();
     loadForms(function (forms) {

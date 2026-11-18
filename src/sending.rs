@@ -162,15 +162,24 @@ pub struct Conversational {
 }
 
 pub async fn send(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
-    send_with(state, spec, None).await
+    send_with(state, spec, None, false).await
+}
+
+/// [`send`] under the strict marketing rules, which the last check before the provider applies in
+/// its own statement: an email needs the person subscribed (not just never asked), and a marketing
+/// hold blocks it with no exception (service-message flows included); a text is held back by a
+/// marketing hold too. Also used by review reminders: the same check refuses one whose request was
+/// answered meanwhile (see `features::reviews::requests::answered_sql`).
+pub async fn send_strict_marketing(state: &AppState, spec: SendSpec<'_>) -> AppResult<Outcome> {
+    send_with(state, spec, None, true).await
 }
 
 /// Send a conversational SMS through the normal path (billing, provider, bookkeeping, events).
 pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversational: &Conversational) -> AppResult<Outcome> {
-    send_with(state, spec, Some(conversational)).await
+    send_with(state, spec, Some(conversational), false).await
 }
 
-async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
+async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>, strict: bool) -> AppResult<Outcome> {
     // A closed account sends nothing on any channel: campaigns, flows, replies, alerts, tests.
     if spec.account.closed_at.is_some() {
         if spec.is_test {
@@ -330,6 +339,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     coupons.fill(&mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
+    // Review request blocks and links are made for this person (see features::reviews).
+    let filled = match crate::features::reviews::personalize(state, spec.account, Some(p), spec.event, &content, spec.channel, spec.is_test, Some(message_id)).await? {
+        std::borrow::Cow::Owned(v) => Some(v),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    let content = match filled {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => content,
+    };
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,
@@ -452,8 +470,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // that opted out), so an opt-out that committed first always wins and nothing can mark it
     // skipped after it's handed over.
     let stop = match &rendered {
-        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational).await?,
-        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id, spec.flow_id, &to).await?,
+        Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational, strict).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, &spec, p.id, message_id, &to, strict).await?,
         Rendered::Email(_) => None,
     };
     if let Some(stop) = stop {
@@ -583,27 +601,34 @@ enum Stop {
 /// The last check before the provider call, in one query against the current state: the person's
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
-async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>, flow_id: Option<Uuid>, to: &str) -> AppResult<Option<Stop>> {
-    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, bool, Option<String>);
+async fn last_check(state: &AppState, spec: &SendSpec<'_>, profile_id: Uuid, message_id: Uuid, to: &str, strict: bool) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, bool, Option<String>, bool);
+    let (account, channel, campaign_id) = (spec.account, spec.channel, spec.campaign_id);
     let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
                 CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
                 (SELECT c.status FROM campaigns c WHERE c.id = $2),
-                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, {}, {}
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, CASE WHEN $5 THEN p.marketing_hold ELSE {} END, {}, {}
          FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE p.id = $1",
         crate::marketing_hold::blocks_email_sql("$4"),
-        crate::features::campaigns_plus::resend::HANDOFF_COLUMNS
+        crate::features::campaigns_plus::resend::HANDOFF_COLUMNS,
+        crate::features::reviews::requests::answered_sql("$5", "$6")
     ))
     .bind(profile_id)
     .bind(campaign_id)
     .bind(channel)
-    .bind(flow_id)
+    .bind(spec.flow_id)
+    .bind(strict)
+    .bind(message_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held, resend, original_to)) = row else {
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held, resend, original_to, answered)) = row else {
         return Ok(Some(Stop::Skip("profile deleted", None)));
     };
+    if answered {
+        return Ok(Some(Stop::Skip(crate::features::reviews::requests::ANSWERED, None)));
+    }
     match campaign.as_deref() {
         _ if campaign_id.is_none() => {}
         Some("sending") => {}
@@ -613,6 +638,9 @@ async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, chann
     if channel == "email" {
         if email.is_none() || email_consent == "unsubscribed" || email_consent == "pending" {
             return Ok(Some(Stop::Skip("not emailable", None)));
+        }
+        if strict && email_consent != "subscribed" {
+            return Ok(Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None)));
         }
         if suppressed {
             return Ok(Some(Stop::Skip("suppressed", None)));
@@ -652,31 +680,34 @@ fn marketing_text_stop(account: &Account, sms_consent: &str, phone: Option<&str>
 /// hours; not for tests) or the inbox's reply rules. If it may go, the message is claimed
 /// (`queued`/`sending` → `sending`); if not, it's marked skipped unless something else already
 /// settled it. None: claimed, send it.
-async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>) -> AppResult<Option<Stop>> {
-    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool);
+async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to: &str, from: &str, conversational: Option<&Conversational>, strict: bool) -> AppResult<Option<Stop>> {
+    type Row = (bool, Option<String>, Option<String>, Option<Value>, Option<String>, Option<i32>, Option<i32>, Option<String>, bool, Option<DateTime<Utc>>, bool, bool, bool);
     let account = spec.account;
     let mut tx = state.db.begin().await?;
     crate::features::inbox::store::lock_number(&mut tx, account.id, to).await?;
     let ours = conversational.map(|_| from);
     // The account row is held (shared) until the claim commits, so an account closing right now
     // either finishes first (and this sees it) or waits for this claim.
-    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed): Row = sqlx::query_as(&format!(
+    let (opted_out, consent, phone, props, campaign, start, end, conflict, from_ours, window_start, closed, held, answered): Row = sqlx::query_as(&format!(
         "SELECT EXISTS (SELECT 1 FROM sms_opt_outs o WHERE o.account_id = a.id AND o.phone_number = $3),
                 p.sms_consent, p.phone_number, p.properties, (SELECT c.status FROM campaigns c WHERE c.id = $4),
                 ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict,
                 $5::text IS NOT NULL AND (a.sms_from = $5 OR EXISTS (SELECT 1 FROM phone_numbers n WHERE n.account_id = a.id AND n.phone_number = $5 AND n.status IN ('verified', 'active'))),
                 (SELECT max(i.provider_received_at) FROM sms_inbound i
                   WHERE $5::text IS NOT NULL AND i.account_id = a.id AND i.from_number = $3 AND i.to_number = $5 AND i.verified AND i.kind NOT IN {}),
-                a.closed_at IS NOT NULL
+                a.closed_at IS NOT NULL, $6 AND COALESCE(p.marketing_hold, false), {}
          FROM accounts a LEFT JOIN profiles p ON p.id = $2 AND p.account_id = a.id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE a.id = $1 FOR SHARE OF a",
-        crate::features::inbox::store::NO_WINDOW_KINDS
+        crate::features::inbox::store::NO_WINDOW_KINDS,
+        crate::features::reviews::requests::answered_sql("$6", "$7")
     ))
     .bind(account.id)
     .bind(spec.profile.id)
     .bind(to)
     .bind(spec.campaign_id)
     .bind(ours)
+    .bind(strict)
+    .bind(message_id)
     .fetch_one(&mut *tx)
     .await?;
     let help = conversational.is_some_and(|c| c.kind == "help");
@@ -686,6 +717,10 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
         Some(Stop::Skip("opted out", None))
     } else if consent.is_none() {
         Some(Stop::Skip("profile deleted", None))
+    } else if answered {
+        Some(Stop::Skip(crate::features::reviews::requests::ANSWERED, None))
+    } else if held {
+        Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None))
     } else if !spec.is_test && spec.campaign_id.is_some() && campaign.as_deref() != Some("sending") {
         Some(Stop::Skip(if matches!(campaign.as_deref(), Some("cancelled") | None) { "campaign cancelled" } else { "campaign stopped" }, None))
     } else if let Some(c) = conversational {

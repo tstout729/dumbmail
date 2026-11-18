@@ -1,5 +1,6 @@
 import { isCouponConditionComplete, newCouponCondition } from "../../features/coupons/CouponConditionFields";
 import { isObjectConditionComplete, newObjectCondition, objectConditionSummary } from "../../features/objects/conditionRules";
+import { isReviewConditionComplete, newReviewCondition, reviewConditionSummary } from "../../features/reviews/ReviewConditionFields";
 import { isLanguageConditionComplete, languageConditionSummary, newLanguageCondition } from "../../features/translations/LanguageConditionFields";
 import type { CmpOp, Condition, EventCountOp, EventWindow, FieldFilter, Prediction, PropOp, SegmentDefinition, TimeOp } from "../../api";
 
@@ -14,6 +15,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
   product: "Viewed, carted or bought a product",
   coupon: "Got or used a coupon code",
   object: "Has objects (reservations, subscriptions …)",
+  review: "Wrote a review",
   list: "List membership",
   segment: "In another segment",
   consent: "Consent",
@@ -28,7 +30,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
 /** Condition types grouped for the pickers. */
 export const conditionGroups: { label: string; types: Condition["type"][] }[] = [
   { label: "Profile", types: ["property", "language"] },
-  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form", "coupon"] },
+  { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form", "coupon", "review"] },
   { label: "Membership", types: ["list", "segment"] },
   { label: "Objects", types: ["object"] },
   { label: "Reachability", types: ["consent", "can_receive", "suppressed"] },
@@ -134,6 +136,8 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return newCouponCondition();
     case "object":
       return newObjectCondition();
+    case "review":
+      return newReviewCondition();
     case "list":
       return { type, list_id: firstListId ?? "", op: "in" };
     case "segment":
@@ -199,6 +203,8 @@ export function isConditionComplete(c: Condition): boolean {
       return isCouponConditionComplete(c);
     case "object":
       return isObjectConditionComplete(c, filterComplete);
+    case "review":
+      return isReviewConditionComplete(c);
     case "list":
       return c.list_id !== "";
     case "segment":
@@ -291,6 +297,8 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
       return `${c.op === "has" ? "" : "not "}${c.action === "redeemed" ? "redeemed" : "got"} a coupon code${c.within_days ? ` in the last ${c.within_days}d` : ""}`;
     case "object":
       return objectConditionSummary(c, filterSummary);
+    case "review":
+      return reviewConditionSummary(c);
     case "list":
       return `${c.op === "in" ? "in" : "not in"} list ${list(c.list_id)}`;
     case "segment":

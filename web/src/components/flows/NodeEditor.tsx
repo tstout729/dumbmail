@@ -5,6 +5,7 @@ import { DelayEditor, EventConditionEditor, NotifyEditor } from "../../features/
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
 import { PushEditor } from "../../features/push/PushEditor";
+import { ReviewStepEditor } from "../../features/reviews/StepEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { ObjectSplitFields } from "../../features/objects/ObjectSplitFields";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
@@ -128,6 +129,8 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigg
       return <WebhookEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
     case "notify":
       return <NotifyEditor node={node} onChange={onChange} readOnly={readOnly} />;
+    case "review_request":
+      return <ReviewStepEditor node={node} onChange={onChange} onEditEmail={onEditEmail} readOnly={readOnly} />;
   }
 }
 
