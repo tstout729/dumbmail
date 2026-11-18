@@ -322,7 +322,8 @@ pub struct AcceptBody {
 
 /// Join the account in one transaction; false when the invite was used, revoked or resent (a new
 /// link) meanwhile, when an owner invite's inviter isn't an owner anymore, or when the account was
-/// closed. The invite went to the login's own address, so that address is now confirmed.
+/// closed. When the server emailed the link (it's never shown to the inviter then), the invite
+/// went to the login's own address, so that address is now confirmed.
 async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bool> {
     let mut tx = state.db.begin().await?;
     // Closing an account holds this row while it removes everyone (see `google_link`).
@@ -368,11 +369,14 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
         .bind(&inv.role)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE users SET email_confirmed_at = COALESCE(email_confirmed_at, now()) WHERE id = $1 AND email = $2 AND disabled_at IS NULL")
-        .bind(user_id)
-        .bind(&inv.email)
-        .execute(&mut *tx)
-        .await?;
+    // Without account email the inviter is shown the link and passes it on, so it proves nothing.
+    if mail::available(state) {
+        sqlx::query("UPDATE users SET email_confirmed_at = COALESCE(email_confirmed_at, now()) WHERE id = $1 AND email = $2 AND disabled_at IS NULL")
+            .bind(user_id)
+            .bind(&inv.email)
+            .execute(&mut *tx)
+            .await?;
+    }
     // Invited back: single sign-on may let them in again.
     sqlx::query(
         "DELETE FROM team_removals WHERE account_id = $1

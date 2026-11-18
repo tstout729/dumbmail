@@ -178,9 +178,12 @@ or reset also stops any sign-in that checked the old password from getting a ses
 Signing up with a password doesn't prove the email address belongs to the person who typed it. So
 a login's email starts unconfirmed, and becomes confirmed when its owner shows they get mail there:
 
-- they open the confirmation link (sent at sign-up; it works once, for 24 hours);
+- they open the confirmation link (sent at sign-up; it works once, for 24 hours) and enter the
+  login's password. The password is needed because the link goes to the address even when someone
+  else made the login: its real owner clicking it confirms nothing;
 - they finish a password reset (the link went to that address);
-- they accept a team invite sent to that address;
+- they accept a team invite emailed to that address (not one whose link was shown to the inviter,
+  as happens when the server can't send email);
 - they sign in with Google for that address.
 
 Single sign-on doesn't confirm an address: an account's owner sets up the identity provider, and
@@ -189,8 +192,9 @@ the Security settings page offers to send the link again.
 
 - `POST /api/me/email-confirmation`: email a new link (older ones stop working). Signed-in
   dashboard sessions only; 3 an hour per login.
-- `POST /api/auth/confirm-email` `{token}`: open a link. It confirms the address and signs nobody
-  in. 20 tries an hour per network address.
+- `POST /api/auth/confirm-email` `{token, password}`: open a link. The password is checked like a
+  sign-in (same limits, same answer when wrong). It confirms the address and signs nobody in. 20
+  tries an hour per network address.
 
 **Continue with Google for an address that already has a password login.** If that login's email is
 confirmed, Google is linked to it and you're signed in; nothing else changes. If it isn't, nothing

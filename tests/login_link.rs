@@ -233,6 +233,13 @@ async fn a_stranger_who_signed_up_first_never_gets_the_owners_account() {
         .await
         .unwrap();
 
+    // The sign-up's confirmation link goes to the real owner. Opening it takes the login's
+    // password, which they don't have, so it confirms nothing.
+    let link = link_token(&h, "victim@acme.test", "/confirm-email?token=").await;
+    let mut inbox = B::new(&h, "198.51.100.19");
+    assert_eq!(call(&h, &mut inbox, "POST", "/api/auth/confirm-email", Some(json!({"token": link, "password": "my own password"}))).await.0, StatusCode::BAD_REQUEST);
+    assert!(!user_row(&h, "victim@acme.test").await.2);
+
     // The real owner signs in with Google: not signed in to anything, sent to choose.
     let mut victim = B::new(&h, "198.51.100.20");
     let back = google(&h, &mut victim, "g-victim", "victim@acme.test", "/campaigns").await;
@@ -433,7 +440,7 @@ async fn confirmed_logins_link_directly_and_keep_everything() {
     let ann_key = new_key(&h, &mut ann, "ann").await;
     let token = link_token(&h, "ann@acme.test", "/confirm-email?token=").await;
     let mut link_browser = B::new(&h, "198.51.100.61");
-    ok(&h, &mut link_browser, "POST", "/api/auth/confirm-email", Some(json!({"token": token}))).await;
+    ok(&h, &mut link_browser, "POST", "/api/auth/confirm-email", Some(json!({"token": token, "password": "ann password"}))).await;
     assert!(link_browser.cookies.is_empty(), "confirming signs nobody in");
     assert_eq!(ok(&h, &mut ann, "GET", "/api/me", None).await["email_confirmed"], true);
     let mut g = B::new(&h, "198.51.100.62");
@@ -501,6 +508,25 @@ async fn with_sign_ups_off_google_links_as_before() {
     h.cleanup().await;
 }
 
+#[tokio::test]
+async fn an_invite_link_shown_to_the_inviter_confirms_nothing() {
+    // Without account email the inviter is handed the link, so a stranger could invite the login
+    // they squatted and accept it themselves.
+    let Some(h) = Harness::with(|c| c.support_email = None).await else { return };
+    let mut squat = B::new(&h, "203.0.113.120");
+    signup(&h, &mut squat, "sq@acme.test", "stranger pass", "Bait").await;
+    let mut other = B::new(&h, "203.0.113.121");
+    signup(&h, &mut other, "accomplice@evil.test", "accomplice pw", "Other").await;
+    let inv = ok(&h, &mut other, "POST", "/api/team/invites", Some(json!({"email": "sq@acme.test", "role": "admin"}))).await;
+    let url = inv["invite_url"].as_str().expect("the inviter sees the link").to_string();
+    let token = url.rsplit('/').next().unwrap();
+    ok(&h, &mut squat, "POST", &format!("/api/invites/{token}/accept"), None).await;
+    assert!(!user_row(&h, "sq@acme.test").await.2, "not confirmed");
+    let mut owner = B::new(&h, "198.51.100.120");
+    assert_eq!(google(&h, &mut owner, "g-sq", "sq@acme.test", "/").await, "/link-google");
+    h.cleanup().await;
+}
+
 // ---- The waiting sign-in ----
 
 #[tokio::test]
@@ -555,10 +581,10 @@ async fn email_confirmation_links_work_once_expire_and_are_limited() {
     assert_ne!(stored, first, "only the hash is kept");
     // Wrong token.
     let mut anon = B::new(&h, "198.51.100.101");
-    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": "nope"}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": "nope", "password": "ann password"}))).await.0, StatusCode::BAD_REQUEST);
     // Expired.
     sqlx::query("UPDATE email_confirmations SET expires_at = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
-    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": first}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": first, "password": "ann password"}))).await.0, StatusCode::BAD_REQUEST);
     assert!(!user_row(&h, "ann@acme.test").await.2);
     // Ask again: a new link; the old one stops working.
     let sent = ok(&h, &mut ann, "POST", "/api/me/email-confirmation", None).await;
@@ -574,11 +600,16 @@ async fn email_confirmation_links_work_once_expire_and_are_limited() {
     assert_ne!(second, first);
     let expires_hours: f64 = sqlx::query_scalar("SELECT (extract(epoch FROM expires_at - created_at) / 3600)::float8 FROM email_confirmations WHERE used_at IS NULL").fetch_one(&h.state.db).await.unwrap();
     assert!((expires_hours - 24.0).abs() < 0.01, "{expires_hours}");
+    // The wrong password: the sign-in page's answer, nothing confirmed, and the link still works.
+    let (st, wrong) = call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": second, "password": "not hers"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(wrong["error"]["message"].as_str().unwrap().contains("don't match"), "{wrong}");
+    assert!(!user_row(&h, "ann@acme.test").await.2);
     // Single use, and it signs nobody in.
-    ok(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": second}))).await;
+    ok(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": second, "password": "ann password"}))).await;
     assert!(anon.cookies.is_empty());
     assert!(user_row(&h, "ann@acme.test").await.2);
-    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": second}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": second, "password": "ann password"}))).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(ok(&h, &mut ann, "GET", "/api/me", None).await["email_confirmed"], true);
     assert_eq!(ok(&h, &mut ann, "POST", "/api/me/email-confirmation", None).await["already_confirmed"], true);
     // A link sent to an address the login no longer has doesn't count.
@@ -586,7 +617,7 @@ async fn email_confirmation_links_work_once_expire_and_are_limited() {
     signup(&h, &mut bo, "bo@acme.test", "bo password", "Bo Co").await;
     let bo_token = link_token(&h, "bo@acme.test", "/confirm-email?token=").await;
     sqlx::query("UPDATE users SET email = 'bo2@acme.test' WHERE email = 'bo@acme.test'").execute(&h.state.db).await.unwrap();
-    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": bo_token}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&h, &mut anon, "POST", "/api/auth/confirm-email", Some(json!({"token": bo_token, "password": "bo password"}))).await.0, StatusCode::BAD_REQUEST);
     assert!(!user_row(&h, "bo2@acme.test").await.2);
     // Asking: 3 an hour per login; never with an API key; another site can't confirm for you.
     clear_of_rate_window(3600).await;
@@ -600,13 +631,13 @@ async fn email_confirmation_links_work_once_expire_and_are_limited() {
     assert_eq!(bearer(&h, &key, "POST", "/api/me/email-confirmation", None).await, StatusCode::FORBIDDEN);
     let mut evil = B::new(&h, "198.51.100.104");
     evil.origin = Some("https://evil.test".into());
-    assert_eq!(call(&h, &mut evil, "POST", "/api/auth/confirm-email", Some(json!({"token": "x"}))).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(call(&h, &mut evil, "POST", "/api/auth/confirm-email", Some(json!({"token": "x", "password": "y"}))).await.0, StatusCode::FORBIDDEN);
     // Opening links: 20 an hour per address.
     let mut guesser = B::new(&h, "198.51.100.105");
     for _ in 0..20 {
-        assert_eq!(call(&h, &mut guesser, "POST", "/api/auth/confirm-email", Some(json!({"token": "guess"}))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h, &mut guesser, "POST", "/api/auth/confirm-email", Some(json!({"token": "guess", "password": "y"}))).await.0, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(call(&h, &mut guesser, "POST", "/api/auth/confirm-email", Some(json!({"token": "guess"}))).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(call(&h, &mut guesser, "POST", "/api/auth/confirm-email", Some(json!({"token": "guess", "password": "y"}))).await.0, StatusCode::TOO_MANY_REQUESTS);
     h.cleanup().await;
 }
 

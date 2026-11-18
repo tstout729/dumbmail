@@ -188,7 +188,10 @@ export function ResetPasswordPage() {
   );
 }
 
-/** `/confirm-email?token=…` from the confirmation email. Confirming signs nobody in. */
+/**
+ * `/confirm-email?token=…` from the confirmation email. The login's password goes with it, so the
+ * address's owner can't confirm a login someone else made with their email. Signs nobody in.
+ */
 export function ConfirmEmailPage() {
   const [params] = useSearchParams();
   const token = params.get("token") ?? "";
@@ -202,15 +205,22 @@ export function ConfirmEmailPage() {
       </AuthLayout>
     );
   }
+  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    confirm.mutate({ token, password: String(new FormData(e.currentTarget).get("password")) });
+  };
   return (
-    <AuthLayout title="Confirm your email" subtitle="Confirm this is your email address for your DumbMail login." footer={backToLogin}>
-      <div className="space-y-3">
+    <AuthLayout title="Confirm your email" subtitle="Enter your DumbMail password to confirm this is your email address." footer={backToLogin}>
+      <form onSubmit={onSubmit} className="space-y-3.5">
+        <Field label="Password" htmlFor="confirm-password">
+          <Input id="confirm-password" name="password" type="password" autoComplete="current-password" required autoFocus />
+        </Field>
         <InlineError message={confirm.error ? errorMessage(confirm.error) : null} />
-        <Button variant="primary" className="w-full" loading={confirm.isPending} disabled={!token} onClick={() => confirm.mutate(token)}>
+        <Button type="submit" variant="primary" className="w-full" loading={confirm.isPending} disabled={!token}>
           Confirm my email
         </Button>
-        {!token ? <p className="text-xs text-zinc-500">Open the link from the email to confirm your address.</p> : null}
-      </div>
+        <p className="text-xs text-zinc-500">{token ? "Didn't make a DumbMail login? Close this page; nothing changes." : "Open the link from the email to confirm your address."}</p>
+      </form>
     </AuthLayout>
   );
 }
