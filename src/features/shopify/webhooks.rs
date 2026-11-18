@@ -94,7 +94,14 @@ async fn store(state: &AppState, topic: &str, domain: &str, webhook_id: &str, bo
     let targets: Vec<(Uuid, Option<i32>)> = if PRIVACY_TOPICS.contains(&topic) {
         sqlx::query_as("SELECT DISTINCT account_id, NULL::int FROM shopify_installs WHERE shop_domain = $1").bind(domain).fetch_all(&state.db).await?
     } else {
-        sqlx::query_as("SELECT account_id, generation FROM shopify_shops WHERE shop_domain = $1 AND status = 'connected'").bind(domain).fetch_all(&state.db).await?
+        // A closed account gets nothing but privacy requests: the delivery is acknowledged and dropped.
+        sqlx::query_as(
+            "SELECT s.account_id, s.generation FROM shopify_shops s JOIN accounts a ON a.id = s.account_id
+             WHERE s.shop_domain = $1 AND s.status = 'connected' AND a.closed_at IS NULL",
+        )
+        .bind(domain)
+        .fetch_all(&state.db)
+        .await?
     };
     for (account_id, generation) in targets {
         let mut tx = state.db.begin().await?;

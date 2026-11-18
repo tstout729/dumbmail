@@ -2381,3 +2381,28 @@ setTimeout(() => console.log(JSON.stringify({{ added: added.length, before, afte
     assert_eq!(out["buffer"], Value::Null, "queued events are deleted");
     assert_eq!(out["profile"], Value::Null, "and who it thought the visitor was");
 }
+
+/// Item 9: a closed account gets only privacy requests; no other Shopify work runs for it.
+#[tokio::test]
+async fn closed_accounts_only_get_privacy_requests() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    mock.lock().unwrap().customers.insert(1, customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED"));
+    // Work already queued, then the account is closed.
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let queries = mock.lock().unwrap().queries;
+    h.fast_forward().await;
+    assert_eq!(mock.lock().unwrap().queries, queries, "no Shopify work runs for a closed account");
+    // New deliveries are acknowledged and dropped…
+    assert_eq!(hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await, StatusCode::OK);
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_webhooks WHERE webhook_id = 'o1'").await, 0);
+    // …except privacy requests, which are still honoured.
+    assert_eq!(hook(&h, "customers/data_request", "d1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1}, "orders_requested": [], "data_request": {"id": 5}})).await, StatusCode::OK);
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests WHERE shopify_request_id = 5").await, 1);
+    h.cleanup().await;
+}
