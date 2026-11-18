@@ -98,10 +98,13 @@ async fn work(state: &AppState, account_id: Uuid, generation: Option<i32>) -> an
     shop::release(state, &lease, more, delay).await
 }
 
-/// Seconds of each slice for each kind of work (what one leaves unused, the later ones get).
+/// Seconds of each slice for each kind of work (what one leaves unused, the later ones get). Each
+/// kind's end is fixed once per run, so a steady backlog of one kind can't eat the next kind's share.
 const PRIVACY_SECS: u64 = 3;
 const WRITEBACK_SECS: u64 = 3;
 const WEBHOOK_SECS: u64 = 6;
+/// The import's share at the end of every slice: webhooks and reads stop this long before the end.
+const IMPORT_SECS: u64 = 3;
 
 async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> anyhow::Result<(bool, Option<chrono::Duration>)> {
     let Some(s) = shop::load(&state.db, account_id).await? else { return Ok((false, None)) };
@@ -144,11 +147,14 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
         });
     }
 
-    // 3. Webhook deliveries, then the items they asked to read again.
-    let hooks_until = until(WEBHOOK_SECS);
+    // 3. Webhook deliveries, then the items they asked to read again: both end, at the latest, the
+    // import's share before the slice does. Fixed here, once.
+    let import_from = deadline - std::time::Duration::from_secs(IMPORT_SECS);
+    let hooks_until = until(WEBHOOK_SECS).min(import_from);
+    let reads_until = hooks_until.max(until(2)).min(import_from);
     let mut cx = orders::Ctx { state, account_id, shop: &s.shop_domain, generation: lease.generation, metrics: &mut metrics, quiet: false };
     more |= webhooks::drain(state, &mut cx, lease, hooks_until).await?;
-    while wait.is_none() && std::time::Instant::now() < hooks_until.max(until(2)) {
+    while wait.is_none() && std::time::Instant::now() < reads_until {
         if !shop::renew(state, lease).await? {
             return Ok((false, None));
         }

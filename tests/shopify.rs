@@ -69,6 +69,8 @@ struct Shopify {
     node_reads: Vec<String>,
     throttle_next: u32,
     queries: u32,
+    /// Each `nodes` read takes this long (a slow store).
+    nodes_delay_ms: u64,
 }
 
 type Mock = Arc<Mutex<Shopify>>;
@@ -132,6 +134,10 @@ fn aliases(q: &str, prefix: &str) -> Vec<String> {
 async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> (StatusCode, axum::Json<Value>) {
     let q = body["query"].as_str().unwrap_or("").to_string();
     let vars = body["variables"].clone();
+    let delay = m.lock().unwrap().nodes_delay_ms;
+    if delay > 0 && q.contains("nodes(ids:") {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
     let mut m = m.lock().unwrap();
     if headers.get("x-shopify-access-token").and_then(|v| v.to_str().ok()) != Some(m.token.as_str()) {
         return (StatusCode::UNAUTHORIZED, axum::Json(json!({"errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"})));
@@ -2851,5 +2857,34 @@ async fn store_codes_belong_to_the_connected_store() {
     assert_eq!(shop, "second-store.myshopify.com");
     // With the same store still connected, the person keeps their code.
     assert_eq!(send(&mut h).await, b);
+    h.cleanup().await;
+}
+
+/// Item 9: a steady backlog of reads can't starve the import: each kind's budget is fixed once
+/// per run, and the import always gets its share.
+#[tokio::test]
+async fn reads_cannot_starve_the_import() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    let generation: i32 = sqlx::query_scalar("SELECT generation FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    // A slow store and a long backlog of customers to read again (more than a slice can do).
+    mock.lock().unwrap().nodes_delay_ms = 400;
+    sqlx::query("INSERT INTO shopify_refresh (account_id, kind, shopify_id) SELECT $1, 'customer', g FROM generate_series(1, 2500) g").bind(acct).execute(&h.state.db).await.unwrap();
+    mock.lock().unwrap().files.insert("customers".into(), jsonl(&[customer(1, Some("ann@example.com"), "SUBSCRIBED", None, "NOT_SUBSCRIBED")]));
+    h.ok("POST", "/api/shopify/import", Some(json!({"confirm": true}))).await;
+    sqlx::query("DELETE FROM jobs WHERE kind = 'shopify_work'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE shopify_shops SET work_queued_at = NULL").execute(&h.state.db).await.unwrap();
+    let ops = mock.lock().unwrap().bulk_ops.len();
+    // One worker run.
+    dumbmail::features::run_job(&h.state, "shopify_work", &json!({"account_id": acct, "generation": generation})).await.unwrap().unwrap();
+    assert!(count(&h, "SELECT count(*) FROM shopify_refresh").await > 0, "the backlog isn't done in one run");
+    assert_eq!(mock.lock().unwrap().bulk_ops.len(), ops + 1, "the import still got its turn");
+    // A lease that expired is never renewed: the run must take it afresh.
+    let lease = dumbmail::features::shopify::shop::acquire(&h.state, acct, generation).await.unwrap().unwrap();
+    sqlx::query("UPDATE shopify_shops SET lease_until = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
+    assert!(!dumbmail::features::shopify::shop::renew(&h.state, &lease).await.unwrap(), "an expired lease isn't renewed");
     h.cleanup().await;
 }
