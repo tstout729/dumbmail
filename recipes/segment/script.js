@@ -1,7 +1,7 @@
 // Segment → DumbMail (Webhooks destination)
 //
 // identify calls with traits.email become profiles (matched by the Segment userId first, then
-// email; the userId is kept as a key, on one profile only). track calls become events named after the Segment event, only for the event names listed in
+// email; the userId is kept as a key, on one profile only; a known userId's email isn't changed). track calls become events named after the Segment event, only for the event names listed in
 // settings.events (and in the integration's metrics), on the person an earlier identify gave that
 // userId (waiting for it if needed). An email inside a track call is never used to pick the person.
 // Each call's messageId is its unique id. Nobody is subscribed: Segment calls carry no marketing
@@ -40,12 +40,17 @@ function handle(input) {
   if (c.type === "identify") {
     var t = c.traits || {};
     if (!t.email) return [{ type: "log", message: "identify without traits.email" }];
-    // Matched by the Segment userId first (as a namespaced external id), so a new email for the same
-    // user changes that profile's address (its consent doesn't carry over) instead of putting the
-    // userId on a second profile.
+    // Matched by the Segment userId first (as a namespaced external id, or the profile an earlier
+    // identify gave the userId key), so the userId is never on two profiles. Anyone with the write
+    // key can send an identify, so one naming another email for a known userId doesn't change that
+    // profile's address (DumbMail logs it); change it in DumbMail if it's real.
     var up = { type: "upsert_profile", email: t.email };
-    if (c.userId) up.external_id = "segment:" + String(c.userId).slice(0, 190);
-    if (c.userId) up.keys = { segment_user_id: String(c.userId) };
+    if (c.userId) {
+      up.external_id = "segment:" + String(c.userId).slice(0, 190);
+      up.keys = { segment_user_id: String(c.userId) };
+      up.match_key = "segment_user_id";
+      up.keep_email = true;
+    }
     return [up];
   }
   if (c.type === "track") {

@@ -1167,17 +1167,37 @@ async fn segment_identify_then_track() {
     retry_now(&h).await;
     s.post(&h, "track-unlisted.json").await;
     s.post(&h, "track-from-browser.json").await;
-    // The same userId with a new email: the same profile's address changes; the userId is never on two profiles.
+    // The same userId with another email: that profile keeps its address (an identify isn't proof of
+    // a change; the log says so), and the userId is never on two profiles.
     s.post(&h, "identify-new-email.json").await;
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE integration_keys->'segment_user_id' ? '019mr8mf4r'").await, 1);
-    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'achilles.new@example.com' AND external_id = 'segment:019mr8mf4r'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'achilles.example@example.com' AND external_id = 'segment:019mr8mf4r'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'achilles.new@example.com'").await, 0);
+    let noted: String = sqlx::query_scalar("SELECT result::text FROM integration_deliveries ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!(noted.contains("keeps its email"), "{noted}");
+    // A profile keyed by an earlier identify (no external id yet) is the one a later identify updates.
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM integrations WHERE id = $1::uuid").bind(&s.id).fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) VALUES ($1, $2, 'patroclus.example@example.com', '{\"segment_user_id\": [\"legacy-7\"]}')")
+        .bind(uuid::Uuid::now_v7())
+        .bind(account)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let mut legacy = fixture("segment", "identify-new-email.json")["input"]["payload"].clone();
+    legacy["userId"] = json!("legacy-7");
+    legacy["messageId"] = json!("ajs-identify-legacy-7");
+    legacy["traits"]["email"] = json!("patroclus.new@example.com");
+    s.post_as(&h, &legacy.to_string(), &json!({}), &json!({}), &s.secret).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE integration_keys->'segment_user_id' ? 'legacy-7'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'patroclus.example@example.com' AND external_id = 'segment:legacy-7'").await, 1);
+    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'patroclus.new@example.com'").await, 0);
     s.post(&h, "page.json").await;
     let (_, again) = s.post_as(&h, &fixture("segment", "track-order-completed.json")["input"]["payload"].to_string(), &json!({}), &json!({}), &s.secret).await;
     assert!(again.contains("duplicate"), "{again}");
-    assert_eq!(values(&h, "Order Completed", "achilles.new@example.com").await, vec![39.95], "the order stays with the person (now at the new address)");
+    assert_eq!(values(&h, "Order Completed", "achilles.example@example.com").await, vec![39.95], "the order stays with the person");
     assert_eq!(count(&h, "SELECT count(*) FROM metrics WHERE name = 'Purchased an Item'").await, 0);
-    assert_eq!(consent(&h, "achilles.new@example.com").await, (true, "never_subscribed".into()));
-    assert!(!campaign_reaches(&mut h, "achilles.new@example.com").await);
+    assert_eq!(consent(&h, "achilles.example@example.com").await, (true, "never_subscribed".into()));
+    assert!(!campaign_reaches(&mut h, "achilles.example@example.com").await);
     assert_eq!(sent_to(&h, "Thanks from Segment"), vec!["achilles.example@example.com"]);
     never_stored(&mut h, &s, &sensitive("segment", &["identify.json"]), &["identify.json"]).await;
     h.cleanup().await;

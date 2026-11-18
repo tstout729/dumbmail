@@ -99,6 +99,14 @@ pub struct UpsertProfile {
     /// action finds them with `profile: {property: <key>, value: <id>}`. Not shown as properties.
     #[serde(default)]
     pub keys: Option<Map<String, Value>>,
+    /// One of `keys`: the person who already holds that value (one profile only) is the one
+    /// updated, when nobody has the `external_id` yet (profiles keyed before an external id was used).
+    #[serde(default)]
+    pub match_key: Option<String>,
+    /// `true`: an existing profile that has an email keeps it; a call naming another address
+    /// doesn't change it (the delivery's log says so).
+    #[serde(default)]
+    pub keep_email: bool,
 }
 
 /// Key names DumbMail keeps its own consent bookkeeping under: a script can't write them.
@@ -379,6 +387,11 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                         if reserved_key(name) {
                             return Err(format!("action {i} ({k}): key names starting with {RESERVED_KEY_PREFIX} are DumbMail's own"));
                         }
+                    }
+                }
+                if let Some(m) = &a.match_key {
+                    if !a.keys.as_ref().is_some_and(|keys| keys.contains_key(m)) {
+                        return Err(format!("action {i} ({k}): match_key must name one of the action's keys"));
                     }
                 }
                 Action::UpsertProfile(a)
@@ -792,7 +805,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
         return Ok(Some(Found { id: existing.as_ref().map(|p| p.id).unwrap_or_else(Uuid::nil), created: existing.is_none() }));
     }
     if existing.is_none() {
-        if let Some(p) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
+        if let Some((p, _)) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
             out.counts.profiles_created += 1;
             if !src.contacts_opted_in {
                 out.counts.held += 1;
@@ -815,7 +828,7 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
 /// and (`ledger`) the action's entry in its delivery's ledger. A failure part-way leaves nothing,
 /// so a retry never finds an unheld profile it made. None when someone else created a matching
 /// profile at the same moment (the caller updates that one instead).
-async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
+async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, extra_keys: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<(Profile, Vec<String>)>> {
     let email = input.email.as_deref().and_then(normalize_email);
     let phone = input.phone_number.as_deref().and_then(normalize_phone);
     let suppressed = match &email {
@@ -823,9 +836,13 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
         Some(_) if no_marketing => Some(REASON_NO_MARKETING),
         _ => None,
     };
-    let keys = Value::Object(merge_keys(&trusted_keys(props), extra_keys));
     let tag = src.tag();
     let mut tx = state.db.begin().await?;
+    // Each key value belongs to one profile: one another profile holds isn't given to this one.
+    lock_key_values(&mut tx, src.account_id, extra_keys).await?;
+    let taken = keys_held_elsewhere(&mut tx, src.account_id, Uuid::nil(), extra_keys).await?;
+    let extra: Map<String, Value> = extra_keys.iter().filter(|(k, _)| !taken.contains(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let keys = Value::Object(merge_keys(&trusted_keys(props), &extra));
     let q = format!(
         "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
                                     source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
@@ -854,7 +871,7 @@ async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, pr
     }
     tx.commit().await?;
     crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
-    Ok(Some(p))
+    Ok(Some((p, taken)))
 }
 
 /// Record in the delivery's ledger that action `i` was written.
@@ -1122,7 +1139,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
 }
 
 async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, print: &str, dry: bool, out: &mut Outcome) -> AppResult<()> {
-    let input = ProfileInput {
+    let mut input = ProfileInput {
         email: p.email.clone().filter(|s| !s.trim().is_empty()),
         phone_number: p.phone_number.clone().filter(|s| !s.trim().is_empty()),
         external_id: p.external_id.clone().filter(|s| !s.trim().is_empty()),
@@ -1132,6 +1149,30 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         ..Default::default()
     };
     let label = who_label(&Who { email: input.email.clone(), phone_number: input.phone_number.clone(), external_id: input.external_id.clone(), ..Default::default() });
+    // The one person already holding the match key's value, when nobody has the external id yet.
+    if let Some(v) = p.match_key.as_ref().and_then(|k| Some((k, p.keys.as_ref()?.get(k)?.clone()))) {
+        let by_external: Option<Uuid> = match &input.external_id {
+            Some(x) => sqlx::query_scalar("SELECT id FROM profiles WHERE account_id = $1 AND external_id = $2").bind(src.account_id).bind(x).fetch_optional(&state.db).await?,
+            None => None,
+        };
+        if by_external.is_none() {
+            if let Lookup::Found(id) = find_by_property(state, src.account_id, v.0, &v.1).await? {
+                input.id = Some(id);
+            }
+        }
+    }
+    // An existing profile's email stays, when the action asks: the other address isn't used.
+    let mut kept_email = false;
+    if p.keep_email && input.email.is_some() {
+        if let Some(found) = audience::find_profile(&state.db, src.account_id, &input).await? {
+            let asked = input.email.as_deref().and_then(crate::models::normalize_email);
+            if found.email.is_some() && found.email != asked {
+                input.email = None;
+                kept_email = true;
+            }
+        }
+    }
+    let kept_note = if kept_email { " (it keeps its email; the call named another address, which wasn't used)" } else { "" };
     let relay = input.email.as_deref().is_some_and(is_relay_address);
     let no_marketing = p.marketing == Some(false);
     if dry {
@@ -1139,7 +1180,7 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         let mut line = match &existing {
             Some(_) => {
                 out.counts.profiles_updated += 1;
-                format!("would update profile {label}")
+                format!("would update profile {label}{kept_note}")
             }
             None => {
                 out.counts.profiles_created += 1;
@@ -1172,12 +1213,15 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
         let last = p.consent.is_empty();
         let props = p.properties.clone().unwrap_or_default();
         let keys = p.keys.clone().unwrap_or_default();
-        if let Some(created) = create_profile(state, src, &input, &props, &keys, no_marketing, last.then_some((i, print))).await? {
+        if let Some((created, taken)) = create_profile(state, src, &input, &props, &keys, no_marketing, last.then_some((i, print))).await? {
             if last {
                 out.applied.insert(i.to_string(), json!(print));
             }
             out.counts.profiles_created += 1;
             let mut line = format!("created profile {label}");
+            if !taken.is_empty() {
+                line.push_str(&format!(" (didn't add {}: another profile already has that value)", taken.join(", ")));
+            }
             if relay {
                 out.counts.suppressed += 1;
                 line.push_str(" and suppressed it from email (booking-site relay address)");
@@ -1202,11 +1246,15 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;
     }
-    if let Some(keys) = &p.keys {
-        add_keys(state, src.account_id, up.profile.id, keys).await?;
-    }
+    let taken = match &p.keys {
+        Some(keys) => add_keys(state, src.account_id, up.profile.id, keys).await?,
+        None => Vec::new(),
+    };
     mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
-    let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });
+    let mut line = format!("{} profile {label}{kept_note}", if up.created { "created" } else { "updated" });
+    if !taken.is_empty() {
+        line.push_str(&format!(" (didn't add {}: another profile already has that value)", taken.join(", ")));
+    }
     let held_before = out.counts.held;
     if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing, out).await? {
         out.counts.suppressed += 1;
