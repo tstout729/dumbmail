@@ -8,11 +8,28 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// The lane sending, flows and segments run in. [`enqueue`] uses it.
+pub const MAIN: &str = "main";
+/// The lane for integration work that must never hold up sending (webhooks, exports, syncs). Only
+/// the background workers (`BACKGROUND_WORKERS`, default 2) take these jobs, and they take nothing
+/// else. Use [`enqueue_background`].
+pub const BACKGROUND: &str = "background";
+
 pub async fn enqueue<'e>(db: impl sqlx::PgExecutor<'e>, kind: &str, payload: Value, run_at: Option<DateTime<Utc>>) -> sqlx::Result<i64> {
-    sqlx::query_scalar("INSERT INTO jobs (kind, payload, run_at) VALUES ($1, $2, COALESCE($3, now())) RETURNING id")
+    enqueue_in(db, MAIN, kind, payload, run_at).await
+}
+
+/// Like [`enqueue`], in the background lane.
+pub async fn enqueue_background<'e>(db: impl sqlx::PgExecutor<'e>, kind: &str, payload: Value, run_at: Option<DateTime<Utc>>) -> sqlx::Result<i64> {
+    enqueue_in(db, BACKGROUND, kind, payload, run_at).await
+}
+
+async fn enqueue_in<'e>(db: impl sqlx::PgExecutor<'e>, lane: &str, kind: &str, payload: Value, run_at: Option<DateTime<Utc>>) -> sqlx::Result<i64> {
+    sqlx::query_scalar("INSERT INTO jobs (kind, payload, run_at, lane) VALUES ($1, $2, COALESCE($3, now()), $4) RETURNING id")
         .bind(kind)
         .bind(payload)
         .bind(run_at)
+        .bind(lane)
         .fetch_one(db)
         .await
 }
@@ -26,14 +43,20 @@ struct Job {
     max_attempts: i32,
 }
 
-/// Claim and run one ready job. Returns false when the queue is empty.
+/// Claim and run one ready main-lane job. Returns false when there is none.
 pub async fn run_one(state: &AppState) -> anyhow::Result<bool> {
+    run_one_in(state, MAIN).await
+}
+
+/// Claim and run one ready job of `lane`. Returns false when there is none.
+pub async fn run_one_in(state: &AppState, lane: &str) -> anyhow::Result<bool> {
     let job: Option<Job> = sqlx::query_as(
         "UPDATE jobs SET locked_at = now(), attempts = attempts + 1
-         WHERE id = (SELECT id FROM jobs WHERE locked_at IS NULL AND run_at <= now()
+         WHERE id = (SELECT id FROM jobs WHERE locked_at IS NULL AND run_at <= now() AND lane = $1
                      ORDER BY run_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
          RETURNING id, kind, payload, attempts, max_attempts",
     )
+    .bind(lane)
     .fetch_optional(&state.db)
     .await?;
     let Some(job) = job else { return Ok(false) };
@@ -110,29 +133,47 @@ async fn dispatch(state: &AppState, kind: &str, p: &Value) -> anyhow::Result<()>
     }
 }
 
-/// Run until the queue is empty (used by tests and the `work-once` command).
+/// Run until both lanes are empty (used by tests and the `work-once` command).
 pub async fn drain(state: &AppState) -> anyhow::Result<usize> {
     let mut n = 0;
-    while run_one(state).await? {
-        n += 1;
-        if n > 100_000 {
-            break;
+    loop {
+        let mut ran = false;
+        for lane in [MAIN, BACKGROUND] {
+            while run_one_in(state, lane).await? {
+                ran = true;
+                n += 1;
+                if n > 100_000 {
+                    return Ok(n);
+                }
+            }
         }
+        if !ran {
+            return Ok(n);
+        }
+    }
+}
+
+/// Run until `lane` is empty, leaving the other lane's jobs where they are.
+pub async fn drain_lane(state: &AppState, lane: &str) -> anyhow::Result<usize> {
+    let mut n = 0;
+    while n <= 100_000 && run_one_in(state, lane).await? {
+        n += 1;
     }
     Ok(n)
 }
 
 pub fn spawn_workers(state: AppState) {
     crate::features::spawn_after_start(state.clone());
-    for i in 0..state.cfg.workers.max(1) {
+    let lanes = std::iter::repeat_n(MAIN, state.cfg.workers.max(1)).chain(std::iter::repeat_n(BACKGROUND, state.cfg.background_workers.max(1)));
+    for (i, lane) in lanes.enumerate() {
         let st = state.clone();
         tokio::spawn(async move {
             loop {
-                match run_one(&st).await {
+                match run_one_in(&st, lane).await {
                     Ok(true) => {}
                     Ok(false) => tokio::time::sleep(Duration::from_millis(500)).await,
                     Err(e) => {
-                        tracing::error!(worker = i, error = %e, "worker error");
+                        tracing::error!(worker = i, lane, error = %e, "worker error");
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                 }

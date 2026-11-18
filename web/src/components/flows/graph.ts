@@ -125,9 +125,14 @@ export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Seg
       return `Enters ${segments.find((s) => s.id === t.segment_id)?.name ?? "a segment"}`;
     case "date_property":
       return `On ${t.field || "a date property"}${t.offset_days ? ` ${t.offset_days > 0 ? "+" : ""}${t.offset_days}d` : ""}`;
+    case "event_date": {
+      const n = t.offset_days ?? 0;
+      const when = n === 0 ? "On" : `${Math.abs(n)} ${Math.abs(n) === 1 ? "day" : "days"} ${n < 0 ? "before" : "after"}`;
+      return `${when} ${t.field || "a date"} in ${t.metric || "an event"}`;
+    }
   }
 }
 
 export function triggerKind(t: FlowTrigger): string {
-  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date" }[t.type];
+  return { metric: "Metric", list: "List", segment: "Segment", date_property: "Date", event_date: "Event date" }[t.type];
 }

@@ -1,0 +1,19 @@
+{
+	"url": "/api/events",
+	"method": "POST",
+	"body": {
+		"metric": "{{parameters.metric}}",
+		"profile": {
+			"email": "{{parameters.email}}",
+			"phone_number": "{{parameters.phone_number}}",
+			"external_id": "{{parameters.external_id}}"
+		},
+		"properties": "{{toCollection(parameters.properties, 'key', 'value')}}",
+		"value": "{{parameters.value}}",
+		"unique_id": "{{parameters.unique_id}}",
+		"time": "{{parameters.time}}"
+	},
+	"response": {
+		"output": "{{body}}"
+	}
+}

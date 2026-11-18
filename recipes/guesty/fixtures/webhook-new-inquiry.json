@@ -1,0 +1,85 @@
+{
+  "description": "reservation.new for an inquiry",
+  "expect": [
+    {
+      "email": "lee.chen@example.org",
+      "first_name": "Lee",
+      "last_name": "Chen",
+      "properties": {
+        "guesty_guest_id": "68b0guest",
+        "last_check_in": "2026-12-17",
+        "last_listing": "Winery Villa"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Inquiry Received",
+      "profile": {
+        "email": "lee.chen@example.org"
+      },
+      "properties": {
+        "check_in": "2026-12-17",
+        "check_out": "2026-12-21",
+        "confirmation_code": "GY-h5SdcsBL",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "reservation_id": "68b0c1d2e3f4a5b6c7d8e9f0",
+        "source_channel": "direct",
+        "status": "inquiry",
+        "version": "2026-11-15T19:04:11.000Z"
+      },
+      "time": "2026-11-15T19:03:58.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:68b0c1d2e3f4a5b6c7d8e9f0:inquiry"
+    }
+  ],
+  "input": {
+    "now": "2026-11-17T18:00:00.000Z",
+    "payload": {
+      "event": "reservation.new",
+      "meta": {
+        "eventId": "e5"
+      },
+      "reservation": {
+        "__v": 3,
+        "_id": "68b0c1d2e3f4a5b6c7d8e9f0",
+        "accountId": "5f1a2b3c4d5e6f7a8b9c0d1e",
+        "checkIn": "2026-12-17T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-17",
+        "checkOut": "2026-12-21T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-21",
+        "confirmationCode": "GY-h5SdcsBL",
+        "createdAt": "2026-11-15T19:03:58.000Z",
+        "guest": {
+          "_id": "68b0guest",
+          "email": "lee.chen@example.org",
+          "fullName": "Lee Chen"
+        },
+        "guestId": "66f1c4a06100f639de7adab8",
+        "guestsCount": 3,
+        "id": "68b0c1d2e3f4a5b6c7d8e9f0",
+        "integration": {
+          "platform": "direct"
+        },
+        "lastUpdatedAt": "2026-11-15T19:04:11.000Z",
+        "listing": {
+          "_id": "66054019764cbb000f37c450",
+          "nickname": "Winery Villa",
+          "title": "Standalone French Villa at the Winery"
+        },
+        "listingId": "66054019764cbb000f37c450",
+        "money": {
+          "currency": "USD",
+          "hostPayout": 900
+        },
+        "nightsCount": 4,
+        "source": "website",
+        "status": "inquiry"
+      }
+    },
+    "source": "webhook"
+  }
+}

@@ -149,7 +149,7 @@ pub async fn is_opted_out(conn: &mut PgConnection, account_id: Uuid, phone: &str
 
 /// Opt a number out: block it at the carrier level, mark its profile unsubscribed from texts,
 /// and cancel its queued texts and pending double opt-ins. Call with the number locked.
-async fn apply_opt_out(conn: &mut PgConnection, account_id: Uuid, phone: &str, ours: &str, source: &str, inbound_id: Option<Uuid>) -> AppResult<()> {
+async fn apply_opt_out(conn: &mut PgConnection, db: &PgPool, account_id: Uuid, phone: &str, ours: &str, source: &str, inbound_id: Option<Uuid>) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO sms_opt_outs (account_id, phone_number, our_number, source, inbound_id) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT DO NOTHING",
@@ -161,12 +161,29 @@ async fn apply_opt_out(conn: &mut PgConnection, account_id: Uuid, phone: &str, o
     .bind(inbound_id)
     .execute(&mut *conn)
     .await?;
-    sqlx::query("UPDATE profiles SET sms_consent = 'unsubscribed', updated_at = now() WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(phone).execute(&mut *conn).await?;
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'opted out' WHERE account_id = $1 AND channel = 'sms' AND to_address = $2 AND status = 'queued'")
+    // Webhooks report the consent change and the skipped texts, from these writes (nothing extra
+    // runs for an account without them).
+    if crate::features::webhooks::wants_consent(db, account_id) {
+        let changed: Vec<(Uuid, String)> = sqlx::query_as(
+            "UPDATE profiles p SET sms_consent = 'unsubscribed', updated_at = now()
+             FROM (SELECT id, sms_consent FROM profiles WHERE account_id = $1 AND phone_number = $2 FOR UPDATE) old
+             WHERE p.id = old.id RETURNING p.id, old.sms_consent",
+        )
         .bind(account_id)
         .bind(phone)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
+        crate::features::webhooks::consent_changed_in(conn, db, account_id, &changed, "sms", "unsubscribed", "stop_keyword").await;
+    } else {
+        sqlx::query("UPDATE profiles SET sms_consent = 'unsubscribed', updated_at = now() WHERE account_id = $1 AND phone_number = $2").bind(account_id).bind(phone).execute(&mut *conn).await?;
+    }
+    const SKIP: &str = "UPDATE messages SET status = 'skipped', error = 'opted out' WHERE account_id = $1 AND channel = 'sms' AND to_address = $2 AND status = 'queued'";
+    if crate::features::observes_unsent(db, account_id) {
+        let skipped: Vec<Uuid> = sqlx::query_scalar(&format!("{SKIP} RETURNING id")).bind(account_id).bind(phone).fetch_all(&mut *conn).await?;
+        crate::features::messages_unsent_in(conn, db, account_id, &skipped).await;
+    } else {
+        sqlx::query(SKIP).bind(account_id).bind(phone).execute(&mut *conn).await?;
+    }
     sqlx::query("UPDATE sms_auto_sends SET status = 'cancelled', error = 'opted out', finished_at = now() WHERE account_id = $1 AND to_number = $2 AND status = 'queued'")
         .bind(account_id)
         .bind(phone)
@@ -182,7 +199,7 @@ async fn apply_opt_out(conn: &mut PgConnection, account_id: Uuid, phone: &str, o
 pub async fn opt_out_only(db: &PgPool, account_id: Uuid, phone: &str, ours: &str) -> AppResult<()> {
     let mut tx = db.begin().await?;
     lock_number(&mut tx, account_id, phone).await?;
-    apply_opt_out(&mut tx, account_id, phone, ours, "keyword", None).await?;
+    apply_opt_out(&mut tx, db, account_id, phone, ours, "keyword", None).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -340,11 +357,24 @@ pub async fn receive(state: &AppState, account_id: Uuid, from: &str, to: &str, m
         return load(db, account_id, msg.provider, provider_message_id).await;
     };
     match kind {
-        "stop" => apply_opt_out(&mut tx, account_id, from, to, opt_out_source(msg), Some(id)).await?,
+        "stop" => apply_opt_out(&mut tx, db, account_id, from, to, opt_out_source(msg), Some(id)).await?,
         "start" => {
             sqlx::query("DELETE FROM sms_opt_outs WHERE account_id = $1 AND phone_number = $2 AND our_number = $3").bind(account_id).bind(from).bind(to).execute(&mut *tx).await?;
             // Only while the profile still has the number that texted.
-            sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND phone_number = $2").bind(profile_id).bind(from).execute(&mut *tx).await?;
+            if crate::features::webhooks::wants_consent(db, account_id) {
+                let changed: Vec<(Uuid, String)> = sqlx::query_as(
+                    "UPDATE profiles p SET sms_consent = 'subscribed', updated_at = now()
+                     FROM (SELECT id, sms_consent FROM profiles WHERE id = $1 AND phone_number = $2 FOR UPDATE) old
+                     WHERE p.id = old.id RETURNING p.id, old.sms_consent",
+                )
+                .bind(profile_id)
+                .bind(from)
+                .fetch_all(&mut *tx)
+                .await?;
+                crate::features::webhooks::consent_changed_in(&mut tx, db, account_id, &changed, "sms", "subscribed", "start_keyword").await;
+            } else {
+                sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND phone_number = $2").bind(profile_id).bind(from).execute(&mut *tx).await?;
+            }
         }
         // START on this number while another of ours still has their opt-out: lift this one only.
         _ if lift_here => {

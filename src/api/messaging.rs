@@ -153,7 +153,9 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
         ctx["email"] = json!("alex@example.com");
         ctx["person"] = json!({"first_name": "Alex", "last_name": "Rivera", "email": "alex@example.com", "properties": {}});
     }
-    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &b.content, &mut ctx, true).await?.into_owned();
+    // Saved blocks and display rules (see features::content); email without them goes on untouched.
+    let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
+    let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
     // A preview shows a sample coupon code and uses none.
     crate::features::coupons::template::fill_sample(&mut ctx);
     if b.channel == "email" {
@@ -456,7 +458,9 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let account = load_account(&state.db, account_id).await?;
     let mut problems = campaigns::readiness(&account, &c, state.email.name() == "ses");
     // Coupons the content uses: they exist, haven't expired and have codes for the audience.
-    problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &c).await?);
+    // (Saved blocks are read as they are now, the way the send will freeze them.)
+    let filled = crate::features::content::prepare::with_saved_filled(state, &c).await?;
+    problems.extend(crate::features::coupons::checks::campaign_problems(state, account_id, &filled).await?);
     if !problems.is_empty() {
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
@@ -590,7 +594,15 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
         .fetch_optional(&mut *tx)
         .await?;
     let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while cancelling; try again".into()))?;
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    if crate::features::observes_unsent(&state.db, account_id) {
+        let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued' RETURNING id")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        crate::features::messages_unsent_in(&mut tx, &state.db, account_id, &skipped).await;
+    } else {
+        sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(row)
 }
@@ -603,13 +615,14 @@ async fn cancel_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>)
 
 async fn duplicate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
     let c = campaigns::load(&state.db, ctx.account_id, id).await?;
-    // A copy of an imported campaign still needing review needs it too.
-    let mut content = c.content.clone();
+    // The copy is a new, unsent email: its saved blocks show their current content again. A copy
+    // of an imported campaign still needing review needs the review too.
+    let mut content = crate::features::content::prepare::relink(&c.content);
     let notes = crate::import_review::campaign_notes(&c);
     if !notes.is_empty() {
         crate::import_review::mirror(&mut content, &notes);
     }
-    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(content), send_at: None, ab_test: c.ab_test, send_options: c.send_options }).await?;
+    let copy = create_campaign(&state, ctx.account_id, CampaignBody { name: Some(format!("{} (copy)", c.name)), channel: Some(c.channel), audience: Some(c.audience), content: Some(content), send_at: None, ab_test: crate::features::content::prepare::relink_ab(&c.ab_test), send_options: c.send_options }).await?;
     Ok(Json(campaign_json(&state, &copy).await?))
 }
 
@@ -884,6 +897,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::Conflict("this flow changed while you were turning it on; open it again".into()))?;
+    crate::features::webhooks::flow_status_changed(&state.db, account_id, id, &row.name, &f.status, status, &row.trigger).await;
     if status == "live" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"first_flow\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
@@ -908,7 +922,11 @@ pub async fn flow_report(state: &AppState, account_id: Uuid, id: Uuid) -> AppRes
     let f = load_flow(state, account_id, id).await?;
     let (stats, active, total) = flows::stats(&state.db, account_id, id).await?;
     let nodes = flows::node_report(&state.db, account_id, &f).await?;
-    Ok(json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes}))
+    let mut out = json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes});
+    if f.trigger["type"] == "event_date" {
+        out["event_dates"] = flows::event_date_report(&state.db, f.id).await?;
+    }
+    Ok(out)
 }
 
 async fn flow_report_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

@@ -39,7 +39,7 @@ pub async fn close(tx: &mut sqlx::PgConnection, import_id: Uuid) -> sqlx::Result
         .fetch_optional(&mut *tx)
         .await?;
     if let Some(a) = account {
-        crate::jobs::enqueue(&mut *tx, JOB_REBASELINE, json!({"account_id": a}), None).await?;
+        crate::jobs::enqueue_background(&mut *tx, JOB_REBASELINE, json!({"account_id": a}), None).await?;
     }
     Ok(())
 }
@@ -63,7 +63,7 @@ pub async fn rebaseline(state: &AppState, account_id: Uuid) -> anyhow::Result<()
             .await?;
     }
     if segs.len() as i64 == BATCH {
-        crate::jobs::enqueue(&state.db, JOB_REBASELINE, json!({"account_id": account_id}), None).await?;
+        crate::jobs::enqueue_background(&state.db, JOB_REBASELINE, json!({"account_id": account_id}), None).await?;
     }
     Ok(())
 }

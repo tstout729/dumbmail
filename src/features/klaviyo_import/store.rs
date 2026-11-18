@@ -111,7 +111,7 @@ pub async fn enqueue(db: &PgPool, kind: &str, import_id: Uuid, run_at: Option<Da
         .fetch_one(db)
         .await?;
     if !queued {
-        crate::jobs::enqueue(db, kind, json!({"import_id": import_id}), run_at).await?;
+        crate::jobs::enqueue_background(db, kind, json!({"import_id": import_id}), run_at).await?;
     }
     Ok(())
 }

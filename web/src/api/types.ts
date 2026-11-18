@@ -1,6 +1,7 @@
 // Types mirror docs/API.md (v0.1 contract plus the "v0.2 additions" section). Keep them in sync with that file.
 
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
+import type { BlockOptions, ContentBlock } from "../features/content/types";
 import type { CouponBlock, CouponCondition } from "../features/coupons/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
@@ -236,10 +237,11 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock =
+export type EmailBlock = BlockOptions &
+  (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
-  | { type: "image"; src: string; alt?: string; href?: string; width?: number }
+  | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }
   | { type: "button"; text: string; href: string; color?: string; align?: Align }
   | { type: "divider" }
   | { type: "spacer"; height?: number }
@@ -247,7 +249,9 @@ export type EmailBlock =
   | { type: "product"; title: string; image?: string; price?: string; href: string; button_text?: string }
   | { type: "html"; html: string }
   | ProductsBlock
-  | CouponBlock;
+  | ContentBlock
+  | CouponBlock
+  );
 
 export type EmailBlockType = EmailBlock["type"];
 
@@ -345,11 +349,15 @@ export type CampaignReport = {
 
 // ---- Flows ----
 
+/** With `cancelled_by`, people leave the flow when a later event of those metrics has the same `key` property value. */
+type CancelledBy = { key?: string; cancelled_by?: string[] };
+
 export type FlowTrigger =
-  | { type: "metric"; metric: string; filters?: FieldFilter[] }
+  | ({ type: "metric"; metric: string; filters?: FieldFilter[] } & CancelledBy)
   | { type: "list"; list_id: string }
   | { type: "segment"; segment_id: string }
-  | { type: "date_property"; field: string; offset_days?: number };
+  | { type: "date_property"; field: string; offset_days?: number }
+  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy);
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
@@ -421,6 +429,8 @@ export type FlowSettings = {
   exit_condition?: SegmentDefinition;
   profile_filter?: SegmentDefinition;
   smart_sending_hours?: number;
+  /** Also send to people held back from marketing (added by an integration without an opt-in). */
+  service_messages?: boolean;
 };
 
 export type FlowDefinition = { entry: string | null; nodes: FlowNode[]; settings?: FlowSettings };
@@ -497,6 +507,12 @@ export type ProfileDetail = {
   segments: Segment[];
   events: EventRow[];
   messages: ProfileMessage[];
+  /** Why email to this profile is suppressed: hard_bounce, complaint, booking_relay or no_marketing. */
+  email_suppressed_reason?: string | null;
+  /** Held back from marketing: added (e.g. by an integration) without agreeing to it. */
+  marketing_hold?: boolean;
+  /** Set when an integration created the profile. */
+  source?: { kind: string; id: string | null; name: string | null } | null;
 };
 
 export type ProfileInput = Partial<

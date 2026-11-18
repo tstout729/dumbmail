@@ -1370,7 +1370,7 @@ async fn a_leave_while_the_import_adds_the_same_person_wins() {
     }
     assert!(waiting, "the leave waits for the import's row");
     import.commit().await.unwrap();
-    assert_eq!(leave.await.unwrap(), 1, "the removal saw the import's row");
+    assert_eq!(leave.await.unwrap().len(), 1, "the removal saw the import's row");
     assert!(!on_list(&h, "Newsletter", "gus@example.com").await);
     // The other order: the leave first, then the import's statement adds nobody.
     let fay = pid(&h, "fay@example.com").await;

@@ -3,11 +3,12 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Take people off a list (the dashboard, the API and MCP, the preference page). For a list imported
+/// Take people off a list and return who was on it (called by `audience::remove_from_list`, which
+/// the dashboard, the API and MCP and the preference page use). For a list imported
 /// from Klaviyo the leave is recorded first, in the same transaction, so a later import never adds them
 /// back. The leave is written before the removal, so an import adding the same person at the same moment
 /// either sees the leave or has its addition removed here. For any other list this is just the removal.
-pub async fn remove_members(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> sqlx::Result<u64> {
+pub async fn remove_members(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
     let mut tx = db.begin().await?;
     sqlx::query(
         "INSERT INTO klaviyo_memberships (account_id, list_id, profile_id, state, left_via)
@@ -21,7 +22,7 @@ pub async fn remove_members(db: &PgPool, account_id: Uuid, list_id: Uuid, profil
     .bind(profile_ids)
     .execute(&mut *tx)
     .await?;
-    let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(list_id).bind(profile_ids).execute(&mut *tx).await?.rows_affected();
+    let removed: Vec<Uuid> = sqlx::query_scalar("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2) RETURNING profile_id").bind(list_id).bind(profile_ids).fetch_all(&mut *tx).await?;
     tx.commit().await?;
-    Ok(n)
+    Ok(removed)
 }

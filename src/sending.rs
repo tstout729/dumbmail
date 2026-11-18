@@ -181,12 +181,17 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 return Ok(Outcome::Skipped("not emailable"));
             }
             if !spec.is_test {
-                let suppressed: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE id = $1")
-                    .bind(p.id)
-                    .fetch_one(&state.db)
-                    .await?;
+                let (suppressed, held): (Option<String>, bool) =
+                    sqlx::query_as(&format!("SELECT p.email_suppressed_reason, {} FROM profiles p WHERE p.id = $1", crate::marketing_hold::blocks_email_sql("$2")))
+                        .bind(p.id)
+                        .bind(spec.flow_id)
+                        .fetch_one(&state.db)
+                        .await?;
                 if suppressed.is_some() {
                     return Ok(Outcome::Skipped("suppressed"));
+                }
+                if held {
+                    return Ok(Outcome::Skipped(crate::marketing_hold::SKIP_REASON));
                 }
             }
             spec.to_override.clone().or_else(|| p.email.clone())
@@ -212,11 +217,12 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                             sqlx::query("UPDATE messages SET send_note = $2 WHERE id = $1").bind(mid).bind(&hours.note).execute(&state.db).await?;
                         }
                         None => {
+                            let mid = Uuid::now_v7();
                             sqlx::query(
                                 "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error, send_note)
                                  VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, 'skipped', $8, $9)",
                             )
-                            .bind(Uuid::now_v7())
+                            .bind(mid)
                             .bind(spec.account.id)
                             .bind(p.id)
                             .bind(spec.campaign_id)
@@ -227,6 +233,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                             .bind(&hours.note)
                             .execute(&state.db)
                             .await?;
+                            crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
                         }
                     }
                     return Ok(Outcome::Skipped(why));
@@ -259,13 +266,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         match spec.message_id {
             Some(mid) => {
                 sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE id = $1").bind(mid).execute(&state.db).await?;
+                crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
             }
             None => {
+                let mid = Uuid::now_v7();
                 sqlx::query(
                     "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, status, error)
                      VALUES ($1, $2, $3, 'email', $4, $5, $6, $7, 'skipped', 'sending paused')",
                 )
-                .bind(Uuid::now_v7())
+                .bind(mid)
                 .bind(spec.account.id)
                 .bind(p.id)
                 .bind(spec.campaign_id)
@@ -274,6 +283,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 .bind(&to)
                 .execute(&state.db)
                 .await?;
+                crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
             }
         }
         return Ok(Outcome::Skipped("sending paused"));
@@ -282,16 +292,27 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
     let mut ctx = render::context(spec.account, Some(p), spec.event, &unsub);
-    // Unique coupon codes are claimed here, after the checks above and just before rendering; a code
-    // stays the person's if a later check skips or defers this attempt. An empty pool holds the
-    // message. Messages without coupons do no coupon work (see features::coupons).
-    let coupons = match crate::features::coupons::assign::prepare_send(state, &spec, message_id).await? {
+    // Saved blocks, display rules and the content module's blocks are worked out per recipient (see
+    // features::content); email that uses none of them goes on untouched. When every block is hidden
+    // for this person they get nothing (a test send says why). This runs before coupon codes are
+    // claimed, so a code is only used for what this person will see.
+    let Some(prepared) = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await? else {
+        if spec.is_test {
+            return Err(AppError::bad("Nothing to show for this person: every block is hidden by a display rule, so they'd be skipped."));
+        }
+        return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
+    };
+    // Unique coupon codes are claimed here, after the checks above and just before rendering, for the
+    // coupons the prepared content shows; a code stays the person's if a later check skips or defers
+    // this attempt. An empty pool holds the message. Messages without coupons do no coupon work (see
+    // features::coupons).
+    let coupons = match crate::features::coupons::assign::prepare_send_for(state, &spec, &prepared, message_id).await? {
         crate::features::coupons::Prepared::Ready(c) => c,
         crate::features::coupons::Prepared::Hold(until) => return Ok(Outcome::Deferred(until)),
     };
     coupons.fill(&mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
-    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, spec.content, &mut ctx, false).await?;
+    let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,
@@ -352,6 +373,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     if price > 0 && crate::billing::balance(&state.db, spec.account.id).await? < price {
         if let Some(mid) = spec.message_id {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'insufficient credit' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            crate::features::messages_unsent(&state.db, spec.account.id, &[mid]).await;
         }
         if spec.is_test {
             return Err(AppError::LimitReached("your balance is empty; add credit in Settings → Billing".into()));
@@ -409,7 +431,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // skipped after it's handed over.
     let stop = match &rendered {
         Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational).await?,
-        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id, spec.flow_id).await?,
         Rendered::Email(_) => None,
     };
     if let Some(stop) = stop {
@@ -433,6 +455,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                         .bind(note)
                         .execute(&state.db)
                         .await?;
+                    crate::features::messages_unsent(&state.db, spec.account.id, &[message_id]).await;
                 }
                 Ok(Outcome::Skipped(why))
             }
@@ -521,6 +544,9 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 .bind(&msg)
                 .execute(&state.db)
                 .await?;
+            if !spec.is_test {
+                crate::features::messages_unsent(&state.db, spec.account.id, &[message_id]).await;
+            }
             Ok(Outcome::Failed(msg))
         }
     }
@@ -535,22 +561,24 @@ enum Stop {
 /// The last check before the provider call, in one query against the current state: the person's
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
-async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>) -> AppResult<Option<Stop>> {
-    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>);
-    let row: Option<Row> = sqlx::query_as(
+async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>, flow_id: Option<Uuid>) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool);
+    let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
                 CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
                 (SELECT c.status FROM campaigns c WHERE c.id = $2),
-                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, {}
          FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE p.id = $1",
-    )
+        crate::marketing_hold::blocks_email_sql("$4")
+    ))
     .bind(profile_id)
     .bind(campaign_id)
     .bind(channel)
+    .bind(flow_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict)) = row else {
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held)) = row else {
         return Ok(Some(Stop::Skip("profile deleted", None)));
     };
     match campaign.as_deref() {
@@ -565,6 +593,9 @@ async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, chann
         }
         if suppressed {
             return Ok(Some(Stop::Skip("suppressed", None)));
+        }
+        if held {
+            return Ok(Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None)));
         }
         if paused {
             return Ok(Some(Stop::Skip("sending paused", None)));
@@ -634,12 +665,16 @@ async fn claim_text(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, to:
     };
     match &stop {
         Some(Stop::Skip(why, note)) => {
-            sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1 AND status IN ('queued', 'sending')")
+            let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2, send_note = COALESCE($3, send_note) WHERE id = $1 AND status IN ('queued', 'sending')")
                 .bind(message_id)
                 .bind(why)
                 .bind(note)
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
+            if n > 0 && !spec.is_test {
+                crate::features::messages_unsent_in(&mut tx, &state.db, account.id, &[message_id]).await;
+            }
         }
         Some(Stop::Defer(_)) => {}
         None => {

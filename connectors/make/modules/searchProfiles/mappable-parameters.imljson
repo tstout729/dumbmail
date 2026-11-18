@@ -1,0 +1,4 @@
+[
+	{ "name": "query", "type": "text", "label": "Email, phone, name or external ID", "required": true },
+	{ "name": "limit", "type": "uinteger", "label": "Limit", "default": 10, "help": "Most profiles to return. Results are fetched 100 at a time." }
+]

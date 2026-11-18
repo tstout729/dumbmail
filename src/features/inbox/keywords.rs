@@ -385,13 +385,22 @@ pub async fn subscribed(state: &AppState, auto: &replies::AutoSend, message_id: 
     }
     // The profile must still have the number that agreed: if its number was changed meanwhile,
     // nobody is subscribed.
-    let updated = sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND phone_number = $3")
-        .bind(auto.profile_id)
-        .bind(auto.account_id)
-        .bind(&auto.to_number)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    const SUBSCRIBE: &str = "UPDATE profiles p SET sms_consent = 'subscribed', updated_at = now()
+         FROM (SELECT id, sms_consent FROM profiles WHERE id = $1 AND account_id = $2 AND phone_number = $3 FOR UPDATE) old
+         WHERE p.id = old.id RETURNING p.id, old.sms_consent";
+    let updated = if crate::features::webhooks::wants_consent(&state.db, auto.account_id) {
+        let changed: Vec<(Uuid, String)> = sqlx::query_as(SUBSCRIBE).bind(auto.profile_id).bind(auto.account_id).bind(&auto.to_number).fetch_all(&mut *tx).await?;
+        crate::features::webhooks::consent_changed_in(&mut tx, &state.db, auto.account_id, &changed, "sms", "subscribed", if double { "double_opt_in" } else { "keyword" }).await;
+        changed.len() as u64
+    } else {
+        sqlx::query("UPDATE profiles SET sms_consent = 'subscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND phone_number = $3")
+            .bind(auto.profile_id)
+            .bind(auto.account_id)
+            .bind(&auto.to_number)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    };
     if updated == 0 {
         tracing::info!(auto = %auto.id, "sign-up not recorded: the profile's number changed before the confirmation went out");
         return Ok(());

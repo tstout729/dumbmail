@@ -140,7 +140,9 @@ async fn an_account_that_never_imported_runs_the_same_sql_as_before() {
     let got: Vec<(&str, usize)> = report.iter().map(|(l, n, _)| (*l, *n)).collect();
     let detail: Vec<String> = report.iter().map(|(l, n, s)| show(l, *n, s)).collect();
     println!("{}", detail.join("\n"));
-    // Measured on origin/main (35d7abc) with this same test.
+    // Measured on origin/main (ea51090) with this same test: the import adds no statement to these
+    // paths. If a later change to main adds one on purpose, run this file on main and update the
+    // numbers; an accidental extra query on a send path is what this is here to catch.
     let expected: Vec<(&str, usize)> = EXPECTED.to_vec();
     assert_eq!(got, expected, "{}", detail.join("\n"));
     h.cleanup().await;
@@ -153,6 +155,6 @@ const EXPECTED: &[(&str, usize)] = &[
     ("test send", 12),
     ("flow go-live", 5),
     ("live flow edit", 2),
-    ("flow email send", 25),
+    ("flow email send", 26),
     ("segment refresh", 7),
 ];

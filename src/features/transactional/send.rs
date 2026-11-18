@@ -235,6 +235,9 @@ async fn resolve_content(db: &PgPool, account_id: Uuid, b: &SendBody) -> AppResu
         o.insert("subject".into(), json!(s));
     }
     check_review(&content)?;
+    if let Some(p) = crate::features::content::prepare::transactional_problem(&content) {
+        return Err(AppError::bad(p));
+    }
     // Coupon codes aren't supported in transactional email (templates saved before that rule included).
     crate::features::coupons::template::forbid(&content)?;
     let o = content.as_object().ok_or_else(|| AppError::bad("content must be an object"))?;
@@ -593,7 +596,15 @@ async fn finish_unsent(db: &PgPool, id: Uuid, message_id: Uuid, status: &str, ms
         .bind(msg)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE messages SET status = $2, error = $3 WHERE id = $1 AND status = 'queued'").bind(message_id).bind(if status == "skipped" { "skipped" } else { "failed" }).bind(msg).execute(&mut *tx).await?;
+    let account: Option<Uuid> = sqlx::query_scalar("UPDATE messages SET status = $2, error = $3 WHERE id = $1 AND status = 'queued' RETURNING account_id")
+        .bind(message_id)
+        .bind(if status == "skipped" { "skipped" } else { "failed" })
+        .bind(msg)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(account) = account {
+        crate::features::messages_unsent_in(&mut tx, db, account, &[message_id]).await;
+    }
     tx.commit().await
 }
 
@@ -764,7 +775,13 @@ pub async fn sweep(db: &PgPool) -> sqlx::Result<()> {
     .await?;
     let ids: Vec<Uuid> = interrupted.into_iter().chain(expired).flatten().collect();
     if !ids.is_empty() {
-        sqlx::query("UPDATE messages SET status = 'failed', error = 'transactional send interrupted or expired' WHERE id = ANY($1) AND status = 'queued'").bind(&ids).execute(db).await?;
+        const FAIL: &str = "UPDATE messages SET status = 'failed', error = 'transactional send interrupted or expired' WHERE id = ANY($1) AND status = 'queued'";
+        if crate::features::observes_any(db) {
+            let failed: Vec<(Uuid, Uuid)> = sqlx::query_as(&format!("{FAIL} RETURNING account_id, id")).bind(&ids).fetch_all(db).await?;
+            crate::features::messages_unsent_rows(db, &failed).await;
+        } else {
+            sqlx::query(FAIL).bind(&ids).execute(db).await?;
+        }
     }
     Ok(())
 }

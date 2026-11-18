@@ -183,7 +183,7 @@ pub async fn connect(state: &AppState, account_id: Uuid, api_key: &str) -> AppRe
         .bind(&info)
         .execute(&mut *tx)
         .await?;
-    crate::jobs::enqueue(&mut *tx, JOB_SURVEY, json!({"import_id": id}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, JOB_SURVEY, json!({"import_id": id}), None).await?;
     tx.commit().await?;
     status_json(state, account_id).await
 }

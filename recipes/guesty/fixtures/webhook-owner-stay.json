@@ -1,0 +1,70 @@
+{
+  "description": "owner stays are skipped",
+  "expect": [
+    {
+      "message": "skipped owner stay 66f1c4a1246e7d9f0f8da88a",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "now": "2026-11-17T18:00:00.000Z",
+    "payload": {
+      "event": "reservation.new",
+      "meta": {
+        "eventId": "e6"
+      },
+      "reservation": {
+        "__v": 3,
+        "_id": "66f1c4a1246e7d9f0f8da88a",
+        "accountId": "5f1a2b3c4d5e6f7a8b9c0d1e",
+        "checkIn": "2026-12-17T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-17",
+        "checkOut": "2026-12-21T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-21",
+        "confirmationCode": "GY-h5SdcsBL",
+        "confirmedAt": "2026-11-15T19:04:11.000Z",
+        "createdAt": "2026-11-15T19:03:58.000Z",
+        "guest": {
+          "_id": "66f1c4a06100f639de7adab8",
+          "email": "dana.whitfield@example.com",
+          "emails": [
+            "dana.whitfield@example.com"
+          ],
+          "firstName": "Dana",
+          "fullName": "Dana Whitfield",
+          "lastName": "Whitfield",
+          "phone": "+1 (503) 555-0142",
+          "phones": [
+            "+1 (503) 555-0142"
+          ]
+        },
+        "guestId": "66f1c4a06100f639de7adab8",
+        "guestsCount": 3,
+        "id": "66f1c4a1246e7d9f0f8da88a",
+        "integration": {
+          "_id": "660d12b08048010013b6a2ef",
+          "platform": "manual"
+        },
+        "lastUpdatedAt": "2026-11-15T19:04:11.000Z",
+        "listing": {
+          "_id": "66054019764cbb000f37c450",
+          "nickname": "Winery Villa",
+          "title": "Standalone French Villa at the Winery"
+        },
+        "listingId": "66054019764cbb000f37c450",
+        "money": {
+          "balanceDue": 712.5,
+          "currency": "USD",
+          "fareAccommodation": 1100,
+          "hostPayout": 1210.2,
+          "totalPaid": 600,
+          "totalTaxes": 112.5
+        },
+        "nightsCount": 4,
+        "source": "owner",
+        "status": "confirmed"
+      }
+    },
+    "source": "webhook"
+  }
+}

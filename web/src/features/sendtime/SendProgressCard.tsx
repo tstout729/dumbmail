@@ -11,7 +11,9 @@ export function SendProgressCard({ campaignId, live, timezone }: { campaignId: s
   if (progress.error) return <p className="mb-4 text-sm text-red-600">{progress.error.message}</p>;
   const p = progress.data;
   const timed = p.buckets.some((b) => b.at !== null);
-  if (!timed && p.totals.skipped_smart_sending === 0) return null;
+  // Shown for timed sends, smart sending, and people display rules left nothing for (see features/content).
+  const nothingToShow = p.skip_reasons.some((r) => r.reason === "nothing to show for this person");
+  if (!timed && p.totals.skipped_smart_sending === 0 && !nothingToShow) return null;
   const at = (iso: string | null) => (iso ? formatDateTime(iso, timezone) : "Right away");
   return (
     <Card title="Delivery schedule" className="mb-4">

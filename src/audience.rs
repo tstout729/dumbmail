@@ -102,6 +102,14 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 
     for attempt in 0..2 {
         let existing = find_profile(db, account_id, input).await?;
+        if fill_only {
+            if let Some(p) = &existing {
+                if let Some(narrowed) = protect_from_public(db, p, input, email.as_deref(), phone.as_deref()).await? {
+                    return Box::pin(upsert_inner(db, account_id, &narrowed, true)).await;
+                }
+            }
+        }
+        let mut old_consent: Option<(String, String)> = None;
         let res = match &existing {
             Some(p) => {
                 let q = if fill_only {
@@ -110,22 +118,34 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             email = COALESCE(p.email, $2), phone_number = COALESCE(p.phone_number, $3),
                             external_id = COALESCE(p.external_id, $4), first_name = COALESCE(p.first_name, $5),
                             last_name = COALESCE(p.last_name, $6), properties = $7 || p.properties,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = CASE WHEN $2::text IS NOT NULL AND COALESCE(p.email, $2::text) = $2::text THEN COALESCE($8, p.email_consent) ELSE p.email_consent END,
+                            sms_consent = CASE WHEN $3::text IS NOT NULL AND COALESCE(p.phone_number, $3::text) = $3::text THEN COALESCE($9, p.sms_consent) ELSE p.sms_consent END,
                             updated_at = now()
-                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                         FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
+                         WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 } else {
+                    // A match by id, phone or external id that brings a different email: the new
+                    // address never agreed to anything. Subscribed drops to never_subscribed
+                    // (unsubscribed stays), and a hard bounce, which belonged to the old address, is
+                    // cleared; a spam complaint stays.
+                    let changed = "($2::text IS NOT NULL AND p.email IS NOT NULL AND p.email <> $2::text)";
                     format!(
                         "UPDATE profiles p SET
                             email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
                             external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
                             last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = COALESCE($8, CASE WHEN {changed} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END),
+                            sms_consent = COALESCE($9, p.sms_consent),
+                            email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                             updated_at = now()
-                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                         FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
+                         WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 };
-                sqlx::query_as::<_, Profile>(&q)
+                // The consent the update replaced, read by the update itself (the row is locked):
+                // a webhook reports a transition only if this write made it.
+                sqlx::query_as::<_, WithOldConsent>(&q)
                     .bind(p.id)
                     .bind(&email)
                     .bind(&phone)
@@ -137,7 +157,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&input.sms_consent)
                     .fetch_one(db)
                     .await
-                    .map(|profile| Upserted { profile, created: false })
+                    .map(|r| {
+                        old_consent = Some((r.old_email_consent, r.old_sms_consent));
+                        Upserted { profile: r.profile, created: false }
+                    })
             }
             None => {
                 let q = format!(
@@ -162,7 +185,12 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
         };
         match res {
-            Ok(u) => return Ok(u),
+            Ok(u) => {
+                let source = if fill_only { EventSource::Browser } else { EventSource::Api };
+                let consent_before = old_consent.as_ref().map(|(e, s)| (e.as_str(), s.as_str()));
+                crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), consent_before, &u.profile, source).await;
+                return Ok(u);
+            }
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
@@ -172,6 +200,51 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         }
     }
     Err(AppError::Conflict("could not save profile, please retry".into()))
+}
+
+/// The public fill-only path (forms, the website script) on a profile an integration wrote (it has
+/// integration keys or a marketing hold): it never adds or changes an email or phone there when it
+/// matched the profile by a different identifier. With a submitted email that isn't this
+/// profile's, the submission goes to the profile that has that email (found or created), without
+/// the other identifiers. Otherwise the identifiers this profile doesn't already have are dropped.
+/// Returns the narrowed input to use instead, or None to go ahead as given.
+async fn protect_from_public(db: &PgPool, p: &Profile, input: &ProfileInput, email: Option<&str>, phone: Option<&str>) -> AppResult<Option<ProfileInput>> {
+    let email_differs = email.is_some_and(|e| p.email.as_deref() != Some(e));
+    let phone_differs = phone.is_some_and(|n| p.phone_number.as_deref() != Some(n));
+    let ext_differs = input.external_id.as_deref().is_some_and(|x| p.external_id.as_deref() != Some(x));
+    if !(email_differs || phone_differs || ext_differs) {
+        return Ok(None);
+    }
+    let protected: bool = sqlx::query_scalar("SELECT integration_keys <> '{}' OR marketing_hold FROM profiles WHERE id = $1").bind(p.id).fetch_optional(db).await?.unwrap_or(false);
+    if !protected {
+        return Ok(None);
+    }
+    let mut narrowed = input.clone();
+    if email_differs {
+        // Someone else's address, or one this person never gave the business: it gets its own profile.
+        narrowed.id = None;
+        narrowed.phone_number = None;
+        narrowed.external_id = None;
+        narrowed.sms_consent = None;
+    } else {
+        if phone_differs {
+            narrowed.phone_number = None;
+            narrowed.sms_consent = None;
+        }
+        if ext_differs {
+            narrowed.external_id = None;
+        }
+    }
+    Ok(Some(narrowed))
+}
+
+/// A profile row with the consent values the update that returned it replaced.
+#[derive(sqlx::FromRow)]
+struct WithOldConsent {
+    #[sqlx(flatten)]
+    profile: Profile,
+    old_email_consent: String,
+    old_sms_consent: String,
 }
 
 pub async fn metric_id(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<Uuid> {
@@ -244,24 +317,68 @@ pub fn is_reserved_metric(name: &str) -> bool {
     is_server_only_metric(name) || named(BROWSER_RESERVED_METRICS, name)
 }
 
-/// Record an event and wake any live flows triggered by that metric. Returns None for duplicates.
+/// Who recorded an event. Webhook payloads carry it, so a receiver can tell browser input from
+/// data DumbMail or the business's own systems confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventSource {
+    /// DumbMail itself (sends, opens, clicks, unsubscribes, forms, alerts).
+    System,
+    /// The REST API or MCP, with an API key or a dashboard session.
+    Api,
+    /// A connected integration syncing from another system.
+    Integration,
+    /// The public browser endpoint (`/client/events`): anyone with the site key can send these.
+    Browser,
+}
+
+impl EventSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventSource::System => "system",
+            EventSource::Api => "api",
+            EventSource::Integration => "integration",
+            EventSource::Browser => "browser",
+        }
+    }
+}
+
+/// Record an event and wake any live flows triggered by that metric (and features that asked to
+/// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
-    insert_event(db, ev, false).await
+    insert_event(db, ev, EventSource::System).await
+}
+
+/// Record an event sent through the REST API or MCP.
+pub async fn record_api_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
+    insert_event(db, ev, EventSource::Api).await
+}
+
+/// Record an event with an explicit source (e.g. an integration's sync).
+pub async fn record_event_from(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
+    if source == EventSource::Browser {
+        return record_browser_event(db, ev).await;
+    }
+    insert_event(db, ev, source).await
 }
 
 /// Record an event a browser sent through the public endpoint. It's marked as such, so features
 /// can tell it from server-confirmed data (e.g. browser orders don't make best sellers).
 pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
-    if is_reserved_metric(ev.metric) {
-        return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", ev.metric.trim())));
+    if is_reserved_metric(ev.metric) || is_account_server_only_metric(db, ev.account_id, ev.metric).await? {
+        return Err(AppError::bad(format!("{:?} is recorded by DumbMail or a server and can't be sent from a browser", ev.metric.trim())));
     }
-    insert_event(db, ev, true).await
+    insert_event(db, ev, EventSource::Browser).await
 }
 
-async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppResult<Option<Uuid>> {
+async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
+    let metric = ev.metric.trim();
     let id = Uuid::now_v7();
     let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
+    // The event, the profile's last activity and the job that wakes flows commit together: an
+    // event a flow wants is never recorded without its job. If anything fails nothing is kept, the
+    // caller gets the error, and a retry with the same unique_id records it afresh.
+    let mut tx = db.begin().await?;
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
          VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
@@ -277,25 +394,66 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppR
     .bind(ev.occurred_at)
     .bind(&ev.unique_id)
     .bind(ev.message_id)
-    .bind(from_browser)
-    .fetch_optional(db)
+    .bind(source == EventSource::Browser)
+    .fetch_optional(&mut *tx)
     .await?;
+    let inserted = match (inserted, &ev.unique_id) {
+        (Some(id), _) => Some(id),
+        // A trusted event (DumbMail, the API, an integration) whose unique_id a browser already
+        // used: the browser's copy is replaced, in this transaction, so flows and every feature see
+        // the trusted one as new. A browser event never replaces anything.
+        (None, Some(unique_id)) if source != EventSource::Browser => {
+            let replaced = sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser")
+                .bind(ev.account_id)
+                .bind(metric_id)
+                .bind(unique_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if replaced == 0 {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
+                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, false)
+                     ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+                     RETURNING id",
+                )
+                .bind(id)
+                .bind(ev.account_id)
+                .bind(ev.profile_id)
+                .bind(metric_id)
+                .bind(&ev.properties)
+                .bind(value)
+                .bind(ev.occurred_at)
+                .bind(unique_id)
+                .bind(ev.message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        }
+        (None, _) => None,
+    };
     let Some(event_id) = inserted else { return Ok(None) };
     sqlx::query("UPDATE profiles SET last_event_at = GREATEST(COALESCE(last_event_at, 'epoch'), COALESCE($2, now())) WHERE id = $1")
         .bind(ev.profile_id)
         .bind(ev.occurred_at)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     let has_flow: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2)",
+        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND trigger->>'metric' = $2
+           AND ((status = 'live' AND trigger->>'type' = 'metric') OR trigger->>'type' = 'event_date'))",
     )
     .bind(ev.account_id)
-    .bind(ev.metric)
-    .fetch_one(db)
+    .bind(metric)
+    .fetch_one(&mut *tx)
     .await?;
-    if has_flow {
-        crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await?;
+    // Webhooks and exports: nothing at all unless the account has one; never fails or stalls this.
+    crate::features::event_recorded_in(&mut tx, db, ev.account_id, event_id, ev.profile_id, metric, source, ev.message_id, &ev.properties).await;
+    if has_flow || crate::features::wants_event(db, ev.account_id, metric).await {
+        crate::jobs::enqueue(&mut *tx, "flow_event", json!({"event_id": event_id}), None).await?;
     }
+    tx.commit().await?;
     Ok(Some(event_id))
 }
 
@@ -373,8 +531,21 @@ pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_i
     .await?;
     if !added.is_empty() {
         crate::jobs::enqueue(db, "flow_list", json!({"list_id": list_id, "profile_ids": added}), None).await?;
+        crate::features::webhooks::list_changed(db, account_id, list_id, &added, true).await;
     }
     Ok(added.len() as u64)
+}
+
+/// Remove profiles from a list (the caller has checked the list is the account's).
+pub async fn remove_from_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
+    // For a list imported from Klaviyo the leave is recorded with the removal, so a later import
+    // never adds the person back (see `klaviyo_import::remove_members`). For any other list this
+    // is just the removal.
+    let removed = crate::features::klaviyo_import::remove_members(db, account_id, list_id, profile_ids).await?;
+    if crate::features::webhooks::wants_list_changes(db, account_id, false) {
+        crate::features::webhooks::list_changed(db, account_id, list_id, &removed, false).await;
+    }
+    Ok(removed.len() as u64)
 }
 
 pub async fn list_belongs(db: &PgPool, account_id: Uuid, list_id: Uuid) -> AppResult<()> {
@@ -512,4 +683,16 @@ pub async fn import_csv(
         }
     }
     Ok(out)
+}
+
+/// Whether this account marked a metric server-only (an integration recorded it: bookings, orders),
+/// on top of the static [`is_reserved_metric`] list. A browser may not send it: a forged
+/// "Reservation Confirmed" would start booking flows for any address.
+pub async fn is_account_server_only_metric(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT server_only FROM metrics WHERE account_id = $1 AND name = $2")
+        .bind(account_id)
+        .bind(name.trim())
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false))
 }
