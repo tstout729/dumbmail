@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  Bell,
   Clock,
   CornerDownRight,
   GitBranch,
@@ -16,6 +17,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode, WaitForReplyNode } from "../../api";
+import { delaySummary, notifySummary, StepResultLine, type StepResult } from "../../features/flowsPlus";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
 import { Menu, cx } from "../ui";
@@ -33,6 +35,7 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   add_to_list: { icon: ListPlus, tone: "bg-accent-50 text-accent-700" },
   remove_from_list: { icon: ListMinus, tone: "bg-red-50 text-red-700" },
   webhook: { icon: Webhook, tone: "bg-zinc-100 text-zinc-600" },
+  notify: { icon: Bell, tone: "bg-amber-50 text-amber-700" },
 };
 
 type NodeStats = Map<string, { entered: number; stats: MessageStats }>;
@@ -43,6 +46,10 @@ type CanvasProps = {
   triggerLabel: string;
   lists: List[];
   report: FlowReport | undefined;
+  /** Per-step results (features/flowsPlus); shown instead of `report` when present. */
+  results?: StepResult[];
+  /** Open the list of people waiting at a step. */
+  onWaiting?: (nodeId: string) => void;
   selected: string | null;
   readOnly?: boolean;
   onSelectTrigger: () => void;
@@ -190,7 +197,7 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
   const listName = (id: string) => lists.find((l) => l.id === id)?.name ?? "a list";
   switch (node.type) {
     case "delay":
-      return { text: `Wait ${node.amount} ${node.amount === 1 ? node.unit.replace(/s$/, "") : node.unit}` };
+      return { text: delaySummary(node) };
     case "email":
       return node.content.subject ? { text: node.content.subject } : { text: "No subject", warning: "Add a subject line" };
     case "sms":
@@ -212,6 +219,8 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
       return node.list_id ? { text: listName(node.list_id) } : { text: "No list", warning: "Choose a list" };
     case "webhook":
       return { text: `${node.method ?? "POST"} ${node.url}` };
+    case "notify":
+      return notifySummary(node);
   }
 }
 
@@ -220,6 +229,7 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
   const Icon = meta.icon;
   const summary = nodeSummary(node, ctx.lists);
   const s = ctx.stats.get(node.id);
+  const r = ctx.results?.find((x) => x.node_id === node.id);
   const isMessage = node.type === "email" || node.type === "sms";
   const selected = ctx.selected === node.id;
   return (
@@ -243,7 +253,9 @@ function NodeCard({ node, ctx }: { node: FlowNode; ctx: ChainCtx }) {
           <span className="line-clamp-2 text-xs text-zinc-500">{summary.text}</span>
         </span>
       </div>
-      {s ? (
+      {r ? (
+        <StepResultLine result={r} onWaiting={ctx.onWaiting ? () => ctx.onWaiting?.(node.id) : undefined} />
+      ) : s ? (
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-zinc-100 pt-2 text-[11px] tabular-nums text-zinc-600">
           <span>{formatNumber(s.entered)} entered</span>
           {isMessage ? (

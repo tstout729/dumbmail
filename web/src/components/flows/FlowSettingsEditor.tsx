@@ -1,4 +1,5 @@
 import type { FlowSettings, Reentry, SegmentDefinition } from "../../api";
+import { NotifyCapField } from "../../features/flowsPlus";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
 import { Field, Input, Select } from "../ui";
 
@@ -43,6 +44,7 @@ export function FlowSettingsEditor({ settings, onChange, readOnly }: Props) {
           className="w-28"
         />
       </Field>
+      <NotifyCapField value={settings.notify_daily_cap} onChange={(notify_daily_cap) => onChange({ ...settings, notify_daily_cap })} />
       <div>
         <div className="mb-1 text-xs font-medium text-zinc-700">Profile filter</div>
         <p className="mb-2 text-xs text-zinc-500">Only people who match can enter. Checked again before each step.</p>
