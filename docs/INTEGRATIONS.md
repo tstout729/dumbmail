@@ -2,7 +2,7 @@
 
 An integration connects any app to DumbMail. The app sends webhooks to the integration's secret URL, or DumbMail fetches from the app's API on a schedule (a *pull*). A small JavaScript function you write, the *script*, turns each payload into a list of *actions*: create or update profiles, track events, change lists, record consent. Every step is logged, failures retry, and anything can be replayed.
 
-Ready-made integrations (*recipes*) exist for Guesty, Stripe and Calendly. Start from one when it fits (`list_integration_recipes`, `create_integration_from_recipe`); otherwise build one with the steps below.
+Ready-made integrations (*recipes*) exist for WooCommerce, BigCommerce, Stripe, Square, Recharge, Paddle, Guesty, Hostaway, Calendly, Typeform, Webflow forms, Zendesk, AfterShip and Segment (see Recipes). Start from one when it fits (`list_integration_recipes`, `create_integration_from_recipe`); otherwise build one with the steps below.
 
 ## Build one in five steps
 
@@ -69,6 +69,7 @@ function handle(input) {
 | `now` | The current time, ISO 8601 UTC |
 | `integration` | `{id, name}` |
 | `response`, `request`, `page`, `backfill` | Pulls only: the app's answer status and headers, the request made (secrets hidden), the page number (from 1) and `{since}` during a backfill, otherwise `null` |
+| `response`, `request`, `context` | Fetches (`source` `fetch`): the app's answer status and headers, the request made (secrets hidden), and the `context` the webhook's `next_request` carried |
 
 Return `[]` (or nothing) when there's nothing to do; the delivery is logged as `ignored`.
 
@@ -152,14 +153,15 @@ Saves values for the next run (`input.state`, and `{{state.KEY}}` in pull settin
 
 A note in the delivery log.
 
-### next_request (pulls only)
+### next_request (pulls, and webhooks that fetch)
 
 ```json
 {"type": "next_request", "query": {"skip": 200}}
 {"type": "next_request", "url": "/v1/items?page=3"}
+{"type": "next_request", "url": "/stores/abc123/v2/orders/250", "context": {"refund_id": 12}}
 ```
 
-Fetch another page. `query` and `headers` merge into the previous request (`null` removes a query parameter); `url`, `method` and `body` replace it. A `url` may change only the path and query: the site (scheme, host, port) stays the pull's own, and it can't carry a user name or password. Values are used as they are (placeholders and secrets are not expanded), and the same headers as in the pull settings are refused, so a payload can't steer the request or its credentials elsewhere.
+In a pull, fetch another page. In a webhook, fetch the record it names: many apps (BigCommerce, Acuity, Eventbrite) send only an id. This needs pull settings, which give the site, headers and credentials; the path and query come from the script, the pull's own query and body don't apply. The answer is stored as a delivery of its own (source `fetch`) and the script runs on it with `input.request`, `input.response` and `input.context` (whatever the webhook put in `context`, up to 16 KB), so it can tell what it fetched. That run may fetch once more (up to 3 fetches from one webhook), for example a refund, then its order. A fetch is queued in the same step that marks the webhook done, is stored once (a job that runs twice doesn't record it twice), and an answer that says "not yet" (404, 409, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes. A replay runs the current script again, which decides afresh what to fetch. `query` and `headers` merge into the previous request (`null` removes a query parameter); `url`, `method` and `body` replace it. A `url` may change only the path and query: the site (scheme, host, port) stays the pull's own, and it can't carry a user name or password. Values are used as they are (placeholders and secrets are not expanded), and the same headers as in the pull settings are refused, so a payload can't steer the request or its credentials elsewhere.
 
 ## Signatures
 
@@ -174,6 +176,9 @@ Fetch another page. `query` and `headers` merge into the previous request (`null
 | `{"type": "hmac", "header": "X-Signature", "timestamp_header": "X-Timestamp", "tolerance_seconds": 300}` | HMAC of `timestamp.body`, rejecting old timestamps |
 | `{"type": "hmac", "header": "Stripe-Signature", "format": "stripe"}` | `t=…,v1=…` headers (Stripe, Calendly): HMAC-SHA256 of `t.body`, 5-minute tolerance |
 | `{"type": "hmac", "header": "svix-signature", "format": "svix"}` | Svix / Standard Webhooks (Guesty and many others): `v1,<base64>` over `id.timestamp.body` with a `whsec_` secret. Use `webhook-signature` for Standard Webhooks headers. |
+| `{"type": "hmac", "header": "Paddle-Signature", "format": "paddle"}` | `ts=…;h1=…` (Paddle): HMAC-SHA256 of `ts:body`, 5-minute tolerance |
+| `{"type": "hmac", "header": "x-square-hmacsha256-signature", "encoding": "base64", "sign_url": true}` | HMAC of the webhook URL (exactly as the app was given it) followed by the body (Square) |
+| `{"type": "hmac", "header": "x-webflow-signature", "timestamp_header": "x-webflow-timestamp", "timestamp_separator": ":", "timestamp_unit": "milliseconds"}` | HMAC of `timestamp:body` with a millisecond timestamp (Webflow). `timestamp_separator: ""` and `timestamp_unit: "iso8601"` cover Zendesk's `timestamp + body` with an ISO 8601 time. |
 | `{"type": "shared_secret", "header": "X-Webhook-Token"}` | The secret itself in a header |
 | `{"type": "shared_secret", "query": "token"}` | The secret in a query parameter (removed before storing) |
 
@@ -229,7 +234,7 @@ OAuth2 tokens are cached (encrypted) and reused until five minutes before they e
 
 ## Deliveries, retries and replays
 
-Every webhook, pull page and replay is a *delivery* with its time, source (`webhook`, `pull`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload.
+Every webhook, pull page, fetch and replay is a *delivery* with its time, source (`webhook`, `pull`, `fetch`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload.
 
 - A webhook is checked, stored and queued in one step, and answered with 200 in milliseconds; the script runs right after in the background.
 - A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again.
@@ -237,7 +242,7 @@ Every webhook, pull page and replay is a *delivery* with its time, source (`webh
 - Nothing secret is stored or shown: every credential value, the access token, the encoded Basic value and anything else a request sent are masked wherever they appear (payloads, response headers such as `Link`, errors, the script's actions and logs, test results), including short ones (a PIN is masked where it stands as a whole word). The next-page request between pages is kept encrypted.
 - `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`. Replays count against the same limits as new webhooks.
 - While an integration is turned off, a webhook gets a log line (as `ignored`), but nothing is written and its payload isn't kept.
-- **Payloads may contain personal data** (names, addresses, booking notes). Only admins and the owner can read them (`integrations.manage`). Set `redact` to remove fields before a payload is stored or shown: dot paths like `results[].notes` or `reservation.notes`, `[]` for each item of a list, `*` for every key and `**` for any depth (`**.keyCode`). The script still sees the whole payload. A payload that isn't JSON or a form can't be checked, so with a redact list it isn't kept. Recipes come with their list (Guesty's removes door codes and access notes).
+- **Payloads may contain personal data** (names, addresses, booking notes). Only admins and the owner can read them (`integrations.manage`). Set `redact` to remove fields before a payload is stored or shown: dot paths like `results[].notes` or `reservation.notes`, `[]` for each item of a list, `*` for every key and `**` for any depth (`**.keyCode`). A pull's script sees the whole page; a webhook's (or fetch's) script runs on what was stored, so redact only fields the script doesn't read (the recipes' test suite checks this for every fixture). A payload that isn't JSON or a form can't be checked, so with a redact list it isn't kept. Recipes come with their list (Guesty's removes door codes and access notes).
 - Payloads are kept at most 30 days, and each account keeps at most 256 MB of them. A new payload makes room by dropping the oldest finished ones (their log lines stay); when payloads still waiting to run fill the budget, the webhook is answered 429 so the app sends it again later (a pull page keeps its log line without the page).
 - Scripts run in their own short-lived process with no network, files, open descriptors or environment. At most 2 run at once per account (8 in total by default); work over that waits a few seconds in the queue.
 - All integration work (deliveries, retries, pulls, backfills) runs in the background queue, apart from sending. A scheduled pull isn't queued while one for the same integration is waiting or running, and one pull runs at a time per account (4 in all by default, `INTEGRATION_PULL_SLOTS`).
@@ -270,7 +275,8 @@ Events from integrations start flows like any other events, and `{{ event.proper
 | Pull interval | 5 minutes or more |
 | Integrations per account | 50 |
 | Delivery log | 30 days; 256 MB of payloads per account, checked when each one arrives |
-| Pulls at once | 1 per account, 4 in total (`INTEGRATION_PULL_SLOTS`) |
+| Pulls at once | 1 per account, 4 in total (`INTEGRATION_PULL_SLOTS`); fetches share these slots |
+| Fetches from one webhook | 3, each `context` up to 16 KB |
 
 ## Recipes
 
@@ -279,6 +285,27 @@ A recipe is a ready-made integration kept in the DumbMail repository under `reci
 - **guesty**: v2 reservation webhooks and the current Open API (`/v1/reservations-v3/search` and `/v1/guests-crud`) → Reservation Booked (once per booking), Reservation Total (the booking's value, once), Reservation Confirmed (one per version of its dates, listing, status or guest), Reservation Cancelled, Reservation Updated and Inquiry Received, ordered by Guesty's own update time; door codes and access notes removed from stored payloads; guests as profiles held back from marketing (relay addresses suppressed); history import with client-credentials (token reuse); and draft booking confirmation, pre-arrival and review request flows marked as service messages. `recipes/guesty/README.md` lists the Guesty doc page behind each assumption, and what still has an end date.
 - **stripe**: Checkout (including delayed payments), invoices, refunds and subscriptions → Placed Order (not for checkouts that needed no payment), Refunded Order (once per refund, its own amount, once it has succeeded, found through its PaymentIntent or charge), Subscription Started (when it becomes active, once) / Cancelled; buyers who tick Checkout's promotional-emails box are subscribed, everyone else is held back from marketing.
 - **calendly**: bookings and cancellations → Meeting Scheduled / Meeting Cancelled, with draft reminder and follow-up flows.
+
+Every recipe below was checked against the vendor's documentation on 2026-11-17 and hasn't yet run against a live account. Each recipe's `README.md` lists the doc page behind each assumption, what's removed before payloads are stored, and what a live check should look at first. None of them subscribes anyone without an opt-in field the vendor documents for that purpose; everyone else they add is held back from marketing.
+
+### Commerce and subscriptions
+
+- **woocommerce**: order and customer webhooks (`X-WC-Webhook-Signature`, base64 HMAC) → Placed Order once it's paid, Fulfilled Order, Cancelled Order (paid orders only), Refunded Order (once per refund id, its own amount). Pending, on-hold, failed and free orders aren't orders. Past orders import with a REST API key once the Pull tab has the store's address. Setup: four webhooks (Order created, Order updated, Customer created, Customer updated) under WooCommerce → Settings → Advanced → Webhooks, with one secret.
+- **bigcommerce**: BigCommerce webhooks carry only an id, so each one fetches the order, refund or customer from the store's API (see `next_request`). Placed Order once paid, Fulfilled Order, Cancelled Order, Refunded Order (once per refund, in the order's currency, unless every payment in it was declined). The checkout's email opt-in box (`is_email_opt_in`) subscribes the buyer. Setup: a store-level API account (read-only Orders, Order transactions, Customers), `store_hash` in the settings, and one webhook per scope created with the API, carrying a secret `X-Webhook-Token` header.
+- **recharge**: Subscription Started, Reactivated, Cancelled and Skipped, Upcoming Charge, Charge Paid, Charge Failed. Recharge's body doesn't say which topic sent it, so each webhook is created with `?topic=<topic>` on the URL, and the topic must fit the signed body. Subscriptions wait for their customer. Draft upcoming-charge reminder (service message).
+- **square**: Placed Order for completed payments, Refunded Order for completed refunds (found through the payment), customers as profiles; Square's "unsubscribed from marketing emails" suppresses the address. Square signs the webhook URL too, so paste it exactly.
+- **paddle** (Paddle Billing): Placed Order for completed transactions, Refunded Order for approved refunds, Subscription Started and Cancelled; customers who tick Paddle Checkout's marketing box (`marketing_consent`) are subscribed. Draft win-back (marketing). Picked over Chargebee, whose webhooks use basic auth instead of a signature.
+
+### Hospitality and bookings
+
+- **hostaway**: reservations read from Hostaway's API every 15 minutes (its webhooks' body isn't documented): Reservation Booked, Reservation Total, Reservation Confirmed (each version, with `paid_in_full` as Hostaway reports it), Reservation Cancelled, Inquiry Received. Door codes, lockbox instructions and wifi details are removed from stored pages and never reach events. Draft pre-arrival flow that fires only for bookings paid in full, with placeholders, not access details. Setup: the Hostaway account ID and API key as credentials.
+
+### Forms, support, shipping and data
+
+- **typeform** and **webflow**: Form Submitted on the respondent's profile. A form submission never subscribes anyone and never renames an existing profile (anyone can type an address into a form); a consent question or checkbox you map in the settings is recorded on the event as `marketing_consent`. Typeform copies choice, yes/no, number and date answers (not free text); Webflow copies only the fields you list. Webflow signs only webhooks created through its API, so the setup creates it that way.
+- **zendesk**: Ticket Created, Ticket Solved and Satisfaction Rated from triggers that post a JSON body the setup gives (Zendesk placeholders). Only the subject and status are kept, never the conversation, and requesters' names aren't taken.
+- **aftership**: Shipment In Transit, Out For Delivery, Delivered and Shipment Exception, once per shipment and status, for the shipment's customer (not the sender). Draft out-for-delivery email (service message).
+- **segment**: identify calls (with `traits.email`) become profiles and keep the Segment userId as a key; track calls become events for the names in `settings.events` (Segment's ecommerce events by default), found by that userId. Calls from Segment's browser and mobile libraries are refused unless `allow_client_sources` is on, because a browser source's write key is public.
 
 ## Worked example: "connect my Guesty"
 
