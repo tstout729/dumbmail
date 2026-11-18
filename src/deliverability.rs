@@ -191,16 +191,29 @@ pub async fn pause(state: &AppState, account_id: Uuid, reason: &str) -> anyhow::
 }
 
 /// Fail a campaign because sending is paused; its queued messages are skipped (never silently dropped).
+/// The campaign is stopped first, in the same transaction, so a batch claiming or re-queuing a message
+/// at the same moment (see `campaigns::claim`) can't leave one queued behind it.
 pub async fn stop_campaign(db: &sqlx::PgPool, campaign_id: Uuid, msg: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test")
-        .bind(campaign_id)
-        .execute(db)
-        .await?;
-    sqlx::query("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1 AND status IN ('sending','scheduled','testing')")
-        .bind(campaign_id)
-        .bind(msg)
-        .execute(db)
-        .await?;
+    let mut tx = db.begin().await?;
+    let account: Option<Uuid> =
+        sqlx::query_scalar("UPDATE campaigns SET status = 'failed', error = $2, updated_at = now() WHERE id = $1 AND status IN ('sending','scheduled','testing') RETURNING account_id")
+            .bind(campaign_id)
+            .bind(msg)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match account.filter(|a| crate::features::observes_unsent(db, *a)) {
+        Some(account) => {
+            let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test RETURNING id")
+                .bind(campaign_id)
+                .fetch_all(&mut *tx)
+                .await?;
+            crate::features::messages_unsent_in(&mut tx, db, account, &skipped).await;
+        }
+        None => {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'sending paused' WHERE campaign_id = $1 AND status = 'queued' AND NOT is_test").bind(campaign_id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -227,10 +240,6 @@ fn esc(s: &str) -> String {
 /// Tenant-chosen text is flattened to one line and kept out of the ready-to-run command, which only
 /// carries the account id.
 async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: &str) {
-    let Some(to) = state.cfg.operator_alert_email.as_deref().or(state.cfg.support_email.as_deref()).filter(|s| s.contains('@')) else {
-        tracing::error!(account = %account_id, "no OPERATOR_ALERT_EMAIL or SUPPORT_EMAIL set; sending pause alert only logged");
-        return;
-    };
     let owner: Option<String> = sqlx::query_scalar(
         "SELECT u.email FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 ORDER BY m.created_at LIMIT 1",
     )
@@ -247,6 +256,16 @@ async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: 
          Once the list is cleaned up, lift it with:\n\n  curl -X POST {}/admin/unpause -H \"Authorization: Bearer $ADMIN_TOKEN\" -H 'Content-Type: application/json' -d '{{\"account_id\":\"{account_id}\"}}'\n",
         state.cfg.public_url()
     );
+    email_operator(state, account_id, &format!("Sending paused: {}", plain(&name, 60)), text).await;
+}
+
+/// Email the operator (OPERATOR_ALERT_EMAIL, or SUPPORT_EMAIL) a plain-text alert about an account.
+/// Callers flatten tenant-chosen text with [`plain`]. Failures are only logged.
+pub async fn email_operator(state: &AppState, account_id: Uuid, subject: &str, text: String) {
+    let Some(to) = state.cfg.operator_alert_email.as_deref().or(state.cfg.support_email.as_deref()).filter(|s| s.contains('@')) else {
+        tracing::error!(account = %account_id, subject, "no OPERATOR_ALERT_EMAIL or SUPPORT_EMAIL set; alert only logged");
+        return;
+    };
     let html = format!("<pre style=\"font-family:ui-monospace,monospace;white-space:pre-wrap\">{}</pre>", esc(&text));
     let email = OutgoingEmail {
         message_id: Uuid::now_v7(),
@@ -254,13 +273,13 @@ async fn alert_operator(state: &AppState, account_id: Uuid, name: &str, reason: 
         from_name: "DumbMail alerts".into(),
         from_email: to.to_string(),
         reply_to: None,
-        subject: format!("Sending paused: {}", plain(&name, 60)),
+        subject: subject.to_string(),
         html,
         text,
         unsubscribe_url: None,
     };
     if let Err(e) = state.email.send(&email).await {
-        tracing::error!(account = %account_id, error = %format!("{e:#}"), "couldn't email the sending pause alert");
+        tracing::error!(account = %account_id, error = %format!("{e:#}"), "couldn't email the operator alert");
     }
 }
 
@@ -480,7 +499,7 @@ pub fn forget_daily_limit(state: &AppState, account_id: Uuid) {
 pub const SUNSET_DAYS: i32 = 180;
 pub const SUNSET_MIN_EMAILS: i64 = 10;
 /// Events that don't show the person did anything.
-const PASSIVE_METRICS: &[&str] = &["Received Email", "Received SMS", "Bounced Email", "Marked Email as Spam", "Unsubscribed", "Unsubscribed from SMS"];
+pub const PASSIVE_METRICS: &[&str] = &["Received Email", "Received SMS", "Bounced Email", "Marked Email as Spam", "Unsubscribed", "Unsubscribed from SMS", "Received Transactional Email"];
 
 /// Appends ` AND NOT (<p is unengaged>)` for a query over `profiles p`.
 pub fn push_not_unengaged(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>) {

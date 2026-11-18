@@ -35,6 +35,10 @@ pub struct Config {
     pub telnyx_api_key: Option<String>,
     #[arg(long, env = "TELNYX_MESSAGING_PROFILE_ID")]
     pub telnyx_messaging_profile_id: Option<String>,
+    /// Telnyx's webhook signing public key (base64; Telnyx portal → Keys & Credentials → Public Key).
+    /// Set, inbound texts on the platform's Telnyx are verified and forged ones rejected.
+    #[arg(long, env = "TELNYX_PUBLIC_KEY")]
+    pub telnyx_public_key: Option<String>,
     #[arg(long, env = "TWILIO_ACCOUNT_SID")]
     pub twilio_account_sid: Option<String>,
     #[arg(long, env = "TWILIO_AUTH_TOKEN", hide_env_values = true)]
@@ -64,6 +68,11 @@ pub struct Config {
     /// Number of concurrent worker tasks.
     #[arg(long, env = "WORKERS", default_value_t = 4)]
     pub workers: usize,
+
+    /// Worker tasks for background-lane jobs (webhooks, exports): these never take sending work,
+    /// and the main workers never take theirs.
+    #[arg(long, env = "BACKGROUND_WORKERS", default_value_t = 2)]
+    pub background_workers: usize,
 
     /// Stripe secret key for credit top-ups (hosted billing).
     #[arg(long, env = "STRIPE_SECRET_KEY", hide_env_values = true)]

@@ -5,6 +5,7 @@ import { Settings2 } from "lucide-react";
 import type { Flow, FlowDefinition, FlowNode, FlowStatus, FlowTrigger } from "../../api";
 import { useFlow, useFlowReport, useLists, useSegments, useSession, useSetFlowStatus, useUpdateFlow } from "../../api";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { CheckPanel } from "../../features/content/CheckPanel";
 import { FlowCanvas, nodeIcons } from "../../components/flows/FlowCanvas";
 import { FlowSettingsEditor } from "../../components/flows/FlowSettingsEditor";
 import { countDescendants, insertAt, isBranch, newNode, nodeLabels, removeNode, replaceNode, triggerSummary, type Slot } from "../../components/flows/graph";
@@ -201,6 +202,7 @@ function FlowBuilder({ flow }: { flow: Flow }) {
         <Modal title={emailNode.name || "Email"} onClose={() => setEmailNodeId(null)} size="full">
           <div className="h-full overflow-y-auto p-5">
             <EmailEditor value={emailNode.content} onChange={(content) => editDef(replaceNode(def, { ...emailNode, content }))} templateName={emailNode.name} />
+            <CheckPanel content={emailNode.content} flowId={flow.id} nodeId={emailNode.id} className="mt-4" />
           </div>
         </Modal>
       ) : null}

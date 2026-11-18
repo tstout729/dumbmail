@@ -1,0 +1,14 @@
+{
+	"baseUrl": "{{ifempty(connection.baseUrl, 'https://dumbmail.ai')}}",
+	"headers": {
+		"Authorization": "Bearer {{connection.apiKey}}"
+	},
+	"response": {
+		"error": {
+			"message": "[{{statusCode}}] {{body.error.message}}"
+		}
+	},
+	"log": {
+		"sanitize": ["request.headers.authorization"]
+	}
+}

@@ -23,7 +23,46 @@ use axum::Router;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::team::access::{rule, Access, Perm, RouteRule, ToolRule};
 use super::{Feature, McpDoc};
+
+use Perm::{CatalogDelete, CatalogWrite, ContentRead};
+
+static ROUTE_RULES: &[RouteRule] = &[
+    rule("GET", "/api/catalog/summary", ContentRead),
+    rule("GET", "/api/catalog/facets", ContentRead),
+    rule("GET", "/api/catalog/products", ContentRead),
+    rule("POST", "/api/catalog/products", CatalogWrite),
+    rule("POST", "/api/catalog/products/import", CatalogWrite),
+    rule("GET", "/api/catalog/products/{key}", ContentRead),
+    rule("DELETE", "/api/catalog/products/{key}", CatalogDelete),
+    // Picks for a person also need profiles.read (checked in the handler).
+    rule("GET", "/api/catalog/recommendations", ContentRead),
+    rule("GET", "/api/catalog/feeds", ContentRead),
+    rule("POST", "/api/catalog/feeds", CatalogWrite),
+    rule("GET", "/api/catalog/feeds/{id}", ContentRead),
+    rule("PATCH", "/api/catalog/feeds/{id}", CatalogWrite),
+    rule("DELETE", "/api/catalog/feeds/{id}", CatalogDelete),
+    rule("POST", "/api/catalog/feeds/{id}/sync", CatalogWrite),
+    rule("GET", "/api/catalog/settings", ContentRead),
+    rule("PATCH", "/api/catalog/settings", CatalogWrite),
+];
+
+static TOOL_RULES: &[ToolRule] = &[
+    ToolRule { name: "list_products", perm: ContentRead },
+    ToolRule { name: "get_product", perm: ContentRead },
+    ToolRule { name: "upsert_products", perm: CatalogWrite },
+    ToolRule { name: "import_products_csv", perm: CatalogWrite },
+    ToolRule { name: "delete_product", perm: CatalogDelete },
+    ToolRule { name: "list_product_feeds", perm: ContentRead },
+    ToolRule { name: "create_product_feed", perm: CatalogWrite },
+    ToolRule { name: "update_product_feed", perm: CatalogWrite },
+    ToolRule { name: "sync_product_feed", perm: CatalogWrite },
+    ToolRule { name: "delete_product_feed", perm: CatalogDelete },
+    ToolRule { name: "get_recommendations", perm: ContentRead },
+    ToolRule { name: "get_catalog_settings", perm: ContentRead },
+    ToolRule { name: "update_catalog_settings", perm: CatalogWrite },
+];
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
 use crate::mcp::{from, obj, tool};
@@ -135,7 +174,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
     let acct = ctx.account_id;
     match name {
         "list_products" => api::list_products(state, acct, &from(a.clone())?).await,
-        "get_product" => store::detail(&state.db, acct, a["product_id"].as_str().unwrap_or("")).await,
+        "get_product" => api::product_detail(state, ctx, a["product_id"].as_str().unwrap_or("")).await,
         "upsert_products" => {
             let items = api::products_from(json!({"products": a["products"].clone()}))?;
             Ok(json!(store::upsert_products(&state.db, acct, &items, store::Origin::Api).await?))
@@ -150,11 +189,20 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
                     "note": format!("Nothing deleted. This removes {:?} with its variants, history and {waiting} waiting restock request(s). If a feed still lists it, the next sync adds it back. Call again with confirm=true once the user approves.", p.title)}));
             }
             let p = store::delete(&state.db, acct, key).await?;
+            crate::features::team::audit(state, ctx, "product.delete", Some(&p.id.to_string()), json!({"title": p.title})).await;
             Ok(json!({"ok": true, "deleted": p.id}))
         }
         "list_product_feeds" => Ok(json!({"data": feeds::list(&state.db, acct).await?})),
-        "create_product_feed" => Ok(json!(feeds::create(&state.db, acct, feed_input(a)?).await?)),
-        "update_product_feed" => Ok(json!(feeds::update(&state.db, acct, id_arg(a, "id")?, feed_input(a)?).await?)),
+        "create_product_feed" => {
+            let f = feeds::create(&state.db, acct, feed_input(a)?).await?;
+            api::feed_changed(state, ctx, "product_feed.create", &f).await;
+            Ok(json!(f))
+        }
+        "update_product_feed" => {
+            let f = feeds::update(&state.db, acct, id_arg(a, "id")?, feed_input(a)?).await?;
+            api::feed_changed(state, ctx, "product_feed.update", &f).await;
+            Ok(json!(f))
+        }
         "sync_product_feed" => api::sync_feed(state, acct, id_arg(a, "id")?).await,
         "delete_product_feed" => {
             let id = id_arg(a, "id")?;
@@ -163,6 +211,7 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
                 return Ok(json!({"dry_run": true, "note": format!("Nothing deleted. This removes the feed {:?}; its products stay but stop updating. Call again with confirm=true once the user approves.", f.name)}));
             }
             feeds::delete(&state.db, acct, id).await?;
+            crate::features::team::audit(state, ctx, "product_feed.delete", Some(&id.to_string()), json!({"name": f.name})).await;
             Ok(json!({"ok": true}))
         }
         "get_recommendations" => {
@@ -171,11 +220,12 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> AppResult<V
                 product_id: a["product_id"].as_str().map(String::from),
                 limit: a["limit"].as_i64(),
             };
-            api::recommendations(state, acct, &q).await
+            api::recommendations_for(state, ctx, &q).await
         }
         "get_catalog_settings" => api::settings_json(state, acct).await,
         "update_catalog_settings" => {
             alerts::update_settings(&state.db, acct, from(a.clone())?).await?;
+            crate::features::team::audit(state, ctx, "catalog.settings_change", None, json!({})).await;
             api::settings_json(state, acct).await
         }
         _ => Err(AppError::not_found("tool")),
@@ -190,6 +240,13 @@ impl Feature for Module {
 
     fn routes(&self) -> Router<AppState> {
         api::routes()
+    }
+
+    /// Reading the catalog is for everyone who sees content; changing it for managers and up;
+    /// deleting for admins and up. The widget, stock and confirmation endpoints are on the public
+    /// list in `team::access::PUBLIC_ROUTES`.
+    fn access(&self) -> Access {
+        Access { routes: ROUTE_RULES, tools: TOOL_RULES }
     }
 
     fn mcp_tools(&self) -> Vec<Value> {

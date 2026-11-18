@@ -101,7 +101,7 @@ pub async fn emails_remaining(db: &PgPool, account_id: Uuid) -> AppResult<i64> {
 }
 
 /// Take one email from the plan. False when there's no active plan or it's used up.
-pub async fn use_email(db: &PgPool, account_id: Uuid) -> AppResult<bool> {
+pub async fn use_email<'e>(db: impl sqlx::PgExecutor<'e>, account_id: Uuid) -> AppResult<bool> {
     let n = sqlx::query(
         "UPDATE accounts SET email_plan_emails_used = email_plan_emails_used + 1
          WHERE id = $1 AND email_plan_tier IS NOT NULL AND email_plan_period_end > now()

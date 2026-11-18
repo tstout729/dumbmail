@@ -7,6 +7,7 @@ import {
   ListPlus,
   Mail,
   MessageSquare,
+  MessageSquareReply,
   Plus,
   Shuffle,
   UserCog,
@@ -14,7 +15,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode } from "../../api";
+import type { ConditionNode, FlowDefinition, FlowNode, FlowNodeType, FlowReport, FlowTrigger, List, MessageStats, RandomSplitNode, WaitForReplyNode } from "../../api";
 import { formatCurrency, formatNumber, formatPercent } from "../../lib/format";
 import { definitionSummary } from "../segments/conditions";
 import { Menu, cx } from "../ui";
@@ -27,6 +28,7 @@ export const nodeIcons: Record<FlowNodeType, { icon: LucideIcon; tone: string }>
   sms: { icon: MessageSquare, tone: "bg-violet-50 text-violet-700" },
   condition: { icon: GitBranch, tone: "bg-amber-50 text-amber-700" },
   random_split: { icon: Shuffle, tone: "bg-fuchsia-50 text-fuchsia-700" },
+  wait_for_reply: { icon: MessageSquareReply, tone: "bg-violet-50 text-violet-700" },
   update_profile: { icon: UserCog, tone: "bg-zinc-100 text-zinc-600" },
   add_to_list: { icon: ListPlus, tone: "bg-accent-50 text-accent-700" },
   remove_from_list: { icon: ListMinus, tone: "bg-red-50 text-red-700" },
@@ -172,9 +174,10 @@ function Chain({ slot, ctx, seen }: { slot: Slot; ctx: ChainCtx; seen: Set<strin
   );
 }
 
-/** "yes"/"no" for a conditional split; "A · 50%"/"B · 50%" for a random split. */
-function branchLabel(node: ConditionNode | RandomSplitNode, branch: "yes" | "no"): string {
+/** "yes"/"no" for a conditional split; "A · 50%"/"B · 50%" for a random split; "replied"/"no reply" for a wait. */
+function branchLabel(node: ConditionNode | RandomSplitNode | WaitForReplyNode, branch: "yes" | "no"): string {
   if (node.type === "condition") return branch;
+  if (node.type === "wait_for_reply") return branch === "yes" ? "replied" : "no reply";
   return branch === "yes" ? `A · ${node.percent}%` : `B · ${100 - node.percent}%`;
 }
 
@@ -198,6 +201,8 @@ function nodeSummary(node: FlowNode, lists: List[]): { text: string; warning?: s
         : { text: "No conditions", warning: "Add a condition" };
     case "random_split":
       return { text: `${node.percent}% A / ${100 - node.percent}% B` };
+    case "wait_for_reply":
+      return { text: `Up to ${node.amount} ${node.amount === 1 ? node.unit.replace(/s$/, "") : node.unit} for them to text back` };
     case "update_profile": {
       const keys = Object.keys(node.properties);
       return keys.length ? { text: `Set ${keys.join(", ")}` } : { text: "No properties", warning: "Add a property" };

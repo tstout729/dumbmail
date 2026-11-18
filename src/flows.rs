@@ -221,7 +221,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     }
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
-            "condition" | "random_split" => vec!["yes", "no"],
+            "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
             "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
@@ -260,6 +260,18 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                 }
             }
             "update_profile" => need("properties")?,
+            "wait_for_reply" => {
+                let amount = n.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+                let unit = match n.str("unit") {
+                    Some("minutes") => 60.0,
+                    Some("hours") => 3600.0,
+                    Some("days") => 86400.0,
+                    _ => 0.0,
+                };
+                if amount <= 0.0 || unit == 0.0 || amount * unit > 30.0 * 86400.0 {
+                    return Err(AppError::bad(format!("wait for reply {} needs a positive amount and a unit (minutes, hours or days), up to 30 days", n.id)));
+                }
+            }
             "add_to_list" | "remove_from_list" => need("list_id")?,
             "webhook" => {
                 let u = n.str("url").unwrap_or("");
@@ -317,8 +329,17 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_public(IpAddr::V4(v4));
             }
-            let seg = v6.segments();
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80)
+            let (seg, o) = (v6.segments(), v6.octets());
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses carry an IPv4 address: judge that one.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])));
+            }
+            if seg[0] == 0x2002 {
+                return ip_is_public(IpAddr::V4(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5])));
+            }
+            // Otherwise only global unicast (2000::/3), minus Teredo tunnels and the documentation range.
+            // That leaves out loopback, IPv4-compatible, unique-local, link-local, site-local and multicast.
+            (seg[0] & 0xe000) == 0x2000 && !(seg[0] == 0x2001 && (seg[1] == 0 || seg[1] == 0x0db8))
         }
     }
 }
@@ -336,7 +357,9 @@ pub async fn check_webhook_url(raw: &str) -> AppResult<(String, std::net::Socket
         .await
         .map_err(|_| AppError::bad(format!("webhook host {host:?} doesn't resolve")))?
         .collect();
-    if addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip())) {
+    // Development and tests may allow localhost (WEBHOOKS_ALLOW_LOCALHOST); never private networks.
+    let local_ok = crate::features::webhooks::net::localhost_allowed() && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback());
+    if !local_ok && (addrs.is_empty() || addrs.iter().any(|a| !ip_is_public(a.ip()))) {
         return Err(AppError::bad("webhook url must point to a public internet address"));
     }
     Ok((host, addrs[0]))
@@ -360,8 +383,12 @@ pub struct Fetched {
 pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     let mut url = raw.to_string();
     for _ in 0..5 {
-        let (host, addr) = check_webhook_url(&url).await.map_err(|_| AppError::bad("enter a public website address"))?;
+        let (host, addr) = tokio::time::timeout(std::time::Duration::from_secs(5), check_webhook_url(&url))
+            .await
+            .map_err(|_| AppError::bad("that address didn't resolve in time"))?
+            .map_err(|_| AppError::bad("enter a public website address"))?;
         let client = reqwest::Client::builder()
+            .no_proxy()
             .resolve(&host, addr)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(10))
@@ -398,19 +425,30 @@ pub async fn fetch_public(raw: &str, max: usize) -> AppResult<Fetched> {
     Err(AppError::bad("that page redirects too many times"))
 }
 
-async fn call_webhook(url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
-    let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    let client = reqwest::Client::builder()
-        .resolve(&host, addr)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("dumbmail-webhook/0.1")
-        // No proxy: the pinned public address is the one connected to.
-        .no_proxy()
-        .build()?;
-    let req = if get { client.get(url) } else { client.post(url).json(payload) };
-    req.send().await?.error_for_status()?;
-    Ok(())
+/// Signed with the account's flow webhook secret (see docs/WEBHOOKS.md); a GET signs an empty body.
+/// One 10-second deadline covers resolving and checking the address, reading the signing secret
+/// (only once the address passed) and the request; no proxy is used, so the connection goes to the
+/// address that was checked.
+async fn call_webhook(state: &AppState, account_id: Uuid, url: &str, get: bool, payload: &Value) -> anyhow::Result<()> {
+    let body = if get { Vec::new() } else { serde_json::to_vec(payload)? };
+    let send = async {
+        let (host, addr) = check_webhook_url(url).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        let headers = crate::features::webhooks::flow_signature_headers(state, account_id, &body).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve(&host, addr)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("dumbmail-webhook/0.1")
+            .build()?;
+        let mut req = if get { client.get(url) } else { client.post(url).header("content-type", "application/json").body(body.clone()) };
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        req.send().await?.error_for_status()?;
+        anyhow::Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), send).await.map_err(|_| anyhow::anyhow!("no response within 10 seconds"))?
 }
 
 async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
@@ -500,7 +538,8 @@ pub async fn on_event(state: &AppState, event_id: Uuid) -> anyhow::Result<()> {
     for f in flows {
         if let Ok(Trigger::Metric { filters, .. }) = parse_trigger(&f.trigger) {
             if filters.iter().all(|flt| segments::json_filter_matches(&obj, flt)) {
-                let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at}});
+                // `from_browser`: recorded by the website script (anyone can send those); unknown counts as true.
+                let ctx = json!({"event": {"id": event_id, "metric": metric, "properties": props, "value": value, "occurred_at": at, "from_browser": from_browser != Some(false)}});
                 start(state, &f, profile_id, ctx).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
             }
         }
@@ -920,15 +959,10 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 }
             }
             "email" | "sms" => {
-                // Smart sending: skip if this person got any message in the last N hours (0 = off).
+                // Smart sending: skip if this person got any marketing message in the last N hours (0 = off).
+                // Inbox replies and other conversational texts (HELP, sign-up texts) don't count.
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
-                let recent: bool = hours > 0
-                    && sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = $2 AND status IN ('sent','delivered') AND NOT is_test AND sent_at > now() - make_interval(hours => $3))")
-                        .bind(run.profile_id)
-                        .bind(&node.kind)
-                        .bind(hours as i32)
-                        .fetch_one(&state.db)
-                        .await?;
+                let recent: bool = hours > 0 && crate::features::sendtime::recently_messaged(&state.db, run.profile_id, &node.kind, hours).await?;
                 if !recent {
                     let event = context.get("event").cloned();
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
@@ -972,6 +1006,48 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 next = node.str(if yes { "yes" } else { "no" }).map(str::to_string);
             }
+            // Wait until they text back (yes) or the time runs out (no); see `features::inbox`. The
+            // start and deadline are saved with the job in one transaction, and the branch is decided
+            // only by replies between them, however late the job runs.
+            "wait_for_reply" if !waited => {
+                let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let secs = (amount
+                    * match node.str("unit") {
+                        Some("minutes") => 60.0,
+                        Some("hours") => 3600.0,
+                        _ => 86400.0,
+                    })
+                .clamp(1.0, 30.0 * 86400.0);
+                let since = Utc::now();
+                let until = since + Duration::milliseconds((secs * 1000.0) as i64);
+                context["_waited"] = json!(node_id);
+                context["_reply_since"] = json!(since);
+                context["_reply_until"] = json!(until);
+                let mut tx = state.db.begin().await?;
+                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&mut *tx).await?;
+                crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                tx.commit().await?;
+                return Ok(());
+            }
+            "wait_for_reply" => {
+                let at = |k: &str| context.get(k).and_then(|v| serde_json::from_value::<chrono::DateTime<Utc>>(v.clone()).ok());
+                let since = at("_reply_since").unwrap_or_else(Utc::now);
+                // A deadline that can't be read counts nothing after the wait began.
+                let deadline = at("_reply_until").unwrap_or(since);
+                let now = Utc::now();
+                let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                if !replied && now < deadline {
+                    // Woken before the deadline without a reply inside the wait: keep waiting.
+                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(deadline)).await?;
+                    return Ok(());
+                }
+                if let Some(o) = context.as_object_mut() {
+                    o.remove("_waited");
+                    o.remove("_reply_since");
+                    o.remove("_reply_until");
+                }
+                next = node.str(if replied { "yes" } else { "no" }).map(str::to_string);
+            }
             "random_split" => {
                 let percent = split_percent(&node).unwrap_or(50);
                 let path_a = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100) < percent;
@@ -994,7 +1070,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     if node.kind == "add_to_list" {
                         crate::audience::add_to_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     } else {
-                        sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = $2").bind(list_id).bind(run.profile_id).execute(&state.db).await?;
+                        crate::audience::remove_from_list(&state.db, flow.account_id, list_id, &[run.profile_id]).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                     }
                 }
             }
@@ -1004,7 +1080,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     "flow": {"id": flow.id, "name": flow.name}, "node_id": node_id,
                     "profile": person, "event": context.get("event"), "body": node.data.get("body"),
                 });
-                if let Err(e) = call_webhook(&url, node.str("method") == Some("GET"), &payload).await {
+                if let Err(e) = call_webhook(state, flow.account_id, &url, node.str("method") == Some("GET"), &payload).await {
                     tracing::warn!(run = %run.id, url = %url, error = %e, "flow webhook failed");
                 }
             }
@@ -1262,6 +1338,18 @@ pub async fn from_blueprint(db: &PgPool, account_id: Uuid, key: &str, name: Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_public_addresses() {
+        let public = |s: &str| super::ip_is_public(s.parse().unwrap());
+        for ok in ["8.8.8.8", "2606:4700:4700::1111", "2002:808:808::1", "64:ff9b::808:808"] {
+            assert!(public(ok), "{ok}");
+        }
+        for no in ["10.0.0.1", "127.0.0.1", "169.254.169.254", "::1", "::ffff:10.0.0.1", "::10.0.0.1", "64:ff9b::a00:1", "64:ff9b::a9fe:a9fe",
+            "2002:a00:1::1", "2001:0:4136:e378::1", "2001:db8::1", "fec0::1", "fd00::1", "fe80::1", "ff02::1"] {
+            assert!(!public(no), "{no}");
+        }
+    }
+
     use super::*;
 
     #[test]

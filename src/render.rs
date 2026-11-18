@@ -103,9 +103,10 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
         "image" => {
             let w = b.get("width").and_then(|v| v.as_u64()).unwrap_or(552).min(552);
             let img = format!(
-                r#"<img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:6px;">"#,
+                r#"<img src="{src}" alt="{alt}" width="{w}" style="display:block;width:100%;max-width:{w}px;height:auto;border:0;border-radius:{r}px;">"#,
                 src = esc(s(b, "src")),
-                alt = esc(s(b, "alt"))
+                alt = esc(s(b, "alt")),
+                r = b.get("radius").and_then(|v| v.as_u64()).unwrap_or(6).min(40)
             );
             let inner = if s(b, "href").is_empty() { img } else { format!(r#"<a href="{}">{img}</a>"#, esc(s(b, "href"))) };
             format!(r#"<tr><td style="{pad}" align="center">{inner}</td></tr>"#)
@@ -158,7 +159,11 @@ fn block_html(b: &Value, brand: &str, font: &str, depth: usize) -> String {
             )
         }
         "products" if depth == 0 => products_html(b, brand, font),
+        "coupon" => crate::features::coupons::template::block_html(b, brand, font),
         "html" => format!(r#"<tr><td style="{pad}">{}</td></tr>"#, s(b, "html")),
+        // A saved block that wasn't filled in before rendering shows the copy stored with it.
+        "saved" => b.get("blocks").and_then(|v| v.as_array()).map(|bs| bs.iter().filter(|x| s(x, "type") != "saved").map(|x| block_html(x, brand, font, depth)).collect()).unwrap_or_default(),
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" => crate::features::content::blocks::html(b, brand, font),
         _ => String::new(),
     }
 }
@@ -248,6 +253,7 @@ fn block_text(b: &Value, out: &mut String) {
         }
         "button" => out.push_str(&format!("{}: {}\n\n", s(b, "text"), s(b, "href"))),
         "product" => out.push_str(&format!("{} {} {}\n\n", s(b, "title"), s(b, "price"), s(b, "href"))),
+        "coupon" => crate::features::coupons::template::block_text(b, out),
         "products" => {
             // Catalog text can't open a template tag in the plain-text part either.
             // A zero-width space after every brace: no sequence of them can open a tag.
@@ -270,6 +276,12 @@ fn block_text(b: &Value, out: &mut String) {
                 }
             }
         }
+        "saved" => {
+            for x in b.get("blocks").and_then(|v| v.as_array()).into_iter().flatten().filter(|x| s(x, "type") != "saved") {
+                block_text(x, out);
+            }
+        }
+        "social" | "video" | "countdown" | "table" | "quote" | "header" | "nav" | "footer" | "image_text" => crate::features::content::blocks::text(b, out),
         _ => {}
     }
 }
@@ -321,8 +333,10 @@ pub fn render_str(source: &str, ctx: &Value, html: bool) -> AppResult<String> {
     if !source.contains("{{") && !source.contains("{%") {
         return Ok(source.to_string());
     }
+    // `{% coupon_code 'NAME' %}` becomes the code prepared for this message (see features::coupons).
+    let source = crate::features::coupons::template::resolve(source, ctx)?;
     env(html)
-        .render_str(source, ctx)
+        .render_str(&source, ctx)
         .map_err(|e| AppError::bad(format!("template error: {e}")))
 }
 
@@ -365,11 +379,66 @@ pub fn context(account: &Account, profile: Option<&Profile>, event: Option<&Valu
     Value::Object(root)
 }
 
+/// What an email's footer carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Footer {
+    /// Brand, postal address and the unsubscribe link (every marketing email).
+    Marketing,
+    /// Brand and postal address only (transactional mail that wants it).
+    Address,
+    /// Nothing (transactional mail by default).
+    None,
+}
+
+/// How an email is rendered. Marketing email always uses the defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct EmailOptions {
+    pub footer: Footer,
+    pub track_clicks: bool,
+    pub track_opens: bool,
+}
+
+impl Default for EmailOptions {
+    fn default() -> Self {
+        Self { footer: Footer::Marketing, track_clicks: true, track_opens: true }
+    }
+}
+
 pub fn render_email(
     account: &Account,
     content: &EmailContent,
     ctx: &Value,
     tracking: Option<&Tracking<'_>>,
+) -> AppResult<RenderedEmail> {
+    render_email_with(account, content, ctx, tracking, EmailOptions::default())
+}
+
+/// The template text an email renders: subject, preheader, then the body as HTML and as text
+/// (without the layout and footer, which never carry template tags). Features that must know what a
+/// message will show (coupon codes) read this, so they see what [`render_email_with`] renders.
+pub fn email_template_parts(content: &EmailContent) -> [String; 4] {
+    let (html, text) = match (&content.blocks, &content.html) {
+        (Some(blocks), _) if !blocks.is_empty() => {
+            let mut text = String::new();
+            blocks.iter().for_each(|b| block_text(b, &mut text));
+            (blocks.iter().map(|b| block_html(b, "#000000", "", 0)).collect(), text)
+        }
+        (_, Some(html)) if !html.trim().is_empty() => {
+            let mut text = String::new();
+            block_text(&json!({"type": "html", "html": html}), &mut text);
+            (html.clone(), text)
+        }
+        _ => (String::new(), String::new()),
+    };
+    [content.subject.clone(), content.preheader.clone().unwrap_or_default(), html, text]
+}
+
+pub fn render_email_with(
+    account: &Account,
+    content: &EmailContent,
+    ctx: &Value,
+    tracking: Option<&Tracking<'_>>,
+    opts: EmailOptions,
 ) -> AppResult<RenderedEmail> {
     let theme = content.theme.clone().unwrap_or_default();
     let brand = safe_color(theme.brand_color.as_deref().unwrap_or(&account.brand_color), "#1f6f5c");
@@ -386,15 +455,23 @@ pub fn render_email(
             .collect();
         format!("{}<br>", links.join(" · "))
     };
-    let footer = format!(
-        r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
-        // The footer goes through the template engine with the body, so brand text (often read
-        // from a website) must not be able to open a template tag.
-        social_html = no_tpl(&social_html),
-        name = no_tpl(&esc(&account.name)),
-        addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
-        unsub = esc(&unsub),
-    );
+    let footer = match opts.footer {
+        Footer::Marketing => format!(
+            r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
+            // The footer goes through the template engine with the body, so brand text (often read
+            // from a website) must not be able to open a template tag.
+            social_html = no_tpl(&social_html),
+            name = no_tpl(&esc(&account.name)),
+            addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
+            unsub = esc(&unsub),
+        ),
+        Footer::Address => format!(
+            "{}{}",
+            no_tpl(&esc(&account.name)),
+            if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) }
+        ),
+        Footer::None => String::new(),
+    };
 
     let (html_source, text_source) = match (&content.blocks, &content.html) {
         (Some(blocks), _) if !blocks.is_empty() => {
@@ -407,8 +484,8 @@ pub fn render_email(
             let mut text = String::new();
             block_text(&json!({"type": "html", "html": html}), &mut text);
             let doc = if html.to_lowercase().contains("<body") {
-                // Custom full HTML: make sure an unsubscribe link exists.
-                if html.contains("unsubscribe_url") {
+                // Custom full HTML: make sure an unsubscribe link exists (and any footer is added).
+                if html.contains("unsubscribe_url") || footer.is_empty() {
                     html.clone()
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
@@ -425,13 +502,22 @@ pub fn render_email(
     let preheader = render_str(content.preheader.as_deref().unwrap_or(""), ctx, false)?;
     let mut html = render_str(&html_source, ctx, true)?;
     let mut text = render_str(&text_source, ctx, false)?;
-    for (label, url) in &socials {
-        text.push_str(&format!("\n{label}: {url}"));
+    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {address}") });
+    match opts.footer {
+        Footer::Marketing => {
+            for (label, url) in &socials {
+                text.push_str(&format!("\n{label}: {url}"));
+            }
+            text.push_str(&format!("\n--\n{signature}\nUnsubscribe: {unsub}\n"));
+        }
+        Footer::Address => text.push_str(&format!("\n--\n{signature}\n")),
+        Footer::None => {}
     }
-    text.push_str(&format!("\n--\n{}{}\nUnsubscribe: {unsub}\n", account.name, if address.is_empty() { String::new() } else { format!(", {address}") }));
 
-    if let Some(t) = tracking {
+    if let Some(t) = tracking.filter(|_| opts.track_clicks) {
         html = rewrite_links(&html, t);
+    }
+    if let Some(t) = tracking.filter(|_| opts.track_opens) {
         let pixel = format!(
             r#"<img src="{}/t/o/{}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;">"#,
             t.public_url,

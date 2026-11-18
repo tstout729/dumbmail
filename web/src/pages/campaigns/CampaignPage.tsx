@@ -18,11 +18,13 @@ import {
 } from "../../api";
 import { AudiencePicker } from "../../components/audience/AudiencePicker";
 import { EmailEditor } from "../../components/email/EmailEditor";
+import { CheckPanel } from "../../features/content/CheckPanel";
 import { SmsEditor } from "../../components/email/SmsEditor";
 import { Button, ConfirmDialog, Field, Input, Page, PageHeader, Select, Skeleton, StatusBadge, Step, cx } from "../../components/ui";
 import { formatDateTime, formatNumber, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { tzAbbrev, utcToZoned, zonedToUtc } from "../../lib/tz";
+import { CouponSendCheck } from "../../features/coupons/CouponSendCheck";
 import { AbTestSettings, AbTestStart, VersionBar } from "./AbTestPanel";
 import {
   addVersion,
@@ -39,6 +41,9 @@ import {
   withVersionContent,
 } from "./abTest";
 import { CampaignReportView } from "./CampaignReport";
+import { SendOptionsPanel, localTimeNote } from "../../features/sendtime/SendOptionsPanel";
+import { clockLabel, sendOptionsOf, timingLabel } from "../../features/sendtime/options";
+import type { SendOptions } from "../../features/sendtime/types";
 import { ChannelIcon } from "./CampaignsPage";
 
 export function CampaignPage() {
@@ -70,7 +75,7 @@ export function CampaignPage() {
   return <CampaignEditor key={c.id} campaign={c} />;
 }
 
-type Draft = Pick<Campaign, "name" | "audience" | "content" | "ab_test">;
+type Draft = Pick<Campaign, "name" | "audience" | "content" | "ab_test"> & { send_options: SendOptions | null };
 
 function isEmail(_content: Campaign["content"], channel: Campaign["channel"]): _content is EmailContent {
   return channel === "email";
@@ -93,7 +98,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
   const [tab, setTab] = useState<VersionId>("a");
   const [removing, setRemoving] = useState<VersionId | "test" | null>(null);
   const editable = campaign.status === "draft" || campaign.status === "scheduled";
-  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content, ab_test: campaign.ab_test };
+  const current: Draft = draft ?? { name: campaign.name, audience: campaign.audience, content: campaign.content, ab_test: campaign.ab_test, send_options: sendOptionsOf(campaign) };
   const test = current.ab_test;
   const versions = versionIds(test);
   // A removed version's tab falls back to A.
@@ -183,7 +188,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
             <StatusBadge status={campaign.status} />
           </span>
         }
-        description={campaign.status === "scheduled" ? `Scheduled for ${formatDateTime(campaign.send_at, tz)} ${tzAbbrev(tz)}` : undefined}
+        description={campaign.status === "scheduled" ? scheduledLine(campaign.send_at, sendOptionsOf(campaign), tz) : undefined}
         actions={
           <>
             <Button variant="ghost" icon={<Copy className="size-3.5" />} onClick={() => duplicate.mutate(campaign.id, { onSuccess: (d) => navigate(`/campaigns/${d.id}`) })}>
@@ -280,7 +285,19 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
           )}
         </Step>
 
-        <Step index={3} title="Review & send" open={open === 3} onToggle={() => setOpen(open === 3 ? null : 3)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
+        <Step index={3} title="Timing" done={current.audience.include.length > 0} open={open === 3} onToggle={() => setOpen(open === 3 ? null : 3)} summary={`${timingLabel(current.send_options)}${current.send_options?.smart_sending ? " · smart sending on" : ""}`}>
+          <SendOptionsPanel
+            campaignId={campaign.id}
+            channel={campaign.channel}
+            audience={current.audience}
+            value={current.send_options}
+            onChange={(send_options) => edit({ send_options })}
+            disabled={!editable}
+            timezone={tz}
+          />
+        </Step>
+
+        <Step index={4} title="Review & send" open={open === 4} onToggle={() => setOpen(open === 4 ? null : 4)} summary={ready ? "Ready to send" : "A few things left"} done={ready && campaign.status === "scheduled"}>
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
               <ul className="space-y-2">
@@ -297,6 +314,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                   </li>
                 ))}
               </ul>
+              {email ? <CheckPanel content={versionContent(current, version) as EmailContent} campaignId={campaign.id} audience={current.audience} /> : null}
               {test ? <AbSummary test={test} total={count} /> : null}
               <TestSend
                 defaultTo={campaign.channel === "email" ? user.email : ""}
@@ -320,6 +338,7 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
                 disabled={!ready}
                 count={count}
                 test={test}
+                localTime={current.send_options?.timing === "local_time" ? (current.send_options.local_time ?? "10:00") : null}
                 scheduling={schedule.isPending || update.isPending}
                 onSchedule={async (sendAt) => {
                   if (!(await save())) return;
@@ -335,7 +354,12 @@ function CampaignEditor({ campaign }: { campaign: Campaign }) {
       {confirmSend ? (
         <ConfirmDialog
           title="Send this campaign now?"
-          body={sendNowBody(test, count)}
+          body={
+            <>
+              {localTimeNote(current.send_options) ? `${localTimeNote(current.send_options)} ${sendNowBody(test, count)}` : sendNowBody(test, count)}
+              <CouponSendCheck campaignId={campaign.id} />
+            </>
+          }
           confirmLabel="Send now"
           loading={send.isPending || update.isPending}
           onConfirm={async () => {
@@ -437,6 +461,8 @@ type SendPanelProps = {
   disabled: boolean;
   count: number | undefined;
   test: AbTest | null;
+  /** Set when it goes out at this hour on each person's clock: the schedule picks only the day. */
+  localTime: string | null;
   scheduling: boolean;
   onSchedule: (sendAt: string) => void;
   onSendNow: () => void;
@@ -447,11 +473,13 @@ function defaultSendTime(timezone: string) {
   return { date: utcToZoned(tomorrow, timezone).date, time: "10:00" };
 }
 
-function SendPanel({ timezone, initial, disabled, count, test, scheduling, onSchedule, onSendNow }: SendPanelProps) {
+function SendPanel({ timezone, initial, disabled, count, test, localTime, scheduling, onSchedule, onSendNow }: SendPanelProps) {
   const [when, setWhen] = useState(() => (initial ? utcToZoned(initial, timezone) : defaultSendTime(timezone)));
-  const sendAt = when.date && when.time ? zonedToUtc(when.date, when.time, timezone) : null;
+  const time = localTime ?? when.time;
+  const sendAt = when.date && time ? zonedToUtc(when.date, time, timezone) : null;
   const [openedAt] = useState(() => Date.now());
-  const inPast = sendAt !== null && new Date(sendAt).getTime() < openedAt;
+  // With local time, any day from today on works: zones whose hour already passed follow the late rule.
+  const inPast = sendAt !== null && (localTime ? when.date < utcToZoned(new Date(openedAt).toISOString(), timezone).date : new Date(sendAt).getTime() < openedAt);
   return (
     <div className="space-y-4 rounded-lg bg-zinc-50 p-4">
       <div>
@@ -466,23 +494,37 @@ function SendPanel({ timezone, initial, disabled, count, test, scheduling, onSch
       <div className="border-t border-zinc-200 pt-4">
         <div className="text-sm font-semibold text-zinc-900">Schedule</div>
         <p className="mb-2 text-xs text-zinc-500">
-          Times are in your account time zone ({timezone.replace(/_/g, " ")}, {tzAbbrev(timezone)}).
+          {localTime
+            ? `Pick the day. It goes out at ${clockLabel(localTime)} in each person's time zone, starting when the first time zone reaches it.`
+            : `Times are in your account time zone (${timezone.replace(/_/g, " ")}, ${tzAbbrev(timezone)}).`}
         </p>
         <div className="flex flex-wrap items-end gap-2">
           <Field label="Date">
             <Input type="date" value={when.date} onChange={(e) => setWhen({ ...when, date: e.target.value })} className="w-40" />
           </Field>
-          <Field label="Time">
-            <Input type="time" value={when.time} onChange={(e) => setWhen({ ...when, time: e.target.value })} className="w-32" />
-          </Field>
+          {localTime ? null : (
+            <Field label="Time">
+              <Input type="time" value={when.time} onChange={(e) => setWhen({ ...when, time: e.target.value })} className="w-32" />
+            </Field>
+          )}
           <Button icon={<CalendarClock className="size-3.5" />} disabled={disabled || !sendAt || inPast} loading={scheduling} onClick={() => sendAt && onSchedule(sendAt)}>
             Schedule
           </Button>
         </div>
-        {inPast ? <p className="mt-1 text-xs text-red-600">Pick a time in the future.</p> : null}
+        {inPast ? <p className="mt-1 text-xs text-red-600">{localTime ? "Pick today or a later day." : "Pick a time in the future."}</p> : null}
       </div>
     </div>
   );
+}
+
+/** The header line for a scheduled campaign. */
+function scheduledLine(sendAt: string | null, o: SendOptions | null, tz: string) {
+  if (o?.timing === "local_time" && o.local_date) {
+    const [y, m, d] = o.local_date.split("-").map(Number);
+    const day = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(y, m - 1, d)));
+    return `Goes out ${day} at ${clockLabel(o.local_time ?? "10:00")} in each person's time zone. Starts ${formatDateTime(sendAt, tz)} ${tzAbbrev(tz)}.`;
+  }
+  return `Scheduled for ${formatDateTime(sendAt, tz)} ${tzAbbrev(tz)}`;
 }
 
 /** The A/B test in one box on the review step. */

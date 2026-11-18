@@ -188,6 +188,7 @@ function ProfileView({ detail }: { detail: ProfileDetail }) {
                         <span className="block text-xs text-zinc-500">
                           {m.campaign_id ? "Campaign" : m.flow_id ? "Flow" : "Message"} · {formatDateTime(m.sent_at, tz)}
                         </span>
+                        {m.note ? <span className="mt-0.5 block text-xs text-amber-700">{m.note}</span> : null}
                       </span>
                       <span className="flex items-center gap-1.5">
                         {m.opened_at ? <MailOpen className="size-3.5 text-accent-600" aria-label="Opened" /> : null}

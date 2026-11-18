@@ -4,6 +4,7 @@ import { useMutationState, useQueryClient } from "@tanstack/react-query";
 import { Menu as MenuIcon, Search } from "lucide-react";
 import { ApiError, authMutationKey, keys, onUnauthorized, useMe } from "../../api";
 import { isTypingTarget, useWindowKeydown } from "../../lib/hooks";
+import { SignInGate } from "../../features/team/SignInGate";
 import { Button, Skeleton } from "../ui";
 import { CommandPalette } from "./CommandPalette";
 import { Logo } from "./Logo";
@@ -52,6 +53,8 @@ export function RequireAuth() {
       </div>
     );
   }
+  // Signed in, but two-factor or single sign-on isn't finished yet.
+  if ((me.data as { restriction?: string | null }).restriction) return <SignInGate />;
   return <Outlet />;
 }
 
