@@ -25,7 +25,10 @@
   var PROFILE = "pl_profile";
   function profile() { return store.get(PROFILE) || {}; }
   function identified(p) { p = p || profile(); return !!(p.email || p.phone_number || p.external_id || p.$token); }
+  // Set by dumbmail.stop(): nothing more is sent from this page.
+  var STOPPED = false;
   function post(path, body) {
+    if (STOPPED && path !== "/client/subscribe") return Promise.resolve({ json: function () { return Promise.resolve({}); } });
     try {
       return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), keepalive: true, credentials: "omit"
@@ -78,7 +81,7 @@
   var EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[a-z]{2,}$/i;
   var api = {
     identify: function (props, how) {
-      if (!props || typeof props !== "object") return api;
+      if (STOPPED || !props || typeof props !== "object") return api;
       var p = profile(), before = identified(p);
       var em = props.email && String(props.email).trim().toLowerCase();
       // A different email is a different person: start a fresh profile instead of merging into theirs.
@@ -101,6 +104,16 @@
     addedToCart: function (p, cart) { addToCart(item(p), "manual", cart ? cartFrom(cart) : null); flushAdd(); return api; },
     startedCheckout: function (cart) { startCheckout(cartFrom(cart || {}), "manual", true); return api; },
     placedOrder: function (order) { placeOrder(order || {}, "manual"); return api; },
+    // The visitor withdrew consent (a cookie banner, Shopify's Customer Privacy API): from now on
+    // this page sends no events, pings or identification, and events waiting for the visitor to be
+    // recognised are deleted along with who the script thought they were. A sign-up form the visitor
+    // submits themselves still goes through.
+    stop: function () {
+      STOPPED = true;
+      store.del(BUFFER);
+      store.del(PROFILE);
+      return api;
+    },
     version: VERSION
   };
 
@@ -925,7 +938,7 @@
   }
 
   // Test-mode views aren't counted, so testing doesn't skew A/B results.
-  function view(f) { if (TEST) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
+  function view(f) { if (TEST || STOPPED) return; fetch(BASE + "/client/forms/" + f.id + "/view?k=" + encodeURIComponent(KEY) + (f.version ? "&v=" + encodeURIComponent(f.version) : ""), { method: "POST", credentials: "omit", keepalive: true }).catch(function () {}); }
 
   function renderEmbeds(f) {
     var slots = document.querySelectorAll('[data-dumbmail-form="' + f.id + '"], [data-postlark-form="' + f.id + '"]');

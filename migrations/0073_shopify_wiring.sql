@@ -13,3 +13,10 @@ CREATE TABLE shopify_coupon_templates (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX shopify_coupon_templates_account_idx ON shopify_coupon_templates(account_id);
+
+-- The app's metrics are server-only for accounts that connected a store before connecting started
+-- marking them (see `features::shopify::SERVER_METRICS`). Small: one row per metric per such account.
+INSERT INTO metrics (id, account_id, name, server_only)
+SELECT gen_random_uuid(), s.account_id, n, true
+FROM shopify_shops s CROSS JOIN unnest(ARRAY['Placed Order', 'Started Checkout', 'Ordered Product', 'Fulfilled Order', 'Fulfilled Partial Order', 'Cancelled Order', 'Refunded Order']) AS n
+ON CONFLICT (account_id, name) DO UPDATE SET server_only = true;
