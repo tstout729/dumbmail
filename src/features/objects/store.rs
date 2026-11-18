@@ -1002,8 +1002,10 @@ mod tests {
         let big = v(json!("123456789012345678901234567890"));
         assert_eq!(big.cmp_stored("123456789012345678901234567889"), Ordering::Greater);
         assert_eq!(v(json!("9")).cmp_stored("10"), Ordering::Less);
-        assert_eq!(v(json!("2026-11-17T12:00:00+01:00")), Version::Time("2026-11-17T11:00:00.000000Z".into()));
-        assert_eq!(v(json!("2026-11-17T11:00:00Z")).cmp_stored("2026-11-17T11:00:00.000000Z"), Ordering::Equal);
+        assert_eq!(v(json!("2026-11-17T12:00:00+01:00")), Version::Time("2026-11-17T11:00:00.000000000Z".into()));
+        assert_eq!(v(json!("2026-11-17T11:00:00Z")).cmp_stored("2026-11-17T11:00:00.000000000Z"), Ordering::Equal);
+        // Every fractional digit counts: 800 ns apart are ordered.
+        assert_eq!(v(json!("2026-11-17T11:00:00.123456900Z")).cmp_stored(v(json!("2026-11-17T11:00:00.1234561Z")).text()), Ordering::Greater);
         assert!(Version::parse(&json!(-1)).is_err());
         assert!(Version::parse(&json!(1.5)).is_err());
         assert!(Version::parse(&json!("yesterday")).is_err());
