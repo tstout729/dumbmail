@@ -85,7 +85,7 @@ function IntegrationsList() {
               <EmptyState
                 icon={<Plug className="size-5" />}
                 title="No integrations yet"
-                description="Start from Guesty, Stripe or Calendly, or connect any other app. You can also ask Claude to build one for you through the MCP server: just say which app."
+                description="Start from a ready-made recipe (online stores, payments, subscriptions, bookings, forms, support and shipping), or connect any other app. You can also ask Claude to build one for you through the MCP server: just say which app."
                 action={
                   canManage ? (
                     <Button variant="primary" onClick={() => setAdding(true)}>
