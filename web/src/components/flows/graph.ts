@@ -51,6 +51,8 @@ export function newNode(type: FlowNodeType, brandColor?: string, firstListId?: s
       return { id, type, list_id: firstListId ?? "", next: null };
     case "webhook":
       return { id, type, url: "https://", method: "POST", next: null };
+    case "notify":
+      return { id, type, to: [], subject: "", body: "", next: null };
     case "review_request":
       return newReviewRequestNode(id, brandColor);
   }
@@ -114,10 +116,11 @@ export const nodeLabels: Record<FlowNodeType, string> = {
   add_to_list: "Add to list",
   remove_from_list: "Remove from list",
   webhook: "Webhook",
+  notify: "Notify the team",
   review_request: "Ask for a review",
 };
 
-export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook", "review_request"];
+export const insertableTypes: FlowNodeType[] = ["delay", "email", "sms", "condition", "random_split", "wait_for_reply", "update_profile", "add_to_list", "remove_from_list", "webhook", "notify", "review_request"];
 
 export function triggerSummary(t: FlowTrigger, lists: List[] = [], segments: Segment[] = []): string {
   switch (t.type) {

@@ -52,13 +52,9 @@ pub struct ChannelQuery {
     pub status: Option<String>,
 }
 
-async fn templates_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ChannelQuery>) -> AppResult<Json<Value>> {
-    let rows: Vec<Template> = sqlx::query_as("SELECT id, name, channel, content, created_at, updated_at FROM templates WHERE account_id = $1 AND ($2::text IS NULL OR channel = $2) ORDER BY updated_at DESC")
-        .bind(ctx.account_id)
-        .bind(&q.channel)
-        .fetch_all(&state.db)
-        .await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn templates_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::templates(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -196,23 +192,15 @@ pub async fn campaign_json(state: &AppState, c: &CampaignRow) -> AppResult<Value
     Ok(v)
 }
 
+/// The newest 500 campaigns that aren't archived (see `features::campaigns_plus::tags::campaigns`).
 pub async fn list_campaigns(state: &AppState, account_id: Uuid, q: &ChannelQuery) -> AppResult<Vec<Value>> {
-    let rows: Vec<CampaignRow> = sqlx::query_as("SELECT * FROM campaigns WHERE account_id = $1 AND ($2::text IS NULL OR channel = $2) AND ($3::text IS NULL OR status = $3) ORDER BY COALESCE(sent_at, send_at, created_at) DESC LIMIT 500")
-        .bind(account_id)
-        .bind(&q.channel)
-        .bind(&q.status)
-        .fetch_all(&state.db)
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for c in &rows {
-        out.push(campaign_json(state, c).await?);
-    }
-    Ok(out)
+    let q = crate::features::campaigns_plus::tags::ListQuery { channel: q.channel.clone(), status: q.status.clone(), ..Default::default() };
+    Ok(crate::features::campaigns_plus::tags::campaigns(state, account_id, &q).await?.0)
 }
 
-async fn campaigns_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<ChannelQuery>) -> AppResult<Json<Value>> {
-    let rows = list_campaigns(&state, ctx.account_id, &q).await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, dates, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn campaigns_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::campaigns(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -337,6 +325,8 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     if !allowed.contains(&c.status.as_str()) {
         return Err(refused(&c.status));
     }
+    // A resend's audience and channel are fixed by what it resends (see `features::campaigns_plus::resend`).
+    crate::features::campaigns_plus::resend::refuse_audience_change(&state.db, &c, b.audience.as_ref(), b.channel.as_deref()).await?;
     let audience = b.audience.as_ref().map(normalize_audience).transpose()?;
     if let Some(ch) = &b.channel {
         check_channel(ch)?;
@@ -403,10 +393,19 @@ async fn patch_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pat
 
 /// Delete a campaign unless it has gone out (checked in the DELETE itself).
 pub async fn delete_campaign(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<()> {
-    let n = sqlx::query("DELETE FROM campaigns WHERE id = $1 AND account_id = $2 AND status NOT IN ('sending', 'testing', 'sent')").bind(id).bind(account_id).execute(&state.db).await?.rows_affected();
+    // A resend that started sending is kept too: it holds one of its original's two resend slots.
+    let n = sqlx::query(
+        "DELETE FROM campaigns WHERE id = $1 AND account_id = $2 AND status NOT IN ('sending', 'testing', 'sent')
+           AND NOT EXISTS (SELECT 1 FROM campaign_resends r WHERE r.campaign_id = campaigns.id AND r.started_at IS NOT NULL)",
+    )
+    .bind(id)
+    .bind(account_id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
     if n == 0 {
         campaigns::load(&state.db, account_id, id).await?;
-        return Err(AppError::Conflict("sent campaigns are kept for reporting and can't be deleted".into()));
+        return Err(AppError::Conflict("campaigns that went out (and resends that started) are kept for reporting and can't be deleted; archive it instead".into()));
     }
     Ok(())
 }
@@ -507,9 +506,9 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     let changed = || AppError::Conflict("this campaign changed while you were sending it; open it again".into());
     let mut tx = state.db.begin().await?;
     let row: CampaignRow = match send_at.filter(|t| *t > now + chrono::Duration::seconds(30)) {
-        Some(t) => sqlx::query_as(
+        Some(t) => match sqlx::query_as(
             "UPDATE campaigns SET status = 'scheduled', send_at = $2, send_options = CASE WHEN $4 THEN $5 ELSE send_options END, updated_at = now()
-             WHERE id = $1 AND status = $3 AND updated_at = $6 RETURNING *",
+             WHERE id = $1 AND status = $3 AND updated_at = $6 AND archived_at IS NULL RETURNING *",
         )
         .bind(id)
         .bind(t)
@@ -519,11 +518,17 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         .bind(c.updated_at)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(changed)?,
+        {
+            Some(r) => r,
+            None => {
+                drop(tx);
+                return Err(crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id, changed()).await);
+            }
+        },
         None => {
-            let r: CampaignRow = sqlx::query_as(
+            let r: Option<CampaignRow> = sqlx::query_as(
                 "UPDATE campaigns SET status = 'sending', send_at = now(), send_options = CASE WHEN $3 THEN $4 ELSE send_options END, updated_at = now()
-                 WHERE id = $1 AND status = $2 AND updated_at = $5 RETURNING *",
+                 WHERE id = $1 AND status = $2 AND updated_at = $5 AND archived_at IS NULL RETURNING *",
             )
             .bind(id)
             .bind(&c.status)
@@ -531,8 +536,11 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
             .bind(&c.send_options)
             .bind(c.updated_at)
             .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(changed)?;
+            .await?;
+            let Some(r) = r else {
+                drop(tx);
+                return Err(crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Campaign, account_id, id, changed()).await);
+            };
             crate::jobs::enqueue(&mut *tx, "campaign_send", json!({"campaign_id": id}), None).await?;
             r
         }
@@ -714,18 +722,14 @@ pub async fn load_flow(state: &AppState, account_id: Uuid, id: Uuid) -> AppResul
         .ok_or_else(|| AppError::not_found("flow"))
 }
 
+/// Flows that aren't archived, live first (see `features::campaigns_plus::tags::flows`).
 pub async fn list_flows(state: &AppState, account_id: Uuid) -> AppResult<Vec<Value>> {
-    let rows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE account_id = $1 ORDER BY (status = 'live') DESC, updated_at DESC").bind(account_id).fetch_all(&state.db).await?;
-    let mut out = Vec::new();
-    for f in &rows {
-        out.push(flow_json(state, f).await?);
-    }
-    Ok(out)
+    Ok(crate::features::campaigns_plus::tags::flows(state, account_id, &Default::default()).await?.0)
 }
 
-async fn flows_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
-    let rows = list_flows(&state, ctx.account_id).await?;
-    let n = rows.len() as i64;
+/// Optional filters (tag, archived, text, status, paging): see `features::campaigns_plus::tags::ListQuery`.
+async fn flows_h(State(state): State<AppState>, ctx: Ctx, Query(q): Query<crate::features::campaigns_plus::tags::ListQuery>) -> AppResult<Json<Value>> {
+    let (rows, n) = crate::features::campaigns_plus::tags::flows(&state, ctx.account_id, &q).await?;
     Ok(page(rows, n))
 }
 
@@ -752,6 +756,8 @@ async fn check_node_refs(state: &AppState, account_id: Uuid, definition: &Value)
             crate::flows::check_webhook_url(n.data.get("url").and_then(|v| v.as_str()).unwrap_or("")).await?;
         }
     }
+    // Notification steps: outside addresses get a confirmation link the first time.
+    crate::features::flows_plus::on_save(state, account_id, &def).await?;
     Ok(())
 }
 
@@ -893,14 +899,17 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         }
     }
     // Turning live was checked against this version of the flow (review included); an edit meanwhile means check again.
-    let row: FlowRow = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 RETURNING *")
+    let row: Option<FlowRow> = sqlx::query_as("UPDATE flows SET status = $2, updated_at = now() WHERE id = $1 AND account_id = $3 AND updated_at = $4 AND ($2 <> 'live' OR archived_at IS NULL) RETURNING *")
         .bind(id)
         .bind(status)
         .bind(account_id)
         .bind(f.updated_at)
         .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::Conflict("this flow changed while you were turning it on; open it again".into()))?;
+        .await?;
+    let Some(row) = row else {
+        let changed = AppError::Conflict("this flow changed while you were turning it on; open it again".into());
+        return Err(if status == "live" { crate::features::campaigns_plus::tags::archived_or(&state.db, crate::features::campaigns_plus::tags::Kind::Flow, account_id, id, changed).await } else { changed });
+    };
     crate::features::webhooks::flow_status_changed(&state.db, account_id, id, &row.name, &f.status, status, &row.trigger).await;
     if status == "live" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"first_flow\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;

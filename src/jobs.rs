@@ -69,11 +69,17 @@ pub async fn run_one_in(state: &AppState, lane: &str) -> anyhow::Result<bool> {
             let msg = format!("{e:#}");
             tracing::warn!(job = job.id, kind = %job.kind, attempt = job.attempts, error = %msg, "job failed");
             if job.attempts >= job.max_attempts {
+                // A back-populate is marked failed (freeing its flow) in the same transaction.
+                let mut tx = state.db.begin().await?;
                 sqlx::query("UPDATE jobs SET run_at = 'infinity', last_error = $2 WHERE id = $1")
                     .bind(job.id)
                     .bind(&msg)
-                    .execute(&state.db)
+                    .execute(&mut *tx)
                     .await?;
+                if job.kind == crate::features::flows_plus::backfill::JOB {
+                    crate::features::flows_plus::backfill::job_dead_in(&mut tx, &job.payload, &msg).await?;
+                }
+                tx.commit().await?;
                 on_dead(state, &job.kind, &job.payload, &msg).await;
             } else {
                 let backoff = 30i64 * 2i64.pow(job.attempts as u32);
@@ -129,6 +135,13 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
+    ("flows_plus_backfill", "backfill_id", "SELECT account_id FROM flow_backfills WHERE id = $1"),
+    ("flows_plus_confirm_address", "account_id", "SELECT $1::uuid"),
+    // Shopify: everything but privacy requests (`shopify_privacy`) and the store worker
+    // (`shopify_work`), which for a closed account only does privacy requests and opt-out
+    // write-backs (see `features::shopify`).
+    ("shopify_setup", "account_id", "SELECT $1::uuid"),
+    ("shopify_rebaseline_segments", "account_id", "SELECT $1::uuid"),
     ("reviews_submitted", "review_id", "SELECT account_id FROM reviews WHERE id = $1"),
     ("reviews_confirm", "review_id", "SELECT account_id FROM reviews WHERE id = $1"),
     ("reviews_send", "intent_id", "SELECT account_id FROM review_sends WHERE id = $1"),
@@ -167,7 +180,7 @@ async fn dispatch(state: &AppState, kind: &str, p: &Value) -> anyhow::Result<()>
             let ids: Vec<Uuid> = serde_json::from_value(p["profile_ids"].clone())?;
             crate::flows::on_list_add(state, uuid("list_id")?, &ids).await
         }
-        "flow_step" => crate::flows::step(state, uuid("run_id")?).await,
+        "flow_step" => crate::flows::step_job(state, p).await,
         "segment_refresh" => crate::flows::refresh_segment(state, uuid("segment_id")?).await,
         other => match crate::features::run_job(state, other, p).await {
             Some(r) => r,

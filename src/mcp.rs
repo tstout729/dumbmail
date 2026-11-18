@@ -314,7 +314,7 @@ Read dumbmail://docs/segments for the details and examples.",
         "properties": {"variants": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "object", "properties": {"id": {"enum": ["b", "c", "d"]}, "content": {"type": "object"}}, "required": ["id", "content"]}},
             "test_percent": {"type": "integer", "minimum": 5, "maximum": 100}, "wait_hours": {"type": "integer", "minimum": 1, "maximum": 168},
             "metric": {"enum": ["open_rate", "click_rate", "revenue"]}, "pick": {"enum": ["auto", "manual"]}}, "required": ["variants"]});
-    let flow_def = json!({"type": "object", "description": "Flow graph: {entry: firstNodeId, nodes: [...], settings?: {reentry: 'never'|'always'|{after_days}, exit_condition?: segment rules, profile_filter?: segment rules, smart_sending_hours?}}. Node types (each has a unique id): delay{amount, unit: minutes|hours|days, next}, email{name?, content, next}, sms{name?, content:{body}, next}, condition{condition: segment rules, yes, no}, random_split{percent: 1-99 share sent down yes (path A), yes, no} for A/B testing paths, update_profile{properties, next}, add_to_list|remove_from_list{list_id, next}, webhook{url, method?, body?, next}. next/yes/no are node ids or null to end. Read postlark://docs/flows."});
+    let flow_def = json!({"type": "object", "description": "Flow graph: {entry: firstNodeId, nodes: [...], settings?: {reentry: 'never'|'always'|{after_days}, exit_condition?: segment rules, profile_filter?: segment rules, smart_sending_hours?}}. Node types (each has a unique id): delay{amount, unit: minutes|hours|days, next}, email{name?, content, next}, sms{name?, content:{body}, next}, condition{condition: segment rules, yes, no}, random_split{percent: 1-99 share sent down yes (path A), yes, no} for A/B testing paths, update_profile{properties, next}, add_to_list|remove_from_list{list_id, next}, webhook{url, method?, body?, next}, notify{to?: [emails], to_property?, subject, body, allow_browser_events?, next}. Delays also take at, weekdays and until; conditions take event_condition (see dumbmail://docs/flows_plus). next/yes/no are node ids or null to end. Read postlark://docs/flows."});
     vec![
         tool("get_account", "Get account overview", "Account settings, sending readiness (sender, domain, SMS number, mailing address), whether email sending is paused for high bounces/complaints (email_sending_paused; only support can lift it), plan usage, counts of profiles/lists/segments/campaigns/flows and the setup checklist. Call this first.", obj(json!({}), &[]), true, false),
         tool("update_account", "Update account settings", "Update brand and sender settings: name, website, from_name, from_email, reply_to, sms_from (E.164), timezone (IANA), address (mailing address shown in email footers, required to send), brand_color (hex), logo_url, social_links ({instagram|facebook|tiktok|x|youtube|pinterest|linkedin|threads: url}, blank removes), conversion_metric (metric used for revenue attribution, default 'Placed Order').",
@@ -355,7 +355,7 @@ Read dumbmail://docs/segments for the details and examples.",
         tool("preview_segment", "Preview segment rules", "Count and sample the profiles matching segment rules WITHOUT saving. Use this to iterate on rules before create_segment.", obj(json!({"definition": segment_def}), &["definition"]), true, false),
         tool("create_segment", "Create a segment", "Save a live segment (membership updates automatically as data changes).", obj(json!({"name": {"type": "string"}, "definition": segment_def}), &["name", "definition"]), false, false),
         tool("update_segment", "Update a segment", "Rename a segment or replace its rules.", obj(json!({"id": {"type": "string"}, "name": {"type": "string"}, "definition": segment_def}), &["id"]), false, false),
-        tool("list_templates", "List templates", "Saved email/SMS templates.", obj(json!({"channel": {"enum": ["email", "sms"]}}), &[]), true, false),
+        tool("list_templates", "List templates", "Saved email/SMS templates with their tags. Archived templates are left out unless archived is true (only archived) or all.", obj(json!({"channel": {"enum": ["email", "sms"]}, "archived": {"enum": ["false", "true", "all"]}}), &[]), true, false),
         tool("create_template", "Create a template", "Save reusable email or SMS content.", obj(json!({"name": {"type": "string"}, "channel": {"enum": ["email", "sms"]}, "content": email_content}), &["name", "content"]), false, false),
         tool("render_preview", "Preview a message", "Render email or SMS content as a real recipient would see it (optionally as a specific profile) to check personalization and wording. Returns subject, preheader and plain-text body (set include_html for the full HTML), or the SMS body with segment count.",
             obj(json!({"channel": {"enum": ["email", "sms"]}, "content": email_content, "profile_id": {"type": "string"}, "event": {"type": "object", "description": "Sample trigger event for flow content, e.g. {properties: {checkout_url: ...}}"}, "include_html": {"type": "boolean"}}), &["channel", "content"]), true, false),
@@ -579,11 +579,8 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
             Ok(serde_json::to_value(aud::update_segment(state, acct, id, aud::SegmentBody { name: a["name"].as_str().map(String::from), definition: a.get("definition").cloned() }).await?)?)
         }
         "list_templates" => {
-            let rows: Vec<crate::models::Template> = sqlx::query_as("SELECT id, name, channel, content, created_at, updated_at FROM templates WHERE account_id = $1 AND ($2::text IS NULL OR channel = $2) ORDER BY updated_at DESC")
-                .bind(acct)
-                .bind(a["channel"].as_str())
-                .fetch_all(&state.db)
-                .await?;
+            let q = crate::features::campaigns_plus::tags::ListQuery { channel: a["channel"].as_str().map(String::from), archived: a["archived"].as_str().map(String::from), ..Default::default() };
+            let (rows, _) = crate::features::campaigns_plus::tags::templates(state, acct, &q).await?;
             Ok(json!({"templates": rows}))
         }
         "create_template" => Ok(serde_json::to_value(msg::create_template(state, acct, from(a)?).await?)?),

@@ -1,0 +1,13 @@
+{
+  "name": "dumbmail-shopify-app",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "deploy": "shopify app deploy",
+    "dev": "shopify app dev"
+  },
+  "workspaces": ["extensions/*"],
+  "devDependencies": {
+    "@shopify/cli": "^5.0.1"
+  }
+}

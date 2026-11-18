@@ -32,7 +32,7 @@ export function StockBadge({ item }: { item: Pick<Product | Variant, "in_stock" 
   );
 }
 
-const sourceLabels: Record<ProductSource, string> = { api: "API", csv: "CSV", feed: "Feed", events: "From your site" };
+const sourceLabels: Record<ProductSource, string> = { api: "API", csv: "CSV", feed: "Feed", events: "From your site", shopify: "Shopify" };
 
 export function SourceBadge({ source }: { source: ProductSource }) {
   return <Badge tone={source === "events" ? "violet" : "gray"}>{sourceLabels[source]}</Badge>;
