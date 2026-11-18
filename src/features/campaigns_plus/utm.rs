@@ -423,7 +423,7 @@ impl Tagger {
         }
         let host = host_of(url)?;
         let matches = |d: &String| host == *d || host.ends_with(&format!(".{d}"));
-        if self.own_hosts.iter().any(|h| host == *h) || self.skip_domains.iter().any(matches) {
+        if self.own_hosts.contains(&host) || self.skip_domains.iter().any(matches) {
             return None;
         }
         let (base, fragment) = match url.find('#') {
