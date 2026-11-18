@@ -563,6 +563,10 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         crate::deliverability::stop_campaign(&state.db, c.id, &crate::deliverability::paused_message(account.sending_paused_reason.as_deref())).await?;
         return Ok(());
     }
+    // An account that isn't approved to send stops here (see features::screening).
+    if crate::features::screening::stop_if_held(state, &account, &c).await? {
+        return Ok(());
+    }
     let ab = ab_test(&c);
     let smart_hours = crate::features::sendtime::options::of(c.send_options.as_ref()).and_then(|o| o.smart_hours());
     // One read against one cutoff: each queued message in the batch is either due now (sent below) or

@@ -311,6 +311,11 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
         return Ok(Outcome::Skipped("sending paused"));
     }
+    // An account not yet approved to send (see features::screening): campaign messages skipped,
+    // flow messages wait. Approved accounts pay nothing here.
+    if let Some(out) = crate::features::screening::send_gate(state, &spec, &to, conversational.is_some()).await? {
+        return Ok(out);
+    }
 
     let message_id = spec.message_id.unwrap_or_else(Uuid::now_v7);
     let unsub = unsubscribe_url(state, spec.account, message_id);
@@ -804,6 +809,7 @@ mod tests {
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
             verified_domains: Vec::new(),
+            sending_review: None,
         }
     }
 }

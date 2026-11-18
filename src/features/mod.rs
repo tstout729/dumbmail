@@ -21,6 +21,7 @@ pub mod observe;
 pub mod push;
 pub mod reports;
 pub mod reviews;
+pub mod screening;
 pub mod sendtime;
 pub mod shopify;
 pub mod team;
@@ -125,6 +126,7 @@ pub static ALL: &[&dyn Feature] = &[
     &push::Module,
     &reports::Module,
     &reviews::Module,
+    &screening::Module,
     &sendtime::Module,
     &shopify::Module,
     &team::Module,

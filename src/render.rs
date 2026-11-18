@@ -766,6 +766,7 @@ mod tests {
             link_domain_status: "not_started".into(),
             link_domain_records: json!([]),
             verified_domains: Vec::new(),
+            sending_review: None,
         }
     }
 

@@ -542,6 +542,8 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
     for content in versions {
         render_preview(state, account_id, RenderBody { channel: c.channel.clone(), content, profile_id: None, event: None }).await?;
     }
+    // Sender screening (hosted): the account's first check and the content check (see features::screening).
+    crate::features::screening::before_launch(state, &account, &c).await?;
     // A local-time send starts when the first time zone reaches the hour on the chosen day (recorded in the options).
     let (send_at, dated) = crate::features::sendtime::plan::launch_start(state, &account, &c, send_at).await?;
     if let Some(opts) = dated {
@@ -870,6 +872,8 @@ pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, mut b: Fl
     if let Some(d) = &b.definition {
         check_node_refs(state, account_id, d).await?;
     }
+    // A live flow's new email and text content is checked (see features::screening).
+    crate::features::screening::before_flow_edit(state, account_id, &cur, b.definition.as_ref()).await?;
     // A flow imported for review keeps its review marker whatever the edit sends, and a flow that went live
     // meanwhile still can't take in content needing review (see import_review.rs).
     let row: Option<FlowRow> = sqlx::query_as(
@@ -952,6 +956,8 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
                     .map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
             }
         }
+        // Sender screening (hosted): the account's first check and the steps' content (see features::screening).
+        crate::features::screening::before_flow_live(state, &account, &f).await?;
         // Segment triggers: snapshot current members so only new entrants start the flow.
         if let Ok(flows::Trigger::Segment { segment_id }) = flows::parse_trigger(&f.trigger) {
             super::audience::get_segment(state, account_id, segment_id).await?;
