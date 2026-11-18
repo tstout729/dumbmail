@@ -804,3 +804,23 @@ async fn a_link_a_tag_completes_keeps_the_long_form_and_goes_where_it_reads() {
     assert_eq!(click(&h, &p[0]).await.1.as_deref(), Some("https://shop.test/plain"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_relaunched_text_campaign_tags_its_new_links() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    h.ok("PUT", "/api/link-tags", Some(json!({"enabled": true}))).await;
+    let (_, first) = texter(&mut h, &list, 8701).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/old-offer").await;
+    launch(&mut h, &id).await;
+    let old = click(&h, &short_paths(&body_to(&h, &first))[0]).await.1.unwrap();
+    assert!(old.starts_with("https://shop.test/old-offer?utm_source=dumbmail&utm_medium=sms"), "{old}");
+    // It fails after a partial send; the edit replaces the content with only a new body.
+    sqlx::query("UPDATE campaigns SET status = 'failed' WHERE id = $1").bind(id.parse::<Uuid>().unwrap()).execute(&h.state.db).await.unwrap();
+    h.ok("PATCH", &format!("/api/campaigns/{id}"), Some(json!({"content": {"body": "Acme Goods: https://shop.test/new-offer"}}))).await;
+    let (_, second) = texter(&mut h, &list, 8702).await;
+    launch(&mut h, &id).await;
+    let new = click(&h, &short_paths(&body_to(&h, &second))[0]).await.1.unwrap();
+    assert!(new.starts_with("https://shop.test/new-offer?utm_source=dumbmail&utm_medium=sms&utm_campaign=black-friday-"), "the relaunch tags its new link: {new}");
+    h.cleanup().await;
+}

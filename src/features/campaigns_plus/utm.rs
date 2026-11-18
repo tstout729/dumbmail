@@ -329,11 +329,16 @@ fn campaign_frozen(defaults: Option<&Defaults>, c: &CampaignRow, over: Option<&O
 /// At send start, on the connection that holds the campaign lock: write the campaign's resolved tags
 /// onto its content and each A/B version's (or take stale ones off). Reads the content as it is now,
 /// after other steps of the same transaction changed it. No settings and no stale key: no write.
-/// Only the first time a send is prepared: a retry, or the winner send after an A/B test, keeps the
-/// tags the first recipients got.
+/// Only when the audience is being fixed: a retry, or the winner send after an A/B test, keeps the
+/// tags the first recipients got. Email: only the first time a send is prepared (a relaunch after a
+/// partial send keeps them); a text campaign gets them afresh at every launch.
 pub async fn freeze_campaign(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::Result<()> {
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1").bind(campaign_id).fetch_one(&mut *db).await?;
-    let started: bool = sqlx::query_scalar("SELECT audience_fixed_at IS NOT NULL OR EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test) FROM campaigns WHERE id = $1")
+    // A text campaign's tags are worked out at every launch, as its short links are (an edited and
+    // relaunched campaign gets them for its new content); email keeps the first send's.
+    let started: bool = sqlx::query_scalar(
+        "SELECT audience_fixed_at IS NOT NULL OR (channel <> 'sms' AND EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND NOT is_test)) FROM campaigns WHERE id = $1",
+    )
         .bind(campaign_id)
         .fetch_one(&mut *db)
         .await?;
