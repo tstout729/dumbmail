@@ -243,7 +243,8 @@ pub async fn archive(state: &AppState, account_id: Uuid, kind: Kind, b: ArchiveB
     .fetch_all(&state.db)
     .await?;
     let rest: Vec<Uuid> = ids.iter().filter(|i| !changed.contains(i)).copied().collect();
-    let skipped: Vec<(Uuid, String, bool)> = sqlx::query_as(&format!("SELECT id, status, archived_at IS NOT NULL FROM {} WHERE account_id = $1 AND id = ANY($2)", kind.table()))
+    let status = if kind == Kind::Template { "''" } else { "status" };
+    let skipped: Vec<(Uuid, String, bool)> = sqlx::query_as(&format!("SELECT id, {status}, archived_at IS NOT NULL FROM {} WHERE account_id = $1 AND id = ANY($2)", kind.table()))
         .bind(account_id)
         .bind(&rest)
         .fetch_all(&state.db)
