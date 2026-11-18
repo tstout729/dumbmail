@@ -456,3 +456,31 @@ async fn guesty_keeps_reservations_as_objects_without_door_codes() {
     }
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn two_change_jobs_for_one_object_start_one_run() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "reservation", "fields": [{"key": "status", "type": "text"}, {"key": "nights", "type": "number"}]}))).await;
+    let fid = live(&mut h, json!({"name": "Changed", "trigger": {"type": "object", "object_type": "reservation", "on": "updated"}, "definition": {"entry": "d1", "settings": {"reentry": "never"}, "nodes": [
+        {"id": "d1", "type": "delay", "amount": 1, "unit": "days", "next": null}]}})).await;
+    let o = h.ok("POST", "/api/objects", Some(reservation("R1", "ana@example.com", json!({"status": "confirmed", "nights": 2})))).await;
+    h.drain().await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "reservation", "external_id": "R1", "fields": {"nights": 3}}))).await;
+    let change: uuid::Uuid = sqlx::query_scalar("SELECT id FROM object_changes WHERE kind = 'updated'").fetch_one(&h.state.db).await.unwrap();
+    // Another change job for the same object is entering the flow and hasn't committed yet.
+    let flow: dumbmail::models::FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1::uuid").bind(&fid).fetch_one(&h.state.db).await.unwrap();
+    let def = dumbmail::flows::parse_definition(&flow.definition).unwrap();
+    let pid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM profiles WHERE email = 'ana@example.com'").fetch_one(&h.state.db).await.unwrap();
+    let ctx = json!({"object": {"id": o["id"], "type": "reservation", "external_id": "R1"}});
+    let mut tx = h.state.db.begin().await.unwrap();
+    assert!(dumbmail::flows::enter(&mut tx, &flow, &def, pid, "d1", &ctx, None).await.unwrap().is_some());
+    let state = h.state.clone();
+    let job = tokio::spawn(async move { dumbmail::features::objects::flow::run_change(&state, change).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!job.is_finished(), "the second start waits for the first one's lock");
+    tx.commit().await.unwrap();
+    job.await.unwrap();
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 1, "re-entry 'never' for this object: one run");
+    h.cleanup().await;
+}
