@@ -310,12 +310,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // features::content); email that uses none of them goes on untouched. When every block is hidden
     // for this person they get nothing (a test send says why). This runs before coupon codes are
     // claimed, so a code is only used for what this person will see.
-    let Some(prepared) = crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx).await? else {
+    let Some(prepared) = crate::features::translations::with_hint(p.locale_hint.clone(), crate::features::content::prepare::prepare(state, spec.account, spec.content, &ctx)).await? else {
         if spec.is_test {
             return Err(AppError::bad("Nothing to show for this person: every block is hidden by a display rule, so they'd be skipped."));
         }
         return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
     };
+    // The language version picked for this person (see features::translations), kept on the message
+    // row for reports (written with the row, below).
+    let language = prepared.get("_lang").and_then(|l| l.as_str()).filter(|l| !l.is_empty()).map(str::to_string);
     // Unique coupon codes are claimed here, after the checks above and just before rendering, for the
     // coupons the prepared content shows; a code stays the person's if a later check skips or defers
     // this attempt. An empty pool holds the message. Messages without coupons do no coupon work (see
@@ -413,8 +416,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // (features::short_links); the text is written with the one it got.
     let short_ref: Option<String> = if spec.message_id.is_none() {
         sqlx::query_scalar(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, short_ref)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, (SELECT c.r FROM unnest($12::text[]) WITH ORDINALITY AS c(r, i)
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (SELECT c.r FROM unnest($13::text[]) WITH ORDINALITY AS c(r, i)
                  WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
              RETURNING short_ref",
         )
@@ -429,13 +432,14 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&subject)
         .bind(spec.is_test)
         .bind(&send_note)
+        .bind(&language)
         .bind(short_links.as_ref().map(|s| s.ref_candidates()))
         .fetch_one(&state.db)
         .await?
     } else {
         sqlx::query_scalar(
-            "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note),
-                short_ref = (SELECT c.r FROM unnest($5::text[]) WITH ORDINALITY AS c(r, i)
+            "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language),
+                short_ref = (SELECT c.r FROM unnest($6::text[]) WITH ORDINALITY AS c(r, i)
                     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
              WHERE u.id = $1 RETURNING u.short_ref",
         )
@@ -443,6 +447,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&subject)
         .bind(&to)
         .bind(&send_note)
+        .bind(&language)
         .bind(short_links.as_ref().map(|s| s.ref_candidates()))
         .fetch_one(&state.db)
         .await?

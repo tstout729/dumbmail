@@ -18,6 +18,7 @@ import { conditionDefaults, conditionGroups, conditionLabels, cmpOps, eventOps, 
 import { useCatalogFacets } from "../../features/catalog/api";
 import type { ProductCondition } from "../../features/catalog/types";
 import { CouponConditionFields } from "../../features/coupons/CouponConditionFields";
+import { LanguageConditionFields } from "../../features/translations/LanguageConditionFields";
 import { useCampaigns, useFlows, useForms, useLists, useMetrics, useSegments } from "../../api";
 import { IconButton, Input, Select, cx } from "../ui";
 
@@ -391,6 +392,8 @@ function RowBody({ condition: c, onChange, ctx, depth }: Omit<RowProps, "onRemov
           <Hint>(hard bounce or spam complaint)</Hint>
         </>
       );
+    case "language":
+      return <LanguageConditionFields condition={c} onChange={onChange} />;
     case "prediction":
       return <PredictionFields condition={c} onChange={onChange} />;
     case "random":

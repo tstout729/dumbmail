@@ -69,7 +69,9 @@ pub async fn create_template(state: &AppState, account_id: Uuid, b: TemplateBody
     let channel = b.channel.unwrap_or_else(|| "email".into());
     check_channel(&channel)?;
     let name = b.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| AppError::bad("give the template a name"))?;
-    let content = b.content.unwrap_or(json!({}));
+    let mut content = b.content.unwrap_or(json!({}));
+    // Blocks get their stable keys (see features::translations::fields).
+    crate::features::translations::fields::assign_keys(&mut content);
     crate::features::coupons::template::check_content(&channel, &content)?;
     Ok(sqlx::query_as("INSERT INTO templates (id, account_id, name, channel, content) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, channel, content, created_at, updated_at")
         .bind(Uuid::now_v7())
@@ -94,7 +96,10 @@ async fn get_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<
     Ok(Json(t.ok_or_else(|| AppError::not_found("template"))?))
 }
 
-async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<TemplateBody>) -> AppResult<Json<Template>> {
+async fn patch_template_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(mut b): ApiJson<TemplateBody>) -> AppResult<Json<Template>> {
+    if let Some(c) = b.content.as_mut() {
+        crate::features::translations::fields::assign_keys(c);
+    }
     // A transactional template's new content must pass the same content check as when it was created.
     crate::features::transactional::check_template_edit(&state.db, ctx.account_id, id, b.content.as_ref()).await?;
     if let Some(content) = &b.content {
@@ -288,7 +293,7 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     };
     let name = b.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| format!("{label} campaign {}", Utc::now().format("%b %-d")));
     let audience = normalize_audience(&b.audience.unwrap_or(json!({})))?;
-    let content = b.content.unwrap_or_else(|| match channel.as_str() {
+    let mut content = b.content.unwrap_or_else(|| match channel.as_str() {
         "sms" => json!({"body": ""}),
         "push" => crate::features::push::content::starter(),
         _ => json!({"subject": "", "blocks": []}),
@@ -296,7 +301,12 @@ pub async fn create_campaign(state: &AppState, account_id: Uuid, b: CampaignBody
     if channel == "push" {
         crate::features::push::content::parse(&content)?;
     }
-    let ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
+    let mut ab_test = checked_ab_test(&channel, b.ab_test.as_ref())?;
+    // Blocks get their stable keys (see features::translations::fields).
+    crate::features::translations::fields::assign_keys(&mut content);
+    if let Some(t) = ab_test.as_mut() {
+        crate::features::translations::fields::assign_keys(t);
+    }
     let send_options = crate::features::sendtime::checked(b.send_options.as_ref())?;
     crate::features::coupons::template::check_campaign(&channel, &content, ab_test.as_ref())?;
     Ok(sqlx::query_as("INSERT INTO campaigns (id, account_id, name, channel, audience, content, ab_test, send_options) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *")
@@ -333,7 +343,11 @@ pub async fn update_campaign(state: &AppState, account_id: Uuid, id: Uuid, b: Ca
 
 /// Edit a campaign only while its status is one of `allowed`. The status is checked in the UPDATE
 /// itself, so a campaign scheduled (or sent) a moment ago isn't changed.
-pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b: CampaignBody, allowed: &[&str]) -> AppResult<CampaignRow> {
+pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, mut b: CampaignBody, allowed: &[&str]) -> AppResult<CampaignRow> {
+    // Blocks get their stable keys (see features::translations::fields).
+    if let Some(c) = b.content.as_mut() {
+        crate::features::translations::fields::assign_keys(c);
+    }
     let c = campaigns::load(&state.db, account_id, id).await?;
     let refused = |status: &str| {
         if EDITABLE.contains(&status) {
@@ -354,7 +368,10 @@ pub async fn update_campaign_in(state: &AppState, account_id: Uuid, id: Uuid, b:
     // Re-check the test against the final channel (SMS can't be judged on opens).
     let channel = b.channel.as_deref().unwrap_or(&c.channel);
     let set_ab = b.ab_test.is_some() || b.channel.is_some();
-    let ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
+    let mut ab_test = checked_ab_test(channel, b.ab_test.as_ref().or(c.ab_test.as_ref()))?;
+    if let Some(t) = ab_test.as_mut() {
+        crate::features::translations::fields::assign_keys(t);
+    }
     crate::features::coupons::template::check_campaign(channel, b.content.as_ref().unwrap_or(&c.content), ab_test.as_ref())?;
     if channel == "push" {
         crate::features::push::content::parse(b.content.as_ref().unwrap_or(&c.content))?;
@@ -813,7 +830,8 @@ pub async fn create_flow(state: &AppState, account_id: Uuid, b: FlowBody) -> App
     let trigger = b.trigger.ok_or_else(|| AppError::bad("a flow needs a trigger"))?;
     let t = flows::parse_trigger(&trigger)?;
     check_trigger_refs(state, account_id, &t).await?;
-    let def = b.definition.unwrap_or(json!({"entry": null, "nodes": []}));
+    let mut def = b.definition.unwrap_or(json!({"entry": null, "nodes": []}));
+    crate::features::translations::fields::assign_keys(&mut def);
     check_node_refs(state, account_id, &def).await?;
     Ok(sqlx::query_as("INSERT INTO flows (id, account_id, name, trigger, definition) VALUES ($1, $2, $3, $4, $5) RETURNING *")
         .bind(Uuid::now_v7())
@@ -835,7 +853,10 @@ async fn get_flow_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid
     Ok(Json(flow_json(&state, &f).await?))
 }
 
-pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, b: FlowBody) -> AppResult<FlowRow> {
+pub async fn update_flow(state: &AppState, account_id: Uuid, id: Uuid, mut b: FlowBody) -> AppResult<FlowRow> {
+    if let Some(d) = b.definition.as_mut() {
+        crate::features::translations::fields::assign_keys(d);
+    }
     let cur = load_flow(state, account_id, id).await?;
     // A live flow can't take in imported content that still needs review.
     if let (true, Some(why)) = (cur.status == "live", b.definition.as_ref().and_then(crate::import_review::live_edit_problem)) {

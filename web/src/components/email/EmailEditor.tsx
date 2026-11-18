@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { ChevronDown, LayoutTemplate, Save } from "lucide-react";
+import { ChevronDown, Languages, LayoutTemplate, Save } from "lucide-react";
 import type { EmailContent } from "../../api";
 import { useSession } from "../../api";
 import { Button, ColorInput, Field, Input, Segmented, Textarea, cx } from "../ui";
@@ -8,6 +8,9 @@ import { EmailPreview } from "./EmailPreview";
 import { LoadTemplateDialog, SaveTemplateDialog } from "./TemplateDialogs";
 import { VariableMenu, insertAtCursor } from "./VariableMenu";
 import { newBlock } from "./blocks";
+import { TranslationsDrawer } from "../../features/translations/TranslationsDrawer";
+import { useUnsavedId } from "../../features/translations/api";
+import type { TranslationTarget } from "../../features/translations/types";
 
 type Props = {
   value: EmailContent;
@@ -19,14 +22,17 @@ type Props = {
   templateName?: string;
   readOnly?: boolean;
   className?: string;
+  /** The saved message, so its language versions can be drafted with AI. */
+  translationTarget?: TranslationTarget;
 };
 
 /** Shared editor for campaign emails, flow email nodes and templates. */
-export function EmailEditor({ value, onChange, showSender = true, templates = true, templateName, readOnly, className }: Props) {
+export function EmailEditor({ value, onChange, showSender = true, templates = true, templateName, readOnly, className, translationTarget }: Props) {
   const { account } = useSession();
   const subjectRef = useRef<HTMLInputElement>(null);
   const [showMore, setShowMore] = useState(false);
-  const [dialog, setDialog] = useState<"load" | "save" | null>(null);
+  const [dialog, setDialog] = useState<"load" | "save" | "languages" | null>(null);
+  const unsavedId = useUnsavedId();
   const mode: "blocks" | "html" = value.blocks === undefined && value.html !== undefined ? "html" : "blocks";
   const set = (patch: Partial<EmailContent>) => onChange({ ...value, ...patch });
 
@@ -96,16 +102,21 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
                 { value: "html", label: "Custom HTML" },
               ]}
             />
+            <div className="flex gap-1">
+              <Button size="sm" variant="ghost" icon={<Languages className="size-3.5" />} onClick={() => setDialog("languages")}>
+                Languages
+              </Button>
             {templates && !readOnly ? (
-              <div className="flex gap-1">
+              <>
                 <Button size="sm" variant="ghost" icon={<LayoutTemplate className="size-3.5" />} onClick={() => setDialog("load")}>
                   Load template
                 </Button>
                 <Button size="sm" variant="ghost" icon={<Save className="size-3.5" />} onClick={() => setDialog("save")}>
                   Save as template
                 </Button>
-              </div>
+              </>
             ) : null}
+            </div>
           </div>
           <fieldset disabled={readOnly} className="min-w-0 min-h-0 flex-1 overflow-y-auto pr-1">
             {mode === "blocks" ? (
@@ -135,6 +146,9 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
           }}
           onClose={() => setDialog(null)}
         />
+      ) : null}
+      {dialog === "languages" ? (
+        <TranslationsDrawer channel="email" value={value} onChange={onChange} target={translationTarget} unsavedId={unsavedId} name={templateName ?? value.subject} readOnly={readOnly} onClose={() => setDialog(null)} />
       ) : null}
       {dialog === "save" ? <SaveTemplateDialog channel="email" content={value} defaultName={templateName ?? value.subject} onClose={() => setDialog(null)} /> : null}
     </div>

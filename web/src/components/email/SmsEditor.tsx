@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { LayoutTemplate, Loader2, Save } from "lucide-react";
+import { Languages, LayoutTemplate, Loader2, Save } from "lucide-react";
 import type { SmsContent } from "../../api";
 import { useSession, useSmsRender } from "../../api";
 import { useDebouncedValue } from "../../lib/hooks";
@@ -7,6 +7,9 @@ import { ShortLinkNote } from "../../features/shortLinks/ShortLinkNote";
 import { Button, Field, Input, Textarea, cx } from "../ui";
 import { LoadTemplateDialog, SaveTemplateDialog } from "./TemplateDialogs";
 import { VariableMenu, insertAtCursor } from "./VariableMenu";
+import { TranslationsDrawer } from "../../features/translations/TranslationsDrawer";
+import { useUnsavedId } from "../../features/translations/api";
+import type { TranslationTarget } from "../../features/translations/types";
 
 const gsm7 = /^[\n\r @£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ!"#¤%&'()*+,\-./0-9:;<=>?¡A-ZÄÖÑÜ§¿a-zäöñüà^{}\\[~\]|€]*$/;
 
@@ -20,12 +23,13 @@ export function smsSegments(body: string): { characters: number; segments: numbe
   return { characters, segments, unicode };
 }
 
-type Props = { value: SmsContent; onChange: (v: SmsContent) => void; templates?: boolean; templateName?: string; readOnly?: boolean };
+type Props = { value: SmsContent; onChange: (v: SmsContent) => void; templates?: boolean; templateName?: string; readOnly?: boolean; translationTarget?: TranslationTarget };
 
-export function SmsEditor({ value, onChange, templates = true, templateName, readOnly }: Props) {
+export function SmsEditor({ value, onChange, templates = true, templateName, readOnly, translationTarget }: Props) {
   const { account } = useSession();
   const ref = useRef<HTMLTextAreaElement>(null);
-  const [dialog, setDialog] = useState<"load" | "save" | null>(null);
+  const [dialog, setDialog] = useState<"load" | "save" | "languages" | null>(null);
+  const unsavedId = useUnsavedId();
   const debounced = useDebouncedValue(value, 400);
   const render = useSmsRender(debounced.body ? debounced : null);
   const local = smsSegments(value.body);
@@ -40,6 +44,9 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
           <div className="text-xs font-medium text-zinc-700">Message</div>
           <div className="flex items-center gap-1">
             <VariableMenu onInsert={(v) => onChange({ ...value, body: insertAtCursor(ref.current, value.body, v) })} />
+            <Button size="sm" variant="ghost" icon={<Languages className="size-3.5" />} onClick={() => setDialog("languages")}>
+              Languages
+            </Button>
             {templates && !readOnly ? (
               <>
                 <Button size="sm" variant="ghost" icon={<LayoutTemplate className="size-3.5" />} onClick={() => setDialog("load")}>
@@ -83,6 +90,9 @@ export function SmsEditor({ value, onChange, templates = true, templateName, rea
           }}
           onClose={() => setDialog(null)}
         />
+      ) : null}
+      {dialog === "languages" ? (
+        <TranslationsDrawer channel="sms" value={value} onChange={onChange} target={translationTarget} unsavedId={unsavedId} name={templateName} readOnly={readOnly} onClose={() => setDialog(null)} />
       ) : null}
       {dialog === "save" ? <SaveTemplateDialog channel="sms" content={value} defaultName={templateName} onClose={() => setDialog(null)} /> : null}
     </div>

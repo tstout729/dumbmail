@@ -5,6 +5,7 @@ import type { PushContent } from "../features/push/types";
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
 import type { BlockOptions, ContentBlock } from "../features/content/types";
 import type { CouponBlock, CouponCondition } from "../features/coupons/types";
+import type { LanguageCondition } from "../features/translations/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
 export type Consent = "subscribed" | "unsubscribed" | "never_subscribed" | "pending";
@@ -35,6 +36,8 @@ export type Profile = {
   created_at: string;
   updated_at: string;
   last_event_at: string | null;
+  /** The person's language, a tag like fr or pt-BR (see features/translations). */
+  locale?: string | null;
 };
 
 export type Plan = "free" | "pro" | "scale" | "self_hosted";
@@ -223,6 +226,7 @@ export type Condition =
   | ConsentCondition
   | CanReceiveCondition
   | SuppressedCondition
+  | LanguageCondition
   | FormCondition
   | EngagementCondition
   | MessageCondition
@@ -239,8 +243,10 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock = BlockOptions &
-  (
+export type EmailBlock = BlockOptions & {
+  /** The block's stable key (translations refer to it), given when the block is created. */
+  key?: string;
+} & (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
   | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }
@@ -537,6 +543,7 @@ export type ProfileInput = Partial<
     | "properties"
     | "email_consent"
     | "sms_consent"
+    | "locale"
   >
 > & { list_ids?: string[] };
 

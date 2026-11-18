@@ -29,6 +29,39 @@ pub struct EmailContent {
     pub html: Option<String>,
     #[serde(default)]
     pub theme: Option<Theme>,
+    /// The language version being sent, set by the content prepare step (see
+    /// `features::translations`); None renders exactly as before.
+    #[serde(default, rename = "_lang")]
+    pub lang: Option<String>,
+    /// The footer lines in that language, set with `lang`.
+    #[serde(default, rename = "_footer")]
+    pub footer_texts: Option<FooterTexts>,
+    /// For a language version of a full-document email: whether the original places its own
+    /// unsubscribe link (decided from the original, set with `lang`).
+    #[serde(default, rename = "_own_unsubscribe")]
+    pub own_unsubscribe: Option<bool>,
+}
+
+/// The words of the marketing footer in the email's language.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FooterTexts {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub unsubscribe: String,
+}
+
+/// `lang` (and `dir="rtl"`) attributes for a language version: only well-formed tags.
+fn lang_attrs(lang: Option<&str>) -> Option<(String, bool)> {
+    let l = crate::features::translations::locale::normalize(lang?)?;
+    let rtl = crate::features::translations::locale::is_rtl(&l);
+    Some((l, rtl))
+}
+
+/// Right-to-left email: the blocks' left and right alignment swap sides.
+fn mirror(html: &str) -> String {
+    html.replace("text-align:left;", "text-align:\u{1}l;").replace("text-align:right;", "text-align:left;").replace("text-align:\u{1}l;", "text-align:right;")
+        .replace("align=\"left\"", "align=\"\u{1}l\"").replace("align=\"right\"", "align=\"left\"").replace("align=\"\u{1}l\"", "align=\"right\"")
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -335,7 +368,43 @@ fn social_links(account: &Account) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-fn layout(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer: &str) -> String {
+fn layout(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer: &str, lang: Option<&(String, bool)>) -> String {
+    let doc = layout_en(inner, preheader, account, theme, footer);
+    match lang {
+        None => doc,
+        Some((l, rtl)) => {
+            let doc = doc.replacen(r#"<html lang="en">"#, &format!(r#"<html lang="{l}">"#), 1);
+            // Right to left goes on the text, not on the layout: a direction on the document or a
+            // layout table would swap the order of columns.
+            if *rtl { text_dir(&doc) } else { doc }
+        }
+    }
+}
+
+/// `dir="rtl"` on every text cell (a cell whose style sets `text-align`); layout tables and column
+/// cells are left alone, so columns keep their order.
+fn text_dir(html: &str) -> String {
+    static TEXT_CELL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<td style="([^"]*text-align:[^"]*)""#).unwrap());
+    TEXT_CELL.replace_all(html, r#"<td dir="rtl" style="$1""#).into_owned()
+}
+
+/// A full HTML document in a language version: `lang` on its root element, in place of any it had.
+/// Direction is left to the author's own markup (a direction on the root would swap the columns of
+/// their tables).
+fn root_lang(html: &str, lang: &str) -> String {
+    static ROOT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<html\b([^>]*)>").unwrap());
+    static ATTR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\slang\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
+    match ROOT.captures(html) {
+        Some(c) => {
+            let whole = c.get(0).expect("match");
+            let kept = ATTR.replace_all(&c[1], "");
+            format!("{}<html{} lang=\"{lang}\">{}", &html[..whole.start()], kept.trim_end(), &html[whole.end()..])
+        }
+        None => html.to_string(),
+    }
+}
+
+fn layout_en(inner: &str, preheader: &str, account: &Account, theme: &Theme, footer: &str) -> String {
     let bg = safe_color(theme.background.as_deref().unwrap_or(""), "#f4f4f5");
     let font = theme.font.clone().unwrap_or_else(|| "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif".into());
     let font = font.replace('"', "'");
@@ -386,6 +455,9 @@ pub fn context(account: &Account, profile: Option<&Profile>, event: Option<&Valu
         let mut person = Map::new();
         person.insert("id".into(), json!(p.id));
         person.insert("properties".into(), p.properties.clone());
+        if let Some(l) = p.locale.as_deref().filter(|l| !l.is_empty()) {
+            person.insert("locale".into(), json!(l));
+        }
         for (k, v) in [("first_name", &p.first_name), ("last_name", &p.last_name), ("email", &p.email), ("phone_number", &p.phone_number), ("external_id", &p.external_id)] {
             match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some(val) => {
@@ -491,6 +563,11 @@ pub fn render_email_hooked(
     let unsub = tracking.map(|t| t.unsubscribe_url.clone()).unwrap_or_else(|| "#".into());
     let address = account.address.clone().unwrap_or_default();
     let socials = social_links(account);
+    let lang = lang_attrs(content.lang.as_deref());
+    let rtl = lang.as_ref().is_some_and(|(_, r)| *r);
+    let ft = content.footer_texts.as_ref().filter(|_| lang.is_some());
+    let reason = ft.map(|f| f.reason.as_str()).filter(|t| !t.trim().is_empty()).unwrap_or("You're receiving this because you subscribed.");
+    let unsub_label = ft.map(|f| f.unsubscribe.as_str()).filter(|t| !t.trim().is_empty()).unwrap_or("Unsubscribe");
     let social_html = if socials.is_empty() {
         String::new()
     } else {
@@ -502,13 +579,15 @@ pub fn render_email_hooked(
     };
     let footer = match opts.footer {
         Footer::Marketing => format!(
-            r#"{social_html}{name}{addr}<br>You're receiving this because you subscribed. <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a>"#,
+            r#"{social_html}{name}{addr}<br>{reason} <a href="{unsub}" data-pl-skip="1" style="color:#6b7280;text-decoration:underline;">{unsub_label}</a>"#,
             // The footer goes through the template engine with the body, so brand text (often read
             // from a website) must not be able to open a template tag.
             social_html = no_tpl(&social_html),
             name = no_tpl(&esc(&account.name)),
-            addr = if address.is_empty() { String::new() } else { format!(" · {}", no_tpl(&esc(&address))) },
+            addr = if address.is_empty() { String::new() } else if rtl { format!(r#" · <span dir="ltr">{}</span>"#, no_tpl(&esc(&address))) } else { format!(" · {}", no_tpl(&esc(&address))) },
             unsub = esc(&unsub),
+            reason = no_tpl(&esc(reason)),
+            unsub_label = no_tpl(&esc(unsub_label)),
         ),
         Footer::Address => format!(
             "{}{}",
@@ -520,23 +599,39 @@ pub fn render_email_hooked(
 
     let (html_source, text_source) = match (&content.blocks, &content.html) {
         (Some(blocks), _) if !blocks.is_empty() => {
-            let inner: String = blocks.iter().map(|b| block_html(b, &brand, font, 0)).collect();
+            let mut inner: String = blocks.iter().map(|b| block_html(b, &brand, font, 0)).collect();
+            if lang.as_ref().is_some_and(|(_, rtl)| *rtl) {
+                inner = mirror(&inner);
+            }
             let mut text = String::new();
             blocks.iter().for_each(|b| block_text(b, &mut text));
-            (layout(&inner, content.preheader.as_deref().unwrap_or(""), account, &theme, &footer), text)
+            (layout(&inner, content.preheader.as_deref().unwrap_or(""), account, &theme, &footer, lang.as_ref()), text)
         }
         (_, Some(html)) if !html.trim().is_empty() => {
             let mut text = String::new();
             block_text(&json!({"type": "html", "html": html}), &mut text);
             let doc = if html.to_lowercase().contains("<body") {
                 // Custom full HTML: make sure an unsubscribe link exists (and any footer is added).
-                if html.contains("unsubscribe_url") || footer.is_empty() {
+                let own_unsubscribe = content.own_unsubscribe.filter(|_| lang.is_some()).unwrap_or_else(|| html.contains("unsubscribe_url"));
+                let doc = if own_unsubscribe || footer.is_empty() {
                     html.clone()
+                } else if lang.is_some() {
+                    // A language version: where a browser really closes the body (a `</body>` in a
+                    // translated attribute, title or comment isn't it), else the end.
+                    let dir = if rtl { r#" dir="rtl""# } else { "" };
+                    let div = format!(r#"<div{dir} style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div>"#);
+                    let at = crate::features::translations::structure::body_close(html).unwrap_or(html.len());
+                    format!("{}{div}{}", &html[..at], &html[at..])
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
+                };
+                match &lang {
+                    Some((l, _)) => root_lang(&doc, l),
+                    None => doc,
                 }
             } else {
-                layout(&format!("<tr><td style=\"padding:8px 24px;\">{html}</td></tr>"), content.preheader.as_deref().unwrap_or(""), account, &theme, &footer)
+                let dir = if rtl { r#" dir="rtl""# } else { "" };
+                layout(&format!("<tr><td{dir} style=\"padding:8px 24px;\">{html}</td></tr>"), content.preheader.as_deref().unwrap_or(""), account, &theme, &footer, lang.as_ref())
             };
             (doc, text)
         }
@@ -547,13 +642,15 @@ pub fn render_email_hooked(
     let preheader = render_str(content.preheader.as_deref().unwrap_or(""), ctx, false)?;
     let mut html = render_str(&html_source, ctx, true)?;
     let mut text = render_str(&text_source, ctx, false)?;
-    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {address}") });
+    // Right to left: the address and links shown in the text part keep their own direction.
+    let iso = |s: &str| if rtl { format!("\u{2066}{s}\u{2069}") } else { s.to_string() };
+    let signature = format!("{}{}", account.name, if address.is_empty() { String::new() } else { format!(", {}", iso(&address)) });
     match opts.footer {
         Footer::Marketing => {
             for (label, url) in &socials {
-                text.push_str(&format!("\n{label}: {url}"));
+                text.push_str(&format!("\n{label}: {}", iso(url)));
             }
-            text.push_str(&format!("\n--\n{signature}\nUnsubscribe: {unsub}\n"));
+            text.push_str(&format!("\n--\n{signature}\n{unsub_label}: {}\n", iso(&unsub)));
         }
         Footer::Address => text.push_str(&format!("\n--\n{signature}\n")),
         Footer::None => {}
@@ -705,7 +802,7 @@ mod tests {
         let profile = Profile {
             id: Uuid::nil(), account_id: Uuid::nil(), email: Some("a@b.co".into()), phone_number: None, external_id: None,
             first_name: None, last_name: Some("".into()), properties: json!({}), email_consent: "subscribed".into(), sms_consent: "never_subscribed".into(),
-            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), last_event_at: None,
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), last_event_at: None, locale: None, locale_hint: None,
         };
         let ctx = context(&acct, Some(&profile), None, "#");
         assert_eq!(render_str("Hi {{ first_name|default('there') }} {{ person.last_name|default('') }}", &ctx, false).unwrap().trim(), "Hi there");
