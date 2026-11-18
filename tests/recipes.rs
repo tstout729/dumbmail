@@ -658,6 +658,39 @@ async fn paddle_orders_refunds_and_its_marketing_consent_box() {
         p.post_as(&h, &b.to_string(), &json!({}), &json!({}), &p.secret).await;
     }
     assert_eq!(consent(&h, "kim.example@example.com").await, (false, "subscribed".into()), "an older 'off' doesn't undo a newer 'on'");
+    // Ivy: Paddle's newer "off" arrives first and changes nothing; an older "on" after it doesn't subscribe.
+    let mut ivy_off = fixture("paddle", "customer-updated-withdrawn.json")["input"]["payload"].clone();
+    ivy_off["event_id"] = json!("evt_ivy_off");
+    ivy_off["data"]["id"] = json!("ctm_ivy");
+    ivy_off["data"]["email"] = json!("ivy.example@example.com");
+    ivy_off["data"]["updated_at"] = json!("2024-06-02T10:00:00.000Z");
+    let mut ivy_on = ivy_off.clone();
+    ivy_on["event_id"] = json!("evt_ivy_on_old");
+    ivy_on["data"]["marketing_consent"] = json!(true);
+    ivy_on["data"]["updated_at"] = json!("2024-06-01T10:00:00.000Z");
+    for b in [ivy_off, ivy_on] {
+        p.post_as(&h, &b.to_string(), &json!({}), &json!({}), &p.secret).await;
+    }
+    assert_eq!(consent(&h, "ivy.example@example.com").await.1, "never_subscribed", "an older 'on' can't follow a newer 'off'");
+    // Ann: Paddle subscribes her; she unsubscribes; later she opts in again herself (a form). Paddle's
+    // "off" after that isn't Paddle's to withdraw.
+    let mut ann_on = fixture("paddle", "customer-updated-consent.json")["input"]["payload"].clone();
+    ann_on["event_id"] = json!("evt_ann_on");
+    ann_on["data"]["id"] = json!("ctm_ann");
+    ann_on["data"]["email"] = json!("ann.example@example.com");
+    ann_on["data"]["updated_at"] = json!("2024-07-01T10:00:00.000Z");
+    p.post_as(&h, &ann_on.to_string(), &json!({}), &json!({}), &p.secret).await;
+    assert_eq!(consent(&h, "ann.example@example.com").await.1, "subscribed");
+    let (ann, account): (uuid::Uuid, uuid::Uuid) = sqlx::query_as("SELECT id, account_id FROM profiles WHERE email = 'ann.example@example.com'").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = 'unsubscribed' WHERE id = $1").bind(ann).execute(&h.state.db).await.unwrap();
+    dumbmail::audience::record_event(&h.state.db, dumbmail::audience::NewEvent { account_id: account, profile_id: ann, metric: "Unsubscribed", properties: json!({"source": "link"}), value: None, occurred_at: None, unique_id: None, message_id: None }).await.unwrap();
+    sqlx::query("UPDATE profiles SET email_consent = 'subscribed' WHERE id = $1").bind(ann).execute(&h.state.db).await.unwrap();
+    let mut ann_off = ann_on.clone();
+    ann_off["event_id"] = json!("evt_ann_off");
+    ann_off["data"]["marketing_consent"] = json!(false);
+    ann_off["data"]["updated_at"] = json!("2024-07-05T10:00:00.000Z");
+    p.post_as(&h, &ann_off.to_string(), &json!({}), &json!({}), &p.secret).await;
+    assert_eq!(consent(&h, "ann.example@example.com").await.1, "subscribed", "her own later opt-in stays");
     let names = ["transaction-completed.json"];
     never_stored(&mut h, &p, &sensitive("paddle", &names), &names).await;
     h.cleanup().await;

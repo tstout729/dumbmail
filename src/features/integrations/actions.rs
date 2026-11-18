@@ -1141,71 +1141,80 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
 
 /// Record a consent change the script vouches for. Subscribing never overrides an earlier unsubscribe.
 async fn consent(state: &AppState, src: &Source, profile_id: Uuid, c: &Consent) -> AppResult<String> {
-    let (col, label) = if c.channel == Channel::Email { ("email_consent", "email") } else { ("sms_consent", "SMS") };
+    let (col, addr_col, label) = if c.channel == Channel::Email { ("email_consent", "email", "email") } else { ("sms_consent", "phone_number", "SMS") };
     let (sub_metric, unsub_metric) = if c.channel == Channel::Email { ("Subscribed to Email Marketing", "Unsubscribed") } else { ("Subscribed to SMS Marketing", "Unsubscribed from SMS") };
+    let ch = if c.channel == Channel::Email { "email" } else { "sms" };
     let as_of = c.as_of.as_deref().and_then(parse_time);
-    if let Some(t) = as_of {
-        // An older preference than one this integration already applied changes nothing.
-        let newer: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM events e JOIN metrics m ON m.id = e.metric_id
-              WHERE e.profile_id = $1 AND e.account_id = $2 AND m.name = ANY($3) AND e.properties->>'integration_id' = $4
-                AND (e.properties->>'as_of')::timestamptz >= $5)",
-        )
+    let iid = src.integration_id.to_string();
+    // Kept in the profile's integration keys (not shown as properties):
+    // - `consent_as_of:<integration>:<channel>`: "<address>|<time>", the newest preference time this
+    //   integration sent for that address, whether or not it changed anything;
+    // - `consent_by:<channel>`: "<integration>|<address>|<time>", who made the current subscription.
+    let vkey = format!("consent_as_of:{iid}:{ch}");
+    let pkey = format!("consent_by:{ch}");
+    // One statement, under a row lock: whether this preference is fresh, whether the current
+    // subscription is this integration's own (same address, still subscribed, and no unsubscribe,
+    // list sign-up or other source's opt-in recorded since), and the change itself.
+    let q = format!(
+        "WITH cur AS (
+            SELECT p.id, p.{col} AS c, p.{addr_col} AS addr, p.integration_keys AS k,
+                   ($3::timestamptz IS NULL OR NOT (split_part(p.integration_keys->'{vkey}'->>0, '|', 1) = p.{addr_col}
+                        AND NULLIF(split_part(p.integration_keys->'{vkey}'->>0, '|', 2), '')::timestamptz >= $3::timestamptz)) AS fresh,
+                   (p.{col} = 'subscribed' AND split_part(p.integration_keys->'{pkey}'->>0, '|', 1) = $4 AND split_part(p.integration_keys->'{pkey}'->>0, '|', 2) = p.{addr_col}
+                        AND NOT EXISTS (SELECT 1 FROM events e JOIN metrics m ON m.id = e.metric_id
+                             WHERE e.profile_id = p.id AND e.account_id = p.account_id
+                               AND e.occurred_at > NULLIF(split_part(p.integration_keys->'{pkey}'->>0, '|', 3), '')::timestamptz
+                               AND (m.name = ANY($6) OR (m.name = $7 AND COALESCE(e.properties->>'integration_id', '') <> $4)))) AS own
+            FROM profiles p WHERE p.id = $1 AND p.account_id = $2 FOR UPDATE
+         ), next AS (
+            SELECT id, c, fresh, own, addr, k,
+                   CASE WHEN NOT fresh OR addr IS NULL THEN c
+                        WHEN $5 AND c IN ('never_subscribed', 'pending') THEN 'subscribed'
+                        WHEN NOT $5 AND (NOT $8 OR own) AND c <> 'unsubscribed' THEN 'unsubscribed'
+                        ELSE c END AS n
+            FROM cur
+         )
+         UPDATE profiles p SET {col} = next.n, updated_at = CASE WHEN next.n <> next.c THEN now() ELSE p.updated_at END,
+             integration_keys = CASE WHEN NOT next.fresh OR next.addr IS NULL THEN p.integration_keys ELSE
+                 (p.integration_keys - '{pkey}' - '{vkey}')
+                 || CASE WHEN $3::timestamptz IS NULL THEN '{{}}'::jsonb ELSE jsonb_build_object('{vkey}', jsonb_build_array(next.addr || '|' || to_char($3::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))) END
+                 || CASE WHEN next.n = 'subscribed' AND next.c <> 'subscribed' THEN jsonb_build_object('{pkey}', jsonb_build_array($4 || '|' || next.addr || '|' || to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')))
+                         WHEN next.n = 'subscribed' AND p.integration_keys ? '{pkey}' THEN jsonb_build_object('{pkey}', p.integration_keys->'{pkey}')
+                         ELSE '{{}}'::jsonb END
+             END
+         FROM next WHERE p.id = next.id
+         RETURNING next.c, next.n, next.fresh, next.own"
+    );
+    let row: Option<(String, String, bool, bool)> = sqlx::query_as(&q)
         .bind(profile_id)
         .bind(src.account_id)
-        .bind(vec![sub_metric, unsub_metric])
-        .bind(src.integration_id.to_string())
-        .bind(t)
-        .fetch_one(&state.db)
+        .bind(as_of)
+        .bind(&iid)
+        .bind(c.subscribed)
+        .bind(vec![unsub_metric, "Subscribed to List"])
+        .bind(sub_metric)
+        .bind(c.only_own)
+        .fetch_optional(&state.db)
         .await?;
-        if newer {
-            return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
-        }
+    let Some((before, after, fresh, own)) = row else { return Ok(String::new()) };
+    if !fresh {
+        return Ok(format!("; kept {label} as it is (a newer preference from this app was already applied)"));
     }
-    if !c.subscribed {
-        if c.only_own {
-            // Only a subscription this integration made: the person's latest opt-in came from it.
-            let own: bool = sqlx::query_scalar(&format!(
-                "SELECT p.{col} = 'subscribed' AND COALESCE((SELECT e.properties->>'integration_id' FROM events e JOIN metrics m ON m.id = e.metric_id
-                   WHERE e.profile_id = p.id AND e.account_id = p.account_id AND m.name = $3 ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) = $4, false)
-                 FROM profiles p WHERE p.id = $1 AND p.account_id = $2"
-            ))
-            .bind(profile_id)
-            .bind(src.account_id)
-            .bind(sub_metric)
-            .bind(src.integration_id.to_string())
-            .fetch_one(&state.db)
-            .await?;
-            if !own {
-                return Ok(format!("; {label} consent left alone (it didn't come from this app)"));
-            }
-        }
-        unsubscribe(state, src, profile_id, c.channel, as_of).await?;
-        return Ok(format!("; unsubscribed from {label}"));
+    if before == after {
+        return Ok(match (c.subscribed, before.as_str()) {
+            (true, "unsubscribed") => format!("; kept {label} unsubscribed (they unsubscribed before)"),
+            (true, _) => format!("; already subscribed to {label}"),
+            (false, "subscribed") if c.only_own && !own => format!("; {label} consent left alone (it didn't come from this app)"),
+            (false, _) => format!("; {label} not subscribed"),
+        });
     }
-    // Only people who never subscribed (or are waiting to confirm) become subscribed.
-    let q = format!("UPDATE profiles SET {col} = 'subscribed', updated_at = now() WHERE id = $1 AND account_id = $2 AND {col} IN ('never_subscribed', 'pending')");
-    let n = sqlx::query(&q).bind(profile_id).bind(src.account_id).execute(&state.db).await?.rows_affected();
-    if n == 0 {
-        let now: String = sqlx::query_scalar(&format!("SELECT {col} FROM profiles WHERE id = $1")).bind(profile_id).fetch_one(&state.db).await?;
-        return Ok(if now == "unsubscribed" { format!("; kept {label} unsubscribed (they unsubscribed before)") } else { format!("; already subscribed to {label}") });
-    }
-    let metric = if c.channel == Channel::Email { "Subscribed to Email Marketing" } else { "Subscribed to SMS Marketing" };
-    audience::record_event(
-        &state.db,
-        NewEvent {
-            account_id: src.account_id,
-            profile_id,
-            metric,
-            properties: json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}),
-            value: None,
-            occurred_at: None,
-            unique_id: None,
-            message_id: None,
-        },
-    )
-    .await?;
-    Ok(format!("; subscribed to {label} (source: {})", c.source))
+    let (metric, props) = if after == "subscribed" {
+        (sub_metric, json!({"source": c.source, "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}))
+    } else {
+        (unsub_metric, json!({"source": "integration", "integration": src.name, "integration_id": src.integration_id, "as_of": as_of}))
+    };
+    audience::record_event(&state.db, NewEvent { account_id: src.account_id, profile_id, metric, properties: props, value: None, occurred_at: None, unique_id: None, message_id: None }).await?;
+    Ok(if after == "subscribed" { format!("; subscribed to {label} (source: {})", c.source) } else { format!("; unsubscribed from {label}") })
 }
 
 async fn unsubscribe(state: &AppState, src: &Source, profile_id: Uuid, channel: Channel, as_of: Option<DateTime<Utc>>) -> AppResult<()> {
