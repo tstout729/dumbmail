@@ -423,8 +423,14 @@ pub async fn apply(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer) -> a
     sqlx::query(
         "INSERT INTO shopify_customers (account_id, customer_id, profile_id, email, phone, email_state, sms_state, shop_domain, shopify_updated_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-         ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id, email = EXCLUDED.email, phone = EXCLUDED.phone,
-            email_state = EXCLUDED.email_state, sms_state = EXCLUDED.sms_state, shop_domain = EXCLUDED.shop_domain,
+         ON CONFLICT (account_id, customer_id) DO UPDATE SET
+            -- An order moved the link after this snapshot was taken: the link (and its contact) stay.
+            profile_id = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.profile_id ELSE shopify_customers.profile_id END,
+            email = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.email ELSE shopify_customers.email END,
+            phone = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.phone ELSE shopify_customers.phone END,
+            email_state = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.email_state ELSE shopify_customers.email_state END,
+            sms_state = CASE WHEN (shopify_customers.linked_at IS NULL OR (EXCLUDED.shopify_updated_at IS NOT NULL AND EXCLUDED.shopify_updated_at > shopify_customers.linked_at)) THEN EXCLUDED.sms_state ELSE shopify_customers.sms_state END,
+            shop_domain = EXCLUDED.shop_domain,
             shopify_updated_at = COALESCE(EXCLUDED.shopify_updated_at, shopify_customers.shopify_updated_at), deleted_at = NULL,
             email_wb_attempts = CASE WHEN shopify_customers.email IS DISTINCT FROM EXCLUDED.email THEN 0 ELSE shopify_customers.email_wb_attempts END,
             sms_wb_attempts = CASE WHEN shopify_customers.phone IS DISTINCT FROM EXCLUDED.phone THEN 0 ELSE shopify_customers.sms_wb_attempts END,
@@ -482,13 +488,15 @@ pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id:
     let Some(p) = found else { return Ok(None) };
     note_profile(db, account_id, shop, customer_id, p.id).await?;
     if let Some(cid) = customer_id {
-        // Moving the link also moves its contact and its time to this event's, so a customer
-        // snapshot no newer than the event (a bulk import running alongside) can't move it back.
+        // Moving the link also moves its contact to this event's, and records when (`linked_at`,
+        // the event's own time): a customer snapshot no newer than the event (a bulk import running
+        // alongside) can't move it back. The snapshot time (`shopify_updated_at`) isn't touched, so
+        // the customer's own later updates (and their consent) still apply.
         let new: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain, email, phone, shopify_updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO shopify_customers (account_id, customer_id, profile_id, shop_domain, email, phone, linked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (account_id, customer_id) DO UPDATE SET profile_id = EXCLUDED.profile_id,
                 email = COALESCE(EXCLUDED.email, shopify_customers.email), phone = COALESCE(EXCLUDED.phone, shopify_customers.phone),
-                shopify_updated_at = GREATEST(shopify_customers.shopify_updated_at, EXCLUDED.shopify_updated_at), updated_at = now()
+                linked_at = GREATEST(shopify_customers.linked_at, EXCLUDED.linked_at), updated_at = now()
                 WHERE shopify_customers.profile_id IS DISTINCT FROM EXCLUDED.profile_id
              RETURNING (xmax = 0)::int::bigint",
         )
@@ -498,7 +506,7 @@ pub async fn profile_for(db: &PgPool, account_id: Uuid, shop: &str, customer_id:
         .bind(shop)
         .bind(&email)
         .bind(&phone)
-        .bind(at.unwrap_or_else(Utc::now))
+        .bind(at)
         .fetch_optional(db)
         .await?;
         if new == Some(1) {
