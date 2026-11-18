@@ -359,8 +359,10 @@ pub fn decode_entities(s: &str) -> String {
     static REF: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"&(#[xX][0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]{1,31});?").unwrap());
     let mut cur = s.to_string();
     for _ in 0..4 {
+        // A browser reads the legacy name `&shy` even with no `;` and letters after it.
+        let next = cur.replace("&shy", "\u{AD}");
         let next = REF
-            .replace_all(&cur, |c: &regex::Captures<'_>| {
+            .replace_all(&next, |c: &regex::Captures<'_>| {
                 let e = &c[1];
                 let n: Option<u32> = if let Some(h) = e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
                     let h = h.trim_start_matches('0');
@@ -482,7 +484,7 @@ mod tests {
 
     #[test]
     fn invisible_characters_are_caught_however_they_are_written() {
-        for bad in ["a\u{202E}b", "a&#x202E;b", "a&#x0000202e;b", "a&#0008238;b", "a&#8203;b", "a&ZeroWidthSpace;b", "a&NegativeThinSpace;b", "a&rlm;b", "a&#xFEFF;b", "a\u{2066}b", "a\u{00AD}b", "a\u{3164}b", "a&amp;#x202E;b", "a\u{E0041}b"] {
+        for bad in ["a\u{202E}b", "a&#x202E;b", "a&#x0000202e;b", "a&#0008238;b", "a&#8203;b", "a&ZeroWidthSpace;b", "a&NegativeThinSpace;b", "a&rlm;b", "a&#xFEFF;b", "a\u{2066}b", "a\u{00AD}b", "a\u{3164}b", "a&amp;#x202E;b", "a\u{E0041}b", "a&shyb", "a&shy;b"] {
             assert!(hidden_controls(bad).is_err(), "{bad:?}");
         }
         for ok in ["می\u{200C}خواهم", "👨\u{200D}👩", "Tom &amp; Jerry", "&lt;b&gt;", "a&#x41;b", "&copy; 2026"] {
