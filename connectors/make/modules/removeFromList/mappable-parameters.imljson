@@ -1,0 +1,4 @@
+[
+	{ "name": "list_id", "type": "select", "label": "List", "required": true, "options": "rpc://listLists" },
+	{ "name": "profile_id", "type": "text", "label": "Profile ID", "required": true, "help": "Use Search profiles first to find it by email." }
+]

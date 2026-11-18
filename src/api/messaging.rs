@@ -590,7 +590,15 @@ pub async fn cancel(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<C
         .fetch_optional(&mut *tx)
         .await?;
     let row = row.ok_or_else(|| AppError::Conflict("the campaign changed while cancelling; try again".into()))?;
-    sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    if crate::features::observes_unsent(&state.db, account_id) {
+        let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued' RETURNING id")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        crate::features::messages_unsent_in(&mut tx, &state.db, account_id, &skipped).await;
+    } else {
+        sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE campaign_id = $1 AND status = 'queued'").bind(id).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(row)
 }
@@ -863,6 +871,7 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::Conflict("this flow changed while you were turning it on; open it again".into()))?;
+    crate::features::webhooks::flow_status_changed(&state.db, account_id, id, &row.name, &f.status, status, &row.trigger).await;
     if status == "live" {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"first_flow\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }

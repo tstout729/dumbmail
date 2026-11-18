@@ -1,0 +1,9 @@
+[
+	{ "name": "id", "type": "text", "label": "Event ID" },
+	{ "name": "topic", "type": "text", "label": "Topic" },
+	{ "name": "created_at", "type": "date", "label": "Created at" },
+	{ "name": "account_id", "type": "text", "label": "Account ID" },
+	{ "name": "api_version", "type": "text", "label": "API version" },
+	{ "name": "test", "type": "boolean", "label": "Test event" },
+	{ "name": "data", "type": "any", "label": "Data", "help": "The event's details; see the topic list in docs/WEBHOOKS.md." }
+]

@@ -1,0 +1,17 @@
+{
+	"url": "/api/profiles",
+	"method": "POST",
+	"body": {
+		"email": "{{parameters.email}}",
+		"phone_number": "{{parameters.phone_number}}",
+		"external_id": "{{parameters.external_id}}",
+		"first_name": "{{parameters.first_name}}",
+		"last_name": "{{parameters.last_name}}",
+		"properties": "{{toCollection(parameters.properties, 'key', 'value')}}",
+		"email_consent": "{{parameters.email_consent}}",
+		"list_ids": "{{parameters.list_ids}}"
+	},
+	"response": {
+		"output": "{{body}}"
+	}
+}

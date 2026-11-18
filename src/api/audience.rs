@@ -180,7 +180,7 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             "UPDATE profiles p SET email = CASE WHEN $2 THEN $3 ELSE p.email END, phone_number = CASE WHEN $4 THEN $5 ELSE p.phone_number END,
                external_id = COALESCE($6, p.external_id), updated_at = now() WHERE p.id = $1 RETURNING {PROFILE_COLS}"
         );
-        return sqlx::query_as::<_, Profile>(&q)
+        let saved = sqlx::query_as::<_, Profile>(&q)
             .bind(id)
             .bind(email.is_some())
             .bind(email.flatten())
@@ -192,7 +192,12 @@ pub async fn patch_profile(state: &AppState, account_id: Uuid, id: Uuid, mut bod
             .map_err(|e| match AppError::from(e) {
                 AppError::Conflict(_) => AppError::Conflict("another profile already uses that email, phone number or external id".into()),
                 other => other,
-            });
+            })?;
+        // This statement doesn't touch consent (the save above reported any consent change), so
+        // it reports none.
+        let consent = (saved.email_consent.as_str(), saved.sms_consent.as_str());
+        crate::features::webhooks::profile_saved(&state.db, account_id, Some(&p), Some(consent), &saved, core::EventSource::Api).await;
+        return Ok(saved);
     }
     Ok(p)
 }
@@ -202,10 +207,10 @@ async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path
 }
 
 async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let n = sqlx::query("DELETE FROM profiles WHERE id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&state.db).await?.rows_affected();
-    if n == 0 {
-        return Err(AppError::not_found("profile"));
-    }
+    let gone: Option<(Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as("DELETE FROM profiles WHERE id = $1 AND account_id = $2 RETURNING email, phone_number, external_id").bind(id).bind(ctx.account_id).fetch_optional(&state.db).await?;
+    let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found("profile")) };
+    crate::features::webhooks::profile_deleted(&state.db, ctx.account_id, json!({"id": id, "email": email, "phone_number": phone_number, "external_id": external_id})).await;
     crate::features::team::audit(&state, &ctx, "profile.delete", Some(&id.to_string()), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
@@ -253,6 +258,7 @@ pub async fn import(state: &AppState, account_id: Uuid, mut b: ImportBody) -> Ap
     if r.created + r.updated > 0 {
         sqlx::query("UPDATE accounts SET onboarding = onboarding || '{\"contacts\": true}' WHERE id = $1").bind(account_id).execute(&state.db).await?;
     }
+    crate::features::webhooks::import_finished(&state.db, account_id, json!({"list_id": b.list_id, "created": r.created, "updated": r.updated, "skipped": r.skipped, "errors": r.errors.len()})).await;
     Ok(json!({"created": r.created, "updated": r.updated, "skipped": r.skipped, "errors": r.errors}))
 }
 
@@ -374,7 +380,7 @@ async fn add_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<U
 
 async fn remove_members_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<MembersBody>) -> AppResult<Json<Value>> {
     core::list_belongs(&state.db, ctx.account_id, id).await?;
-    let n = sqlx::query("DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)").bind(id).bind(&b.profile_ids).execute(&state.db).await?.rows_affected();
+    let n = core::remove_from_list(&state.db, ctx.account_id, id, &b.profile_ids).await?;
     crate::features::team::audit(&state, &ctx, "list.members_remove", Some(&id.to_string()), json!({"removed": n})).await;
     Ok(Json(json!({"removed": n})))
 }
@@ -534,7 +540,7 @@ pub async fn track(state: &AppState, account_id: Uuid, b: TrackBody) -> AppResul
     if !props.is_object() {
         return Err(AppError::bad("properties must be an object"));
     }
-    let id = core::record_event(
+    let id = core::record_api_event(
         &state.db,
         NewEvent {
             account_id,

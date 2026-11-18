@@ -378,6 +378,9 @@ pub async fn prepare_send(state: &AppState, campaign_id: Uuid) -> anyhow::Result
         .bind(fix)
         .execute(&mut *tx)
         .await?;
+    if c.sent_at.is_none() {
+        crate::features::webhooks::campaign_sent_in(&mut tx, &state.db, c.account_id, c.id).await;
+    }
     tx.commit().await?;
 
     // Send options (local time, best time, gradual): give each new recipient a release time.
@@ -423,7 +426,7 @@ async fn insert_rest(tx: &mut sqlx::Transaction<'_, Postgres>, c: &CampaignRow, 
 }
 
 async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
+    let done: Option<(String, Uuid)> = sqlx::query_as(
         // A test slice that has gone out waits for its results ('testing') before the winner send;
         // the wait starts when the last test message is handled (sends can be deferred, e.g. SMS quiet hours).
         "UPDATE campaigns SET
@@ -432,11 +435,15 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
            updated_at = now()
          FROM (SELECT ab_test IS NOT NULL AND ab_winner IS NULL AND (ab_test->>'test_percent')::int < 100 AS awaiting_winner FROM campaigns WHERE id = $1) w
          WHERE id = $1 AND status = 'sending'
-         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)",
+         AND NOT EXISTS (SELECT 1 FROM messages WHERE campaign_id = $1 AND status IN ('queued','sending') AND NOT is_test)
+         RETURNING status, account_id",
     )
     .bind(campaign_id)
-    .execute(db)
+    .fetch_optional(db)
     .await?;
+    if let Some(("sent", account_id)) = done.as_ref().map(|(s, a)| (s.as_str(), *a)) {
+        crate::features::webhooks::campaign_finished(db, account_id, campaign_id).await;
+    }
     Ok(())
 }
 
@@ -444,10 +451,15 @@ async fn finish_if_done(db: &PgPool, campaign_id: Uuid) -> anyhow::Result<()> {
 pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> anyhow::Result<()> {
     let c: CampaignRow = sqlx::query_as("SELECT * FROM campaigns WHERE id = $1").bind(campaign_id).fetch_one(&state.db).await?;
     if c.status != "sending" {
-        sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued'")
-            .bind(ids)
-            .execute(&state.db)
-            .await?;
+        if crate::features::observes_unsent(&state.db, c.account_id) {
+            let skipped: Vec<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued' RETURNING id")
+                .bind(ids)
+                .fetch_all(&state.db)
+                .await?;
+            crate::features::messages_unsent(&state.db, c.account_id, &skipped).await;
+        } else {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'campaign cancelled' WHERE id = ANY($1) AND status = 'queued'").bind(ids).execute(&state.db).await?;
+        }
         return Ok(());
     }
     let account = load_account(&state.db, c.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -481,12 +493,14 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         if let Some(hours) = smart_hours {
             if crate::features::sendtime::recently_messaged(&state.db, pid, &c.channel, hours).await? {
                 sqlx::query("UPDATE messages SET status = 'skipped', error = 'smart sending' WHERE id = $1").bind(mid).execute(&state.db).await?;
+                crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
                 continue;
             }
         }
         let q = format!("SELECT {PROFILE_COLS} FROM profiles p WHERE p.id = $1");
         let Some(profile) = sqlx::query_as::<_, Profile>(&q).bind(pid).fetch_optional(&state.db).await? else {
             sqlx::query("UPDATE messages SET status = 'skipped', error = 'profile deleted' WHERE id = $1").bind(mid).execute(&state.db).await?;
+            crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
             continue;
         };
         // Test-slice messages carry their version; everyone after the test gets the winner.
@@ -528,17 +542,23 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
                 return Ok(());
             }
             Ok(Outcome::Skipped(why)) => {
-                sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1").bind(mid).bind(why).execute(&state.db).await?;
+                // `sending::send` may have marked it skipped already (and reported it); only the
+                // write that changes the status reports it.
+                let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status <> 'skipped'").bind(mid).bind(why).execute(&state.db).await?.rows_affected();
+                if n > 0 {
+                    crate::features::messages_unsent(&state.db, c.account_id, &[*mid]).await;
+                }
             }
             Ok(_) => {}
             Err(e) => {
                 // A content problem affects every recipient: fail the campaign instead of retrying forever.
-                sqlx::query("UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)")
-                    .bind(c.id)
-                    .bind(e.public_message())
-                    .bind(mid)
-                    .execute(&state.db)
-                    .await?;
+                const FAIL_REST: &str = "UPDATE messages SET status = 'failed', error = $2 WHERE campaign_id = $1 AND (status = 'queued' OR id = $3)";
+                if crate::features::observes_unsent(&state.db, c.account_id) {
+                    let failed: Vec<Uuid> = sqlx::query_scalar(&format!("{FAIL_REST} RETURNING id")).bind(c.id).bind(e.public_message()).bind(mid).fetch_all(&state.db).await?;
+                    crate::features::messages_unsent(&state.db, c.account_id, &failed).await;
+                } else {
+                    sqlx::query(FAIL_REST).bind(c.id).bind(e.public_message()).bind(mid).execute(&state.db).await?;
+                }
                 sqlx::query("UPDATE campaigns SET status = 'failed', error = $2 WHERE id = $1").bind(c.id).bind(e.public_message()).execute(&state.db).await?;
                 return Ok(());
             }
@@ -596,7 +616,14 @@ pub async fn requeue_claimed(db: &PgPool, campaign_id: Uuid, message_id: Uuid, c
                 .await?;
         }
         Some(why) => {
-            sqlx::query("UPDATE messages SET status = 'skipped', error = $2, claimed_at = NULL WHERE id = $1 AND status = 'sending'").bind(message_id).bind(why).execute(&mut *tx).await?;
+            let account: Option<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'skipped', error = $2, claimed_at = NULL WHERE id = $1 AND status = 'sending' RETURNING account_id")
+                .bind(message_id)
+                .bind(why)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some(account) = account {
+                crate::features::messages_unsent_in(&mut tx, db, account, &[message_id]).await;
+            }
         }
     }
     tx.commit().await?;
@@ -735,15 +762,32 @@ const CLAIM_TIMEOUT_MINUTES: i32 = 10;
 /// Scheduler: a worker that crashed mid-send leaves its message 'sending'. Mark those failed (they may or
 /// may not have gone out, so they're never resent) and let their campaigns finish.
 pub async fn release_abandoned_claims(state: &AppState) -> anyhow::Result<()> {
-    let campaigns: Vec<Uuid> = sqlx::query_scalar(
-        "WITH r AS (UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
-                    WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
-                    RETURNING campaign_id)
-         SELECT DISTINCT campaign_id FROM r",
-    )
-    .bind(CLAIM_TIMEOUT_MINUTES)
-    .fetch_all(&state.db)
-    .await?;
+    // Reporting the failures needs every message's id; with nothing watching, only the campaigns.
+    let campaigns: Vec<Uuid> = if crate::features::observes_any(&state.db) {
+        let failed: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
+             WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
+             RETURNING campaign_id, account_id, id",
+        )
+        .bind(CLAIM_TIMEOUT_MINUTES)
+        .fetch_all(&state.db)
+        .await?;
+        crate::features::messages_unsent_rows(&state.db, &failed.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>()).await;
+        let mut campaigns: Vec<Uuid> = failed.iter().map(|r| r.0).collect();
+        campaigns.sort();
+        campaigns.dedup();
+        campaigns
+    } else {
+        sqlx::query_scalar(
+            "WITH r AS (UPDATE messages SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
+                        WHERE status = 'sending' AND campaign_id IS NOT NULL AND claimed_at < now() - make_interval(mins => $1)
+                        RETURNING campaign_id)
+             SELECT DISTINCT campaign_id FROM r",
+        )
+        .bind(CLAIM_TIMEOUT_MINUTES)
+        .fetch_all(&state.db)
+        .await?
+    };
     for id in campaigns {
         finish_if_done(&state.db, id).await?;
     }

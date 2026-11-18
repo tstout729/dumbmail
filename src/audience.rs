@@ -102,6 +102,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 
     for attempt in 0..2 {
         let existing = find_profile(db, account_id, input).await?;
+        let mut old_consent: Option<(String, String)> = None;
         let res = match &existing {
             Some(p) => {
                 let q = if fill_only {
@@ -112,7 +113,8 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             last_name = COALESCE(p.last_name, $6), properties = $7 || p.properties,
                             email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
                             updated_at = now()
-                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                         FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
+                         WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 } else {
                     format!(
@@ -122,10 +124,13 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
                             email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
                             updated_at = now()
-                         WHERE p.id = $1 RETURNING {PROFILE_COLS}"
+                         FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
+                         WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 };
-                sqlx::query_as::<_, Profile>(&q)
+                // The consent the update replaced, read by the update itself (the row is locked):
+                // a webhook reports a transition only if this write made it.
+                sqlx::query_as::<_, WithOldConsent>(&q)
                     .bind(p.id)
                     .bind(&email)
                     .bind(&phone)
@@ -137,7 +142,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     .bind(&input.sms_consent)
                     .fetch_one(db)
                     .await
-                    .map(|profile| Upserted { profile, created: false })
+                    .map(|r| {
+                        old_consent = Some((r.old_email_consent, r.old_sms_consent));
+                        Upserted { profile: r.profile, created: false }
+                    })
             }
             None => {
                 let q = format!(
@@ -162,7 +170,12 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
         };
         match res {
-            Ok(u) => return Ok(u),
+            Ok(u) => {
+                let source = if fill_only { EventSource::Browser } else { EventSource::Api };
+                let consent_before = old_consent.as_ref().map(|(e, s)| (e.as_str(), s.as_str()));
+                crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), consent_before, &u.profile, source).await;
+                return Ok(u);
+            }
             // Lost a race with another insert, or the update collided with another profile's identity.
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") && attempt == 0 && existing.is_none() => continue,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
@@ -172,6 +185,15 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         }
     }
     Err(AppError::Conflict("could not save profile, please retry".into()))
+}
+
+/// A profile row with the consent values the update that returned it replaced.
+#[derive(sqlx::FromRow)]
+struct WithOldConsent {
+    #[sqlx(flatten)]
+    profile: Profile,
+    old_email_consent: String,
+    old_sms_consent: String,
 }
 
 pub async fn metric_id(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<Uuid> {
@@ -244,9 +266,48 @@ pub fn is_reserved_metric(name: &str) -> bool {
     is_server_only_metric(name) || named(BROWSER_RESERVED_METRICS, name)
 }
 
-/// Record an event and wake any live flows triggered by that metric. Returns None for duplicates.
+/// Who recorded an event. Webhook payloads carry it, so a receiver can tell browser input from
+/// data DumbMail or the business's own systems confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventSource {
+    /// DumbMail itself (sends, opens, clicks, unsubscribes, forms, alerts).
+    System,
+    /// The REST API or MCP, with an API key or a dashboard session.
+    Api,
+    /// A connected integration syncing from another system.
+    Integration,
+    /// The public browser endpoint (`/client/events`): anyone with the site key can send these.
+    Browser,
+}
+
+impl EventSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventSource::System => "system",
+            EventSource::Api => "api",
+            EventSource::Integration => "integration",
+            EventSource::Browser => "browser",
+        }
+    }
+}
+
+/// Record an event and wake any live flows triggered by that metric (and features that asked to
+/// see it). Returns None for duplicates.
 pub async fn record_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
-    insert_event(db, ev, false).await
+    insert_event(db, ev, EventSource::System).await
+}
+
+/// Record an event sent through the REST API or MCP.
+pub async fn record_api_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
+    insert_event(db, ev, EventSource::Api).await
+}
+
+/// Record an event with an explicit source (e.g. an integration's sync).
+pub async fn record_event_from(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
+    if source == EventSource::Browser {
+        return record_browser_event(db, ev).await;
+    }
+    insert_event(db, ev, source).await
 }
 
 /// Record an event a browser sent through the public endpoint. It's marked as such, so features
@@ -255,13 +316,18 @@ pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Op
     if is_reserved_metric(ev.metric) {
         return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", ev.metric.trim())));
     }
-    insert_event(db, ev, true).await
+    insert_event(db, ev, EventSource::Browser).await
 }
 
-async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppResult<Option<Uuid>> {
+async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> AppResult<Option<Uuid>> {
     let metric_id = metric_id(db, ev.account_id, ev.metric).await?;
+    let metric = ev.metric.trim();
     let id = Uuid::now_v7();
     let value = ev.value.or_else(|| ev.properties.get("$value").and_then(|v| v.as_f64()));
+    // The event, the profile's last activity and the job that wakes flows commit together: an
+    // event a flow wants is never recorded without its job. If anything fails nothing is kept, the
+    // caller gets the error, and a retry with the same unique_id records it afresh.
+    let mut tx = db.begin().await?;
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
          VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
@@ -277,25 +343,28 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, from_browser: bool) -> AppR
     .bind(ev.occurred_at)
     .bind(&ev.unique_id)
     .bind(ev.message_id)
-    .bind(from_browser)
-    .fetch_optional(db)
+    .bind(source == EventSource::Browser)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(event_id) = inserted else { return Ok(None) };
     sqlx::query("UPDATE profiles SET last_event_at = GREATEST(COALESCE(last_event_at, 'epoch'), COALESCE($2, now())) WHERE id = $1")
         .bind(ev.profile_id)
         .bind(ev.occurred_at)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     let has_flow: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2)",
     )
     .bind(ev.account_id)
-    .bind(ev.metric)
-    .fetch_one(db)
+    .bind(metric)
+    .fetch_one(&mut *tx)
     .await?;
-    if has_flow {
-        crate::jobs::enqueue(db, "flow_event", json!({"event_id": event_id}), None).await?;
+    // Webhooks and exports: nothing at all unless the account has one; never fails or stalls this.
+    crate::features::event_recorded_in(&mut tx, db, ev.account_id, event_id, ev.profile_id, metric, source, ev.message_id, &ev.properties).await;
+    if has_flow || crate::features::wants_event(db, ev.account_id, metric).await {
+        crate::jobs::enqueue(&mut *tx, "flow_event", json!({"event_id": event_id}), None).await?;
     }
+    tx.commit().await?;
     Ok(Some(event_id))
 }
 
@@ -314,8 +383,20 @@ pub async fn add_to_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_i
     .await?;
     if !added.is_empty() {
         crate::jobs::enqueue(db, "flow_list", json!({"list_id": list_id, "profile_ids": added}), None).await?;
+        crate::features::webhooks::list_changed(db, account_id, list_id, &added, true).await;
     }
     Ok(added.len() as u64)
+}
+
+/// Remove profiles from a list (the caller has checked the list is the account's).
+pub async fn remove_from_list(db: &PgPool, account_id: Uuid, list_id: Uuid, profile_ids: &[Uuid]) -> AppResult<u64> {
+    const REMOVE: &str = "DELETE FROM list_members WHERE list_id = $1 AND profile_id = ANY($2)";
+    if !crate::features::webhooks::wants_list_changes(db, account_id, false) {
+        return Ok(sqlx::query(REMOVE).bind(list_id).bind(profile_ids).execute(db).await?.rows_affected());
+    }
+    let removed: Vec<Uuid> = sqlx::query_scalar(&format!("{REMOVE} RETURNING profile_id")).bind(list_id).bind(profile_ids).fetch_all(db).await?;
+    crate::features::webhooks::list_changed(db, account_id, list_id, &removed, false).await;
+    Ok(removed.len() as u64)
 }
 
 pub async fn list_belongs(db: &PgPool, account_id: Uuid, list_id: Uuid) -> AppResult<()> {

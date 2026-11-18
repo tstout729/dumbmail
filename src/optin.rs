@@ -323,7 +323,16 @@ pub async fn confirm(state: &AppState, id: Uuid) -> AppResult<Confirmed> {
     .fetch_optional(&state.db)
     .await?;
     let Some((account_id, profile_id, list_id, mut props)) = row else { return status(state, id).await };
-    sqlx::query("UPDATE profiles SET email_consent = 'subscribed', updated_at = now() WHERE id = $1").bind(profile_id).execute(&state.db).await?;
+    let before: Option<String> = sqlx::query_scalar(
+        "UPDATE profiles p SET email_consent = 'subscribed', updated_at = now() FROM (SELECT id, email_consent FROM profiles WHERE id = $1 FOR UPDATE) old
+         WHERE p.id = old.id RETURNING old.email_consent",
+    )
+    .bind(profile_id)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some(before) = before {
+        crate::features::webhooks::consent_changed(&state.db, account_id, profile_id, "email", &before, "subscribed", "double_opt_in", None).await;
+    }
     // Waiting confirmations for the same address are done too.
     sqlx::query("UPDATE optin_confirmations SET confirmed_at = now() WHERE profile_id = $1 AND list_id = $2 AND confirmed_at IS NULL")
         .bind(profile_id)
