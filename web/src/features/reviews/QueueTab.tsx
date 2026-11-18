@@ -25,6 +25,9 @@ export function QueueTab() {
   const canManage = useCan("reviews.manage");
   const canDelete = useCan("catalog.delete");
   const canExport = useCan("export");
+  const canManageExports = useCan("exports.manage");
+  const canReadProfiles = useCan("profiles.read");
+  const canExportPeople = canManageExports && canReadProfiles;
   const [view, setView] = useState<View>("pending");
   const [rating, setRating] = useState("");
   const [verified, setVerified] = useState("");
@@ -134,6 +137,11 @@ export function QueueTab() {
             {canExport ? (
               <Button icon={<Download className="size-3.5" />} onClick={() => exportReviews(filters).catch((e: Error) => toast.error(e.message))}>
                 Export CSV
+              </Button>
+            ) : null}
+            {canExport && canExportPeople ? (
+              <Button variant="ghost" icon={<Download className="size-3.5" />} onClick={() => exportReviews(filters, true).catch((e: Error) => toast.error(e.message))}>
+                With reviewers' emails
               </Button>
             ) : null}
           </div>
@@ -283,7 +291,7 @@ function ReviewCard({ r, timeZone, canManage, canDelete, selected, onSelect }: {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Stars value={r.rating} />
             <ReviewStatusBadge status={r.status} awaitingConfirmation={r.awaiting_confirmation} />
-            {r.verified ? <Badge tone="green">Verified buyer</Badge> : <Badge>Not verified</Badge>}
+            {r.verified ? <Badge tone="green">Verified buyer</Badge> : r.verified_by_source ? <Badge tone="blue">Marked verified by the source</Badge> : <Badge>Not verified</Badge>}
             {r.imported ? <Badge tone="blue">Imported</Badge> : null}
             {r.source === "public" ? <Badge>From your site</Badge> : null}
             {r.incentivized ? <Badge tone="violet">Got a discount</Badge> : null}

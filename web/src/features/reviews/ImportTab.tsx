@@ -32,7 +32,7 @@ export function ImportTab() {
     <div className="space-y-4">
       {canImport ? <ImportCard /> : <Notice tone="gray" title="Importing reviews needs an Admin or Owner" />}
       <Card title="Export">
-        <p className="text-sm text-zinc-600">Download every review as a CSV file: product, rating, text, name, date, status and, if you can see profiles, the reviewer's email.</p>
+        <p className="text-sm text-zinc-600">Download every review as a CSV file: product, rating, text, name, date and status. Admins and Owners can add the reviewer's email from the Reviews tab.</p>
         <div className="mt-3">
           <Button icon={<Download className="size-3.5" />} disabled={!canExport} onClick={() => exportReviews({}).catch((e: Error) => toast.error(e.message))}>
             Export all reviews
@@ -96,7 +96,7 @@ function ImportCard() {
   return (
     <Card title="Import reviews">
       <div className="space-y-4">
-        <p className="text-sm text-zinc-600">Bring in reviews from another app's CSV export. You'll see how the columns match before anything is imported. Imported reviews keep their date, name and verified mark, and are labelled "Imported" here.</p>
+        <p className="text-sm text-zinc-600">Bring in reviews from another app's CSV export. You'll see how the columns match before anything is imported. Imported reviews keep their date and name, are labelled "Imported" here, and never get the public "Verified buyer" badge (the source's own mark shows here only).</p>
         <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 shadow-xs hover:bg-zinc-50">
           <Upload className="size-3.5" />
           {fileName ? `Change file (${fileName})` : "Choose a CSV file"}

@@ -71,6 +71,7 @@ function SettingsForm({ s }: { s: ReviewSettings }) {
       questions: d.questions.map((q) => (q.kind === "choice" ? q : { id: q.id, label: q.label, kind: "text" })),
       public_reviews: d.public_reviews,
       request_days: d.request_days,
+      purchase_metrics: d.purchase_metrics,
       thank_you_coupon: d.thank_you_coupon || null,
       subscribe_form_id: d.subscribe_form_id || null,
       widget: Object.fromEntries(Object.entries(d.widget).filter(([, v]) => v !== "" && v !== undefined)),
@@ -101,7 +102,10 @@ function SettingsForm({ s }: { s: ReviewSettings }) {
           <Notice tone="gray" title="Held reviews still need a fair decision">
             {s.honesty}
           </Notice>
-          <Field label="Also hold reviews that mention" hint="Profanity, email addresses, phone numbers and links are always held.">
+          <Field label="Also count as a purchase or stay" hint="Placed Order, Fulfilled Order, Delivered and your integrations' bookings already do. Only these, recorded by your systems, make a review verified.">
+            <TagInput value={d.purchase_metrics} onChange={(v) => set({ purchase_metrics: v })} placeholder="e.g. Reservation Confirmed" aria-label="Purchase metrics" />
+          </Field>
+          <Field label="Also hold reviews that mention" hint="Profanity, email addresses, phone numbers and links are always held, in the review, the name and the answers.">
             <TagInput value={d.flag_words} onChange={(v) => set({ flag_words: v })} placeholder="Type a word and press Enter" aria-label="Flag words" />
           </Field>
         </div>

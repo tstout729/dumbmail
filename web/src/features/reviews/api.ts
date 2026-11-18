@@ -44,8 +44,9 @@ export const reviewsApi = {
   createFlow: (kind: "order" | "stay") => api<{ id: string; name: string; note: string }>("POST", "/api/reviews/flows", { kind }),
 };
 
-export function exportReviews(q: ReviewQuery) {
-  return downloadCsv(withQuery("/api/reviews/export", q as Query), undefined, "reviews.csv");
+/** `withPeople` adds reviewers' emails (Admins and Owners only). */
+export function exportReviews(q: ReviewQuery, withPeople = false) {
+  return downloadCsv(withQuery("/api/reviews/export", { ...(q as Query), with_people: withPeople || undefined }), undefined, "reviews.csv");
 }
 
 export function useReviews(q: ReviewQuery) {

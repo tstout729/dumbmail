@@ -19,6 +19,8 @@ export type Review = {
   recommend: boolean | null;
   answers: ReviewAnswer[];
   verified: boolean;
+  /** Imports: the source marked it verified (never shown publicly as a badge). */
+  verified_by_source: boolean;
   source: ReviewSource;
   imported: boolean;
   incentivized: boolean;
@@ -72,6 +74,7 @@ export type ReviewSettings = {
   thank_you_coupon: string | null;
   subscribe_form_id: string | null;
   widget: WidgetSettings;
+  purchase_metrics: string[];
   reject_reasons: RejectReason[];
   honesty: string;
 };
