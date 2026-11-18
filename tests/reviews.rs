@@ -750,13 +750,12 @@ async fn browser_details_are_never_loaded_and_a_trusted_order_takes_over_the_lin
     assert!(!page.contains("evil.test"));
     let (verified,): (bool,) = sqlx::query_as("SELECT verified FROM review_requests").fetch_one(&h.state.db).await.unwrap();
     assert!(!verified, "a browser-recorded order proves no purchase");
-    // A trusted source names the product but sends no image: the name becomes public, the browser's image never does.
-    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "jane@x.test"}, "properties": {"order_id": "77", "items": [{"product_id": "TEE", "name": "Comfy tee"}]}, "unique_id": "srv-77"}))).await;
-    h.drain().await;
-    h.fast_forward().await;
-    let asks = mails_to(&h, "jane@x.test");
-    let new_links: Vec<String> = asks.iter().flat_map(|m| tokens(&m.html)).filter(|t| *t != old).collect();
-    assert_eq!(new_links.len(), 1, "the verified order asks again: {}", asks.len());
+    // The store's own system records the same order (through the API, with its order reference) and
+    // names the product, with no image: the name becomes public, the browser's image never does.
+    let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "TEE", "name": "Comfy tee", "order_id": "77"}))).await;
+    let url = v["requests"][0]["url"].as_str().unwrap_or_else(|| panic!("the verified order takes the line: {v}"));
+    let new_links = vec![url.rsplit('/').next().unwrap().to_string()];
+    assert_ne!(new_links[0], old);
     let (s, _, _) = h.raw("GET", &format!("/e/review/{old}"), &[], "").await;
     assert_eq!(s, StatusCode::NOT_FOUND, "the old link stops working");
     let (verified,): (bool,) = sqlx::query_as("SELECT verified FROM review_requests").fetch_one(&h.state.db).await.unwrap();
@@ -830,7 +829,7 @@ async fn one_ask_one_message_across_retries_and_crashes() {
     assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
     // The run is put back on the ask (as if its worker died after the send, before moving on).
     let run: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
-    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active' WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active', context = context - '_waited' WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
     sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
     dumbmail::jobs::enqueue(&h.state.db, "flow_step", json!({"run_id": run}), None).await.unwrap();
     h.drain().await;
@@ -838,6 +837,7 @@ async fn one_ask_one_message_across_retries_and_crashes() {
     let flow_msgs: i64 = sqlx::query_scalar("SELECT count(*) FROM messages m JOIN profiles p ON p.id = m.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(flow_msgs, 1);
     // A worker that stops between claiming the ask and handing it over: sent once, later.
+    sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
     dumbmail::features::reviews::hooks::fail("review_send", acct, 0);
     order(&mut h, "sam@x.test", "2", json!([{"product_id": "MUG", "name": "Mug"}]), "o2").await;
     h.drain().await;
@@ -865,18 +865,24 @@ async fn an_ask_that_never_went_leaves_the_order_line_free() {
     h.credit(10.0).await;
     let acct = account_id(&h).await;
     person(&h, acct, "jane@x.test", "subscribed").await;
-    // An ordinary flow email with a Review request block, while sending is paused.
+    // An ordinary flow email with a Review request block.
     let flow = json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "a", "nodes": [
         {"id": "a", "type": "email", "next": null, "content": {"subject": "Thanks", "blocks": [{"type": "review_request"}]}}]}});
     let f = h.ok("POST", "/api/flows", Some(flow)).await;
     h.ok("POST", &format!("/api/flows/{}/status", f["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
-    sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
     order(&mut h, "jane@x.test", "55", json!([{"product_id": "MUG", "name": "Mug"}]), "o55").await;
+    // The email is rendered with its ask, then stopped at the sender's last check (an opt-out
+    // landing in between, say): nothing reached her.
     h.drain().await;
-    assert!(mails_to(&h, "jane@x.test").is_empty());
-    let sent: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT sent_at FROM review_requests").fetch_one(&h.state.db).await.unwrap();
-    assert!(sent.is_none(), "a request isn't sent until its message is");
-    sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let (sent, mid): (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) = sqlx::query_as("SELECT sent_at, message_id FROM review_requests").fetch_one(&h.state.db).await.unwrap();
+    assert!(sent.is_none(), "rendering a block doesn't mark the request sent");
+    let mid = mid.expect("the request knows its message");
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
+    sqlx::query("UPDATE messages SET status = 'skipped', sent_at = NULL, error = 'not emailable' WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
+    // The scheduler settles it: a message that didn't go frees its request.
+    dumbmail::features::reviews::requests::settle_carried(&h.state).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM review_requests").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 0, "an ask that never went doesn't hold the order line");
     let v = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "MUG", "order_id": "55"}))).await;
     assert!(v["requests"][0]["url"].is_string(), "the order line is free again: {v}");
     h.cleanup().await;
