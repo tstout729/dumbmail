@@ -28,7 +28,14 @@ can't test them. Integration test runs and dry runs show them as `(hidden)`, and
 private value would change. Sending access details such as door codes needs a dedicated, separately
 authorised delivery that doesn't exist yet, so keep them out of messages (and out of objects if you
 can). A sensitive field taken off a type stays sensitive: its stored values and history are
-deleted in the background, and a later field with the same name is sensitive again.
+deleted in the background, and a later field with the same name is sensitive again. Saving a type
+with a sensitive field marked `sensitive: false` leaves it sensitive. To make it an ordinary field,
+send `unmark_sensitive: ["door_code"]` with `confirm: true` (and the field's enum options, if any):
+its stored values and history are deleted first, so nothing private becomes visible.
+
+A segment, trigger filter or report that tests a field which is now sensitive (or gone) stops
+matching anyone as a whole. So "not in segment X" matches nobody when X's rule can't be tested,
+never everyone.
 
 A type is also made the first time an object of it is upserted, with each field's type guessed from
 its first value (`2026-12-01` is a date, `true` a boolean, `4` a number, other text is text). A new
@@ -74,7 +81,10 @@ Upsert by type and `external_id` (the object's id in your system):
   "value": {"field": "$as_of"}}` holds only when the payment evidence is at least as new as the
   object's last version (`$as_of`).
 - `as_of`: the change's time (or version number) in your system. An upsert older than the newest
-  one written is ignored, so a late message never undoes a newer one.
+  one written is ignored, so a late message never undoes a newer one. Times keep their full
+  precision (to the nanosecond). The same version again is a duplicate: its fields are ignored,
+  and it links only people the write that set that version named (once they're known), never
+  someone a later write unlinked.
 - Every change is recorded: what changed, from what to what, when and by whom (`api`, `mcp` or
   `integration:<id>`). Writing the same values again changes nothing and records nothing. History
   keeps the newest 100 changes per object, for up to a year.

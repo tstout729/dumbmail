@@ -244,7 +244,10 @@ OAuth2 tokens are cached (encrypted) and reused until five minutes before they e
 Every webhook, pull page and replay is a *delivery* with its time, source (`webhook`, `pull`, `replay`), status (`pending`, `ok`, `error`, `ignored`), error, what was written (counts and a line per action), duration and payload.
 
 - A webhook is checked, stored and queued in one step, and answered with 200 in milliseconds; the script runs right after in the background.
-- A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again.
+- A failed webhook delivery retries after 1, 5, 30 and 120 minutes (five tries), then stays failed. Failed pull pages aren't retried: the next scheduled pull fetches again. A page fetched again
+  before its progress was saved (after a crash or a failure) carries on with the earlier attempt's
+  record of what it already wrote, so those actions aren't applied twice: a delete it already made
+  never removes an object created since under the same id.
 - The first time a delivery's script runs successfully, its list of actions is kept with the delivery (missing `unique_id`s and `time`s filled in). A retry applies exactly that list; it never runs the script again, so a script whose output depends on the time can't record something twice. Each delivery also records which actions it already wrote, and a retry or replay skips those (`already_written` in the counts).
 - Nothing secret is stored or shown: every credential value, the access token, the encoded Basic value and anything else a request sent are masked wherever they appear (payloads, response headers such as `Link`, errors, the script's actions and logs, test results), including short ones (a PIN is masked where it stands as a whole word). The next-page request between pages is kept encrypted.
 - `replay_integration_deliveries` runs stored deliveries again with the current script: pick `delivery_ids`, or `all_failed: true` for every delivery that failed for good and hasn't been replayed (up to 500 at a time). Needs `confirm: true`. Replays count against the same limits as new webhooks.
