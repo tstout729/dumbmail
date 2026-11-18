@@ -36,6 +36,33 @@ pub fn is_code(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// How many references a message can choose from when its row is written (see `sending::send`).
+pub const REF_CANDIDATES: usize = 8;
+
+/// The references a message may take, in order of preference: the first one not already used in its
+/// account is written on its row. From the message's id, so a retried send picks the same ones. The
+/// tag doesn't cover the reference, so switching to a later candidate only changes those 6
+/// characters of the link.
+pub fn ref_candidates(secret: &str, message_id: Uuid) -> Vec<String> {
+    (0..REF_CANDIDATES)
+        .map(|i| {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+            mac.update(b"short-link-ref:v1|");
+            mac.update(message_id.simple().to_string().as_bytes());
+            mac.update(&[i as u8]);
+            let digest = mac.finalize().into_bytes();
+            let mut n = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"));
+            (0..REF_LEN)
+                .map(|_| {
+                    let c = ALPHABET[(n % 62) as usize] as char;
+                    n /= 62;
+                    c
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The tag for `target`, going to `url`, in message `message_id`.
 pub fn tag(secret: &str, target: &str, url: &str, message_id: Uuid) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");

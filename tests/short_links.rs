@@ -637,3 +637,37 @@ async fn a_relaunched_campaign_builds_its_links_afresh() {
     assert_eq!(click(&h, &old_path).await.1.as_deref(), Some("https://shop.test/old-offer"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_reference_already_used_in_the_account_is_never_written_twice() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    let (pid, phone) = texter(&mut h, &list, 8301).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/unique").await;
+    let cid: Uuid = id.parse().unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(cid).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
+    let mid: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+    // An older text in the account already holds this message's first choice of reference.
+    let refs = code::ref_candidates("test-secret", mid);
+    let older = Uuid::now_v7();
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, short_ref) VALUES ($1, $2, $3, 'sms', $4, 'sent', $5)")
+        .bind(older)
+        .bind(acct)
+        .bind(pid)
+        .bind(&phone)
+        .bind(&refs[0])
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    dumbmail::campaigns::send_batch(&h.state, cid, &[mid]).await.unwrap();
+    let written: Option<String> = sqlx::query_scalar("SELECT short_ref FROM messages WHERE id = $1").bind(mid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(written.as_deref(), Some(refs[1].as_str()), "the next free reference");
+    let body = body_to(&h, &phone);
+    let p = short_paths(&body);
+    assert_eq!(&p[0][code::TARGET_LEN..code::TARGET_LEN + code::REF_LEN], refs[1], "the text carries the reference its row got: {body}");
+    assert!(click(&h, &p[0]).await.0.is_redirection());
+    assert_eq!(clicks_of(&h, mid).await, (1, 1, true));
+    assert_eq!(clicks_of(&h, older).await, (0, 0, false));
+    h.cleanup().await;
+}

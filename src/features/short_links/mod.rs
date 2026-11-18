@@ -45,8 +45,9 @@ pub struct Module;
 
 /// The index clicks find a message by: the account and the message's reference. Built in the
 /// background after startup (`messages` is big); short links wait for it (see [`runtime`]).
+/// Unique, so a reference names one message in its account (the write picks a free one).
 pub const INDEXES: &[(&str, &str)] =
-    &[("messages_short_ref_idx", "CREATE INDEX CONCURRENTLY messages_short_ref_idx ON messages (account_id, short_ref) WHERE short_ref IS NOT NULL")];
+    &[("messages_short_ref_uq", "CREATE UNIQUE INDEX CONCURRENTLY messages_short_ref_uq ON messages (account_id, short_ref) WHERE short_ref IS NOT NULL")];
 const INDEX_LOCK: i64 = 0x0d4d_7368_6f72_746c;
 
 pub const JOB_CLEANUP: &str = "short_links_cleanup";
@@ -80,7 +81,7 @@ pub async fn ensure_index(state: &AppState) -> anyhow::Result<()> {
 const LOOKUP_SQL: &str = "SELECT t.url, m.id FROM short_link_targets t
      JOIN accounts a ON a.id = t.account_id AND a.closed_at IS NULL
      JOIN messages m ON m.account_id = t.account_id AND m.short_ref = $2 AND m.channel = 'sms'
-     WHERE t.code = $1 LIMIT 16";
+     WHERE t.code = $1 LIMIT 2";
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "link not found").into_response()

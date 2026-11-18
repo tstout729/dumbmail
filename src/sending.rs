@@ -347,7 +347,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         /// Message, provider, and whether that provider is the customer's own account (not billed).
         Sms(OutgoingSms, std::sync::Arc<dyn crate::providers::sms::SmsProvider>, bool),
     }
-    let (subject, rendered) = if spec.channel == "email" {
+    let (subject, mut rendered) = if spec.channel == "email" {
         let content: EmailContent = serde_json::from_value(content.into_owned())?;
         let from_email = content
             .from_email
@@ -409,10 +409,14 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
     }
 
-    if spec.message_id.is_none() {
-        sqlx::query(
+    // A text with short links takes the first of its references not already used in the account
+    // (features::short_links); the text is written with the one it got.
+    let short_ref: Option<String> = if spec.message_id.is_none() {
+        sqlx::query_scalar(
             "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, short_ref)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, (SELECT c.r FROM unnest($12::text[]) WITH ORDINALITY AS c(r, i)
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
+             RETURNING short_ref",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -425,18 +429,27 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&subject)
         .bind(spec.is_test)
         .bind(&send_note)
-        .bind(short_links.as_ref().map(|s| s.message_ref()))
-        .execute(&state.db)
-        .await?;
+        .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+        .fetch_one(&state.db)
+        .await?
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), short_ref = $5 WHERE id = $1")
-            .bind(message_id)
-            .bind(&subject)
-            .bind(&to)
-            .bind(&send_note)
-            .bind(short_links.as_ref().map(|s| s.message_ref()))
-            .execute(&state.db)
-            .await?;
+        sqlx::query_scalar(
+            "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note),
+                short_ref = (SELECT c.r FROM unnest($5::text[]) WITH ORDINALITY AS c(r, i)
+                    WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
+             WHERE u.id = $1 RETURNING u.short_ref",
+        )
+        .bind(message_id)
+        .bind(&subject)
+        .bind(&to)
+        .bind(&send_note)
+        .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+        .fetch_one(&state.db)
+        .await?
+    };
+    if let (Some(links), Rendered::Sms(s, _, _)) = (&short_links, &mut rendered) {
+        let chosen = short_ref.ok_or_else(|| AppError::Internal(anyhow::anyhow!("no free short link reference for this text")))?;
+        s.body = links.with_ref(&s.body, &chosen);
     }
 
     match &rendered {

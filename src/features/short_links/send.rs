@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::code::{self, PATH_LEN, REF_LEN, TARGET_LEN};
+use super::code::{self, PATH_LEN, TARGET_LEN};
 use super::runtime;
 use crate::error::AppResult;
 use crate::models::Account;
@@ -131,7 +131,8 @@ fn destinations(links: Vec<String>, hook: Option<&dyn LinkHook>) -> Vec<(String,
 
 /// The short links of one text.
 pub struct TextLinks {
-    message_ref: String,
+    /// The references the message may take; its links are written with the first.
+    refs: Vec<String>,
     /// Link as written → its short link.
     links: HashMap<String, String>,
     issued: HashSet<String>,
@@ -139,9 +140,25 @@ pub struct TextLinks {
 }
 
 impl TextLinks {
-    /// The message's reference, written on its row.
-    pub fn message_ref(&self) -> &str {
-        &self.message_ref
+    /// The references the message may take, in order: the statement that writes its row picks the
+    /// first one not already used in its account.
+    pub fn ref_candidates(&self) -> &[String] {
+        &self.refs
+    }
+
+    /// `body`, rendered with the first candidate, with the reference the row actually got.
+    pub fn with_ref(&self, body: &str, chosen: &str) -> String {
+        if chosen == self.refs[0] {
+            return body.to_string();
+        }
+        let mut out = body.to_string();
+        for link in &self.issued {
+            // `.../s/<target><ref><tag>`: only the reference changes.
+            let at = link.len() - code::TAG_LEN - code::REF_LEN;
+            let rekeyed = format!("{}{chosen}{}", &link[..at], &link[at + code::REF_LEN..]);
+            out = out.replace(link.as_str(), &rekeyed);
+        }
+        out
     }
 }
 
@@ -177,7 +194,8 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
         let mut conn = state.db.acquire().await?;
         ensure_targets(&mut conn, spec.account.id, &urls).await?
     };
-    let message_ref = code::random(REF_LEN);
+    let refs = code::ref_candidates(&state.cfg.secret_key, message_id);
+    let message_ref = refs[0].clone();
     let base = link_base.trim_end_matches('/');
     let links: HashMap<String, String> = dests
         .into_iter()
@@ -187,7 +205,7 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
         return Ok(None);
     }
     let issued = links.values().cloned().collect();
-    Ok(Some(TextLinks { message_ref, links, issued, own }))
+    Ok(Some(TextLinks { refs, links, issued, own }))
 }
 
 /// The targets riding on a campaign's content (codes checked again: content can be typed by hand).
