@@ -3,6 +3,8 @@
 //! Not built yet. Everything this feature needs (routes, MCP tools and docs, jobs, scheduler
 //! work) goes in this file, or in a `push/` folder replacing it, through the `Feature` trait.
 
+pub mod crypto;
+
 use super::Feature;
 
 pub struct Module;
