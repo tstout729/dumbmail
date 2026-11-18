@@ -788,23 +788,40 @@ pub async fn freeze_campaign(state: &AppState, db: &mut PgConnection, c: &Campai
             ids.extend(content_refs(&v["content"]));
         }
     }
-    if ids.is_empty() {
+    // Language versions (see features::translations) are fixed with the rest of the content.
+    let versioned = c.content.get("translations").is_some() || ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).is_some_and(|vs| vs.iter().any(|v| v["content"].get("translations").is_some()));
+    if ids.is_empty() && !versioned {
         return Ok(None);
     }
     ids.sort();
     ids.dedup();
-    let rows: Vec<(Uuid, String, Value)> = sqlx::query_as("SELECT id, name, blocks FROM saved_blocks WHERE account_id = $1 AND id = ANY($2)")
-        .bind(c.account_id)
-        .bind(&ids)
-        .fetch_all(&mut *db)
-        .await?;
+    let rows: Vec<(Uuid, String, Value)> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as("SELECT id, name, blocks FROM saved_blocks WHERE account_id = $1 AND id = ANY($2)").bind(c.account_id).bind(&ids).fetch_all(&mut *db).await?
+    };
     let saved: SavedMap = rows.into_iter().map(|(id, n, b)| (id, (n, b))).collect();
-    let content = freeze_with(&c.content, &saved);
+    let mut content = freeze_with(&c.content, &saved);
     let mut ab_changed = false;
     if let Some(variants) = ab.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
         for v in variants {
             if let Some(next) = freeze_with(&v["content"], &saved) {
                 v["content"] = next;
+                ab_changed = true;
+            }
+        }
+    }
+    // The footer wording each language needs, fixed for this send, so a later edit can't change
+    // what the rest of this campaign's recipients get.
+    let mut all: Vec<&Value> = vec![content.as_ref().unwrap_or(&c.content)];
+    all.extend(ab.as_ref().and_then(|t| t.get("variants")).and_then(|v| v.as_array()).into_iter().flatten().map(|v| &v["content"]));
+    if let Some(sys) = crate::features::translations::system_snapshot(&mut *db, &state.cfg.secret_key, c.account_id, &all).await? {
+        let mut next = content.unwrap_or_else(|| c.content.clone());
+        next["_system"] = sys.clone();
+        content = Some(next);
+        if let Some(variants) = ab.as_mut().and_then(|t| t.get_mut("variants")).and_then(|v| v.as_array_mut()) {
+            for v in variants {
+                v["content"]["_system"] = sys.clone();
                 ab_changed = true;
             }
         }
@@ -863,6 +880,10 @@ pub fn relink(content: &Value) -> Value {
     let mut out = content.clone();
     if let Some(list) = out.get_mut("blocks").and_then(|b| b.as_array_mut()) {
         walk(list);
+    }
+    // The copy gets its own footer wording when it's sent (see features::translations).
+    if let Some(o) = out.as_object_mut() {
+        o.remove("_system");
     }
     out
 }

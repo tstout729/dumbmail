@@ -613,7 +613,7 @@ pub fn check_saved(content: &Value) -> AppResult<()> {
 // ---------- Choosing and applying a version ----------
 
 /// Keys the content prepare step computes (see `features::content::prepare`); content can't set them.
-pub const COMPUTED: [&str; 3] = ["_lang", "_footer", "_own_unsubscribe"];
+pub const COMPUTED: [&str; 4] = ["_lang", "_footer", "_own_unsubscribe", "_system"];
 
 /// Whether the content prepare step has language work to do for `content` (see [`choose`]).
 pub fn has_versions(content: &Value) -> bool {

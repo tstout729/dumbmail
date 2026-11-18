@@ -73,9 +73,78 @@ pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx
     let Some(lang) = fields::choose(content, &extra, &account_default, person, pin().as_deref()) else { return Ok(None) };
     let mut out = fields::localize(content, &lang, &own_hosts(state, Some(account)));
     if !lang.is_empty() {
-        out["_footer"] = texts::footer(&state.db, account.id, &lang).await;
+        // A campaign's wording was fixed when its send started; anything else uses the account's
+        // current wording (cached, refreshed off the send path).
+        out["_footer"] = match snapshot_footer(&state.cfg.secret_key, account.id, content, &lang) {
+            Some(f) => f,
+            None => texts::footer(&state.db, account.id, &lang).await,
+        };
     }
     Ok(Some((out, lang)))
+}
+
+/// The languages a message can go out in: its default and versions, and its saved blocks'.
+fn content_languages(content: &Value, out: &mut Vec<String>) -> bool {
+    let (default, langs) = fields::languages(content);
+    let versioned = content.get("translations").is_some_and(|t| t.is_object());
+    let saved = fields::saved_block_languages(content);
+    if !versioned && saved.is_empty() {
+        return false;
+    }
+    for l in default.into_iter().chain(langs).chain(saved) {
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    }
+    true
+}
+
+/// The signature over an account's footer snapshot (language, reason, unsubscribe label, sorted).
+fn snapshot_sig(secret: &str, account_id: Uuid, footer: &Value) -> String {
+    let mut lines: Vec<String> = footer
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(l, f)| format!("{l}\t{}\t{}", f["reason"].as_str().unwrap_or(""), f["unsubscribe"].as_str().unwrap_or("")))
+        .collect();
+    lines.sort();
+    let signed = crate::auth::sign(secret, &format!("system:{account_id}:{}", lines.join("\n")));
+    signed.rsplit('.').next().unwrap_or_default().to_string()
+}
+
+/// The footer lines in `lang` from a campaign's snapshot, when the content carries a genuine one.
+fn snapshot_footer(secret: &str, account_id: Uuid, content: &Value, lang: &str) -> Option<Value> {
+    let sys = content.get("_system")?;
+    let footer = sys.get("footer")?;
+    if sys.get("sig").and_then(|s| s.as_str()) != Some(snapshot_sig(secret, account_id, footer).as_str()) {
+        return None;
+    }
+    footer.get(lang).cloned()
+}
+
+/// When a campaign's send starts (inside the transaction that locks it, on its connection): the
+/// footer wording each language the campaign can go out in needs, fixed for the rest of this send,
+/// as `_system` for each version's content. None when no version has language versions (then
+/// nothing is read).
+pub async fn system_snapshot(conn: &mut sqlx::PgConnection, secret: &str, account_id: Uuid, contents: &[&Value]) -> sqlx::Result<Option<Value>> {
+    let mut langs = Vec::new();
+    let mut any = false;
+    for c in contents {
+        any |= content_languages(c, &mut langs);
+    }
+    if !any {
+        return Ok(None);
+    }
+    let s = texts::load(conn, account_id).await?;
+    for l in s.all() {
+        if !langs.contains(&l) {
+            langs.push(l);
+        }
+    }
+    let footer: Map<String, Value> = langs.iter().map(|l| (l.clone(), texts::footer_in(&s, l))).collect();
+    let footer = Value::Object(footer);
+    let sig = snapshot_sig(secret, account_id, &footer);
+    Ok(Some(json!({"footer": footer, "sig": sig})))
 }
 
 /// The languages the saved blocks an email points at carry.

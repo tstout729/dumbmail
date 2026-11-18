@@ -304,19 +304,19 @@ pub fn forget(account_id: Uuid) {
     }
 }
 
-/// The account's settings, from the cache when fresh.
-pub async fn settings(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
-    if let Ok(c) = CACHE.lock() {
-        if let Some((at, s)) = c.get(&account_id) {
-            if at.elapsed() < Duration::from_secs(CACHE_SECS) {
-                return Ok(s.clone());
-            }
-        }
-    }
-    let row: Option<(String, Vec<String>)> = sqlx::query_as("SELECT default_language, languages FROM account_languages WHERE account_id = $1").bind(account_id).fetch_optional(db).await?;
-    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT language, key, text FROM system_texts WHERE account_id = $1 LIMIT 2000").bind(account_id).fetch_all(db).await?;
+static REFRESHING: Lazy<Mutex<std::collections::HashSet<Uuid>>> = Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Read an account's settings (two statements) on `conn`.
+pub async fn load(conn: &mut sqlx::PgConnection, account_id: Uuid) -> sqlx::Result<Settings> {
+    let row: Option<(String, Vec<String>)> = sqlx::query_as("SELECT default_language, languages FROM account_languages WHERE account_id = $1").bind(account_id).fetch_optional(&mut *conn).await?;
+    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT language, key, text FROM system_texts WHERE account_id = $1 LIMIT 2000").bind(account_id).fetch_all(&mut *conn).await?;
     let (default_language, languages) = row.unwrap_or_else(|| ("en".into(), Vec::new()));
-    let s = Settings { default_language, languages, texts: rows.into_iter().map(|(l, k, t)| ((l, k), t)).collect() };
+    Ok(Settings { default_language, languages, texts: rows.into_iter().map(|(l, k, t)| ((l, k), t)).collect() })
+}
+
+async fn load_and_cache(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
+    let mut conn = db.acquire().await?;
+    let s = load(&mut conn, account_id).await?;
     if let Ok(mut c) = CACHE.lock() {
         if c.len() > 10_000 {
             c.clear();
@@ -324,6 +324,30 @@ pub async fn settings(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
         c.insert(account_id, (Instant::now(), s.clone()));
     }
     Ok(s)
+}
+
+/// The account's settings from the cache. An entry older than [`CACHE_SECS`] is still used and
+/// refreshed in the background, so sends never wait on it; only the first use on a server reads
+/// it in line.
+pub async fn settings(db: &PgPool, account_id: Uuid) -> sqlx::Result<Settings> {
+    let cached = CACHE.lock().ok().and_then(|c| c.get(&account_id).cloned());
+    match cached {
+        Some((at, s)) => {
+            if at.elapsed() >= Duration::from_secs(CACHE_SECS) && REFRESHING.lock().is_ok_and(|mut r| r.insert(account_id)) {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = load_and_cache(&db, account_id).await {
+                        tracing::warn!(account = %account_id, error = %e, "couldn't refresh language settings");
+                    }
+                    if let Ok(mut r) = REFRESHING.lock() {
+                        r.remove(&account_id);
+                    }
+                });
+            }
+            Ok(s)
+        }
+        None => load_and_cache(db, account_id).await,
+    }
 }
 
 /// System texts in one language.
@@ -426,7 +450,12 @@ pub async fn for_profile(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> Tex
 /// The footer lines for an email sent in `lang`, as the content prepare step stores them (`_footer`).
 pub async fn footer(db: &PgPool, account_id: Uuid, lang: &str) -> Value {
     let s = settings(db, account_id).await.unwrap_or_default();
-    let t = Texts::for_lang(&s, lang);
+    footer_in(&s, lang)
+}
+
+/// The footer lines in `lang` from settings already read.
+pub fn footer_in(s: &Settings, lang: &str) -> Value {
+    let t = Texts::for_lang(s, lang);
     json!({"reason": t.get("footer.reason", ""), "unsubscribe": t.get("footer.unsubscribe", "")})
 }
 

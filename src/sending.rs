@@ -302,7 +302,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
         return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
     };
-    // The language version picked for this person (see features::translations), for reports.
+    // The language version picked for this person (see features::translations), kept on the message
+    // row for reports (written with the row, below).
     let language = prepared.get("_lang").and_then(|l| l.as_str()).filter(|l| !l.is_empty()).map(str::to_string);
     // Unique coupon codes are claimed here, after the checks above and just before rendering, for the
     // coupons the prepared content shows; a code stays the person's if a later check skips or defers
@@ -393,8 +394,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
 
     if spec.message_id.is_none() {
         sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(message_id)
         .bind(spec.account.id)
@@ -407,20 +408,18 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         .bind(&subject)
         .bind(spec.is_test)
         .bind(&send_note)
+        .bind(&language)
         .execute(&state.db)
         .await?;
     } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note) WHERE id = $1")
+        sqlx::query("UPDATE messages SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language) WHERE id = $1")
             .bind(message_id)
             .bind(&subject)
             .bind(&to)
             .bind(&send_note)
+            .bind(&language)
             .execute(&state.db)
             .await?;
-    }
-
-    if let Some(lang) = &language {
-        sqlx::query("UPDATE messages SET language = $2 WHERE id = $1").bind(message_id).bind(lang).execute(&state.db).await?;
     }
 
     match &rendered {

@@ -854,3 +854,83 @@ async fn translations_inside_a_saved_block_are_used_on_their_own() {
     assert!(m.html.contains("À bientôt"), "{}", m.html);
     h.cleanup().await;
 }
+
+// ---------- Statements per recipient ----------
+
+#[derive(Clone, Default)]
+struct Counter {
+    n: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counter {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Statements run by sending campaign `cid` to everyone in its audience (start and every recipient).
+async fn send_statements(h: &mut Harness, cid: &str) -> usize {
+    use tracing_subscriber::layer::SubscriberExt;
+    let c = Counter::default();
+    let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(c.clone()));
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    h.drain().await;
+    drop(guard);
+    c.n.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A new campaign with `content` to `list`, sent; the statements it took.
+async fn campaign_statements(h: &mut Harness, content: &Value, list: &str) -> usize {
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": format!("C{}", Uuid::now_v7().simple()), "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+    send_statements(h, c["id"].as_str().unwrap()).await
+}
+
+#[tokio::test]
+async fn translations_cost_no_statements_per_recipient_and_a_campaign_keeps_one_wording() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    set_languages(&mut h, json!(["fr"])).await;
+    let mut people = Vec::new();
+    for i in 0..6 {
+        people.push(person(&mut h, &format!("p{i}@x.test"), Some("fr")).await);
+    }
+    let two = list_of(&mut h, &people[..2]).await;
+    let six = list_of(&mut h, &people).await;
+    let plain = json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "News"}]});
+    let mut translated = plain.clone();
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": translated, "language": "fr", "strings": [{"id": "subject", "text": "Salut"}, {"id": "b0:text", "text": "Nouvelles"}]}))).await;
+    translated = v["content"].clone();
+    // Warm everything up once (caches, prepared statements).
+    campaign_statements(&mut h, &translated, &two).await;
+    campaign_statements(&mut h, &plain, &two).await;
+    let (p2, p6) = (campaign_statements(&mut h, &plain, &two).await, campaign_statements(&mut h, &plain, &six).await);
+    let (t2, t6) = (campaign_statements(&mut h, &translated, &two).await, campaign_statements(&mut h, &translated, &six).await);
+    assert_eq!(t6 - t2, p6 - p2, "per recipient: translated {} vs plain {} statements for 4 more people", t6 - t2, p6 - p2);
+    let langs: Vec<Option<String>> = sqlx::query_scalar("SELECT DISTINCT language FROM messages WHERE subject = 'Salut'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(langs, vec![Some("fr".to_string())], "the language is written with the message");
+
+    // The footer's wording is fixed when the send starts: a change halfway doesn't reach the rest.
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Fixed", "audience": {"include": [{"type": "list", "id": six}]}, "content": translated}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    // The send starts (the content is frozen and the batches queued), then the wording changes.
+    assert!(dumbmail::jobs::run_one(&h.state).await.unwrap());
+    let frozen = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert!(frozen["content"]["_system"]["footer"]["fr"].is_object(), "{}", frozen["content"]);
+    h.ok("PUT", "/api/translations/system-texts", Some(json!({"language": "fr", "texts": {"footer.unsubscribe": "Plus de messages"}}))).await;
+    h.drain().await;
+    let mine: Vec<String> = sqlx::query_scalar("SELECT id::text FROM messages WHERE campaign_id = $1::uuid").bind(&cid).fetch_all(&h.state.db).await.unwrap();
+    let sent: Vec<_> = h.state.email.sent().into_iter().filter(|m| mine.contains(&m.message_id.to_string())).collect();
+    assert_eq!(sent.len(), 6);
+    assert!(sent.iter().all(|m| m.html.contains(">Se désabonner</a>") && !m.html.contains("Plus de messages")));
+
+    // Content can't bring its own wording: a forged snapshot is ignored.
+    let mut forged = translated.clone();
+    forged["_system"] = json!({"footer": {"fr": {"reason": "FORGED", "unsubscribe": "FORGED"}}, "sig": "x"});
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": forged, "language": "fr"}))).await;
+    assert!(!p["html"].as_str().unwrap().contains("FORGED") && p["html"].as_str().unwrap().contains("Plus de messages"));
+    h.cleanup().await;
+}
