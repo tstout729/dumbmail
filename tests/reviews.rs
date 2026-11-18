@@ -1488,3 +1488,37 @@ async fn a_reminder_isnt_lost_on_resume() {
     assert_eq!(mails_to(&h, "sam@x.test").len(), 2, "and its reminder went too");
     h.cleanup().await;
 }
+
+/// Round 3, item 4: a catalog product's image and address are trusted only when the catalog got
+/// them from a trusted source; a product learned from browser events keeps them untrusted, even
+/// once the catalog has verified it (its name is trusted then).
+#[tokio::test]
+async fn catalog_links_and_images_need_a_trusted_source() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    sqlx::query(
+        "INSERT INTO catalog_products (id, account_id, external_id, title, url, image_url, source, verified, verified_at)
+         VALUES ($1, $2, 'LEARNED', 'Learned tee', 'https://acme.test/products/tee?ref=evil', 'https://acme.test/i/tee.png', 'events', true, now())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(acct)
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    product(&mut h, "FED", "Fed mug").await;
+    for key in ["LEARNED", "FED"] {
+        h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": key, "order_id": format!("O-{key}")}))).await;
+    }
+    let trust = |key: &'static str| {
+        let db = h.state.db.clone();
+        async move {
+            let t: (bool, bool, bool) = sqlx::query_as("SELECT name_trusted, image_trusted, url_trusted FROM review_subjects WHERE external_id = $1").bind(key).fetch_one(&db).await.unwrap();
+            t
+        }
+    };
+    assert_eq!(trust("LEARNED").await, (true, false, false), "browser-learned: the verified name only");
+    assert_eq!(trust("FED").await, (true, true, true), "from the API: all three");
+    h.cleanup().await;
+}
