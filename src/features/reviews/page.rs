@@ -364,7 +364,8 @@ fn written(s: &store::Settings, b: &SubmitBody, default_name: &str) -> AppResult
 async fn save(state: &AppState, account: &Account, r: &Request, existing: Option<&Review>, b: &SubmitBody) -> AppResult<Value> {
     let s = store::settings(&state.db, account.id).await?;
     let person = profile(state, r.profile_id).await?.ok_or_else(|| AppError::not_found("review link"))?;
-    let w = written(&s, b, &store::default_name(person.first_name.as_deref(), person.last_name.as_deref()))?;
+    let stay = store::subject_by_id(&state.db, r.subject_id).await.is_ok_and(|s| s.kind == "listing");
+    let w = written(&s, b, store::default_name(r.verified, stay))?;
     let photo_ids: Vec<Uuid> = b.photos.clone().unwrap_or_default().into_iter().take(photos::MAX_PER_REVIEW as usize).collect();
     let publish = store::auto_publishes(&s, r.verified, w.rating, &w.flags);
     let mut tx = state.db.begin().await?;

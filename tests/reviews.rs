@@ -152,7 +152,7 @@ async fn the_flow_asks_once_and_a_verified_review_goes_live() {
     assert_eq!(other["summary"]["count"], 0);
     let r = &w["reviews"][0];
     assert_eq!(r["verified"], true);
-    assert_eq!(r["name"], "Jane D.");
+    assert_eq!(r["name"], "A verified buyer", "no name given: nothing from her profile");
     assert_eq!(r["title"], "Great <b>mug</b>", "stored as plain text; the widget escapes it");
     let raw = w.to_string();
     assert!(!raw.contains("jane@x.test") && !raw.contains(&jane.to_string()), "no email or profile id in public answers");
@@ -1577,5 +1577,27 @@ async fn verified_means_a_purchase_or_a_stay() {
     }
     let server_only: bool = sqlx::query_scalar("SELECT server_only FROM metrics WHERE account_id = $1 AND name = 'Inquiry Received'").bind(acct).fetch_one(&h.state.db).await.unwrap();
     assert!(server_only, "the inquiry is server-only, and still not a purchase");
+    h.cleanup().await;
+}
+
+/// Round 3, item 6: a review written with no name shows nothing from the person's profile.
+#[tokio::test]
+async fn no_name_from_the_profile() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_id(&h).await;
+    let pk = site_key(&h, acct).await;
+    product(&mut h, "MUG", "Blue mug").await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    let t = api_link(&mut h, "jane@x.test", "MUG", true).await;
+    let (s, v) = submit(&h, &t, json!({"rating": 5, "body": "Lovely"})).await;
+    assert!(s.is_success(), "{v}");
+    let stay = h.ok("POST", "/api/reviews/requests", Some(json!({"email": "jane@x.test", "product_id": "CABIN", "kind": "listing", "name": "The cabin", "order_id": "R-9"}))).await;
+    let t2 = stay["requests"][0]["url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    submit(&h, &t2, json!({"rating": 5})).await;
+    let names: Vec<(String, String)> = sqlx::query_as("SELECT s.external_id, r.display_name FROM reviews r JOIN review_subjects s ON s.id = r.subject_id ORDER BY s.external_id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(names, vec![("CABIN".to_string(), "A guest".to_string()), ("MUG".to_string(), "A verified buyer".to_string())]);
+    let w = widget(&h, &format!("/client/reviews?k={pk}&product_id=MUG")).await;
+    assert!(!w.to_string().contains("Jane"), "{w}");
     h.cleanup().await;
 }

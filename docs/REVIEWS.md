@@ -137,7 +137,8 @@ isn't sent at all.
   an unguessable id, only while their review is published. Removing a photo or unpublishing the
   review stops it being served; copies already cached by browsers or proxies can still show for up
   to five minutes.
-- Left empty, the name shown is first name and last initial ("Jane D.").
+- Left empty, the name shown is never taken from the person's profile: "A verified buyer" for a
+  verified purchase, "A guest" for a stay, otherwise "A customer".
 - A review never subscribes anyone. If you pick a sign-up form (`subscribe_form_id`), the page offers
   an unticked box; ticking it signs them up through that form, with its list's double opt-in if it
   has one.

@@ -424,14 +424,13 @@ pub fn auto_publishes(s: &Settings, verified: bool, rating: i16, flags: &[String
     s.auto_publish && verified && rating >= s.auto_publish_min_rating && flags.is_empty()
 }
 
-/// "Jane D." from a profile's names; "A customer" with neither.
-pub fn default_name(first: Option<&str>, last: Option<&str>) -> String {
-    let f = first.map(str::trim).filter(|s| !s.is_empty());
-    let l = last.map(str::trim).and_then(|s| s.chars().next());
-    match (f, l) {
-        (Some(f), Some(l)) => format!("{} {}.", f.chars().take(40).collect::<String>(), l.to_uppercase()),
-        (Some(f), None) => f.chars().take(40).collect(),
-        _ => "A customer".into(),
+/// The name shown when the reviewer gave none: never anything from their profile. "A guest" for a
+/// stay, "A verified buyer" for a verified purchase, otherwise "A customer".
+pub fn default_name(verified: bool, stay: bool) -> &'static str {
+    match (stay, verified) {
+        (true, _) => "A guest",
+        (false, true) => "A verified buyer",
+        (false, false) => "A customer",
     }
 }
 
@@ -785,9 +784,9 @@ mod tests {
 
     #[test]
     fn default_names_and_plain_text() {
-        assert_eq!(default_name(Some("Jane"), Some("doe")), "Jane D.");
-        assert_eq!(default_name(Some("Jane"), None), "Jane");
-        assert_eq!(default_name(None, Some("Doe")), "A customer");
+        assert_eq!(default_name(true, false), "A verified buyer");
+        assert_eq!(default_name(true, true), "A guest");
+        assert_eq!(default_name(false, false), "A customer");
         assert_eq!(plain("  hi\u{0}\n\n\n\nthere  ", 100), "hi\n\nthere");
         assert_eq!(plain("abcdef", 3), "abc");
     }
