@@ -41,11 +41,14 @@ function e164(p) {
 // Paid in full only when every signal agrees: a booked status, a total above zero, a remaining
 // balance (sent only with includePayments=1) of exactly zero, and isPaid not saying otherwise.
 // Missing or conflicting signals mean not paid.
+// Exact evidence only: a booked status, a total above zero, a remaining balance of exactly zero,
+// and isPaid either absent (null) or saying paid (true or 1). Any other isPaid value is a
+// contradiction, and so not paid.
 function paidInFull(r) {
   if (BOOKED.indexOf(String(r.status || "")) < 0) return false;
   if (!(typeof r.totalPrice === "number" && r.totalPrice > 0)) return false;
-  if (typeof r.remainingBalance !== "number" || Math.abs(r.remainingBalance) >= 0.005) return false;
-  if (r.isPaid === false || r.isPaid === 0) return false;
+  if (r.remainingBalance !== 0) return false;
+  if (r.isPaid !== undefined && r.isPaid !== null && r.isPaid !== true && r.isPaid !== 1) return false;
   return true;
 }
 
@@ -55,19 +58,24 @@ function reservation(r, historical, settings) {
   if (status === "ownerStay" && settings.skip_owner_stays !== false) return [{ type: "log", message: "skipped owner stay " + id }];
   var updated = iso(r.updatedOn) || iso(r.reservationDate);
   if (!updated) return [{ type: "log", message: "reservation " + id + " has no update time, so it can't be put in order" }];
-  if (!r.guestEmail) return [{ type: "log", message: "reservation " + id + " has no guest email" }];
-  var who = { email: r.guestEmail };
-  var p = { type: "upsert_profile", email: r.guestEmail, keys: { hostaway_reservation: id } };
-  if (r.guestFirstName) p.first_name = r.guestFirstName;
-  if (r.guestLastName) p.last_name = r.guestLastName;
-  var ph = e164(r.phone);
-  if (ph) p.phone_number = ph;
+  // Without an email, the guest an earlier version named is found by the reservation id, so an
+  // unpaid or pending version still stands their reminder down.
+  var who = r.guestEmail ? { email: r.guestEmail } : { property: "hostaway_reservation", value: id };
+  var paid = paidInFull(r);
   var props = clean({
     reservation_id: id, confirmation_code: r.confirmationCode, listing_id: r.listingMapId, channel: r.channelName,
     status: status, check_in: r.arrivalDate, check_out: r.departureDate, nights: r.nights, guests: r.numberOfGuests,
-    paid_in_full: paidInFull(r), historical: historical || undefined,
+    paid_in_full: paid, historical: historical || undefined,
   });
-  var out = [p];
+  var out = [];
+  if (r.guestEmail) {
+    var p = { type: "upsert_profile", email: r.guestEmail, keys: { hostaway_reservation: id } };
+    if (r.guestFirstName) p.first_name = r.guestFirstName;
+    if (r.guestLastName) p.last_name = r.guestLastName;
+    var ph = e164(r.phone);
+    if (ph) p.phone_number = ph;
+    out.push(p);
+  }
   if (status.indexOf("inquiry") === 0) {
     out.push({ type: "track_event", metric: "Inquiry Received", profile: who, time: iso(r.reservationDate) || updated, unique_id: "hostaway:" + id + ":inquiry", properties: props });
     return out;
@@ -85,7 +93,10 @@ function reservation(r, historical, settings) {
   if (r.totalPrice > 0) {
     out.push({ type: "track_event", metric: "Reservation Total", profile: who, value: r.totalPrice, time: iso(r.reservationDate) || updated, unique_id: "hostaway:" + id + ":total", properties: clean({ reservation_id: id, currency: r.currency, check_in: r.arrivalDate, check_out: r.departureDate, historical: historical || undefined }) });
   }
-  out.push({ type: "track_event", metric: "Reservation Confirmed", profile: who, time: updated, unique_id: "hostaway:" + id + ":confirmed:" + updated, properties: props });
+  // The payment state is part of the version: a paid and an unpaid update in the same second are
+  // two events, and the unpaid one is dated a millisecond later so it's the newest (unpaid wins).
+  var when = paid ? updated : new Date(Date.parse(updated) + 1).toISOString();
+  out.push({ type: "track_event", metric: "Reservation Confirmed", profile: who, time: when, unique_id: "hostaway:" + id + ":confirmed:" + updated + ":" + (paid ? "paid" : "unpaid"), properties: props });
   return out;
 }
 
@@ -112,13 +123,15 @@ function handle(input) {
   var newestIds = st.pending_ids || [];
   if (first && rows.length) {
     newest = iso(rows[0].updatedOn) || null;
-    newestIds = rows.filter(function (r) { return iso(r.updatedOn) === newest; }).map(function (r) { return String(r.id); });
+    newestIds = rows.filter(function (r) { return iso(r.updatedOn) === newest; }).map(function (r) { return String(r.id); }).filter(function (x, i, all) { return all.indexOf(x) === i; });
   }
   var out = [];
   var done = rows.length < LIMIT;
   for (var i = 0; i < rows.length; i++) {
     var u = iso(rows[i].updatedOn);
-    if (u && stop && (u < stop || (u === stop && stopIds.indexOf(String(rows[i].id)) >= 0))) { done = true; break; }
+    if (u && stop && u < stop) { done = true; break; }
+    // Rows tied at the boundary time: every one is looked at; only those already read are skipped.
+    if (u && stop && u === stop && stopIds.indexOf(String(rows[i].id)) >= 0) continue;
     out = out.concat(reservation(rows[i], !!input.backfill, input.settings || {}));
   }
   if (done) {

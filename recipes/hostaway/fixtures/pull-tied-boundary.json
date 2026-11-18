@@ -67,7 +67,7 @@
       },
       "time": "2026-11-17T09:00:00.000Z",
       "type": "track_event",
-      "unique_id": "hostaway:62:confirmed:2026-11-17T09:00:00.000Z"
+      "unique_id": "hostaway:62:confirmed:2026-11-17T09:00:00.000Z:paid"
     },
     {
       "type": "set_state",

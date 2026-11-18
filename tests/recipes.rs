@@ -873,24 +873,41 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     sam["id"] = json!(50);
     sam["guestEmail"] = json!("sam.example@example.com");
     sam["phone"] = Value::Null;
+    // Kit: paid. Lee: a paid and an unpaid version in the same second (unpaid wins). Dee: a 0.004 balance.
+    let mut kit = first[0].clone();
+    kit["id"] = json!(51);
+    kit["guestEmail"] = json!("kit.example@example.com");
+    kit["phone"] = Value::Null;
+    let mut lee_unpaid = kit.clone();
+    lee_unpaid["id"] = json!(52);
+    lee_unpaid["guestEmail"] = json!("lee.example@example.com");
+    lee_unpaid["remainingBalance"] = json!(80);
+    let mut lee_paid = lee_unpaid.clone();
+    lee_paid["remainingBalance"] = json!(0);
+    let mut dee = kit.clone();
+    dee["id"] = json!(53);
+    dee["guestEmail"] = json!("dee.example@example.com");
+    dee["remainingBalance"] = json!(0.004);
     let mut rows: Vec<Value> = first[..3].to_vec();
-    rows.extend([signals[0].clone(), signals[1].clone(), sam]);
+    rows.extend([signals[0].clone(), signals[1].clone(), sam, kit, lee_paid, lee_unpaid, dee]);
     for (i, r) in rows.iter_mut().enumerate() {
-        r["updatedOn"] = json!(stamp(30 + i as i64 * 10));
+        // Lee's two versions (indexes 7 and 8) share one second.
+        let slot = if i == 8 { 7 } else { i } as i64;
+        r["updatedOn"] = json!(stamp(30 + slot * 10));
         r["arrivalDate"] = json!(in_two);
     }
     *api.rows.lock().unwrap() = rows.clone();
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Booked").await, 5);
+    assert_eq!(events(&h, "Reservation Booked").await, 8);
     assert_eq!(values(&h, "Reservation Total", "robin.example@example.com").await, vec![867.0]);
     assert_eq!(events(&h, "Reservation Cancelled").await, 1);
     // The next run reads back only to the change the last one saw: nothing new, nothing twice.
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Confirmed").await, 5);
+    assert_eq!(events(&h, "Reservation Confirmed").await, 9, "Lee's paid and unpaid versions are two events");
     let waiting = "SELECT count(*) FROM flow_event_date_fires WHERE outcome = 'pending'";
-    assert_eq!(count(&h, waiting).await, 5, "each confirmed version waits; the paid-in-full filter is checked when it fires");
+    assert_eq!(count(&h, waiting).await, 9, "each confirmed version waits; the paid-in-full filter is checked when it fires");
     // Newer versions, newest first: guest 20 pays; Robin's booking now shows a balance due again;
     // Sam's goes back to awaiting payment.
     let mut paid = rows[1].clone();
@@ -902,13 +919,18 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     let mut waiting = rows[5].clone();
     waiting["status"] = json!("awaitingPayment");
     waiting["updatedOn"] = json!(stamp(3));
+    // Kit's booking goes back to awaiting payment, in a version with no guest email.
+    let mut kit_waiting = rows[6].clone();
+    kit_waiting["status"] = json!("awaitingPayment");
+    kit_waiting["updatedOn"] = json!(stamp(4));
+    kit_waiting.as_object_mut().unwrap().remove("guestEmail");
     let rest: Vec<Value> = vec![rows[2].clone(), rows[3].clone(), rows[4].clone()];
-    let newest: Vec<Value> = [paid, unpaid, waiting].into_iter().chain(rest).collect();
+    let newest: Vec<Value> = [paid, unpaid, waiting, kit_waiting].into_iter().chain(rest).collect();
     *api.rows.lock().unwrap() = newest;
     h.ok("POST", &format!("/api/integrations/{id}/pull"), Some(json!({}))).await;
     h.drain().await;
-    assert_eq!(events(&h, "Reservation Confirmed").await, 7);
-    assert_eq!(events(&h, "Reservation Unconfirmed").await, 1);
+    assert_eq!(events(&h, "Reservation Confirmed").await, 11);
+    assert_eq!(events(&h, "Reservation Unconfirmed").await, 2, "Sam's, and Kit's (found by the reservation id)");
     // Tomorrow comes.
     sqlx::query("UPDATE flow_event_date_fires SET due_at = now() - interval '1 minute' WHERE outcome = 'pending'").execute(&h.state.db).await.unwrap();
     assert_eq!(api.tokens.load(std::sync::atomic::Ordering::SeqCst), 1, "the token is reused");
@@ -917,7 +939,7 @@ async fn hostaway_pulls_reservations_and_reminds_only_paid_stays() {
     assert_eq!(
         sent_to(&h, "See you soon"),
         vec!["guest20@example.com"],
-        "only the stay that's now paid in full: not the cancelled one, not missing or conflicting payment details, and not the two whose newest version isn't paid"
+        "only the stay that's now paid in full: not cancelled, missing, conflicting or nearly-zero payment details, not a same-second unpaid version, and not the bookings whose newest version isn't paid (Kit's had no email)"
     );
     // Held back from marketing.
     assert_eq!(consent(&h, "robin.example@example.com").await, (true, "never_subscribed".into()));
