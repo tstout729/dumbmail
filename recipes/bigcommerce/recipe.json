@@ -1,0 +1,80 @@
+{
+  "key": "bigcommerce",
+  "name": "BigCommerce",
+  "category": "Ecommerce",
+  "description": "BigCommerce orders become events: Placed Order once it's paid, Fulfilled Order, Cancelled Order and Refunded Order (once per refund, its own amount). BigCommerce's webhooks only carry an id, so DumbMail fetches each order, refund and customer from your store's API. Shoppers who tick the checkout's email opt-in box are subscribed; everyone else is held back from marketing.",
+  "metrics": [
+    "Placed Order",
+    "Fulfilled Order",
+    "Cancelled Order",
+    "Refunded Order"
+  ],
+  "docs": [
+    "https://docs.bigcommerce.com/docs/integrations/webhooks",
+    "https://docs.bigcommerce.com/developer/docs/integrations/webhooks/event-reference/events",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-orders",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/order-status/get-order-statuses",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-operations/payment-actions/get-order-refund-by-id",
+    "https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/customers/v3/get-customers"
+  ],
+  "signature": {
+    "type": "shared_secret",
+    "header": "X-Webhook-Token"
+  },
+  "signature_secret": {
+    "label": "Webhook token",
+    "help": "A long random value you choose. Send it in the X-Webhook-Token header of every webhook you create (the headers object of POST /v3/hooks)."
+  },
+  "credentials": [
+    {
+      "name": "access_token",
+      "label": "Store API account access token",
+      "help": "BigCommerce control panel \u2192 Settings \u2192 Store-level API accounts \u2192 Create API account. Give it read-only access to Orders, Order transactions and Customers. Used to fetch what each webhook names, and to import past orders."
+    }
+  ],
+  "settings": {
+    "store_hash": ""
+  },
+  "pull": {
+    "method": "GET",
+    "url": "https://api.bigcommerce.com/stores/{{settings.store_hash}}/v2/orders",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "query": {
+      "min_date_modified": "{{state.cursor|since}}",
+      "sort": "date_modified:asc",
+      "limit": 50,
+      "page": "{{state.page|'1'}}"
+    },
+    "auth": {
+      "type": "header",
+      "name": "X-Auth-Token",
+      "value": "{{secret.access_token}}"
+    },
+    "max_pages": 20
+  },
+  "redact": [
+    "**.ip_address",
+    "**.ip_address_v6",
+    "**.registration_ip_address",
+    "**.notes",
+    "**.staff_notes",
+    "**.customer_message",
+    "**.form_fields",
+    "**.credit_card_type",
+    "**.payment_provider_id",
+    "**.authentication"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Set store_hash in the integration's settings: it's the part after /stores/ in your API path (for example abc123 in https://api.bigcommerce.com/stores/abc123/v3/).",
+    "Create a store-level API account (Settings \u2192 Store-level API accounts) with read-only Orders, Order transactions and Customers scopes. Save its access token as the credential access_token.",
+    "Pick a long random token and save it as the integration's signing secret.",
+    "Create one webhook per scope with the API: POST https://api.bigcommerce.com/stores/<store_hash>/v3/hooks with {\"scope\": \"<scope>\", \"destination\": \"<webhook URL>\", \"is_active\": true, \"headers\": {\"X-Webhook-Token\": \"<the same token>\"}}. The scopes: store/order/created, store/order/updated, store/order/statusUpdated, store/order/refund/created, store/customer/created, store/customer/updated.",
+    "Place a test order and check the delivery log: each webhook is followed by a fetch of the order.",
+    "To import past orders, use Import history in the Pull tab. Imported orders are marked historical."
+  ],
+  "flows": []
+}

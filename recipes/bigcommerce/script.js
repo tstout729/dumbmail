@@ -1,0 +1,150 @@
+// BigCommerce → DumbMail
+//
+// BigCommerce webhooks are thin: they carry only an id ({"scope": "store/order/updated",
+// "data": {"type": "order", "id": 250}}). So the script asks DumbMail to fetch the record from the
+// store's API (next_request), and the script runs again on the answer (input.source "fetch").
+// Refunds are fetched, then their order (for the buyer and the currency). The pull imports past
+// orders. See README.md for the BigCommerce page behind each assumption.
+//
+// Placed Order: once per order, when its status says it's been paid. Fulfilled Order: once, when
+// Shipped or Completed. Cancelled Order: once. Refunded Order: once per refund, with its own amount,
+// unless every payment in it was declined. A shopper who ticked the checkout's email opt-in box
+// (is_email_opt_in) is subscribed to email; nobody else is.
+
+// Order status ids (GET /v2/order_statuses).
+var PAID = [2, 3, 4, 8, 9, 10, 11, 13, 14]; // Shipped, Partially Shipped, Refunded, Awaiting Pickup, Awaiting Shipment, Completed, Awaiting Fulfillment, Disputed, Partially Refunded
+var FULFILLED = [2, 10];
+var CANCELLED = 5;
+var MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+// RFC 2822 ("Tue, 05 Mar 2019 21:40:11 +0000") → ISO 8601 UTC.
+function rfc2822(s) {
+  var m = /^\w{3}, (\d{1,2}) (\w{3}) (\d{4}) (\d\d):(\d\d):(\d\d) ([+-])(\d\d)(\d\d)$/.exec(String(s || "").trim());
+  if (!m || MONTHS[m[2]] === undefined) return undefined;
+  var t = Date.UTC(+m[3], MONTHS[m[2]], +m[1], +m[4], +m[5], +m[6]);
+  var off = (+m[8] * 60 + +m[9]) * 60000 * (m[7] === "+" ? 1 : -1);
+  return new Date(t - off).toISOString();
+}
+
+function num(s) {
+  var n = parseFloat(s);
+  return isFinite(n) ? n : undefined;
+}
+
+function clean(o) {
+  var out = {};
+  for (var k in o) if (o[k] !== null && o[k] !== undefined && o[k] !== "") out[k] = o[k];
+  return out;
+}
+
+function e164(phone, country) {
+  if (!phone) return undefined;
+  var p = String(phone).trim();
+  var d = p.replace(/[^0-9]/g, "");
+  if (p.charAt(0) === "+" && d.length >= 8 && d.length <= 15) return "+" + d;
+  if ((country === "US" || country === "CA") && d.length === 10) return "+1" + d;
+  return undefined;
+}
+
+function orderActions(o, ctx, historical) {
+  if (!o || !o.id) return [{ type: "log", message: "no order in the answer" }];
+  if (o.status_id === 0 || o.is_deleted) return [{ type: "log", message: "order " + o.id + " is incomplete or archived" }];
+  var b = o.billing_address || {};
+  if (!b.email) return [{ type: "log", message: "order " + o.id + " has no billing email" }];
+  var who = { email: b.email };
+  var p = { type: "upsert_profile", email: b.email };
+  if (b.first_name) p.first_name = b.first_name;
+  if (b.last_name) p.last_name = b.last_name;
+  var ph = e164(b.phone, b.country_iso2);
+  if (ph) p.phone_number = ph;
+  if (o.customer_id > 0) p.keys = { bigcommerce_customer: String(o.customer_id) };
+  if (o.is_email_opt_in === true) p.consent = [{ channel: "email", subscribed: true, source: "BigCommerce checkout email opt-in" }];
+  var out = [p];
+  var currency = o.default_currency_code || o.currency_code;
+  var base = clean({ order_id: o.id, status: o.status, currency: currency, channel_id: o.channel_id, historical: historical || undefined });
+  var modified = rfc2822(o.date_modified);
+  var total = num(o.total_inc_tax);
+  if (PAID.indexOf(o.status_id) >= 0 && total > 0) {
+    var placed = JSON.parse(JSON.stringify(base));
+    placed.item_count = o.items_total;
+    out.push({ type: "track_event", metric: "Placed Order", profile: who, value: total, time: rfc2822(o.date_created), unique_id: "bigcommerce:order:" + o.id + ":placed", properties: placed });
+  } else if (PAID.indexOf(o.status_id) < 0) {
+    out.push({ type: "log", message: "order " + o.id + " is " + o.status + "; it's recorded once it's paid" });
+  }
+  if (FULFILLED.indexOf(o.status_id) >= 0) out.push({ type: "track_event", metric: "Fulfilled Order", profile: who, time: rfc2822(o.date_shipped) || modified, unique_id: "bigcommerce:order:" + o.id + ":fulfilled", properties: base });
+  if (o.status_id === CANCELLED) out.push({ type: "track_event", metric: "Cancelled Order", profile: who, time: modified, unique_id: "bigcommerce:order:" + o.id + ":cancelled", properties: base });
+  var rf = ctx && ctx.refund;
+  if (rf) {
+    out.push({
+      type: "track_event", metric: "Refunded Order", profile: who, value: num(rf.total_amount), time: rf.created || modified,
+      unique_id: "bigcommerce:refund:" + rf.id,
+      properties: clean({ order_id: o.id, refund_id: rf.id, currency: currency, reason: rf.reason, historical: historical || undefined }),
+    });
+  }
+  return out;
+}
+
+function fetched(input) {
+  var url = String((input.request && input.request.url) || "");
+  var p = input.payload || {};
+  var ctx = input.context || {};
+  if (/\/payment_actions\/refunds\/\d+/.test(url)) {
+    var r = p.data;
+    if (!r || !r.id) return [{ type: "log", message: "no refund in the answer" }];
+    var pays = r.payments || [];
+    if (pays.length && pays.every(function (x) { return x.is_declined; })) return [{ type: "log", message: "refund " + r.id + " was declined" }];
+    // The order gives the buyer and the currency.
+    return [{ type: "next_request", url: "/stores/" + input.settings.store_hash + "/v2/orders/" + r.order_id, context: { refund: clean({ id: r.id, total_amount: r.total_amount, created: r.created, reason: r.reason }) } }];
+  }
+  if (/\/v3\/customers/.test(url)) {
+    return (p.data || []).filter(function (c) { return c.email; }).map(function (c) {
+      var u = { type: "upsert_profile", email: c.email, keys: { bigcommerce_customer: String(c.id) } };
+      if (c.first_name) u.first_name = c.first_name;
+      if (c.last_name) u.last_name = c.last_name;
+      var ph = e164(c.phone);
+      if (ph) u.phone_number = ph;
+      return u;
+    });
+  }
+  if (/\/v2\/orders\/\d+/.test(url)) return orderActions(p, ctx, false);
+  return [{ type: "log", message: "unexpected answer from " + url.split("?")[0] }];
+}
+
+var LIMIT = 50;
+
+function pulled(input) {
+  var rows = Array.isArray(input.payload) ? input.payload : [];
+  var out = [];
+  rows.forEach(function (o) { out = out.concat(orderActions(o, null, !!input.backfill)); });
+  if (!rows.length) return out.concat([{ type: "log", message: "no changed orders" }]);
+  var page = parseInt((input.state && input.state.page) || "1", 10) || 1;
+  if (rows.length >= LIMIT) {
+    out.push({ type: "set_state", values: { page: String(page + 1) } });
+    out.push({ type: "next_request", query: { page: String(page + 1) } });
+  } else {
+    // Done: the next run starts at the newest change read (inclusive, so nothing is missed).
+    out.push({ type: "set_state", values: { cursor: rfc2822(rows[rows.length - 1].date_modified), page: "1" } });
+  }
+  return out;
+}
+
+function handle(input) {
+  if (input.source === "fetch") return fetched(input);
+  if (input.source === "pull") return pulled(input);
+  var e = input.payload || {};
+  var d = e.data || {};
+  var hash = input.settings && input.settings.store_hash;
+  if (!hash) return [{ type: "log", message: "set store_hash in the integration's settings first" }];
+  if (e.producer && e.producer !== "stores/" + hash) return [{ type: "log", message: "this webhook is from another store (" + e.producer + ")" }];
+  var scope = String(e.scope || "");
+  if (scope === "store/order/refund/created" && d.refund && d.refund.refund_id) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v3/orders/" + d.id + "/payment_actions/refunds/" + d.refund.refund_id }];
+  }
+  if (/^store\/order\/(created|updated|statusUpdated)$/.test(scope) && d.id) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v2/orders/" + d.id }];
+  }
+  if (/^store\/customer\/(created|updated)$/.test(scope) && d.id) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v3/customers", query: { "id:in": String(d.id) } }];
+  }
+  return [{ type: "log", message: "ignored BigCommerce scope " + (scope || "(none)") }];
+}
