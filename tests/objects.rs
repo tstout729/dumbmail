@@ -960,3 +960,38 @@ async fn the_scheduler_and_retention_stay_bounded() {
     assert_eq!(count(&h, &format!("SELECT count(*) FROM object_changes WHERE object_id = '{last}'")).await, 100, "the newest 100 are kept");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn single_writes_are_audited_and_type_edits_keep_stored_values_valid() {
+    let mut h = harness!();
+    h.signup().await;
+    // An empty object is in its history from the start.
+    let r = h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "E1"}))).await;
+    let o = h.ok("GET", &format!("/api/objects/{}", r["id"].as_str().unwrap()), None).await;
+    assert_eq!(o["history"][0]["kind"], "created", "{o}");
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "agent", "scopes": ["full"]}))).await["key"].as_str().unwrap().to_string();
+    let (err, _, text) = mcp(&h, &key, "upsert_objects", json!({"objects": [{"type": "stay", "external_id": "E2", "fields": {"nights": "3"}}]})).await;
+    assert!(!err, "{text}");
+    h.ok("DELETE", &format!("/api/objects/{}", r["id"].as_str().unwrap()), None).await;
+    let audits: Vec<(String, Value)> = sqlx::query_as("SELECT action, details FROM audit_log WHERE action LIKE 'objects.%' ORDER BY created_at").fetch_all(&h.state.db).await.unwrap();
+    let actions: Vec<&str> = audits.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(actions, vec!["objects.upsert", "objects.upsert", "objects.delete"], "{audits:?}");
+    assert!(!format!("{audits:?}").contains("nights"), "no fields in the audit: {audits:?}");
+    // nights is text now ("3"); making it a number changes what's stored: refused with a count ...
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "E3", "fields": {"nights": "several"}}))).await;
+    let mut fields: Vec<Value> = h.ok("GET", "/api/object-types/stay", None).await["fields"].as_array().unwrap().clone();
+    for f in fields.iter_mut() {
+        if f["key"] == "nights" {
+            f["type"] = json!("number");
+        }
+    }
+    let (s, e) = h.req("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone()}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().starts_with("2 stays have a value in nights"), "{e}");
+    assert_eq!(count(&h, "SELECT count(*) FROM object_types WHERE fields @> '[{\"key\": \"nights\", \"type\": \"text\"}]'").await, 1, "nothing changed");
+    // ... and with convert, values that fit are converted and the rest removed.
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields, "convert": true}))).await;
+    let nights: Vec<(String, Option<Value>)> = sqlx::query_as("SELECT external_id, fields->'nights' FROM objects ORDER BY external_id").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(nights, vec![("E2".to_string(), Some(json!(3))), ("E3".to_string(), None)]);
+    h.cleanup().await;
+}

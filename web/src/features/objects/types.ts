@@ -29,7 +29,7 @@ export type ObjectType = {
   used_by?: string[];
 };
 
-export type ObjectTypeInput = { key: string; name?: string; plural?: string; fields?: FieldDef[]; title_field?: string };
+export type ObjectTypeInput = { key: string; name?: string; plural?: string; fields?: FieldDef[]; title_field?: string; convert?: boolean };
 
 export type FieldValues = Record<string, unknown>;
 

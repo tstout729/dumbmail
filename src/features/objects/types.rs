@@ -367,6 +367,64 @@ pub struct TypeInput {
     /// The field shown as each object's title ("" to clear).
     #[serde(default)]
     pub title_field: Option<String>,
+    /// When a field's new type doesn't fit values already stored: convert those that can be and
+    /// remove the rest (without it, the edit is refused with a count).
+    #[serde(default)]
+    pub convert: bool,
+}
+
+/// Most objects one type edit checks or converts for a field whose type changed.
+pub const MAX_CONVERT: i64 = 100_000;
+
+/// Stored values of fields whose definition changed: refused (with a count) unless `convert`, in
+/// which case values that fit are put in the new form and the rest removed. In the edit's
+/// transaction, under the type's row lock.
+async fn check_stored(conn: &mut PgConnection, t: &ObjectType, new: &[FieldDef], convert: bool) -> AppResult<u64> {
+    let mut converted = 0;
+    for f in new {
+        let Some(old) = t.field(&f.key) else { continue };
+        if old.kind == f.kind && old.options == f.options && old.currency == f.currency {
+            continue;
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM objects WHERE type_id = $1 AND fields ? $2").bind(t.id).bind(&f.key).fetch_one(&mut *conn).await?;
+        if n > MAX_CONVERT {
+            return Err(AppError::bad(format!("{} objects have {}: too many to check in one edit; add a new field instead", n, f.key)));
+        }
+        let rows: Vec<(Uuid, Value)> = sqlx::query_as("SELECT id, fields->$2 FROM objects WHERE type_id = $1 AND fields ? $2").bind(t.id).bind(&f.key).fetch_all(&mut *conn).await?;
+        let mut misfit = 0u64;
+        let mut changes: Vec<(Uuid, Option<Value>)> = Vec::new();
+        for (id, v) in rows {
+            match normalize(f, &v) {
+                Ok(nv) if nv == v => {}
+                Ok(nv) => changes.push((id, Some(nv))),
+                Err(_) => {
+                    misfit += 1;
+                    changes.push((id, None));
+                }
+            }
+        }
+        if changes.is_empty() {
+            continue;
+        }
+        if !convert {
+            return Err(AppError::Conflict(format!(
+                "{} {} {} a value in {} that a {} field holds differently ({misfit} can't be kept). Save with convert to convert those that fit and remove the rest.",
+                changes.len(),
+                if changes.len() == 1 { t.name.to_lowercase() } else { t.plural.to_lowercase() },
+                if changes.len() == 1 { "has" } else { "have" },
+                f.key,
+                serde_json::to_value(f.kind).ok().and_then(|k| k.as_str().map(String::from)).unwrap_or_default()
+            )));
+        }
+        for (id, nv) in changes {
+            match nv {
+                Some(v) => sqlx::query("UPDATE objects SET fields = jsonb_set(fields, ARRAY[$2], $3) WHERE id = $1").bind(id).bind(&f.key).bind(v).execute(&mut *conn).await?,
+                None => sqlx::query("UPDATE objects SET fields = fields - $2 WHERE id = $1").bind(id).bind(&f.key).execute(&mut *conn).await?,
+            };
+            converted += 1;
+        }
+    }
+    Ok(converted)
 }
 
 fn check_name(what: &str, s: &str) -> AppResult<String> {
@@ -421,6 +479,9 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
     };
     check_fields(&fields, title.as_deref())?;
     let created = cur.is_none();
+    if let Some(c) = &cur {
+        check_stored(&mut tx, c, &fields, b.convert).await?;
+    }
     let row: ObjectType = match cur {
         Some(c) => {
             let q = format!(

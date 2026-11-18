@@ -27,6 +27,7 @@ import {
 } from "../../components/ui";
 import { formatNumber, formatRelative, pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { ApiError } from "../../api/client";
 import { useCan } from "../team/api";
 import { useDeleteObjectType, useObjects, useObjectType, useSaveObjectType } from "./api";
 import { fieldLabel, formatValue, keyFields, kindLabels } from "./parts";
@@ -183,6 +184,8 @@ function FieldsEditor({ ty }: { ty: ObjectType }) {
   const [name, setName] = useState(ty.name);
   const [plural, setPlural] = useState(ty.plural);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // A field's new type doesn't fit stored values: the server says how many; converting needs a yes.
+  const [convertAsk, setConvertAsk] = useState<string | null>(null);
   const existing = new Set(ty.fields.map((f) => f.key));
   const keys = fields.map((f) => f.key.trim());
   const problem = !name.trim() || !plural.trim()
@@ -196,10 +199,18 @@ function FieldsEditor({ ty }: { ty: ObjectType }) {
           : null;
   const set = (i: number, f: FieldDef) => setFields(fields.map((x, j) => (j === i ? f : x)));
   const titleChoices = fields.filter((f) => !f.sensitive && ["text", "enum", "number", "date", "datetime"].includes(f.type) && f.key.trim());
-  const onSave = () =>
+  const onSave = (convert = false) =>
     save.mutate(
-      { key: ty.key, name: name.trim(), plural: plural.trim(), fields: fields.map(clean), title_field: titleChoices.some((f) => f.key === title) ? title : "" },
-      { onSuccess: () => toast.success("Fields saved") },
+      { key: ty.key, name: name.trim(), plural: plural.trim(), fields: fields.map(clean), title_field: titleChoices.some((f) => f.key === title) ? title : "", convert },
+      {
+        onSuccess: () => {
+          setConvertAsk(null);
+          toast.success("Fields saved");
+        },
+        onError: (e) => {
+          if (e instanceof ApiError && e.status === 409) setConvertAsk(e.message);
+        },
+      },
     );
   return (
     <fieldset disabled={!canEdit} className="min-w-0 space-y-4">
@@ -265,16 +276,27 @@ function FieldsEditor({ ty }: { ty: ObjectType }) {
         </Select>
       </Field>
       <p className="text-xs text-zinc-500">Removing a field here keeps the values already stored on objects; new values for it add it back.</p>
-      <InlineError message={problem ?? save.error?.message} />
+      <InlineError message={problem ?? (convertAsk ? null : save.error?.message)} />
       {canEdit ? (
         <div className="flex flex-wrap justify-between gap-2 border-t border-zinc-200 pt-4">
           <Button variant="danger" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
             Delete type
           </Button>
-          <Button variant="primary" disabled={Boolean(problem)} loading={save.isPending} onClick={onSave}>
+          <Button variant="primary" disabled={Boolean(problem)} loading={save.isPending} onClick={() => onSave()}>
             Save fields
           </Button>
         </div>
+      ) : null}
+      {convertAsk ? (
+        <ConfirmDialog
+          title="Convert stored values?"
+          body={convertAsk}
+          confirmLabel="Convert and save"
+          danger
+          loading={save.isPending}
+          onConfirm={() => onSave(true)}
+          onClose={() => setConvertAsk(null)}
+        />
       ) : null}
       {confirmDelete ? (
         <ConfirmDialog

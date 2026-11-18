@@ -109,7 +109,8 @@ impl Feature for Module {
             tool("list_object_types", "List object types", "The account's object types (reservation, subscription ...) with their fields and how many objects each has.", obj(json!({}), &[]), true, false),
             tool("upsert_object_type", "Create or change an object type", "Create a type, or change its name, plural, fields (replaces the list) or title field. Types are also made on the first upsert of an object, with field types guessed from the values; use this to fix them, add enum options or mark fields sensitive.",
                 obj(json!({"key": {"type": "string", "description": "Lower-case letters, digits and _"}, "name": {"type": "string"}, "plural": {"type": "string"},
-                    "fields": {"type": "array", "items": field_schema(), "maxItems": 100}, "title_field": {"type": "string", "description": "The field shown as each object's title (\"\" clears)"}}), &["key"]), false, false),
+                    "fields": {"type": "array", "items": field_schema(), "maxItems": 100}, "title_field": {"type": "string", "description": "The field shown as each object's title (\"\" clears)"},
+                    "convert": {"type": "boolean", "description": "When a field's new type doesn't fit stored values: convert those that fit and remove the rest. Without it such an edit is refused with a count; ask the user first."}}), &["key"]), false, false),
             tool("delete_object_type", "Delete an object type", "Delete a type and all its objects, with their history. Refused while a flow or segment uses it. Needs confirm=true; without it you get a dry run with the count.",
                 obj(json!({"key": {"type": "string"}, "confirm": {"type": "boolean"}}), &["key"]), false, true),
             tool("list_objects", "List objects", "A type's objects, newest change first, searched by title or external id (sensitive fields are never in lists). Or, with profile_id, one person's objects by type.",
@@ -172,6 +173,13 @@ impl Feature for Module {
                             Err(AppError::Internal(e)) => return Err(AppError::Internal(e)),
                             Err(e) => out.push(json!({"index": i, "external_id": b.external_id, "error": e.public_message()})),
                         }
+                    }
+                    let written = out.iter().filter(|r| r.get("id").is_some() && !matches!(r["result"].as_str(), Some("unchanged" | "older" | "duplicate"))).count();
+                    if written > 0 {
+                        let mut kinds: Vec<&str> = items.iter().map(|b| b.type_key.trim()).collect();
+                        kinds.sort();
+                        kinds.dedup();
+                        super::team::audit(state, ctx, "objects.upsert", None, json!({"count": written, "types": kinds})).await;
                     }
                     Ok(json!({"results": out}))
                 }

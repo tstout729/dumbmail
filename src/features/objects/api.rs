@@ -96,7 +96,12 @@ pub async fn delete_type(state: &AppState, ctx: &Ctx, key: &str, confirm: bool) 
 }
 
 pub async fn upsert_one(state: &AppState, ctx: &Ctx, source: &str, b: &UpsertInput) -> AppResult<Value> {
-    Ok(json!(store::upsert(state, &Writer::new(ctx.account_id, source), b).await?))
+    let r = store::upsert(state, &Writer::new(ctx.account_id, source), b).await?;
+    // The same values-free record as a bulk upsert: what, which type, what happened.
+    if !matches!(r.result, "unchanged" | "older" | "duplicate") || r.linked + r.unlinked > 0 {
+        audit(state, ctx, "objects.upsert", Some(&r.id.to_string()), json!({"count": 1, "types": [r.type_key], "result": r.result})).await;
+    }
+    Ok(json!(r))
 }
 
 /// Delete objects (by id, or by type and external ids). Without `confirm`, says what would go.
@@ -155,11 +160,13 @@ struct TypePatch {
     fields: Option<Vec<types::FieldDef>>,
     #[serde(default)]
     title_field: Option<String>,
+    #[serde(default)]
+    convert: bool,
 }
 
 async fn patch_type_h(State(state): State<AppState>, ctx: Ctx, Path(key): Path<String>, ApiJson(b): ApiJson<TypePatch>) -> AppResult<Json<Value>> {
     types::require(&state.db, ctx.account_id, &key).await?;
-    let input = TypeInput { key, name: b.name, plural: b.plural, fields: b.fields, title_field: b.title_field };
+    let input = TypeInput { key, name: b.name, plural: b.plural, fields: b.fields, title_field: b.title_field, convert: b.convert };
     Ok(Json(upsert_type(&state, &ctx, input).await?))
 }
 
