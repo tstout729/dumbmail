@@ -459,7 +459,16 @@ pub async fn seed(state: &AppState, mut budget: i64) -> anyhow::Result<()> {
 }
 
 /// Object-date flows: fires waiting, started, filtered and missed, and the next one due.
-pub async fn report(db: &PgPool, flow_id: Uuid) -> AppResult<Value> {
+pub async fn report(db: &PgPool, f: &FlowRow) -> AppResult<Value> {
+    // Checked against the type as it is now: a date field that's sensitive or gone shows nothing.
+    if let Ok(t) = flows::parse_trigger(&f.trigger) {
+        if let Some((key, a)) = date_args(&t) {
+            if super::types::check_rule_fields(db, f.account_id, &key, &[a.field.as_str()]).await.is_err() {
+                return Ok(json!({"counts": {}, "next_due_at": null, "hidden": true, "note": "This flow's date field is sensitive or no longer on its type, so it starts nothing and shows nothing."}));
+            }
+        }
+    }
+    let flow_id = f.id;
     let rows: Vec<(String, i64)> = sqlx::query_as("SELECT outcome, count(*) FROM flow_object_date_fires WHERE flow_id = $1 GROUP BY outcome").bind(flow_id).fetch_all(db).await?;
     let next: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT min(due_at) FROM flow_object_date_fires WHERE flow_id = $1 AND outcome = 'pending'").bind(flow_id).fetch_one(db).await?;
     let counts: Map<String, Value> = rows.into_iter().map(|(k, n)| (k, json!(n))).collect();

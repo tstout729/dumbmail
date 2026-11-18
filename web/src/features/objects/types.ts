@@ -10,8 +10,10 @@ export type FieldDef = {
   options?: string[];
   /** money: e.g. USD. */
   currency?: string;
-  /** Hidden from lists and from people who can't read profiles. */
+  /** Never in messages or lists, and hidden from people who can't read profiles. */
   sensitive?: boolean;
+  /** A sensitive enum's options aren't shown; saving it without options keeps them. */
+  options_hidden?: boolean;
 };
 
 export type ObjectType = {

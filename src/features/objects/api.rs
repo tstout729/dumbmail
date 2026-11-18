@@ -52,6 +52,15 @@ pub fn routes() -> Router<AppState> {
 
 pub fn type_json(t: &types::ObjectType, count: Option<i64>) -> Value {
     let mut v = json!(t);
+    // A sensitive field's options are never listed (they'd say what values it can hold).
+    if let Some(fields) = v["fields"].as_array_mut() {
+        for f in fields {
+            if f["sensitive"] == true && f.get("options").is_some() {
+                f.as_object_mut().map(|o| o.remove("options"));
+                f["options_hidden"] = json!(true);
+            }
+        }
+    }
     if let Some(n) = count {
         v["object_count"] = json!(n);
     }
@@ -243,6 +252,6 @@ async fn profile_objects_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pa
 }
 
 /// The object-date report for a flow's results (used by the flow report).
-pub async fn flow_report(state: &AppState, flow_id: Uuid) -> AppResult<Value> {
-    flow::report(&state.db, flow_id).await
+pub async fn flow_report(state: &AppState, f: &crate::models::FlowRow) -> AppResult<Value> {
+    flow::report(&state.db, f).await
 }

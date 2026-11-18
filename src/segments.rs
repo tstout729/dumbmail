@@ -203,6 +203,10 @@ pub enum Condition {
         /// Only objects they're linked to this way (e.g. `guest`).
         #[serde(default)]
         relationship: Option<String>,
+        /// Set by `load` when a field rule names a field the type doesn't define or marks
+        /// sensitive: the rule then matches nobody, whatever its `op`. Never read from JSON.
+        #[serde(skip)]
+        blocked: bool,
     },
     /// A stable random share of profiles, e.g. a 10% holdout. The same seed always picks the same people.
     Random {
@@ -413,25 +417,54 @@ pub async fn load(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Optio
     let mut stack: Vec<Uuid> = self_id.into_iter().collect();
     let mut budget = Budget { refs: MAX_SEGMENT_REFS, conditions: MAX_EXPANDED_CONDITIONS };
     resolve(db, account_id, &mut def.conditions, &mut stack, &mut budget).await?;
-    // Object rules may not test a type's sensitive fields (they'd tell who has which value).
-    let mut rules = Vec::new();
-    object_rules(&def.conditions, &mut rules);
-    for (key, fields) in rules {
+    // Object rules are checked against each type as it is now: one that names a field the type
+    // doesn't define, or marks sensitive, matches nobody (a count would tell who has which value).
+    block_object_rules(db, account_id, &mut def.conditions).await?;
+    Ok(def)
+}
+
+/// [`load`] for saving rules: a rule that names a field it can't test is refused, with the reason.
+pub async fn load_checked(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Option<Uuid>) -> AppResult<Definition> {
+    let def = load(db, account_id, v, self_id).await?;
+    let mut problems = Vec::new();
+    blocked_rules(&def.conditions, &mut problems);
+    for (key, fields) in problems {
         crate::features::objects::types::check_rule_fields(db, account_id, &key, &fields.iter().map(String::as_str).collect::<Vec<_>>()).await?;
     }
     Ok(def)
 }
 
-/// Each object condition's type and the fields it tests, including inside groups and other segments.
-fn object_rules(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
+fn blocked_rules(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
     for c in conds {
         match c {
-            Condition::Object { object_type, where_, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.clone()).collect())),
-            Condition::Group { conditions, .. } => object_rules(conditions, out),
-            Condition::Segment { resolved: Some(d), .. } => object_rules(&d.conditions, out),
+            Condition::Object { object_type, where_, blocked: true, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.clone()).collect())),
+            Condition::Group { conditions, .. } => blocked_rules(conditions, out),
+            Condition::Segment { resolved: Some(d), .. } => blocked_rules(&d.conditions, out),
             _ => {}
         }
     }
+}
+
+/// Mark each object condition (in groups and other segments too) whose rules can't be tested now.
+fn block_object_rules<'a>(db: &'a sqlx::PgPool, account_id: Uuid, conds: &'a mut [Condition]) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<()>> + Send + 'a>> {
+    Box::pin(async move {
+        for c in conds.iter_mut() {
+            match c {
+                Condition::Object { object_type, where_, blocked, .. } => {
+                    let fields: Vec<&str> = where_.iter().map(|f| f.field.as_str()).collect();
+                    *blocked = match crate::features::objects::types::check_rule_fields(db, account_id, object_type.trim(), &fields).await {
+                        Ok(()) => false,
+                        Err(crate::error::AppError::Internal(e)) => return Err(crate::error::AppError::Internal(e)),
+                        Err(_) => !fields.is_empty(),
+                    };
+                }
+                Condition::Group { conditions, .. } => block_object_rules(db, account_id, conditions).await?,
+                Condition::Segment { resolved: Some(d), .. } => block_object_rules(db, account_id, &mut d.conditions).await?,
+                _ => {}
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Limits on inlining other segments, so a chain of segments that each include another many times
@@ -1319,7 +1352,10 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             };
             qb.push(")");
         }
-        Condition::Object { object_type, op, count, where_, relationship } => {
+        Condition::Object { blocked: true, .. } => {
+            qb.push("FALSE");
+        }
+        Condition::Object { object_type, op, count, where_, relationship, .. } => {
             qb.push("((SELECT count(DISTINCT o.id) FROM object_links ol JOIN objects o ON o.id = ol.object_id JOIN object_types ot ON ot.id = o.type_id");
             qb.push(" WHERE ol.profile_id = p.id AND ot.account_id = p.account_id AND o.account_id = p.account_id AND ot.key = ").push_bind(object_type.trim().to_string());
             if let Some(r) = relationship {

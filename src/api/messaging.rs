@@ -978,7 +978,7 @@ pub async fn flow_report(state: &AppState, account_id: Uuid, id: Uuid) -> AppRes
         out["event_dates"] = flows::event_date_report(&state.db, f.id).await?;
     }
     if f.trigger["type"] == "object_date" {
-        out["object_dates"] = crate::features::objects::api::flow_report(state, f.id).await?;
+        out["object_dates"] = crate::features::objects::api::flow_report(state, &f).await?;
     }
     Ok(out)
 }

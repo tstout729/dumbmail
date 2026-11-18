@@ -66,6 +66,9 @@ pub struct FieldDef {
     /// never in lists.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sensitive: bool,
+    /// Sent back by the dashboard with a type it read (see `api::type_json`); never stored.
+    #[serde(default, skip_serializing)]
+    pub options_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -308,7 +311,7 @@ pub fn inferred(key: &str, v: &Value) -> Result<FieldDef, String> {
     if !valid_field_key(key) {
         return Err(format!("field {key:?}: a field key is 1-64 letters, digits and _ starting with a letter"));
     }
-    Ok(FieldDef { key: key.to_string(), label: None, kind: infer(v).map_err(|e| format!("{key}: {e}"))?, options: Vec::new(), currency: None, sensitive: false })
+    Ok(FieldDef { key: key.to_string(), label: None, kind: infer(v).map_err(|e| format!("{key}: {e}"))?, options: Vec::new(), currency: None, sensitive: false, options_hidden: false })
 }
 
 /// Names for a type made on its first upsert: `reservation` → Reservation / Reservations.
@@ -394,7 +397,23 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
         Some(n) => check_name("plural", n)?,
         None => cur.as_ref().map(|c| c.plural.clone()).unwrap_or(dplural),
     };
-    let fields = b.fields.clone().or_else(|| cur.as_ref().map(|c| c.fields.clone())).unwrap_or_default();
+    let mut fields = b.fields.clone().or_else(|| cur.as_ref().map(|c| c.fields.clone())).unwrap_or_default();
+    // Sensitivity can't be lost: a field named like a sensitive one taken off this type is sensitive
+    // again, and a sensitive field's options (never shown) are kept when an edit sends none.
+    let mut removed: Vec<String> = Vec::new();
+    if let Some(c) = &cur {
+        for f in fields.iter_mut() {
+            if c.removed_sensitive.contains(&f.key) {
+                f.sensitive = true;
+            }
+            if let Some(old) = c.field(&f.key).filter(|o| o.sensitive && o.kind == Kind::Enum) {
+                if f.kind == Kind::Enum && f.options.is_empty() {
+                    f.options = old.options.clone();
+                }
+            }
+        }
+        removed = c.fields.iter().filter(|o| o.sensitive && !fields.iter().any(|f| f.key == o.key)).map(|o| o.key.clone()).collect();
+    }
     let title = match &b.title_field {
         Some(t) if t.trim().is_empty() => None,
         Some(t) => Some(t.trim().to_string()),
@@ -404,8 +423,16 @@ pub async fn upsert(db: &sqlx::PgPool, account_id: Uuid, b: TypeInput) -> AppRes
     let created = cur.is_none();
     let row: ObjectType = match cur {
         Some(c) => {
-            let q = format!("UPDATE object_types SET name = $2, plural = $3, fields = $4, title_field = $5, updated_at = now() WHERE id = $1 RETURNING {TYPE_COLS}");
-            sqlx::query_as(&q).bind(c.id).bind(&name).bind(&plural).bind(json!(fields)).bind(&title).fetch_one(&mut *tx).await?
+            let q = format!(
+                "UPDATE object_types SET name = $2, plural = $3, fields = $4, title_field = $5, updated_at = now(),
+                    removed_sensitive = ARRAY(SELECT DISTINCT unnest(removed_sensitive || $6::text[])) WHERE id = $1 RETURNING {TYPE_COLS}"
+            );
+            let row: ObjectType = sqlx::query_as(&q).bind(c.id).bind(&name).bind(&plural).bind(json!(fields)).bind(&title).bind(&removed).fetch_one(&mut *tx).await?;
+            // Its stored values and history go, in the background, a batch at a time.
+            for f in &removed {
+                crate::jobs::enqueue_background(&mut *tx, JOB_PURGE, json!({"type_id": c.id, "field": f}), None).await?;
+            }
+            row
         }
         None => insert(&mut tx, account_id, &key, &name, &plural, &fields, title.as_deref()).await?,
     };
@@ -472,7 +499,8 @@ pub async fn for_upsert(conn: &mut PgConnection, account_id: Uuid, key: &str, va
         Some(_) => {
             let q = format!("SELECT {TYPE_COLS} FROM object_types WHERE account_id = $1 AND key = $2 FOR UPDATE");
             let mut t: ObjectType = sqlx::query_as(&q).bind(account_id).bind(key).fetch_one(&mut *conn).await?;
-            add_inferred(&mut t.fields, values)?;
+            let removed = t.removed_sensitive.clone();
+            add_inferred(&mut t.fields, values, &removed)?;
             let q = format!("UPDATE object_types SET fields = $2, updated_at = now() WHERE id = $1 RETURNING {TYPE_COLS}");
             Ok(sqlx::query_as(&q).bind(t.id).bind(json!(t.fields)).fetch_one(&mut *conn).await?)
         }
@@ -483,7 +511,7 @@ pub async fn for_upsert(conn: &mut PgConnection, account_id: Uuid, key: &str, va
                 return Box::pin(for_upsert(conn, account_id, key, values)).await;
             }
             let mut fields = Vec::new();
-            add_inferred(&mut fields, values)?;
+            add_inferred(&mut fields, values, &[])?;
             let (name, plural) = default_names(key);
             // A text field called name or title becomes the title.
             let title = ["name", "title"].iter().find(|k| fields.iter().any(|f| f.key == **k && f.kind == Kind::Text)).map(|k| k.to_string());
@@ -492,7 +520,7 @@ pub async fn for_upsert(conn: &mut PgConnection, account_id: Uuid, key: &str, va
     }
 }
 
-fn add_inferred(fields: &mut Vec<FieldDef>, values: &Map<String, Value>) -> AppResult<()> {
+fn add_inferred(fields: &mut Vec<FieldDef>, values: &Map<String, Value>, removed_sensitive: &[String]) -> AppResult<()> {
     let mut keys: Vec<&String> = values.keys().collect();
     keys.sort();
     for k in keys {
@@ -503,7 +531,44 @@ fn add_inferred(fields: &mut Vec<FieldDef>, values: &Map<String, Value>) -> AppR
         if fields.len() >= MAX_FIELDS {
             return Err(AppError::bad(format!("a type can have at most {MAX_FIELDS} fields; {k:?} would be one more")));
         }
-        fields.push(inferred(k, v).map_err(AppError::bad)?);
+        let mut f = inferred(k, v).map_err(AppError::bad)?;
+        // The name of a sensitive field taken off the type: sensitive again.
+        f.sensitive = removed_sensitive.contains(k);
+        fields.push(f);
+    }
+    Ok(())
+}
+
+pub const JOB_PURGE: &str = "objects_purge_field";
+
+/// Job: delete a removed sensitive field's stored values and history, a batch at a time (stops if
+/// the type defines the field again: its values are its own again, and sensitive).
+pub async fn purge_field(db: &sqlx::PgPool, type_id: Uuid, field: &str) -> AppResult<()> {
+    const BATCH: i64 = 1000;
+    let defined: Option<Value> = sqlx::query_scalar("SELECT fields FROM object_types WHERE id = $1").bind(type_id).fetch_optional(db).await?;
+    let Some(defs) = defined else { return Ok(()) };
+    if defs.as_array().is_some_and(|a| a.iter().any(|f| f["key"] == field)) {
+        return Ok(());
+    }
+    let objects = sqlx::query("UPDATE objects SET fields = fields - $2 WHERE id IN (SELECT id FROM objects WHERE type_id = $1 AND fields ? $2 LIMIT $3)")
+        .bind(type_id)
+        .bind(field)
+        .bind(BATCH)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let history = sqlx::query(
+        "UPDATE object_changes SET before = before - $2, after = after - $2, changed = array_remove(changed, $2)
+         WHERE id IN (SELECT c.id FROM object_changes c JOIN objects o ON o.id = c.object_id WHERE o.type_id = $1 AND (c.before ? $2 OR c.after ? $2) LIMIT $3)",
+    )
+    .bind(type_id)
+    .bind(field)
+    .bind(BATCH)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if objects as i64 >= BATCH || history as i64 >= BATCH {
+        crate::jobs::enqueue_background(db, JOB_PURGE, json!({"type_id": type_id, "field": field}), None).await?;
     }
     Ok(())
 }
@@ -535,7 +600,7 @@ mod tests {
     use super::*;
 
     fn def(kind: Kind) -> FieldDef {
-        FieldDef { key: "f".into(), label: None, kind, options: Vec::new(), currency: None, sensitive: false }
+        FieldDef { key: "f".into(), label: None, kind, options: Vec::new(), currency: None, sensitive: false, options_hidden: false }
     }
 
     #[test]
@@ -576,7 +641,7 @@ mod tests {
         assert!(!valid_type_key("1x"));
         assert!(valid_field_key("checkIn"));
         assert!(!valid_field_key("check-in"));
-        let f = |k: &str, kind| FieldDef { key: k.into(), label: None, kind, options: Vec::new(), currency: None, sensitive: false };
+        let f = |k: &str, kind| FieldDef { key: k.into(), label: None, kind, options: Vec::new(), currency: None, sensitive: false, options_hidden: false };
         assert!(check_fields(&[f("a", Kind::Text), f("a", Kind::Date)], None).is_err());
         assert!(check_fields(&[f("a", Kind::Text)], Some("b")).is_err());
         let mut secret = f("code", Kind::Text);

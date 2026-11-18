@@ -859,3 +859,58 @@ async fn sensitive_fields_never_reach_messages_or_dry_runs() {
     }
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn sensitivity_survives_edits_and_rules_fail_closed_at_run_time() {
+    let mut h = harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [
+        {"key": "status", "type": "text"}, {"key": "check_in", "type": "date"},
+        {"key": "pin", "type": "text", "sensitive": true}, {"key": "lock", "type": "enum", "options": ["front", "back"], "sensitive": true}]}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"status": "confirmed", "check_in": day(5), "pin": "4417", "lock": "front"}, "profiles": [{"email": "a@example.com"}]}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"pin": "5512"}}))).await;
+    // A sensitive enum's options are never listed, in the type or in an error.
+    let t = h.ok("GET", "/api/object-types/stay", None).await;
+    assert!(!t.to_string().contains("front"), "{t}");
+    let (s, e) = h.req("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S2", "fields": {"lock": "side"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(!e.to_string().contains("front"), "{e}");
+    // Saving the type without the hidden options keeps them.
+    let mut fields: Vec<Value> = t["fields"].as_array().unwrap().clone();
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone()}))).await;
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S3", "fields": {"lock": "back"}}))).await;
+    // Rules saved while status was ordinary; then status becomes sensitive.
+    let seg = h.ok("POST", "/api/segments", Some(json!({"name": "No confirmed stay", "definition": {"conditions": [{"type": "object", "object_type": "stay", "op": "zero", "where": [{"field": "status", "op": "eq", "value": "confirmed"}]}]}}))).await;
+    let seg_id: uuid::Uuid = seg["id"].as_str().unwrap().parse().unwrap();
+    live(&mut h, json!({"name": "Not cancelled", "trigger": {"type": "object", "object_type": "stay", "on": "updated", "filters": [{"field": "status", "op": "neq", "value": "cancelled"}]},
+        "definition": {"entry": "d1", "nodes": [{"id": "d1", "type": "delay", "amount": 1, "unit": "days", "next": null}]}})).await;
+    let date_flow = h.ok("POST", "/api/flows", Some(email_flow("Dated", json!({"type": "object_date", "object_type": "stay", "field": "check_in", "offset_days": -1}), "x"))).await;
+    for f in fields.iter_mut() {
+        if f["key"] == "status" || f["key"] == "check_in" {
+            f["sensitive"] = json!(true);
+        }
+    }
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields.clone()}))).await;
+    h.ok("POST", "/api/profiles", Some(json!({"email": "nobody@example.com"}))).await;
+    dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM segment_members WHERE segment_id = '{seg_id}'")).await, 0, "a zero-count rule on a sensitive field matches nobody");
+    assert_eq!(h.req("POST", "/api/segments/preview", Some(json!({"definition": seg["definition"].clone()}))).await.0, StatusCode::BAD_REQUEST, "saving or previewing says why");
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"pin": "7777"}}))).await;
+    h.drain().await;
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 0, "a `neq` filter on a sensitive field starts nothing");
+    let report = h.ok("GET", &format!("/api/flows/{}/report", date_flow["id"].as_str().unwrap()), None).await;
+    assert_eq!(report["object_dates"]["hidden"], true, "{report}");
+    // Taking pin off the type: its values and history go, and a later pin is sensitive again.
+    fields.retain(|f| f["key"] != "pin");
+    h.ok("PATCH", "/api/object-types/stay", Some(json!({"fields": fields}))).await;
+    h.drain().await;
+    let left: String = sqlx::query_scalar("SELECT concat_ws(' ', (SELECT string_agg(fields::text, ' ') FROM objects), (SELECT string_agg(concat_ws(' ', before::text, after::text, changed::text), ' ') FROM object_changes))").fetch_one(&h.state.db).await.unwrap();
+    for v in ["4417", "5512", "7777", "\"pin\""] {
+        assert!(!left.contains(v), "{v} survived: {left}");
+    }
+    h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": "S1", "fields": {"pin": "1234"}}))).await;
+    let t = h.ok("GET", "/api/object-types/stay", None).await;
+    assert_eq!(t["fields"].as_array().unwrap().iter().find(|f| f["key"] == "pin").unwrap()["sensitive"], true);
+    assert!(!h.ok("GET", "/api/object-types/stay/objects", None).await.to_string().contains("1234"));
+    h.cleanup().await;
+}

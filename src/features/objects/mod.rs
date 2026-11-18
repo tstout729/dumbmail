@@ -209,6 +209,10 @@ impl Feature for Module {
                 None => Ok(()),
             }),
             JOB_TRIM => Some(trim(state).await),
+            types::JOB_PURGE => Some(match (id("type_id"), payload["field"].as_str()) {
+                (Some(t), Some(f)) => types::purge_field(&state.db, t, f).await.map_err(|e| anyhow::anyhow!(e.public_message())),
+                _ => Ok(()),
+            }),
             _ => None,
         }
     }

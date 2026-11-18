@@ -233,7 +233,7 @@ function FieldsEditor({ ty }: { ty: ObjectType }) {
               </Select>
             </Field>
             {f.type === "enum" ? (
-              <Field label="Options" hint="Leave empty for any short text" className="w-full sm:w-64">
+              <Field label="Options" hint={f.options_hidden ? "Hidden for a sensitive field; leave empty to keep them" : "Leave empty for any short text"} className="w-full sm:w-64">
                 <TagInput value={f.options ?? []} onChange={(options) => set(i, { ...f, options })} placeholder="Add an option" aria-label="Options" />
               </Field>
             ) : null}
@@ -310,6 +310,7 @@ function clean(f: FieldDef): FieldDef {
   const out: FieldDef = { key: f.key.trim(), type: f.type };
   if (f.label?.trim()) out.label = f.label.trim();
   if (f.type === "enum" && f.options?.length) out.options = f.options;
+  // `options_hidden` is only for showing: the server keeps hidden options when none are sent.
   if (f.type === "money" && f.currency) out.currency = f.currency;
   if (f.sensitive) out.sensitive = true;
   return out;
