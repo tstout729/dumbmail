@@ -3,7 +3,7 @@ import { ArrowDown, ArrowUp, Bookmark, ChevronDown, Copy, GripVertical, Plus, Tr
 import type { EmailBlock, EmailBlockType } from "../../api";
 import { IconButton, Menu, buttonClass, cx } from "../ui";
 import { BlockFields } from "./BlockFields";
-import { blockMeta, blockOrder, blockSummary, newBlock } from "./blocks";
+import { blockMeta, blockOrder, blockSummary, newBlock, withKeys } from "./blocks";
 import { BlockOptionsPanel, SavedBlockPicker } from "../../features/content/BlockExtras";
 
 type BlockListProps = {
@@ -63,7 +63,7 @@ export function BlockList({ blocks, onChange, nested, savedBlocks = true }: Bloc
   };
   const duplicate = (i: number) => {
     const next = [...blocks];
-    next.splice(i + 1, 0, structuredClone(blocks[i]));
+    next.splice(i + 1, 0, withKeys(structuredClone(blocks[i])));
     onChange(next);
     setOpen(i + 1);
   };

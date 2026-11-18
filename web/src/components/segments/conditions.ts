@@ -1,5 +1,6 @@
 import { isCouponConditionComplete, newCouponCondition } from "../../features/coupons/CouponConditionFields";
 import { isObjectConditionComplete, newObjectCondition, objectConditionSummary } from "../../features/objects/conditionRules";
+import { isLanguageConditionComplete, languageConditionSummary, newLanguageCondition } from "../../features/translations/LanguageConditionFields";
 import type { CmpOp, Condition, EventCountOp, EventWindow, FieldFilter, Prediction, PropOp, SegmentDefinition, TimeOp } from "../../api";
 
 export const conditionLabels: Record<Condition["type"], string> = {
@@ -18,6 +19,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
   consent: "Consent",
   can_receive: "Can receive email or SMS",
   suppressed: "Email suppressed",
+  language: "Language",
   prediction: "Prediction",
   random: "Random sample",
   group: "Group (AND / OR)",
@@ -25,7 +27,7 @@ export const conditionLabels: Record<Condition["type"], string> = {
 
 /** Condition types grouped for the pickers. */
 export const conditionGroups: { label: string; types: Condition["type"][] }[] = [
-  { label: "Profile", types: ["property"] },
+  { label: "Profile", types: ["property", "language"] },
   { label: "Activity", types: ["event", "event_value", "event_time", "product", "engagement", "message", "form", "coupon"] },
   { label: "Membership", types: ["list", "segment"] },
   { label: "Objects", types: ["object"] },
@@ -142,6 +144,8 @@ export function conditionDefaults(type: Condition["type"], firstListId?: string)
       return { type, channel: "email", value: true };
     case "suppressed":
       return { type, value: true };
+    case "language":
+      return newLanguageCondition();
     case "prediction":
       return { type, measure: "churn_risk", op: "in", value: ["high"] };
     case "random":
@@ -203,6 +207,8 @@ export function isConditionComplete(c: Condition): boolean {
     case "can_receive":
     case "suppressed":
       return true;
+    case "language":
+      return isLanguageConditionComplete(c);
     case "prediction":
       if (c.measure === "churn_risk") return c.op === "in" ? Array.isArray(c.value) && c.value.length > 0 : typeof c.value === "string";
       return c.op === "between" ? isPair(c.value, isNum) : isNum(c.value);
@@ -295,6 +301,8 @@ export function conditionSummary(c: Condition, names: Names | ((id: string) => s
       return `${c.value ? "can" : "can't"} receive ${c.channel === "sms" ? "SMS" : c.channel === "push" ? "push" : "email"}`;
     case "suppressed":
       return c.value ? "email suppressed" : "email not suppressed";
+    case "language":
+      return languageConditionSummary(c);
     case "prediction":
       return `${predictions.find((p) => p.value === c.measure)?.label ?? c.measure} ${cmpSummary(c.op, c.value)}`;
     case "random":

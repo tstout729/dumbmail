@@ -601,7 +601,8 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
         };
         // Test-slice messages carry their version; everyone after the test gets the winner.
         let content = version_content(&c, ab.as_ref(), variant.as_deref().or(c.ab_winner.as_deref())).unwrap_or(&c.content);
-        let outcome = sending::send(
+        // Inside this campaign's own send, the footer wording fixed at its start applies (see features::translations).
+        let outcome = crate::features::translations::in_campaign(c.id, sending::send(
             state,
             SendSpec {
                 account: &account,
@@ -616,7 +617,7 @@ pub async fn send_batch(state: &AppState, campaign_id: Uuid, ids: &[Uuid]) -> an
                 message_id: Some(*mid),
                 to_override: None,
             },
-        )
+        ))
         .await;
         match outcome {
             // A text or push outside its recipient's hours waits alone; everyone else in the batch goes on.

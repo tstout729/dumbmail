@@ -82,9 +82,9 @@ function TemplateEditor({ template }: { template: Template }) {
         }
       />
       {template.channel === "email" ? (
-        <EmailEditor value={current.content as EmailContent} onChange={(content) => setDraft({ ...current, content })} templates={false} />
+        <EmailEditor value={current.content as EmailContent} onChange={(content) => setDraft({ ...current, content })} templates={false} translationTarget={{ kind: "template", id: template.id }} />
       ) : (
-        <SmsEditor value={current.content as SmsContent} onChange={(content) => setDraft({ ...current, content })} templates={false} />
+        <SmsEditor value={current.content as SmsContent} onChange={(content) => setDraft({ ...current, content })} templates={false} translationTarget={{ kind: "template", id: template.id }} />
       )}
       {confirmDelete ? (
         <ConfirmDialog

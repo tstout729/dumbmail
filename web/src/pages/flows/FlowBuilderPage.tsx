@@ -242,7 +242,7 @@ function FlowBuilder({ flow }: { flow: Flow }) {
       {emailNode && emailNode.type === "email" ? (
         <Modal title={emailNode.name || "Email"} onClose={() => setEmailNodeId(null)} size="full">
           <div className="h-full overflow-y-auto p-5">
-            <EmailEditor value={emailNode.content} onChange={(content) => editDef(replaceNode(def, { ...emailNode, content }))} templateName={emailNode.name} />
+            <EmailEditor value={emailNode.content} onChange={(content) => editDef(replaceNode(def, { ...emailNode, content }))} templateName={emailNode.name} translationTarget={{ kind: "flow", id: flow.id, step: emailNode.id }} />
             <CheckPanel content={emailNode.content} flowId={flow.id} nodeId={emailNode.id} className="mt-4" />
           </div>
         </Modal>

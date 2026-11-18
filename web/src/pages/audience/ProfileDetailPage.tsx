@@ -251,6 +251,7 @@ function PropertiesCard({ profile, tz }: { profile: Profile; tz: string }) {
     ["Email", profile.email],
     ["Phone", profile.phone_number ? formatPhone(profile.phone_number) : null],
     ["External ID", profile.external_id],
+    ["Language", profile.locale ?? null],
     ["Created", formatDateTime(profile.created_at, tz)],
     ["Last active", profile.last_event_at ? formatDateTime(profile.last_event_at, tz) : null],
   ];
@@ -305,6 +306,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
     email: profile.email ?? "",
     phone_number: profile.phone_number ?? "",
     external_id: profile.external_id ?? "",
+    locale: profile.locale ?? "",
     email_consent: profile.email_consent,
     sms_consent: profile.sms_consent,
   });
@@ -321,6 +323,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
         email: nullable(fields.email),
         phone_number: nullable(fields.phone_number),
         external_id: nullable(fields.external_id),
+        locale: nullable(fields.locale),
         email_consent: fields.email_consent,
         sms_consent: fields.sms_consent,
         properties,
@@ -334,7 +337,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
     );
   };
 
-  const text = (key: "first_name" | "last_name" | "email" | "phone_number" | "external_id", label: string) => (
+  const text = (key: "first_name" | "last_name" | "email" | "phone_number" | "external_id" | "locale", label: string) => (
     <Field label={label}>
       <Input value={fields[key]} onChange={(e) => setFields({ ...fields, [key]: e.target.value })} />
     </Field>
@@ -350,6 +353,7 @@ function ProfileEditForm({ profile, onDone }: { profile: Profile; onDone: () => 
         {text("email", "Email")}
         {text("phone_number", "Phone")}
         {text("external_id", "External ID")}
+        {text("locale", "Language (like fr or pt-BR)")}
         <div className="grid grid-cols-2 gap-3">
           <Field label="Email consent">
             <Select value={fields.email_consent} onChange={(e) => setFields({ ...fields, email_consent: e.target.value as Consent })}>

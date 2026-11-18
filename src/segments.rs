@@ -117,6 +117,18 @@ pub enum Condition {
         #[serde(default = "yes")]
         value: bool,
     },
+    /// The person's language (`profiles.locale`, see features::translations): `is`, `is_not` or
+    /// `is_one_of` the tags in `values` (or `value`). A tag without a region (`fr`) matches every
+    /// region of the language (`fr-CA`); one with a region matches only it. `is_not` includes
+    /// people whose language isn't known.
+    Language {
+        #[serde(default)]
+        op: LangOp,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        values: Vec<String>,
+    },
     /// Email suppressed after a hard bounce or spam complaint.
     Suppressed {
         #[serde(default = "yes")]
@@ -344,6 +356,24 @@ pub enum ListOp {
     #[default]
     In,
     NotIn,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LangOp {
+    #[default]
+    Is,
+    IsNot,
+    IsOneOf,
+}
+
+/// A language condition's tags, normalized (at most 20).
+fn language_tags(value: &Option<String>, values: &[String]) -> AppResult<Vec<String>> {
+    let raw: Vec<&String> = value.iter().chain(values.iter()).collect();
+    if raw.is_empty() || raw.len() > 20 {
+        return Err(AppError::bad("a language condition needs 1 to 20 language tags (like fr or pt-BR)"));
+    }
+    raw.into_iter().map(|t| crate::features::translations::locale::normalize(t).ok_or_else(|| AppError::bad(format!("{t:?} isn't a language tag like fr or pt-BR")))).collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -667,6 +697,9 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 }
             }
             Condition::Group { conditions, .. } => validate(conditions, depth + 1)?,
+            Condition::Language { value, values, .. } => {
+                language_tags(value, values)?;
+            }
             Condition::List { .. } | Condition::Segment { .. } | Condition::CanReceive { .. } | Condition::Suppressed { .. } => {}
         }
     }
@@ -1247,6 +1280,14 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
         }
         Condition::Suppressed { value } => {
             qb.push(if *value { "(p.email_suppressed_reason IS NOT NULL)" } else { "(p.email_suppressed_reason IS NULL)" });
+        }
+        Condition::Language { op, value, values } => {
+            let tags = language_tags(value, values).unwrap_or_default();
+            let (exact, bare): (Vec<String>, Vec<String>) = tags.into_iter().map(|t| t.to_lowercase()).partition(|t| t.contains('-'));
+            if *op == LangOp::IsNot {
+                qb.push("NOT ");
+            }
+            qb.push("COALESCE(lower(p.locale) = ANY(").push_bind(exact).push(") OR lower(split_part(p.locale, '-', 1)) = ANY(").push_bind(bare).push("), false)");
         }
         Condition::Form { form_id, op, within_days, since, until } => {
             if *op == HasOp::HasNot {
