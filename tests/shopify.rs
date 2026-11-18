@@ -753,16 +753,16 @@ async fn orders_become_trusted_events_once() {
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
         &json!({"metric": "Placed Order", "profile": {"email": "ann@example.com"}, "properties": {"tracked_by": "shopify_pixel", "total": 9999, "shopify_state": forged}, "value": 9999, "unique_id": "order:5001"}).to_string()).await;
     assert_eq!(s, StatusCode::OK);
+    h.drain().await;
+    assert_eq!(flow_runs(&h).await, 1, "the browser's order started the flow, as it does today");
+    let browser_row: Uuid = sqlx::query_scalar("SELECT id FROM events WHERE unique_id = 'order:5001'").fetch_one(&h.state.db).await.unwrap();
+    connect(&mut h).await;
     // Once connected, the app's metrics can't be sent from a browser for this account.
     for metric in ["Placed Order", "Started Checkout", "Refunded Order", "Fulfilled Order", "Cancelled Order", "Ordered Product", "Fulfilled Partial Order"] {
         let (s, _, body) = h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")],
             &json!({"metric": metric, "profile": {"email": "ann@example.com"}, "value": 5}).to_string()).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{metric}: {body}");
     }
-    h.drain().await;
-    assert_eq!(flow_runs(&h).await, 1, "the browser's order started the flow, as it does today");
-    let browser_row: Uuid = sqlx::query_scalar("SELECT id FROM events WHERE unique_id = 'order:5001'").fetch_one(&h.state.db).await.unwrap();
-    connect(&mut h).await;
 
     // Then Shopify's webhook: the same event, now with the real amounts, trusted.
     hook(&h, "orders/create", "w1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now())).await;
@@ -781,7 +781,8 @@ async fn orders_become_trusted_events_once() {
     assert_eq!(props["shopify_customer_id"], "1");
     assert_eq!(props["shopify_shop"], SHOP);
     assert_eq!(props["refunded_total"], 0.0, "nothing from the browser's copy is kept");
-    assert_eq!(flow_runs(&h).await, 2, "every consumer sees the trusted order as new (main's rule)");
+    // The flow sees the trusted order as a new event; Ann is already in it from the browser's copy.
+    assert_eq!(flow_runs(&h).await, 1);
     assert_eq!(count_events(&h, "Ordered Product").await, 2);
     assert_eq!(value(&h, "Ordered Product", "order:5001:12").await, Some(30.0));
     // The order doesn't touch consent.
@@ -795,13 +796,13 @@ async fn orders_become_trusted_events_once() {
     h.drain().await;
     assert_eq!(count_events(&h, "Placed Order").await, 2);
     assert_eq!(value(&h, "Placed Order", "order:5002").await, Some(100.0));
-    assert_eq!(flow_runs(&h).await, 3);
+    assert_eq!(flow_runs(&h).await, 2);
 
     // An old order seen for the first time (an edit to last week's order) is history: no flow.
     hook(&h, "orders/updated", "w3", &order_body(5003, 3, "cat@example.com", chrono::Utc::now() - chrono::Duration::days(7))).await;
     h.drain().await;
     assert_eq!(count_events(&h, "Placed Order").await, 3);
-    assert_eq!(flow_runs(&h).await, 3, "history doesn't start flows");
+    assert_eq!(flow_runs(&h).await, 2, "history doesn't start flows");
 
     // A refund: read from the Admin API (shop money, successful transactions), applied once
     // however many webhooks mention it.
@@ -1763,12 +1764,17 @@ async fn privacy_requests_are_retried_without_blocking_others() {
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests WHERE shopify_request_id = 666").await, 1);
 
     // Retention: a body never processed is deleted after 30 days and counted.
-    sqlx::query("INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, received_at, generation, shop_domain) SELECT account_id, 'old', 'orders/create', '{\"id\": 1}', now() - interval '31 days', -1, $1 FROM shopify_shops")
+    sqlx::query("INSERT INTO shopify_webhooks (account_id, webhook_id, topic, payload, received_at, generation, shop_domain) SELECT account_id, 'old', 'orders/create', '{\"id\": 1}', now() - interval '31 days', generation, $1 FROM shopify_shops")
         .bind(SHOP)
         .execute(&h.state.db)
         .await
         .unwrap();
     tick(&h).await;
+    // Clean-up is queued in the background lane; run just that job (the worker would process the
+    // stale delivery itself otherwise).
+    let lane: String = sqlx::query_scalar("SELECT lane FROM jobs WHERE kind = 'shopify_cleanup'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(lane, dumbmail::jobs::BACKGROUND);
+    dumbmail::features::run_job(&h.state, "shopify_cleanup", &json!({})).await.unwrap().unwrap();
     let kept: Option<Value> = sqlx::query_scalar("SELECT payload FROM shopify_webhooks WHERE webhook_id = 'old'").fetch_one(&h.state.db).await.unwrap();
     assert!(kept.is_none());
     let v = h.ok("GET", "/api/shopify", None).await;
@@ -2079,6 +2085,12 @@ console.log(JSON.stringify({{
 
 // ---------- Wiring round ----------
 
+/// A browser event through the public endpoint; its status.
+async fn browser(h: &Harness, pk: &str, metric: &str) -> StatusCode {
+    let body = json!({"metric": metric, "profile": {"email": "ann@example.com"}, "value": 5}).to_string();
+    h.raw("POST", &format!("/client/events?k={pk}"), &[("content-type", "application/json")], &body).await.0
+}
+
 /// Item 3: connecting makes the app's metrics server-only for that account only, and they stay so
 /// after a disconnect; other accounts keep sending the same names from their browsers.
 #[tokio::test]
@@ -2295,13 +2307,19 @@ async fn bulk_download_skip_limit() {
 
 /// Item 10: withdrawing consent after the snippet loaded stops it: nothing more is sent, and events
 /// waiting to be sent are deleted.
-#[test]
-fn snippet_stops_when_consent_is_withdrawn() {
+#[tokio::test]
+async fn snippet_stops_when_consent_is_withdrawn() {
     if !node_available() {
         eprintln!("node not installed; skipping");
         return;
     }
-    let onsite = include_str!("../src/onsite.js");
+    let mut h = harness!();
+    h.signup().await;
+    let pk: String = sqlx::query_scalar("SELECT public_key FROM accounts").fetch_one(&h.state.db).await.unwrap();
+    // The snippet exactly as the server serves it.
+    let (s, _, onsite) = h.raw("GET", &format!("/onsite.js?k={pk}"), &[], "").await;
+    assert_eq!(s, StatusCode::OK);
+    h.cleanup().await;
     let liquid = include_str!("../connectors/shopify/extensions/dumbmail-embed/blocks/dumbmail.liquid");
     let embed = liquid.split("<script>").nth(1).unwrap().split("</script>").next().unwrap().replace("{{ dumbmail_src | json }}", "\"https://dm.test/onsite.js?k=pk\"");
     let script = format!(
@@ -2310,22 +2328,36 @@ const posts = [];
 const storage = () => {{ const m = new Map(); return {{ getItem: (k) => m.has(k) ? m.get(k) : null, setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k), _m: m }}; }};
 const ls = storage(), ss = storage();
 const listeners = {{}};
-const el = () => new Proxy({{ attrs: {{}}, style: {{}}, setAttribute(k, v) {{ this.attrs[k] = v; }}, getAttribute(k) {{ return this.attrs[k] ?? null; }} }}, {{ get: (t, k) => k in t ? t[k] : (() => null) }});
+const el = () => new Proxy({{
+  attrs: {{}}, style: {{}}, dataset: {{}}, children: [], childNodes: [], textContent: "", innerHTML: "", className: "", value: "",
+  classList: {{ contains: () => false, add: () => {{}}, remove: () => {{}}, toggle: () => {{}} }},
+  setAttribute(k, v) {{ this.attrs[k] = v; }}, getAttribute(k) {{ return this.attrs[k] ?? null; }}, hasAttribute(k) {{ return k in this.attrs; }},
+  querySelector: () => null, querySelectorAll: () => [], getElementsByTagName: () => [], closest: () => null, matches: () => false,
+  appendChild: (c) => c, insertBefore: (c) => c, removeChild: (c) => c, remove: () => {{}}, addEventListener: () => {{}}, removeEventListener: () => {{}},
+  attachShadow: () => el(), getBoundingClientRect: () => ({{ top: 0, left: 0, width: 0, height: 0 }}),
+}}, {{ get: (t, k) => k in t ? t[k] : (typeof k === "symbol" ? undefined : (() => null)) }});
 const script = el();
 script.attrs.src = "https://dm.test/onsite.js?k=pk";
 script.src = "https://dm.test/onsite.js?k=pk";
 globalThis.localStorage = ls; globalThis.sessionStorage = ss;
 globalThis.location = {{ href: "https://shop.test/products/mug", origin: "https://shop.test", pathname: "/products/mug", search: "", hostname: "shop.test", protocol: "https:" }};
-globalThis.navigator = {{ userAgent: "node" }};
+Object.defineProperty(globalThis, "navigator", {{ value: {{ userAgent: "node", sendBeacon: () => true }}, configurable: true }});
 globalThis.fetch = (url, opts) => {{ if (opts && opts.method === "POST") posts.push(String(url)); return Promise.resolve({{ ok: true, json: () => Promise.resolve([]) }}); }};
 globalThis.document = new Proxy({{
   currentScript: script, readyState: "complete", head: {{ appendChild: (s) => {{ added.push(s); }} }}, body: el(), documentElement: el(),
-  createElement: () => el(), querySelector: () => null, querySelectorAll: () => [], getElementById: () => null,
+  createElement: () => el(), querySelector: () => null, querySelectorAll: () => [], getElementById: () => null, getElementsByTagName: () => [],
+  removeEventListener: () => {{}}, visibilityState: "visible", hidden: false,
   addEventListener: (n, cb) => {{ listeners[n] = cb; }}, cookie: "", title: "Mug", referrer: "",
 }}, {{ get: (t, k) => k in t ? t[k] : undefined }});
 const added = [];
 globalThis.window = globalThis;
-window.addEventListener = () => {{}};
+window.addEventListener = () => {{}}; window.removeEventListener = () => {{}};
+globalThis.history = {{ pushState: () => {{}}, replaceState: () => {{}} }};
+globalThis.MutationObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.IntersectionObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.requestAnimationFrame = (f) => setTimeout(f, 0);
+globalThis.getComputedStyle = () => ({{}}); globalThis.innerWidth = 1200; globalThis.innerHeight = 800; globalThis.scrollY = 0;
+globalThis.Intl = Intl;
 window.setTimeout = setTimeout; window.setInterval = () => 0;
 window.Shopify = {{ loadFeatures: (f, cb) => {{ window.Shopify.customerPrivacy = {{ analyticsProcessingAllowed: () => true, marketingAllowed: () => true }}; cb(false); }} }};
 {embed}
@@ -2340,7 +2372,7 @@ window.dumbmail.track("After Stop", {{}});
 window.dumbmail.identify({{ email: "bob@example.com" }});
 setTimeout(() => console.log(JSON.stringify({{ added: added.length, before, after: posts.length - before, buffer: ls.getItem("pl_buffer"), profile: ls.getItem("pl_profile") }})), 20);
 "#,
-        onsite_json = serde_json::to_string(onsite).unwrap()
+        onsite_json = serde_json::to_string(&onsite).unwrap()
     );
     let out: Value = serde_json::from_str(&run_node(&script)).unwrap();
     assert_eq!(out["added"], 1, "the embed loaded the snippet");
