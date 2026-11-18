@@ -184,6 +184,15 @@ CREATE TABLE review_sends (
     finished_at timestamptz
 );
 CREATE UNIQUE INDEX review_sends_step ON review_sends (flow_run_id, node_id) WHERE flow_run_id IS NOT NULL;
+-- Each request is asked once and reminded once: one intent per (request, stage), however many
+-- sends race for it. A skipped or failed intent gives its requests back.
+CREATE TABLE review_send_items (
+    request_id uuid NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+    stage text NOT NULL CHECK (stage IN ('ask', 'reminder')),
+    send_id uuid NOT NULL REFERENCES review_sends(id) ON DELETE CASCADE,
+    PRIMARY KEY (request_id, stage)
+);
+CREATE INDEX review_send_items_send ON review_send_items (send_id);
 CREATE INDEX review_sends_pending ON review_sends (created_at) WHERE status = 'pending';
 
 -- Confirmation emails for public reviews per normalised address per day, across all accounts.

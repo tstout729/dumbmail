@@ -157,28 +157,44 @@ pub enum Made {
     Skipped(&'static str),
 }
 
-/// Whether nothing has reached the person with this request yet and nothing is about to: never
-/// sent, not carried by a message that was handed over or may still be on its way, not waiting in a
-/// send intent, and never used. Such a request doesn't hold its order line.
-async fn never_reached(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT q.sent_at IS NULL AND q.submitted_at IS NULL
+/// What an order line's request has come to, for asking about the line again.
+enum LineState {
+    /// A message carried it and didn't go (or never got recorded): it doesn't hold the line.
+    NeverReached,
+    /// Never sent and not carried by any message: ask with it (one send intent per request).
+    Unsent,
+    /// Sent, used, or on its way.
+    Asked,
+}
+
+/// See [`LineState`].
+async fn line_state(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<LineState> {
+    let (reached, unsent): (bool, bool) = sqlx::query_as(
+        "SELECT NOT (q.sent_at IS NULL AND q.submitted_at IS NULL
             AND NOT EXISTS (SELECT 1 FROM review_sends rs WHERE rs.status = 'pending' AND q.id = ANY(rs.request_ids))
-            AND (q.message_id IS NULL
-                 OR EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id AND m.sent_at IS NULL AND m.status IN ('skipped', 'failed'))
-                 OR (NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id) AND q.created_at < now() - interval '30 minutes'))
+            AND q.message_id IS NOT NULL
+            AND (EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id AND m.sent_at IS NULL AND m.status IN ('skipped', 'failed'))
+                 OR (NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id) AND q.created_at < now() - interval '30 minutes'))),
+            q.sent_at IS NULL AND q.message_id IS NULL
          FROM review_requests q WHERE q.id = $1",
     )
     .bind(id)
     .fetch_one(conn)
-    .await
+    .await?;
+    Ok(if !reached {
+        LineState::NeverReached
+    } else if unsent {
+        LineState::Unsent
+    } else {
+        LineState::Asked
+    })
 }
 
 /// A request for one person and one item, or the open one they already have. Checked and written
 /// under a lock on the person and the item, so two sends at once can't both ask.
 ///
 /// An order line is asked about once, unless nothing ever reached the person (see
-/// [`never_reached`]); and a request that isn't verified gives way to a verified one for the same
+/// [`LineState`]); and a request that isn't verified gives way to a verified one for the same
 /// line or item (its link stops working).
 pub async fn make(state: &AppState, account: &Account, profile_id: Uuid, item: &Item, m: &Make<'_>) -> AppResult<Made> {
     let db = &state.db;
@@ -207,8 +223,16 @@ pub async fn make(state: &AppState, account: &Account, profile_id: Uuid, item: &
                 tx.commit().await?;
                 return Ok(Made::Existing(r));
             }
-            let replace = (verified && !r.verified && r.submitted_at.is_none() && r.review_id.is_none()) || never_reached(&mut tx, r.id).await?;
-            if !replace {
+            let state = line_state(&mut tx, r.id).await?;
+            let upgrade = verified && !r.verified && r.submitted_at.is_none() && r.review_id.is_none();
+            if !upgrade && matches!(state, LineState::Unsent) && r.open() {
+                // Made but not sent yet (a link, a skipped ask, or another call's ask in flight): this
+                // send uses it, and the send intent's unique key lets only one ask go.
+                tx.commit().await?;
+                return Ok(Made::Existing(r));
+            }
+            let lapsed = matches!(state, LineState::Unsent) && !r.open();
+            if !upgrade && !lapsed && !matches!(state, LineState::NeverReached) {
                 return Ok(Made::Skipped("asked"));
             }
             sqlx::query("DELETE FROM review_requests WHERE id = $1").bind(r.id).execute(&mut *tx).await?;
@@ -377,19 +401,37 @@ pub struct NewIntent<'a> {
     pub flow: Option<(Uuid, Uuid, &'a str)>,
 }
 
-/// Record a send intent and its queued message row together (the step's own, for a flow).
-/// Returns the intent, or the one the same flow step already recorded.
-pub async fn record_intent(conn: &mut sqlx::PgConnection, n: &NewIntent<'_>) -> AppResult<Intent> {
+/// What recording an intent came to.
+pub enum Recorded {
+    /// A new intent, holding the requests no other intent of the same stage holds.
+    New(Intent),
+    /// This flow step's own intent, recorded by an earlier attempt.
+    Own(Intent),
+    /// Another intent already holds every one of these requests for this stage: nothing to send.
+    Taken,
+}
+
+/// Record a send intent and its queued message row together (the step's own, for a flow). Each
+/// request goes to at most one intent per stage (ask, reminder), by a unique key: requests another
+/// intent already holds are left out, and if none is left the holder is returned instead.
+pub async fn record_intent(conn: &mut sqlx::PgConnection, n: &NewIntent<'_>) -> AppResult<Recorded> {
     let id = Uuid::now_v7();
     let (flow_id, run_id, node_id) = match n.flow {
         Some((f, r, node)) => (Some(f), Some(r), Some(node)),
         None => (None, None, None),
     };
+    if let (Some(run), Some(node)) = (run_id, node_id) {
+        let q = format!("SELECT {INTENT_COLS} FROM review_sends WHERE flow_run_id = $1 AND node_id = $2");
+        if let Some(i) = sqlx::query_as::<_, Intent>(&q).bind(run).bind(node).fetch_optional(&mut *conn).await? {
+            return Ok(Recorded::Own(i));
+        }
+    }
+    let stage = if n.kind == "reminder" { "reminder" } else { "ask" };
     let q = format!(
         "INSERT INTO review_sends (id, account_id, profile_id, flow_run_id, node_id, kind, channel, request_ids, created_ids)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING RETURNING {INTENT_COLS}"
     );
-    let made: Option<Intent> = sqlx::query_as(&q)
+    let inserted: Option<Intent> = sqlx::query_as(&q)
         .bind(id)
         .bind(n.account.id)
         .bind(n.person.id)
@@ -401,10 +443,30 @@ pub async fn record_intent(conn: &mut sqlx::PgConnection, n: &NewIntent<'_>) -> 
         .bind(n.created_ids)
         .fetch_optional(&mut *conn)
         .await?;
-    let Some(intent) = made else {
+    let Some(mut intent) = inserted else {
+        // The same step, recorded at the same moment by another worker.
         let q = format!("SELECT {INTENT_COLS} FROM review_sends WHERE flow_run_id = $1 AND node_id = $2");
-        return Ok(sqlx::query_as(&q).bind(run_id).bind(node_id).fetch_one(&mut *conn).await?);
+        return Ok(Recorded::Own(sqlx::query_as(&q).bind(run_id).bind(node_id).fetch_one(&mut *conn).await?));
     };
+    // The unique key decides: a racing send's insert waits here for the first to commit, then
+    // takes nothing it already holds.
+    let mine: Vec<Uuid> = sqlx::query_scalar(
+        "INSERT INTO review_send_items (request_id, stage, send_id) SELECT r, $2, $3 FROM unnest($1::uuid[]) r ON CONFLICT DO NOTHING RETURNING request_id",
+    )
+    .bind(n.request_ids)
+    .bind(stage)
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if mine.is_empty() {
+        sqlx::query("DELETE FROM review_sends WHERE id = $1").bind(id).execute(&mut *conn).await?;
+        return Ok(Recorded::Taken);
+    }
+    if mine.len() != n.request_ids.len() {
+        let keep: Vec<Uuid> = n.request_ids.iter().copied().filter(|r| mine.contains(r)).collect();
+        sqlx::query("UPDATE review_sends SET request_ids = $2 WHERE id = $1").bind(id).bind(&keep).execute(&mut *conn).await?;
+        intent.request_ids = keep;
+    }
     let to = if n.channel == "sms" { n.person.phone_number.clone() } else { n.person.email.clone() };
     sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, flow_id, flow_node_id, to_address, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued')")
         .bind(intent.id)
@@ -416,7 +478,7 @@ pub async fn record_intent(conn: &mut sqlx::PgConnection, n: &NewIntent<'_>) -> 
         .bind(to.unwrap_or_default())
         .execute(&mut *conn)
         .await?;
-    Ok(intent)
+    Ok(Recorded::New(intent))
 }
 
 async fn intent_for_step(db: &PgPool, run_id: Uuid, node_id: &str) -> AppResult<Option<Intent>> {
@@ -451,6 +513,8 @@ async fn finish(state: &AppState, intent: &Intent, status: &str, why: &str) -> A
             ready = sqlx::query_scalar("UPDATE review_requests SET sent_at = now() WHERE id = ANY($1) AND sent_at IS NULL RETURNING id").bind(&intent.request_ids).fetch_all(&mut *tx).await?;
         }
     } else {
+        // Nothing reached them: the requests are free to be asked (or reminded) again.
+        sqlx::query("DELETE FROM review_send_items WHERE send_id = $1").bind(intent.id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM review_requests WHERE id = ANY($1) AND sent_at IS NULL AND submitted_at IS NULL AND review_id IS NULL").bind(&intent.created_ids).execute(&mut *tx).await?;
         if intent.kind == "reminder" {
             sqlx::query("UPDATE review_requests SET reminded_at = NULL WHERE id = ANY($1)").bind(&intent.request_ids).execute(&mut *tx).await?;
@@ -655,13 +719,19 @@ pub async fn flow_step(
             if requests.is_empty() {
                 return Ok(None);
             }
-            let intent = record_intent(
+            let recorded = record_intent(
                 &mut tx,
                 &NewIntent { account, person, kind: if reminder { "reminder" } else { "ask" }, channel, request_ids: &requests, created_ids: &created, flow: Some((flow.id, run_id, node_id)) },
             )
             .await
             .map_err(err)?;
             tx.commit().await?;
+            let intent = match recorded {
+                Recorded::New(i) => i,
+                Recorded::Own(i) if i.status == "pending" => i,
+                // Settled already, or another send is already asking about all of these.
+                Recorded::Own(_) | Recorded::Taken => return Ok(None),
+            };
             if !reminder {
                 let mut all = ids_in(context.get("review_requests"));
                 for i in &intent.request_ids {
@@ -1024,10 +1094,20 @@ pub async fn send_ask(state: &AppState, account: &Account, person: &Profile, cha
     }
     let ids: Vec<Uuid> = requests.iter().map(|r| r.id).collect();
     let mut tx = state.db.begin().await?;
-    let intent = record_intent(&mut tx, &NewIntent { account, person, kind: "api", channel, request_ids: &ids, created_ids: &[], flow: None }).await?;
+    let intent = match record_intent(&mut tx, &NewIntent { account, person, kind: "api", channel, request_ids: &ids, created_ids: &[], flow: None }).await? {
+        Recorded::New(i) => i,
+        Recorded::Own(_) | Recorded::Taken => return Ok("already asked"),
+    };
+    // Its job is queued with it: if this request stops before dispatching, the job still sends it
+    // (once: whoever claims the intent first sends, the other finds it settled or claimed).
+    crate::jobs::enqueue(&mut *tx, "reviews_send", json!({"intent_id": intent.id}), Some(chrono::Utc::now() + chrono::Duration::seconds(API_SAFETY_SECS))).await?;
     tx.commit().await?;
+    super::hooks::point("api_after_intent", account.id).await.map_err(AppError::Internal)?;
     run_api_intent(state, account, &intent).await
 }
+
+/// When the job queued with an API ask runs, in case the request that made it never dispatched it.
+const API_SAFETY_SECS: i64 = 120;
 
 /// Dispatch an API ask (now, or from its job when it had to wait).
 pub async fn run_api_intent(state: &AppState, account: &Account, intent: &Intent) -> AppResult<&'static str> {

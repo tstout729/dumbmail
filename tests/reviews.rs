@@ -1284,3 +1284,50 @@ async fn a_text_ask_always_has_its_link() {
     assert_eq!(out["body"], format!("How was it? {link} Thanks!"));
     h.cleanup().await;
 }
+
+/// A write through the API with the dashboard's session, usable from several tasks at once.
+async fn api_post(h: &Harness, path: &str, body: Value) -> (StatusCode, Value) {
+    let b = h.page_headers("POST", axum::http::Request::builder().method("POST").uri(path).header("content-type", "application/json")).await;
+    let res = tower::ServiceExt::oneshot(h.router.clone(), b.body(axum::body::Body::from(body.to_string())).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Round 3, item 1: one intent per ask however many sends race for it, and the job that
+/// dispatches it is queued with it, so an API call that stops right after recording still sends.
+#[tokio::test]
+async fn one_intent_per_ask_and_always_dispatched() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    let body = json!({"email": "jane@x.test", "product_id": "MUG", "order_id": "A1", "send": "email", "confirm": true, "smart_sending_hours": 0});
+    let (a, b) = tokio::join!(api_post(&h, "/api/reviews/requests", body.clone()), api_post(&h, "/api/reviews/requests", body.clone()));
+    assert!(a.0.is_success() && b.0.is_success(), "{a:?} {b:?}");
+    let sent: Vec<&str> = [a.1["sent"].as_str().unwrap_or(""), b.1["sent"].as_str().unwrap_or("")].to_vec();
+    assert_eq!(sent.iter().filter(|s| **s == "sent").count(), 1, "{a:?} {b:?}");
+    let links: std::collections::HashSet<&str> = [&a.1, &b.1].iter().filter_map(|v| v["requests"][0]["url"].as_str()).collect();
+    assert_eq!(links.len(), 1, "both calls hand back the same link, or the second none: {a:?} {b:?}");
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM review_sends").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(intents, 1, "one intent for the one request");
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1, "one email, also after the queued job runs");
+    // Asked again later: nothing new.
+    let v = h.ok("POST", "/api/reviews/requests", Some(body)).await;
+    assert_ne!(v["sent"], "sent", "{v}");
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
+
+    // The API call stops right after its intent commits, before dispatching it.
+    person(&h, acct, "sam@x.test", "subscribed").await;
+    dumbmail::features::reviews::hooks::fail("api_after_intent", acct, 0);
+    let (s, _) = h.req("POST", "/api/reviews/requests", Some(json!({"email": "sam@x.test", "product_id": "MUG", "order_id": "A2", "send": "email", "confirm": true, "smart_sending_hours": 0}))).await;
+    assert!(!s.is_success(), "the call stopped");
+    assert!(mails_to(&h, "sam@x.test").is_empty());
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "the job queued with the intent sends it");
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "once");
+    h.cleanup().await;
+}
