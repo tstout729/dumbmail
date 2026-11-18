@@ -335,39 +335,65 @@ fn same_elem(a: &Elem, b: &Elem) -> Result<(), String> {
 }
 
 /// Characters that change how text around them is shown without showing anything themselves:
-/// bidirectional controls (which can reorder an address or a link) and invisible format
-/// characters (which can make a label look empty). Zero-width joiners and non-joiners stay
+/// every Unicode format character (General_Category Cf: bidirectional controls, which can
+/// reorder an address or a link, and zero-width and other invisible characters, which can make a
+/// label look empty) and the blank "filler" letters. Zero-width joiners and non-joiners stay
 /// allowed: Persian, Arabic, Indic scripts and emoji need them.
 pub fn is_hidden_control(c: char) -> bool {
-    matches!(c,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
-        | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}' | '\u{180E}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}')
+    if c == '\u{200C}' || c == '\u{200D}' {
+        return false;
+    }
+    matches!(c as u32,
+        // General_Category=Cf (Unicode 15).
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F
+        // Blank letters that render as nothing.
+        | 0x115F | 0x1160 | 0x3164 | 0xFFA0 | 0x2800)
 }
 
-/// `s` with HTML character references decoded (`&#x202E;`, `&#8238;`, `&rlm;` …), for checking
-/// what a reader would actually get.
+/// `s` with HTML character references decoded (`&#x202E;`, `&#0008238;`, `&rlm;`,
+/// `&ZeroWidthSpace;` …), repeated until nothing changes, for checking what a reader could get.
+/// Named references outside the ones that produce invisible characters are left as they are.
 pub fn decode_entities(s: &str) -> String {
-    static REF: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[A-Za-z]{2,8});?").unwrap());
-    REF.replace_all(s, |c: &regex::Captures<'_>| {
-        let e = &c[1];
-        let n = if let Some(h) = e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
-            u32::from_str_radix(h, 16).ok()
-        } else if let Some(d) = e.strip_prefix('#') {
-            d.parse().ok()
-        } else {
-            match e {
-                "lrm" => Some(0x200E),
-                "rlm" => Some(0x200F),
-                "zwsp" => Some(0x200B),
-                "NoBreak" => Some(0x2060),
-                "ZeroWidthSpace" => Some(0x200B),
-                "nbsp" => Some(0xA0),
-                _ => None,
-            }
-        };
-        n.and_then(char::from_u32).map(String::from).unwrap_or_else(|| c[0].to_string())
-    })
-    .into_owned()
+    static REF: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"&(#[xX][0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]{1,31});?").unwrap());
+    let mut cur = s.to_string();
+    for _ in 0..4 {
+        let next = REF
+            .replace_all(&cur, |c: &regex::Captures<'_>| {
+                let e = &c[1];
+                let n: Option<u32> = if let Some(h) = e.strip_prefix("#x").or_else(|| e.strip_prefix("#X")) {
+                    let h = h.trim_start_matches('0');
+                    if h.len() > 6 { None } else { u32::from_str_radix(if h.is_empty() { "0" } else { h }, 16).ok() }
+                } else if let Some(d) = e.strip_prefix('#') {
+                    let d = d.trim_start_matches('0');
+                    if d.len() > 7 { None } else { (if d.is_empty() { "0" } else { d }).parse().ok() }
+                } else {
+                    match e {
+                        "lrm" => Some(0x200E),
+                        "rlm" => Some(0x200F),
+                        "shy" => Some(0xAD),
+                        "zwnj" => Some(0x200C),
+                        "zwj" => Some(0x200D),
+                        "ZeroWidthSpace" | "NegativeVeryThinSpace" | "NegativeThinSpace" | "NegativeMediumSpace" | "NegativeThickSpace" => Some(0x200B),
+                        "NoBreak" => Some(0x2060),
+                        "ApplyFunction" | "af" => Some(0x2061),
+                        "InvisibleTimes" | "it" => Some(0x2062),
+                        "InvisibleComma" | "ic" => Some(0x2063),
+                        "amp" => Some(0x26),
+                        "nbsp" => Some(0xA0),
+                        _ => None,
+                    }
+                };
+                n.and_then(char::from_u32).map(String::from).unwrap_or_else(|| c[0].to_string())
+            })
+            .into_owned();
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
 }
 
 /// Why a text can't be shown as written, if it can't: it hides characters (see
@@ -452,6 +478,16 @@ mod tests {
         assert!(compare("Sale today", "Soldes <b>aujourd'hui</b>").is_err(), "no markup in a plain-text field");
         assert!(compare("<p>a</p><p>b</p>", "<p>a<p>b</p></p>").is_err(), "nesting");
         assert!(compare("<!--[if mso]>x<![endif]-->", "<!--[if !mso]>x<![endif]-->").is_err());
+    }
+
+    #[test]
+    fn invisible_characters_are_caught_however_they_are_written() {
+        for bad in ["a\u{202E}b", "a&#x202E;b", "a&#x0000202e;b", "a&#0008238;b", "a&#8203;b", "a&ZeroWidthSpace;b", "a&NegativeThinSpace;b", "a&rlm;b", "a&#xFEFF;b", "a\u{2066}b", "a\u{00AD}b", "a\u{3164}b", "a&amp;#x202E;b", "a\u{E0041}b"] {
+            assert!(hidden_controls(bad).is_err(), "{bad:?}");
+        }
+        for ok in ["می\u{200C}خواهم", "👨\u{200D}👩", "Tom &amp; Jerry", "&lt;b&gt;", "a&#x41;b", "&copy; 2026"] {
+            assert!(hidden_controls(ok).is_ok(), "{ok:?}");
+        }
     }
 
     #[test]
