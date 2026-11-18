@@ -313,6 +313,10 @@ async fn web_push_end_to_end() {
     assert_eq!(report["people"]["sent"], 1, "{report}");
     assert_eq!(report["people"]["clicked"], 1);
     assert_eq!(report["platforms"][0]["delivered"], 1);
+    // An order after the tap is credited to the push, like an SMS click.
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "ana@x.test"}, "value": 42.5}))).await;
+    let camp = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await;
+    assert_eq!(camp["stats"]["revenue"], 42.5, "{camp}");
 
     // The browser can't forge the server's push events.
     let (s, v) = public_post(&h, "/client/events", &a.key, json!({"metric": "Clicked Push", "profile": {"email": "ana@x.test"}})).await;
