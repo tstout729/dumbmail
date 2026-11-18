@@ -1467,7 +1467,7 @@ async fn imports_go_to_the_message_and_language_they_were_made_for() {
 }
 
 #[tokio::test]
-async fn right_to_left_keeps_column_order_and_full_documents_get_a_root_direction() {
+async fn right_to_left_keeps_column_order_and_full_documents_get_only_a_language() {
     let mut h = harness!();
     h.signup().await;
     set_languages(&mut h, json!(["ar", "pt-BR"])).await;
@@ -1483,11 +1483,21 @@ async fn right_to_left_keeps_column_order_and_full_documents_get_a_root_directio
         assert!(!tag.contains("dir=\"rtl\""), "a layout element has a direction: <{tag}");
     }
     assert!(html.contains(r#"<td dir="rtl" style="padding:8px 24px;text-align:"#), "{html}");
-    // A full HTML document gets lang and dir on its root.
-    let doc = json!({"subject": "Hi", "html": "<html lang=\"en\"><body><p>Hello</p></body></html>"});
-    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": doc, "language": "ar", "strings": [{"id": "html", "text": "<html lang=\"en\"><body><p>مرحبا</p></body></html>"}]}))).await;
+    // A full HTML document gets only lang on its root: the author's markup decides direction, so
+    // their two-column table keeps its order. DumbMail's own footer runs right to left.
+    let table = "<table><tr><td>FIRST</td><td>SECOND</td></tr></table>";
+    let doc = json!({"subject": "Hi", "html": format!("<html lang=\"en\"><body><p>Hello</p>{table}</body></html>")});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": doc, "language": "ar", "strings": [{"id": "html", "text": format!("<html lang=\"en\"><body><p>مرحبا</p>{table}</body></html>")}]}))).await;
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": v["content"], "language": "ar"}))).await;
-    assert!(p["html"].as_str().unwrap().starts_with(r#"<html lang="ar" dir="rtl"><body>"#), "{}", p["html"]);
+    let html = p["html"].as_str().unwrap();
+    assert!(html.starts_with(r#"<html lang="ar"><body>"#), "{html}");
+    assert!(!html[..html.find("SECOND").unwrap()].contains("dir="), "nothing before the columns has a direction: {html}");
+    assert!(html.contains(r#"<div dir="rtl" style="text-align:center"#), "{html}");
+    // The author's own direction stays.
+    let doc = json!({"subject": "Hi", "html": "<html dir=\"rtl\"><body><p>Hello</p></body></html>"});
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": doc, "language": "ar", "strings": [{"id": "html", "text": "<html dir=\"rtl\"><body><p>مرحبا</p></body></html>"}]}))).await;
+    let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": v["content"], "language": "ar"}))).await;
+    assert!(p["html"].as_str().unwrap().starts_with(r#"<html dir="rtl" lang="ar"><body>"#), "{}", p["html"]);
     // pt-PT doesn't get the pt-BR version: exact, then the language, then the default.
     let pt = h.ok("POST", "/api/translations/apply", Some(json!({"content": {"subject": "Hello", "blocks": [{"type": "heading", "text": "Hi"}]}, "language": "pt-BR", "strings": [{"id": "subject", "text": "Olá"}]}))).await;
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": pt["content"], "language": "pt-PT"}))).await;

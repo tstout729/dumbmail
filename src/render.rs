@@ -361,17 +361,17 @@ fn text_dir(html: &str) -> String {
     TEXT_CELL.replace_all(html, r#"<td dir="rtl" style="$1""#).into_owned()
 }
 
-/// A full HTML document in a language version: `lang` (and `dir="rtl"`) on its root element, in
-/// place of any it had.
-fn root_lang(html: &str, lang: &str, rtl: bool) -> String {
+/// A full HTML document in a language version: `lang` on its root element, in place of any it had.
+/// Direction is left to the author's own markup (a direction on the root would swap the columns of
+/// their tables).
+fn root_lang(html: &str, lang: &str) -> String {
     static ROOT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<html\b([^>]*)>").unwrap());
-    static ATTR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\s(lang|dir)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
+    static ATTR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\slang\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
     match ROOT.captures(html) {
         Some(c) => {
             let whole = c.get(0).expect("match");
             let kept = ATTR.replace_all(&c[1], "");
-            let dir = if rtl { r#" dir="rtl""# } else { "" };
-            format!("{}<html{} lang=\"{lang}\"{dir}>{}", &html[..whole.start()], kept.trim_end(), &html[whole.end()..])
+            format!("{}<html{} lang=\"{lang}\">{}", &html[..whole.start()], kept.trim_end(), &html[whole.end()..])
         }
         None => html.to_string(),
     }
@@ -591,14 +591,15 @@ pub fn render_email_hooked(
                 } else if lang.is_some() {
                     // A language version: where a browser really closes the body (a `</body>` in a
                     // translated attribute, title or comment isn't it), else the end.
-                    let div = format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div>"#);
+                    let dir = if rtl { r#" dir="rtl""# } else { "" };
+                    let div = format!(r#"<div{dir} style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div>"#);
                     let at = crate::features::translations::structure::body_close(html).unwrap_or(html.len());
                     format!("{}{div}{}", &html[..at], &html[at..])
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)
                 };
                 match &lang {
-                    Some((l, rtl)) => root_lang(&doc, l, *rtl),
+                    Some((l, _)) => root_lang(&doc, l),
                     None => doc,
                 }
             } else {
