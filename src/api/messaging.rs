@@ -836,8 +836,10 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             return Err(AppError::bad("add at least one step before turning the flow on"));
         }
         let account = load_account(&state.db, account_id).await?;
-        let has_email = def.nodes.iter().any(|n| n.kind == "email");
-        let has_sms = def.nodes.iter().any(|n| n.kind == "sms");
+        // A review request step sends on its own channel (see features::reviews).
+        let channel = |n: &flows::Node| if n.kind == "review_request" { n.data.get("channel").and_then(|v| v.as_str()).unwrap_or("email").to_string() } else { n.kind.clone() };
+        let has_email = def.nodes.iter().any(|n| channel(n) == "email");
+        let has_sms = def.nodes.iter().any(|n| channel(n) == "sms");
         if has_email && account.from_email.is_none() {
             return Err(AppError::bad("set a sender email in Settings → Sending before turning on a flow with emails"));
         }
@@ -848,9 +850,9 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             return Err(AppError::bad("set an SMS sending number in Settings → SMS before turning on a flow with texts"));
         }
         for n in &def.nodes {
-            if n.kind == "email" || n.kind == "sms" {
+            if matches!(n.kind.as_str(), "email" | "sms" | "review_request") {
                 let content = n.data.get("content").cloned().unwrap_or(json!({}));
-                render_preview(state, account_id, RenderBody { channel: n.kind.clone(), content, profile_id: None, event: Some(json!({"properties": {}})) })
+                render_preview(state, account_id, RenderBody { channel: channel(n), content, profile_id: None, event: Some(json!({"properties": {}})) })
                     .await
                     .map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
             }

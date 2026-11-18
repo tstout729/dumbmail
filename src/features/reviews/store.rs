@@ -353,7 +353,7 @@ pub fn flags(text: &str, account_words: &[String]) -> Vec<String> {
     if PHONE.is_match(text) {
         out.push("phone".into());
     }
-    if URL.is_match(text) {
+    if URL.is_match(&EMAIL.replace_all(text, " ")) {
         out.push("link".into());
     }
     let lower = text.to_lowercase();
