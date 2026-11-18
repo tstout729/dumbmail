@@ -43,7 +43,7 @@ async fn account(state: &AppState, k: &str) -> AppResult<Account> {
     if k.is_empty() || k.len() > 100 {
         return Err(AppError::Unauthorized);
     }
-    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1").bind(k).fetch_optional(&state.db).await?.ok_or(AppError::Unauthorized)
+    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1 AND closed_at IS NULL").bind(k).fetch_optional(&state.db).await?.ok_or(AppError::Unauthorized)
 }
 
 async fn throttle(state: &AppState, headers: &HeaderMap) -> AppResult<()> {

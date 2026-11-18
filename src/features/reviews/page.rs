@@ -51,6 +51,9 @@ async fn load(state: &AppState, token: &str) -> AppResult<(Request, Account, Opt
     let id = requests::id_from_token(state, token).ok_or_else(|| AppError::not_found("review link"))?;
     let r = requests::get(&state.db, id).await?.ok_or_else(|| AppError::not_found("review link"))?;
     let account = crate::campaigns::load_account(&state.db, r.account_id).await?;
+    if account.closed_at.is_some() {
+        return Err(AppError::not_found("review link"));
+    }
     let review = match r.review_id {
         Some(rid) => Some(store::get(&state.db, r.account_id, rid).await?),
         None => None,
@@ -786,7 +789,7 @@ pub struct KeyQuery {
 
 pub async fn write_public_h(State(state): State<AppState>, Query(q): Query<KeyQuery>, headers: HeaderMap, body: Bytes) -> Response {
     let res: AppResult<Value> = async {
-        let account: Account = sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1").bind(&q.k).fetch_optional(&state.db).await?.ok_or(AppError::Unauthorized)?;
+        let account: Account = sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1 AND closed_at IS NULL").bind(&q.k).fetch_optional(&state.db).await?.ok_or(AppError::Unauthorized)?;
         let b: WriteBody = serde_json::from_slice(&body).map_err(|_| AppError::bad("send JSON with product_id, email and rating"))?;
         let ip = crate::public::client_ip(&headers);
         write_public(&state, &account, &b, ip.as_deref()).await
@@ -822,6 +825,9 @@ async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Respo
     };
     let Some((account_id, email, confirmed, expired)) = row else { return not_found() };
     let Ok(account) = crate::campaigns::load_account(&state.db, account_id).await else { return not_found() };
+    if account.closed_at.is_some() {
+        return not_found();
+    }
     if confirmed {
         return message(&account, "Review confirmed", "Thanks! Your review will appear once we've had a look.");
     }
