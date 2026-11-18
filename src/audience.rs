@@ -130,13 +130,15 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                     // (unsubscribed stays), and a hard bounce, which belonged to the old address, is
                     // cleared; a spam complaint stays.
                     let changed = "($2::text IS NOT NULL AND p.email IS NOT NULL AND p.email <> $2::text)";
+                    // The same for a different phone number: an SMS subscription belonged to the old one.
+                    let new_phone = "($3::text IS NOT NULL AND p.phone_number IS NOT NULL AND p.phone_number <> $3::text)";
                     format!(
                         "UPDATE profiles p SET
                             email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
                             external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
                             last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
                             email_consent = COALESCE($8, CASE WHEN {changed} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END),
-                            sms_consent = COALESCE($9, p.sms_consent),
+                            sms_consent = COALESCE($9, CASE WHEN {new_phone} AND p.sms_consent = 'subscribed' THEN 'never_subscribed' ELSE p.sms_consent END),
                             email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
