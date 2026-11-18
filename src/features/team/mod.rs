@@ -233,6 +233,16 @@ impl Feature for Module {
         }]
     }
 
+    async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
+        if kind != google_link::RELEASE_NUMBERS_JOB {
+            return None;
+        }
+        Some(match payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
+            Some(account_id) => google_link::release_numbers(state, account_id).await,
+            None => Ok(()),
+        })
+    }
+
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
         // About every 20 minutes.
         if tick.is_multiple_of(60) {

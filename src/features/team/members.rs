@@ -151,7 +151,7 @@ fn invite_result(state: &AppState, id: Uuid, email: &str, role: Role, expires: D
 pub async fn invite(state: &AppState, ctx: &Ctx, b: InviteBody, dry_run: bool) -> AppResult<Value> {
     let role = parse_role(&b.role)?;
     may_assign(ctx, role)?;
-    let email = normalize_email(&b.email).ok_or_else(|| AppError::bad("enter a valid email"))?;
+    let email = normalize_email(&b.email).filter(|e| !super::google_link::reserved_login_email(e)).ok_or_else(|| AppError::bad("enter a valid email"))?;
     let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 AND u.email = $2)")
         .bind(ctx.account_id)
         .bind(&email)
@@ -322,11 +322,11 @@ pub struct AcceptBody {
 
 /// Join the account in one transaction; false when the invite was used, revoked or resent (a new
 /// link) meanwhile, when an owner invite's inviter isn't an owner anymore, or when the account was
-/// closed. When the server emailed the link (it's never shown to the inviter then), the invite
-/// went to the login's own address, so that address is now confirmed.
+/// closed. Accepting an invite doesn't confirm the login's email: the link may have been passed on.
 async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bool> {
     let mut tx = state.db.begin().await?;
-    // Closing an account holds this row while it removes everyone (see `google_link`).
+    // Every owner change, and closing the account, holds this row (see `lock_account` and
+    // `google_link::give_up_login`), so while it's held the inviter's role can't change.
     let open: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE id = $1 AND closed_at IS NULL FOR SHARE").bind(inv.account_id).fetch_optional(&mut *tx).await?;
     if open.is_none() {
         return Ok(false);
@@ -346,7 +346,7 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
     }
     if inv.role == Role::Owner.as_str() {
         let inviter_still_owner = match inv.invited_by_id {
-            Some(by) => sqlx::query_scalar::<_, String>("SELECT role FROM memberships WHERE account_id = $1 AND user_id = $2 FOR SHARE")
+            Some(by) => sqlx::query_scalar::<_, String>("SELECT role FROM memberships WHERE account_id = $1 AND user_id = $2")
                 .bind(inv.account_id)
                 .bind(by)
                 .fetch_optional(&mut *tx)
@@ -369,14 +369,6 @@ async fn join(state: &AppState, inv: &OpenInvite, user_id: Uuid) -> AppResult<bo
         .bind(&inv.role)
         .execute(&mut *tx)
         .await?;
-    // Without account email the inviter is shown the link and passes it on, so it proves nothing.
-    if mail::available(state) {
-        sqlx::query("UPDATE users SET email_confirmed_at = COALESCE(email_confirmed_at, now()) WHERE id = $1 AND email = $2 AND disabled_at IS NULL")
-            .bind(user_id)
-            .bind(&inv.email)
-            .execute(&mut *tx)
-            .await?;
-    }
     // Invited back: single sign-on may let them in again.
     sqlx::query(
         "DELETE FROM team_removals WHERE account_id = $1
@@ -466,14 +458,22 @@ pub async fn accept_h(
 
 /// Google sign-in coming back from an invite link (`next=/invite/<token>`) for an email that has
 /// no login yet: make the login and join the invited account, instead of starting a new account.
-pub async fn google_invite_signup(state: &AppState, next: &str, email: &str, google_sub: &str, name: Option<String>) -> AppResult<Option<(Uuid, Uuid)>> {
+/// `email_confirmed`: Google is the authority for the address (see `api::google`).
+pub async fn google_invite_signup(state: &AppState, next: &str, email: &str, google_sub: &str, name: Option<String>, email_confirmed: bool) -> AppResult<Option<(Uuid, Uuid)>> {
     let Some(token) = next.strip_prefix("/invite/").map(|t| t.split(['?', '#', '/']).next().unwrap_or("")) else { return Ok(None) };
     let Ok(inv) = open_invite(state, token).await else { return Ok(None) };
     if !login::same(&inv.email, email) {
         return Ok(None);
     }
     let uid = Uuid::now_v7();
-    sqlx::query("INSERT INTO users (id, email, name, google_sub) VALUES ($1, $2, $3, $4)").bind(uid).bind(email).bind(name).bind(google_sub).execute(&state.db).await?;
+    sqlx::query("INSERT INTO users (id, email, name, google_sub, email_confirmed_at) VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN now() END)")
+        .bind(uid)
+        .bind(email)
+        .bind(name)
+        .bind(google_sub)
+        .bind(email_confirmed)
+        .execute(&state.db)
+        .await?;
     if !join(state, &inv, uid).await? {
         sqlx::query("DELETE FROM users WHERE id = $1").bind(uid).execute(&state.db).await?;
         return Ok(None);
@@ -499,6 +499,14 @@ async fn member_row(tx: &mut sqlx::PgConnection, account_id: Uuid, user_id: Uuid
     Ok((email, Role::parse(&role).unwrap_or(Role::Analyst)))
 }
 
+/// After an owner change has locked the memberships it touches, lock the account row. Closing an
+/// account ("start fresh", `google_link::give_up_login`) takes the same locks in the same order
+/// and decides who owns what only after holding them, so the two can't cross.
+async fn lock_account(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    Ok(())
+}
+
 /// Lock the account's owners, so two changes can't both remove "the other" owner.
 async fn owners(tx: &mut sqlx::PgConnection, account_id: Uuid) -> AppResult<Vec<Uuid>> {
     Ok(sqlx::query_scalar("SELECT user_id FROM memberships WHERE account_id = $1 AND role = 'owner' FOR UPDATE").bind(account_id).fetch_all(&mut *tx).await?)
@@ -509,6 +517,7 @@ pub async fn change_role(state: &AppState, ctx: &Ctx, user_id: Uuid, role: &str)
     let mut tx = state.db.begin().await?;
     let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, old) = member_row(&mut tx, ctx.account_id, user_id).await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     if (old == Role::Owner || new == Role::Owner) && old != new {
         if ctx.role != Role::Owner {
             return Err(AppError::Forbidden("only owners can make or change owners".into()));
@@ -537,6 +546,7 @@ pub async fn remove(state: &AppState, ctx: &Ctx, user_id: Uuid, dry_run: bool) -
     let mut tx = state.db.begin().await?;
     let owner_count = owners(&mut tx, ctx.account_id).await?.len() as i64;
     let (email, role) = member_row(&mut tx, ctx.account_id, user_id).await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     let leaving = Some(user_id) == ctx.user_id;
     if role == Role::Owner && ctx.role != Role::Owner && !leaving {
         return Err(AppError::Forbidden("only owners can remove an owner".into()));
@@ -609,6 +619,7 @@ pub async fn transfer_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): Api
     let mut tx = state.db.begin().await?;
     owner_acting(&mut tx, &ctx).await?;
     let (email, _) = member_row(&mut tx, ctx.account_id, b.user_id).await?;
+    lock_account(&mut tx, ctx.account_id).await?;
     sqlx::query("UPDATE memberships SET role = 'owner' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(b.user_id).execute(&mut *tx).await?;
     sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(ctx.account_id).bind(me).execute(&mut *tx).await?;
     tx.commit().await?;

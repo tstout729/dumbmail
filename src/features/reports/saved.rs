@@ -578,7 +578,7 @@ pub async fn send_scheduled(state: &AppState, report_id: Uuid, occurrence: DateT
 pub async fn enqueue_due(state: &AppState) -> anyhow::Result<()> {
     let due: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT r.id, r.schedule, a.timezone, r.next_run_at FROM saved_reports r JOIN accounts a ON a.id = r.account_id
-         WHERE r.schedule IS NOT NULL AND r.next_run_at <= now() AND a.closed_at IS NULL ORDER BY r.next_run_at LIMIT 50",
+         WHERE r.schedule IS NOT NULL AND r.next_run_at <= now() ORDER BY r.next_run_at LIMIT 50",
     )
     .fetch_all(&state.db)
     .await?;

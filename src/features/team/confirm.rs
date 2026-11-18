@@ -2,13 +2,14 @@
 //!
 //! Signing up with a password doesn't prove the address belongs to the person, so a login starts
 //! unconfirmed. It becomes confirmed when its owner shows they get mail there: opening a link from
-//! this module, finishing a password reset, accepting a team invite emailed to that address, or
-//! signing in with Google for it.
+//! this module, finishing a password reset, or signing in with Google for an address Google is the
+//! authority for (see `crate::api::google`).
 //!
 //! The link is emailed to the address even when a stranger made the login, so opening it also
 //! takes the login's password: that proves both the mailbox and that the person made the login.
-//! The address's real owner, clicking a link for a login they never made, confirms nothing. Single sign-on doesn't count: an account's owner sets up the
-//! identity provider, and that owner may not be the address's owner.
+//! The address's real owner, clicking a link for a login they never made, confirms nothing.
+//! Accepting a team invite doesn't count (its link can be passed on), and neither does single
+//! sign-on (an account's owner sets up the identity provider, and may not be the address's owner).
 //!
 //! "Continue with Google" links to an existing password login only once it's confirmed (see
 //! `crate::api::google` and [`super::google_link`]).

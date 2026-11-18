@@ -251,9 +251,7 @@ pub async fn queue_sync(db: &PgPool, feed_id: Uuid, full: bool) -> AppResult<boo
 pub async fn queue_due(db: &PgPool) -> anyhow::Result<()> {
     let due: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE catalog_feeds SET next_sync_at = now() + make_interval(hours => interval_hours)
-         WHERE id IN (SELECT f.id FROM catalog_feeds f WHERE f.enabled AND f.next_sync_at <= now()
-                        AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = f.account_id AND a.closed_at IS NOT NULL)
-                      ORDER BY f.next_sync_at LIMIT 50) RETURNING id",
+         WHERE id IN (SELECT id FROM catalog_feeds WHERE enabled AND next_sync_at <= now() ORDER BY next_sync_at LIMIT 50) RETURNING id",
     )
     .fetch_all(db)
     .await?;

@@ -308,8 +308,9 @@ struct KeyQuery {
     k: String,
 }
 
+/// The account a site key belongs to. A closed account answers like an unknown key.
 async fn account_by_public_key(state: &AppState, k: &str) -> AppResult<Account> {
-    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1")
+    sqlx::query_as("SELECT * FROM accounts WHERE public_key = $1 AND closed_at IS NULL")
         .bind(k)
         .fetch_optional(&state.db)
         .await?
@@ -461,7 +462,7 @@ async fn client_test(State(state): State<AppState>, Query(q): Query<KeyQuery>, b
         }
         let test: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM site_tests WHERE code = $1 AND expires_at > now()").bind(code).fetch_optional(&state.db).await?;
         let Some(account_id) = test else { return Err(AppError::not_found("test")) };
-        let key_account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1").bind(&q.k).fetch_optional(&state.db).await?;
+        let key_account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE public_key = $1 AND closed_at IS NULL").bind(&q.k).fetch_optional(&state.db).await?;
         let (check, mut detail) = if key_account == Some(account_id) {
             (check.to_string(), test_detail(&b["detail"]))
         } else {

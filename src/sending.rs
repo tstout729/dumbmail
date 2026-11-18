@@ -171,6 +171,16 @@ pub async fn send_conversational(state: &AppState, spec: SendSpec<'_>, conversat
 }
 
 async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<&Conversational>) -> AppResult<Outcome> {
+    // A closed account sends nothing on any channel: campaigns, flows, replies, alerts, tests.
+    if spec.account.closed_at.is_some() {
+        if spec.is_test {
+            return Err(AppError::Conflict("this account is closed, so it can't send".into()));
+        }
+        if let Some(mid) = spec.message_id {
+            sqlx::query("UPDATE messages SET status = 'skipped', error = 'account closed' WHERE id = $1 AND status IN ('queued', 'sending')").bind(mid).execute(&state.db).await?;
+        }
+        return Ok(Outcome::Skipped("account closed"));
+    }
     let p = spec.profile;
     // SMS: a note when the phone's and the profile's time zones disagreed (kept on the message).
     let mut send_note: Option<String> = None;
@@ -720,6 +730,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             sending_paused_at: None,
             sending_paused_reason: None,
+            closed_at: None,
             email_daily_limit_override: None,
             email_sunset_enabled: true,
             link_domain: None,

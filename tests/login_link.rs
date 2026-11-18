@@ -133,8 +133,9 @@ fn mock_google() -> &'static Arc<Mutex<HashMap<String, Value>>> {
     })
 }
 
-/// Sign in with "Google" as (`sub`, `email`) and return where the callback sends the browser.
-async fn google(h: &Harness, b: &mut B, sub: &str, email: &str, next: &str) -> String {
+/// Sign in with "Google" as `claims` (merged into a valid ID token) and return where the
+/// callback sends the browser.
+async fn google_token(h: &Harness, b: &mut B, claims: Value, next: &str) -> String {
     let codes = mock_google();
     let (st, _, headers) = send(h, b, "GET", &format!("/api/auth/google?next={}", enc(next)), None).await;
     assert_eq!(st, StatusCode::SEE_OTHER);
@@ -142,13 +143,50 @@ async fn google(h: &Harness, b: &mut B, sub: &str, email: &str, next: &str) -> S
     let q: HashMap<String, String> = url::Url::parse(&loc).unwrap().query_pairs().into_owned().collect();
     let code = format!("code-{}", Uuid::now_v7().simple());
     let now = chrono::Utc::now().timestamp();
-    codes.lock().unwrap().insert(
-        code.clone(),
-        json!({"iss": "https://accounts.google.com", "aud": "test-client.apps.googleusercontent.com", "sub": sub, "email": email, "email_verified": true, "exp": now + 600, "name": "Vic Tim", "given_name": "Vic"}),
-    );
+    let mut token = json!({"iss": "https://accounts.google.com", "aud": "test-client.apps.googleusercontent.com", "email_verified": true, "exp": now + 600, "name": "Vic Tim", "given_name": "Vic"});
+    for (k, v) in claims.as_object().unwrap() {
+        token[k] = v.clone();
+    }
+    codes.lock().unwrap().insert(code.clone(), token);
     let (st, _, headers) = send(h, b, "GET", &format!("/api/auth/google/callback?code={code}&state={}", enc(&q["state"])), None).await;
     assert_eq!(st, StatusCode::SEE_OTHER);
     headers[header::LOCATION].to_str().unwrap().to_string()
+}
+
+/// Sign in with "Google" as (`sub`, `email`): a Google Workspace account on the address's own
+/// domain (`hd`), or a Gmail account, so Google is the authority for the address.
+async fn google(h: &Harness, b: &mut B, sub: &str, email: &str, next: &str) -> String {
+    let domain = email.rsplit('@').next().unwrap();
+    let claims = if domain == "gmail.com" { json!({"sub": sub, "email": email}) } else { json!({"sub": sub, "email": email, "hd": domain}) };
+    google_token(h, b, claims, next).await
+}
+
+fn totp_code(secret_b32: &str, offset_secs: i64) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut secret, mut buf, mut bits) = (Vec::new(), 0u32, 0u32);
+    for c in secret_b32.trim_end_matches('=').bytes() {
+        buf = (buf << 5) | A.iter().position(|&x| x == c).unwrap() as u32;
+        bits += 5;
+        if bits >= 8 {
+            secret.push(((buf >> (bits - 8)) & 0xff) as u8);
+            bits -= 8;
+        }
+    }
+    let t = totp_rs::Builder::new().with_secret(secret).with_digits(6).with_step_duration(30).with_skew(1).build().unwrap();
+    t.generate((chrono::Utc::now().timestamp() + offset_secs) as u64).to_string()
+}
+
+/// Turn two-factor on for a signed-in browser; returns the secret. The code used is this step's,
+/// so the next one entered must be a later step's (`totp_code(secret, 30)`).
+async fn turn_on_two_factor(h: &Harness, b: &mut B) -> String {
+    let setup = ok(h, b, "POST", "/api/me/two-factor/setup", None).await;
+    let secret = setup["secret"].as_str().unwrap().to_string();
+    ok(h, b, "POST", "/api/me/two-factor/enable", Some(json!({"code": totp_code(&secret, 0)}))).await;
+    secret
+}
+
+async fn pending_rows(h: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM google_link_pending").fetch_one(&h.state.db).await.unwrap()
 }
 
 // ---- Setting things up ----
@@ -315,7 +353,13 @@ async fn a_stranger_who_signed_up_first_never_gets_the_owners_account() {
         .fetch_one(&h.state.db)
         .await
         .unwrap();
-    assert!(old_login.0.starts_with("removed+") && old_login.0.ends_with("@invalid.dumbmail") && old_login.1 && old_login.2, "{old_login:?}");
+    let local = old_login.0.strip_prefix("removed+").and_then(|r| r.strip_suffix("@removed.dumbmail.invalid")).unwrap_or_else(|| panic!("{old_login:?}"));
+    assert!(local.len() == 32 && local.chars().all(|c| c.is_ascii_hexdigit()) && old_login.1 && old_login.2, "{old_login:?}");
+    // Random, not derived from the login's id, at a domain nobody can sign up with.
+    let old_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1").bind(&old_login.0).fetch_one(&h.state.db).await.unwrap();
+    assert_ne!(local, old_id.simple().to_string());
+    let (st, _) = call(&h, &mut B::new(&h, "198.51.100.29"), "POST", "/api/auth/signup", Some(json!({"email": "x@removed.dumbmail.invalid", "password": "whatever pw", "company": "X"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
     // Its scheduled work doesn't run: the campaign stopped, the flow is off, and the scheduler
     // never starts a campaign on a closed account even if one is due.
     let (cstatus, fstatus): (String, String) = sqlx::query_as("SELECT (SELECT status FROM campaigns WHERE id = $1), (SELECT status FROM flows WHERE id = $2)").bind(campaign).bind(flow).fetch_one(&h.state.db).await.unwrap();
@@ -415,17 +459,130 @@ async fn that_was_me_with_the_password_links_google_and_keeps_everything() {
     h.cleanup().await;
 }
 
+// ---- Two-factor login always applies, and a link waits for it ----
+
 #[tokio::test]
-async fn that_was_me_still_needs_two_factor() {
+async fn that_was_me_links_only_after_two_factor_and_google_never_skips_it() {
     let h = harness!();
     let mut owner = B::new(&h, "198.51.100.50");
     signup(&h, &mut owner, "owner@acme.test", "correct horse", "Acme").await;
-    sqlx::query("UPDATE users SET totp_enabled_at = now() WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    let secret = turn_on_two_factor(&h, &mut owner).await;
+    // "That was me" with the right password: a password sign-in waiting on its code.
     let mut b = B::new(&h, "198.51.100.51");
     assert_eq!(google(&h, &mut b, "g-owner", "owner@acme.test", "/").await, "/link-google");
     let me = ok(&h, &mut b, "POST", "/api/auth/google/link/password", Some(json!({"password": "correct horse"}))).await;
     assert_eq!(me["restriction"], "two_factor_code");
     assert_eq!(call(&h, &mut b, "GET", "/api/campaigns", None).await.0, StatusCode::FORBIDDEN);
+    // Until the code is in, nothing about the login has changed.
+    let (_, sub, confirmed, _) = user_row(&h, "owner@acme.test").await;
+    assert_eq!((sub, confirmed), (None, false), "not linked or confirmed before two-factor");
+    // The waiting choice was taken by this sign-in: it can't be used again.
+    assert_eq!(call(&h, &mut b, "POST", "/api/auth/google/link/fresh", None).await.0, StatusCode::NOT_FOUND);
+    // The code finishes the sign-in, and the link is made.
+    let me = ok(&h, &mut b, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert!(me["restriction"].is_null());
+    let (_, sub, confirmed, _) = user_row(&h, "owner@acme.test").await;
+    assert_eq!((sub.as_deref(), confirmed), (Some("g-owner"), true));
+    // A later Google sign-in to the linked login still needs the login's own code.
+    let mut later = B::new(&h, "198.51.100.52");
+    assert_eq!(google(&h, &mut later, "g-owner", "owner@acme.test", "/").await, "/");
+    assert_eq!(ok(&h, &mut later, "GET", "/api/me", None).await["restriction"], "two_factor_code");
+    assert_eq!(call(&h, &mut later, "GET", "/api/campaigns", None).await.0, StatusCode::FORBIDDEN);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_abandoned_two_factor_step_leaves_the_login_unlinked() {
+    let h = harness!();
+    let mut owner = B::new(&h, "198.51.100.53");
+    signup(&h, &mut owner, "owner@acme.test", "correct horse", "Acme").await;
+    let secret = turn_on_two_factor(&h, &mut owner).await;
+    let mut b = B::new(&h, "198.51.100.54");
+    assert_eq!(google(&h, &mut b, "g-owner", "owner@acme.test", "/").await, "/link-google");
+    ok(&h, &mut b, "POST", "/api/auth/google/link/password", Some(json!({"password": "correct horse"}))).await;
+    // They walk away; the wait for the code runs out. A code entered later still signs them in
+    // (it's a password sign-in), but links nothing.
+    sqlx::query("UPDATE google_link_pending SET expires_at = now() - interval '1 second'").execute(&h.state.db).await.unwrap();
+    let me = ok(&h, &mut b, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert!(me["restriction"].is_null());
+    let (_, sub, confirmed, _) = user_row(&h, "owner@acme.test").await;
+    assert_eq!((sub, confirmed), (None, false));
+    // Google still offers the choice next time.
+    assert_eq!(google(&h, &mut B::new(&h, "198.51.100.55"), "g-owner", "owner@acme.test", "/").await, "/link-google");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_confirmed_login_with_two_factor_needs_the_code_before_google_is_linked() {
+    let h = harness!();
+    let mut owner = B::new(&h, "198.51.100.56");
+    signup(&h, &mut owner, "owner@acme.test", "correct horse", "Acme").await;
+    let secret = turn_on_two_factor(&h, &mut owner).await;
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    let mut b = B::new(&h, "198.51.100.57");
+    assert_eq!(google(&h, &mut b, "g-owner", "owner@acme.test", "/flows").await, "/flows");
+    assert_eq!(ok(&h, &mut b, "GET", "/api/me", None).await["restriction"], "two_factor_code");
+    assert_eq!(call(&h, &mut b, "GET", "/api/campaigns", None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(user_row(&h, "owner@acme.test").await.1, None, "not linked before the code");
+    ok(&h, &mut b, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert_eq!(user_row(&h, "owner@acme.test").await.1.as_deref(), Some("g-owner"));
+    ok(&h, &mut b, "GET", "/api/campaigns", None).await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_link_is_made_only_while_the_login_is_as_it_was_checked() {
+    let h = harness!();
+    let mut owner = B::new(&h, "198.51.100.58");
+    signup(&h, &mut owner, "owner@acme.test", "correct horse", "Acme").await;
+    let secret = turn_on_two_factor(&h, &mut owner).await;
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    let mut b = B::new(&h, "198.51.100.59");
+    assert_eq!(google(&h, &mut b, "g-owner", "owner@acme.test", "/").await, "/");
+    // The password changes while the sign-in waits on its code.
+    sqlx::query("UPDATE users SET credential_version = credential_version + 1 WHERE email = 'owner@acme.test'").execute(&h.state.db).await.unwrap();
+    ok(&h, &mut b, "POST", "/api/auth/two-factor", Some(json!({"code": totp_code(&secret, 30)}))).await;
+    assert_eq!(user_row(&h, "owner@acme.test").await.1, None, "the login changed, so nothing is linked");
+    h.cleanup().await;
+}
+
+// ---- Google speaks only for addresses it's the authority for ----
+
+#[tokio::test]
+async fn google_matches_a_login_only_for_an_address_it_is_the_authority_for() {
+    let h = harness!();
+    let mut pat = B::new(&h, "198.51.100.140");
+    signup(&h, &mut pat, "pat@acme.test", "pat password", "Pat Co").await;
+    // A Google account using a non-Gmail address with no Workspace domain: no match at all.
+    let mut b = B::new(&h, "198.51.100.141");
+    assert_eq!(google_token(&h, &mut b, json!({"sub": "g-pat", "email": "pat@acme.test"}), "/").await, "/login?error=use_password");
+    assert!(!b.has("pl_session") && !b.has("pl_google_link"));
+    assert_eq!(pending_rows(&h).await, 0, "no waiting choice");
+    // A Workspace account on another domain: no match either.
+    assert_eq!(google_token(&h, &mut b, json!({"sub": "g-pat", "email": "pat@acme.test", "hd": "other.test"}), "/").await, "/login?error=use_password");
+    assert_eq!(pending_rows(&h).await, 0);
+    // Its own domain: Google speaks for it, so the choice is offered.
+    assert_eq!(google_token(&h, &mut b, json!({"sub": "g-pat", "email": "pat@acme.test", "hd": "acme.test"}), "/").await, "/link-google");
+    // A confirmed login isn't linked from a non-authoritative sign-in either.
+    sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE email = 'pat@acme.test'").execute(&h.state.db).await.unwrap();
+    let mut c = B::new(&h, "198.51.100.142");
+    assert_eq!(google_token(&h, &mut c, json!({"sub": "g-pat", "email": "pat@acme.test"}), "/").await, "/login?error=use_password");
+    assert_eq!(user_row(&h, "pat@acme.test").await.1, None);
+    // Gmail needs no hd.
+    let mut vic = B::new(&h, "198.51.100.143");
+    signup(&h, &mut vic, "vic@gmail.com", "vic password", "Vic Co").await;
+    assert_eq!(google_token(&h, &mut B::new(&h, "198.51.100.144"), json!({"sub": "g-vic", "email": "vic@gmail.com"}), "/").await, "/link-google");
+    // Once linked by its Google account, a login signs in with it whatever the address.
+    assert_eq!(google_token(&h, &mut c, json!({"sub": "g-pat", "email": "pat@acme.test", "hd": "acme.test"}), "/").await, "/");
+    let mut d = B::new(&h, "198.51.100.145");
+    assert_eq!(google_token(&h, &mut d, json!({"sub": "g-pat", "email": "pat@acme.test"}), "/").await, "/");
+    assert!(d.has("pl_session"));
+    // New sign-ups work for any address; only an authoritative one starts confirmed.
+    let mut e = B::new(&h, "198.51.100.146");
+    assert_eq!(google_token(&h, &mut e, json!({"sub": "g-new", "email": "new@elsewhere.test"}), "/").await, "/onboarding");
+    assert!(!user_row(&h, "new@elsewhere.test").await.2);
+    assert_eq!(google_token(&h, &mut B::new(&h, "198.51.100.147"), json!({"sub": "g-gm", "email": "someone@gmail.com"}), "/").await, "/onboarding");
+    assert!(user_row(&h, "someone@gmail.com").await.2);
     h.cleanup().await;
 }
 
@@ -462,24 +619,6 @@ async fn confirmed_logins_link_directly_and_keep_everything() {
     assert!(g.has("pl_session"));
     assert_eq!(login(&h, &mut B::new(&h, "198.51.100.67"), "bo@acme.test", "bo new password").await.0, StatusCode::OK);
 
-    // 3. By accepting a team invite sent to its address: a new login, and a signed-in one.
-    let mut owner = B::new(&h, "198.51.100.68");
-    let team_account = signup(&h, &mut owner, "owner@team.test", "owner password", "Team").await["account"]["id"].as_str().unwrap().to_string();
-    join_new(&h, &mut owner, "cy@team.test", "manager", "198.51.100.69").await;
-    assert!(user_row(&h, "cy@team.test").await.2);
-    let mut g = B::new(&h, "198.51.100.70");
-    assert_eq!(google(&h, &mut g, "g-cy", "cy@team.test", "/").await, "/");
-    assert_eq!(ok(&h, &mut g, "GET", "/api/me", None).await["account"]["id"], team_account);
-    let mut di = B::new(&h, "198.51.100.71");
-    signup(&h, &mut di, "di@team.test", "di password", "Di Co").await;
-    assert!(!user_row(&h, "di@team.test").await.2);
-    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "di@team.test", "role": "content"}))).await;
-    let inv = link_token(&h, "di@team.test", "/invite/").await;
-    ok(&h, &mut di, "POST", &format!("/api/invites/{inv}/accept"), None).await;
-    assert!(user_row(&h, "di@team.test").await.2);
-    let mut g = B::new(&h, "198.51.100.72");
-    assert!(google(&h, &mut g, "g-di", "di@team.test", "/").await == "/" && g.has("pl_session"));
-
     // A login already linked to another Google account is still refused.
     let mut intruder = B::new(&h, "198.51.100.73");
     assert_eq!(google(&h, &mut intruder, "g-someone-else", "ann@acme.test", "/").await, "/login?error=conflict");
@@ -488,23 +627,59 @@ async fn confirmed_logins_link_directly_and_keep_everything() {
 }
 
 #[tokio::test]
-async fn with_sign_ups_off_google_links_as_before() {
+async fn with_sign_ups_off_the_same_rules_apply() {
     let Some(h) = Harness::with(|c| c.allow_signup = false).await else { return };
-    // Logins made by the operator (there's no sign-up).
-    let (_, account) = dumbmail::api::account::create_account(&h.state, "old@acme.test", "old password", None, "Old").await.unwrap();
+    // Logins made by the operator (there's no sign-up); invites and single sign-on can make them too.
+    dumbmail::api::account::create_account(&h.state, "old@acme.test", "old password", None, "Old").await.unwrap();
     dumbmail::api::account::create_account(&h.state, "kept@acme.test", "kept password", None, "Kept").await.unwrap();
     sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE email = 'kept@acme.test'").execute(&h.state.db).await.unwrap();
-    // Unconfirmed: linked directly, its other ways in cut off (as before).
+    // Unconfirmed: the choice page, never a direct link; starting fresh isn't offered.
     let mut b = B::new(&h, "198.51.100.80");
-    assert_eq!(google(&h, &mut b, "g-old", "old@acme.test", "/").await, "/");
-    assert_eq!(ok(&h, &mut b, "GET", "/api/me", None).await["account"]["id"], account.id.to_string());
+    assert_eq!(google(&h, &mut b, "g-old", "old@acme.test", "/").await, "/link-google");
+    assert!(!b.has("pl_session"));
+    let (_, sub, _, has_password) = user_row(&h, "old@acme.test").await;
+    assert_eq!((sub, has_password), (None, true), "nothing linked, nothing wiped");
+    assert_eq!(ok(&h, &mut b, "GET", "/api/auth/google/link", None).await["can_start_fresh"], false);
+    assert_eq!(call(&h, &mut b, "POST", "/api/auth/google/link/fresh", None).await.0, StatusCode::FORBIDDEN);
+    ok(&h, &mut b, "POST", "/api/auth/google/link/password", Some(json!({"password": "old password"}))).await;
     let (_, sub, confirmed, has_password) = user_row(&h, "old@acme.test").await;
-    assert_eq!((sub.as_deref(), confirmed, has_password), (Some("g-old"), true, false));
+    assert_eq!((sub.as_deref(), confirmed, has_password), (Some("g-old"), true, true));
     // Confirmed: linked, nothing removed.
     let mut c = B::new(&h, "198.51.100.81");
     assert_eq!(google(&h, &mut c, "g-kept", "kept@acme.test", "/").await, "/");
     assert!(user_row(&h, "kept@acme.test").await.3, "the password stays");
     assert_eq!(login(&h, &mut B::new(&h, "198.51.100.82"), "kept@acme.test", "kept password").await.0, StatusCode::OK);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn accepting_an_invite_confirms_nothing() {
+    let h = harness!();
+    let mut owner = B::new(&h, "198.51.100.68");
+    let team_account = signup(&h, &mut owner, "owner@team.test", "owner password", "Team").await["account"]["id"].as_str().unwrap().to_string();
+    // A new login made by accepting an emailed invite: not confirmed, so Google offers the choice.
+    join_new(&h, &mut owner, "cy@team.test", "manager", "198.51.100.69").await;
+    assert!(!user_row(&h, "cy@team.test").await.2);
+    assert_eq!(google(&h, &mut B::new(&h, "198.51.100.70"), "g-cy", "cy@team.test", "/").await, "/link-google");
+    // An existing login accepting while signed in: not confirmed either.
+    let mut di = B::new(&h, "198.51.100.71");
+    signup(&h, &mut di, "di@team.test", "di password", "Di Co").await;
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "di@team.test", "role": "content"}))).await;
+    let inv = link_token(&h, "di@team.test", "/invite/").await;
+    ok(&h, &mut di, "POST", &format!("/api/invites/{inv}/accept"), None).await;
+    assert!(!user_row(&h, "di@team.test").await.2);
+    // Signing up from an invite with Google: confirmed only when Google is the authority.
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "gi@team.test", "role": "content"}))).await;
+    let t = link_token(&h, "gi@team.test", "/invite/").await;
+    let mut gi = B::new(&h, "198.51.100.72");
+    assert_eq!(google(&h, &mut gi, "g-gi", "gi@team.test", &format!("/invite/{t}")).await, "/");
+    assert_eq!(ok(&h, &mut gi, "GET", "/api/me", None).await["account"]["id"], team_account);
+    assert!(user_row(&h, "gi@team.test").await.2);
+    ok(&h, &mut owner, "POST", "/api/team/invites", Some(json!({"email": "gx@else.test", "role": "content"}))).await;
+    let t = link_token(&h, "gx@else.test", "/invite/").await;
+    let mut gx = B::new(&h, "198.51.100.73");
+    assert_eq!(google_token(&h, &mut gx, json!({"sub": "g-gx", "email": "gx@else.test"}), &format!("/invite/{t}")).await, "/");
+    assert!(!user_row(&h, "gx@else.test").await.2);
     h.cleanup().await;
 }
 
@@ -524,6 +699,46 @@ async fn an_invite_link_shown_to_the_inviter_confirms_nothing() {
     assert!(!user_row(&h, "sq@acme.test").await.2, "not confirmed");
     let mut owner = B::new(&h, "198.51.100.120");
     assert_eq!(google(&h, &mut owner, "g-sq", "sq@acme.test", "/").await, "/link-google");
+    h.cleanup().await;
+}
+
+// ---- Leaving and ownership changes can't cross ----
+
+#[tokio::test]
+async fn starting_fresh_and_an_ownership_transfer_cannot_leave_an_account_ownerless() {
+    let h = harness!();
+    // Account X is owned by M; the unconfirmed login L (victim@acme.test) is an admin there.
+    let mut m = B::new(&h, "203.0.113.130");
+    let x: Uuid = signup(&h, &mut m, "m@x.test", "m password 1", "X").await["account"]["id"].as_str().unwrap().parse().unwrap();
+    let mut l = B::new(&h, "203.0.113.131");
+    signup(&h, &mut l, "victim@acme.test", "stranger pass", "Bait").await;
+    ok(&h, &mut m, "POST", "/api/team/invites", Some(json!({"email": "victim@acme.test", "role": "admin"}))).await;
+    let t = link_token(&h, "victim@acme.test", "/invite/").await;
+    ok(&h, &mut l, "POST", &format!("/api/invites/{t}/accept"), None).await;
+    let (l_id, ..) = user_row(&h, "victim@acme.test").await;
+    let (m_id, ..) = user_row(&h, "m@x.test").await;
+    let mut victim = B::new(&h, "198.51.100.130");
+    assert_eq!(google(&h, &mut victim, "g-victim", "victim@acme.test", "/").await, "/link-google");
+    // M hands X to L in a transaction that's still open (the locks an ownership transfer takes:
+    // the memberships it changes, then the account) while the victim starts fresh.
+    let mut transfer = h.state.db.begin().await.unwrap();
+    sqlx::query("SELECT user_id FROM memberships WHERE account_id = $1 AND user_id = ANY($2) ORDER BY user_id FOR UPDATE").bind(x).bind(vec![l_id, m_id]).execute(&mut *transfer).await.unwrap();
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE").bind(x).execute(&mut *transfer).await.unwrap();
+    sqlx::query("UPDATE memberships SET role = 'owner' WHERE account_id = $1 AND user_id = $2").bind(x).bind(l_id).execute(&mut *transfer).await.unwrap();
+    sqlx::query("UPDATE memberships SET role = 'admin' WHERE account_id = $1 AND user_id = $2").bind(x).bind(m_id).execute(&mut *transfer).await.unwrap();
+    let (fresh, ()) = tokio::join!(call(&h, &mut victim, "POST", "/api/auth/google/link/fresh", None), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        transfer.commit().await.unwrap();
+    });
+    assert!(fresh.0.is_success(), "{fresh:?}");
+    // X ended with its only owner gone, so it was closed rather than left with nobody in charge.
+    let (closed, owners): (bool, i64) = sqlx::query_as("SELECT closed_at IS NOT NULL, (SELECT count(*) FROM memberships WHERE account_id = $1 AND role = 'owner') FROM accounts WHERE id = $1")
+        .bind(x)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(closed || owners > 0, "X has no owner and isn't closed");
+    assert!(closed);
     h.cleanup().await;
 }
 
@@ -548,7 +763,7 @@ async fn a_waiting_google_sign_in_works_once_briefly_and_only_in_its_browser() {
         let (_, _, hd) = send(&h, &mut c, "GET", "/api/auth/google?next=/", None).await;
         let q: HashMap<String, String> = url::Url::parse(hd[header::LOCATION].to_str().unwrap()).unwrap().query_pairs().into_owned().collect();
         let now = chrono::Utc::now().timestamp();
-        codes.lock().unwrap().insert("code-ttl".into(), json!({"iss": "https://accounts.google.com", "aud": "test-client.apps.googleusercontent.com", "sub": "g-vic", "email": "vic@acme.test", "email_verified": true, "exp": now + 600}));
+        codes.lock().unwrap().insert("code-ttl".into(), json!({"iss": "https://accounts.google.com", "aud": "test-client.apps.googleusercontent.com", "sub": "g-vic", "email": "vic@acme.test", "hd": "acme.test", "email_verified": true, "exp": now + 600}));
         send(&h, &mut c, "GET", &format!("/api/auth/google/callback?code=code-ttl&state={}", enc(&q["state"])), None).await
     };
     let set = headers.get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap().to_string()).find(|c| c.starts_with("pl_google_link=")).unwrap();

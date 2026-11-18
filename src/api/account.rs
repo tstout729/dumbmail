@@ -86,36 +86,43 @@ pub async fn create_account(state: &AppState, email: &str, password: &str, name:
     let email = normalize_email(email).ok_or_else(|| AppError::bad("enter a valid email"))?;
     team::login::check_new_password(password)?;
     let hash = auth::hash_password(password)?;
-    insert_owner(state, &email, Some(hash), None, name, company, None).await
+    insert_owner(state, &email, Some(hash), None, false, name, company, None).await
 }
 
 /// Insert a new account and its owner (with a password hash, a Google subject id, or both).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_owner(
     state: &AppState,
     email: &str,
     password_hash: Option<String>,
     google_sub: Option<&str>,
+    email_confirmed: bool,
     name: Option<String>,
     company: &str,
     website: Option<String>,
 ) -> AppResult<(User, Account)> {
     let mut tx = state.db.begin().await?;
-    let made = insert_owner_tx(&mut tx, email, password_hash, google_sub, name, company, website).await?;
+    let made = insert_owner_tx(&mut tx, email, password_hash, google_sub, email_confirmed, name, company, website).await?;
     tx.commit().await?;
     Ok(made)
 }
 
-/// [`insert_owner`] inside a transaction the caller commits. A Google subject id means Google
-/// proved the address, so the login starts with its email confirmed.
+/// [`insert_owner`] inside a transaction the caller commits. `email_confirmed`: the address is
+/// proven to be theirs (a Google sign-in Google is the authority for).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_owner_tx(
     tx: &mut sqlx::PgConnection,
     email: &str,
     password_hash: Option<String>,
     google_sub: Option<&str>,
+    email_confirmed: bool,
     name: Option<String>,
     company: &str,
     website: Option<String>,
 ) -> AppResult<(User, Account)> {
+    if team::google_link::reserved_login_email(email) {
+        return Err(AppError::bad("use another email address"));
+    }
     let company = company.trim();
     if company.is_empty() {
         return Err(AppError::bad("enter your company or brand name"));
@@ -128,7 +135,7 @@ pub(crate) async fn insert_owner_tx(
         .fetch_one(&mut *tx)
         .await?;
     let user: User = sqlx::query_as(
-        "INSERT INTO users (id, email, name, password_hash, google_sub, email_confirmed_at) VALUES ($1, $2, $3, $4, $5, CASE WHEN $5::text IS NOT NULL THEN now() END)
+        "INSERT INTO users (id, email, name, password_hash, google_sub, email_confirmed_at) VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() END)
          RETURNING id, email, name",
     )
         .bind(Uuid::now_v7())
@@ -136,6 +143,7 @@ pub(crate) async fn insert_owner_tx(
         .bind(name.filter(|n| !n.trim().is_empty()))
         .bind(password_hash)
         .bind(google_sub)
+        .bind(email_confirmed)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match AppError::from(e) {

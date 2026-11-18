@@ -555,7 +555,7 @@ pub async fn run_auto_recharge(state: &AppState) -> anyhow::Result<()> {
     }
     let due: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
         "SELECT id, stripe_customer_id, stripe_payment_method_id, auto_recharge_amount_micros FROM accounts
-         WHERE auto_recharge_enabled AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
+         WHERE auto_recharge_enabled AND closed_at IS NULL AND stripe_payment_method_id IS NOT NULL AND stripe_customer_id IS NOT NULL
            AND balance_micros < auto_recharge_threshold_micros
            AND (auto_recharge_failed_at IS NULL OR auto_recharge_failed_at < now() - interval '1 day')
          LIMIT 50",
@@ -611,7 +611,7 @@ pub async fn charge_numbers(state: &AppState) -> anyhow::Result<()> {
         // period are skipped so they can't crowd newly due numbers out of the batch.
         "SELECT p.id, p.account_id, p.phone_number, p.monthly_price_micros, p.past_due_since, p.next_charge_at
          FROM phone_numbers p JOIN accounts a ON a.id = p.account_id
-         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now()
+         WHERE p.status <> 'released' AND p.monthly_price_micros > 0 AND p.next_charge_at <= now() AND a.closed_at IS NULL
            AND (p.past_due_since IS NULL
                 OR a.balance_micros >= p.monthly_price_micros
                 OR (p.past_due_since <= now() - make_interval(days => $1)

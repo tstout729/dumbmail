@@ -128,8 +128,9 @@ Members can turn on two-factor login with an authenticator app (TOTP, RFC 6238):
 2. `POST /api/me/two-factor/enable` `{code}` confirms it and returns 10 one-time recovery codes.
    They're shown once; only their hashes are kept.
 
-After that, password sign-ins need a code: the session starts restricted (`restriction:
-"two_factor_code"` in `/api/me`) until `POST /api/auth/two-factor` `{code}` succeeds. A recovery
+After that, password and Google sign-ins need a code: the session starts restricted
+(`restriction: "two_factor_code"` in `/api/me`) until `POST /api/auth/two-factor` `{code}`
+succeeds. Google's own sign-in never stands in for the factor you set up here. A recovery
 code works in place of the app's code, once. Each app code works once, and attempts are limited
 (6 per 10 minutes).
 
@@ -182,13 +183,12 @@ a login's email starts unconfirmed, and becomes confirmed when its owner shows t
   login's password. The password is needed because the link goes to the address even when someone
   else made the login: its real owner clicking it confirms nothing;
 - they finish a password reset (the link went to that address);
-- they accept a team invite emailed to that address (not one whose link was shown to the inviter,
-  as happens when the server can't send email);
-- they sign in with Google for that address.
+- they sign in with Google, for an address Google is the authority for (below).
 
-Single sign-on doesn't confirm an address: an account's owner sets up the identity provider, and
-that owner may not be the address's owner. `GET /api/me` says `email_confirmed`. While it's false,
-the Security settings page offers to send the link again.
+Accepting a team invite doesn't confirm an address (an invite link can be passed on), and neither
+does single sign-on (an account's owner sets up the identity provider, and that owner may not be
+the address's owner). `GET /api/me` says `email_confirmed`. While it's false, the Security settings
+page offers to send the link again.
 
 - `POST /api/me/email-confirmation`: email a new link (older ones stop working). Signed-in
   dashboard sessions only; 3 an hour per login.
@@ -196,33 +196,54 @@ the Security settings page offers to send the link again.
   sign-in (same limits, same answer when wrong). It confirms the address and signs nobody in. 20
   tries an hour per network address.
 
-**Continue with Google for an address that already has a password login.** If that login's email is
-confirmed, Google is linked to it and you're signed in; nothing else changes. If it isn't, nothing
-is linked and nobody is signed in: whoever made it may be a stranger who signed up with your
-address first and is waiting for you to move in. You go to a page that says when the login was
-made, with two choices. The choice stays open for 10 minutes, works once, and only in the browser
-that signed in with Google.
+**When Google speaks for an address.** Google is the authority for a Gmail address
+(`@gmail.com`, `@googlemail.com`) and for a Google Workspace account whose `hd` claim is the
+address's own domain. For any other address Google only checked the mailbox once, when the Google
+account was made, and it may have changed hands since (Google's "Verify the Google ID token"
+guide). So a Google sign-in is matched to an existing DumbMail login by email only for an address
+Google is the authority for. For any other address that already has a login, nothing is linked
+and the sign-in page says to log in with that login's password (or reset it). A login already
+linked to a Google account signs in with it whatever the address. A new sign-up with Google works
+for any address, but only an address Google is the authority for starts confirmed.
+
+**Continue with Google for an address that already has a login.** If that login's email is
+confirmed, you're signed in to it, and Google is linked once that sign-in is complete (after your
+two-factor code, if you use two-factor); nothing else changes. If it isn't confirmed, nothing is
+linked and nobody is signed in: whoever made it may be a stranger who signed up with your address
+first and is waiting for you to move in. You go to a page that says when the login was made, with
+two choices. The choice stays open for 10 minutes, works once, and only in the browser that signed
+in with Google.
 
 - **That was me**: type that login's password. It's checked exactly like the sign-in page (same
-  limits, same answer for a wrong password). If it's right, Google is linked, the email is marked
-  confirmed, nothing is removed, and you're signed in as with a password, so two-factor login
-  still applies.
-- **That wasn't me, start fresh**: in one step, the old login is emptied and can never sign in
-  again (its password, sessions, two-factor, single sign-on links and API keys go, and it leaves
-  every account). Each account it alone owned is closed: everyone in it loses access (their own
-  logins are untouched), its API keys and pending invites stop working, single sign-on turns off,
-  its website snippet and forms stop, scheduled and sending campaigns stop, flows go back to draft,
-  email sending is paused, and auto-recharge and plan renewal stop. The closed account's audit log
-  records `account.closed` with reason `email_owner_started_fresh`. Then you get a new, empty
-  account as its owner, as a first-time Google sign-up does.
+  limits, same answer for a wrong password). If it's right, you're signed in as with a password
+  (two-factor login still applies), and once that sign-in is complete Google is linked and the
+  email marked confirmed. Nothing is removed. If you never finish the two-factor step, nothing
+  about the login changes.
+- **That wasn't me, start fresh**: for a login you didn't make. In one step, the old login is
+  emptied and can never sign in again (its password, sessions, two-factor, single sign-on links and
+  API keys go, it leaves every account, and its address is freed). Each account it alone owned is
+  closed (below). Then you get a new, empty account as its owner, as a first-time Google sign-up
+  does. On a server with sign-ups off this choice isn't offered.
+
+Resetting the password of a login you didn't make keeps that login's account and everyone who has
+access to it, so "Start fresh" is the choice for a login you didn't create.
+
+A link is made only while the login is still as it was checked: no Google account, the same
+confirmation state and the same password (a reset or change in between cancels it).
 
 The page's routes: `GET /api/auth/google/link` (what to show), `POST /api/auth/google/link/password`
 `{password}` and `POST /api/auth/google/link/fresh`. They work only with the cookie the Google
 sign-in left in that browser, and only from the app's own pages.
 
-On a server with sign-ups off, nobody can make a login by signing up, so Continue with Google links
-to an unconfirmed login directly, as before (cutting off its password, sessions, two-factor and the
-keys it made).
+**A closed account does nothing and costs nothing.** Everyone in it loses access (their own logins
+are untouched); sessions and API keys are refused; its website snippet, forms and pending invites
+stop; single sign-on turns off; nothing sends on any channel (campaigns, flows, replies, alerts,
+tests, transactional); no job starts work for it (campaigns, flows, segment refreshes, feed syncs,
+product checks, report emails, webhooks, exports); its phone numbers are released and not billed;
+plan renewal and auto-recharge stop, and a payment that arrives later is kept as credit and doesn't
+reopen the plan. Texts sent to its numbers still record opt-outs (STOP), and bounces, complaints
+and delivery results are still recorded; nothing else happens. The audit log records
+`account.closed` with reason `email_owner_started_fresh`.
 
 ## API keys
 

@@ -288,11 +288,11 @@ export function LinkGooglePage() {
               Connect Google and log in
             </Button>
             <p className="text-xs text-zinc-500">
-              Forgot it?{" "}
+              Made it but forgot the password?{" "}
               <Link to="/forgot-password" className="font-medium text-accent-700 hover:underline">
-                Set a new password
-              </Link>{" "}
-              from the email, then continue with Google again.
+                Reset it
+              </Link>
+              . Resetting keeps this login's account and everyone who has access to it, so only do it if you made this login.
             </p>
           </form>
         ) : null}
@@ -300,13 +300,19 @@ export function LinkGooglePage() {
           <div className="space-y-3 border-t border-zinc-100 pt-4">
             <div>
               <h2 className="font-medium text-zinc-900">That wasn't me</h2>
-              <p className="mt-0.5">Start fresh with a new, empty account of your own. The old login stops working for good.</p>
+              <p className="mt-0.5">
+                For a login you didn't make. Start fresh with a new, empty account of your own; the old login stops working for good, and nobody else gets into your new
+                account.
+              </p>
             </div>
             <InlineError message={fresh.error ? errorMessage(fresh.error) : null} />
             <Button className="w-full" onClick={() => setConfirmFresh(true)}>
               Start fresh
             </Button>
           </div>
+        ) : null}
+        {!info.has_password && !info.can_start_fresh ? (
+          <p className="border-t border-zinc-100 pt-4">This login has no password and this server doesn't take new sign-ups. Ask the person who runs this DumbMail server for help.</p>
         ) : null}
         <p className="text-xs text-zinc-500">This choice is open for {info.expires_in_minutes} minutes.</p>
       </div>

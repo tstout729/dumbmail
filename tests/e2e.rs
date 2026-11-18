@@ -672,25 +672,28 @@ async fn brand_import_and_google_sign_in() {
     let (_, hdrs, _) = h.raw("GET", "/api/auth/google/callback?error=access_denied&state=x", &[], "").await;
     assert_eq!(hdrs.get(header::LOCATION).unwrap().to_str().unwrap(), "/login?error=cancelled");
 
-    // Google with the same email doesn't link to a password login whose email was never confirmed
-    // (see tests/login_link.rs); once it's confirmed it's the same person, and everything stays.
-    let claims = |sub: &str, email: &str, given: Option<&str>| GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from) };
+    // Google with the same email matches an existing login only for an address Google is the
+    // authority for (a Workspace `hd` here), and never changes it on the spot: an unconfirmed login
+    // goes to the choice page, a confirmed one is linked once its sign-in is complete (see
+    // tests/login_link.rs). Without `hd` the login's password is the way in.
+    let claims = |sub: &str, email: &str, given: Option<&str>| {
+        let domain = email.rsplit('@').next().unwrap();
+        let hd = (domain != "gmail.com").then(|| domain.to_string());
+        GoogleClaims { sub: sub.into(), email: email.into(), name: given.map(|g| format!("{g} Smith")), given_name: given.map(String::from), hd }
+    };
     let account_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
-    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "planted"}))).await;
-    let key = key["key"].as_str().unwrap().to_string();
     let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = 'owner@acme.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap(), GoogleUser::Unconfirmed(uid));
+    let mut no_hd = claims("g-owner", "owner@acme.test", None);
+    no_hd.hd = None;
+    assert_eq!(google_user(&h.state, &no_hd).await.unwrap(), GoogleUser::UsePassword);
     sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE id = $1").bind(uid).execute(&h.state.db).await.unwrap();
-    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", Some("Olive"))).await.unwrap(), GoogleUser::SignedIn(uid, account_id, false));
-    assert_eq!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), GoogleUser::SignedIn(uid, account_id, false));
+    assert!(matches!(google_user(&h.state, &claims("g-owner", "owner@acme.test", None)).await.unwrap(), GoogleUser::Link { user_id, account_id: a, .. } if user_id == uid && a == account_id));
+    let linked: Option<String> = sqlx::query_scalar("SELECT google_sub FROM users WHERE id = $1").bind(uid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(linked, None, "nothing is linked until the sign-in completes");
     h.cookie = old_cookie;
     let (s, _) = h.req("GET", "/api/me", None).await;
-    assert_eq!(s, StatusCode::OK, "sessions stay when a confirmed login links Google");
-    let (s, _) = h.req("POST", "/api/auth/login", Some(json!({"email": "owner@acme.test", "password": "correct horse"}))).await;
-    assert_eq!(s, StatusCode::OK, "the password still works");
-    assert!(google_user(&h.state, &claims("g-intruder", "owner@acme.test", None)).await.is_err(), "a second Google account can't take over the email");
-    let (s, _, _) = h.raw("GET", "/api/me", &[("authorization", &format!("Bearer {key}"))], "").await;
-    assert_eq!(s, StatusCode::OK, "API keys stay");
+    assert_eq!(s, StatusCode::OK, "nothing about the login changed");
 
     // New people get a new account: named after them on free mail, after their domain on a work address.
     let GoogleUser::SignedIn(_, ann_acct, created) = google_user(&h.state, &claims("g-ann", "ann@gmail.com", Some("Ann"))).await.unwrap() else { panic!("new Google user") };

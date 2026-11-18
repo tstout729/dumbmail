@@ -724,7 +724,7 @@ async fn attempt(state: &AppState, id: Uuid, rendered: Option<OutgoingEmail>) ->
 /// final status and why, or None to send.
 async fn last_check(db: &PgPool, account_id: Uuid, to_email: &str) -> sqlx::Result<Option<(&'static str, String)>> {
     let (all_paused, off, paused, suppressed): (bool, bool, bool, Option<String>) = sqlx::query_as(&format!(
-        "SELECT COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true),
+        "SELECT COALESCE((SELECT sending_paused_at IS NOT NULL OR closed_at IS NOT NULL FROM accounts WHERE id = $1), true),
                 COALESCE((SELECT enabled_at IS NULL FROM transactional_settings WHERE account_id = $1), true),
                 COALESCE((SELECT paused_at IS NOT NULL FROM transactional_settings WHERE account_id = $1), false),
                 {SUPPRESSED}"

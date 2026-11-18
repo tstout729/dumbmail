@@ -3,7 +3,8 @@
 //! A session starts as soon as the password (or Google, or SSO) checks out, but until two-factor
 //! is done it carries a [`Restriction`] and can only finish signing in (see `access`). That keeps
 //! one code path for every sign-in method:
-//! - password sign-ins need the person's two-factor code when they've turned it on;
+//! - password and Google sign-ins need the person's two-factor code when they've turned it on
+//!   (Google's own sign-in never stands in for the factor they chose here);
 //! - when an account requires two-factor for everyone, password and Google sign-ins need it too
 //!   (people without it set it up first). Google's own sign-in doesn't count: we can't tell whether
 //!   the Google account has two-step verification, so we ask for our own code;
@@ -73,6 +74,9 @@ pub struct SessionStart {
     /// For single sign-on: the provider settings revision the sign-in ran under. The session is
     /// only made while it's still the current one (and single sign-on is still on).
     pub sso_revision: Option<i32>,
+    /// The session's id, when the caller recorded something tied to it first (a Google link
+    /// waiting for this sign-in to finish, see `google_link`). A new one otherwise.
+    pub id: Option<Uuid>,
 }
 
 /// Start a browser session. `method` is password, google or sso (`sso_account` is the account
@@ -93,7 +97,7 @@ pub async fn start_session_with(state: &AppState, user_id: Uuid, account_id: Uui
            AND ($12::int IS NULL OR EXISTS (SELECT 1 FROM account_sso c WHERE c.account_id = $6 AND c.enabled AND c.revision = $12))
          FOR SHARE OF u",
     )
-    .bind(Uuid::now_v7())
+    .bind(how.id.unwrap_or_else(Uuid::now_v7))
     .bind(auth::sha256_hex(&token))
     .bind(user_id)
     .bind(account_id)
@@ -123,7 +127,7 @@ pub async fn start_session_with(state: &AppState, user_id: Uuid, account_id: Uui
 pub async fn revoke_unverified_sessions(state: &AppState, user_id: Uuid, keep: Option<Uuid>) -> AppResult<u64> {
     Ok(sqlx::query(
         "DELETE FROM sessions s USING accounts a WHERE s.user_id = $1 AND a.id = s.account_id AND NOT s.mfa_ok AND s.id IS DISTINCT FROM $2
-           AND (s.auth_method = 'password' OR a.require_two_factor)",
+           AND (s.auth_method IN ('password', 'google') OR a.require_two_factor)",
     )
     .bind(user_id)
     .bind(keep)
@@ -208,7 +212,8 @@ async fn load_session(state: &AppState, token_hash: Option<String>, sid: Option<
         Some(id) => id,
         None => sqlx::query_scalar("UPDATE sessions SET id = COALESCE(id, $2) WHERE token_hash = $1 RETURNING id").bind(&r.token_hash).bind(Uuid::now_v7()).fetch_one(&state.db).await?,
     };
-    let restriction = if r.auth_method == "password" && r.totp_on && !r.mfa_ok {
+    // A login's own two-factor applies to every sign-in but single sign-on (which has its own rule).
+    let restriction = if (r.auth_method == "password" || r.auth_method == "google") && r.totp_on && !r.mfa_ok {
         Some(Restriction::TwoFactorCode)
     } else if r.require_two_factor && !r.mfa_ok {
         Some(if r.totp_on { Restriction::TwoFactorCode } else { Restriction::TwoFactorSetup })
@@ -652,14 +657,20 @@ pub async fn verify_session_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b
     code_ok(&state, uid).await?;
     sqlx::query("UPDATE sessions SET mfa_ok = true, reauth_at = now() WHERE id = $1").bind(sid).execute(&state.db).await?;
     audit(&state, &ctx, "login.two_factor", None, json!({})).await;
+    // The sign-in is complete: a Google link waiting on it is made now.
+    super::google_link::complete_if_signed_in(&state, sid, &meta_of(&ctx)).await?;
     let fresh = reload(&state, &ctx).await?;
     Ok(Json(me_json(&state, &fresh).await?))
+}
+
+fn meta_of(ctx: &Ctx) -> ReqMeta {
+    ReqMeta { ip: ctx.ip.clone(), user_agent: ctx.user_agent.clone() }
 }
 
 /// Re-read a session after changing it.
 async fn reload(state: &AppState, ctx: &Ctx) -> AppResult<Ctx> {
     match ctx.session_id {
-        Some(sid) => ctx_for_session_id(state, sid, &ReqMeta { ip: ctx.ip.clone(), user_agent: ctx.user_agent.clone() }).await,
+        Some(sid) => ctx_for_session_id(state, sid, &meta_of(ctx)).await,
         None => Ok(ctx.clone()),
     }
 }
@@ -744,6 +755,7 @@ pub async fn enable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJs
     // it's you: nothing already known was checked (see `reauth_h`).
     if let Some(sid) = ctx.session_id {
         sqlx::query("UPDATE sessions SET mfa_ok = true WHERE id = $1").bind(sid).execute(&state.db).await?;
+        super::google_link::complete_if_signed_in(&state, sid, &meta_of(&ctx)).await?;
     }
     // Password sessions elsewhere haven't entered a code; they sign in again with one.
     let signed_out = revoke_unverified_sessions(&state, uid, ctx.session_id).await?;
@@ -772,7 +784,7 @@ pub async fn disable_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJ
     sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
     let signed_out = sqlx::query(
         "DELETE FROM sessions s USING accounts a WHERE s.user_id = $1 AND a.id = s.account_id AND NOT s.mfa_ok AND s.id IS DISTINCT FROM $2
-           AND (s.auth_method = 'password' OR a.require_two_factor)",
+           AND (s.auth_method IN ('password', 'google') OR a.require_two_factor)",
     )
     .bind(uid)
     .bind(ctx.session_id)

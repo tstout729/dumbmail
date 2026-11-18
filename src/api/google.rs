@@ -11,9 +11,13 @@
 //! asked; then it marks that session as just confirmed (as `POST /api/me/reauth` does), without
 //! starting a new one.
 //!
-//! A Google sign-in for an address that already has a password login links to it only when that
-//! login's email is confirmed (see `features::team::confirm`). Otherwise the person chooses on the
-//! `/link-google` page (see `features::team::google_link`).
+//! A Google account is matched to an existing login by email only when Google is the authority
+//! for that address: a Gmail address, or a Workspace account whose `hd` claim is the address's own
+//! domain (Google's "Verify the Google ID token" guide: otherwise `email_verified` can stay true
+//! after the mailbox changed hands). Then it links to that login only when the login's email is
+//! confirmed (see `features::team::confirm`); otherwise the person chooses on the `/link-google`
+//! page (see `features::team::google_link`). A link is saved only once the sign-in that makes it
+//! is complete, two-factor included.
 
 use axum::extract::{Query, State};
 use axum::response::Redirect;
@@ -27,6 +31,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::account::{insert_owner, new_session, session_cookie, with_cookie_domain};
+use crate::features::team::google_link::{self, LinkPlan};
 use crate::auth;
 use crate::error::{AppError, AppResult};
 use crate::models::normalize_email;
@@ -187,11 +192,19 @@ async fn callback(State(state): State<AppState>, headers: axum::http::HeaderMap,
     let fail = |jar: CookieJar, code: &str| (jar, Redirect::to(&app_location(&state, &format!("/login?error={code}"))));
     match finish(&state, cookie, q).await {
         // An unconfirmed password login has this address: the person chooses on the next page.
-        Ok(Finished::Choose(token)) => (jar.add(crate::features::team::google_link::cookie(&state, token)), Redirect::to(&app_location(&state, "/link-google"))),
+        Ok(Finished::Choose(token)) => (jar.add(google_link::cookie(&state, token)), Redirect::to(&app_location(&state, "/link-google"))),
         Ok(Finished::SignedIn(user_id, account_id, dest)) => match new_session(&state, user_id, account_id, "google", &meta).await {
             Ok(token) => {
                 crate::features::team::audit::record(&state, account_id, &meta.actor(Some(user_id)), "login", None, json!({"method": "google"})).await;
                 (jar.add(session_cookie(&state, token)), Redirect::to(&app_location(&state, &dest)))
+            }
+            Err(_) => fail(jar, "failed"),
+        },
+        // A confirmed login gets Google linked once this sign-in is complete (two-factor too).
+        Ok(Finished::Link(plan, account_id)) => match google_link::linking_session(&state, &plan, None, account_id, "google", &meta).await {
+            Ok(token) => {
+                crate::features::team::audit::record(&state, account_id, &meta.actor(Some(plan.user_id)), "login", None, json!({"method": "google"})).await;
+                (jar.add(session_cookie(&state, token)), Redirect::to(&app_location(&state, &plan.next)))
             }
             Err(_) => fail(jar, "failed"),
         },
@@ -310,13 +323,15 @@ async fn confirm(state: &AppState, jar: &CookieJar, meta: &crate::features::team
 enum Finished {
     /// Sign this login in to this account, then go here.
     SignedIn(Uuid, Uuid, String),
+    /// Sign the confirmed login in to this account; link Google once the sign-in is complete.
+    Link(LinkPlan, Uuid),
     /// The address has a password login whose email was never confirmed: the person chooses what
     /// happens on the `/link-google` page. The token is for its cookie.
     Choose(String),
 }
 
-/// Finish the sign-in. Errors are codes the login page explains:
-/// cancelled, expired, unavailable, google, unverified, conflict, closed, failed.
+/// Finish the sign-in. Errors are codes the login page explains: cancelled, expired,
+/// unavailable, google, unverified, conflict, use_password, closed, failed.
 async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> Result<Finished, &'static str> {
     if let Some(e) = &q.error {
         return Err(if e == "access_denied" { "cancelled" } else { "google" });
@@ -328,7 +343,8 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> R
     // Coming back from an invite link with no login yet: join that account instead of starting one.
     let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE google_sub = $1 OR email = $2)").bind(&claims.sub).bind(&claims.email).fetch_one(&state.db).await.map_err(|_| "failed")?;
     if !known {
-        if let Some((uid, account)) = crate::features::team::members::google_invite_signup(state, &next, &claims.email, &claims.sub, claims.name.clone()).await.map_err(|_| "failed")? {
+        let invited = crate::features::team::members::google_invite_signup(state, &next, &claims.email, &claims.sub, claims.name.clone(), claims.authoritative()).await.map_err(|_| "failed")?;
+        if let Some((uid, account)) = invited {
             return Ok(Finished::SignedIn(uid, account, "/".into()));
         }
     }
@@ -339,7 +355,11 @@ async fn finish(state: &AppState, cookie: Option<String>, q: CallbackQuery) -> R
     })?;
     Ok(match found {
         GoogleUser::SignedIn(user_id, account_id, created) => Finished::SignedIn(user_id, account_id, if created { "/onboarding".into() } else { next }),
-        GoogleUser::Unconfirmed(user_id) => Finished::Choose(crate::features::team::google_link::create(state, user_id, &claims, &next).await.map_err(|_| "failed")?),
+        GoogleUser::Link { user_id, account_id, credential_version } => {
+            Finished::Link(LinkPlan::new(user_id, &claims, credential_version, true, &next), account_id)
+        }
+        GoogleUser::Unconfirmed(user_id) => Finished::Choose(google_link::create(state, user_id, &claims, &next).await.map_err(|_| "failed")?),
+        GoogleUser::UsePassword => return Err("use_password"),
     })
 }
 
@@ -350,6 +370,24 @@ pub struct GoogleClaims {
     pub email: String,
     pub name: Option<String>,
     pub given_name: Option<String>,
+    /// The Google Workspace domain the account belongs to (`hd`), if any.
+    pub hd: Option<String>,
+}
+
+impl GoogleClaims {
+    /// Whether Google is the authority for this address, so it proves who owns the mailbox now:
+    /// a Gmail address, or a Workspace account (`hd`) on the address's own domain. Any other
+    /// address was only verified once, when the Google account was made, and may have changed
+    /// hands since. (`email_verified` is already required by [`parse_id_token`].)
+    pub fn authoritative(&self) -> bool {
+        is_authoritative(&self.email, self.hd.as_deref())
+    }
+}
+
+/// See [`GoogleClaims::authoritative`].
+pub fn is_authoritative(email: &str, hd: Option<&str>) -> bool {
+    let domain = email.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
+    matches!(domain, "gmail.com" | "googlemail.com") || hd.is_some_and(|h| !h.is_empty() && h.eq_ignore_ascii_case(domain))
 }
 
 /// Read the ID token from Google's token endpoint. It came straight from Google over TLS in answer
@@ -374,7 +412,7 @@ pub fn parse_id_token(token: &str, client_id: &str, now: i64) -> Result<GoogleCl
     let email = c["email"].as_str().and_then(normalize_email).filter(|_| verified).ok_or("Your Google account needs a verified email address.")?;
     let sub = c["sub"].as_str().filter(|s| !s.is_empty()).ok_or_else(bad)?.to_string();
     let text = |k: &str| c[k].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    Ok(GoogleClaims { sub, email, name: text("name"), given_name: text("given_name") })
+    Ok(GoogleClaims { sub, email, name: text("name"), given_name: text("given_name"), hd: text("hd").map(|h| h.to_ascii_lowercase()) })
 }
 
 const FREE_MAIL: [&str; 16] = [
@@ -385,19 +423,23 @@ const FREE_MAIL: [&str; 16] = [
 /// Who a Google sign-in is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoogleUser {
-    /// Sign in as (user, account, created).
+    /// Sign in as (user, account, created): a login already linked to this Google account, or a
+    /// new one.
     SignedIn(Uuid, Uuid, bool),
-    /// A password login has this address but its email was never confirmed, so it may not be the
-    /// address owner's: nothing is linked and nobody is signed in (see `features::team::google_link`).
+    /// A login whose email is confirmed has this address: sign it in, and link Google once the
+    /// sign-in is complete, if the login still has this credential version, no Google account and
+    /// a confirmed email.
+    Link { user_id: Uuid, account_id: Uuid, credential_version: i32 },
+    /// A login whose email was never confirmed has this address, so it may not be the address
+    /// owner's: nothing is linked and nobody is signed in (see `features::team::google_link`).
     Unconfirmed(Uuid),
+    /// A login has this address, but Google isn't the authority for it (see
+    /// [`GoogleClaims::authoritative`]): use that login's password.
+    UsePassword,
 }
 
-/// Find or create the DumbMail user for a Google sign-in.
-///
-/// An existing password login for the address is linked only when its email is confirmed (it's
-/// proven to be the same person, so everything stays). An unconfirmed one isn't touched: the person
-/// chooses between proving it's theirs and starting fresh. With sign-ups off nobody can have made
-/// a login by signing up, so an unconfirmed one is linked as before, cutting off its other ways in.
+/// Find or create the DumbMail user for a Google sign-in. Nothing here changes an existing login:
+/// a link is saved later, once the sign-in that makes it is complete (see `google_link`).
 pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<GoogleUser> {
     let first_account = |uid: Uuid| async move {
         crate::features::team::login::pick_account(state, uid).await?.ok_or_else(|| AppError::Forbidden("this login isn't part of any account anymore".into()))
@@ -405,60 +447,28 @@ pub async fn google_user(state: &AppState, c: &GoogleClaims) -> AppResult<Google
     if let Some(uid) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE google_sub = $1 AND disabled_at IS NULL").bind(&c.sub).fetch_optional(&state.db).await? {
         return Ok(GoogleUser::SignedIn(uid, first_account(uid).await?, false));
     }
-    let existing: Option<(Uuid, Option<String>, bool)> =
-        sqlx::query_as("SELECT id, google_sub, email_confirmed_at IS NOT NULL FROM users WHERE email = $1 AND disabled_at IS NULL").bind(&c.email).fetch_optional(&state.db).await?;
-    if let Some((uid, linked, confirmed)) = existing {
+    let existing: Option<(Uuid, Option<String>, bool, i32)> =
+        sqlx::query_as("SELECT id, google_sub, email_confirmed_at IS NOT NULL, credential_version FROM users WHERE email = $1 AND disabled_at IS NULL")
+            .bind(&c.email)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some((uid, linked, confirmed, credential_version)) = existing {
+        if !c.authoritative() {
+            return Ok(GoogleUser::UsePassword);
+        }
         if linked.is_some() {
             return Err(AppError::Conflict("this email is already linked to a different Google account".into()));
         }
         if confirmed {
-            // The address's owner already had this login: link Google and keep everything.
-            let n = sqlx::query("UPDATE users SET google_sub = $2 WHERE id = $1 AND google_sub IS NULL AND email_confirmed_at IS NOT NULL AND disabled_at IS NULL")
-                .bind(uid)
-                .bind(&c.sub)
-                .execute(&state.db)
-                .await?
-                .rows_affected();
-            if n != 1 {
-                return Err(AppError::Conflict("this login changed while you were signing in; try again".into()));
-            }
-            return Ok(GoogleUser::SignedIn(uid, first_account(uid).await?, false));
+            return Ok(GoogleUser::Link { user_id: uid, account_id: first_account(uid).await?, credential_version });
         }
-        if state.cfg.allow_signup {
-            return Ok(GoogleUser::Unconfirmed(uid));
-        }
-        // Sign-ups are off, so this login came from an invite, the operator or single sign-on.
-        // Linking cuts off every way someone else could still get in: the password, every older
-        // session, pending password resets, a two-factor app they may have set up, and the API
-        // keys they could have made (keys this login made, and keys from before teams on accounts
-        // it owns; teammates' keys on shared accounts stay). The owner makes new keys if needed.
-        let mut tx = state.db.begin().await?;
-        sqlx::query(
-            "UPDATE users SET google_sub = $2, email_confirmed_at = now(), password_hash = NULL, credential_version = credential_version + 1,
-                    totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1",
-        )
-            .bind(uid)
-            .bind(&c.sub)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM password_resets WHERE user_id = $1").bind(uid).execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE api_keys SET revoked_at = now() WHERE revoked_at IS NULL AND (created_by = $1
-                OR (created_by IS NULL AND account_id IN (SELECT account_id FROM memberships WHERE user_id = $1 AND role = 'owner')))",
-        )
-        .bind(uid)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Ok(GoogleUser::SignedIn(uid, first_account(uid).await?, false));
+        return Ok(GoogleUser::Unconfirmed(uid));
     }
     if !state.cfg.allow_signup {
         return Err(AppError::Forbidden("no DumbMail account uses this Google address, and sign-ups are off on this server".into()));
     }
     let (company, website) = brand_for(c);
-    let (user, account) = insert_owner(state, &c.email, None, Some(&c.sub), c.name.clone(), &company, website).await?;
+    let (user, account) = insert_owner(state, &c.email, None, Some(&c.sub), c.authoritative(), c.name.clone(), &company, website).await?;
     Ok(GoogleUser::SignedIn(user.id, account.id, true))
 }
 
