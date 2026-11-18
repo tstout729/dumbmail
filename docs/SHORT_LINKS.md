@@ -100,7 +100,9 @@ text carries the one it got.
   targets and campaign link maps.
 - Request logs show short links as `/s/…`, without their 24 characters.
 - Lookups use an index on `messages (account_id, short_ref)`, built in the background after the
-  server starts.
+  server starts. Each lookup checks in the same statement that the index is there and reads
+  `messages` only if it is; if it's gone, or the lookup fails, the click gets "link not found" and
+  the server stops issuing short links until a check finds the index again.
 - A server puts short links in texts only once that index is in place and it has been accepting
   requests for 2 minutes. During a deploy the old server keeps getting some clicks for a short while
   and can't resolve `/s/` links, so texts sent in a new server's first 2 minutes use the long form.

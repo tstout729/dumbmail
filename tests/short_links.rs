@@ -549,15 +549,34 @@ async fn without_its_index_a_server_answers_not_found_without_a_query() {
     launch(&mut h, &id).await;
     let path = short_paths(&body_to(&h, &phone))[0].clone();
     assert!(click(&h, &path).await.0.is_redirection());
-    // The index goes missing; the scheduler's check notices.
+    // The index goes missing between scheduler checks: the server still thinks it's there.
     sqlx::query(&format!("DROP INDEX {}", short_links::INDEXES[0].0)).execute(&h.state.db).await.unwrap();
-    assert!(!short_links::check_index(&h.state).await);
+    assert!(short_links::index_ready(&h.state));
+    // The lookup checks for itself: not found, without scanning messages, and the server stops
+    // issuing short links.
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) {}", short_links::LOOKUP_SQL))
+        .bind(&path[..code::TARGET_LEN])
+        .bind(&path[code::TARGET_LEN..code::TARGET_LEN + code::REF_LEN])
+        .bind(short_links::INDEXES[0].0)
+        .fetch_all(&h.state.db)
+        .await
+        .unwrap();
+    let scans: Vec<&String> = plan.iter().filter(|l| l.contains("on messages") && !l.contains("never executed")).collect();
+    assert!(scans.is_empty(), "messages isn't read without its index: {plan:#?}");
+    assert_eq!(click(&h, &path).await.0, StatusCode::NOT_FOUND);
+    assert!(!short_links::index_ready(&h.state));
     assert!(!short_links::issuing(&h.state), "and no new short links are issued");
+    // Known missing now: further clicks answer without any query.
     let ((status, _, _), queries) = counted(click(&h, &path)).await;
-    assert_eq!((status, queries), (StatusCode::NOT_FOUND, 0), "no lookup that would scan messages");
+    assert_eq!((status, queries), (StatusCode::NOT_FOUND, 0));
     // Rebuilt: links resolve again.
     short_links::ensure_index(&h.state).await.unwrap();
     assert!(click(&h, &path).await.0.is_redirection());
+    // A refresh that can't read the catalog counts the index as missing, not as still there.
+    assert!(short_links::index_ready(&h.state));
+    h.state.db.close().await;
+    assert!(!short_links::check_index(&h.state).await);
+    assert!(!short_links::index_ready(&h.state));
     h.cleanup().await;
 }
 

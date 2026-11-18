@@ -78,10 +78,16 @@ pub async fn ensure_index(state: &AppState) -> anyhow::Result<()> {
 
 // ---------- The click ----------
 
-const LOOKUP_SQL: &str = "SELECT t.url, m.id FROM short_link_targets t
-     JOIN accounts a ON a.id = t.account_id AND a.closed_at IS NULL
-     JOIN messages m ON m.account_id = t.account_id AND m.short_ref = $2 AND m.channel = 'sms'
-     WHERE t.code = $1 LIMIT 2";
+/// The lookup checks, in the same statement, that the index on `messages` is in place, and runs the
+/// join only if it is (a one-time filter: without the index nothing scans `messages`). Returns
+/// whether the index was there, and the candidates as `[[url, message id], ...]`.
+pub const LOOKUP_SQL: &str = "WITH idx AS (SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+         WHERE c.relname = $3 AND c.relnamespace = current_schema()::regnamespace AND i.indisvalid AND i.indisready) AS ok)
+     SELECT (SELECT ok FROM idx), COALESCE((SELECT jsonb_agg(jsonb_build_array(x.url, x.id)) FROM (
+         SELECT t.url, m.id FROM short_link_targets t
+         JOIN accounts a ON a.id = t.account_id AND a.closed_at IS NULL
+         JOIN messages m ON m.account_id = t.account_id AND m.short_ref = $2 AND m.channel = 'sms'
+         WHERE t.code = $1 AND (SELECT ok FROM idx) LIMIT 2) x), '[]')";
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "link not found").into_response()
@@ -103,8 +109,17 @@ async fn click(State(state): State<AppState>, headers: HeaderMap, Path(path): Pa
         Err(limit::Refused::TooMany) => return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response(),
         Err(limit::Refused::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "busy, try again").into_response(),
     };
-    let rows = sqlx::query_as::<_, (String, Uuid)>(LOOKUP_SQL).bind(target).bind(message_ref).fetch_all(&state.db).await;
-    let found = rows.ok().and_then(|rows| rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag)));
+    let rows = match sqlx::query_as::<_, (bool, Value)>(LOOKUP_SQL).bind(target).bind(message_ref).bind(INDEXES[0].0).fetch_one(&state.db).await {
+        Ok((true, rows)) => rows,
+        // The index is gone, or the lookup failed: answer not found and stop using short links until
+        // a check finds the index again.
+        Ok((false, _)) | Err(_) => {
+            runtime::mark_index_missing(&state);
+            return not_found();
+        }
+    };
+    let rows: Vec<(String, Uuid)> = serde_json::from_value(rows).unwrap_or_default();
+    let found = rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag));
     let Some((url, message_id)) = found else {
         // The miss keeps its count against the address.
         return not_found();

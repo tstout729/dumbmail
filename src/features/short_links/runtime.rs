@@ -79,13 +79,18 @@ pub fn issuing(state: &AppState) -> bool {
 pub async fn check_index(state: &AppState) -> bool {
     let rt = of(state);
     *lock(&rt.last_check) = Some(Instant::now());
-    let valid: Option<bool> = match sqlx::query_scalar(crate::features::reports::indexes::STATE_SQL).bind(super::INDEXES[0].0).fetch_optional(&state.db).await {
-        Ok(v) => v,
-        // Can't tell: keep what we knew.
-        Err(_) => return rt.index_ready(),
-    };
+    // Can't tell (the read failed): count it as missing; the next check finds it again.
+    let valid: Option<bool> = sqlx::query_scalar(crate::features::reports::indexes::STATE_SQL).bind(super::INDEXES[0].0).fetch_optional(&state.db).await.ok().flatten();
     rt.index_ready.store(valid == Some(true), Ordering::Relaxed);
     rt.index_ready()
+}
+
+/// A lookup found the index missing, or failed: stop using it (clicks answer not found, no new short
+/// links) until a check finds it again.
+pub fn mark_index_missing(state: &AppState) {
+    let rt = of(state);
+    rt.index_ready.store(false, Ordering::Relaxed);
+    *lock(&rt.last_check) = Some(Instant::now());
 }
 
 /// Whether the index is in place, checking again (at most every [`RECHECK_EVERY`]) when it wasn't.
