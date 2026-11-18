@@ -380,7 +380,10 @@ pub async fn setup(state: &AppState, account_id: Uuid, generation: Option<i32>) 
             // Retried by the scheduler (setup_after) as well as by the job queue.
             anyhow::bail!("shopify setup: {} webhook subscriptions refused", missing.len());
         }
-        Ok(_) => start_history(state, &s).await?,
+        Ok(_) => {
+            start_history(state, &s).await?;
+            super::starters::ensure(&state.db, account_id).await?;
+        }
     }
     Ok(())
 }

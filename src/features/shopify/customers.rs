@@ -230,10 +230,17 @@ pub fn source_tag(shop: &str) -> String {
     format!("integration:shopify:{shop}")
 }
 
-/// Give a profile that has no email this address. Its email consent starts over (never subscribed):
-/// consent never comes from somewhere else. False if another profile has the address or this one got one.
-async fn attach_email(db: &PgPool, id: Uuid, email: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET email = $2, email_consent = 'never_subscribed', updated_at = now() WHERE id = $1 AND email IS NULL").bind(id).bind(email).execute(db).await;
+/// Give a profile that has no email this address, marked as the store's (`email_source`), so a
+/// service-message flow can reach a held person there. Its email consent starts over (never
+/// subscribed): consent never comes from somewhere else. False if another profile has the address or
+/// this one got one.
+async fn attach_email(db: &PgPool, shop: &str, id: Uuid, email: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE profiles SET email = $2, email_consent = 'never_subscribed', email_source = $3, updated_at = now() WHERE id = $1 AND email IS NULL")
+        .bind(id)
+        .bind(email)
+        .bind(source_tag(shop))
+        .execute(db)
+        .await;
     match r {
         Ok(r) => Ok(r.rows_affected() == 1),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
@@ -241,8 +248,13 @@ async fn attach_email(db: &PgPool, id: Uuid, email: &str) -> sqlx::Result<bool> 
     }
 }
 
-async fn attach_phone(db: &PgPool, id: Uuid, phone: &str) -> sqlx::Result<bool> {
-    let r = sqlx::query("UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', updated_at = now() WHERE id = $1 AND phone_number IS NULL").bind(id).bind(phone).execute(db).await;
+async fn attach_phone(db: &PgPool, shop: &str, id: Uuid, phone: &str) -> sqlx::Result<bool> {
+    let r = sqlx::query("UPDATE profiles SET phone_number = $2, sms_consent = 'never_subscribed', phone_source = $3, updated_at = now() WHERE id = $1 AND phone_number IS NULL")
+        .bind(id)
+        .bind(phone)
+        .bind(source_tag(shop))
+        .execute(db)
+        .await;
     match r {
         Ok(r) => Ok(r.rows_affected() == 1),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
@@ -335,7 +347,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
         Some(e) => match by_email(db, account_id, e).await? {
             Some(p) => Some(p),
             None => match &linked {
-                Some(l) if l.email.is_none() && attach_email(db, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
+                Some(l) if l.email.is_none() && attach_email(db, shop, l.id, e).await? => Some(P { email: Some(e.clone()), ..l.clone() }),
                 _ => create(db, account_id, shop, Some(e), None, first, last).await?,
             },
         },
@@ -343,7 +355,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
             Some(ph) => match by_phone(db, account_id, ph).await? {
                 Some(p) => Some(p),
                 None => match &linked {
-                    Some(l) if l.phone_number.is_none() && attach_phone(db, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
+                    Some(l) if l.phone_number.is_none() && attach_phone(db, shop, l.id, ph).await? => Some(P { phone_number: Some(ph.clone()), ..l.clone() }),
                     _ => create(db, account_id, shop, None, Some(ph), first, last).await?,
                 },
             },
@@ -370,7 +382,7 @@ async fn apply_inner(db: &PgPool, account_id: Uuid, shop: &str, c: &Customer, hi
     if let Some(ph) = &phone {
         let sms_owner = match by_phone(db, account_id, ph).await? {
             Some(p) => Some(p.id),
-            None if main.phone_number.is_none() && attach_phone(db, main.id, ph).await? => Some(main.id),
+            None if main.phone_number.is_none() && attach_phone(db, shop, main.id, ph).await? => Some(main.id),
             None => create(db, account_id, shop, None, Some(ph), first, last).await?.map(|p| p.id),
         };
         if let Some(owner) = sms_owner {

@@ -550,7 +550,7 @@ async fn count(h: &Harness, sql: &str) -> i64 {
 /// A live flow on this metric (to see which events start flows).
 async fn live_flow(h: &mut Harness, metric: &str) {
     h.ok("POST", "/api/flows", Some(json!({"name": format!("On {metric}"), "trigger": {"type": "metric", "metric": metric}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
-    sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flows SET status = 'live' WHERE name NOT IN ('Order confirmed', 'Order shipped')").execute(&h.state.db).await.unwrap();
 }
 
 async fn flow_runs(h: &Harness) -> i64 {
@@ -1251,7 +1251,7 @@ async fn history_import() {
     let seg_id = seg["id"].as_str().unwrap().to_string();
     h.ok("POST", "/api/flows", Some(json!({"name": "Welcome buyers", "trigger": {"type": "segment", "segment_id": seg_id}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
     h.ok("POST", "/api/flows", Some(json!({"name": "Thanks", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
-    sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flows SET status = 'live' WHERE name NOT IN ('Order confirmed', 'Order shipped')").execute(&h.state.db).await.unwrap();
     dumbmail::flows::refresh_segment(&h.state, seg_id.parse().unwrap()).await.unwrap();
 
     let ops_before = mock.lock().unwrap().bulk_ops.len();
@@ -2164,7 +2164,7 @@ async fn history_entries_never_start_flows_and_real_ones_always_do() {
     let seg = h.ok("POST", "/api/segments", Some(json!({"name": "Buyers", "definition": {"match": "all", "conditions": [{"type": "event", "metric": "Placed Order", "op": "at_least", "count": 1}]}}))).await;
     let seg_id: Uuid = seg["id"].as_str().unwrap().parse().unwrap();
     h.ok("POST", "/api/flows", Some(json!({"name": "Welcome buyers", "trigger": {"type": "segment", "segment_id": seg_id.to_string()}, "definition": {"entry": "d", "nodes": [{"id": "d", "type": "delay", "amount": 1, "unit": "days", "next": null}]}}))).await;
-    sqlx::query("UPDATE flows SET status = 'live'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flows SET status = 'live' WHERE name NOT IN ('Order confirmed', 'Order shipped')").execute(&h.state.db).await.unwrap();
     dumbmail::flows::refresh_segment(&h.state, seg_id).await.unwrap();
     // History: an order the import brings in. Its buyer enters the segment, quietly, whenever the
     // refresh runs (here: after the import finished).
@@ -3033,5 +3033,37 @@ async fn an_emptied_store_empties_the_catalog() {
     h.ok("POST", "/api/shopify/products/resync", None).await;
     settle_imports(&h).await;
     assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["published"], false, "gone from the store: unpublished");
+    h.cleanup().await;
+}
+
+/// Item 13: an address the store supplies later to an existing held profile is marked as the
+/// store's (so service messages reach it there); connecting ships two draft service-message flows.
+#[tokio::test]
+async fn store_addresses_and_order_starters() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let flows: Vec<(String, String, Value)> = sqlx::query_as("SELECT name, status, definition FROM flows ORDER BY name").fetch_all(&h.state.db).await.unwrap();
+    let names: Vec<&str> = flows.iter().map(|f| f.0.as_str()).collect();
+    assert_eq!(names, ["Order confirmed", "Order shipped"]);
+    assert!(flows.iter().all(|f| f.1 == "draft" && f.2["settings"]["service_messages"] == true), "{flows:?}");
+    // Reconnecting doesn't add them twice.
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect(&mut h).await;
+    assert_eq!(count(&h, "SELECT count(*) FROM flows").await, 2);
+
+    // A phone-first customer, held; later Shopify has their email too.
+    mock.lock().unwrap().customers.insert(1, customer(1, None, "NOT_SUBSCRIBED", Some("+15035550111"), "NOT_SUBSCRIBED"));
+    hook(&h, "customers/update", "c1", &json!({"id": 1})).await;
+    h.drain().await;
+    mock.lock().unwrap().customers.insert(1, customer_at(1, Some("late@example.com"), "NOT_SUBSCRIBED", Some("+15035550111"), "NOT_SUBSCRIBED", "2025-03-01T00:00:00Z", "2025-03-01T00:00:00Z"));
+    hook(&h, "customers/update", "c2", &json!({"id": 1})).await;
+    h.drain().await;
+    let (pid, held, source): (Uuid, bool, Option<String>) = sqlx::query_as("SELECT id, marketing_hold, email_source FROM profiles WHERE email = 'late@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert!(held);
+    assert_eq!(source.as_deref(), Some("integration:shopify:acme-goods.myshopify.com"));
+    let confirmed: Uuid = sqlx::query_scalar("SELECT id FROM flows WHERE name = 'Order confirmed'").fetch_one(&h.state.db).await.unwrap();
+    assert!(!dumbmail::marketing_hold::blocks_email(&h.state.db, pid, Some(confirmed)).await.unwrap(), "the order confirmation reaches the store's address");
     h.cleanup().await;
 }

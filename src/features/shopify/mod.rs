@@ -26,6 +26,7 @@ pub mod orders;
 pub mod privacy;
 pub mod products;
 pub mod shop;
+pub mod starters;
 pub mod webhooks;
 
 use async_trait::async_trait;
