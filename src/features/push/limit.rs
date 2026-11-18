@@ -30,11 +30,35 @@ fn account_gate(account_id: Uuid) -> Arc<Semaphore> {
     m.entry(account_id).or_insert_with(|| Arc::new(Semaphore::new(PER_ACCOUNT))).clone()
 }
 
+/// Calls waiting for a slot, per account (tests watch it).
+static WAITING: Lazy<Mutex<HashMap<Uuid, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// Wait for a slot: the account's first (so one busy account waits on itself), then the overall one.
 pub async fn slot(account_id: Uuid) -> Slot {
-    let account = account_gate(account_id).acquire_owned().await.expect("never closed");
+    let gate = account_gate(account_id);
+    let account = match gate.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            *WAITING.lock().unwrap_or_else(|e| e.into_inner()).entry(account_id).or_default() += 1;
+            let p = gate.acquire_owned().await;
+            let mut w = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = w.get_mut(&account_id) {
+                *n -= 1;
+                if *n == 0 {
+                    w.remove(&account_id);
+                }
+            }
+            p.expect("never closed")
+        }
+    };
     let all = ALL.clone().acquire_owned().await.expect("never closed");
     Slot { _account: account, _all: all }
+}
+
+/// Calls waiting for one of an account's slots (tests).
+#[doc(hidden)]
+pub fn waiting(account_id: Uuid) -> usize {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).get(&account_id).copied().unwrap_or(0)
 }
 
 /// Calls in flight for an account (tests).

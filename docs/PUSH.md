@@ -138,10 +138,10 @@ DumbMail doesn't ship a native SDK. Your app asks for permission, registers its 
 
 ### Credentials
 
-- **Apple**: in your Apple developer account, create an APNs auth key (Certificates, Identifiers & Profiles → Keys, with Apple Push Notifications service). Enter its key ID, your team ID, your app's bundle ID and the `.p8` file. Turn **production** off for development builds (they use the APNs sandbox).
+- **Apple**: in your Apple developer account, create an APNs auth key (Certificates, Identifiers & Profiles → Keys, with Apple Push Notifications service). Enter its key ID, your team ID, your app's bundle ID and the `.p8` file. **Production** sets the APNs environment for devices whose app doesn't say which one it uses (see `environment` below); turn it off if all your builds are development builds.
 - **Android**: in Firebase, Project settings → Service accounts → Generate new private key. Paste the whole JSON file. DumbMail uses FCM HTTP v1 and keeps the OAuth token cached.
 
-Secrets are stored encrypted and never shown again. When Apple or Google says the account's setup is wrong (credentials, project, topic, or a sandbox token sent to production), Settings → Push shows the reason and no device is deleted. A device is removed only when Apple or Google says that device is gone (APNs `Unregistered` or `ExpiredToken`, `BadDeviceToken` once the environment has accepted other notifications; FCM `UNREGISTERED`).
+Secrets are stored encrypted and never shown again. When Apple or Google says the account's setup is wrong (credentials, project, topic, or a sandbox token sent to production), Settings → Push shows the reason and no device is deleted. A device is removed only when Apple or Google says that device is gone (APNs `Unregistered` or `ExpiredToken`; APNs `BadDeviceToken` only for a device whose app said its environment, since otherwise it may just belong to the other one; FCM `UNREGISTERED`).
 
 ### Registering a device
 
@@ -149,10 +149,10 @@ Secrets are stored encrypted and never shown again. When Apple or Google says th
 
 ```json
 {"platform": "ios", "token": "<APNs device token as hex, or FCM registration token>", "permission": "granted",
- "app_version": "2.4.0", "identity": {"type": "external_id", "value": "cust_123", "grant": "v1.…"}}
+ "environment": "production", "app_version": "2.4.0", "identity": {"type": "external_id", "value": "cust_123", "grant": "v1.…"}}
 ```
 
-`permission` is required: `granted`, `provisional` (iOS), `denied` or `not_determined`. Only `granted` and `provisional` are sent to; provisional devices are marked as such. Call it on every launch, after asking for permission, after sign-in (with a grant), and whenever the permission changes. On sign-out, `POST {base}/client/push/devices/sign-out?k=…` with `{"platform", "token"}` (the device goes back to an anonymous profile); to forget a device entirely, `POST {base}/client/push/devices/remove?k=…`.
+`permission` is required: `granted`, `provisional` (iOS), `denied` or `not_determined`. On iOS, send `environment`: `sandbox` for development builds (run from Xcode) and `production` for TestFlight and App Store builds (for example from a `#if DEBUG` check, or the `aps-environment` entitlement). Without it the account's default is used, and a token Apple calls bad is kept, since it may only belong to the other environment. Only `granted` and `provisional` are sent to; provisional devices are marked as such. Call it on every launch, after asking for permission, after sign-in (with a grant), and whenever the permission changes. On sign-out, `POST {base}/client/push/devices/sign-out?k=…` with `{"platform", "token"}` (the device goes back to an anonymous profile); to forget a device entirely, `POST {base}/client/push/devices/remove?k=…`.
 
 When someone opens a notification, read `dumbmail.t` (iOS) or `dumbmail_t` (Android data) and `POST {base}/client/push/opened?k=…` with `{"t": "<that value>"}`. The tap's link is `dumbmail.url` / `dumbmail_url`: opening it records the tap too.
 

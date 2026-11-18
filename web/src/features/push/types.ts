@@ -46,7 +46,7 @@ export type PushPrompt = {
 
 export type PushSettings = {
   web: { enabled: boolean; ready: boolean; vapid_public_key: string | null; sw_path: string; sw_scope: string; prompt: PushPrompt; service_worker_url: string };
-  apns: { configured: boolean; key_id: string | null; team_id: string | null; bundle_id: string | null; production: boolean; verified: boolean; error: string | null };
+  apns: { configured: boolean; key_id: string | null; team_id: string | null; bundle_id: string | null; production: boolean; error: string | null };
   fcm: { configured: boolean; project_id: string | null; client_email: string | null; error: string | null };
   identity: { configured: boolean; hint: string | null };
   account_id: string;

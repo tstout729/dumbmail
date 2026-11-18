@@ -119,27 +119,8 @@ async fn mock() -> (Mock, String) {
                 (StatusCode::CREATED, [("location", format!("https://push.test/m/{id}"))]).into_response()
             }),
         )
-        .route(
-            "/apns/3/device/{token}",
-            post(|State(m): State<Mock>, Path(token): Path<String>, v: Version, h: HeaderMap, b: Bytes| async move {
-                m.record(format!("/apns/{token}"), v, h.clone(), b).await;
-                let reason = |s: StatusCode, r: &str| (s, axum::Json(json!({"reason": r}))).into_response();
-                if token.starts_with("dead") {
-                    return reason(StatusCode::GONE, "Unregistered");
-                }
-                if token.starts_with("ab12") {
-                    return (StatusCode::GONE, axum::Json(json!({"reason": "Unregistered", "timestamp": 1000}))).into_response();
-                }
-                if token.starts_with("bad0") {
-                    return reason(StatusCode::BAD_REQUEST, "BadDeviceToken");
-                }
-                if token.starts_with("cafe") {
-                    return reason(StatusCode::BAD_REQUEST, "DeviceTokenNotForTopic");
-                }
-                let id = h.get("apns-id").and_then(|v| v.to_str().ok()).unwrap_or("x").to_string();
-                (StatusCode::OK, [("apns-id", id)]).into_response()
-            }),
-        )
+        .route("/apns/3/device/{token}", post(|m: State<Mock>, t: Path<String>, v: Version, h: HeaderMap, b: Bytes| apns(m, t, v, h, b, "production")))
+        .route("/apns-sandbox/3/device/{token}", post(|m: State<Mock>, t: Path<String>, v: Version, h: HeaderMap, b: Bytes| apns(m, t, v, h, b, "sandbox")))
         .route(
             "/oauth2/token",
             post(|State(m): State<Mock>, h: HeaderMap, b: Bytes| async move {
@@ -184,6 +165,28 @@ async fn mock() -> (Mock, String) {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (m, base)
+}
+
+/// The stand-in APNs, both environments. A hit is recorded as `/apns/{token}` with the environment
+/// in an `x-env` header.
+async fn apns(State(m): State<Mock>, Path(token): Path<String>, v: Version, mut h: HeaderMap, b: Bytes, env: &'static str) -> axum::response::Response {
+    h.insert("x-env", env.parse().unwrap());
+    m.record(format!("/apns/{token}"), v, h.clone(), b).await;
+    let reason = |s: StatusCode, r: &str| (s, axum::Json(json!({"reason": r}))).into_response();
+    if token.starts_with("dead") {
+        return reason(StatusCode::GONE, "Unregistered");
+    }
+    if token.starts_with("ab12") {
+        return (StatusCode::GONE, axum::Json(json!({"reason": "Unregistered", "timestamp": 1000}))).into_response();
+    }
+    if token.starts_with("bad0") {
+        return reason(StatusCode::BAD_REQUEST, "BadDeviceToken");
+    }
+    if token.starts_with("cafe") {
+        return reason(StatusCode::BAD_REQUEST, "DeviceTokenNotForTopic");
+    }
+    let id = h.get("apns-id").and_then(|v| v.to_str().ok()).unwrap_or("x").to_string();
+    (StatusCode::OK, [("apns-id", id)]).into_response()
 }
 
 async fn harness_with_mock(price: f64) -> Option<(Harness, Mock, String)> {
@@ -786,9 +789,17 @@ fn service_account(project: &str) -> String {
 }
 
 async fn register(h: &Harness, a: &Acct, platform: &str, token: &str, permission: Option<&str>, email: &str) -> (StatusCode, Value) {
+    register_in(h, a, platform, token, permission, email, None).await
+}
+
+/// [`register`], the app saying which APNs environment it was built for.
+async fn register_in(h: &Harness, a: &Acct, platform: &str, token: &str, permission: Option<&str>, email: &str, environment: Option<&str>) -> (StatusCode, Value) {
     let mut body = json!({"platform": platform, "token": token, "identity": a.grant("email", email)});
     if let Some(p) = permission {
         body["permission"] = json!(p);
+    }
+    if let Some(e) = environment {
+        body["environment"] = json!(e);
     }
     public_post(h, "/client/push/devices", &a.key, body).await
 }
@@ -843,42 +854,54 @@ async fn apple_and_firebase_answers_are_read_right() {
         let db = db.clone();
         async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM push_devices WHERE profile_id = $1").bind(p).fetch_one(&db).await.unwrap() }
     };
-    // Before this environment has accepted anything, BadDeviceToken may mean development vs
-    // production: an account problem, nothing deleted.
+    // A device that didn't say which APNs environment it's for: BadDeviceToken may mean development
+    // vs production, an account problem, nothing deleted. Another token's success proves nothing
+    // about it, however often.
+    let good = "a".repeat(64);
+    register(&h, &a, "ios", &good, Some("granted"), "ivy@x.test").await;
     register(&h, &a, "ios", &format!("bad0{}", "1".repeat(60)), Some("granted"), "ivy@x.test").await;
     register(&h, &a, "ios", &format!("cafe{}", "1".repeat(60)), Some("granted"), "ivy@x.test").await;
     register(&h, &a, "android", &format!("nf{}", "x".repeat(40)), Some("granted"), "dan@x.test").await;
     register(&h, &a, "android", &format!("sid{}", "x".repeat(40)), Some("granted"), "dan@x.test").await;
-    let cid = push_campaign(&mut h, &l, json!({"title": "One"})).await;
-    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
-    h.drain().await;
-    assert_eq!((devices(ivy).await, devices(dan).await), (2, 2), "nothing deleted on account problems");
+    for title in ["One", "One again"] {
+        let cid = push_campaign(&mut h, &l, json!({"title": title})).await;
+        h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+        h.drain().await;
+    }
+    assert_eq!(m.hits(&format!("/apns/{good}")).len(), 2, "the good token was accepted");
+    assert!(m.hits("/apns/").iter().all(|x| x.headers["x-env"] == "sandbox"), "the account's default environment");
+    assert_eq!((devices(ivy).await, devices(dan).await), (3, 2), "nothing deleted on account problems");
     let s = h.ok("GET", "/api/push/settings", None).await;
     assert!(s["apns"]["error"].as_str().is_some_and(|e| e.contains("BadDeviceToken") || e.contains("DeviceTokenNotForTopic")), "{s}");
     assert!(s["fcm"]["error"].as_str().is_some(), "{s}");
-    assert_eq!(s["apns"]["verified"], false);
+    let (st, _) = register_in(&h, &a, "ios", &good, Some("granted"), "ivy@x.test", Some("staging")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "only sandbox or production");
 
-    // Once APNs accepted something here, BadDeviceToken is about the device; Unregistered too,
-    // unless the device registered again after the time Apple gives.
+    // A device that said its environment is tried there, and then BadDeviceToken is about the
+    // device; Unregistered too, unless the device registered again after the time Apple gives.
     sqlx::query("DELETE FROM push_devices").execute(&h.state.db).await.unwrap();
-    let good = "a".repeat(64);
     register(&h, &a, "ios", &good, Some("granted"), "ivy@x.test").await;
-    register(&h, &a, "ios", &format!("bad0{}", "2".repeat(60)), Some("granted"), "ivy@x.test").await;
+    let prod_bad = format!("bad0{}", "2".repeat(60));
+    register_in(&h, &a, "ios", &prod_bad, Some("granted"), "ivy@x.test", Some("production")).await;
+    register_in(&h, &a, "ios", &format!("bad0{}", "5".repeat(60)), Some("granted"), "ivy@x.test", Some("sandbox")).await;
     register(&h, &a, "ios", &format!("dead{}", "3".repeat(60)), Some("granted"), "ivy@x.test").await;
     register(&h, &a, "ios", &format!("ab12{}", "4".repeat(60)), Some("granted"), "ivy@x.test").await;
     register(&h, &a, "android", &format!("dead{}", "x".repeat(40)), Some("granted"), "dan@x.test").await;
     register(&h, &a, "android", &format!("huge{}", "x".repeat(40)), Some("granted"), "dan@x.test").await;
-    sqlx::query("UPDATE push_settings SET apns_verified_at = now()").execute(&h.state.db).await.unwrap();
+    // Re-registering without saying keeps what the app said before.
+    register(&h, &a, "ios", &prod_bad, Some("granted"), "ivy@x.test").await;
     let cid = push_campaign(&mut h, &l, json!({"title": "Two"})).await;
     h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
     h.drain().await;
+    assert_eq!(m.hits(&format!("/apns/{prod_bad}"))[0].headers["x-env"], "production", "sent to the environment it said");
     let ok = m.hits(&format!("/apns/{good}"));
     assert_eq!(ok.last().unwrap().version, Version::HTTP_2);
     assert_eq!(devices(ivy).await, 2, "the good one and the re-registered one stay");
     assert_eq!(devices(dan).await, 1, "UNREGISTERED is removed; a huge error body is just a failure");
 
-    // Connections and tokens are per account and credential version: new credentials, new ones.
-    assert_eq!(providers::apns_pools_for(a.id).await, 1);
+    // Connections and tokens are per account, credential version and (APNs) environment: new
+    // credentials, new ones.
+    assert_eq!(providers::apns_pools_for(a.id).await, 2, "sandbox and production");
     assert_eq!(providers::fcm_tokens_for(a.id).await, 1);
     assert_eq!(m.hits("/oauth2/token").len(), 1, "token reused across sends");
     h.ok("PATCH", "/api/push/settings", Some(json!({"apns": {"key_id": "ZZZ123DEFG", "team_id": "TEAM999999", "bundle_id": "com.acme.app", "production": false}, "fcm": {"service_account_json": service_account("acme-app")}}))).await;
@@ -1087,5 +1110,184 @@ async fn public_endpoints_refuse_unknown_keys_and_setup_needs_settings_permissio
     let (s, v) = h.req("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(v.to_string().contains("Settings → Push"), "{v}");
+    h.cleanup().await;
+}
+
+/// Wait until `n` of the account's provider calls are waiting for a slot.
+async fn until_waiting(account: Uuid, n: usize) {
+    for _ in 0..500 {
+        if limit::waiting(account) >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("never waited for a slot");
+}
+
+/// Wait until a database session running a statement like `pattern` waits for a lock.
+async fn until_lock_wait(h: &Harness, pattern: &str) {
+    for _ in 0..500 {
+        let n = count(h, &format!("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database() AND query LIKE '{pattern}'")).await;
+        if n > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("nothing waited for a lock");
+}
+
+#[tokio::test]
+async fn the_final_claim_comes_after_the_wait_for_a_provider_slot() {
+    let (mut h, m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    // Eight slow devices take every one of the account's provider slots.
+    let busy_list = list(&mut h, "Busy").await;
+    person(&mut h, &busy_list, "busy@x.test", "B").await;
+    for i in 0..limit::PER_ACCOUNT {
+        enroll(&h, &a, &browser(&base, &format!("slow-{i}")), "busy@x.test").await;
+    }
+    let slow = m.gate("/webpush/slow-");
+    let cid = push_campaign(&mut h, &busy_list, json!({"title": "Slow"})).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let first = drain_in_background(&h);
+    slow.wait(limit::PER_ACCOUNT as u32).await;
+
+    // Xia's push waits for a slot; she turns push off meanwhile.
+    let l = list(&mut h, "X").await;
+    let xia = person(&mut h, &l, "xia@x.test", "Xia").await;
+    enroll(&h, &a, &browser(&base, "x1"), "xia@x.test").await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "For Xia"})).await;
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let second = drain_in_background(&h);
+    until_waiting(a.id, 1).await;
+    h.ok("PUT", &format!("/api/push/profiles/{xia}/opt-out"), Some(json!({"opted_out": true}))).await;
+    slow.open();
+    first.await.unwrap();
+    second.await.unwrap();
+    assert!(m.hits("/webpush/x1").is_empty(), "the opt-out during the wait is seen");
+    let (mid, status, _) = message_of(&h, xia).await;
+    assert_eq!(status, "skipped");
+    assert_eq!(delivery_of(&h, mid).await.0, "skipped");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_sends_at_once_cant_both_pass_smart_sending() {
+    let (mut h, m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "R").await;
+    let r = person(&mut h, &l, "r@x.test", "R").await;
+    enroll(&h, &a, &browser(&base, "r1"), "r@x.test").await;
+    let smart = |title: &str| json!({"name": title, "channel": "push", "audience": {"include": [{"type": "list", "id": l}]}, "content": {"title": title}, "send_options": {"smart_sending": true}});
+    let one = h.ok("POST", "/api/campaigns", Some(smart("One"))).await["id"].as_str().unwrap().to_string();
+    let two = h.ok("POST", "/api/campaigns", Some(smart("Two"))).await["id"].as_str().unwrap().to_string();
+    // The first is claimed and with the push service (not sent yet) when the second is claimed.
+    let gate = m.gate("/webpush/r1");
+    h.ok("POST", &format!("/api/campaigns/{one}/send"), None).await;
+    let first = drain_in_background(&h);
+    gate.wait(1).await;
+    h.ok("POST", &format!("/api/campaigns/{two}/send"), None).await;
+    let second = drain_in_background(&h);
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), second).await;
+    gate.open();
+    first.await.unwrap();
+    assert!(done.is_ok(), "the second never reached the push service");
+    assert_eq!(m.hits("/webpush/r1").len(), 1, "only one of the two went");
+    let skipped: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT d.status, d.error FROM push_deliveries d JOIN messages m ON m.id = d.message_id WHERE m.profile_id = $1 AND d.status = 'skipped'").bind(r).fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(skipped, vec![("skipped".to_string(), Some("smart sending".to_string()))]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_a_person_during_a_send_neither_deadlocks_nor_sends_after() {
+    let (mut h, m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+
+    // Deleted while the hand-off waits for its final claim: skipped, nothing sent.
+    let p = person(&mut h, &l, "p@x.test", "P").await;
+    enroll(&h, &a, &browser(&base, "p1"), "p@x.test").await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "One"})).await;
+    let pause = send::hook::Pause::hold(a.id);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    h.ok("DELETE", &format!("/api/profiles/{p}"), None).await;
+    pause.release(a.id);
+    tokio::time::timeout(std::time::Duration::from_secs(20), task).await.expect("no deadlock").unwrap();
+    assert!(m.hits("/webpush/p1").is_empty());
+
+    // Deleted while the final claim holds its locks: the deletion waits for the claim (the person
+    // comes first in both), then the push goes and its results find nobody; no deadlock either way.
+    let q = person(&mut h, &l, "q@x.test", "Q").await;
+    enroll(&h, &a, &browser(&base, "q1"), "q@x.test").await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "Two"})).await;
+    let pause = send::hook::Pause::hold_at(a.id, send::hook::Point::InClaim);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    let st = h.state.clone();
+    let account = a.id;
+    let deletion = tokio::spawn(async move { sqlx::query("DELETE FROM profiles WHERE id = $1 AND account_id = $2").bind(q).bind(account).execute(&st.db).await.unwrap() });
+    until_lock_wait(&h, "DELETE FROM profiles%").await;
+    pause.release(a.id);
+    tokio::time::timeout(std::time::Duration::from_secs(20), task).await.expect("no deadlock").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), deletion).await.expect("no deadlock").unwrap();
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM profiles WHERE id = '{q}'")).await, 0);
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM messages WHERE profile_id = '{q}'")).await, 0);
+
+    // Deleted while the results are being saved: the same.
+    let s = person(&mut h, &l, "s@x.test", "S").await;
+    enroll(&h, &a, &browser(&base, "s1"), "s@x.test").await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "Three"})).await;
+    let pause = send::hook::Pause::hold_at(a.id, send::hook::Point::InApply);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    let st = h.state.clone();
+    let deletion = tokio::spawn(async move { sqlx::query("DELETE FROM profiles WHERE id = $1 AND account_id = $2").bind(s).bind(account).execute(&st.db).await.unwrap() });
+    until_lock_wait(&h, "DELETE FROM profiles%").await;
+    pause.release(a.id);
+    tokio::time::timeout(std::time::Duration::from_secs(20), task).await.expect("no deadlock").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), deletion).await.expect("no deadlock").unwrap();
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM profiles WHERE id = '{s}'")).await, 0);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn registering_while_a_send_is_accepted_neither_deadlocks_nor_loses_either() {
+    let (mut h, m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let l = list(&mut h, "L").await;
+    let ana = person(&mut h, &l, "ana@x.test", "Ana").await;
+    let bob = person(&mut h, &l, "bob@x.test", "Bob").await;
+    let b = browser(&base, "a1");
+    enroll(&h, &a, &b, "ana@x.test").await;
+    let version = |h: &Harness| {
+        let db = h.state.db.clone();
+        async move { sqlx::query_as::<_, (i64, Option<Uuid>)>("SELECT version, profile_id FROM push_devices WHERE address LIKE '%/webpush/a1'").fetch_one(&db).await.unwrap() }
+    };
+    let (v0, _) = version(&h).await;
+    let cid = push_campaign(&mut h, &l, json!({"title": "Hi"})).await;
+    let pause = send::hook::Pause::hold_at(a.id, send::hook::Point::InApply);
+    h.ok("POST", &format!("/api/campaigns/{cid}/send"), None).await;
+    let task = drain_in_background(&h);
+    pause.arrived().await;
+    // Bob signs in on Ana's browser while her push's acceptance is being saved.
+    let (router, key, grant) = (h.router.clone(), a.key.clone(), a.grant("email", "bob@x.test"));
+    let reg = tokio::spawn(async move {
+        let body = json!({"subscription": {"endpoint": b.endpoint, "keys": {"p256dh": b.p256dh, "auth": b.auth}}, "identity": grant});
+        router.oneshot(post_req("/client/push/subscribe", &key, "203.0.113.9", &body)).await.unwrap().status()
+    });
+    until_lock_wait(&h, "%FROM profiles%FOR UPDATE%").await;
+    pause.release(a.id);
+    tokio::time::timeout(std::time::Duration::from_secs(20), task).await.expect("no deadlock").unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(20), reg).await.expect("no deadlock").unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(message_of(&h, ana).await.1, "sent", "Ana's push was accepted and counted");
+    assert_eq!(m.hits("/webpush/a1").len(), 1);
+    let (v1, owner) = version(&h).await;
+    assert!(v1 > v0 && owner == Some(bob), "and the browser is Bob's now");
     h.cleanup().await;
 }

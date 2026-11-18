@@ -222,19 +222,29 @@ static APNS_TOKENS: Lazy<Mutex<HashMap<String, (String, i64)>>> = Lazy::new(|| M
 static APNS_POOLS: Lazy<Mutex<HashMap<String, reqwest::Client>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 const MAX_CACHED: usize = 1000;
 
-fn apns_key(row: &Row) -> String {
+/// An APNs environment: "production" or "sandbox".
+pub fn apns_environment(row: &Row, device: Option<&str>) -> &'static str {
+    match device {
+        Some("sandbox") => "sandbox",
+        Some("production") => "production",
+        _ if row.apns_production => "production",
+        _ => "sandbox",
+    }
+}
+
+fn apns_key(row: &Row, env: &str) -> String {
     format!(
         "{}:{}:{}:{}:{}",
         row.account_id,
         row.credentials_version,
         row.apns_team_id.as_deref().unwrap_or(""),
         row.apns_key_id.as_deref().unwrap_or(""),
-        if row.apns_production { "production" } else { "sandbox" }
+        env
     )
 }
 
-async fn apns_client(row: &Row) -> Option<reqwest::Client> {
-    let key = apns_key(row);
+async fn apns_client(row: &Row, env: &str) -> Option<reqwest::Client> {
+    let key = apns_key(row, env);
     let mut m = APNS_POOLS.lock().await;
     if let Some(c) = m.get(&key) {
         return Some(c.clone());
@@ -252,9 +262,9 @@ pub async fn apns_pools_for(account_id: Uuid) -> usize {
     APNS_POOLS.lock().await.keys().filter(|k| k.starts_with(&prefix)).count()
 }
 
-async fn apns_token(row: &Row, p8: &str) -> Option<(String, String)> {
+async fn apns_token(row: &Row, p8: &str, env: &str) -> Option<(String, String)> {
     let (key_id, team_id) = (row.apns_key_id.as_deref()?, row.apns_team_id.as_deref()?);
-    let key = apns_key(row);
+    let key = apns_key(row, env);
     let now = chrono::Utc::now().timestamp();
     let mut m = APNS_TOKENS.lock().await;
     if let Some((t, at)) = m.get(&key) {
@@ -277,19 +287,51 @@ pub struct ApnsMessage<'a> {
     pub collapse_id: Option<&'a str>,
 }
 
-pub async fn send_apns(state: &AppState, row: &Row, m: &ApnsMessage<'_>) -> Sent {
-    let (Some(enc), Some(topic)) = (row.apns_key_enc.as_deref(), row.apns_bundle_id.as_deref()) else { return Sent::Account("APNs isn't set up".into()) };
-    let Ok(p8) = crate::crypto::decrypt(&state.cfg.secret_key, enc) else { return Sent::Account("the APNs key can't be read".into()) };
-    let Some((cache, token)) = apns_token(row, &p8).await else { return Sent::Account("the APNs key can't sign".into()) };
-    let Some(client) = apns_client(row).await else { return Sent::Retry("couldn't connect".into(), None) };
+/// What a provider call needs, got before the final claim so nothing waits between the claim and the call.
+pub enum Creds {
+    Web,
+    Apns { client: reqwest::Client, token: String, cache: String, base: String, topic: String, env: &'static str },
+    Fcm { token: String, cache: String, url: String },
+}
+
+/// Get a platform's credentials (a provider token; for Firebase, possibly a sign-in) for a device.
+/// An error is the outcome to record without calling the provider.
+pub async fn prepare(state: &AppState, row: &Row, kind: &str, apns_env: Option<&str>) -> Result<Creds, Sent> {
+    match kind {
+        "web" => Ok(Creds::Web),
+        "ios" => {
+            let env = apns_environment(row, apns_env);
+            let (Some(enc), Some(topic)) = (row.apns_key_enc.as_deref(), row.apns_bundle_id.as_deref()) else { return Err(Sent::Account("APNs isn't set up".into())) };
+            let Ok(p8) = crate::crypto::decrypt(&state.cfg.secret_key, enc) else { return Err(Sent::Account("the APNs key can't be read".into())) };
+            let Some((cache, token)) = apns_token(row, &p8, env).await else { return Err(Sent::Account("the APNs key can't sign".into())) };
+            let Some(client) = apns_client(row, env).await else { return Err(Sent::Retry("couldn't connect".into(), None)) };
+            let base = match (test_base(state), env) {
+                (Some(b), "sandbox") => format!("{b}/apns-sandbox"),
+                (Some(b), _) => format!("{b}/apns"),
+                (None, "sandbox") => "https://api.sandbox.push.apple.com".into(),
+                (None, _) => "https://api.push.apple.com".into(),
+            };
+            Ok(Creds::Apns { client, token, cache, base, topic: topic.to_string(), env })
+        }
+        _ => {
+            let (Some(enc), Some(project)) = (row.fcm_credentials_enc.as_deref(), row.fcm_project_id.as_deref()) else { return Err(Sent::Account("Firebase isn't set up".into())) };
+            let Ok(raw) = crate::crypto::decrypt(&state.cfg.secret_key, enc) else { return Err(Sent::Account("the service account can't be read".into())) };
+            let Ok(sa) = serde_json::from_str::<ServiceAccount>(&raw) else { return Err(Sent::Account("the service account can't be read".into())) };
+            let (cache, token) = fcm_token(state, row, &sa, &raw).await?;
+            let base = test_base(state).map(|b| format!("{b}/fcm")).unwrap_or_else(|| "https://fcm.googleapis.com".into());
+            Ok(Creds::Fcm { token, cache, url: format!("{base}/v1/projects/{project}/messages:send") })
+        }
+    }
+}
+
+/// Send to APNs. `own_environment`: the device said which environment it belongs to, so a
+/// `BadDeviceToken` from that environment is about the device.
+pub async fn send_apns(creds: &Creds, m: &ApnsMessage<'_>, own_environment: bool) -> Sent {
+    let Creds::Apns { client, token, cache, base, topic, env } = creds else { return Sent::Account("APNs isn't set up".into()) };
+    let (cache, env) = (cache.clone(), *env);
     if !m.device_token.chars().all(|c| c.is_ascii_hexdigit()) || m.device_token.len() > 200 {
         return Sent::Gone("APNs BadDeviceToken".into(), None);
     }
-    let base = match test_base(state) {
-        Some(b) => format!("{b}/apns"),
-        None if row.apns_production => "https://api.push.apple.com".into(),
-        None => "https://api.sandbox.push.apple.com".into(),
-    };
     let expiration = if m.ttl == 0 { 0 } else { chrono::Utc::now().timestamp() + m.ttl };
     let mut req = client
         .post(format!("{base}/3/device/{}", m.device_token))
@@ -320,10 +362,10 @@ pub async fn send_apns(state: &AppState, row: &Row, m: &ApnsMessage<'_>) -> Sent
     match (status, reason.as_str()) {
         // The token is no longer valid for this app: device-specific.
         (410, "Unregistered" | "ExpiredToken") => Sent::Gone(class, body["timestamp"].as_i64()),
-        // An invalid token, or one from the other environment: device-specific only once this
-        // environment has proven right (it accepted something since the credentials last changed).
-        (400, "BadDeviceToken") if row.apns_verified_at.is_some() => Sent::Gone(class, None),
-        (400, "BadDeviceToken") => Sent::Account(format!("{class}: check that development builds use the sandbox and App Store builds production")),
+        // An invalid token, or one from the other environment: about the device only when it was
+        // tried in the environment its app said it belongs to.
+        (400, "BadDeviceToken") if own_environment => Sent::Gone(class, None),
+        (400, "BadDeviceToken") => Sent::Account(format!("{class} ({env}): have the app say whether it's a development (sandbox) or App Store (production) build when it registers")),
         (400, "DeviceTokenNotForTopic" | "BadTopic" | "TopicDisallowed" | "MissingTopic") => Sent::Account(class),
         (403, "ExpiredProviderToken" | "InvalidProviderToken" | "MissingProviderToken") => {
             APNS_TOKENS.lock().await.remove(&cache);
@@ -401,16 +443,10 @@ pub async fn fcm_tokens_for(account_id: Uuid) -> usize {
     FCM_TOKENS.lock().await.keys().filter(|k| k.starts_with(&prefix)).count()
 }
 
-pub async fn send_fcm(state: &AppState, row: &Row, message: &Value) -> Sent {
-    let (Some(enc), Some(project)) = (row.fcm_credentials_enc.as_deref(), row.fcm_project_id.as_deref()) else { return Sent::Account("Firebase isn't set up".into()) };
-    let Ok(raw) = crate::crypto::decrypt(&state.cfg.secret_key, enc) else { return Sent::Account("the service account can't be read".into()) };
-    let Ok(sa) = serde_json::from_str::<ServiceAccount>(&raw) else { return Sent::Account("the service account can't be read".into()) };
-    let (cache, token) = match fcm_token(state, row, &sa, &raw).await {
-        Ok(t) => t,
-        Err(s) => return s,
-    };
-    let base = test_base(state).map(|b| format!("{b}/fcm")).unwrap_or_else(|| "https://fcm.googleapis.com".into());
-    let res = match HTTP.post(format!("{base}/v1/projects/{project}/messages:send")).bearer_auth(&token).json(&json!({"message": message})).send().await {
+pub async fn send_fcm(creds: &Creds, message: &Value) -> Sent {
+    let Creds::Fcm { token, cache, url } = creds else { return Sent::Account("Firebase isn't set up".into()) };
+    let cache = cache.clone();
+    let res = match HTTP.post(url).bearer_auth(token).json(&json!({"message": message})).send().await {
         Ok(r) => r,
         Err(e) => return network(&e),
     };

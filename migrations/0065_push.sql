@@ -20,8 +20,6 @@ CREATE TABLE push_settings (
     apns_key_enc        text,
     -- The APNs environment for devices whose app didn't say which one it was built for.
     apns_production     boolean NOT NULL DEFAULT true,
-    -- When APNs first accepted a notification with the current credentials and environment.
-    apns_verified_at    timestamptz,
     -- Firebase Cloud Messaging HTTP v1: the service account JSON, encrypted.
     fcm_project_id      text,
     fcm_client_email    text,
@@ -64,6 +62,9 @@ CREATE TABLE push_devices (
     last_error    text,
     user_agent    text,
     app_version   text,
+    -- iOS: the APNs environment the app said it was built for. Unset: the account's default, and then
+    -- Apple calling the token bad says nothing about the device (it may belong to the other one).
+    apns_environment text CHECK (apns_environment IN ('sandbox', 'production')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     last_sent_at  timestamptz,

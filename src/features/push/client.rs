@@ -187,51 +187,81 @@ pub struct Registration<'a> {
     pub permission: &'a str,
     pub user_agent: Option<&'a str>,
     pub app_version: Option<&'a str>,
+    /// iOS: the APNs environment the app says it was built for (kept when a registration doesn't say).
+    pub apns_environment: Option<&'a str>,
 }
 
-/// Save a registration in one transaction holding the account's push settings row (so the caps on
-/// anonymous devices and on a person's devices hold under concurrent registrations). The version
-/// goes up whenever the owner, the address or the keys change. Returns (device id, linked to a
-/// known person).
+/// Save a registration in one transaction, taking its locks in the push module's one order: the
+/// people (the device's current owner and its new one), then the device, then the account's push
+/// settings row (so the caps hold under concurrent registrations). The version goes up whenever the
+/// owner, the address or the keys change. Returns (device id, linked to a known person).
 pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<(Uuid, bool)> {
+    // The owner read before its lock can change under us; then start over (rarely more than once).
+    for _ in 0..5 {
+        if let Some(out) = try_save_device(state, account_id, r, owner).await? {
+            return Ok(out);
+        }
+    }
+    Err(AppError::Busy("this device is being registered elsewhere at the same time; try again".into()))
+}
+
+async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_>, owner: Owner) -> AppResult<Option<(Uuid, bool)>> {
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT 1 FROM push_settings WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
-    type Existing = (Uuid, Option<Uuid>, bool, Option<String>, Option<String>, Option<Uuid>);
-    let existing: Option<Existing> = sqlx::query_as(
-        "SELECT id, profile_id, anonymous, p256dh, auth_secret, test_user_id FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE",
-    )
-    .bind(account_id)
-    .bind(r.kind)
-    .bind(r.address)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if existing.as_ref().is_some_and(|e| e.5.is_some()) {
+    let seen: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as("SELECT profile_id, test_user_id, anonymous FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3")
+        .bind(account_id)
+        .bind(r.kind)
+        .bind(r.address)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if seen.as_ref().is_some_and(|e| e.1.is_some()) {
         return Err(AppError::Conflict("this browser is a team member's test device".into()));
     }
-    let (profile_id, anonymous) = match (owner, &existing) {
-        (Owner::Person(p), _) => (p, false),
-        (Owner::Carry(p, anon), _) => (p, anon),
-        (Owner::Keep, Some((_, Some(p), anon, ..))) => (*p, *anon),
-        (Owner::Keep, _) | (Owner::Anonymous, _) => {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND anonymous").bind(account_id).fetch_one(&mut *tx).await?;
-            if count >= MAX_ANONYMOUS {
-                return Err(AppError::Busy("this account has too many anonymous push devices; unused ones are removed after 180 days".into()));
-            }
-            let id = Uuid::now_v7();
-            sqlx::query("INSERT INTO profiles (id, account_id, properties) VALUES ($1, $2, '{\"anonymous_push_subscriber\": true}')").bind(id).bind(account_id).execute(&mut *tx).await?;
-            (id, true)
-        }
+    let old_owner = seen.as_ref().and_then(|e| e.0);
+    // 1. The people.
+    let (profile_id, anonymous, fresh) = match (owner, old_owner) {
+        (Owner::Person(p), _) => (p, false, false),
+        (Owner::Carry(p, anon), _) => (p, anon, false),
+        (Owner::Keep, Some(p)) => (p, seen.as_ref().is_some_and(|e| e.2), false),
+        (Owner::Keep, None) | (Owner::Anonymous, _) => (Uuid::now_v7(), true, true),
     };
-    // The person's row, so concurrent registrations for them take turns with the cap below.
-    sqlx::query("SELECT 1 FROM profiles WHERE id = $1 FOR UPDATE").bind(profile_id).execute(&mut *tx).await?;
+    let mut people: Vec<Uuid> = old_owner.into_iter().chain((!fresh).then_some(profile_id)).collect();
+    people.sort();
+    people.dedup();
+    let locked: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM profiles WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(&people).fetch_all(&mut *tx).await?;
+    if !fresh && !locked.contains(&profile_id) {
+        // The person was deleted meanwhile.
+        return Ok(None);
+    }
+    if fresh {
+        sqlx::query("INSERT INTO profiles (id, account_id, properties) VALUES ($1, $2, '{\"anonymous_push_subscriber\": true}')").bind(profile_id).bind(account_id).execute(&mut *tx).await?;
+    }
+    // 2. The device, and it must still be as read.
+    type Existing = (Uuid, Option<Uuid>, Option<String>, Option<String>, Option<Uuid>, bool);
+    let existing: Option<Existing> = sqlx::query_as("SELECT id, profile_id, p256dh, auth_secret, test_user_id, anonymous FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 FOR UPDATE")
+        .bind(account_id)
+        .bind(r.kind)
+        .bind(r.address)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if existing.as_ref().map(|e| (e.1, e.4, e.5)) != seen {
+        return Ok(None);
+    }
+    // 3. The settings row.
+    sqlx::query("SELECT 1 FROM push_settings WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    if fresh {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND anonymous").bind(account_id).fetch_one(&mut *tx).await?;
+        if count >= MAX_ANONYMOUS {
+            return Err(AppError::Busy("this account has too many anonymous push devices; unused ones are removed after 180 days".into()));
+        }
+    }
     let keys = r.keys.map(|k| (k.0.to_string(), k.1.to_string()));
     let id = match &existing {
-        Some((id, old_profile, _, p256dh, auth, _)) => {
+        Some((id, old_profile, p256dh, auth, ..)) => {
             let changed = *old_profile != Some(profile_id) || (keys.is_some() && keys != p256dh.clone().zip(auth.clone()));
             sqlx::query(
                 "UPDATE push_devices SET profile_id = $2, anonymous = $3, p256dh = COALESCE($4, p256dh), auth_secret = COALESCE($5, auth_secret), permission = $6,
                         status = 'active', failures = 0, disabled_at = NULL, last_seen_at = now(), version = version + CASE WHEN $7 THEN 1 ELSE 0 END,
-                        user_agent = COALESCE($8, user_agent), app_version = COALESCE($9, app_version)
+                        user_agent = COALESCE($8, user_agent), app_version = COALESCE($9, app_version), apns_environment = COALESCE($10, apns_environment)
                  WHERE id = $1",
             )
             .bind(id)
@@ -243,18 +273,16 @@ pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(changed)
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
+            .bind(r.apns_environment)
             .execute(&mut *tx)
             .await?;
-            if let (Some(old), true) = (old_profile, *old_profile != Some(profile_id)) {
-                forget_empty_anonymous(&mut tx, *old).await?;
-            }
             *id
         }
         None => {
             let id = Uuid::now_v7();
             sqlx::query(
-                "INSERT INTO push_devices (id, account_id, profile_id, anonymous, kind, address, p256dh, auth_secret, permission, user_agent, app_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                "INSERT INTO push_devices (id, account_id, profile_id, anonymous, kind, address, p256dh, auth_secret, permission, user_agent, app_version, apns_environment)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(id)
             .bind(account_id)
@@ -267,6 +295,7 @@ pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             .bind(r.permission)
             .bind(r.user_agent.map(|u| u.chars().take(300).collect::<String>()))
             .bind(r.app_version.map(|u| u.chars().take(40).collect::<String>()))
+            .bind(r.apns_environment)
             .execute(&mut *tx)
             .await?;
             id
@@ -281,22 +310,41 @@ pub async fn save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     .bind(MAX_DEVICES_PER_PROFILE)
     .execute(&mut *tx)
     .await?;
+    // The device left a nameless profile: it goes too when nothing else is on it (its lock is held).
+    if let Some(old) = old_owner.filter(|o| *o != profile_id) {
+        forget_nameless_in(&mut tx, &[old]).await?;
+    }
     tx.commit().await?;
-    Ok((id, !anonymous))
+    Ok(Some((id, !anonymous)))
 }
 
-/// An anonymous profile left with no device, no message and no event is deleted.
-async fn forget_empty_anonymous(tx: &mut sqlx::PgConnection, profile_id: Uuid) -> AppResult<()> {
+/// Nameless push profiles (made for a device without a grant) that nothing else is on any more (no
+/// device, no list, no message or event but push's own) are deleted. The caller holds their locks,
+/// or (from [`forget_nameless`]) they're taken here, before anything else.
+async fn forget_nameless_in(tx: &mut sqlx::PgConnection, ids: &[Uuid]) -> AppResult<()> {
+    sqlx::query("SELECT 1 FROM profiles WHERE id = ANY($1) ORDER BY id FOR UPDATE").bind(ids).execute(&mut *tx).await?;
     sqlx::query(
-        "DELETE FROM profiles p WHERE p.id = $1 AND p.email IS NULL AND p.phone_number IS NULL AND p.external_id IS NULL
+        "DELETE FROM profiles p WHERE p.id = ANY($1) AND p.email IS NULL AND p.phone_number IS NULL AND p.external_id IS NULL
            AND p.properties ? 'anonymous_push_subscriber'
            AND NOT EXISTS (SELECT 1 FROM push_devices d WHERE d.profile_id = p.id)
-           AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.profile_id = p.id)
-           AND NOT EXISTS (SELECT 1 FROM events e WHERE e.profile_id = p.id)",
+           AND NOT EXISTS (SELECT 1 FROM list_members l WHERE l.profile_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.profile_id = p.id AND m.channel <> 'push')
+           AND NOT EXISTS (SELECT 1 FROM events e JOIN metrics mt ON mt.id = e.metric_id WHERE e.profile_id = p.id AND mt.name NOT IN ('Received Push', 'Clicked Push'))",
     )
-    .bind(profile_id)
+    .bind(ids)
     .execute(&mut *tx)
     .await?;
+    Ok(())
+}
+
+/// [`forget_nameless_in`] in a transaction of its own (after the device itself was removed).
+pub(super) async fn forget_nameless(db: &sqlx::PgPool, ids: &[Uuid]) -> AppResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    forget_nameless_in(&mut tx, ids).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -342,7 +390,7 @@ pub async fn subscribe(State(state): State<AppState>, Query(q): Query<KeyQuery>,
                     owner = Owner::Carry(p, anon);
                 }
             }
-            let reg = Registration { kind: "web", address: endpoint, keys: Some((p256dh, auth)), permission: "granted", user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()), app_version: None };
+            let reg = Registration { kind: "web", address: endpoint, keys: Some((p256dh, auth)), permission: "granted", user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()), app_version: None, apns_environment: None };
             let (_, linked) = save_device(&state, a.id, &reg, owner).await?;
             Ok(json!({"ok": true, "linked": linked}))
         }
@@ -381,7 +429,7 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
                 .fetch_optional(&state.db)
                 .await?;
             let Some((_, permission)) = found else { return Ok(json!({"ok": true})) };
-            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: &permission, user_agent: None, app_version: None };
+            let reg = Registration { kind: "web", address: endpoint, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None };
             save_device(&state, a.id, &reg, Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }
@@ -433,7 +481,14 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 None => Owner::Keep,
             };
             let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
-            let reg = Registration { kind: platform, address: &token, keys: None, permission, user_agent: None, app_version: b["app_version"].as_str() };
+            // iOS: which APNs environment the build uses (development builds: sandbox; TestFlight and
+            // the App Store: production).
+            let environment = match (platform, b.get("environment").and_then(Value::as_str)) {
+                ("ios", Some(e @ ("sandbox" | "production"))) => Some(e),
+                ("ios", Some(_)) => return Err(AppError::bad("environment must be sandbox or production")),
+                _ => None,
+            };
+            let reg = Registration { kind: platform, address: &token, keys: None, permission, user_agent: None, app_version: b["app_version"].as_str(), apns_environment: environment };
             let (id, linked) = save_device(&state, a.id, &reg, owner).await?;
             Ok(json!({"ok": true, "device_id": id, "linked": linked, "sendable": permission != "denied"}))
         }
@@ -459,7 +514,7 @@ pub async fn device_sign_out(State(state): State<AppState>, Query(q): Query<KeyQ
                 .fetch_optional(&state.db)
                 .await?;
             let Some(permission) = permission else { return Ok(json!({"ok": true})) };
-            let reg = Registration { kind: platform, address: &token, keys: None, permission: &permission, user_agent: None, app_version: None };
+            let reg = Registration { kind: platform, address: &token, keys: None, permission: &permission, user_agent: None, app_version: None, apns_environment: None };
             save_device(&state, a.id, &reg, Owner::Anonymous).await?;
             Ok(json!({"ok": true}))
         }

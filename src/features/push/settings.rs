@@ -28,7 +28,6 @@ pub struct Row {
     pub apns_bundle_id: Option<String>,
     pub apns_key_enc: Option<String>,
     pub apns_production: bool,
-    pub apns_verified_at: Option<chrono::DateTime<chrono::Utc>>,
     pub credentials_version: i64,
     pub fcm_project_id: Option<String>,
     pub fcm_client_email: Option<String>,
@@ -304,7 +303,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
     match b.apns {
         None => {}
         Some(None) => {
-            sqlx::query("UPDATE push_settings SET apns_key_id = NULL, apns_team_id = NULL, apns_bundle_id = NULL, apns_key_enc = NULL, apns_error = NULL, apns_verified_at = NULL, credentials_version = credentials_version + 1, updated_at = now() WHERE account_id = $1")
+            sqlx::query("UPDATE push_settings SET apns_key_id = NULL, apns_team_id = NULL, apns_bundle_id = NULL, apns_key_enc = NULL, apns_error = NULL, credentials_version = credentials_version + 1, updated_at = now() WHERE account_id = $1")
                 .bind(account_id)
                 .execute(&mut *tx)
                 .await?;
@@ -317,7 +316,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
             }
             let enc = a.key_p8.as_deref().map(|k| crate::crypto::encrypt(&state.cfg.secret_key, k.trim())).transpose().map_err(AppError::Internal)?;
             sqlx::query(
-                "UPDATE push_settings SET apns_key_id = $2, apns_team_id = $3, apns_bundle_id = $4, apns_production = $5, apns_key_enc = COALESCE($6, apns_key_enc), apns_error = NULL, apns_verified_at = NULL, credentials_version = credentials_version + 1, updated_at = now()
+                "UPDATE push_settings SET apns_key_id = $2, apns_team_id = $3, apns_bundle_id = $4, apns_production = $5, apns_key_enc = COALESCE($6, apns_key_enc), apns_error = NULL, credentials_version = credentials_version + 1, updated_at = now()
                  WHERE account_id = $1",
             )
             .bind(account_id)
@@ -414,7 +413,6 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             "team_id": row.apns_team_id,
             "bundle_id": row.apns_bundle_id,
             "production": row.apns_production,
-            "verified": row.apns_verified_at.is_some(),
             "error": row.apns_error,
         },
         "fcm": {
