@@ -38,6 +38,8 @@ struct Shopify {
     products: HashMap<i64, Value>,
     /// Orders as the GraphQL Admin API returns them to a `nodes` read (refunds with transactions).
     orders: HashMap<i64, Value>,
+    /// Further pages of a refund's connections, by (refund gid, field): page n answers cursor "n".
+    refund_pages: HashMap<(String, String), Vec<Value>>,
     files: HashMap<String, String>,
     bulk_ops: Vec<String>,
     /// Whether each bulk operation asked for `groupObjects: true`.
@@ -189,6 +191,15 @@ async fn graphql(State(m): State<Mock>, headers: HeaderMap, axum::Json(body): ax
         let phase = m.bulk_ops[n - 1].clone();
         let url = m.files.get(&phase).filter(|f| !f.is_empty()).map(|_| format!("{}/files/{phase}.jsonl?op={n}", m.files["__base"]));
         return gql_ok(json!({"node": {"id": vars["id"], "status": "COMPLETED", "errorCode": null, "objectCount": "3", "url": url}}));
+    }
+    if q.contains("... on Refund") {
+        let id = vars["id"].as_str().unwrap_or("").to_string();
+        let field = if q.contains("transactions(") { "transactions" } else { "refundLineItems" };
+        let n: usize = vars["after"].as_str().and_then(|c| c.parse().ok()).unwrap_or(0);
+        let pages = m.refund_pages.get(&(id, field.to_string())).cloned().unwrap_or_default();
+        let nodes = pages.get(n).cloned().unwrap_or(json!([]));
+        let more = n + 1 < pages.len();
+        return gql_ok(json!({"node": {field: {"nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": (n + 1).to_string()}}}}));
     }
     if q.contains("nodes(ids:") {
         let ids: Vec<String> = serde_json::from_value(vars["ids"].clone()).unwrap();
@@ -2738,5 +2749,60 @@ async fn history_refunds_are_quiet() {
     }
     assert_eq!(value(&h, "Refunded Order", "refund:9").await, Some(20.0));
     assert_eq!(flow_runs(&h).await, 0, "the import's refund starts no flow");
+    h.cleanup().await;
+}
+
+/// Item 6: every refund transaction is read (not just the first page); one too large to read in
+/// full is left as it was and marked, rather than counted wrong; a new order and its lines are
+/// recorded together.
+#[tokio::test]
+async fn refunds_are_read_in_full() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    hook(&h, "orders/create", "o1", &order_body(5001, 1, "ann@example.com", chrono::Utc::now() - chrono::Duration::minutes(5))).await;
+    h.drain().await;
+    let tx = |n: usize| (0..n).map(|_| json!({"kind": "REFUND", "status": "SUCCESS", "amountSet": {"shopMoney": {"amount": "2.00", "currencyCode": "USD"}}})).collect::<Vec<_>>();
+    // 25 transactions of 2.00: 20 on the first page, 5 on the next.
+    let mut r = refund(900, &now, &[], &[]);
+    r["transactions"] = json!({"nodes": tx(20), "pageInfo": {"hasNextPage": true, "endCursor": "1"}});
+    r["refundLineItems"]["pageInfo"] = json!({"hasNextPage": false, "endCursor": null});
+    {
+        let mut m = mock.lock().unwrap();
+        m.orders.insert(5001, gql_order(5001, &now, vec![r.clone()]));
+        m.refund_pages.insert(("gid://shopify/Refund/900".into(), "transactions".into()), vec![json!([]), json!(tx(5))]);
+    }
+    hook(&h, "refunds/create", "r1", &json!({"id": 900, "order_id": 5001})).await;
+    h.drain().await;
+    assert_eq!(value(&h, "Refunded Order", "refund:900").await, Some(50.0), "all 25 transactions");
+    assert_eq!(value(&h, "Placed Order", "order:5001").await, Some(50.0));
+    // A refund whose transactions never end: not reconciled, value left as it was.
+    let mut endless = refund(901, &now, &[], &[]);
+    endless["transactions"] = json!({"nodes": tx(20), "pageInfo": {"hasNextPage": true, "endCursor": "1"}});
+    {
+        let mut m = mock.lock().unwrap();
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+        m.orders.insert(5001, gql_order(5001, &later, vec![r, endless]));
+        m.refund_pages.insert(("gid://shopify/Refund/901".into(), "transactions".into()), (0..40).map(|_| json!(tx(1))).collect());
+    }
+    hook(&h, "refunds/create", "r2", &json!({"id": 901, "order_id": 5001})).await;
+    h.drain().await;
+    let (v, props, _, _) = event(&h, "Placed Order", "order:5001").await.unwrap();
+    assert_eq!(v, Some(50.0), "not changed to a wrong total");
+    assert_eq!(props["refunds_not_reconciled"], true);
+    // A new order and its lines go in together: a failure on a line leaves no order either.
+    sqlx::query(
+        "CREATE FUNCTION fail_line() RETURNS trigger AS $$ BEGIN IF NEW.unique_id = 'order:5002:12' THEN RAISE EXCEPTION 'line failed'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER fail_line BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION fail_line()").execute(&h.state.db).await.unwrap();
+    hook(&h, "orders/create", "o2", &order_body(5002, 2, "bob@example.com", chrono::Utc::now())).await;
+    h.drain().await;
+    assert!(event(&h, "Placed Order", "order:5002").await.is_none(), "no order without its lines");
+    assert!(event(&h, "Ordered Product", "order:5002:11").await.is_none());
     h.cleanup().await;
 }

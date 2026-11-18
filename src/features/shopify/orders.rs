@@ -287,11 +287,47 @@ impl Refund {
     }
 }
 
-/// Everything about an order's refunds, read for a few orders at a time.
+/// Everything about an order's refunds, read for a few orders at a time. A refund with more
+/// transactions or lines than one page is read on (see [`complete_refund`]).
 pub const REFUNDS_QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Order { id updatedAt
     refunds { id createdAt
-        transactions(first: 20) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } }
-        refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } } } } } }";
+        transactions(first: 20) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } pageInfo { hasNextPage endCursor } }
+        refundLineItems(first: 100) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } pageInfo { hasNextPage endCursor } } } } } }";
+
+const REFUND_TX_PAGE: &str = "query($id: ID!, $after: String) { node(id: $id) { ... on Refund {
+    transactions(first: 50, after: $after) { nodes { kind status amountSet { shopMoney { amount currencyCode } } } pageInfo { hasNextPage endCursor } } } } }";
+const REFUND_LINES_PAGE: &str = "query($id: ID!, $after: String) { node(id: $id) { ... on Refund {
+    refundLineItems(first: 100, after: $after) { nodes { lineItem { id } subtotalSet { shopMoney { amount } } } pageInfo { hasNextPage endCursor } } } } }";
+/// Most extra pages read for one refund's transactions or lines. Past this, the order's refunds are
+/// left as they were and marked "not reconciled" rather than counted wrong.
+pub const MAX_REFUND_PAGES: usize = 20;
+
+/// Read the rest of a refund's transactions and lines into it. `false`: more than
+/// [`MAX_REFUND_PAGES`] pages, so its total isn't known.
+async fn complete_refund(state: &AppState, shop: &ShopRow, r: &mut Value) -> Result<bool, ApiError> {
+    let Some(id) = r["id"].as_str().map(String::from) else { return Ok(true) };
+    for (field, query) in [("transactions", REFUND_TX_PAGE), ("refundLineItems", REFUND_LINES_PAGE)] {
+        let mut pages = 0;
+        while r[field]["pageInfo"]["hasNextPage"].as_bool() == Some(true) {
+            if pages >= MAX_REFUND_PAGES {
+                return Ok(false);
+            }
+            pages += 1;
+            let after = r[field]["pageInfo"]["endCursor"].clone();
+            let d = client::graphql(state, shop, query, json!({"id": id, "after": after})).await?;
+            let more = &d["node"][field];
+            let extra = more["nodes"].as_array().cloned().unwrap_or_default();
+            if let Some(nodes) = r[field]["nodes"].as_array_mut() {
+                nodes.extend(extra);
+            }
+            r[field]["pageInfo"] = more["pageInfo"].clone();
+            if more["pageInfo"].is_null() {
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
 
 /// Orders read per refunds query.
 pub const REFUNDS_PER_QUERY: usize = 5;
@@ -587,20 +623,34 @@ async fn apply_inner(cx: &mut Ctx<'_>, o: &Order) -> anyhow::Result<()> {
         (p, Some(placed_value(total, refunded, is_cancelled)))
     };
     let (props, value) = merge_order(&json!({}));
-    events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props, value, at: o.placed_at() }, quiet, Some(&merge_order)).await?;
-
     // Ordered Product, one per line. Values are settled with the order's in `recompute`.
-    for (l, item) in o.lines.iter().zip(items.iter()) {
-        let mut p = base.clone();
-        if let Some(obj) = item.as_object() {
-            for (k, v) in obj {
-                p.insert(k.clone(), v.clone());
+    let line_props: Vec<(i64, Decimal, Value)> = o
+        .lines
+        .iter()
+        .zip(items.iter())
+        .map(|(l, item)| {
+            let mut p = base.clone();
+            if let Some(obj) = item.as_object() {
+                for (k, v) in obj {
+                    p.insert(k.clone(), v.clone());
+                }
             }
-        }
-        p.insert("line_item_id".into(), json!(l.id.to_string()));
-        p.insert("shopify_state".into(), json!({"line_total": l.total().normalize().to_string()}));
+            p.insert("line_item_id".into(), json!(l.id.to_string()));
+            p.insert("shopify_state".into(), json!({"line_total": l.total().normalize().to_string()}));
+            (l.id, l.total(), Value::Object(p))
+        })
+        .collect();
+    // A new order: the order and its lines are recorded together (all or none).
+    let mut first: Vec<ServerEvent<'_>> = vec![ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props.clone(), value, at: o.placed_at() }];
+    for (lid, line_total, p) in &line_props {
+        first.push(ServerEvent { profile_id, metric: "Ordered Product", unique_id: format!("order:{}:{}", o.id, lid), properties: p.clone(), value: Some(if cancelled { 0.0 } else { to_f64(*line_total) }), at: o.placed_at() });
+    }
+    let created = events::create_together(db, cx.metrics, cx.account_id, first, quiet).await?;
+    if !created {
+        events::put(db, cx.metrics, cx.account_id, ServerEvent { profile_id, metric: "Placed Order", unique_id: format!("order:{}", o.id), properties: props, value, at: o.placed_at() }, quiet, Some(&merge_order)).await?;
+    }
+    for (l, (_, _, props)) in o.lines.iter().zip(line_props.into_iter()).filter(|_| !created) {
         let line_total = l.total();
-        let props = Value::Object(p);
         let merge_line = |old: &Value| -> (Value, Option<f64>) {
             // Keep what `recompute` settled last time, so a replay writes nothing.
             let mut p = props.clone();
@@ -673,9 +723,36 @@ pub async fn refresh_refunds(cx: &mut Ctx<'_>, shop: &ShopRow, ids: &[i64]) -> R
     let data = client::graphql(cx.state, shop, REFUNDS_QUERY, json!({"ids": gids})).await?;
     for n in data["nodes"].as_array().into_iter().flatten() {
         let Some(order_id) = num_id(&n["id"]) else { continue };
-        let refunds: Vec<Refund> = n["refunds"].as_array().map(|a| a.iter().take(MAX_LINES).filter_map(Refund::from_graphql).collect()).unwrap_or_default();
+        let mut raw: Vec<Value> = n["refunds"].as_array().map(|a| a.iter().take(MAX_LINES).cloned().collect()).unwrap_or_default();
+        let mut complete = true;
+        for r in raw.iter_mut() {
+            complete &= complete_refund(cx.state, shop, r).await?;
+        }
+        if !complete {
+            // Too large to read in full: leave the order's refunds as they were and say so, rather
+            // than count a wrong total.
+            tracing::warn!(account = %cx.account_id, order = order_id, "a Shopify order's refunds are too large to read in full; not reconciled");
+            not_reconciled(cx, order_id).await.map_err(|_| ApiError::Network("database"))?;
+            continue;
+        }
+        let refunds: Vec<Refund> = raw.iter().filter_map(Refund::from_graphql).collect();
         set_refunds(cx, order_id, t(&n["updatedAt"]), &refunds).await.map_err(|_| ApiError::Network("database"))?;
     }
+    Ok(())
+}
+
+/// Mark the order's refunds as not reconciled (`refunds_not_reconciled` on its Placed Order).
+async fn not_reconciled(cx: &mut Ctx<'_>, order_id: i64) -> anyhow::Result<()> {
+    let db = &cx.state.db;
+    let placed = cx.metrics.id(db, cx.account_id, "Placed Order").await?;
+    let Some(fence) = super::fence::open(db, cx.account_id, cx.shop, cx.generation, None, Some(order_id)).await? else { return Ok(()) };
+    sqlx::query("UPDATE events SET properties = properties || '{\"refunds_not_reconciled\": true}' WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser = false")
+        .bind(cx.account_id)
+        .bind(placed)
+        .bind(format!("order:{order_id}"))
+        .execute(db)
+        .await?;
+    fence.done().await?;
     Ok(())
 }
 
@@ -725,6 +802,9 @@ async fn set_refunds_inner(cx: &mut Ctx<'_>, order_id: i64, updated_at: Option<D
     st["refund_at"] = Value::Object(at);
     st["line_refunds"] = Value::Object(lines.iter().map(|(k, v)| (k.clone(), smap(v))).collect());
     st["refunds_read_at"] = json!(updated_at.map(|u| u.to_rfc3339()));
+    if let Some(o) = props.as_object_mut() {
+        o.remove("refunds_not_reconciled");
+    }
     sqlx::query("UPDATE events SET properties = $2 WHERE id = $1").bind(event_id).bind(&props).execute(&mut *tx).await?;
     recompute(&mut tx, cx.account_id, placed, line, order_id).await?;
     tx.commit().await?;

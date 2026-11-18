@@ -139,6 +139,51 @@ pub async fn put(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, ev: Serve
     Ok(Put::Unchanged)
 }
 
+/// Record new server events that belong together (an order and its lines) all at once or not at
+/// all: through `audience::record_events_from` (live) or one transaction of `record_history`
+/// (history), replacing browser copies as `put` does. `false`: one of them was already there as a
+/// server event (another writer got there first); use `put` for each instead.
+pub async fn create_together(db: &PgPool, metrics: &mut Metrics, account_id: Uuid, evs: Vec<ServerEvent<'_>>, quiet: bool) -> anyhow::Result<bool> {
+    let Some(first) = evs.first() else { return Ok(true) };
+    let live = !quiet && first.at > Utc::now() - Duration::hours(LIVE_WINDOW_HOURS);
+    let mut ids = Vec::with_capacity(evs.len());
+    for ev in &evs {
+        ids.push(metrics.id(db, account_id, ev.metric).await?);
+    }
+    let mut tx = db.begin().await?;
+    let uniques: Vec<String> = evs.iter().map(|e| e.unique_id.clone()).collect();
+    // Lock-free check inside the transaction; the inserts below are ON CONFLICT DO NOTHING anyway.
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM events WHERE account_id = $1 AND metric_id = ANY($2) AND unique_id = ANY($3) AND from_browser = false)")
+        .bind(account_id)
+        .bind(&ids)
+        .bind(&uniques)
+        .fetch_one(&mut *tx)
+        .await?;
+    if taken {
+        return Ok(false);
+    }
+    if live {
+        drop(tx);
+        let news: Vec<NewEvent<'_>> = evs
+            .iter()
+            .map(|ev| NewEvent { account_id, profile_id: ev.profile_id, metric: ev.metric, properties: ev.properties.clone(), value: ev.value, occurred_at: Some(ev.at), unique_id: Some(ev.unique_id.clone()), message_id: None })
+            .collect();
+        let made = audience::record_events_from(db, news, EventSource::Integration).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        return Ok(made.iter().all(|m| m.is_some()));
+    }
+    for (ev, mid) in evs.iter().zip(&ids) {
+        sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser").bind(account_id).bind(mid).bind(&ev.unique_id).execute(&mut *tx).await?;
+    }
+    let history: Vec<HistoryEvent> = evs
+        .iter()
+        .zip(&ids)
+        .map(|(ev, mid)| HistoryEvent { profile_id: ev.profile_id, metric_id: *mid, properties: ev.properties.clone(), value: ev.value, occurred_at: ev.at, unique_id: ev.unique_id.clone() })
+        .collect();
+    let n = audience::record_history(&mut *tx, account_id, &history).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    tx.commit().await?;
+    Ok(n as usize == history.len())
+}
+
 // ---------- The history window ----------
 //
 // Imported orders and customers can move people into segments; those entries mustn't start
