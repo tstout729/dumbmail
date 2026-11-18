@@ -307,7 +307,9 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
         if r.kind == "web" {
             let current = auth.as_deref();
             let shown = |claimed: Option<&str>| matches!((current, claimed), (Some(c), Some(x)) if crypto::ct_eq(c, x));
-            let proven = matches!(owner, Owner::Carry(..)) || shown(r.keys.map(|k| k.1)) || shown(r.proof);
+            // The `previous` flow proves the old subscription, not this endpoint: an endpoint that's
+            // already registered still needs its own auth secret.
+            let proven = shown(r.keys.map(|k| k.1)) || shown(r.proof);
             let rekeys = r.keys.is_some_and(|(p, a)| Some(p) != p256dh.as_deref() || Some(a) != current);
             if (owner_changes || rekeys) && !proven {
                 return Err(not_holder(r.kind));
@@ -324,14 +326,18 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
                         "this device was registered before install secrets: register it once with its current owner (no sign-in change) to get its install_secret first".into(),
                     ))
                 }
-                None => issue_secret = true,
+                // A named owner's device adopts one only with a grant for that owner; an anonymous
+                // device has nothing else to show, so its first same-owner call adopts one.
+                None if seen.as_ref().is_some_and(|e| e.2) || matches!(owner, Owner::Person(_)) => issue_secret = true,
+                None => {}
             }
         }
     } else if r.kind != "web" {
         issue_secret = r.carried_secret_hash.is_none();
     }
     let install_secret = issue_secret.then(crypto::new_install_secret);
-    let secret_hash = install_secret.as_deref().map(crypto::install_secret_hash).or(r.carried_secret_hash.map(str::to_string));
+    // A carried secret (a new token for the same install) only ever goes on a newly stored device.
+    let secret_hash = install_secret.as_deref().map(crypto::install_secret_hash).or(r.carried_secret_hash.filter(|_| existing.is_none()).map(str::to_string));
     // 3. The settings row.
     sqlx::query("SELECT 1 FROM push_settings WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
     // The caps, before anything is stored: a new device must fit the account's (all devices, and
@@ -637,12 +643,22 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
             let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
             let secret = b["install_secret"].as_str();
             // A new token for the same install (the old one shown with its install secret): it takes
-            // over the old device's owner and secret.
+            // over the old device's owner and secret. A new token that's already registered follows
+            // its own rules first; the old one is forgotten only once that's accepted.
             let mut carried: Option<String> = None;
             let mut left_anonymous: Option<Uuid> = None;
+            let mut forget_after: Option<String> = None;
             if let Some(prev) = b["previous_token"].as_str() {
                 let prev = stored_token(platform, prev)?;
-                if prev != token {
+                let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3)")
+                    .bind(a.id)
+                    .bind(platform)
+                    .bind(&token)
+                    .fetch_one(&state.db)
+                    .await?;
+                if prev != token && taken {
+                    forget_after = Some(prev);
+                } else if prev != token {
                     let Some((p, anon, hash)) = take_over(&state, a.id, platform, &prev, secret).await? else { return Err(not_holder(platform)) };
                     match (owner, p) {
                         (Owner::Keep, Some(p)) => owner = Owner::Carry(p, anon),
@@ -671,6 +687,11 @@ pub async fn register_device(State(state): State<AppState>, Query(q): Query<KeyQ
                 carried_secret_hash: carried.as_deref(),
             };
             let saved = save_device(&state, a.id, &reg, owner).await?;
+            if let Some(prev) = forget_after {
+                if let Some((Some(p), true, _)) = take_over(&state, a.id, platform, &prev, secret).await? {
+                    forget_nameless(&state.db, &[p]).await?;
+                }
+            }
             if let Some(p) = left_anonymous {
                 forget_nameless(&state.db, &[p]).await?;
             }

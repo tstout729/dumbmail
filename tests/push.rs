@@ -1498,6 +1498,22 @@ async fn a_browser_device_changes_only_for_the_browser_holding_it() {
     assert_eq!((st, v["linked"].as_bool()), (StatusCode::OK, Some(true)), "{v}");
     assert!(web_device(&h, &real.endpoint).await.is_none());
     assert_eq!(web_device(&h, &moved.endpoint).await.unwrap().2, Some(bob));
+    // The `previous` flow proves only the old subscription: it can't be pointed at someone else's endpoint.
+    let theirs = browser(&base, "o1");
+    enroll(&h, &a, &theirs, "ana@x.test").await;
+    let mine = browser(&base, "m1");
+    subscribe(&h, &a, &mine, json!({})).await;
+    let fake = Browser { endpoint: theirs.endpoint.clone(), ..browser(&base, "o1") };
+    let (st, _) = public_post(
+        &h,
+        "/client/push/subscribe",
+        &a.key,
+        json!({"subscription": {"endpoint": fake.endpoint, "keys": {"p256dh": fake.p256dh, "auth": fake.auth}}, "previous": {"endpoint": mine.endpoint, "auth": mine.auth}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let t = web_device(&h, &theirs.endpoint).await.unwrap();
+    assert_eq!((t.1.as_str(), t.2), (theirs.auth.as_str(), Some(ana)), "theirs is untouched");
     // And a stranger can't sign it out or remove it with only the endpoint.
     public_post(&h, "/client/push/sign-out", &a.key, json!({"endpoint": moved.endpoint, "auth": "x".repeat(22)})).await;
     public_post(&h, "/client/push/unsubscribe", &a.key, json!({"endpoint": moved.endpoint, "auth": "x".repeat(22)})).await;
@@ -1559,6 +1575,20 @@ async fn an_app_device_changes_only_with_its_install_secret() {
     let (st, v) = app_call(&h, &a, "/client/push/devices", "ios", &tok2, json!({"previous_token": tok, "install_secret": s})).await;
     assert_eq!((st, v.get("install_secret")), (StatusCode::OK, None), "the install keeps its secret: {v}");
     assert_eq!((app_owner(&h, &tok).await, app_owner(&h, &tok2).await), (None, Some(Some(anon))));
+    // Its own secret with someone else's token as the new one doesn't move or re-key theirs.
+    let other = "c".repeat(64);
+    let (_, v) = app_call(&h, &a, "/client/push/devices", "ios", &other, json!({"identity": a.grant("email", "ivy@x.test")})).await;
+    let other_secret = v["install_secret"].as_str().unwrap().to_string();
+    let other_hash: Option<String> = sqlx::query_scalar("SELECT install_secret_hash FROM push_devices WHERE address = $1").bind(&other).fetch_one(&h.state.db).await.unwrap();
+    let tok3 = "d".repeat(64);
+    app_call(&h, &a, "/client/push/devices", "ios", &tok3, json!({"previous_token": tok2, "install_secret": s})).await;
+    assert_eq!(app_call(&h, &a, "/client/push/devices", "ios", &other, json!({"previous_token": tok3, "install_secret": s})).await.0, StatusCode::CONFLICT);
+    let now_hash: Option<String> = sqlx::query_scalar("SELECT install_secret_hash FROM push_devices WHERE address = $1").bind(&other).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((app_owner(&h, &other).await, now_hash), (Some(Some(ivy)), other_hash), "theirs is untouched");
+    assert_eq!(app_call(&h, &a, "/client/push/devices/sign-out", "ios", &other, json!({"install_secret": other_secret})).await.0, StatusCode::OK);
+    let tok2 = tok3;
+    assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "ios", &tok2, json!({"install_secret": "x".repeat(43)})).await.0, StatusCode::CONFLICT);
+    assert_eq!(app_owner(&h, &tok2).await, Some(Some(anon)), "lost nothing to a refused take-over");
     assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "ios", &tok2, json!({"install_secret": s})).await.0, StatusCode::OK);
     assert_eq!(app_owner(&h, &tok2).await, None);
     h.cleanup().await;
@@ -1582,7 +1612,16 @@ async fn a_device_registered_before_install_secrets_adopts_one_on_its_first_call
     assert_eq!(app_call(&h, &a, "/client/push/devices/remove", "android", &tok, json!({})).await.0, StatusCode::CONFLICT);
     assert_eq!(app_owner(&h, &tok).await, Some(Some(ivy)));
 
-    // Its first call with the same owner and token adopts one and returns it, once.
+    // A call without a grant still refreshes it, but a named owner's device adopts no secret that way.
+    let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &tok, json!({})).await;
+    assert_eq!((st, v.get("install_secret")), (StatusCode::OK, None));
+    // An anonymous one does (it has nothing else to show).
+    let anon_tok = format!("g{}", "x".repeat(40));
+    app_call(&h, &a, "/client/push/devices", "android", &anon_tok, json!({})).await;
+    sqlx::query("UPDATE push_devices SET install_secret_hash = NULL WHERE address = $1").bind(&anon_tok).execute(&h.state.db).await.unwrap();
+    assert!(app_call(&h, &a, "/client/push/devices", "android", &anon_tok, json!({})).await.1["install_secret"].is_string());
+
+    // Its first call with the same owner (a grant for them) and token adopts one and returns it, once.
     let (st, v) = app_call(&h, &a, "/client/push/devices", "android", &tok, json!({"identity": a.grant("email", "ivy@x.test")})).await;
     assert_eq!(st, StatusCode::OK);
     let secret = v["install_secret"].as_str().expect("adopted").to_string();
