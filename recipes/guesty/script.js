@@ -22,6 +22,12 @@
 // - Reservation Cancelled: timed by Guesty's own update time, so a late, older cancellation never
 //   undoes a newer reinstatement.
 // - Inquiry Received.
+// Each reservation is also kept as a `reservation` object (see dumbmail://docs/objects) with its
+// current status, dates, listing, nights, guests and channel, written with Guesty's own time as
+// `as_of` so a late, older message never undoes a newer one. Its `guest` link is replaced by each
+// message: when Guesty moves the booking to another guest (or it has none), the old guest is
+// unlinked at once, and the new one is linked as soon as DumbMail knows them. Object-date flows
+// (the pre-arrival flow) follow it when its dates move or it's cancelled.
 // A webhook without any Guesty time can't be ordered, so it writes no events; the next pull (every
 // 15 minutes) records the change with Guesty's time. A v2 event for a guest DumbMail doesn't know
 // yet is retried until the pull has added them.
@@ -31,6 +37,13 @@
 // from marketing unless the owner says they opted in; booking-site relay addresses are suppressed.
 
 var SEARCH_PATH = "/v1/reservations-v3/search";
+// Payment evidence for upcoming arrivals: Guesty's reservations reports search documents
+// money.balanceDue and money.totalPaid (the v3 search and v2 webhooks carry no money, and the legacy
+// webhooks retire on 1 March 2027). Checked against Guesty's public documentation only.
+var REPORTS_PATH = "/v1/reservations-reports/reservations/search";
+// At most this often, and at most this many pages (of 100) per check.
+var SWEEP_EVERY_MS = 3600000;
+var SWEEP_MAX_PAGES = 10;
 var GUESTS_PATH = "/v1/guests-crud";
 // 50 a page keeps the reservations waiting for their guests well inside the 64 KB saved state.
 var PAGE_SIZE = 50;
@@ -39,7 +52,7 @@ var GUEST_COLUMNS = "id firstName lastName fullName guestEmail guestPhone";
 // What makes a new booking version: a change to any of these (Guesty's field names in
 // meta.changedFields, and ours when comparing a legacy webhook's before and after).
 var VERSION_CHANGES = ["status", "checkIn", "checkOut", "checkInDateLocalized", "checkOutDateLocalized", "listingId", "unitId", "listing", "guestId", "guest"];
-var VERSION_FIELDS = ["status", "check_in", "check_out", "listing_id", "guest_id"];
+var VERSION_FIELDS = ["status", "check_in", "check_out", "listing_id", "guest_id", "paid_in_full"];
 
 function str(v) {
   return v === undefined || v === null || v === "" ? null : String(v);
@@ -118,10 +131,14 @@ function details(r) {
   var checkIn = day(r.checkInDateLocalized || stay.checkInDateLocalized || r.checkIn || stay.checkIn);
   var checkOut = day(r.checkOutDateLocalized || stay.checkOutDateLocalized || r.checkOut || stay.checkOut);
   var total = null;
+  // Paid in full, as Guesty reports it: nothing left to pay on a booking worth something. Unknown
+  // (null) when the message carries no money (v2 webhooks and the current reservation API don't).
+  var paidInFull = null;
   if (m) {
     var paid = num(m.totalPaid);
     var due = num(m.balanceDue);
     total = paid !== null || due !== null ? (paid || 0) + (due || 0) : num(m.hostPayout);
+    if (due !== null && total !== null) paidInFull = due === 0 && total > 0;
   }
   return {
     reservation_id: str(r.reservationId || r._id || r.id),
@@ -135,6 +152,7 @@ function details(r) {
     guests: num(r.guestsCount !== undefined ? r.guestsCount : stay.guestsCount),
     total: total,
     currency: m ? str(m.currency) : null,
+    paid_in_full: paidInFull,
     source_channel: str(integration.platform || r.channel || r.platform || r.source),
     guest_id: str(r.guestId || (r.guest && (r.guest._id || r.guest.id))),
   };
@@ -178,6 +196,11 @@ function reservationActions(r, guest, who, version, input, versioned) {
   for (var k in d) if (d[k] !== null && k !== "total" && k !== "currency") props[k] = d[k];
   if (historical) props.historical = true;
   props.version = version;
+
+  // Payment is part of the versioned write: an older message never overrides a newer state. If a
+  // newer message without money got there first, payment stays as it was (unknown means no
+  // pre-arrival message) until Guesty's next message that carries money.
+  out.push(reservationObject(d, who, version));
 
   var status = String(r.status || "").toLowerCase();
   if (BOOKED.indexOf(status) >= 0) {
@@ -225,6 +248,44 @@ function reservationActions(r, guest, who, version, input, versioned) {
   return out;
 }
 
+// The reservation as it is now. Only what this message says is written (a v2 webhook without the
+// listing's name leaves the stored name alone); door codes and notes are never among the fields.
+// `who` may be null (no guest, or one DumbMail can't find yet): the old guest is unlinked anyway.
+// Payment: a version that carries money records `paid_in_full` with the time of that evidence
+// (`paid_checked_at`, Guesty's own time for the version); a version without money makes payment
+// unknown (both cleared), so evidence is never older than the reservation's last change.
+function reservationObject(d, who, version) {
+  var fields = clean({
+    status: d.status ? d.status.toLowerCase() : null, confirmation_code: d.confirmation_code, listing_id: d.listing_id, listing_name: d.listing_name,
+    check_in: d.check_in, check_out: d.check_out, nights: d.nights, guests: d.guests, total: d.total, currency: d.currency,
+    source_channel: d.source_channel, guest_id: d.guest_id,
+  });
+  if (d.paid_in_full !== null) {
+    fields.paid_in_full = d.paid_in_full;
+    fields.paid_checked_at = version;
+  } else {
+    fields.paid_in_full = null;
+    fields.paid_checked_at = null;
+  }
+  var profiles = [];
+  if (who) {
+    var link = {};
+    for (var k in who) if (k !== "if_missing") link[k] = who[k];
+    link.relationship = "guest";
+    profiles.push(link);
+  }
+  return { type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: fields, profiles: profiles, replace_links: ["guest"], as_of: version };
+}
+
+// A reservation with no guest DumbMail can find from this message: only its object, which unlinks
+// any former guest at once (and links `who`, a lookup by the Guesty guest id, if they're known).
+function objectOnly(r, version, input, who) {
+  var d = details(r);
+  if (!d.reservation_id || isOwnerStay(r, input.settings || {})) return [];
+  if (!version) return [];
+  return [reservationObject(d, who || null, version)];
+}
+
 function clean(o) {
   var out = {};
   for (var k in o) if (o[k] !== null && o[k] !== undefined) out[k] = o[k];
@@ -235,7 +296,7 @@ function changedFields(r, before) {
   if (!before) return [];
   var a = details(r);
   var b = details(before);
-  return ["status", "check_in", "check_out", "guests", "total", "listing_id", "guest_id"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
+  return ["status", "check_in", "check_out", "guests", "total", "listing_id", "guest_id", "paid_in_full"].filter(function (f) { return b[f] !== null && b[f] !== a[f]; });
 }
 
 // "Reservation Updated", once per change (webhooks only: they say what changed).
@@ -269,7 +330,7 @@ function fromWebhook(input) {
     var gid = str(data.guestId);
     var who = whoFor(null, gid, true);
     if (!data.reservationId) return [{ type: "log", message: ev + " with no reservationId" }];
-    if (!who) return [{ type: "log", message: ev + " for " + data.reservationId + " has no guestId; the next pull picks it up" }];
+    if (!who) return objectOnly(data, str(meta.publishedAt), input).concat([{ type: "log", message: ev + " for " + data.reservationId + " has no guestId; the reservation is kept without a guest" }]);
     // v2 events carry no email: this reaches guests DumbMail already has; the pull adds new ones.
     var changed = Array.isArray(meta.changedFields) ? meta.changedFields : null;
     var versioned = ev === "reservation.created.v2" || !changed || changed.some(function (f) { return VERSION_CHANGES.indexOf(String(f)) >= 0; });
@@ -282,7 +343,12 @@ function fromWebhook(input) {
     var r = p.reservation;
     if (!r) return [{ type: "log", message: ev + " with no reservation object" }];
     var g = guestFrom(r.guest, r.guestId);
-    if (!g.email && !g.phone) return [{ type: "log", message: "reservation " + (r._id || r.id) + ": the guest has no usable email or phone, so there's no profile to write" }];
+    if (!g.email && !g.phone) {
+      // Still applied to the reservation at once (a cancellation, a new guest): the former guest is
+      // unlinked, and the new one is linked by their Guesty id if DumbMail knows them.
+      var v = str(r.lastUpdatedAt) || str(meta.publishedAt);
+      return objectOnly(r, v, input, whoFor(null, g.id, false)).concat([{ type: "log", message: "reservation " + (r._id || r.id) + ": the guest has no usable email or phone, so there's no profile to write" }]);
+    }
     var version = str(r.lastUpdatedAt) || str(meta.publishedAt);
     var before = p.reservationBefore;
     var moved = before ? changedFields(r, before).some(function (f) { return VERSION_FIELDS.indexOf(f) >= 0; }) : true;
@@ -374,7 +440,8 @@ function fromGuests(input) {
     var g = gid && byId[gid] ? guestFrom(byId[gid], gid, true) : null;
     var who = whoFor(g && (g.email || g.phone) ? g : null, gid);
     if (!who) {
-      out.push({ type: "log", message: "reservation " + r.reservationId + " has no guest; skipped" });
+      objectOnly(r, updatedAt(r), input).forEach(function (a) { out.push(a); });
+      out.push({ type: "log", message: "reservation " + r.reservationId + " has no guest; kept without one" });
       return;
     }
     reservationActions(r, g && (g.email || g.phone) ? g : null, who, updatedAt(r), input).forEach(function (a) { out.push(a); });
@@ -385,12 +452,84 @@ function fromGuests(input) {
   if (st.page_more) {
     var q = { limit: PAGE_SIZE, sort: "lastUpdatedAt", "filter[lastUpdatedAt][gte]": cursor, skip: skip, columns: null, filters: null };
     out.push({ type: "next_request", url: SEARCH_PATH, query: q });
+  } else if (sweepDue(input)) {
+    out.push(sweepRequest(input, 0));
+    out.push({ type: "log", message: "checking payment for confirmed arrivals in the next " + sweepDays(input) + " days" });
   }
   out.push({ type: "log", message: "page " + input.page + ": wrote " + pending.length + " reservations" });
   return out;
 }
 
+function sweepDays(input) {
+  var n = Number((input.settings || {}).payment_check_days);
+  return n >= 1 && n <= 90 ? Math.floor(n) : 45;
+}
+
+function sweepDue(input) {
+  var last = (input.state || {}).payment_checked_at;
+  return !last || Date.parse(input.now) - Date.parse(last) >= SWEEP_EVERY_MS;
+}
+
+function isoDay(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// The reports search for confirmed reservations arriving from yesterday (listing time zones run
+// behind UTC) to `days` ahead, oldest id first, a page of 100.
+function sweepRequest(input, skip) {
+  var now = Date.parse(input.now);
+  return {
+    type: "next_request", url: REPORTS_PATH,
+    query: {
+      "filter[checkInDate][gte]": isoDay(now - 86400000), "filter[checkInDate][lt]": isoDay(now + sweepDays(input) * 86400000),
+      "filter[status]": "confirmed", sort: "_id", limit: 100, skip: skip,
+      "filter[lastUpdatedAt][gte]": null, columns: null, filters: null,
+    },
+  };
+}
+
+// A page of the payment check: each reservation's payment, as evidence taken now. It's written
+// only onto a reservation DumbMail has and that hasn't changed since (only_if_as_of_at_most), so
+// older evidence never lands on a newer version. A reservation whose money is missing is left as it is.
+function fromReports(input) {
+  var page = input.payload || {};
+  var results = Array.isArray(page.results) ? page.results : [];
+  var st = input.state || {};
+  var pages = (Number(st.payment_check_pages) || 0) + 1;
+  var out = [];
+  // Evidence is as old as the page: never from a replay of a stored page, and dated by the
+  // response's own Date header when it has one (else now: the script runs as the page arrives).
+  if (input.replay) return [{ type: "log", message: "a replayed payment check page writes no payment evidence (it may be stale)" }];
+  var hdrs = (input.response && input.response.headers) || {};
+  var stamped = Date.parse(hdrs.date || hdrs.Date || "");
+  var takenAt = !isNaN(stamped) && stamped <= Date.parse(input.now) ? new Date(stamped).toISOString() : input.now;
+  results.forEach(function (r) {
+    var id = str(r.reservationId);
+    var m = r.money;
+    if (!id || !m) return;
+    var due = num(m.balanceDue);
+    var paid = num(m.totalPaid);
+    if (due === null || paid === null) return;
+    out.push({
+      type: "upsert_object", object_type: "reservation", external_id: id,
+      fields: { paid_in_full: due === 0 && paid + due > 0, paid_checked_at: takenAt },
+      only_if_as_of_at_most: takenAt,
+    });
+  });
+  var more = !!(page.pagination && page.pagination.hasMore) && pages < SWEEP_MAX_PAGES;
+  if (more) {
+    out.push({ type: "set_state", values: { payment_check_pages: pages } });
+    out.push(sweepRequest(input, pages * 100));
+  } else {
+    out.push({ type: "set_state", values: { payment_check_pages: null, payment_checked_at: input.now } });
+  }
+  out.push({ type: "log", message: "payment check page " + pages + ": " + results.length + " reservations" });
+  return out;
+}
+
 function handle(input) {
   if (input.source !== "pull") return fromWebhook(input);
-  return requestPath(input).indexOf(GUESTS_PATH) === 0 ? fromGuests(input) : fromSearch(input);
+  var path = requestPath(input);
+  if (path.indexOf(REPORTS_PATH) === 0) return fromReports(input);
+  return path.indexOf(GUESTS_PATH) === 0 ? fromGuests(input) : fromSearch(input);
 }

@@ -7,6 +7,7 @@ import { SmsEditor } from "../email/SmsEditor";
 import { PushEditor } from "../../features/push/PushEditor";
 import { ReviewStepEditor } from "../../features/reviews/StepEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
+import { ObjectSplitFields } from "../../features/objects/ObjectSplitFields";
 import { Button, Field, IconButton, Input, Segmented, Select, Textarea } from "../ui";
 
 type Props = {
@@ -66,6 +67,17 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigg
           </p>
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
           <EventConditionEditor node={node} onChange={onChange} trigger={trigger} />
+          {trigger?.type === "object" || trigger?.type === "object_date" ? (
+            <ObjectSplitFields
+              objectType={trigger.object_type}
+              filters={node.object_filters}
+              onChange={(object_filters) => {
+                const next = { ...node, object_filters };
+                if (!object_filters) delete next.object_filters;
+                onChange(next);
+              }}
+            />
+          ) : null}
         </fieldset>
       );
     case "wait_for_reply":

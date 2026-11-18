@@ -28,6 +28,14 @@ pub struct Definition {
     pub match_: Match,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Set by `load` when any rule in it (or in a segment it uses) can't be tested now: the whole
+    /// definition then matches nobody, so no negation ("not in segment") can turn it into everyone.
+    #[serde(skip)]
+    pub blocked: bool,
+    /// Set by `load`: lets the query check each object rule's fields against the type as it is when
+    /// the query runs (a field made sensitive after loading).
+    #[serde(skip)]
+    pub account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +210,24 @@ pub enum Condition {
         #[serde(default)]
         until: Option<String>,
     },
+    /// Has (or doesn't have, `zero`) objects of a type (see `features::objects`) whose fields match
+    /// `where`, e.g. a reservation checking in within the next 14 days.
+    Object {
+        object_type: String,
+        #[serde(default = "at_least")]
+        op: EventOp,
+        #[serde(default)]
+        count: Option<i64>,
+        #[serde(rename = "where", default)]
+        where_: Vec<Filter>,
+        /// Only objects they're linked to this way (e.g. `guest`).
+        #[serde(default)]
+        relationship: Option<String>,
+        /// Set by `load` when a field rule names a field the type doesn't define or marks
+        /// sensitive: the rule then matches nobody, whatever its `op`. Never read from JSON.
+        #[serde(skip)]
+        blocked: bool,
+    },
     /// Reviews someone wrote, or a review link waiting for them (see `features::reviews`).
     Review(crate::features::reviews::segment::ReviewCondition),
     /// A stable random share of profiles, e.g. a 10% holdout. The same seed always picks the same people.
@@ -265,6 +291,12 @@ pub enum PropOp {
     MoreThanDaysAgo,
     /// The date's month and day fall within the next N days (0 = today), e.g. birthdays.
     AnniversaryWithinDays,
+    /// The date is today or in the next N days (a date-time: from now to N days ahead).
+    WithinNextDays,
+    /// The date is today or later (a date-time: after now).
+    InFuture,
+    /// The date is before today (a date-time: before now).
+    InPast,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -425,7 +457,69 @@ pub async fn load(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Optio
     let mut stack: Vec<Uuid> = self_id.into_iter().collect();
     let mut budget = Budget { refs: MAX_SEGMENT_REFS, conditions: MAX_EXPANDED_CONDITIONS };
     resolve(db, account_id, &mut def.conditions, &mut stack, &mut budget).await?;
+    // Object rules are checked against each type as it is now: one that names a field the type
+    // doesn't define, or marks sensitive, matches nobody (a count would tell who has which value).
+    block_object_rules(db, account_id, &mut def.conditions).await?;
+    def.blocked = contains_blocked(&def.conditions);
+    def.account_id = Some(account_id);
     Ok(def)
+}
+
+/// [`load`] for saving rules: a rule that names a field it can't test is refused, with the reason.
+pub async fn load_checked(db: &sqlx::PgPool, account_id: Uuid, v: &Value, self_id: Option<Uuid>) -> AppResult<Definition> {
+    let def = load(db, account_id, v, self_id).await?;
+    let mut problems = Vec::new();
+    blocked_rules(&def.conditions, &mut problems);
+    for (key, fields) in problems {
+        crate::features::objects::types::check_rule_fields(db, account_id, &key, &fields.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    }
+    Ok(def)
+}
+
+fn blocked_rules(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
+    for c in conds {
+        match c {
+            Condition::Object { object_type, where_, blocked: true, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.clone()).collect())),
+            Condition::Group { conditions, .. } => blocked_rules(conditions, out),
+            Condition::Segment { resolved: Some(d), .. } => blocked_rules(&d.conditions, out),
+            _ => {}
+        }
+    }
+}
+
+/// Whether any rule here, in a group or in a segment used here, is blocked.
+fn contains_blocked(conds: &[Condition]) -> bool {
+    conds.iter().any(|c| match c {
+        Condition::Object { blocked, .. } => *blocked,
+        Condition::Group { conditions, .. } => contains_blocked(conditions),
+        Condition::Segment { resolved: Some(d), .. } => d.blocked || contains_blocked(&d.conditions),
+        _ => false,
+    })
+}
+
+/// Mark each object condition (in groups and other segments too) whose rules can't be tested now.
+fn block_object_rules<'a>(db: &'a sqlx::PgPool, account_id: Uuid, conds: &'a mut [Condition]) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<()>> + Send + 'a>> {
+    Box::pin(async move {
+        for c in conds.iter_mut() {
+            match c {
+                Condition::Object { object_type, where_, blocked, .. } => {
+                    let fields: Vec<&str> = where_.iter().map(|f| f.field.as_str()).collect();
+                    *blocked = match crate::features::objects::types::check_rule_fields(db, account_id, object_type.trim(), &fields).await {
+                        Ok(()) => false,
+                        Err(crate::error::AppError::Internal(e)) => return Err(crate::error::AppError::Internal(e)),
+                        Err(_) => !fields.is_empty(),
+                    };
+                }
+                Condition::Group { conditions, .. } => block_object_rules(db, account_id, conditions).await?,
+                Condition::Segment { resolved: Some(d), .. } => {
+                    block_object_rules(db, account_id, &mut d.conditions).await?;
+                    d.blocked = contains_blocked(&d.conditions);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Limits on inlining other segments, so a chain of segments that each include another many times
@@ -581,6 +675,24 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 }
                 check_window(*within_days, since, until)?;
             }
+            Condition::Object { object_type, count, where_, relationship, .. } => {
+                if !crate::features::objects::types::valid_type_key(object_type.trim()) {
+                    return Err(AppError::bad("an object condition needs the object type's key (e.g. reservation)"));
+                }
+                if count.is_some_and(|c| c < 0) {
+                    return Err(AppError::bad("count must be 0 or more"));
+                }
+                if where_.len() > 20 {
+                    return Err(AppError::bad("an object condition takes at most 20 field rules"));
+                }
+                if where_.iter().any(|f| f.value.as_ref().is_some_and(|v| v.is_object())) {
+                    return Err(AppError::bad("comparing one field with another is only for object flows, not segments"));
+                }
+                if relationship.as_deref().is_some_and(|r| r.trim().is_empty() || r.chars().count() > 50) {
+                    return Err(AppError::bad("relationship is 1-50 characters (e.g. guest)"));
+                }
+                check_filters(where_)?;
+            }
             Condition::Review(r) => crate::features::reviews::segment::validate(r)?,
             Condition::Random { percent, .. } => {
                 if !(percent.is_finite() && *percent > 0.0 && *percent <= 100.0) {
@@ -680,12 +792,15 @@ fn check_filter(field: &str, op: PropOp, value: &Option<Value>) -> AppResult<()>
     if field.trim().is_empty() {
         return Err(AppError::bad("condition needs a field"));
     }
-    let needs_value = !matches!(op, PropOp::Exists | PropOp::NotExists);
+    let needs_value = !matches!(op, PropOp::Exists | PropOp::NotExists | PropOp::InFuture | PropOp::InPast);
     if needs_value && value.as_ref().is_none_or(|v| v.is_null()) {
         return Err(AppError::bad(format!("condition on {field:?} needs a value")));
     }
     if matches!(op, PropOp::WithinLastDays | PropOp::MoreThanDaysAgo) && value.as_ref().and_then(as_f64).is_none() {
         return Err(AppError::bad("day-based conditions need a number of days"));
+    }
+    if op == PropOp::WithinNextDays && !value.as_ref().and_then(as_f64).is_some_and(|d| (0.0..=3650.0).contains(&d)) {
+        return Err(AppError::bad("within_next_days needs a number of days from 0 to 3650"));
     }
     if op == PropOp::AnniversaryWithinDays && !value.as_ref().and_then(as_f64).is_some_and(|d| (0.0..=366.0).contains(&d)) {
         return Err(AppError::bad("anniversary_within_days needs a number of days from 0 to 366"));
@@ -716,6 +831,8 @@ const ACCOUNT_TZ: &str = "(SELECT a.timezone FROM accounts a WHERE a.id = p.acco
 enum Source {
     Profile,
     Event,
+    /// An object's fields (`o`, inside an object condition).
+    Object,
 }
 
 fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str) {
@@ -735,6 +852,9 @@ fn push_text_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         Source::Event => {
             qb.push("(e.properties->>").push_bind(field.to_string()).push(")");
         }
+        Source::Object => {
+            qb.push("(o.fields->>").push_bind(field.to_string()).push(")");
+        }
     }
 }
 
@@ -746,6 +866,10 @@ fn push_json_field(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str
         }
         Source::Event if field != "value" => {
             qb.push("(e.properties->").push_bind(field.to_string()).push(")");
+            true
+        }
+        Source::Object => {
+            qb.push("(o.fields->").push_bind(field.to_string()).push(")");
             true
         }
         _ => false,
@@ -931,6 +1055,35 @@ fn push_filter(qb: &mut QueryBuilder<'_, Postgres>, src: Source, field: &str, op
             push_time_field(qb, src, field);
             qb.push(if op == PropOp::WithinLastDays { " >= " } else { " < " });
             qb.push("now() - make_interval(secs => ").push_bind(days * 86400.0).push(")");
+        }
+        PropOp::WithinNextDays | PropOp::InFuture | PropOp::InPast => {
+            // A plain date by calendar day in the account's time zone; a date-time against now.
+            let today = format!("(now() AT TIME ZONE {ACCOUNT_TZ})::date");
+            qb.push("(CASE WHEN ");
+            push_text_field(qb, src, field);
+            qb.push(" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN pl_ts(");
+            push_text_field(qb, src, field);
+            qb.push(")::date");
+            match op {
+                PropOp::WithinNextDays => {
+                    let days = as_f64(&v).unwrap_or(0.0).clamp(0.0, 3650.0);
+                    qb.push(format!(" BETWEEN {today} AND {today} + ")).push_bind(days.floor() as i32);
+                    qb.push(" ELSE ");
+                    push_time_field(qb, src, field);
+                    qb.push(" BETWEEN now() AND now() + make_interval(secs => ").push_bind(days * 86400.0).push(")");
+                }
+                PropOp::InFuture => {
+                    qb.push(format!(" >= {today} ELSE "));
+                    push_time_field(qb, src, field);
+                    qb.push(" > now()");
+                }
+                _ => {
+                    qb.push(format!(" < {today} ELSE "));
+                    push_time_field(qb, src, field);
+                    qb.push(" <= now()");
+                }
+            }
+            qb.push(" END)");
         }
         PropOp::AnniversaryWithinDays => {
             // Month and day of the date, compared with today and the next N days in the account's time zone.
@@ -1269,6 +1422,29 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             };
             qb.push(")");
         }
+        Condition::Object { blocked: true, .. } => {
+            qb.push("FALSE");
+        }
+        Condition::Object { object_type, op, count, where_, relationship, .. } => {
+            qb.push("((SELECT count(DISTINCT o.id) FROM object_links ol JOIN objects o ON o.id = ol.object_id JOIN object_types ot ON ot.id = o.type_id");
+            qb.push(" WHERE ol.profile_id = p.id AND ot.account_id = p.account_id AND o.account_id = p.account_id AND ot.key = ").push_bind(object_type.trim().to_string());
+            if let Some(r) = relationship {
+                qb.push(" AND ol.relationship = ").push_bind(r.trim().to_lowercase());
+            }
+            for f in where_ {
+                qb.push(" AND (");
+                push_filter(qb, Source::Object, &f.field, f.op, &f.value);
+                qb.push(")");
+            }
+            let n = count.unwrap_or(1);
+            match op {
+                EventOp::AtLeast => qb.push(") >= ").push_bind(n),
+                EventOp::AtMost => qb.push(") <= ").push_bind(n),
+                EventOp::Exactly => qb.push(") = ").push_bind(n),
+                EventOp::Zero => qb.push(") = 0"),
+            };
+            qb.push(")");
+        }
         Condition::Review(r) => crate::features::reviews::segment::push(qb, r),
         Condition::Random { percent, seed } => {
             // Stable per profile and seed: hash into 0..9999 and keep the lowest `percent` share.
@@ -1301,7 +1477,44 @@ fn push_conditions(qb: &mut QueryBuilder<'_, Postgres>, m: Match, conds: &[Condi
 
 /// Push a boolean SQL expression for the definition, referencing profile alias `p`.
 pub fn push_definition(qb: &mut QueryBuilder<'_, Postgres>, def: &Definition) {
+    if def.blocked {
+        qb.push("FALSE");
+        return;
+    }
+    let mut rules = Vec::new();
+    object_rule_fields(&def.conditions, &mut rules);
+    rules.retain(|(_, fields)| !fields.is_empty());
+    let Some(account_id) = def.account_id.filter(|_| !rules.is_empty()) else {
+        push_conditions(qb, def.match_, &def.conditions);
+        return;
+    };
+    // The whole definition holds only while every field its object rules test is still on its type
+    // and not sensitive (checked once per query, at its start), so a type edit made after loading
+    // can't make a negated rule match everyone.
+    qb.push("(NOT EXISTS (SELECT 1 FROM object_types gt WHERE gt.account_id = ").push_bind(account_id).push(" AND (");
+    for (i, (key, fields)) in rules.into_iter().enumerate() {
+        if i > 0 {
+            qb.push(" OR ");
+        }
+        qb.push("(gt.key = ").push_bind(key).push(" AND EXISTS (SELECT 1 FROM unnest(").push_bind(fields).push(
+            "::text[]) x WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements(gt.fields) e WHERE e->>'key' = x AND e->>'sensitive' IS DISTINCT FROM 'true')))",
+        );
+    }
+    qb.push(")) AND (");
     push_conditions(qb, def.match_, &def.conditions);
+    qb.push("))");
+}
+
+/// Each object rule's type and the fields it tests, in groups and used segments too.
+fn object_rule_fields(conds: &[Condition], out: &mut Vec<(String, Vec<String>)>) {
+    for c in conds {
+        match c {
+            Condition::Object { object_type, where_, .. } => out.push((object_type.trim().to_string(), where_.iter().map(|f| f.field.trim().to_string()).collect())),
+            Condition::Group { conditions, .. } => object_rule_fields(conditions, out),
+            Condition::Segment { resolved: Some(d), .. } => object_rule_fields(&d.conditions, out),
+            _ => {}
+        }
+    }
 }
 
 /// Count profiles in an account matching a definition, plus a sample.
@@ -1400,7 +1613,7 @@ pub fn json_filter_matches(obj: &Value, f: &Filter) -> bool {
         },
         PropOp::In => in_list(&want),
         PropOp::NotIn => !in_list(&want),
-        PropOp::WithinLastDays | PropOp::MoreThanDaysAgo | PropOp::AnniversaryWithinDays => false,
+        PropOp::WithinLastDays | PropOp::MoreThanDaysAgo | PropOp::AnniversaryWithinDays | PropOp::WithinNextDays | PropOp::InFuture | PropOp::InPast => false,
     }
 }
 
@@ -1502,6 +1715,33 @@ mod tests {
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "bought"}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "category": " "}]})).is_err());
         assert!(parse(&json!({"conditions": [{"type": "product", "action": "viewed", "within_days": 0}]})).is_err());
+    }
+
+    #[test]
+    fn object_rules_compile_with_bound_values() {
+        let def = parse(&json!({"match": "all", "conditions": [
+            {"type": "object", "object_type": "reservation", "relationship": "guest", "where": [
+                {"field": "status", "op": "eq", "value": "confirmed"},
+                {"field": "check_in", "op": "within_next_days", "value": 14}]},
+            {"type": "object", "object_type": "subscription", "op": "zero", "where": [{"field": "renews_on", "op": "in_future"}]},
+            {"type": "object", "object_type": "pet", "op": "at_least", "count": 2, "where": [{"field": "kind", "op": "in", "value": ["dog", "cat"]}]}
+        ]}))
+        .unwrap();
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT 1 FROM profiles p WHERE ");
+        push_definition(&mut qb, &def);
+        let sql = qb.sql();
+        assert!(sql.contains("FROM object_links ol JOIN objects o ON o.id = ol.object_id"), "{sql}");
+        assert!(sql.contains("ot.account_id = p.account_id"), "objects are read only from the person's own account");
+        assert!(sql.contains("(o.fields->>$"), "{sql}");
+        assert!(sql.contains(") = 0"), "{sql}");
+        for leaked in ["reservation", "guest", "confirmed", "check_in", "renews_on", "dog"] {
+            assert!(!sql.contains(leaked), "{leaked} must be bound, not inlined");
+        }
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "Reservation"}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "where": [{"field": "check_in", "op": "within_next_days"}]}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "where": [{"field": "check_in", "op": "within_next_days", "value": 5000}]}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "object", "object_type": "reservation", "count": -1}]})).is_err());
+        assert!(parse(&json!({"conditions": [{"type": "property", "field": "renews_on", "op": "in_past"}]})).is_ok(), "no value needed");
     }
 
     #[test]

@@ -19,6 +19,12 @@ What the script assumes, and the Guesty page each assumption comes from (read 20
 
 ## Money
 
+**Payment check (reports search).** Once an hour at most, after an incremental pull finishes, the pull pages through `GET /v1/reservations-reports/reservations/search` (Guesty's reservations reports search, the one current endpoint that documents `money.balanceDue` and `money.totalPaid`) for confirmed reservations checking in from yesterday to `payment_check_days` ahead (default 45), 100 a page, at most 10 pages. Each reservation's payment is written to its `reservation` object as evidence taken at that moment (`paid_in_full`, `paid_checked_at`), and only if the reservation hasn't changed since (`only_if_as_of_at_most`), so older evidence never lands on a newer version; a reservation without money in the report is left as it is. This path is built and tested against Guesty's public documentation and fixtures only: it hasn't been run against Guesty itself. Source: [Search Reservations (Reservations Reports)](https://open-api-docs.guesty.com/reference/reservationsreportsopenapicontroller_searchreservations).
+
+
+Pre-arrival flows send only for bookings Guesty reports as **paid in full**: `paid_in_full` is true when the reservation's `money.balanceDue` is 0 and its total (`money.totalPaid` + `money.balanceDue`, or `money.hostPayout`) is above 0, false when something is still due, and missing (unknown) when a message carries no money. Unknown never sends. It's recorded on the `reservation` object and on the Reservation Booked and Reservation Confirmed events, and a change in it makes a new Reservation Confirmed version. Payment is written with the rest of the reservation, by Guesty's own time: an older message never overrides a newer state, and when a newer message without money arrived first, the payment status stays as it was (unknown sends nothing) until Guesty's next message that carries money.
+
+
 The current reservation API and the v2 webhooks carry no totals. Guesty moved pricing to the guest folio (`GET /guest-folio/overview`) and payments to `GET /payments`; see the 5 November 2026 changelog. A booking's value is recorded as `Reservation Total` only when a legacy webhook delivers the reservation's `money`, once per reservation, whether it arrives before or after the messages without a total. **After 1 March 2027 bookings are recorded without a total** until the recipe reads the folio API.
 
 ## Events

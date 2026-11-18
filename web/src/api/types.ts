@@ -5,6 +5,7 @@ import type { PushContent } from "../features/push/types";
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
 import type { BlockOptions, ContentBlock } from "../features/content/types";
 import type { CouponBlock, CouponCondition } from "../features/coupons/types";
+import type { ObjectCondition, ObjectDateTrigger, ObjectTrigger } from "../features/objects/types";
 import type { ReviewCondition, ReviewRequestBlock, ReviewRequestNode, ReviewsBlock } from "../features/reviews/types";
 import type { LanguageCondition } from "../features/translations/types";
 
@@ -144,7 +145,10 @@ export type PropOp =
   | "not_in"
   | "within_last_days"
   | "more_than_days_ago"
-  | "anniversary_within_days";
+  | "anniversary_within_days"
+  | "within_next_days"
+  | "in_future"
+  | "in_past";
 
 export type FieldFilter = { field: string; op: PropOp; value?: unknown };
 
@@ -218,6 +222,7 @@ export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: 
 export type Condition =
   | ProductCondition
   | CouponCondition
+  | ObjectCondition
   | ReviewCondition
   | PropertyCondition
   | EventCondition
@@ -370,7 +375,9 @@ export type FlowTrigger =
   | { type: "list"; list_id: string }
   | { type: "segment"; segment_id: string }
   | { type: "date_property"; field: string; offset_days?: number }
-  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy);
+  | ({ type: "event_date"; metric: string; field: string; offset_days?: number; hour?: number; filters?: FieldFilter[] } & CancelledBy)
+  | ObjectTrigger
+  | ObjectDateTrigger;
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
@@ -385,6 +392,8 @@ export type ConditionNode = {
   condition: SegmentDefinition;
   /** A trigger split: filters on the event that started the run. */
   event_condition?: EventSplit;
+  /** In object flows: rules on the run's object's fields (all must hold too). */
+  object_filters?: FieldFilter[];
   yes: string | null;
   no: string | null;
 };

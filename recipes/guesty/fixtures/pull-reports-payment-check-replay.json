@@ -1,0 +1,99 @@
+{
+  "description": "A replayed payment check page writes no payment evidence: a stored page may be older than the reservations' latest changes",
+  "expect": [
+    {
+      "message": "a replayed payment check page writes no payment evidence (it may be stale)",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "page": 2,
+    "payload": {
+      "pagination": {
+        "hasMore": false,
+        "limit": 100,
+        "skip": 0
+      },
+      "results": [
+        {
+          "checkIn": "2026-12-19T16:00:00",
+          "checkInDate": "2026-12-19",
+          "checkOutDate": "2026-12-23",
+          "confirmationCode": "GY-h5SdcsBL",
+          "guestId": "66f1c4a06100f639de7adab8",
+          "guestNotes": "Door code 5512",
+          "keyCode": "5512",
+          "listingId": "66054019764cbb000f37c450",
+          "money": {
+            "balanceDue": 0,
+            "currency": "USD",
+            "hostPayout": 1210.2,
+            "isFullyPaid": true,
+            "totalPaid": 1312.5
+          },
+          "reservationId": "66f1c4a1246e7d9f0f8da88a",
+          "status": "confirmed"
+        },
+        {
+          "checkInDate": "2026-12-02",
+          "checkOutDate": "2026-12-05",
+          "confirmationCode": "GY-due",
+          "guestId": "67guest",
+          "money": {
+            "balanceDue": 412.5,
+            "currency": "USD",
+            "isFullyPaid": false,
+            "totalPaid": 600
+          },
+          "reservationId": "67a0b1c2d3e4f5a6b7c8d9e0",
+          "status": "confirmed"
+        },
+        {
+          "checkInDate": "2026-12-10",
+          "checkOutDate": "2026-12-12",
+          "confirmationCode": "GY-nomoney",
+          "reservationId": "68nomoney000000000000000",
+          "status": "confirmed"
+        }
+      ]
+    },
+    "replay": true,
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "filter[checkInDate][gte]",
+          "2026-11-16"
+        ],
+        [
+          "filter[checkInDate][lt]",
+          "2027-01-01"
+        ],
+        [
+          "filter[status]",
+          "confirmed"
+        ],
+        [
+          "sort",
+          "_id"
+        ],
+        [
+          "limit",
+          "100"
+        ],
+        [
+          "skip",
+          "0"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/reservations-reports/reservations/search"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-17T10:00:49.000Z",
+      "skip": 0
+    }
+  }
+}

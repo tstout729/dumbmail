@@ -50,6 +50,7 @@ pub fn server_cap() -> i64 {
 }
 const DATE_REFUSED: &str = "date-triggered flows can't be back-populated: people whose date is still ahead will enter on their own when it arrives";
 const METRIC_REFUSED: &str = "metric-triggered flows can't be back-populated: past events don't start flows, only new ones do";
+const OBJECT_REFUSED: &str = "object-triggered flows can't be back-populated: past changes don't start flows, only new ones do";
 
 /// The most people one back-populate may add: `FLOW_BACKFILL_MAX` (default 50,000).
 pub fn max_people() -> i64 {
@@ -131,7 +132,8 @@ async fn rules(state: &AppState, flow: &FlowRow, def: &FlowDef) -> AppResult<Rul
     let trigger = crate::flows::parse_trigger(&flow.trigger)?;
     let segment = match &trigger {
         Trigger::Metric { .. } => return Err(AppError::bad(METRIC_REFUSED)),
-        Trigger::DateProperty { .. } | Trigger::EventDate { .. } => return Err(AppError::bad(DATE_REFUSED)),
+        Trigger::Object { .. } => return Err(AppError::bad(OBJECT_REFUSED)),
+        Trigger::DateProperty { .. } | Trigger::EventDate { .. } | Trigger::ObjectDate { .. } => return Err(AppError::bad(DATE_REFUSED)),
         Trigger::List { .. } => None,
         Trigger::Segment { segment_id } => {
             let raw: Value = sqlx::query_scalar("SELECT definition FROM segments WHERE id = $1 AND account_id = $2")

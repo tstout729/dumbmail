@@ -135,6 +135,8 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
+    ("objects_change", "change_id", "SELECT account_id FROM object_changes WHERE id = $1"),
+    ("objects_bulk", "bulk_id", "SELECT account_id FROM object_bulk_upserts WHERE id = $1"),
     ("flows_plus_backfill", "backfill_id", "SELECT account_id FROM flow_backfills WHERE id = $1"),
     ("flows_plus_confirm_address", "account_id", "SELECT $1::uuid"),
     ("translations_draft", "job_id", "SELECT account_id FROM translation_jobs WHERE id = $1"),

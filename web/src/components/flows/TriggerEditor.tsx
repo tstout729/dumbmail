@@ -2,6 +2,7 @@ import { Plus, X } from "lucide-react";
 import type { FieldFilter, FlowTrigger, List, Segment } from "../../api";
 import { useMetrics } from "../../api";
 import { FilterFields } from "../segments/ConditionBuilder";
+import { ObjectDateTriggerFields, ObjectTriggerFields } from "../../features/objects/ObjectTriggerFields";
 import { Button, Field, IconButton, Input, Select, TagInput } from "../ui";
 
 type Props = { trigger: FlowTrigger; onChange: (t: FlowTrigger) => void; lists: List[]; segments: Segment[]; readOnly?: boolean };
@@ -18,6 +19,10 @@ const defaults = (type: FlowTrigger["type"], lists: List[], segments: Segment[])
       return { type, field: "birthday", offset_days: 0 };
     case "event_date":
       return { type, metric: "", field: "", offset_days: -2, hour: 9 };
+    case "object":
+      return { type, object_type: "", on: "any" };
+    case "object_date":
+      return { type, object_type: "", field: "", offset_days: -2, hour: 9 };
   }
 };
 
@@ -83,6 +88,8 @@ export function TriggerEditor({ trigger, onChange, lists, segments, readOnly }: 
           <option value="segment">Segment: when someone joins a segment</option>
           <option value="date_property">Date: yearly on a profile date (e.g. birthday)</option>
           <option value="event_date">Event date: days before or after a date in an event (e.g. check-in)</option>
+          <option value="object">Object: when an object (e.g. a reservation) is created or changes</option>
+          <option value="object_date">Object date: before or after an object's date (e.g. check-in)</option>
         </Select>
       </Field>
       {trigger.type === "metric" ? (
@@ -156,6 +163,8 @@ export function TriggerEditor({ trigger, onChange, lists, segments, readOnly }: 
           <CancelledByFields keyName={trigger.key} cancelledBy={trigger.cancelled_by} onChange={(k, c) => onChange(withCancel(trigger, k, c))} />
         </>
       ) : null}
+      {trigger.type === "object" ? <ObjectTriggerFields trigger={trigger} onChange={onChange} /> : null}
+      {trigger.type === "object_date" ? <ObjectDateTriggerFields trigger={trigger} onChange={onChange} /> : null}
     </fieldset>
   );
 }

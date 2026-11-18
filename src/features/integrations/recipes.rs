@@ -109,6 +109,12 @@ pub async fn create(state: &AppState, account_id: Uuid, key: &str, name: Option<
         redact: Some(strings(&m["redact"])),
         ..Default::default()
     };
+    // Object types the recipe writes, made up front with their field types (an account that already
+    // has one with the same key keeps its own).
+    for t in m["object_types"].as_array().into_iter().flatten() {
+        let input: crate::features::objects::types::TypeInput = serde_json::from_value(t.clone()).map_err(|e| AppError::bad(format!("recipe object type: {e}")))?;
+        crate::features::objects::types::create_if_missing(&state.db, account_id, input).await?;
+    }
     let integ = model::create(state, account_id, Some(key), changes).await?;
     let purchases = metric_names(&m["metrics"], true);
     if !purchases.is_empty() {
@@ -152,6 +158,10 @@ mod tests {
             }
             if !m["pull"].is_null() {
                 super::super::pull::PullConfig::parse(&m["pull"]).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
+            }
+            for t in m["object_types"].as_array().into_iter().flatten() {
+                let t: crate::features::objects::types::TypeInput = serde_json::from_value(t.clone()).unwrap_or_else(|e| panic!("{} object type: {e}", r.key));
+                crate::features::objects::types::check_fields(t.fields.as_deref().unwrap_or_default(), t.title_field.as_deref()).unwrap_or_else(|e| panic!("{}: {}", r.key, e.public_message()));
             }
             for f in m["flows"].as_array().into_iter().flatten() {
                 crate::flows::parse_trigger(&f["trigger"]).unwrap_or_else(|e| panic!("{} flow {}: {}", r.key, f["name"], e.public_message()));
