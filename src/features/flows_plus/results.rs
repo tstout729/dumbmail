@@ -60,7 +60,8 @@ pub fn results_sql() -> String {
          notes AS (
             SELECT n.node_id, count(*) FILTER (WHERE n.status = 'sent')::bigint AS sent,
                    count(*) FILTER (WHERE n.status = 'skipped')::bigint AS skipped,
-                   count(*) FILTER (WHERE n.status IN ('failed', 'unknown'))::bigint AS failed
+                   count(*) FILTER (WHERE n.status = 'failed')::bigint AS failed,
+                   count(*) FILTER (WHERE n.status = 'unconfirmed')::bigint AS unconfirmed
             FROM flow_notifications n
             WHERE n.flow_id = $2 AND n.account_id = $1 AND n.created_at >= $3 AND n.created_at < $4
             GROUP BY 1)
@@ -123,7 +124,7 @@ pub async fn results(state: &AppState, account_id: Uuid, flow_id: Uuid, range: R
         if n.kind == "notify" {
             let x = notes.as_array().and_then(|a| a.iter().find(|m| m["node_id"] == n.id.as_str())).cloned().unwrap_or(json!({}));
             let g = |k: &str| x.get(k).and_then(Value::as_i64).unwrap_or(0);
-            s["notifications"] = json!({"sent": g("sent"), "skipped": g("skipped"), "failed": g("failed")});
+            s["notifications"] = json!({"sent": g("sent"), "skipped": g("skipped"), "failed": g("failed"), "unconfirmed": g("unconfirmed")});
         }
         steps.push(s);
     }
@@ -197,14 +198,27 @@ pub async fn remove(state: &AppState, ctx: &Ctx, flow_id: Uuid, b: RemoveBody) -
             .await?;
         return Ok(json!({"dry_run": true, "would_remove": n, "confirm": "Call again with confirm: true to take them out of the flow."}));
     }
+    // A run whose current step is sending right now is left alone (the send claimed it first);
+    // it's reported back so it can be removed once the step is done.
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE flow_runs SET status = 'exited', finished_at = now(), current_node = NULL WHERE id = ANY($1) AND flow_id = $2 AND account_id = $3 AND status = 'active' RETURNING id",
+        "UPDATE flow_runs SET status = 'exited', finished_at = now(), current_node = NULL
+         WHERE id = ANY($1) AND flow_id = $2 AND account_id = $3 AND status = 'active' AND (sending_until IS NULL OR sending_until < now())
+         RETURNING id",
     )
     .bind(&b.run_ids)
     .bind(flow.id)
     .bind(ctx.account_id)
     .fetch_all(&state.db)
     .await?;
+    let busy: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM flow_runs WHERE id = ANY($1) AND flow_id = $2 AND account_id = $3 AND status = 'active'")
+        .bind(&b.run_ids)
+        .bind(flow.id)
+        .bind(ctx.account_id)
+        .fetch_all(&state.db)
+        .await?;
     crate::features::team::audit(state, ctx, "flow.remove_people", Some(&flow.id.to_string()), json!({"flow": flow.name, "removed": ids.len()})).await;
-    Ok(json!({"removed": ids.len(), "run_ids": ids}))
+    Ok(json!({
+        "removed": ids.len(), "run_ids": ids, "sending_now": busy,
+        "note": if busy.is_empty() { "" } else { "Some people were being sent a message by this flow at that moment and weren't removed; try again in a minute." },
+    }))
 }

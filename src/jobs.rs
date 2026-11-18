@@ -90,6 +90,9 @@ pub async fn run_one_in(state: &AppState, lane: &str) -> anyhow::Result<bool> {
 }
 
 async fn on_dead(state: &AppState, kind: &str, payload: &Value, msg: &str) {
+    if kind == crate::features::flows_plus::backfill::JOB {
+        crate::features::flows_plus::backfill::job_dead(state, payload).await;
+    }
     if kind == "campaign_send" {
         if let Some(id) = payload["campaign_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) {
             let _ = sqlx::query("UPDATE campaigns SET status = 'failed', error = $2 WHERE id = $1")

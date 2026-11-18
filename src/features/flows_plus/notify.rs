@@ -2,16 +2,19 @@
 //!
 //! A `notify` step emails up to five addresses: fixed ones (`to`) and/or the address in one of the
 //! person's profile properties (`to_property`). Only the account's team members' addresses and
-//! addresses that clicked a confirmation link get anything; the first time an outside address is
-//! saved in a flow it is sent that link. A notification is a service message from the account's
-//! sender: no unsubscribe footer, a plain line saying who set it up, billed like any email, held to
-//! the sending rate and the account's pause, and capped per flow per local day (`notify_daily_cap`
-//! in the flow's settings, default 200, at most 2,000). Runs started by an event from the website
-//! script get no notification unless the step sets `allow_browser_events`.
+//! outside addresses that confirmed get anything. Saving a flow only records an outside address as
+//! unconfirmed; the confirmation link goes out only when someone who can change account settings
+//! asks for it (and never while sending is paused). A notification is a service message from the
+//! account's sender: no unsubscribe footer, a plain line saying who set it up, billed like any email,
+//! counted in the account's daily allowance, held to the sending rate and the account's pause, and
+//! capped per flow per local day (`notify_daily_cap`, default 200, at most 2,000). Runs started by an
+//! event from the website script get no notification unless the step sets `allow_browser_events`. A
+//! hard bounce or complaint from a notification address blocks it (an Admin can clear a bounce).
 //!
-//! Exactly once: each (run, step, address) is claimed in `flow_notifications` before the provider
-//! call, together with the day's count. A claim cut off before its result is recorded becomes
-//! `unknown` and is never sent again.
+//! Exactly once: the first time the step runs for a run, its recipients and rendered message are
+//! stored (`pending`), with the day's count; a retry uses that list. Each send is marked `handing`
+//! just before the provider call: a crash before that leaves it `pending` and it's sent on the retry;
+//! a crash after it makes it `unconfirmed` (never sent again, billed since it may have gone out).
 
 use std::collections::HashSet;
 
@@ -31,6 +34,8 @@ pub const DEFAULT_DAILY_CAP: i64 = 200;
 pub const MAX_DAILY_CAP: i64 = 2_000;
 /// Outside addresses an account may have waiting for confirmation at once.
 pub const MAX_PENDING: i64 = 20;
+/// Confirmation emails an account may send in 24 hours (and each address gets at most one a day).
+pub const MAX_CONFIRMATIONS_PER_DAY: i64 = 50;
 const SUBJECT_MAX: usize = 200;
 const BODY_MAX: usize = 5_000;
 /// How long a confirmation link works.
@@ -134,97 +139,120 @@ pub async fn team_addresses(db: &PgPool, account_id: Uuid, emails: &[String]) ->
 
 /// SQL (binds: $1 account, $2 address): the address may receive notifications now.
 const ALLOWED: &str = "(EXISTS (SELECT 1 FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.account_id = $1 AND lower(u.email) = $2)
-     OR EXISTS (SELECT 1 FROM flow_notify_addresses a WHERE a.account_id = $1 AND a.email = $2 AND a.confirmed_at IS NOT NULL))";
+     OR EXISTS (SELECT 1 FROM flow_notify_addresses a WHERE a.account_id = $1 AND a.email = $2 AND a.confirmed_at IS NOT NULL AND a.removed_at IS NULL))";
 
-/// SQL (binds: $1 account, $2 address): mail to this address bounced hard or drew a complaint.
+/// SQL (binds: $1 account, $2 address): mail to this address bounced hard or drew a complaint
+/// (as a profile, a message, or a notification).
 const BAD_ADDRESS: &str = "(EXISTS (SELECT 1 FROM profiles WHERE account_id = $1 AND email = $2 AND email_suppressed_reason IS NOT NULL)
-     OR EXISTS (SELECT 1 FROM messages WHERE account_id = $1 AND to_address = $2 AND (status = 'complained' OR (status = 'bounced' AND bounce_type = 'Permanent'))))";
+     OR EXISTS (SELECT 1 FROM messages WHERE account_id = $1 AND to_address = $2 AND (status = 'complained' OR (status = 'bounced' AND bounce_type = 'Permanent')))
+     OR EXISTS (SELECT 1 FROM flow_notify_addresses WHERE account_id = $1 AND email = $2 AND blocked_reason IS NOT NULL))";
 
-/// Confirmation emails an account may send in 24 hours.
-pub const MAX_CONFIRMATIONS_PER_DAY: i64 = 50;
-
-/// Ask outside addresses to confirm (team members' addresses need nothing). An address never seen
-/// gets a confirmation email; `ask_again` (someone added the address by hand) sends another to one
-/// still waiting or removed earlier. Each address gets at most one an hour and each account at most
-/// [`MAX_CONFIRMATIONS_PER_DAY`] a day; addresses that bounced or complained, and accounts whose
-/// sending is paused, get none. Returns each address's status: team, confirmed, pending (a link was
-/// sent), waiting (one was sent within the hour, or it was removed and saving a flow doesn't ask
-/// again) or unreachable.
-pub async fn request_confirmations(state: &AppState, account_id: Uuid, emails: &[String], ask_again: bool) -> AppResult<Vec<(String, &'static str)>> {
+/// Record outside addresses as unconfirmed (no email is sent; see [`send_confirmation_request`]).
+/// Returns each address's status.
+pub async fn record_addresses(state: &AppState, account_id: Uuid, emails: &[String]) -> AppResult<Vec<Value>> {
     let emails: Vec<String> = emails.iter().filter_map(|e| normalize_email(e)).collect::<HashSet<_>>().into_iter().collect();
     let team = team_addresses(&state.db, account_id, &emails).await?;
-    let mut out = Vec::new();
-    for e in emails {
-        if team.contains(&e) {
-            out.push((e, "team"));
-            continue;
-        }
+    let outside: Vec<String> = emails.iter().filter(|e| !team.contains(*e)).cloned().collect();
+    if !outside.is_empty() {
         let mut tx = state.db.begin().await?;
-        // One at a time per account, so the limits below hold.
-        let paused: bool = sqlx::query_scalar("SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).fetch_one(&mut *tx).await?;
-        type Known = (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>);
-        let existing: Option<Known> =
-            sqlx::query_as("SELECT confirmed_at, removed_at FROM flow_notify_addresses WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).fetch_optional(&mut *tx).await?;
-        if let Some((Some(_), None)) = existing {
-            out.push((e, "confirmed"));
-            continue;
+        // One at a time per account, so the limit on waiting addresses holds.
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+        let new: i64 = sqlx::query_scalar("SELECT count(*) FROM unnest($2::text[]) e WHERE NOT EXISTS (SELECT 1 FROM flow_notify_addresses a WHERE a.account_id = $1 AND a.email = e)")
+            .bind(account_id)
+            .bind(&outside)
+            .fetch_one(&mut *tx)
+            .await?;
+        let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_addresses WHERE account_id = $1 AND confirmed_at IS NULL AND removed_at IS NULL AND blocked_reason IS NULL")
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if new > 0 && pending + new > MAX_PENDING {
+            return Err(AppError::LimitReached(format!("at most {MAX_PENDING} outside addresses can wait to confirm; remove some first")));
         }
-        let bad: bool = sqlx::query_scalar(&format!("SELECT {BAD_ADDRESS}")).bind(account_id).bind(&e).fetch_one(&mut *tx).await?;
-        if bad {
-            out.push((e, "unreachable"));
-            continue;
-        }
-        match existing {
-            None => {
-                let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_addresses WHERE account_id = $1 AND confirmed_at IS NULL AND removed_at IS NULL")
-                    .bind(account_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                if pending >= MAX_PENDING {
-                    return Err(AppError::LimitReached(format!("{MAX_PENDING} addresses are already waiting to confirm; remove some before adding more")));
-                }
-                sqlx::query("INSERT INTO flow_notify_addresses (account_id, email) VALUES ($1, $2)").bind(account_id).bind(&e).execute(&mut *tx).await?;
-            }
-            Some((_, removed)) => {
-                if !ask_again {
-                    tx.commit().await?;
-                    out.push((e, "waiting"));
-                    continue;
-                }
-                if removed.is_some() {
-                    sqlx::query("UPDATE flow_notify_addresses SET removed_at = NULL, confirmed_at = NULL, requested_at = now() WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).execute(&mut *tx).await?;
-                }
-            }
-        }
-        let (this_hour, today): (i64, i64) = sqlx::query_as(
-            "SELECT count(*) FILTER (WHERE email = $2 AND sent_at > now() - interval '1 hour'), count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'",
-        )
-        .bind(account_id)
-        .bind(&e)
-        .fetch_one(&mut *tx)
-        .await?;
-        let status = if paused || this_hour > 0 {
-            "waiting"
-        } else if today >= MAX_CONFIRMATIONS_PER_DAY {
-            tx.commit().await?;
-            return Err(AppError::LimitReached(format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow")));
-        } else {
-            sqlx::query("INSERT INTO flow_notify_confirm_sends (account_id, email) VALUES ($1, $2)").bind(account_id).bind(&e).execute(&mut *tx).await?;
-            crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
-            "pending"
-        };
+        sqlx::query("INSERT INTO flow_notify_addresses (account_id, email) SELECT $1, e FROM unnest($2::text[]) e ON CONFLICT DO NOTHING").bind(account_id).bind(&outside).execute(&mut *tx).await?;
         tx.commit().await?;
-        out.push((e, status));
     }
-    Ok(out)
+    statuses(&state.db, account_id, &emails).await
+}
+
+/// Ask an outside address to confirm: without `confirm`, says whether a link would go out. Refused
+/// while the account's sending is paused, for team members (they need none), for confirmed,
+/// bounced or complaining addresses; one per address per day (across all accounts) and
+/// [`MAX_CONFIRMATIONS_PER_DAY`] per account, enforced in the insert that records it.
+pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email: &str, confirm: bool) -> AppResult<Value> {
+    let e = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
+    if !team_addresses(&state.db, account_id, std::slice::from_ref(&e)).await?.is_empty() {
+        return Err(AppError::bad("team members' addresses get notifications without confirming"));
+    }
+    let (paused, bad, confirmed): (bool, bool, bool) = sqlx::query_as(&format!(
+        "SELECT COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true), {BAD_ADDRESS},
+                EXISTS (SELECT 1 FROM flow_notify_addresses WHERE account_id = $1 AND email = $2 AND confirmed_at IS NOT NULL AND removed_at IS NULL)"
+    ))
+    .bind(account_id)
+    .bind(&e)
+    .fetch_one(&state.db)
+    .await?;
+    if paused {
+        return Err(AppError::Conflict("sending is paused for this account, so no confirmation email can go out".into()));
+    }
+    if bad {
+        return Err(AppError::bad(format!("mail to {e} bounced or drew a complaint, so it can't be asked")));
+    }
+    if confirmed {
+        return Err(AppError::bad(format!("{e} already confirmed")));
+    }
+    if !confirm {
+        return Ok(json!({"dry_run": true, "email": e, "confirm": "Call again with confirm: true to email this address a link to confirm."}));
+    }
+    record_addresses(state, account_id, std::slice::from_ref(&e)).await?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    // One per address a day across all accounts: serialize on the address.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 11))").bind(&e).execute(&mut *tx).await?;
+    let sent: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO flow_notify_confirm_sends (account_id, email) SELECT $1, $2
+         WHERE NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours')
+           AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours') < $3
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(&e)
+    .bind(MAX_CONFIRMATIONS_PER_DAY)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if sent.is_none() {
+        let address_today: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE email = $1 AND sent_at > now() - interval '24 hours')")
+            .bind(&e)
+            .fetch_one(&mut *tx)
+            .await?;
+        return Err(AppError::LimitReached(if address_today {
+            format!("{e} was sent a confirmation link in the last 24 hours; try again tomorrow")
+        } else {
+            format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow")
+        }));
+    }
+    sqlx::query("UPDATE flow_notify_addresses SET requested_at = now(), removed_at = NULL WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).execute(&mut *tx).await?;
+    crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
+    tx.commit().await?;
+    Ok(json!({"email": e, "status": "pending", "sent": true}))
 }
 
 /// Job: send an outside address its confirmation link (a fresh one; earlier links stop working).
+/// Pause and suppression are checked again right before it's handed over.
 pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let (Some(account_id), Some(email)) = (payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()), payload["email"].as_str()) else { return Ok(()) };
+    let (paused, bad): (bool, bool) = sqlx::query_as(&format!("SELECT COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true), {BAD_ADDRESS}"))
+        .bind(account_id)
+        .bind(email)
+        .fetch_one(&state.db)
+        .await?;
+    if paused || bad {
+        tracing::info!(account = %account_id, "confirmation email not sent: sending paused or the address bounced");
+        return Ok(());
+    }
     let token = crate::auth::random_token(32);
     let updated: Option<String> = sqlx::query_scalar(
-        "UPDATE flow_notify_addresses SET token_hash = $3, requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND removed_at IS NULL RETURNING email",
+        "UPDATE flow_notify_addresses SET token_hash = $3, requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND removed_at IS NULL AND blocked_reason IS NULL RETURNING email",
     )
     .bind(account_id)
     .bind(email)
@@ -268,45 +296,61 @@ pub async fn confirm(db: &PgPool, token: &str) -> sqlx::Result<Option<(String, S
     .await
 }
 
+fn row_status(confirmed: bool, removed: bool, blocked: Option<&str>) -> &'static str {
+    match (blocked, removed, confirmed) {
+        (Some("complaint"), ..) => "complained",
+        (Some(_), ..) => "bounced",
+        (None, true, _) => "removed",
+        (None, false, true) => "confirmed",
+        (None, false, false) => "unconfirmed",
+    }
+}
+
 pub async fn list_addresses(db: &PgPool, account_id: Uuid) -> AppResult<Vec<Value>> {
-    let rows: Vec<(String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> =
-        sqlx::query_as("SELECT email, confirmed_at, requested_at FROM flow_notify_addresses WHERE account_id = $1 AND removed_at IS NULL ORDER BY email LIMIT 500").bind(account_id).fetch_all(db).await?;
+    type R = (String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>, Option<String>, Option<chrono::DateTime<Utc>>);
+    let rows: Vec<R> = sqlx::query_as(
+        "SELECT email, confirmed_at, requested_at, blocked_reason, blocked_at FROM flow_notify_addresses WHERE account_id = $1 AND (removed_at IS NULL OR blocked_reason IS NOT NULL) ORDER BY email LIMIT 500",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
     Ok(rows
         .into_iter()
-        .map(|(email, confirmed_at, requested_at)| json!({"email": email, "status": if confirmed_at.is_some() { "confirmed" } else { "pending" }, "confirmed_at": confirmed_at, "requested_at": requested_at}))
+        .map(|(email, confirmed_at, requested_at, blocked, blocked_at)| {
+            json!({"email": email, "status": row_status(confirmed_at.is_some(), false, blocked.as_deref()), "confirmed_at": confirmed_at, "requested_at": requested_at, "blocked_reason": blocked, "blocked_at": blocked_at})
+        })
         .collect())
 }
 
-/// The status of each address for notifications: team, confirmed, pending, removed or new (never asked).
+/// The status of each address for notifications: team, confirmed, unconfirmed, removed, bounced,
+/// complained or new (never recorded). A team member's address can be bounced or complained too.
 pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppResult<Vec<Value>> {
     let emails: Vec<String> = emails.iter().filter_map(|e| normalize_email(e)).take(50).collect();
     let team = team_addresses(db, account_id, &emails).await?;
-    let known: Vec<(String, bool, bool)> = sqlx::query_as("SELECT email, confirmed_at IS NOT NULL, removed_at IS NOT NULL FROM flow_notify_addresses WHERE account_id = $1 AND email = ANY($2)")
-        .bind(account_id)
-        .bind(&emails)
-        .fetch_all(db)
-        .await?;
+    let known: Vec<(String, bool, bool, Option<String>)> =
+        sqlx::query_as("SELECT email, confirmed_at IS NOT NULL, removed_at IS NOT NULL, blocked_reason FROM flow_notify_addresses WHERE account_id = $1 AND email = ANY($2)")
+            .bind(account_id)
+            .bind(&emails)
+            .fetch_all(db)
+            .await?;
     Ok(emails
         .iter()
         .map(|e| {
-            let status = if team.contains(e) {
-                "team"
-            } else {
-                match known.iter().find(|k| &k.0 == e) {
-                    Some((_, _, true)) => "removed",
-                    Some((_, true, _)) => "confirmed",
-                    Some((_, false, _)) => "pending",
-                    None => "new",
-                }
+            let k = known.iter().find(|k| &k.0 == e);
+            let status = match (k, team.contains(e)) {
+                (Some((_, _, _, Some(b))), _) => row_status(false, false, Some(b)),
+                (_, true) => "team",
+                (Some((_, c, r, None)), false) => row_status(*c, *r, None),
+                (None, false) => "new",
             };
-            json!({"email": e, "status": status})
+            json!({"email": e, "status": status, "blocked_reason": k.and_then(|k| k.3.clone())})
         })
         .collect())
 }
 
 pub async fn remove_address(db: &PgPool, account_id: Uuid, email: &str) -> AppResult<bool> {
     let email = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
-    // Kept as removed, so adding it again is held to the same limits as asking again.
+    // Kept as removed (with any bounce or complaint), so adding it again starts unconfirmed.
     Ok(sqlx::query("UPDATE flow_notify_addresses SET removed_at = now(), confirmed_at = NULL, token_hash = NULL WHERE account_id = $1 AND email = $2 AND removed_at IS NULL")
         .bind(account_id)
         .bind(&email)
@@ -316,8 +360,44 @@ pub async fn remove_address(db: &PgPool, account_id: Uuid, email: &str) -> AppRe
         > 0)
 }
 
-/// When a flow is saved: outside fixed addresses in its notification steps that were never asked
-/// get a confirmation link.
+/// Clear a hard bounce after the address was fixed. Complaints can't be cleared.
+pub async fn clear_bounce(db: &PgPool, account_id: Uuid, email: &str) -> AppResult<bool> {
+    let email = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
+    let reason: Option<Option<String>> = sqlx::query_scalar("SELECT blocked_reason FROM flow_notify_addresses WHERE account_id = $1 AND email = $2").bind(account_id).bind(&email).fetch_optional(db).await?;
+    match reason.flatten().as_deref() {
+        Some("complaint") => Err(AppError::bad(format!("{email} marked a notification as spam; that can't be cleared"))),
+        Some(_) => Ok(sqlx::query("UPDATE flow_notify_addresses SET blocked_reason = NULL, blocked_at = NULL WHERE account_id = $1 AND email = $2 AND blocked_reason = 'hard_bounce'")
+            .bind(account_id)
+            .bind(&email)
+            .execute(db)
+            .await?
+            .rows_affected()
+            > 0),
+        None => Ok(false),
+    }
+}
+
+/// The email provider reported a hard bounce or a complaint for message `provider_message_id`.
+/// If it was a notification, block its address for that account. Returns whether it was one.
+pub async fn provider_strike(db: &PgPool, provider_message_id: &str, complaint: bool) -> sqlx::Result<bool> {
+    let row: Option<(Uuid, String)> = sqlx::query_as("SELECT account_id, to_email FROM flow_notifications WHERE provider_message_id = $1 LIMIT 1").bind(provider_message_id).fetch_optional(db).await?;
+    let Some((account_id, email)) = row else { return Ok(false) };
+    let reason = if complaint { "complaint" } else { "hard_bounce" };
+    // A complaint is never downgraded to a bounce.
+    sqlx::query(
+        "INSERT INTO flow_notify_addresses (account_id, email, blocked_reason, blocked_at, removed_at) VALUES ($1, $2, $3, now(), now())
+         ON CONFLICT (account_id, email) DO UPDATE SET blocked_reason = CASE WHEN flow_notify_addresses.blocked_reason = 'complaint' THEN 'complaint' ELSE EXCLUDED.blocked_reason END, blocked_at = now()",
+    )
+    .bind(account_id)
+    .bind(&email)
+    .bind(reason)
+    .execute(db)
+    .await?;
+    Ok(true)
+}
+
+/// When a flow is saved: outside fixed addresses in its notification steps are recorded as
+/// unconfirmed. Nothing is emailed.
 pub async fn on_save(state: &AppState, account_id: Uuid, def: &crate::flows::FlowDef) -> AppResult<()> {
     let mut emails = Vec::new();
     for n in def.nodes.iter().filter(|n| n.kind == "notify") {
@@ -326,7 +406,7 @@ pub async fn on_save(state: &AppState, account_id: Uuid, def: &crate::flows::Flo
     if emails.is_empty() {
         return Ok(());
     }
-    request_confirmations(state, account_id, &emails, false).await.map(|_| ())
+    record_addresses(state, account_id, &emails).await.map(|_| ())
 }
 
 // ---------- Sending ----------
@@ -335,35 +415,49 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Skip a recipient, unless this (run, step, address) was already handled.
-async fn skip(db: &PgPool, account_id: Uuid, flow_id: Uuid, run_id: Uuid, node_id: &str, to: &str, why: &str) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO flow_notifications (id, account_id, flow_id, run_id, node_id, to_email, status, error) VALUES ($1, $2, $3, $4, $5, $6, 'skipped', $7)
-         ON CONFLICT (run_id, node_id, to_email) DO NOTHING",
-    )
-    .bind(Uuid::now_v7())
-    .bind(account_id)
-    .bind(flow_id)
-    .bind(run_id)
-    .bind(node_id)
-    .bind(to)
-    .bind(why)
-    .execute(db)
-    .await?;
-    Ok(())
+/// A stored recipient of a step for a run.
+#[derive(sqlx::FromRow)]
+struct Row {
+    id: Uuid,
+    to_email: String,
+    status: String,
+    subject: Option<String>,
+    body: Option<String>,
 }
 
-async fn settle(db: &PgPool, id: Uuid, status: &str, why: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE flow_notifications SET status = $2, error = $3 WHERE id = $1 AND status = 'sending'").bind(id).bind(status).bind(why).execute(db).await?;
+async fn stored(db: &PgPool, run_id: Uuid, node_id: &str) -> sqlx::Result<Vec<Row>> {
+    sqlx::query_as("SELECT id, to_email, status, subject, body FROM flow_notifications WHERE run_id = $1 AND node_id = $2 ORDER BY to_email").bind(run_id).bind(node_id).fetch_all(db).await
+}
+
+async fn settle(db: &PgPool, id: Uuid, from: &str, status: &str, why: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE flow_notifications SET status = $3, error = $4 WHERE id = $1 AND status = $2").bind(id).bind(from).bind(status).bind(why).execute(db).await?;
     Ok(())
 }
 
 /// Run a notification step for one person. Never stops the flow: problems are recorded per
-/// recipient. Database errors are returned (the job retries, and claims keep it from sending twice).
+/// recipient. `Some(t)`: the account's daily allowance (or the provider) says wait until `t`; the
+/// run waits there and the retry sends what's still pending. Database errors are returned (the job
+/// retries with the stored list).
 #[allow(clippy::too_many_arguments)]
-pub async fn run(state: &AppState, account: &Account, flow: &FlowRow, person: &Profile, run_id: Uuid, node_id: &str, node: &Node, context: &Value) -> anyhow::Result<()> {
-    let Ok(step) = read(node) else { return Ok(()) };
+pub async fn run(state: &AppState, account: &Account, flow: &FlowRow, person: &Profile, run_id: Uuid, node_id: &str, node: &Node, context: &Value) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
     let db = &state.db;
+    let mut rows = stored(db, run_id, node_id).await?;
+    if rows.is_empty() {
+        let Ok(step) = read(node) else { return Ok(None) };
+        record_recipients(state, account, flow, person, run_id, node_id, &step, context).await?;
+        rows = stored(db, run_id, node_id).await?;
+    }
+    for r in rows.iter().filter(|r| r.status == "pending") {
+        if let Some(until) = send_one(state, account, flow, r).await? {
+            return Ok(Some(until));
+        }
+    }
+    Ok(None)
+}
+
+/// Fix who this step emails for this run, and what it says, in one transaction with the day's count.
+#[allow(clippy::too_many_arguments)]
+async fn record_recipients(state: &AppState, account: &Account, flow: &FlowRow, person: &Profile, run_id: Uuid, node_id: &str, step: &Step, context: &Value) -> anyhow::Result<()> {
     let mut to: Vec<String> = Vec::new();
     for e in step.to.iter().cloned().chain(step.to_property.as_ref().and_then(|k| person.properties.get(k)).and_then(Value::as_str).and_then(normalize_email)) {
         if !to.contains(&e) && to.len() < MAX_RECIPIENTS {
@@ -372,32 +466,62 @@ pub async fn run(state: &AppState, account: &Account, flow: &FlowRow, person: &P
     }
     // Unknown counts as from a browser, as everywhere in flows.
     let from_browser = context.get("event").is_some_and(|e| e.get("from_browser").and_then(Value::as_bool) != Some(false));
-    if from_browser && !step.allow_browser_events {
-        for e in &to {
-            skip(db, account.id, flow.id, run_id, node_id, e, "started by a website event").await?;
-        }
-        return Ok(());
-    }
     let ctx = crate::render::context(account, Some(person), context.get("event"), "");
     let rendered = crate::render::render_str(&step.subject, &ctx, false).and_then(|s| Ok((s, crate::render::render_str(&step.body, &ctx, false)?)));
-    let Ok((subject, body)) = rendered else {
-        for e in &to {
-            skip(db, account.id, flow.id, run_id, node_id, e, "template error").await?;
-        }
-        return Ok(());
+    let skip = if from_browser && !step.allow_browser_events {
+        Some("started by a website event")
+    } else if rendered.is_err() {
+        Some("template error")
+    } else {
+        None
     };
-    let subject = crate::features::team::mail::plain(&subject, SUBJECT_MAX);
+    let (subject, body) = rendered.map(|(s, b)| (crate::features::team::mail::plain(&s, SUBJECT_MAX), b)).unwrap_or_default();
     let cap = daily_cap(&flow.definition);
+    let day = Utc::now().with_timezone(&crate::sending::account_tz(account)).date_naive();
+    let mut tx = state.db.begin().await?;
     for e in &to {
-        send_one(state, account, flow, run_id, node_id, e, &subject, &body, cap).await?;
+        let status = if skip.is_some() { "skipped" } else { "pending" };
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO flow_notifications (id, account_id, flow_id, run_id, node_id, to_email, status, error, subject, body) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (run_id, node_id, to_email) DO NOTHING RETURNING id",
+        )
+        .bind(Uuid::now_v7())
+        .bind(account.id)
+        .bind(flow.id)
+        .bind(run_id)
+        .bind(node_id)
+        .bind(e)
+        .bind(status)
+        .bind(skip)
+        .bind(&subject)
+        .bind(&body)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = id else { continue };
+        if status != "pending" {
+            continue;
+        }
+        let counted: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO flow_notify_usage (flow_id, day, sent) VALUES ($1, $2, 1)
+             ON CONFLICT (flow_id, day) DO UPDATE SET sent = flow_notify_usage.sent + 1 WHERE flow_notify_usage.sent < $3 RETURNING sent",
+        )
+        .bind(flow.id)
+        .bind(day)
+        .bind(cap as i32)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if counted.is_none() {
+            sqlx::query("UPDATE flow_notifications SET status = 'skipped', error = 'daily limit reached' WHERE id = $1").bind(id).execute(&mut *tx).await?;
+        }
     }
+    tx.commit().await?;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, run_id: Uuid, node_id: &str, to: &str, subject: &str, body: &str, cap: i64) -> anyhow::Result<()> {
+/// Send one stored, pending notification. `Some(t)`: wait until `t` and try again (it stays pending).
+async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, r: &Row) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
     let db = &state.db;
-    let (allowed, bad): (bool, bool) = sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}")).bind(account.id).bind(to).fetch_one(db).await?;
+    let (allowed, bad): (bool, bool) = sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}")).bind(account.id).bind(&r.to_email).fetch_one(db).await?;
     let from_email = account.from_email.clone().filter(|s| !s.trim().is_empty());
     let why = if !allowed {
         Some("address not confirmed")
@@ -413,57 +537,36 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, run_id: U
         None
     };
     if let Some(why) = why {
-        return Ok(skip(db, account.id, flow.id, run_id, node_id, to, why).await?);
+        settle(db, r.id, "pending", "skipped", why).await?;
+        return Ok(None);
     }
     let price = crate::billing::quote(state, account.id, "email", 1, false, false).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     if price > 0 && crate::billing::balance(db, account.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? < price {
-        return Ok(skip(db, account.id, flow.id, run_id, node_id, to, "insufficient credit").await?);
+        settle(db, r.id, "pending", "skipped", "insufficient credit").await?;
+        return Ok(None);
     }
-    // The claim and the day's count, together: a retry finds the claim and sends nothing.
-    let id = Uuid::now_v7();
-    let day = Utc::now().with_timezone(&crate::sending::account_tz(account)).date_naive();
-    let mut tx = db.begin().await?;
-    let claimed: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO flow_notifications (id, account_id, flow_id, run_id, node_id, to_email, status, subject) VALUES ($1, $2, $3, $4, $5, $6, 'sending', $7)
-         ON CONFLICT (run_id, node_id, to_email) DO NOTHING RETURNING id",
-    )
-    .bind(id)
-    .bind(account.id)
-    .bind(flow.id)
-    .bind(run_id)
-    .bind(node_id)
-    .bind(to)
-    .bind(subject)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if claimed.is_none() {
-        tx.rollback().await?;
-        return Ok(());
+    // The account's daily allowance (warm-up), like any email: past it, the step waits.
+    if let Err(until) = crate::deliverability::take_daily_slot(state, account.id).await? {
+        return Ok(Some(until));
     }
-    let counted: Option<i32> = sqlx::query_scalar(
-        "INSERT INTO flow_notify_usage (flow_id, day, sent) VALUES ($1, $2, 1)
-         ON CONFLICT (flow_id, day) DO UPDATE SET sent = flow_notify_usage.sent + 1 WHERE flow_notify_usage.sent < $3 RETURNING sent",
-    )
-    .bind(flow.id)
-    .bind(day)
-    .bind(cap as i32)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if counted.is_none() {
-        sqlx::query("UPDATE flow_notifications SET status = 'skipped', error = 'daily limit reached' WHERE id = $1").bind(id).execute(&mut *tx).await?;
-        tx.commit().await?;
-        return Ok(());
-    }
-    tx.commit().await?;
-
     crate::sending::throttle_email(state).await;
     // A pause, a removed member or address, or a bounce can land while waiting for a slot.
     let (allowed, bad, paused): (bool, bool, bool) =
-        sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}, COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true)")).bind(account.id).bind(to).fetch_one(db).await?;
-    if !allowed || bad || paused {
-        settle(db, id, "skipped", if paused { "sending paused" } else if bad { "address bounced or complained" } else { "address not confirmed" }).await?;
-        return Ok(());
+        sqlx::query_as(&format!("SELECT {ALLOWED}, {BAD_ADDRESS}, COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true)")).bind(account.id).bind(&r.to_email).fetch_one(db).await?;
+    let stop = if paused { Some("sending paused") } else if bad { Some("address bounced or complained") } else if !allowed { Some("address not confirmed") } else { None };
+    if let Some(why) = stop {
+        crate::deliverability::return_daily_slot(state, account.id);
+        settle(db, r.id, "pending", "skipped", why).await?;
+        return Ok(None);
     }
+    // Recorded as handed over before the call: a crash after this never sends it again.
+    let handing: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'handing', handed_at = now() WHERE id = $1 AND status = 'pending' RETURNING id").bind(r.id).fetch_optional(db).await?;
+    if handing.is_none() {
+        crate::deliverability::return_daily_slot(state, account.id);
+        return Ok(None);
+    }
+    let subject = r.subject.clone().unwrap_or_default();
+    let body = r.body.clone().unwrap_or_default();
     let footer = format!("You get this because {} set up a notification in a DumbMail flow ({}).", crate::features::team::mail::plain(&account.name, 80), crate::features::team::mail::plain(&flow.name, 80));
     let paras: String = body.split("\n\n").map(|p| format!("<p style=\"margin:0 0 14px\">{}</p>", esc(p.trim()).replace('\n', "<br>"))).collect();
     let html = format!(
@@ -471,12 +574,12 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, run_id: U
         esc(&footer)
     );
     let email = OutgoingEmail {
-        message_id: id,
-        to: to.to_string(),
+        message_id: r.id,
+        to: r.to_email.clone(),
         from_name: account.from_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| account.name.clone()),
         from_email: from_email.unwrap_or_default(),
         reply_to: account.reply_to.clone().filter(|s| !s.is_empty()),
-        subject: subject.to_string(),
+        subject,
         html,
         text: format!("{body}\n\n--\n{footer}\n"),
         unsubscribe_url: None,
@@ -484,41 +587,74 @@ async fn send_one(state: &AppState, account: &Account, flow: &FlowRow, run_id: U
     match state.email.send_once(&email).await {
         Ok(provider_id) => {
             let mut tx = db.begin().await?;
-            let first: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'sent', sent_at = now(), provider_message_id = $2, error = NULL WHERE id = $1 AND status = 'sending' RETURNING id")
-                .bind(id)
+            let first: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'sent', sent_at = now(), provider_message_id = $2, error = NULL WHERE id = $1 AND status = 'handing' RETURNING id")
+                .bind(r.id)
                 .bind(&provider_id)
                 .fetch_optional(&mut *tx)
                 .await?;
             if first.is_some() {
-                let cost = crate::billing::charge_email_tx(state, &mut tx, account.id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-                sqlx::query("UPDATE flow_notifications SET cost_micros = $2 WHERE id = $1").bind(id).bind(cost).execute(&mut *tx).await?;
+                charge(state, &mut tx, account.id, r.id).await?;
             }
             tx.commit().await?;
-            // Bounces and complaints count toward the account's rates (not its warm-up limit).
-            crate::deliverability::record_confirmation_send(db, id, &provider_id, account.id).await?;
+            // Counts toward the account's limit and its bounce and complaint rates, like any email.
+            crate::deliverability::record_send(db, r.id, &provider_id, account.id, None).await?;
+            crate::deliverability::complete_daily_slot(state, account.id);
+            Ok(None)
         }
         Err(e) => {
+            if let Some(busy) = e.downcast_ref::<crate::providers::email::ProviderBusy>() {
+                // Refused for now, so not sent: back to pending, and the step waits.
+                crate::deliverability::return_daily_slot(state, account.id);
+                settle(db, r.id, "handing", "pending", "the email provider was busy").await?;
+                let wait = chrono::Duration::from_std(busy.retry_after).unwrap_or(chrono::Duration::minutes(15)).clamp(chrono::Duration::minutes(1), chrono::Duration::hours(1));
+                return Ok(Some(Utc::now() + wait));
+            }
+            if e.downcast_ref::<crate::providers::email::ProviderMaybeSent>().is_some() {
+                crate::deliverability::complete_daily_slot(state, account.id);
+                unconfirmed(state, r.id, "the email provider may have taken it; not sent again").await?;
+                return Ok(None);
+            }
             // Only a short class is kept: a provider's own words can echo addresses or settings.
-            let (status, why) = if e.downcast_ref::<crate::providers::email::ProviderBusy>().is_some() {
-                ("failed", "the email provider was busy")
-            } else if e.downcast_ref::<crate::providers::email::ProviderMaybeSent>().is_some() {
-                ("unknown", "may have gone out; not sent again")
-            } else {
-                ("failed", "the email provider refused it")
-            };
-            tracing::warn!(notification = %id, flow = %flow.id, "flow notification not sent: {why}");
-            settle(db, id, status, why).await?;
+            tracing::warn!(notification = %r.id, flow = %flow.id, "flow notification refused by the email provider");
+            crate::deliverability::return_daily_slot(state, account.id);
+            settle(db, r.id, "handing", "failed", "the email provider refused it").await?;
+            Ok(None)
         }
+    }
+}
+
+/// Charge one notification once, with its own row.
+async fn charge(state: &AppState, tx: &mut sqlx::PgConnection, account_id: Uuid, id: Uuid) -> anyhow::Result<()> {
+    let first: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET cost_micros = 0 WHERE id = $1 AND cost_micros IS NULL RETURNING id").bind(id).fetch_optional(&mut *tx).await?;
+    if first.is_some() {
+        let cost = crate::billing::charge_email_tx(state, &mut *tx, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        sqlx::query("UPDATE flow_notifications SET cost_micros = $2 WHERE id = $1").bind(id).bind(cost).execute(&mut *tx).await?;
     }
     Ok(())
 }
 
-/// Scheduler: claims cut off before their result was recorded may have gone out; they become
-/// `unknown` and are never sent again.
-pub async fn sweep(db: &PgPool) -> sqlx::Result<()> {
-    sqlx::query("UPDATE flow_notifications SET status = 'unknown', error = 'cut off while sending; may have gone out, not sent again' WHERE status = 'sending' AND created_at < now() - interval '15 minutes'")
-        .execute(db)
+/// A send whose handoff is uncertain: never sent again, and billed, since it may have gone out.
+async fn unconfirmed(state: &AppState, id: Uuid, why: &str) -> anyhow::Result<()> {
+    let mut tx = state.db.begin().await?;
+    let row: Option<Uuid> = sqlx::query_scalar("UPDATE flow_notifications SET status = 'unconfirmed', error = $2 WHERE id = $1 AND status = 'handing' RETURNING account_id")
+        .bind(id)
+        .bind(why)
+        .fetch_optional(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM flow_notify_usage WHERE day < (now() - interval '3 days')::date").execute(db).await?;
+    if let Some(account_id) = row {
+        charge(state, &mut tx, account_id, id).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Scheduler: handoffs cut off before their result was recorded may have gone out; they become
+/// `unconfirmed` (never sent again, billed). Old daily counters are deleted.
+pub async fn sweep(state: &AppState) -> anyhow::Result<()> {
+    let cut: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM flow_notifications WHERE status = 'handing' AND handed_at < now() - interval '15 minutes' LIMIT 500").fetch_all(&state.db).await?;
+    for id in cut {
+        unconfirmed(state, id, "cut off while being handed to the email provider; not sent again").await?;
+    }
+    sqlx::query("DELETE FROM flow_notify_usage WHERE day < (now() - interval '3 days')::date").execute(&state.db).await?;
     Ok(())
 }

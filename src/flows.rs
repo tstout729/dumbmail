@@ -349,6 +349,16 @@ async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
 pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: Value) -> AppResult<Option<Uuid>> {
     let def = parse_definition(&flow.definition)?;
     let Some(entry) = def.entry.clone() else { return Ok(None) };
+    // The cheap rejection first, with no lock or transaction: most repeat triggers stop here.
+    let (blocked, days) = reentry_rule(&def, 3);
+    let sql = format!("SELECT {blocked}");
+    let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(flow.id).bind(profile_id);
+    if let Some(d) = days {
+        q = q.bind(d);
+    }
+    if q.fetch_one(&state.db).await? {
+        return Ok(None);
+    }
     if let Some(f) = &def.settings.profile_filter {
         if !segments::profile_matches(&state.db, profile_id, &segments::load(&state.db, flow.account_id, f, None).await?).await? {
             return Ok(None);
@@ -360,9 +370,23 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
     Ok(id)
 }
 
+/// The re-entry rule as an SQL condition that is true when person $2 may not enter flow $1 now,
+/// and the seconds to bind as `$window` when the rule has a window (then bind it last).
+fn reentry_rule(def: &FlowDef, window: usize) -> (String, Option<f64>) {
+    let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
+    match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
+        (Value::String(s), _) if s == "always" => ("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')".into(), None),
+        (_, Some(days)) => (
+            format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => ${window})))"),
+            Some(days * 86400.0),
+        ),
+        _ => ("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2)".into(), None),
+    }
+}
+
 /// Start a run at step `node` inside `tx` unless re-entry rules say no, with its first job at
-/// `run_at` (now when None). The re-entry check and the insert run under a lock on this flow and
-/// person, so two starts can't both pass it. Back-populate uses this to place people mid-flow.
+/// `run_at` (now when None). Under a lock on this flow and person, the rule is checked again and the
+/// run and its job are written in one statement, so two starts can't both pass it.
 pub async fn enter(
     tx: &mut sqlx::PgConnection,
     flow: &FlowRow,
@@ -373,46 +397,28 @@ pub async fn enter(
     run_at: Option<chrono::DateTime<Utc>>,
 ) -> AppResult<Option<Uuid>> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(profile_id).execute(&mut *tx).await?;
-    let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
-    let blocked: bool = match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
-        (Value::String(s), _) if s == "always" => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')")
-                .bind(flow.id)
-                .bind(profile_id)
-                .fetch_one(&mut *tx)
-                .await?
-        }
-        (_, Some(days)) => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => $3)))")
-                .bind(flow.id)
-                .bind(profile_id)
-                .bind(days * 86400.0)
-                .fetch_one(&mut *tx)
-                .await?
-        }
-        _ => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2)")
-                .bind(flow.id)
-                .bind(profile_id)
-                .fetch_one(&mut *tx)
-                .await?
-        }
-    };
-    if blocked {
-        return Ok(None);
-    }
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context) VALUES ($1, $2, $3, $4, $5, $6)")
-        .bind(id)
+    let (blocked, days) = reentry_rule(def, 9);
+    let sql = format!(
+        "WITH r AS (
+            INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context)
+            SELECT $3, $1, $4, $2, $5, $6 WHERE NOT {blocked}
+            RETURNING id)
+         INSERT INTO jobs (kind, payload, run_at, lane) SELECT 'flow_step', jsonb_build_object('run_id', r.id), COALESCE($7, now()), $8 FROM r
+         RETURNING (payload->>'run_id')::uuid"
+    );
+    let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
         .bind(flow.id)
-        .bind(flow.account_id)
         .bind(profile_id)
+        .bind(Uuid::now_v7())
+        .bind(flow.account_id)
         .bind(node)
         .bind(context)
-        .execute(&mut *tx)
-        .await?;
-    crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": id}), run_at).await?;
-    Ok(Some(id))
+        .bind(run_at)
+        .bind(crate::jobs::MAIN);
+    if let Some(d) = days {
+        q = q.bind(d);
+    }
+    Ok(q.fetch_optional(&mut *tx).await?)
 }
 
 /// Job: an event happened; start matching metric-triggered flows.
@@ -546,7 +552,8 @@ struct Run {
 }
 
 async fn finish(db: &PgPool, run_id: Uuid, status: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE flow_runs SET status = $2, finished_at = now(), current_node = NULL WHERE id = $1")
+    // Only a run still active: one taken out of the flow stays exited.
+    sqlx::query("UPDATE flow_runs SET status = $2, finished_at = now(), current_node = NULL, sending_until = NULL WHERE id = $1 AND status = 'active'")
         .bind(run_id)
         .bind(status)
         .execute(db)
@@ -603,11 +610,22 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
         }
         let waited = context.get("_waited").and_then(|v| v.as_str()) == Some(node_id.as_str());
         if !waited {
-            sqlx::query("UPDATE flow_runs SET visited = visited || to_jsonb($2::text) WHERE id = $1")
-                .bind(run.id)
-                .bind(&node_id)
-                .execute(&state.db)
-                .await?;
+            // The claim: only while the run is still active. A step that reaches people outside
+            // (a message, a notification, a webhook) is marked as sending until it advances, and
+            // "remove from flow" leaves such a run alone, so a removal and a send can't both happen.
+            let reaches_out = !matches!(node.kind.as_str(), "delay" | "condition" | "random_split" | "wait_for_reply" | "update_profile" | "add_to_list" | "remove_from_list");
+            let claimed = sqlx::query(
+                "UPDATE flow_runs SET visited = visited || to_jsonb($2::text), sending_until = CASE WHEN $3 THEN now() + interval '15 minutes' END WHERE id = $1 AND status = 'active'",
+            )
+            .bind(run.id)
+            .bind(&node_id)
+            .bind(reaches_out)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+            if claimed == 0 {
+                return Ok(());
+            }
         }
         let mut next = node.next().map(str::to_string);
         match node.kind.as_str() {
@@ -619,7 +637,9 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     Some(crate::features::flows_plus::delay::Wait::Exit) => return finish(&state.db, run.id, "exited").await,
                     Some(crate::features::flows_plus::delay::Wait::Continue) => {
                         current = next;
-                        sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&current).bind(&context).execute(&state.db).await?;
+                        if !advance(&state.db, run.id, current.as_deref(), &context).await? {
+                            return Ok(());
+                        }
                         continue;
                     }
                 };
@@ -631,21 +651,15 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                         _ => 86400.0,
                     };
                 context["_waited"] = json!(node_id);
-                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-                    .bind(run.id)
-                    .bind(&node_id)
-                    .bind(&context)
-                    .execute(&state.db)
-                    .await?;
                 let at = until.unwrap_or_else(|| Utc::now() + Duration::milliseconds((secs * 1000.0) as i64));
-                crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                // The wait and its wake-up are saved together, and only while the run is active.
+                wait_until(&state.db, run.id, &node_id, &context, at).await?;
                 return Ok(());
             }
             "delay" => {
-                if let Some(at) = crate::features::flows_plus::delay::wake(&account, &person, &node, &mut context, Utc::now()) {
-                    // Woken before its time (or its time moved with the person's zone): keep waiting.
-                    sqlx::query("UPDATE flow_runs SET context = $2 WHERE id = $1").bind(run.id).bind(&context).execute(&state.db).await?;
-                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                if let Some(at) = crate::features::flows_plus::delay::wake(&mut context, Utc::now()) {
+                    // Woken before its time (early, or retried after a crash): keep waiting for it.
+                    wait_until(&state.db, run.id, &node_id, &context, at).await?;
                     return Ok(());
                 }
                 if let Some(o) = context.as_object_mut() {
@@ -679,13 +693,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     .await;
                     match out {
                         Ok(Outcome::Deferred(until)) => {
-                            sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-                                .bind(run.id)
-                                .bind(&node_id)
-                                .bind(&context)
-                                .execute(&state.db)
-                                .await?;
-                            crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                            wait_until(&state.db, run.id, &node_id, &context, until).await?;
                             return Ok(());
                         }
                         Ok(_) => {}
@@ -720,8 +728,16 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 context["_reply_since"] = json!(since);
                 context["_reply_until"] = json!(until);
                 let mut tx = state.db.begin().await?;
-                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&mut *tx).await?;
-                crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                let n = sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1 AND status = 'active'")
+                    .bind(run.id)
+                    .bind(&node_id)
+                    .bind(&context)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                if n == 1 {
+                    crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                }
                 tx.commit().await?;
                 return Ok(());
             }
@@ -770,7 +786,13 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     }
                 }
             }
-            "notify" => crate::features::flows_plus::notify::run(state, &account, &flow, &person, run.id, &node_id, &node, &context).await?,
+            "notify" => {
+                // Past the account's daily allowance (or a busy provider): wait, then send what's left.
+                if let Some(until) = crate::features::flows_plus::notify::run(state, &account, &flow, &person, run.id, &node_id, &node, &context).await? {
+                    wait_until(&state.db, run.id, &node_id, &context, until).await?;
+                    return Ok(());
+                }
+            }
             "webhook" => {
                 let url = node.str("url").unwrap_or_default().to_string();
                 let payload = json!({
@@ -784,14 +806,41 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
             _ => {}
         }
         current = next;
-        sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-            .bind(run.id)
-            .bind(&current)
-            .bind(&context)
-            .execute(&state.db)
-            .await?;
+        if !advance(&state.db, run.id, current.as_deref(), &context).await? {
+            return Ok(());
+        }
     }
     finish(&state.db, run.id, "failed").await
+}
+
+/// Move an active run to its next step (ending any send in progress). False: it was taken out of
+/// the flow meanwhile, so stop.
+async fn advance(db: &PgPool, run_id: Uuid, node: Option<&str>, context: &Value) -> anyhow::Result<bool> {
+    let n = sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3, sending_until = NULL WHERE id = $1 AND status = 'active'")
+        .bind(run_id)
+        .bind(node)
+        .bind(context)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok(n == 1)
+}
+
+/// Park an active run at `node` until `at`: its state and its wake-up job in one transaction.
+async fn wait_until(db: &PgPool, run_id: Uuid, node: &str, context: &Value, at: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    let n = sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3, sending_until = NULL WHERE id = $1 AND status = 'active'")
+        .bind(run_id)
+        .bind(node)
+        .bind(context)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 1 {
+        crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run_id}), Some(at)).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn stats(db: &PgPool, account_id: Uuid, flow_id: Uuid) -> AppResult<(MessageStats, i64, i64)> {

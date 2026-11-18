@@ -6,7 +6,7 @@
 //! `weekdays` or `until` is worked out in the person's time zone (the send-time module's lookup:
 //! their profile's zone or one derived from where they are, else the account's), and the instant it
 //! ends is kept on the run (`_wait_until`, with `_wait_from`, when they reached the step) so a run
-//! woken early keeps waiting and a step marked `recompute_zone` can be worked out again when it fires.
+//! woken early, or retried after a crash, keeps waiting for that same moment.
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc};
 use chrono_tz::Tz;
@@ -46,7 +46,6 @@ pub struct Plan {
     /// Allowed days, Monday = bit 0.
     pub weekdays: Option<u8>,
     pub until: Option<Until>,
-    pub recompute_zone: bool,
 }
 
 /// What a delay decided when the person reached it.
@@ -136,11 +135,7 @@ pub fn parse(n: &Node) -> AppResult<Option<Plan>> {
         }
         None => None,
     };
-    let recompute_zone = match present(n, "recompute_zone") {
-        Some(v) => v.as_bool().ok_or_else(|| bad("`recompute_zone` must be true or false"))?,
-        None => false,
-    };
-    Ok(Some(Plan { at, weekdays, until, recompute_zone }))
+    Ok(Some(Plan { at, weekdays, until }))
 }
 
 /// Dates outside these years are treated as unreadable (event properties can hold anything, and
@@ -180,13 +175,25 @@ fn parse_when_any(v: &Value, tz: Tz) -> Option<DateTime<Utc>> {
     if let Ok(t) = DateTime::parse_from_rfc3339(s) {
         return Some(t.with_timezone(&Utc));
     }
-    for f in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
-        if let Ok(n) = NaiveDateTime::parse_from_str(s, f).map_err(|_| ()).and_then(|n| if (MIN_YEAR..MAX_YEAR).contains(&n.year()) { Ok(n) } else { Err(()) }) {
-            return Some(clock::local_instant(tz, n.date(), n.time().num_seconds_from_midnight() / 60));
+    let in_range = |y: i32| (MIN_YEAR..MAX_YEAR).contains(&y);
+    // A date-time without a zone is in `tz`, seconds kept.
+    for f in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M"] {
+        if let Ok(n) = NaiveDateTime::parse_from_str(s, f) {
+            if !in_range(n.year()) {
+                return None;
+            }
+            let t = n.time();
+            return clock::local_instant(tz, n.date(), t.num_seconds_from_midnight() / 60).checked_add_signed(Duration::seconds(i64::from(t.second())));
         }
     }
-    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok())?;
-    if !(MIN_YEAR..MAX_YEAR).contains(&d.year()) {
+    // Only an exact YYYY-MM-DD is a date; anything else that didn't parse above is unreadable.
+    let b = s.as_bytes();
+    let exact = b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if !exact {
+        return None;
+    }
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    if !in_range(d.year()) {
         return None;
     }
     Some(clock::local_instant(tz, d, 0))
@@ -254,7 +261,6 @@ pub fn decide(plan: &Plan, node: &Node, from: DateTime<Utc>, now: DateTime<Utc>,
     match end(plan, amount_secs(node), from, tz, context, profile_props) {
         Some(t) if t > now => {
             context["_wait_until"] = json!(t);
-            context["_wait_from"] = json!(from);
             Wait::Until(t)
         }
         // Past (or no usable date): an `until` follows its rule; other options can't be past.
@@ -276,22 +282,14 @@ fn saved_time(context: &Value, k: &str) -> Option<DateTime<Utc>> {
     context.get(k).and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
-/// The run woke at a delay it was waiting on. `Some(t)`: keep waiting until `t` (saved in
-/// `context`). `None`: the wait is over (its saved times are cleared); plain delays always end here.
-pub fn wake(account: &Account, person: &Profile, node: &Node, context: &mut Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let until = saved_time(context, "_wait_until")?;
-    let mut target = until;
-    if let Ok(Some(plan)) = parse(node) {
-        if plan.recompute_zone {
-            let from = saved_time(context, "_wait_from").unwrap_or(now);
-            if let Some(t) = end(&plan, amount_secs(node), from, person_zone(account, person), context, &person.properties) {
-                target = t;
-            }
-        }
-    }
-    // Woken early (a second early is close enough).
-    if target > now + Duration::seconds(1) && target < now + Duration::days(11 * 366) {
-        context["_wait_until"] = json!(target);
+/// The run woke at a delay it was waiting on. `Some(t)`: keep waiting until `t`, the moment saved
+/// when it arrived (a job woken early, or retried after a crash before its wake-up was queued).
+/// `None`: the wait is over and its saved time is cleared; plain delays always end here. Saved times
+/// are within the same years [`parse_when`] reads, so every saved deadline is kept.
+pub fn wake(context: &mut Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let target = saved_time(context, "_wait_until")?;
+    // A second early is close enough.
+    if sane(target).is_some() && target > now + Duration::seconds(1) {
         return Some(target);
     }
     if let Some(o) = context.as_object_mut() {
@@ -438,6 +436,38 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_keep_their_seconds_and_malformed_ones_are_unreadable() {
+        let at = |v: &str| parse_when(&json!(v), Los_Angeles);
+        assert_eq!(at("2026-12-20T15:30:45"), Some(la(2026, 12, 20, 15, 30) + Duration::seconds(45)));
+        assert_eq!(at("2026-12-20 15:30:45.5"), Some(la(2026, 12, 20, 15, 30) + Duration::seconds(45)));
+        assert_eq!(at("2026-12-20"), Some(la(2026, 12, 20, 0, 0)));
+        assert_eq!(at("2026-12-20T15:30:45Z"), Some(Utc.with_ymd_and_hms(2026, 12, 20, 15, 30, 45).unwrap()));
+        // No falling back to the date at the front of something that isn't a timestamp.
+        for bad in ["2026-12-20T99:00", "2026-12-20garbage", "2026-12-20T", "2026-1-5", "20261220", "2026-12-20 10"] {
+            assert_eq!(at(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_saved_deadline_is_kept_however_far_away() {
+        let now = la(2026, 11, 17, 9, 0);
+        // 15 years out (inside the years dates may take): a job retried after a crash keeps waiting.
+        let far = la(2041, 6, 1, 10, 0);
+        let mut ctx = json!({"_waited": "d", "_wait_until": far});
+        assert_eq!(wake(&mut ctx, now), Some(far));
+        assert_eq!(ctx["_wait_until"], json!(far));
+        // Due: the wait ends and its time is cleared.
+        let mut ctx = json!({"_waited": "d", "_wait_until": now});
+        assert_eq!(wake(&mut ctx, now), None);
+        assert!(ctx.get("_wait_until").is_none());
+        // Plain delays have no saved time and end as before.
+        assert_eq!(wake(&mut json!({"_waited": "d"}), now), None);
+        // The parser's latest date still parses and still waits.
+        let latest = parse_when(&json!("2199-12-31"), Los_Angeles).unwrap();
+        assert_eq!(wake(&mut json!({"_wait_until": latest}), now), Some(latest));
+    }
+
+    #[test]
     fn rejects_bad_options() {
         for bad in [
             json!({"at": "25:00"}),
@@ -450,7 +480,6 @@ mod tests {
             json!({"until": {"field": "event.x", "offset_amount": -1}}),
             json!({"until": {"field": "event.x", "offset_amount": 400, "offset_unit": "days"}}),
             json!({"until": {"field": "event.x", "if_past": "maybe"}}),
-            json!({"at": "10:00", "recompute_zone": "yes"}),
         ] {
             let mut v = bad.clone();
             v["amount"] = json!(1);

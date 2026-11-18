@@ -1151,6 +1151,15 @@ async fn ses_webhook(State(state): State<AppState>, Path(secret): Path<String>, 
             crate::deliverability::note_outcome(&state, account_id, campaign_id).await;
         }
     }
+    // A flow notification's hard bounce or complaint blocks that address (see features::flows_plus).
+    let blocks = match kind {
+        "Bounce" => msg["bounce"]["bounceType"].as_str() == Some("Permanent"),
+        "Complaint" => true,
+        _ => false,
+    };
+    if blocks && crate::features::flows_plus::notify::provider_strike(&state.db, pid, kind == "Complaint").await? {
+        return Ok(StatusCode::OK);
+    }
     let Some(m) = msg_by_provider_id(&state, pid).await? else { return Ok(StatusCode::OK) };
     match kind {
         "Delivery" => {

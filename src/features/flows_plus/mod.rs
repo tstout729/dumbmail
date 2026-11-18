@@ -42,6 +42,10 @@ static ROUTES: &[RouteRule] = &[
     rule("GET", "/api/flows-plus/notify-addresses", Perm::FlowEdit),
     rule("POST", "/api/flows-plus/notify-addresses", Perm::FlowEdit),
     rule("POST", "/api/flows-plus/notify-addresses/remove", Perm::FlowEdit),
+    // Emailing an outside address is a change to who the account contacts: account settings.
+    rule("POST", "/api/flows-plus/notify-addresses/send-confirmation", Perm::SettingsWrite),
+    // Clearing a bounce is a deliverability decision: Admins and Owners only.
+    rule("POST", "/api/flows-plus/notify-addresses/clear-bounce", Perm::Domains),
     rule("GET", "/api/flows-plus/metric-trust", Perm::AudienceRead),
     public("GET", "/flow-notify/confirm"),
     public("POST", "/flow-notify/confirm"),
@@ -57,6 +61,8 @@ static TOOLS: &[ToolRule] = &[
     ToolRule { name: "list_notify_addresses", perm: Perm::FlowEdit },
     ToolRule { name: "add_notify_address", perm: Perm::FlowEdit },
     ToolRule { name: "remove_notify_address", perm: Perm::FlowEdit },
+    ToolRule { name: "send_notify_confirmation", perm: Perm::SettingsWrite },
+    ToolRule { name: "clear_notify_bounce", perm: Perm::Domains },
 ];
 
 /// Check this module's step options when a flow is saved (called from `flows::parse_definition`).
@@ -73,7 +79,7 @@ pub fn validate(def: &FlowDef, raw: &Value) -> AppResult<()> {
 }
 
 /// When a flow is saved (called from the flow API's step checks): outside notification addresses
-/// that were never asked get a confirmation link.
+/// are recorded as unconfirmed. Nothing is emailed.
 pub async fn on_save(state: &AppState, account_id: Uuid, def: &FlowDef) -> AppResult<()> {
     notify::on_save(state, account_id, def).await
 }
@@ -138,12 +144,39 @@ struct AddressBody {
 
 async fn add_address(state: &AppState, ctx: &Ctx, email: &str) -> AppResult<Value> {
     let e = crate::models::normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
-    let out = notify::request_confirmations(state, ctx.account_id, std::slice::from_ref(&e), true).await?;
-    let status = out.first().map_or("pending", |o| o.1);
-    if status == "pending" {
-        crate::features::team::audit(state, ctx, "flow.notify_address_request", Some(&e), json!({})).await;
+    let out = notify::record_addresses(state, ctx.account_id, std::slice::from_ref(&e)).await?;
+    Ok(out.into_iter().next().unwrap_or(json!({"email": e})))
+}
+
+#[derive(Deserialize)]
+struct ConfirmBody {
+    email: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn send_confirmation(state: &AppState, ctx: &Ctx, email: &str, confirm: bool) -> AppResult<Value> {
+    let v = notify::send_confirmation_request(state, ctx.account_id, email, confirm).await?;
+    if v["sent"] == true {
+        crate::features::team::audit(state, ctx, "flow.notify_confirmation_sent", v["email"].as_str(), json!({})).await;
     }
-    Ok(json!({"email": e, "status": status}))
+    Ok(v)
+}
+
+async fn send_confirmation_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<ConfirmBody>) -> AppResult<Json<Value>> {
+    Ok(Json(send_confirmation(&state, &ctx, &b.email, b.confirm).await?))
+}
+
+async fn clear_bounce(state: &AppState, ctx: &Ctx, email: &str) -> AppResult<Value> {
+    let cleared = notify::clear_bounce(&state.db, ctx.account_id, email).await?;
+    if cleared {
+        crate::features::team::audit(state, ctx, "flow.notify_bounce_clear", Some(&email.trim().to_lowercase()), json!({})).await;
+    }
+    Ok(json!({"cleared": cleared}))
+}
+
+async fn clear_bounce_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AddressBody>) -> AppResult<Json<Value>> {
+    Ok(Json(clear_bounce(&state, &ctx, &b.email).await?))
 }
 
 async fn add_address_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<AddressBody>) -> AppResult<Json<Value>> {
@@ -225,6 +258,8 @@ fn routes() -> Router<AppState> {
         .route("/api/flows/{id}/backfills/{backfill_id}/cancel", post(cancel_h))
         .route("/api/flows-plus/notify-addresses", get(addresses_h).post(add_address_h))
         .route("/api/flows-plus/notify-addresses/remove", post(remove_address_h))
+        .route("/api/flows-plus/notify-addresses/send-confirmation", post(send_confirmation_h))
+        .route("/api/flows-plus/notify-addresses/clear-bounce", post(clear_bounce_h))
         .route("/api/flows-plus/metric-trust", get(metric_trust_h))
         .route("/flow-notify/confirm", get(confirm_page).post(confirm_post))
 }
@@ -248,20 +283,26 @@ fn tools() -> Vec<Value> {
             "End the runs of up to 500 people in a flow (they get nothing more from it; they can enter again only as its re-entry rules allow). Without confirm: true it only says how many would be taken out.",
             obj(json!({"flow_id": flow_id, "run_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": results::MAX_REMOVE}, "confirm": {"type": "boolean"}}), &["flow_id", "run_ids"]), false, true),
         tool("backfill_flow", "Add people who already qualify to a flow",
-            "Back-populate a live list-, segment- or date-triggered flow with people who already qualify (not metric-triggered flows: past events don't start flows). Without confirm: true it only counts them. With confirm it starts adding them in the background, respecting re-entry rules, the profile filter and the exit condition; consent is checked when each message goes out. Date flows add people whose trigger day already passed but who still have a step ahead, placed at the step their date implies. One at a time per flow; capped (default 50,000; `limit` lowers it).",
+            "Back-populate a live list- or segment-triggered flow with people who are in the trigger list or segment now (not metric flows: past events don't start flows; not date flows: people whose date is still ahead enter on their own). Without confirm: true it only counts them. With confirm it adds them in the background in paced batches; each person is checked again as they're added (still in the list or segment, the profile filter, the exit condition, re-entry rules) and consent is checked when each message goes out. One at a time per flow; capped (default 50,000; `limit` lowers it).",
             obj(json!({"flow_id": flow_id, "confirm": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1}}), &["flow_id"]), false, true),
         tool("list_flow_backfills", "List a flow's back-populates", "A flow's recent back-populates with their status (running, done, cancelled, failed) and how many people were added and skipped.",
             obj(json!({"flow_id": flow_id}), &["flow_id"]), true, false),
         tool("cancel_flow_backfill", "Stop a back-populate", "Stop adding people to a flow. People already added stay in the flow (take them out with remove_from_flow).",
             obj(json!({"flow_id": flow_id, "backfill_id": {"type": "string"}}), &["flow_id", "backfill_id"]), false, true),
         tool("list_notify_addresses", "List notification addresses",
-            "Outside addresses (not team members) used by flow notification steps, and whether each has confirmed. Pass emails to get the status of specific addresses (team, confirmed, pending or new). Only team members and confirmed addresses get notifications.",
+            "Outside addresses (not team members) used by flow notification steps and their status: confirmed, unconfirmed, bounced or complained (with the reason). Pass emails to get the status of specific addresses (team, confirmed, unconfirmed, removed, bounced, complained or new). Only team members and confirmed addresses get notifications; bounced and complained addresses get none.",
             obj(json!({"emails": {"type": "array", "items": {"type": "string"}, "maxItems": 50}}), &[]), true, false),
-        tool("add_notify_address", "Ask an address to confirm notifications",
-            "Email an outside address a link to confirm it wants this account's flow notifications (sent again at most once an hour). Team members' addresses need no confirmation. At most 20 addresses can be waiting at once.",
+        tool("add_notify_address", "Record a notification address",
+            "Record an outside address for flow notifications as unconfirmed. Nothing is emailed; it gets nothing until it confirms (see send_notify_confirmation). Team members' addresses need no confirmation. At most 20 addresses can wait to confirm.",
             obj(json!({"email": {"type": "string"}}), &["email"]), false, false),
-        tool("remove_notify_address", "Remove a notification address", "Remove an outside address: it stops getting flow notifications until it confirms again.",
+        tool("send_notify_confirmation", "Email an address a link to confirm notifications",
+            "Email an outside address a link to confirm it wants this account's flow notifications. Without confirm: true it only checks. Refused while sending is paused, and for bounced or complaining addresses. Each address gets at most one a day, and an account sends at most 50 a day.",
+            obj(json!({"email": {"type": "string"}, "confirm": {"type": "boolean"}}), &["email"]), false, true),
+        tool("remove_notify_address", "Remove a notification address", "Remove an outside address: it stops getting flow notifications until it's confirmed again.",
             obj(json!({"email": {"type": "string"}}), &["email"]), false, true),
+        tool("clear_notify_bounce", "Clear a notification address's bounce",
+            "After fixing an address whose notification hard bounced, let it get notifications again. Complaints (marked as spam) can't be cleared.",
+            obj(json!({"email": {"type": "string"}}), &["email"]), false, false),
     ]
 }
 
@@ -297,6 +338,8 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: &Value) -> Option<AppR
         .await,
         "add_notify_address" => async { add_address(state, ctx, a["email"].as_str().unwrap_or("")).await }.await,
         "remove_notify_address" => async { remove_address(state, ctx, a["email"].as_str().unwrap_or("")).await }.await,
+        "send_notify_confirmation" => async { send_confirmation(state, ctx, a["email"].as_str().unwrap_or(""), a["confirm"].as_bool() == Some(true)).await }.await,
+        "clear_notify_bounce" => async { clear_bounce(state, ctx, a["email"].as_str().unwrap_or("")).await }.await,
         _ => return None,
     };
     Some(r)
@@ -343,7 +386,7 @@ impl Feature for Module {
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
         if tick.is_multiple_of(15) {
-            notify::sweep(&state.db).await?;
+            notify::sweep(state).await?;
         }
         Ok(())
     }

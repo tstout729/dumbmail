@@ -15,6 +15,7 @@ CREATE TABLE flow_backfills (
     created_by   uuid,
     created_at   timestamptz NOT NULL DEFAULT now(),
     snapshot_at  timestamptz,
+    last_batch_at timestamptz,
     finished_at  timestamptz
 );
 -- One back-populate per flow at a time, enforced by the insert.
@@ -30,3 +31,10 @@ CREATE TABLE flow_backfill_members (
     PRIMARY KEY (backfill_id, profile_id)
 );
 CREATE INDEX flow_backfill_members_todo_idx ON flow_backfill_members (backfill_id, profile_id) WHERE done_at IS NULL;
+-- Pacing reads the people enrolled recently.
+CREATE INDEX flow_backfill_members_done_idx ON flow_backfill_members (backfill_id, done_at) WHERE done_at IS NOT NULL;
+
+-- A run whose current step is reaching someone outside (a message, a notification, a webhook) is
+-- marked until it moves on, so "remove from flow" and that send can't both happen. Nullable with no
+-- default: adding it doesn't rewrite the table.
+ALTER TABLE flow_runs ADD COLUMN sending_until timestamptz;
