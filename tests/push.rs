@@ -393,6 +393,12 @@ async fn web_push_end_to_end() {
     assert_eq!(est["count"], 1);
     let est = h.ok("POST", "/api/campaigns/estimate", Some(json!({"channel": "push", "platforms": ["ios"], "audience": {"include": [{"type": "list", "id": l}]}}))).await;
     assert_eq!(est["count"], 0);
+    // The send-time preview counts the same way: the campaign's platforms, or the ones given.
+    let ios = h.ok("POST", "/api/campaigns", Some(json!({"name": "iOS only", "channel": "push", "audience": {"include": [{"type": "list", "id": l}]}, "content": {"title": "x", "platforms": ["ios"]}}))).await;
+    let pv = h.ok("POST", "/api/sendtime/preview", Some(json!({"campaign_id": ios["id"]}))).await;
+    assert_eq!(pv["total"], 0, "{pv}");
+    let pv = h.ok("POST", "/api/sendtime/preview", Some(json!({"channel": "push", "platforms": ["web"], "audience": {"include": [{"type": "list", "id": l}]}}))).await;
+    assert_eq!(pv["total"], 1, "{pv}");
 
     let cid = push_campaign(
         &mut h,
@@ -1092,6 +1098,12 @@ async fn flows_tests_and_isolation() {
     let cid = push_campaign(&mut h, &l, json!({"title": "Test me"})).await;
     let r = h.ok("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["w@x.test"]}))).await;
     assert_eq!(r["sent"], 1);
+    // A test whose only device is still to be retried isn't counted as sent.
+    let lz = list(&mut h, "Z").await;
+    person(&mut h, &lz, "z@x.test", "Zed").await;
+    enroll(&h, &a, &browser(&base, "busy-t1"), "z@x.test").await;
+    let r = h.ok("POST", &format!("/api/campaigns/{cid}/test"), Some(json!({"to": ["z@x.test"]}))).await;
+    assert_eq!(r["sent"], 0, "{r}");
     assert_eq!(opened(&m.hits("/webpush/w1")[0], &wb)["t"], "[Test] Test me");
     let mine = browser(&base, "me1");
     h.ok("POST", "/api/push/test-devices", Some(json!({"subscription": {"endpoint": mine.endpoint, "keys": {"p256dh": mine.p256dh, "auth": mine.auth}}}))).await;

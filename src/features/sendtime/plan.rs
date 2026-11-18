@@ -376,16 +376,22 @@ pub async fn launch_start(state: &AppState, account: &Account, c: &CampaignRow, 
 
 /// Estimate when a send goes out: release times for a random sample of the audience, scaled to its
 /// size, in 15-minute buckets. Also counts who smart sending would skip right now.
-pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience: &Audience, opts: Option<SendOptions>, send_at: Option<DateTime<Utc>>) -> AppResult<Value> {
+pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience: &Audience, push_platforms: Option<Vec<String>>, opts: Option<SendOptions>, send_at: Option<DateTime<Utc>>) -> AppResult<Value> {
     let account = crate::campaigns::load_account(&state.db, account_id).await?;
     let tz = crate::sending::account_tz(&account);
-    let total = crate::campaigns::estimate(&state.db, account_id, channel, audience).await?;
+    // Push: only people with a device on a platform it goes to.
+    let resolved = crate::campaigns::resolve_audience(&state.db, account_id, channel, audience).await?.with_push_platforms(push_platforms);
+    let total: i64 = {
+        let mut qb = QueryBuilder::new("SELECT count(*)");
+        crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
+        qb.build_query_scalar().fetch_one(&state.db).await?
+    };
     let now = Utc::now();
     let start = send_at.filter(|t| *t > now).unwrap_or(now);
     let skipped = match opts.as_ref().and_then(SendOptions::smart_hours) {
         Some(h) => {
             let mut qb = QueryBuilder::new("SELECT count(*)");
-            crate::campaigns::append_audience(&mut qb, &state.db, account_id, channel, audience).await?;
+            crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
             qb.push(" AND ");
             push_recently_messaged(&mut qb, channel, h);
             Some(qb.build_query_scalar::<i64>().fetch_one(&state.db).await?)
@@ -414,7 +420,7 @@ pub async fn preview(state: &AppState, account_id: Uuid, channel: &str, audience
     };
     let plan = build_plan(state, &account, channel, opts, local_start).await?;
     let mut qb = QueryBuilder::new("SELECT p.id, p.properties, p.phone_number");
-    crate::campaigns::append_audience(&mut qb, &state.db, account_id, channel, audience).await?;
+    crate::campaigns::push_audience(&mut qb, account_id, channel, &resolved);
     qb.push(" ORDER BY random() LIMIT ").push_bind(SAMPLE);
     let rows: Vec<(Uuid, Value, Option<String>)> = qb.build_query_as().fetch_all(&state.db).await?;
     let zones: Vec<(Uuid, Tz)> = rows.iter().map(|(id, props, phone)| (*id, zone::resolve_parts(props, phone.as_deref(), tz).0)).collect();

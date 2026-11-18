@@ -391,7 +391,13 @@ pub async fn campaign_test(state: &AppState, account: &crate::models::Account, c
             None => return Err(AppError::bad(format!("{email} isn't a profile in this account"))),
         };
         match send::test_to_profile(state, account, &profile, content, Some(c.id), member).await? {
-            Outcome::Sent(_) => sent += 1,
+            // Sent only once a device took it: one still retrying (or unconfirmed) isn't counted.
+            Outcome::Sent(id) => {
+                let status: Option<String> = sqlx::query_scalar("SELECT status FROM messages WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
+                if matches!(status.as_deref(), Some("sent" | "delivered")) {
+                    sent += 1;
+                }
+            }
             Outcome::Failed(e) => return Err(AppError::bad(format!("test to {email} failed: {e}"))),
             Outcome::Skipped(why) => return Err(AppError::bad(format!("test to {email} not sent: {why}"))),
             Outcome::Deferred(_) => {}

@@ -634,7 +634,8 @@ async fn call(state: &AppState, ctx: &Ctx, name: &str, a: Value) -> AppResult<Va
                 }
                 let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
                 if !audience.include.is_empty() {
-                    dry["send_plan"] = crate::features::sendtime::plan::preview(state, acct, &c.channel, &audience, opts, send_at).await?;
+                    let platforms = campaigns::push_platforms(&c.channel, &c.content, c.ab_test.as_ref());
+                    dry["send_plan"] = crate::features::sendtime::plan::preview(state, acct, &c.channel, &audience, platforms, opts, send_at).await?;
                 }
                 dry["dry_run"] = json!(true);
                 dry["note"] = json!(format!("Nothing sent. This would {} to {} recipients. Call again with confirm=true once the user approves.",

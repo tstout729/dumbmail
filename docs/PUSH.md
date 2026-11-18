@@ -68,13 +68,13 @@ Your own button can ask too (it must run from a click):
 A device is linked to a person only with an **enrollment grant** that your own server makes for the person signed in. Anyone can copy your site key, so a browser or app can't just say who it belongs to, and a link from one of your emails (which can be forwarded) doesn't link a device either.
 
 1. Make an enrollment secret in Settings → Push (`rotate_push_identity_secret`; shown once). Keep it on your server only.
-2. For a signed-in customer, your server makes a grant valid for at most 24 hours:
+2. For a signed-in customer, your server makes a grant valid for at most 24 hours (DumbMail allows five minutes of clock difference on top, so `expires` may be up to 24 hours and 5 minutes past DumbMail's clock):
 
    ```
    grant = "v1." + expires + "." + hex(HMAC-SHA256(secret, "v1|push-enroll|" + ACCOUNT_ID + "|" + type + "|" + value + "|" + expires))
    ```
 
-   `ACCOUNT_ID` is your DumbMail account id (shown in Settings → Push, and as `account_id` in `get_push_settings`). `type` is `external_id` (your customer id) or `email` (lowercased and trimmed); `value` is that id or email. `expires` is a Unix time in seconds, at most a day ahead. A grant for an email never names a profile whose external id is the same text.
+   `ACCOUNT_ID` is your DumbMail account id (shown in Settings → Push, and as `account_id` in `get_push_settings`). `type` is `external_id` (your customer id) or `email`. Sign `value` exactly as DumbMail reads it: an `external_id` with leading and trailing spaces removed (case kept), an `email` with leading and trailing spaces removed and then lowercased (`" Ana@Shop.TEST "` is signed as `ana@shop.test`). Send the same `value` you signed. `expires` is a Unix time in seconds, at most a day ahead. A grant for an email never names a profile whose external id is the same text.
 3. Pass `{type, value, grant}` to the page or app. The snippet keeps it in memory only, never in the browser's storage; pass it again on each page.
 
 ```js
@@ -186,6 +186,11 @@ enum Push {
             default: permission = "not_determined"
             }
             var body: [String: Any] = ["platform": "ios", "token": token, "permission": permission]
+            #if DEBUG
+            body["environment"] = "sandbox"      // builds run from Xcode use the APNs sandbox
+            #else
+            body["environment"] = "production"   // TestFlight and the App Store
+            #endif
             if let grant = Session.pushGrant { body["identity"] = grant }   // {type, value, grant} from your server
             post("/client/push/devices", body)
         }
@@ -248,9 +253,18 @@ fun post(path: String, body: JSONObject) = thread {
 
 ```js
 import messaging, { AuthorizationStatus } from "@react-native-firebase/messaging";
-import { AppState, Platform } from "react-native";
+import { AppState, PermissionsAndroid, Platform } from "react-native";
 
 const post = (path, body) => fetch(`https://dumbmail.ai${path}?k=YOUR_SITE_KEY`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+// Android 13 (API 33) and later show notifications only after POST_NOTIFICATIONS is granted, and
+// Firebase's requestPermission() doesn't ask for it there. Declare it in AndroidManifest.xml too:
+// <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+async function androidPermission() {
+  if (Platform.Version < 33) return "granted";
+  const r = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+  return r === PermissionsAndroid.RESULTS.GRANTED ? "granted" : "denied";
+}
 
 function permissionOf(status) {
   if (status === AuthorizationStatus.AUTHORIZED) return "granted";
@@ -261,11 +275,13 @@ function permissionOf(status) {
 
 // Call after sign-in (identity = {type, value, grant} from your server) and on every start.
 export async function registerPush(identity) {
-  const status = await messaging().requestPermission();
+  const permission = Platform.OS === "android" ? await androidPermission() : permissionOf(await messaging().requestPermission());
   await messaging().registerDeviceForRemoteMessages();
-  // iOS sends to APNs directly, so register the APNs token there; Android uses the FCM token.
+  // iOS sends to APNs directly, so register the APNs token there (and say which APNs environment
+  // the build uses); Android uses the FCM token.
   const token = Platform.OS === "ios" ? await messaging().getAPNSToken() : await messaging().getToken();
-  if (token) await post("/client/push/devices", { platform: Platform.OS, token, permission: permissionOf(status), identity });
+  const environment = Platform.OS === "ios" ? (__DEV__ ? "sandbox" : "production") : undefined;
+  if (token) await post("/client/push/devices", { platform: Platform.OS, token, permission, environment, identity });
 }
 
 // Report changes made in the phone's settings when the app comes back.
