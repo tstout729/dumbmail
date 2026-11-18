@@ -493,3 +493,64 @@ async fn a_freshly_started_server_sends_long_links_until_it_has_served_a_while()
     assert_eq!(h.ok("GET", "/api/short-links/settings", None).await["ready"], true);
     h.cleanup().await;
 }
+
+/// Wait until the current clock minute has room for a burst (the limits count in fixed minutes).
+async fn clear_of_minute_edge() {
+    let s = chrono::Timelike::second(&chrono::Utc::now());
+    if s > 45 {
+        tokio::time::sleep(std::time::Duration::from_secs(u64::from(61 - s))).await;
+    }
+}
+
+async fn click_from(h: &Harness, path: &str, ip: &str) -> StatusCode {
+    h.raw("GET", &format!("/s/{path}"), &[("x-real-ip", ip)], "").await.0
+}
+
+#[tokio::test]
+async fn guessing_is_limited_per_address_and_valid_clicks_never_count() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 7901).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/limited").await;
+    launch(&mut h, &id).await;
+    let path = short_paths(&body_to(&h, &phone))[0].clone();
+    let mut wrong = path.clone().into_bytes();
+    wrong[code::PATH_LEN - 1] = if wrong[code::PATH_LEN - 1] == b'a' { b'b' } else { b'a' };
+    let wrong = String::from_utf8(wrong).unwrap();
+    clear_of_minute_edge().await;
+    // Valid clicks, however many, never count against an address.
+    for _ in 0..40 {
+        assert!(click_from(&h, &path, "198.51.100.7").await.is_redirection());
+    }
+    // 30 misses from one address are answered; then it gets 429 without a lookup, valid link or not.
+    for i in 0..30 {
+        assert_eq!(click_from(&h, &wrong, "198.51.100.8").await, StatusCode::NOT_FOUND, "miss {i}");
+    }
+    assert_eq!(counted(click_from(&h, &wrong, "198.51.100.8")).await, (StatusCode::TOO_MANY_REQUESTS, 0));
+    let (status, queries) = counted(click_from(&h, &path, "198.51.100.8")).await;
+    assert_eq!((status, queries), (StatusCode::TOO_MANY_REQUESTS, 0), "refused before any query");
+    // Other addresses are unaffected.
+    assert!(click_from(&h, &path, "198.51.100.9").await.is_redirection());
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn without_its_index_a_server_answers_not_found_without_a_query() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 7902).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/indexed").await;
+    launch(&mut h, &id).await;
+    let path = short_paths(&body_to(&h, &phone))[0].clone();
+    assert!(click(&h, &path).await.0.is_redirection());
+    // The index goes missing; the scheduler's check notices.
+    sqlx::query(&format!("DROP INDEX {}", short_links::INDEXES[0].0)).execute(&h.state.db).await.unwrap();
+    assert!(!short_links::check_index(&h.state).await);
+    assert!(!short_links::issuing(&h.state), "and no new short links are issued");
+    let ((status, _, _), queries) = counted(click(&h, &path)).await;
+    assert_eq!((status, queries), (StatusCode::NOT_FOUND, 0), "no lookup that would scan messages");
+    // Rebuilt: links resolve again.
+    short_links::ensure_index(&h.state).await.unwrap();
+    assert!(click(&h, &path).await.0.is_redirection());
+    h.cleanup().await;
+}

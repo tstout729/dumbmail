@@ -15,12 +15,13 @@
 //! deleted by a background job.
 
 pub mod code;
+pub mod limit;
 pub mod runtime;
 pub mod send;
 
 use async_trait::async_trait;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -88,11 +89,26 @@ fn not_found() -> Response {
 /// `/s/<target><message ref><tag>`: find the target and the messages with that reference in its
 /// account, keep the one the tag was made for, record the click and redirect to the stored
 /// destination. Anything else (wrong shape, unknown, tampered, deleted target, closed account) gets
-/// the plain not-found page.
-async fn click(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+/// the plain not-found page. No lookup runs unless the server knows its index on `messages` is in
+/// place, and the lookup is limited (see [`limit`]).
+async fn click(State(state): State<AppState>, headers: HeaderMap, Path(path): Path<String>) -> Response {
     let Some((target, message_ref, tag)) = code::split(&path) else { return not_found() };
-    let Ok(rows) = sqlx::query_as::<_, (String, Uuid)>(LOOKUP_SQL).bind(target).bind(message_ref).fetch_all(&state.db).await else { return not_found() };
-    let Some((url, message_id)) = rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag)) else { return not_found() };
+    if !runtime::index_known(&state).await {
+        return not_found();
+    }
+    let ip = crate::public::client_ip(&headers);
+    let slot = match limit::LIMITER.admit(ip.as_deref()) {
+        Ok(slot) => slot,
+        Err(limit::Refused::TooMany) => return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response(),
+        Err(limit::Refused::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "busy, try again").into_response(),
+    };
+    let rows = sqlx::query_as::<_, (String, Uuid)>(LOOKUP_SQL).bind(target).bind(message_ref).fetch_all(&state.db).await;
+    drop(slot);
+    let found = rows.ok().and_then(|rows| rows.into_iter().find(|(url, id)| code::verify(&state.cfg.secret_key, target, url, *id, tag)));
+    let Some((url, message_id)) = found else {
+        limit::LIMITER.missed(ip.as_deref());
+        return not_found();
+    };
     // Only ever a destination the send path stored for this account.
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return not_found();

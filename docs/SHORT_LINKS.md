@@ -64,7 +64,9 @@ message can't record a click for another (the tag covers the message's full id, 
 6-character reference), and a link always goes where it went when it was sent: if cleanup frees a
 code and it's later given to another destination, the old link's tag no longer matches. Target codes and message references aren't secret; the tag is what
 can't be guessed. 12 base-62 characters is 62^12, about 3.2 × 10^21 (71 bits). The click endpoint
-has no rate limit, so assume an attacker sends 100,000 guesses a second for ten years
+limits each address to 30 lookups a minute that end in "not found" (then 429 for the rest of the
+minute) and 32 lookups at once per server (then 503), but don't count on that: assume an attacker
+spread over many addresses sends 100,000 guesses a second for ten years
 (3 × 10^13 guesses): each guess matches with probability at most 1 in 3.2 × 10^21 for each message
 sharing that reference (almost always one), so the chance of forging a single click in all that time
 is about 1 in 100 million. Message references are 6 characters (5.7 × 10^10 values per account): two
