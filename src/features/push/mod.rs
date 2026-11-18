@@ -148,6 +148,9 @@ async fn identity_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<V
 #[derive(Deserialize)]
 struct TestDeviceBody {
     subscription: Value,
+    /// The auth secret this browser had for the endpoint, when its keys changed.
+    #[serde(default)]
+    proof: Option<Value>,
 }
 
 /// The dashboard's own browser, as a test device for the signed-in member (never in an audience).
@@ -159,9 +162,27 @@ async fn test_device_h(State(state): State<AppState>, ctx: Ctx, headers: axum::h
     if !providers::endpoint_allowed(&state, endpoint) || !crypto::check_subscription_keys(p256dh, auth) {
         return Err(AppError::bad("that isn't a browser push subscription"));
     }
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND test_user_id = $2").bind(ctx.account_id).bind(user).fetch_one(&state.db).await?;
-    if count >= 5 {
-        sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE account_id = $1 AND test_user_id = $2 ORDER BY last_seen_at LIMIT 1)").bind(ctx.account_id).bind(user).execute(&state.db).await?;
+    // One transaction holding the browser's row: a browser that's another member's test device
+    // becomes this member's only for whoever holds it (its current auth secret, compared in
+    // constant time), checked before anything is evicted for the cap.
+    let mut tx = state.db.begin().await?;
+    let current: Option<(Option<Uuid>, Option<Uuid>, Option<String>)> =
+        sqlx::query_as("SELECT profile_id, test_user_id, auth_secret FROM push_devices WHERE account_id = $1 AND kind = 'web' AND address = $2 FOR UPDATE")
+            .bind(ctx.account_id)
+            .bind(endpoint)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some((None, member, stored)) = &current {
+        let proof = b.proof.as_ref().and_then(|p| p["auth"].as_str());
+        let shown = |c: Option<&str>| matches!((stored.as_deref(), c), (Some(s), Some(c)) if crypto::ct_eq(s, c));
+        if *member != Some(user) && !(shown(Some(auth)) || shown(proof)) {
+            return Err(AppError::Conflict("this browser is another team member's test device; adding it needs its current subscription".into()));
+        }
+    }
+    let theirs_already = current.as_ref().is_some_and(|c| c.1 == Some(user));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND test_user_id = $2").bind(ctx.account_id).bind(user).fetch_one(&mut *tx).await?;
+    if count >= 5 && !theirs_already {
+        sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE account_id = $1 AND test_user_id = $2 ORDER BY last_seen_at LIMIT 1)").bind(ctx.account_id).bind(user).execute(&mut *tx).await?;
     }
     let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|u| u.chars().take(300).collect::<String>());
     // A browser that is someone's linked device stays theirs; this only adds it as a test device.
@@ -181,9 +202,10 @@ async fn test_device_h(State(state): State<AppState>, ctx: Ctx, headers: axum::h
     .bind(p256dh)
     .bind(auth)
     .bind(ua)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
     let id = id.ok_or_else(|| AppError::Conflict("this browser is already one of your audience's devices; send it a test from that person's profile".into()))?;
+    tx.commit().await?;
     Ok(Json(json!({"device_id": id})))
 }
 
