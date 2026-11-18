@@ -2806,3 +2806,50 @@ async fn refunds_are_read_in_full() {
     assert!(event(&h, "Ordered Product", "order:5002:11").await.is_none());
     h.cleanup().await;
 }
+
+/// Item 7: a store-made code is reused only for the store (and install) that made it.
+#[tokio::test]
+async fn store_codes_belong_to_the_connected_store() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    h.credit(5.0).await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    let c = h.ok("POST", "/api/coupons", Some(json!({"name": "WELCOME", "description": "10% off"}))).await;
+    let cid = c["id"].as_str().unwrap().to_string();
+    h.ok("PUT", &format!("/api/shopify/coupons/{cid}"), Some(json!({"title": "Welcome 10%", "value": {"percentage": 10}, "prefix": "HI"}))).await;
+    let list = h.ok("POST", "/api/lists", Some(json!({"name": "News"}))).await;
+    let lid: Uuid = list["id"].as_str().unwrap().parse().unwrap();
+    let p = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, email_consent) VALUES ($1, $2, 'ann@x.test', 'subscribed')").bind(p).bind(acct).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO list_members (list_id, profile_id) VALUES ($1, $2)").bind(lid).bind(p).execute(&h.state.db).await.unwrap();
+    let content = json!({"subject": "A code", "blocks": [{"type": "text", "html": "<p>CODE[{% coupon_code 'WELCOME' %}]</p>"}]});
+    let send = |h: &mut Harness| {
+        let content = content.clone();
+        let h = h as *mut Harness;
+        async move {
+            let h = unsafe { &mut *h };
+            let camp = h.ok("POST", "/api/campaigns", Some(json!({"name": "Sale", "channel": "email", "audience": {"include": [{"type": "list", "id": lid}]}, "content": content}))).await;
+            h.ok("POST", &format!("/api/campaigns/{}/send", camp["id"].as_str().unwrap()), None).await;
+            for _ in 0..5 {
+                h.fast_forward().await;
+            }
+            let m = h.state.email.sent().into_iter().rfind(|m| m.to == "ann@x.test").expect("sent");
+            let i = m.html.find("CODE[").unwrap() + 5;
+            m.html[i..].split(']').next().unwrap().to_string()
+        }
+    };
+    let a = send(&mut h).await;
+    assert!(mock.lock().unwrap().discounts.contains_key(&a));
+    // Store A is disconnected and store B connected: Ann's next message gets a code B made.
+    h.ok("POST", "/api/shopify/disconnect", Some(json!({"confirm": true}))).await;
+    connect_shop(&mut h, "second-store.myshopify.com").await;
+    let b = send(&mut h).await;
+    assert_ne!(b, a, "store A's code isn't handed out once store B is connected");
+    let shop: String = sqlx::query_scalar("SELECT shop_domain FROM shopify_discount_codes WHERE code = $1").bind(&b).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(shop, "second-store.myshopify.com");
+    // With the same store still connected, the person keeps their code.
+    assert_eq!(send(&mut h).await, b);
+    h.cleanup().await;
+}

@@ -10,3 +10,6 @@ ALTER TABLE shopify_customers ADD COLUMN generation integer;
 ALTER TABLE shopify_customer_profiles ADD COLUMN generation integer;
 ALTER TABLE shopify_created_profiles ADD COLUMN generation integer;
 ALTER TABLE shopify_products ADD COLUMN generation integer;
+
+-- The install a discount code was made for: a code is reused only for that store and install.
+ALTER TABLE shopify_discount_codes ADD COLUMN generation integer;
