@@ -559,20 +559,29 @@ fn expand_with(state: &AppState, account: &Account, content: &Value, ctx: &Value
 /// every block is hidden for them (the recipient is skipped with [`NOTHING_TO_SHOW`]). Content that
 /// uses nothing from this module comes back as is, without being read further or copied.
 pub async fn prepare<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value) -> AppResult<Option<Cow<'c, Value>>> {
-    // Language versions first (see features::translations): the person's language replaces the
+    // Saved blocks are read first (when the email uses any), so the languages they carry count too.
+    let saved = if uses_content_features(content) { Some(load_saved(&state.db, account.id, &content_refs(content)).await?) } else { None };
+    let saved_langs = saved.as_ref().map(crate::features::translations::saved_languages).unwrap_or_default();
+    // Language versions (see features::translations): the person's language replaces the
     // translated text, here and in saved blocks. Content without versions is passed on untouched.
-    if let Some((local, lang)) = crate::features::translations::localized(state, account, content, ctx).await? {
-        return Ok(prepare_in(state, account, &local, ctx, &lang).await?.map(|c| Cow::Owned(c.into_owned())));
+    if let Some((local, lang)) = crate::features::translations::localized(state, account, content, ctx, &saved_langs).await? {
+        let mut saved = saved;
+        if let Some(s) = saved.as_mut() {
+            crate::features::translations::localize_saved(s, &lang, &crate::features::translations::own_hosts(state, Some(account)));
+        }
+        return Ok(prepare_in(state, account, &local, ctx, saved).await?.map(|c| Cow::Owned(c.into_owned())));
     }
-    prepare_in(state, account, content, ctx, "").await
+    prepare_in(state, account, content, ctx, saved).await
 }
 
-async fn prepare_in<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value, lang: &str) -> AppResult<Option<Cow<'c, Value>>> {
+async fn prepare_in<'c>(state: &AppState, account: &Account, content: &'c Value, ctx: &Value, saved: Option<SavedMap>) -> AppResult<Option<Cow<'c, Value>>> {
     if !uses_content_features(content) {
         return Ok(Some(Cow::Borrowed(content)));
     }
-    let mut saved = load_saved(&state.db, account.id, &content_refs(content)).await?;
-    crate::features::translations::localize_saved(&mut saved, lang, &crate::features::translations::own_hosts(state, Some(account)));
+    let saved = match saved {
+        Some(s) => s,
+        None => load_saved(&state.db, account.id, &content_refs(content)).await?,
+    };
     let (prepared, shows, rule_errors) = expand_with(state, account, content, ctx, &saved, false)?;
     if rule_errors > 0 {
         tracing::info!(account = %account.id, rules = rule_errors, "display rules couldn't be decided for a recipient; their blocks were hidden");

@@ -58,14 +58,33 @@ fn pin() -> Option<String> {
 /// For the content prepare step: `content` in the person's language (from `ctx.person.locale`)
 /// with `_lang` and the footer lines in that language (`_footer`), and the language; None when
 /// the content has no language versions (it's used as it is).
-pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx: &Value) -> AppResult<Option<(Value, String)>> {
+///
+/// `saved_langs` are the languages the email's saved blocks carry (see [`saved_languages`]); with
+/// those, an email whose only translations are in a saved block is versioned too.
+pub async fn localized(state: &AppState, account: &Account, content: &Value, ctx: &Value, saved_langs: &[String]) -> AppResult<Option<(Value, String)>> {
     let person = ctx.pointer("/person/locale").and_then(|v| v.as_str());
-    let Some(lang) = fields::choose(content, person, pin().as_deref()) else { return Ok(None) };
+    let mut extra = saved_langs.to_vec();
+    for l in fields::saved_block_languages(content) {
+        if !extra.contains(&l) {
+            extra.push(l);
+        }
+    }
+    let account_default = if extra.is_empty() || content.get("translations").is_some() { "en".to_string() } else { texts::settings(&state.db, account.id).await?.default_language };
+    let Some(lang) = fields::choose(content, &extra, &account_default, person, pin().as_deref()) else { return Ok(None) };
     let mut out = fields::localize(content, &lang, &own_hosts(state, Some(account)));
     if !lang.is_empty() {
         out["_footer"] = texts::footer(&state.db, account.id, &lang).await;
     }
     Ok(Some((out, lang)))
+}
+
+/// The languages the saved blocks an email points at carry.
+pub fn saved_languages(saved: &SavedMap) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, blocks) in saved.values() {
+        fields::blocks_languages(blocks, &mut out);
+    }
+    out
 }
 
 /// Saved blocks in the language being sent (their blocks carry their own translations).

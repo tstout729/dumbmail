@@ -624,16 +624,67 @@ pub fn has_versions(content: &Value) -> bool {
 /// version with the same tag, else the same language, else the message's default. None when the
 /// message has no language versions (nothing to do). `pinned` (a preview or test in a chosen
 /// language) wins over the person's.
-pub fn choose(content: &Value, person_locale: Option<&str>, pinned: Option<&str>) -> Option<String> {
-    let Some(tr) = content.get("translations").filter(|t| t.is_object()) else {
+///
+/// `extra` are languages the email's saved blocks carry (an email whose only translations are in
+/// a saved block is versioned too); `account_default` is the default when the email doesn't say.
+pub fn choose(content: &Value, extra: &[String], account_default: &str, person_locale: Option<&str>, pinned: Option<&str>) -> Option<String> {
+    let tr = content.get("translations").filter(|t| t.is_object());
+    if tr.is_none() && extra.is_empty() {
         // Content can't set the computed keys itself; strip them (empty: no language).
         return COMPUTED.iter().any(|k| content.get(*k).is_some()).then(String::new);
-    };
-    let default = tr.get("default").and_then(|d| d.as_str()).and_then(locale::normalize).unwrap_or_else(|| "en".into());
+    }
+    let default = tr.and_then(|t| t.get("default")).and_then(|d| d.as_str()).and_then(locale::normalize).or_else(|| locale::normalize(account_default)).unwrap_or_else(|| "en".into());
     let mut all = vec![default.clone()];
-    all.extend(tr.get("languages").and_then(|l| l.as_array()).into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)));
+    all.extend(tr.and_then(|t| t.get("languages")).and_then(|l| l.as_array()).into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)));
+    for l in extra {
+        if !all.contains(l) {
+            all.push(l.clone());
+        }
+    }
     let pick = |want: &str| locale::best_match(want, &all).cloned();
     Some(pinned.and_then(pick).or_else(|| person_locale.and_then(pick)).unwrap_or(default))
+}
+
+/// The languages carried by the blocks of saved blocks that were copied into `content` (frozen
+/// when a campaign's send started).
+pub fn saved_block_languages(content: &Value) -> Vec<String> {
+    fn inner(list: &[Value], in_saved: bool, out: &mut Vec<String>) {
+        for b in list {
+            if in_saved {
+                for k in b.get("i18n").and_then(|m| m.as_object()).into_iter().flat_map(|m| m.keys()) {
+                    if !out.contains(k) {
+                        out.push(k.clone());
+                    }
+                }
+            }
+            match s(b, "type") {
+                "saved" if b.get("frozen").and_then(|f| f.as_bool()) == Some(true) => inner(b.get("blocks").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]), true, out),
+                "columns" => {
+                    for col in b.get("columns").and_then(|c| c.as_array()).into_iter().flatten() {
+                        inner(col.as_array().map(|a| a.as_slice()).unwrap_or(&[]), in_saved, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    inner(content.get("blocks").and_then(|b| b.as_array()).map(|a| a.as_slice()).unwrap_or(&[]), false, &mut out);
+    out
+}
+
+/// The languages a saved block's blocks carry.
+pub fn blocks_languages(blocks: &Value, out: &mut Vec<String>) {
+    for b in blocks.as_array().into_iter().flatten() {
+        for k in b.get("i18n").and_then(|m| m.as_object()).into_iter().flat_map(|m| m.keys()) {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        for col in b.get("columns").and_then(|c| c.as_array()).into_iter().flatten() {
+            blocks_languages(col, out);
+        }
+    }
 }
 
 /// One block in `lang`: each translated field that's current replaces the default text, then the
@@ -830,14 +881,14 @@ mod tests {
         let mut c = email();
         add_language(&mut c, "en", "fr");
         add_language(&mut c, "en", "pt-BR");
-        assert_eq!(choose(&c, Some("fr-CA"), None).as_deref(), Some("fr"));
-        assert_eq!(choose(&c, Some("pt-PT"), None).as_deref(), Some("pt-BR"));
-        assert_eq!(choose(&c, Some("en-GB"), None).as_deref(), Some("en"));
-        assert_eq!(choose(&c, Some("de"), None).as_deref(), Some("en"));
-        assert_eq!(choose(&c, None, None).as_deref(), Some("en"));
-        assert_eq!(choose(&c, Some("de"), Some("fr")).as_deref(), Some("fr"));
-        assert_eq!(choose(&email(), Some("fr"), None), None, "no versions: nothing to do");
-        assert_eq!(choose(&json!({"subject": "x", "_lang": "fr"}), None, None).as_deref(), Some(""), "content can't set _lang");
+        assert_eq!(choose(&c, &[], "en", Some("fr-CA"), None).as_deref(), Some("fr"));
+        assert_eq!(choose(&c, &[], "en", Some("pt-PT"), None).as_deref(), Some("pt-BR"));
+        assert_eq!(choose(&c, &[], "en", Some("en-GB"), None).as_deref(), Some("en"));
+        assert_eq!(choose(&c, &[], "en", Some("de"), None).as_deref(), Some("en"));
+        assert_eq!(choose(&c, &[], "en", None, None).as_deref(), Some("en"));
+        assert_eq!(choose(&c, &[], "en", Some("de"), Some("fr")).as_deref(), Some("fr"));
+        assert_eq!(choose(&email(), &[], "en", Some("fr"), None), None, "no versions: nothing to do");
+        assert_eq!(choose(&json!({"subject": "x", "_lang": "fr"}), &[], "en", None, None).as_deref(), Some(""), "content can't set _lang");
     }
 
     #[test]

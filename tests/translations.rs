@@ -821,3 +821,36 @@ async fn localized_links_are_real_web_addresses_and_never_dumbmails_own() {
     assert!(html.contains("mailto:bonjour@acme.test"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn translations_inside_a_saved_block_are_used_on_their_own() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    set_languages(&mut h, json!(["fr"])).await;
+    let (_, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Sign-off", "blocks": [{"type": "text", "html": "<p>See you soon</p>"}]}))).await;
+    let sbid = sb["id"].as_str().unwrap().to_string();
+    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "fr", "strings": [{"id": "b0:html", "text": "<p>À bientôt</p>"}]}))).await;
+    // The email itself has no translations at all.
+    let content = json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "News"}, {"type": "saved", "saved_block_id": sbid}]});
+    let ann = person(&mut h, "ann@x.test", Some("fr")).await;
+    let bob = person(&mut h, "bob@x.test", None).await;
+    let list = list_of(&mut h, &[ann, bob]).await;
+    // A campaign: the saved block is copied in when the send starts, translations and all.
+    let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "SB", "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+    h.ok("POST", &format!("/api/campaigns/{}/send", c["id"].as_str().unwrap()), None).await;
+    h.drain().await;
+    let sent = h.state.email.sent();
+    let a = sent.iter().find(|m| m.to == "ann@x.test").unwrap();
+    let b = sent.iter().find(|m| m.to == "bob@x.test").unwrap();
+    assert!(a.html.contains("À bientôt") && a.html.contains(r#"<html lang="fr">"#), "{}", a.html);
+    assert!(b.html.contains("See you soon") && !b.html.contains("À bientôt"));
+    // A flow: the saved block is read live.
+    let flow = h.ok("POST", "/api/flows", Some(json!({"name": "F", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "e1", "nodes": [{"id": "e1", "type": "email", "content": content, "next": null}]}}))).await;
+    h.ok("POST", &format!("/api/flows/{}/status", flow["id"].as_str().unwrap()), Some(json!({"status": "live"}))).await;
+    h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "ann@x.test"}}))).await;
+    h.fast_forward().await;
+    let m = h.state.email.sent().into_iter().filter(|m| m.to == "ann@x.test").last().unwrap();
+    assert!(m.html.contains("À bientôt"), "{}", m.html);
+    h.cleanup().await;
+}
