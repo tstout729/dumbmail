@@ -875,3 +875,64 @@ async fn two_texts_taking_the_same_reference_at_once_both_go_out() {
     assert!(click(&h, &p[0]).await.0.is_redirection());
     h.cleanup().await;
 }
+
+/// Send one campaign message the way `campaigns::send_batch` does, for a person loaded before.
+async fn send_campaign_message(h: &Harness, cid: Uuid, mid: Uuid, profile: &dumbmail::models::Profile) -> dumbmail::sending::Outcome {
+    let account = dumbmail::campaigns::load_account(&h.state.db, account_id(h).await).await.unwrap();
+    let c = dumbmail::campaigns::load(&h.state.db, account.id, cid).await.unwrap();
+    let spec = dumbmail::sending::SendSpec {
+        account: &account, profile, channel: &c.channel, content: &c.content, campaign_id: Some(cid), flow_id: None, flow_node_id: None, event: None, is_test: false, message_id: Some(mid), to_override: None,
+    };
+    dumbmail::sending::send(&h.state, spec).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_person_deleted_mid_campaign_is_skipped_and_the_campaign_goes_on() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    for (channel, content) in [("sms", json!({"body": "Acme Goods: https://shop.test/mid-send"})), ("email", json!({"subject": "Hi", "blocks": [{"type": "text", "html": "<p><a href=\"https://shop.test/e\">Shop</a></p>"}]}))] {
+        let list = h.ok("POST", "/api/lists", Some(json!({"name": format!("People {channel}")}))).await["id"].as_str().unwrap().to_string();
+        let mut people = Vec::new();
+        for n in 0..3u32 {
+            let p = if channel == "sms" {
+                texter(&mut h, &list, 8900 + n).await
+            } else {
+                let email = format!("p{n}@x.test");
+                let p = h.ok("POST", "/api/profiles", Some(json!({"email": email, "email_consent": "subscribed", "list_ids": [list]}))).await;
+                (p["id"].as_str().unwrap().parse().unwrap(), email)
+            };
+            people.push(p);
+        }
+        let c = h.ok("POST", "/api/campaigns", Some(json!({"name": format!("Mid {channel}"), "channel": channel, "audience": {"include": [{"type": "list", "id": list}]}, "content": content}))).await;
+        let cid: Uuid = c["id"].as_str().unwrap().parse().unwrap();
+        sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(cid).execute(&h.state.db).await.unwrap();
+        dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
+        // The first person was claimed and loaded, then deleted before the send wrote their message.
+        let (gone, gone_to) = people[0].clone();
+        let mid: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND profile_id = $2").bind(cid).bind(gone).fetch_one(&h.state.db).await.unwrap();
+        sqlx::query("UPDATE messages SET status = 'sending', claimed_at = now() WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
+        let q = format!("SELECT {} FROM profiles p WHERE p.id = $1", dumbmail::models::PROFILE_COLS);
+        let profile: dumbmail::models::Profile = sqlx::query_as(&q).bind(gone).fetch_one(&h.state.db).await.unwrap();
+        if channel == "sms" {
+            sqlx::query("DELETE FROM profiles WHERE id = $1").bind(gone).execute(&h.state.db).await.unwrap();
+        } else {
+            // An email reads the person again earlier in the send (its suppression check, as on
+            // main), so here only the message row goes, as the person's deletion does to it.
+            sqlx::query("DELETE FROM messages WHERE id = $1").bind(mid).execute(&h.state.db).await.unwrap();
+        }
+        let out = send_campaign_message(&h, cid, mid, &profile).await;
+        assert!(matches!(out, dumbmail::sending::Outcome::Skipped("profile deleted")), "{channel}: {out:?}");
+        let sent_to_gone = if channel == "sms" { h.state.sms.sent().iter().filter(|s| s.to == gone_to).count() } else { h.state.email.sent().iter().filter(|e| e.to == gone_to).count() };
+        assert_eq!(sent_to_gone, 0, "{channel}: nothing goes to the deleted person");
+        // Everyone else still gets it, and the campaign doesn't fail.
+        let rest: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1 AND status = 'queued'").bind(cid).fetch_all(&h.state.db).await.unwrap();
+        assert_eq!(rest.len(), 2);
+        dumbmail::campaigns::send_batch(&h.state, cid, &rest).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+        assert_ne!(status, "failed", "{channel}");
+        let sent: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE campaign_id = $1 AND status = 'sent'").bind(cid).fetch_one(&h.state.db).await.unwrap();
+        assert_eq!(sent, 2, "{channel}");
+    }
+    let _ = (acct, list);
+    h.cleanup().await;
+}
