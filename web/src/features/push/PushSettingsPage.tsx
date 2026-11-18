@@ -125,6 +125,22 @@ function urlKey(b64: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+/** Wait until the worker is active. (`serviceWorker.ready` never settles here: the worker's scope doesn't cover this page.) */
+async function activated(reg: ServiceWorkerRegistration): Promise<ServiceWorkerRegistration> {
+  const worker = reg.installing ?? reg.waiting;
+  if (reg.active || !worker) return reg;
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("The browser didn't start the notification worker.")), 15_000);
+    worker.addEventListener("statechange", () => {
+      if (worker.state === "activated") {
+        window.clearTimeout(timer);
+        resolve();
+      }
+    });
+  });
+  return reg;
+}
+
 /** Subscribe this browser (on the dashboard's own address) as the member's test device, then send it a test. */
 function TestInThisBrowser({ settings }: { settings: PushSettings }) {
   const canTest = useCan("campaigns.test");
@@ -142,8 +158,7 @@ function TestInThisBrowser({ settings }: { settings: PushSettings }) {
         setError(permission === "denied" ? "This browser blocks notifications from DumbMail. Allow them in the browser's site settings and try again." : "Notifications weren't allowed.");
         return;
       }
-      const reg = await navigator.serviceWorker.register(`/push/sw.js?k=${encodeURIComponent(settings.public_key)}`, { scope: "/push/" });
-      await navigator.serviceWorker.ready;
+      const reg = await activated(await navigator.serviceWorker.register(`/push/sw.js?k=${encodeURIComponent(settings.public_key)}`, { scope: "/push/" }));
       const sub = (await reg.pushManager.getSubscription()) ?? (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlKey(key) }));
       await add.mutateAsync(sub.toJSON());
       const r = await send.mutateAsync({ to: "me" });
