@@ -160,6 +160,8 @@ pub async fn render_preview(state: &AppState, account_id: Uuid, b: RenderBody) -
     // Saved blocks and display rules (see features::content); email without them goes on untouched.
     let prepared = crate::features::content::prepare::for_preview(state, &account, &b.content, &ctx, profile.is_none()).await?;
     let content = crate::features::catalog::personalize(&state.db, &account, profile.as_ref(), b.event.as_ref(), &prepared, &mut ctx, true).await?.into_owned();
+    // Review blocks and links show samples in a preview and make nothing (see features::reviews).
+    let content = crate::features::reviews::personalize(state, &account, profile.as_ref(), b.event.as_ref(), &content, &b.channel, true, None).await?.into_owned();
     // A preview shows a sample coupon code and uses none.
     crate::features::coupons::template::fill_sample(&mut ctx);
     if b.channel == "email" {
@@ -929,8 +931,10 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             return Err(AppError::bad("add at least one step before turning the flow on"));
         }
         let account = load_account(&state.db, account_id).await?;
-        let has_email = def.nodes.iter().any(|n| n.kind == "email");
-        let has_sms = def.nodes.iter().any(|n| n.kind == "sms");
+        // A review request step sends on its own channel (see features::reviews).
+        let channel = |n: &flows::Node| if n.kind == "review_request" { n.data.get("channel").and_then(|v| v.as_str()).unwrap_or("email").to_string() } else { n.kind.clone() };
+        let has_email = def.nodes.iter().any(|n| channel(n) == "email");
+        let has_sms = def.nodes.iter().any(|n| channel(n) == "sms");
         if has_email && account.from_email.is_none() {
             return Err(AppError::bad("set a sender email in Settings → Sending before turning on a flow with emails"));
         }
@@ -947,9 +951,9 @@ pub async fn set_flow_status(state: &AppState, account_id: Uuid, id: Uuid, statu
             }
         }
         for n in &def.nodes {
-            if n.kind == "email" || n.kind == "sms" || n.kind == "push" {
+            if matches!(n.kind.as_str(), "email" | "sms" | "push" | "review_request") {
                 let content = n.data.get("content").cloned().unwrap_or(json!({}));
-                render_preview(state, account_id, RenderBody { channel: n.kind.clone(), content, profile_id: None, event: Some(json!({"properties": {}})) })
+                render_preview(state, account_id, RenderBody { channel: channel(n), content, profile_id: None, event: Some(json!({"properties": {}})) })
                     .await
                     .map_err(|e| AppError::bad(format!("step {}: {}", n.id, e.public_message())))?;
             }

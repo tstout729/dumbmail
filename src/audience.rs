@@ -296,7 +296,7 @@ pub async fn fill_location_from_timezone(db: &PgPool, profile_id: Uuid, tz: &str
 
 /// Metrics only DumbMail itself records, from a real stock or price change or a confirmed request:
 /// nobody may send them, not even with an API key. Feature modules add theirs here.
-pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock"];
+pub const SERVER_ONLY_METRICS: &[&str] = &["Back in Stock", "Price Dropped", "Subscribed to Back in Stock", "Submitted Review", "Ready To Review"];
 
 /// Metrics the server records about messages, consent and sign-ups. Flows trust them, so a browser
 /// (the public `/client/events` endpoint) may not send them. The API and MCP still may (for imports).

@@ -269,7 +269,7 @@ fn id_arg(a: &Value) -> AppResult<Uuid> {
 }
 
 const BLOCK_TYPES: &[&str] = &[
-    "heading", "text", "image", "button", "divider", "spacer", "columns", "product", "products", "html", "social", "video", "countdown", "table", "quote", "header", "nav", "footer", "image_text",
+    "heading", "text", "image", "button", "divider", "spacer", "columns", "product", "products", "html", "social", "video", "countdown", "table", "quote", "header", "nav", "footer", "image_text", "reviews", "review_request",
 ];
 
 #[async_trait]

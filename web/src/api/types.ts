@@ -5,6 +5,7 @@ import type { PushContent } from "../features/push/types";
 import type { ProductCondition, ProductsBlock } from "../features/catalog/types";
 import type { BlockOptions, ContentBlock } from "../features/content/types";
 import type { CouponBlock, CouponCondition } from "../features/coupons/types";
+import type { ReviewCondition, ReviewRequestBlock, ReviewRequestNode, ReviewsBlock } from "../features/reviews/types";
 import type { LanguageCondition } from "../features/translations/types";
 
 /** `pending`: signed up through a double opt-in form and hasn't confirmed by email yet (gets no email). */
@@ -217,6 +218,7 @@ export type GroupCondition = { type: "group"; match: "all" | "any"; conditions: 
 export type Condition =
   | ProductCondition
   | CouponCondition
+  | ReviewCondition
   | PropertyCondition
   | EventCondition
   | EventValueCondition
@@ -259,6 +261,8 @@ export type EmailBlock = BlockOptions & {
   | ProductsBlock
   | ContentBlock
   | CouponBlock
+  | ReviewsBlock
+  | ReviewRequestBlock
   );
 
 export type EmailBlockType = EmailBlock["type"];
@@ -423,6 +427,7 @@ export type WebhookNode = {
 };
 
 export type FlowNode =
+  | ReviewRequestNode
   | DelayNode
   | EmailNode
   | SmsNode
