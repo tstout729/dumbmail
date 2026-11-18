@@ -30,6 +30,28 @@ pub const MAX_DEVICES_PER_PROFILE: i64 = 10;
 pub const MAX_REGISTRATIONS_PER_HOUR: i32 = 30;
 /// Anonymous devices an account keeps at most.
 pub const MAX_ANONYMOUS: i64 = 200_000;
+/// Devices per account, anonymous and identified alike.
+pub const MAX_DEVICES_PER_ACCOUNT: i64 = 1_000_000;
+
+/// Test hook: lower an account's device caps (per account, anonymous). Never set outside tests.
+#[doc(hidden)]
+pub mod caps {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+    use uuid::Uuid;
+
+    static CAPS: Lazy<Mutex<HashMap<Uuid, (i64, i64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    pub fn lower(account_id: Uuid, per_account: i64, anonymous: i64) {
+        CAPS.lock().unwrap_or_else(|e| e.into_inner()).insert(account_id, (per_account, anonymous));
+    }
+
+    pub(super) fn of(account_id: Uuid) -> (i64, i64) {
+        CAPS.lock().unwrap_or_else(|e| e.into_inner()).get(&account_id).copied().unwrap_or((super::MAX_DEVICES_PER_ACCOUNT, super::MAX_ANONYMOUS))
+    }
+}
 const MAX_BODY: usize = 8 * 1024;
 
 const SW_JS: &str = include_str!("sw.js");
@@ -248,12 +270,27 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
     }
     // 3. The settings row.
     sqlx::query("SELECT 1 FROM push_settings WHERE account_id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
-    if fresh {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM push_devices WHERE account_id = $1 AND anonymous").bind(account_id).fetch_one(&mut *tx).await?;
-        if count >= MAX_ANONYMOUS {
+    // The caps, before anything is stored: a new device must fit the account's (all devices, and
+    // anonymous ones); the person's least recently seen devices beyond theirs are turned off first.
+    if existing.is_none() {
+        let (max_all, max_anonymous) = caps::of(account_id);
+        let (all, anon): (i64, i64) = sqlx::query_as("SELECT count(*), count(*) FILTER (WHERE anonymous) FROM push_devices WHERE account_id = $1").bind(account_id).fetch_one(&mut *tx).await?;
+        if all >= max_all {
+            return Err(AppError::Busy("this account has too many push devices; turned-off and unused ones are removed over time".into()));
+        }
+        if anonymous && anon >= max_anonymous {
             return Err(AppError::Busy("this account has too many anonymous push devices; unused ones are removed after 180 days".into()));
         }
     }
+    sqlx::query(
+        "UPDATE push_devices SET status = 'disabled', disabled_at = now()
+         WHERE id IN (SELECT id FROM push_devices WHERE profile_id = $1 AND status = 'active' AND id IS DISTINCT FROM $2 ORDER BY last_seen_at DESC, id DESC OFFSET $3)",
+    )
+    .bind(profile_id)
+    .bind(existing.as_ref().map(|e| e.0))
+    .bind(MAX_DEVICES_PER_PROFILE - 1)
+    .execute(&mut *tx)
+    .await?;
     let keys = r.keys.map(|k| (k.0.to_string(), k.1.to_string()));
     let id = match &existing {
         Some((id, ..)) => {
@@ -299,15 +336,6 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             id
         }
     };
-    // Over the per-person cap: their least recently seen devices are turned off.
-    sqlx::query(
-        "UPDATE push_devices SET status = 'disabled', disabled_at = now()
-         WHERE id IN (SELECT id FROM push_devices WHERE profile_id = $1 AND status = 'active' ORDER BY last_seen_at DESC, id DESC OFFSET $2)",
-    )
-    .bind(profile_id)
-    .bind(MAX_DEVICES_PER_PROFILE)
-    .execute(&mut *tx)
-    .await?;
     // The device left a nameless profile: it goes too when nothing else is on it (its lock is held).
     if let Some(old) = old_owner.filter(|o| *o != profile_id) {
         forget_nameless_in(&mut tx, &[old]).await?;
@@ -404,9 +432,9 @@ pub async fn unsubscribe(State(state): State<AppState>, Query(q): Query<KeyQuery
             let a = account_by_key(&state, &q.k).await?;
             let b = body_json(&body)?;
             let (Some(endpoint), Some(auth)) = (b["endpoint"].as_str(), b["auth"].as_str()) else { return Err(AppError::bad("endpoint and auth are required")) };
-            let n = sqlx::query("DELETE FROM push_devices WHERE account_id = $1 AND kind = 'web' AND address = $2 AND auth_secret = $3").bind(a.id).bind(endpoint).bind(auth).execute(&state.db).await?.rows_affected();
+            let gone = remove(&state, a.id, "web", endpoint, Some(auth)).await?;
             // Confirmed either way: after this the server has no such registration.
-            Ok(json!({"ok": true, "removed": n}))
+            Ok(json!({"ok": true, "removed": gone as i64}))
         }
         .await,
     )
@@ -433,6 +461,24 @@ pub async fn sign_out(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         }
         .await,
     )
+}
+
+/// Forget a device (for web, only with its secret); an anonymous one's nameless profile goes too
+/// when nothing else is on it, so subscribing and unsubscribing can't pile up profiles.
+async fn remove(state: &AppState, account_id: Uuid, kind: &str, address: &str, auth: Option<&str>) -> AppResult<bool> {
+    let gone: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+        "DELETE FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3 AND ($4::text IS NULL OR auth_secret = $4) RETURNING profile_id, anonymous",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(address)
+    .bind(auth)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some((Some(p), true)) = gone {
+        forget_nameless(&state.db, &[p]).await?;
+    }
+    Ok(gone.is_some())
 }
 
 fn check_token(platform: &str, token: &str) -> AppResult<()> {
@@ -529,7 +575,7 @@ pub async fn remove_device(State(state): State<AppState>, Query(q): Query<KeyQue
             let token = b["token"].as_str().unwrap_or_default().trim();
             check_token(platform, token)?;
             let token = if platform == "ios" { token.to_ascii_lowercase() } else { token.to_string() };
-            sqlx::query("DELETE FROM push_devices WHERE account_id = $1 AND kind = $2 AND address = $3").bind(a.id).bind(platform).bind(&token).execute(&state.db).await?;
+            remove(&state, a.id, platform, &token, None).await?;
             Ok(json!({"ok": true}))
         }
         .await,
@@ -771,6 +817,25 @@ var window = { isSecureContext: true, PushManager: function () {}, Notification:
         let subscribe = v["log"].as_array().unwrap().iter().rfind(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).cloned().unwrap();
         assert_eq!(subscribe["body"]["identity"]["grant"], "v1.9999999999.abcd");
         assert!(v["log"].as_array().unwrap().iter().any(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/sign-out"))), "{v}");
+    }
+
+    #[test]
+    fn a_sign_out_that_fails_stops_the_subscription_here_and_is_retried_until_confirmed() {
+        let v = run("__sub = mkSub();", &push_js(), &["__fetchOk = false", "window.dumbmail.notifications.signOut()"]);
+        assert!(has(&v, "unsubscribe"), "the browser stops using it at once: {v}");
+        assert!(v["ls"]["pl_push_removal"].as_str().is_some_and(|s| s.contains("fcm.googleapis.com")), "{v}");
+        // Later pages: the unlink is sent again until DumbMail confirms it.
+        let ls = v["ls"].to_string();
+        let v = run(&format!("var __saved = {ls}; for (var k in __saved) __ls[k] = __saved[k]; __fetchOk = false;"), &push_js(), &[]);
+        assert!(v["ls"]["pl_push_removal"].as_str().is_some(), "still kept: {v}");
+        let ls = v["ls"].to_string();
+        let v = run(&format!("var __saved = {ls}; for (var k in __saved) __ls[k] = __saved[k];"), &push_js(), &[]);
+        let sent: Vec<&Value> = v["log"].as_array().unwrap().iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/unsubscribe"))).collect();
+        assert_eq!((sent.len(), sent[0]["body"]["auth"].as_str()), (1, Some("A")), "{v}");
+        assert!(v["ls"].get("pl_push_removal").is_none(), "confirmed: {v}");
+        // A server that answers but refuses counts as not confirmed too.
+        let v = run("__sub = mkSub(); fetch = function (u, i) { __log.push({ fetch: u }); return Promise.resolve({ ok: false }); };", &push_js(), &["window.dumbmail.notifications.signOut()"]);
+        assert!(has(&v, "unsubscribe") && v["ls"]["pl_push_removal"].as_str().is_some(), "{v}");
     }
 
     const WORKER: &str = r#"

@@ -99,14 +99,21 @@
       return forget(proof).then(function () { return sub ? sub.unsubscribe() : false; });
     });
   }
-  // The site's visitor signed out: this browser goes back to being anonymous.
+  // The site's visitor signed out: this browser goes back to being anonymous. If DumbMail can't
+  // confirm that, the browser stops using this subscription (so the person signed out gets nothing
+  // more here) and the unlink is sent again on later pages until DumbMail confirms it.
   function signOut() {
     grant = null;
     store.del("pl_push_sent");
     if (!supported) return Promise.resolve();
     return existing().then(function (sub) {
       if (!sub) return;
-      return post("/client/push/sign-out", { endpoint: sub.endpoint, auth: (sub.toJSON().keys || {}).auth });
+      var proof = { endpoint: sub.endpoint, auth: (sub.toJSON().keys || {}).auth };
+      return post("/client/push/sign-out", proof).then(function (r) {
+        if (!r || !r.ok) throw new Error("not confirmed");
+      }).catch(function () {
+        return Promise.resolve(sub.unsubscribe()).catch(function () {}).then(function () { return forget(proof); });
+      });
     }).catch(function () {});
   }
 

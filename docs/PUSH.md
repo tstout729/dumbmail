@@ -80,7 +80,9 @@ A device is linked to a person only with an **enrollment grant** that your own s
 ```js
 // On your site, after sign-in (grant made on your server):
 dumbmail.notifications.identify({ type: "external_id", value: "cust_123", grant: "v1.1795000000.9f2c…" });
-// On sign-out: this browser goes back to an anonymous profile of its own.
+// On sign-out: this browser goes back to an anonymous profile of its own. If DumbMail can't be
+// reached, the browser drops its subscription at once and the snippet sends the unlink again on
+// later pages until DumbMail confirms it.
 dumbmail.notifications.signOut();
 ```
 
@@ -335,6 +337,6 @@ Campaigns take `channel: "push"`; flows take `{"type": "push", "content": {...},
 
 ## Limits
 
-- 30 device registrations an hour from one address, per account. 10 active devices per person (registering an 11th turns off their least recent). 200,000 anonymous devices per account; anonymous devices unused for 180 days are removed.
+- 30 device registrations an hour from one address, per account. 10 active devices per person (registering an 11th turns off their least recent). 1,000,000 devices per account, of which at most 200,000 anonymous; all are checked before a new device is stored. Anonymous devices unused for 180 days are removed. When an anonymous device is removed (unsubscribed, gone, or unused), its anonymous profile is deleted too unless something else is on it (another device, a list, or activity other than push's own).
 - 50 test sends an hour per account.
 - Web push only goes to the browsers' own push services (Google, Mozilla, Microsoft and Apple).

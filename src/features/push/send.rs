@@ -1068,7 +1068,12 @@ pub async fn cleanup(state: &AppState) -> anyhow::Result<()> {
     }
     sqlx::query("DELETE FROM push_registration_counts WHERE hour < now() - interval '1 day'").execute(&state.db).await?;
     sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE status = 'disabled' AND disabled_at < now() - interval '30 days' LIMIT 1000)").execute(&state.db).await?;
-    sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE anonymous AND last_seen_at < now() - interval '180 days' LIMIT 1000)").execute(&state.db).await?;
+    let owners: Vec<Option<Uuid>> =
+        sqlx::query_scalar("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE anonymous AND last_seen_at < now() - interval '180 days' LIMIT 1000) RETURNING profile_id")
+            .fetch_all(&state.db)
+            .await?;
+    let owners: Vec<Uuid> = owners.into_iter().flatten().collect();
+    super::client::forget_nameless(&state.db, &owners).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     Ok(())
 }
 

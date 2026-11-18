@@ -1367,3 +1367,51 @@ async fn a_flow_push_step_is_sent_by_the_worker_holding_the_run_only() {
     assert_eq!(count(&h, &format!("SELECT count(*) FROM messages WHERE profile_id = '{q}' AND flow_id = '{fid}'")).await, 1, "one message for the visit");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn nameless_profiles_dont_pile_up_and_device_caps_hold_before_anything_is_stored() {
+    let (mut h, _m, base) = push_harness!(0.0);
+    let a = setup(&mut h).await;
+    let nameless = "SELECT count(*) FROM profiles WHERE properties ? 'anonymous_push_subscriber'";
+    let unsubscribe = |b: &Browser| json!({"endpoint": b.endpoint, "auth": b.auth});
+
+    // Subscribing and unsubscribing without a grant, again and again, leaves nobody behind.
+    for i in 0..3 {
+        let b = browser(&base, &format!("n{i}"));
+        assert_eq!(subscribe(&h, &a, &b, json!({})).await.0, StatusCode::OK);
+        assert_eq!(public_post(&h, "/client/push/unsubscribe", &a.key, unsubscribe(&b)).await.0, StatusCode::OK);
+    }
+    assert_eq!((count(&h, nameless).await, count(&h, "SELECT count(*) FROM push_devices").await), (0, 0));
+
+    // A sign-out leaves a nameless profile; removing the device then takes it too.
+    let l = list(&mut h, "L").await;
+    person(&mut h, &l, "ana@x.test", "Ana").await;
+    let b = browser(&base, "signed");
+    enroll(&h, &a, &b, "ana@x.test").await;
+    public_post(&h, "/client/push/sign-out", &a.key, unsubscribe(&b)).await;
+    assert_eq!(count(&h, nameless).await, 1);
+    public_post(&h, "/client/push/unsubscribe", &a.key, unsubscribe(&b)).await;
+    assert_eq!(count(&h, nameless).await, 0);
+
+    // One with something else on it (here, a list) stays.
+    let b = browser(&base, "kept");
+    subscribe(&h, &a, &b, json!({})).await;
+    let p: Uuid = sqlx::query_scalar("SELECT profile_id FROM push_devices WHERE address LIKE '%/kept'").fetch_one(&h.state.db).await.unwrap();
+    h.ok("POST", &format!("/api/lists/{l}/members"), Some(json!({"profile_ids": [p]}))).await;
+    public_post(&h, "/client/push/unsubscribe", &a.key, unsubscribe(&b)).await;
+    assert_eq!(count(&h, nameless).await, 1);
+
+    // The caps: per account, for anonymous and identified devices alike, checked before storing.
+    dumbmail::features::push::client::caps::lower(a.id, 2, 1);
+    assert_eq!(subscribe(&h, &a, &browser(&base, "c1"), json!({})).await.0, StatusCode::OK);
+    let before = (count(&h, "SELECT count(*) FROM push_devices").await, count(&h, nameless).await);
+    assert_ne!(subscribe(&h, &a, &browser(&base, "c2"), json!({})).await.0, StatusCode::OK, "anonymous cap");
+    assert_eq!((count(&h, "SELECT count(*) FROM push_devices").await, count(&h, nameless).await), before, "nothing stored");
+    let c3 = browser(&base, "c3");
+    enroll(&h, &a, &c3, "ana@x.test").await;
+    let (s, _) = subscribe(&h, &a, &browser(&base, "c4"), a.grant("email", "ana@x.test")).await;
+    assert_ne!(s, StatusCode::OK, "the account cap counts identified devices too");
+    assert_eq!(count(&h, "SELECT count(*) FROM push_devices").await, 2);
+    enroll(&h, &a, &c3, "ana@x.test").await;
+    h.cleanup().await;
+}
