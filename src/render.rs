@@ -165,13 +165,19 @@ fn take_marks(rendered: &str, open: &str, close: &str) -> (String, Vec<std::ops:
 /// How much of what the URL pattern found in a text is the link: trailing sentence punctuation
 /// (`.` `,` `!` `?` `;` `:`, quotes, and closing brackets that aren't balanced inside the link) is
 /// left out and stays in the text after it, so "Shop the sale: https://shop.example/sale." links to
-/// `/sale`. Long tracked links and short links (`features::short_links`) end in the same place.
+/// `/sale`. So is a trailing character from another script that isn't a letter or digit (an emoji,
+/// `”`, `’`, `…`, `。`); letters and digits in any script, and the marks that combine with them,
+/// stay part of the link. Long tracked links and short links (`features::short_links`) end in the
+/// same place.
 pub fn sms_link_len(found: &str) -> usize {
+    // Combining marks (accents written as a separate character) belong to the letter before them.
+    let combining = |c: char| matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F);
     let mut end = found.len();
     while let Some(last) = found[..end].chars().last() {
         let link = &found[..end];
         let unbalanced = |open: char, close: char| last == close && link.matches(close).count() > link.matches(open).count();
-        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') {
+        let other_script_ending = !last.is_ascii() && !last.is_alphanumeric() && !combining(last);
+        if matches!(last, '.' | ',' | '!' | '?' | ';' | ':' | '\'' | '"') || unbalanced('(', ')') || unbalanced('[', ']') || unbalanced('{', '}') || other_script_ending {
             end -= last.len_utf8();
         } else {
             break;

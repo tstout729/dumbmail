@@ -393,6 +393,23 @@ mod tests {
         assert_eq!(cut("https://shop.example/e!)."), "https://shop.example/e");
         assert_eq!(cut("https://shop.example/"), "https://shop.example/");
         assert_eq!(cut("https://shop.example/?a=b"), "https://shop.example/?a=b");
+        // Sentence endings from other scripts stay in the text too.
+        assert_eq!(cut("https://shop.test/sale.🙂"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale🎉🎉"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale👍🏽"), "https://shop.test/sale", "an emoji with a skin tone");
+        assert_eq!(cut("https://shop.test/sale❤️"), "https://shop.test/sale", "an emoji with its variation selector");
+        assert_eq!(cut("https://shop.test/sale”"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale.’"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale»"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale…"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale。"), "https://shop.test/sale");
+        assert_eq!(cut("https://shop.test/sale）"), "https://shop.test/sale");
+        // Letters and digits in any script, and combining marks, are part of the link.
+        assert_eq!(cut("https://bücher.example/straße"), "https://bücher.example/straße");
+        assert_eq!(cut("https://例え.jp/パス"), "https://例え.jp/パス");
+        assert_eq!(cut("https://shop.test/кафе."), "https://shop.test/кафе");
+        assert_eq!(cut("https://shop.test/cafe\u{301}"), "https://shop.test/cafe\u{301}");
+        assert_eq!(cut("https://shop.test/١٢٣"), "https://shop.test/١٢٣");
     }
 
     #[test]

@@ -21,7 +21,9 @@ them off in Settings → Texting (`PATCH /api/short-links/settings`, MCP
   completed (`https://shop.com/buy {{- 'now' }}` renders as `/buynow`) keeps the long form, which
   goes where it reads. Sentence punctuation right after a link (`.` `,` `!` `?` `;` `:`, quotes,
   and closing brackets that aren't balanced inside the link) isn't part of it: it stays in the text
-  after the short link. The destination is exactly the characters the short link replaced. So
+  after the short link. Neither is a trailing character from another script that isn't a letter or
+  digit, like an emoji, `”`, `’`, `…` or `。`; letters in any script (`https://bücher.example/straße`)
+  stay in the link. The destination is exactly the characters the short link replaced. So
   "Shop the sale: https://shop.com/sale." shows the short link followed by a full stop and goes to
   `https://shop.com/sale`. Links that keep the long tracked form end in the same place.
 - Not shortened (they keep the long tracked form, as before): anything a variable or template tag
