@@ -95,6 +95,9 @@ struct PreviewBody {
     #[serde(default, deserialize_with = "present")]
     send_options: Option<Value>,
     send_at: Option<DateTime<Utc>>,
+    /// Push: the platforms it goes to (missing: the campaign's, or every platform).
+    #[serde(default)]
+    platforms: Option<Vec<String>>,
 }
 
 /// Deserializes a present field (even `null`) as Some, so a missing field stays None.
@@ -109,8 +112,8 @@ async fn preview(state: &AppState, account_id: Uuid, b: PreviewBody) -> AppResul
         None => None,
     };
     let channel = b.channel.or_else(|| c.as_ref().map(|c| c.channel.clone())).unwrap_or_else(|| "email".into());
-    if channel != "email" && channel != "sms" {
-        return Err(AppError::bad("channel must be email or sms"));
+    if !matches!(channel.as_str(), "email" | "sms" | "push") {
+        return Err(AppError::bad("channel must be email, sms or push"));
     }
     let audience_v = b.audience.or_else(|| c.as_ref().map(|c| c.audience.clone())).ok_or_else(|| AppError::bad("give an audience or a campaign_id"))?;
     let audience: Audience = serde_json::from_value(audience_v).map_err(|e| AppError::bad(format!("invalid audience: {e}")))?;
@@ -126,7 +129,13 @@ async fn preview(state: &AppState, account_id: Uuid, b: PreviewBody) -> AppResul
         o.local_date = None;
     }
     let send_at = b.send_at.or_else(|| c.as_ref().filter(|c| c.status == "scheduled").and_then(|c| c.send_at));
-    plan::preview(state, account_id, &channel, &audience, opts, send_at).await
+    // Push counts only people with a device on a platform it goes to, as the send does.
+    let platforms = match (channel.as_str(), b.platforms) {
+        ("push", Some(p)) => Some(p),
+        ("push", None) => c.as_ref().and_then(|c| crate::campaigns::push_platforms(&channel, &c.content, c.ab_test.as_ref())),
+        _ => None,
+    };
+    plan::preview(state, account_id, &channel, &audience, platforms, opts, send_at).await
 }
 
 async fn preview_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<PreviewBody>) -> AppResult<Json<Value>> {
@@ -185,7 +194,7 @@ impl Feature for Module {
         let audience = json!({"type": "object", "description": "{include: [{type: list|segment, id}], exclude: [...]}"});
         vec![
             tool("preview_send_plan", "Preview when a campaign goes out", "Estimate how many recipients get the campaign when, for its send options (or the send_options given here): 15-minute buckets with their main time zones, from a random sample of up to 2,000 recipients scaled to the audience. Also counts who smart sending would skip right now. Nothing is sent or saved.",
-                obj(json!({"campaign_id": {"type": "string"}, "send_options": send_options_schema(), "send_at": {"type": "string", "format": "date-time", "description": "When sending starts (for local_time: the day). Defaults to the campaign's schedule, or now."}, "channel": {"enum": ["email", "sms"]}, "audience": audience}), &[]), true, false),
+                obj(json!({"campaign_id": {"type": "string"}, "send_options": send_options_schema(), "send_at": {"type": "string", "format": "date-time", "description": "When sending starts (for local_time: the day). Defaults to the campaign's schedule, or now."}, "channel": {"enum": ["email", "sms", "push"]}, "platforms": {"type": "array", "items": {"enum": ["web", "ios", "android"]}, "description": "Push: the platforms it goes to (defaults to the campaign's)."}, "audience": audience}), &[]), true, false),
             tool("get_send_progress", "Campaign send progress by time zone", "For a campaign that is sending or sent: messages per release time (with their time zones) waiting, sent, skipped by smart sending, skipped for other reasons and failed, plus the next release and skip reasons.",
                 obj(json!({"campaign_id": {"type": "string"}}), &["campaign_id"]), true, false),
             tool("get_send_settings", "Get SMS quiet hours", "The hours texts may go out in each recipient's own time zone (default 09:00-20:00; never wider than 08:00-21:00), using their phone number's zone (a profile time zone can only narrow it). Texts outside the window wait for it to open. sms_zone_conflict: what happens when the phone's and profile's zones never share texting hours.", obj(json!({}), &[]), true, false),
@@ -205,7 +214,7 @@ impl Feature for Module {
                     Some(_) => Some(uuid_arg(a, "campaign_id")?),
                     None => None,
                 };
-                preview(state, acct, PreviewBody { campaign_id, channel: a["channel"].as_str().map(String::from), audience: a.get("audience").cloned(), send_options: a.get("send_options").cloned(), send_at }).await
+                preview(state, acct, PreviewBody { campaign_id, channel: a["channel"].as_str().map(String::from), audience: a.get("audience").cloned(), send_options: a.get("send_options").cloned(), send_at, platforms: a.get("platforms").cloned().map(serde_json::from_value).transpose().map_err(|_| AppError::bad("platforms must be a list of web, ios and android"))? }).await
             }
             .await,
             "get_send_progress" => async { plan::progress(&state.db, acct, uuid_arg(a, "campaign_id")?).await }.await,

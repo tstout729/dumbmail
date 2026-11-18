@@ -385,8 +385,15 @@ struct MockGuesty {
     seen: Mutex<Vec<(String, String, String)>>,
 }
 
+/// The mock's change times: an hour before the test run started, one second apart, so they stay
+/// inside the pull's 24-hour look-back whatever day the tests run (a fixed date ran out of it).
 fn mock_updated_at(i: usize) -> String {
-    format!("2026-11-17T10:{:02}:{:02}.000Z", i / 60, i % 60)
+    static BASE: std::sync::OnceLock<chrono::DateTime<chrono::Utc>> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        use chrono::Timelike;
+        (chrono::Utc::now() - chrono::Duration::hours(1)).with_nanosecond(0).unwrap()
+    });
+    (base + chrono::Duration::seconds(i as i64)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// A stand-in for Guesty's Open API: OAuth tokens, `GET /v1/reservations-v3/search` (changed
