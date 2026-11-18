@@ -178,12 +178,30 @@ pub async fn record_addresses(state: &AppState, account_id: Uuid, emails: &[Stri
     statuses(&state.db, account_id, &emails).await
 }
 
+/// SQL (binds: $1 account, $2 address): why another confirmation link can't be handed over now, or
+/// NULL. Counts links already handed over (`handing` or `sent`) in each window.
+const CONFIRM_LIMIT: &str = "CASE
+    WHEN EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2 AND status IN ('handing', 'sent') AND handed_at > now() - interval '1 hour') THEN 'address_hour'
+    WHEN (SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND status IN ('handing', 'sent') AND handed_at > now() - interval '24 hours') >= 50 THEN 'account_day'
+    WHEN (SELECT count(*) FROM flow_notify_confirm_sends WHERE email = $2 AND status IN ('handing', 'sent') AND handed_at > now() - interval '24 hours') >= 3 THEN 'address_day'
+  END";
+
+fn limit_message(reason: &str, e: &str) -> String {
+    match reason {
+        "address_hour" => format!("{e} was sent a confirmation link in the last hour; try again later"),
+        "account_day" => format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow"),
+        "address_day" => format!("{e} was sent {MAX_PER_ADDRESS_PER_DAY} confirmation links in the last 24 hours; try again tomorrow"),
+        _ => format!("a confirmation link to {e} is already on its way"),
+    }
+}
+
 /// Ask an outside address to confirm: without `confirm`, says whether a link would go out. Refused
 /// while the account's sending is paused, for team members (they need none), for confirmed,
-/// bounced or complaining addresses. Limits, enforced in the insert that records it: one per
-/// address per day across all accounts, except that an account's first request to an address goes
-/// even after another account's (so it can't be blocked) while the address has had fewer than
-/// [`MAX_PER_ADDRESS_PER_DAY`] that day; and [`MAX_CONFIRMATIONS_PER_DAY`] per account.
+/// bounced or complaining addresses, and when a limit already rules it out. Limits (one per address
+/// per account an hour, [`MAX_CONFIRMATIONS_PER_DAY`] per account a day, [`MAX_PER_ADDRESS_PER_DAY`]
+/// per address a day across all accounts) count links actually handed over, and are enforced again
+/// in the statement that claims the link for sending: a request queued meanwhile past a limit is
+/// dropped there, with the reason kept for the step's settings.
 pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email: &str, confirm: bool) -> AppResult<Value> {
     let e = normalize_email(email).ok_or_else(|| AppError::bad("that isn't an email address"))?;
     if !team_addresses(&state.db, account_id, std::slice::from_ref(&e)).await?.is_empty() {
@@ -206,13 +224,28 @@ pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email
     if confirmed {
         return Err(AppError::bad(format!("{e} already confirmed")));
     }
+    let knowable = |db: &PgPool| {
+        let e = e.clone();
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(&format!(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2 AND status = 'queued') THEN 'queued' ELSE {CONFIRM_LIMIT} END"
+            ))
+            .bind(account_id)
+            .bind(&e)
+            .fetch_one(&db)
+            .await
+        }
+    };
+    if let Some(reason) = knowable(&state.db).await? {
+        return Err(AppError::Busy(limit_message(&reason, &e)));
+    }
     if !confirm {
         return Ok(json!({"dry_run": true, "email": e, "confirm": "Call again with confirm: true to email this address a link to confirm."}));
     }
     record_addresses(state, account_id, std::slice::from_ref(&e)).await?;
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
-    // One per address a day across all accounts: serialize on the address.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 11))").bind(&e).execute(&mut *tx).await?;
     // Asking a removed address again brings it back: it counts against the addresses waiting.
     let reviving: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_notify_addresses WHERE account_id = $1 AND email = $2 AND removed_at IS NOT NULL)")
@@ -229,62 +262,78 @@ pub async fn send_confirmation_request(state: &AppState, account_id: Uuid, email
             return Err(AppError::Conflict(format!("at most {MAX_PENDING} outside addresses can wait to confirm; remove some first")));
         }
     }
-    let sent: Option<i64> = sqlx::query_scalar(
+    // One request waiting per account and address (checked again under the locks).
+    let attempt: Option<i64> = sqlx::query_scalar(
         "INSERT INTO flow_notify_confirm_sends (account_id, email) SELECT $1, $2
-         WHERE ((SELECT count(*) FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') = 0
-                OR (NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2)
-                    AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE email = $2 AND sent_at > now() - interval '24 hours') < $4))
-           AND (SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours') < $3
-         RETURNING id",
+         WHERE NOT EXISTS (SELECT 1 FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = $2 AND status = 'queued') RETURNING id",
     )
     .bind(account_id)
     .bind(&e)
-    .bind(MAX_CONFIRMATIONS_PER_DAY)
-    .bind(MAX_PER_ADDRESS_PER_DAY)
     .fetch_optional(&mut *tx)
     .await?;
-    if sent.is_none() {
-        let account_today: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_confirm_sends WHERE account_id = $1 AND sent_at > now() - interval '24 hours'")
-            .bind(account_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        // Under the account's limit, so it was the address's.
-        let address_today = account_today < MAX_CONFIRMATIONS_PER_DAY;
-        return Err(AppError::Busy(if address_today {
-            format!("{e} was sent a confirmation link in the last 24 hours; try again tomorrow")
-        } else {
-            format!("this account sent {MAX_CONFIRMATIONS_PER_DAY} confirmation emails in the last 24 hours; try again tomorrow")
-        }));
-    }
+    let Some(attempt) = attempt else { return Err(AppError::Busy(limit_message("queued", &e))) };
     sqlx::query("UPDATE flow_notify_addresses SET requested_at = now(), removed_at = NULL WHERE account_id = $1 AND email = $2").bind(account_id).bind(&e).execute(&mut *tx).await?;
-    crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "email": e}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, CONFIRM_JOB, json!({"account_id": account_id, "attempt_id": attempt}), None).await?;
     tx.commit().await?;
-    Ok(json!({"email": e, "status": "pending", "sent": true}))
+    Ok(json!({"email": e, "status": "queued", "sent": true}))
 }
 
-/// Job: send an outside address its confirmation link (a fresh one; earlier links stop working).
-/// Pause and suppression are checked again right before it's handed over.
+/// Job: hand one confirmation request over. Pause and suppression are checked again first; then the
+/// request is claimed for sending in one statement that enforces the limits (counting links already
+/// handed over), or dropped with the reason. A retried job finds its request already claimed and
+/// sends nothing new.
 pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Result<()> {
-    let (Some(account_id), Some(email)) = (payload["account_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()), payload["email"].as_str()) else { return Ok(()) };
+    let Some(attempt) = payload["attempt_id"].as_i64() else { return Ok(()) };
+    let row: Option<(Uuid, String, String)> = sqlx::query_as("SELECT account_id, email, status FROM flow_notify_confirm_sends WHERE id = $1").bind(attempt).fetch_optional(&state.db).await?;
+    let Some((account_id, email, status)) = row else { return Ok(()) };
+    if status != "queued" {
+        return Ok(());
+    }
     let (paused, bad): (bool, bool) = sqlx::query_as(&format!("SELECT COALESCE((SELECT sending_paused_at IS NOT NULL FROM accounts WHERE id = $1), true), {BAD_ADDRESS}"))
         .bind(account_id)
-        .bind(email)
+        .bind(&email)
         .fetch_one(&state.db)
         .await?;
     if paused || bad {
-        tracing::info!(account = %account_id, "confirmation email not sent: sending paused or the address bounced");
+        let why = if paused { "not sent: sending is paused for this account" } else { "not sent: mail to this address bounced or drew a complaint" };
+        sqlx::query("UPDATE flow_notify_confirm_sends SET status = 'skipped', error = $2 WHERE id = $1 AND status = 'queued'").bind(attempt).bind(why).execute(&state.db).await?;
         return Ok(());
     }
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE").bind(account_id).execute(&mut *tx).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 11))").bind(&email).execute(&mut *tx).await?;
+    let claimed: Option<i64> = sqlx::query_scalar(&format!(
+        "UPDATE flow_notify_confirm_sends SET status = 'handing', handed_at = now() WHERE id = $3 AND status = 'queued' AND ({CONFIRM_LIMIT}) IS NULL RETURNING id"
+    ))
+    .bind(account_id)
+    .bind(&email)
+    .bind(attempt)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if claimed.is_none() {
+        let reason: Option<String> = sqlx::query_scalar(&format!("SELECT {CONFIRM_LIMIT}")).bind(account_id).bind(&email).fetch_one(&mut *tx).await?;
+        if let Some(reason) = reason {
+            sqlx::query("UPDATE flow_notify_confirm_sends SET status = 'dropped', error = $2 WHERE id = $1 AND status = 'queued'")
+                .bind(attempt)
+                .bind(format!("not sent: {}", limit_message(&reason, &email)))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    tx.commit().await?;
     let token = crate::auth::random_token(32);
     let updated: Option<String> = sqlx::query_scalar(
         "UPDATE flow_notify_addresses SET token_hash = $3, requested_at = now() WHERE account_id = $1 AND email = $2 AND confirmed_at IS NULL AND removed_at IS NULL AND blocked_reason IS NULL RETURNING email",
     )
     .bind(account_id)
-    .bind(email)
+    .bind(&email)
     .bind(crate::auth::sha256_hex(&token))
     .fetch_optional(&state.db)
     .await?;
     if updated.is_none() {
+        sqlx::query("UPDATE flow_notify_confirm_sends SET status = 'skipped', error = 'not sent: the address was removed or confirmed meanwhile' WHERE id = $1").bind(attempt).execute(&state.db).await?;
         return Ok(());
     }
     let account = crate::campaigns::load_account(&state.db, account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -294,7 +343,9 @@ pub async fn send_confirmation(state: &AppState, payload: &Value) -> anyhow::Res
         format!("{name} wants to email you notifications from one of their automated flows in DumbMail (for example, when a booking or an order comes in)."),
         "Confirm below to start getting them. If you don't know them or don't want these, ignore this email: you'll get nothing.".to_string(),
     ];
-    crate::features::team::mail::send(state, email, &format!("Confirm notifications from {name}"), &lines, ("Confirm notifications", &url), &format!("This link works for {LINK_DAYS} days.")).await;
+    let sent = crate::features::team::mail::send(state, &email, &format!("Confirm notifications from {name}"), &lines, ("Confirm notifications", &url), &format!("This link works for {LINK_DAYS} days.")).await;
+    let (status, why) = if sent { ("sent", None) } else { ("failed", Some("not sent: the email provider didn't take it")) };
+    sqlx::query("UPDATE flow_notify_confirm_sends SET status = $2, error = $3 WHERE id = $1").bind(attempt).bind(status).bind(why).execute(&state.db).await?;
     Ok(())
 }
 
@@ -358,6 +409,14 @@ pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppRe
             .bind(&emails)
             .fetch_all(db)
             .await?;
+    // The latest confirmation request for each, with why it wasn't sent if it wasn't.
+    let attempts: Vec<(String, String, Option<String>, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT DISTINCT ON (email) email, status, error, requested_at FROM flow_notify_confirm_sends WHERE account_id = $1 AND email = ANY($2) ORDER BY email, id DESC",
+    )
+    .bind(account_id)
+    .bind(&emails)
+    .fetch_all(db)
+    .await?;
     Ok(emails
         .iter()
         .map(|e| {
@@ -368,7 +427,9 @@ pub async fn statuses(db: &PgPool, account_id: Uuid, emails: &[String]) -> AppRe
                 (Some((_, c, r, None)), false) => row_status(*c, *r, None),
                 (None, false) => "new",
             };
-            json!({"email": e, "status": status, "blocked_reason": k.and_then(|k| k.3.clone())})
+            let last = attempts.iter().find(|a| &a.0 == e);
+            json!({"email": e, "status": status, "blocked_reason": k.and_then(|k| k.3.clone()),
+                   "last_confirmation": last.map(|a| json!({"status": a.1, "error": a.2, "at": a.3}))})
         })
         .collect())
 }

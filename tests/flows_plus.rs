@@ -317,29 +317,57 @@ async fn confirmation_emails_need_settings_rights_and_respect_pause_and_limits()
     assert_eq!(s, StatusCode::CONFLICT);
     sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
 
-    // Asked, then paused before it went out: checked again at the handoff, so nothing is sent.
+    // Asked, then paused before it went out: checked again at the handoff, so nothing is sent, and
+    // the reason shows.
     h.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
     sqlx::query("UPDATE accounts SET sending_paused_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
     h.drain().await;
     assert_eq!(confirm_emails(&h, "a@outside.test"), 0);
     sqlx::query("UPDATE accounts SET sending_paused_at = NULL WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    let st = h.ok("GET", "/api/flows-plus/notify-addresses?emails=a@outside.test", None).await;
+    assert_eq!(st["statuses"][0]["last_confirmation"]["status"], "skipped", "{st}");
 
-    // Each account's first request to an address goes, so another account can't block it; repeats
-    // within a day are refused, from either account.
+    // It wasn't handed over, so it can be asked again; then one an hour per account.
+    h.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "a@outside.test"), 1);
+    let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+
+    // A retried job sends nothing new: once handed over (or claimed and cut off), never again.
+    let sent_attempt: i64 = sqlx::query_scalar("SELECT id FROM flow_notify_confirm_sends WHERE account_id = $1 AND status = 'sent'").bind(acct).fetch_one(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue_background(&h.state.db, "flows_plus_confirm_address", json!({"account_id": acct, "attempt_id": sent_attempt}), None).await.unwrap();
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "a@outside.test"), 1);
+
+    // Another account's request isn't blocked by this one's; a second while one waits is.
     let mut other = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
     other.ok("POST", "/api/auth/signup", Some(json!({"email": "else@other.test", "password": "correct horse", "company": "Other"}))).await;
     other.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
     let (s, v) = other.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
-    let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
-    // However many accounts ask, an address gets at most 3 a day.
-    for i in 0..3 {
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "a@outside.test"), 2);
+
+    // Three a day per address across accounts, counted when they're handed over: two more accounts
+    // ask while neither has gone out; the first goes, the second is dropped with the reason.
+    let mut many = Vec::new();
+    for i in 0..2 {
         let mut x = Harness { state: h.state.clone(), router: h.router.clone(), cookie: None, admin: h.admin.clone(), dbname: String::new() };
         x.ok("POST", "/api/auth/signup", Some(json!({"email": format!("x{i}@many.test"), "password": "correct horse", "company": format!("Many {i}")}))).await;
-        let (s, v) = x.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
-        assert_eq!(s, if i == 0 { StatusCode::OK } else { StatusCode::TOO_MANY_REQUESTS }, "account {i}: {v}");
+        x.ok("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "a@outside.test", "confirm": true}))).await;
+        many.push(x);
     }
+    h.drain().await;
+    assert_eq!(confirm_emails(&h, "a@outside.test"), 3, "never more than three a day");
+    let mut reasons = Vec::new();
+    for x in many.iter_mut() {
+        let st = x.ok("GET", "/api/flows-plus/notify-addresses?emails=a@outside.test", None).await;
+        reasons.push(st["statuses"][0]["last_confirmation"].clone());
+    }
+    assert_eq!(reasons.iter().filter(|r| r["status"] == "sent").count(), 1, "{reasons:?}");
+    let dropped = reasons.iter().find(|r| r["status"] == "dropped").expect("one dropped");
+    assert!(dropped["error"].as_str().unwrap().contains("try again tomorrow"), "{dropped}");
 
     // Two requests racing for the same address and account: exactly one is recorded.
     let (a, b) = tokio::join!(
@@ -350,24 +378,26 @@ async fn confirmation_emails_need_settings_rights_and_respect_pause_and_limits()
     let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM flow_notify_confirm_sends WHERE email = 'race@outside.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(recorded, 1);
 
-    // 50 a day per account.
-    for i in 0..60 {
-        sqlx::query("INSERT INTO flow_notify_confirm_sends (account_id, email) VALUES ($1, $2)").bind(acct).bind(format!("filler{i}@outside.test")).execute(&h.state.db).await.unwrap();
+    // 50 a day per account, counting ones handed over.
+    for i in 0..50 {
+        sqlx::query("INSERT INTO flow_notify_confirm_sends (account_id, email, status, handed_at) VALUES ($1, $2, 'sent', now())").bind(acct).bind(format!("filler{i}@outside.test")).execute(&h.state.db).await.unwrap();
     }
     let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "late@outside.test", "confirm": true}))).await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    sqlx::query("UPDATE flow_notify_confirm_sends SET handed_at = now() - interval '2 days', status = 'sent'").execute(&h.state.db).await.unwrap();
+
     // Asking a removed address again counts against the 20 waiting.
-    // Waiting now: a@, race@ and late@. 16 more makes 19; removing race@ makes 18; two more fill it.
-    for i in 0..16 {
+    // Waiting now: a@ and race@ (late@ was refused before it was recorded). 17 more makes 19;
+    // removing race@ makes 18; two more fill it.
+    for i in 0..17 {
         h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": format!("wait{i}@outside.test")}))).await;
     }
     h.ok("POST", "/api/flows-plus/notify-addresses/remove", Some(json!({"email": "race@outside.test"}))).await;
-    for i in 16..18 {
+    for i in 17..19 {
         h.ok("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": format!("wait{i}@outside.test")}))).await;
     }
     let (s, _) = h.req("POST", "/api/flows-plus/notify-addresses", Some(json!({"email": "one-too-many@outside.test"}))).await;
     assert_eq!(s, StatusCode::CONFLICT);
-    sqlx::query("UPDATE flow_notify_confirm_sends SET sent_at = sent_at - interval '2 days'").execute(&h.state.db).await.unwrap();
     let (s, v) = h.req("POST", "/api/flows-plus/notify-addresses/send-confirmation", Some(json!({"email": "race@outside.test", "confirm": true}))).await;
     assert_eq!(s, StatusCode::CONFLICT, "{v}");
 
@@ -954,7 +984,8 @@ async fn back_populate_has_one_cap_across_the_server_and_a_dead_job_frees_the_fl
     run(&h.state, &json!({"backfill_id": bid2})).await.unwrap();
     unsafe { std::env::remove_var("FLOW_BACKFILL_SERVER_CAP") };
     assert_eq!(flow_runs(&h, &fid2).await, 50, "only the room left on the server");
-    // A paused flow's waiting runs don't take anyone's room.
+    // A paused flow's waiting runs keep their room (they come back when it's turned on), so pausing
+    // and resuming can't get around the cap.
     let emails: Vec<String> = (0..60).map(|i| format!("s{i}@x.test")).collect();
     let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
     let (fid3, bid3, _) = list_backfill(&mut h, &refs).await;
@@ -963,9 +994,8 @@ async fn back_populate_has_one_cap_across_the_server_and_a_dead_job_frees_the_fl
     unsafe { std::env::set_var("FLOW_BACKFILL_SERVER_CAP", "200") };
     run(&h.state, &json!({"backfill_id": bid3})).await.unwrap();
     unsafe { std::env::remove_var("FLOW_BACKFILL_SERVER_CAP") };
-    // The second flow (live) has 150 waiting by now, so 50 is left of the 200; if the paused flow's
-    // 150 counted there would be no room at all.
-    assert_eq!(flow_runs(&h, &fid3).await, 50, "the paused flow's 150 don't count");
+    // 150 (paused) + 150 (live) are waiting: no room left of the 200.
+    assert_eq!(flow_runs(&h, &fid3).await, 0, "the paused flow's waiting runs still count");
 
     // A back-populate whose job runs out of retries is marked failed, and the flow can start another.
     let (fid2, bid2, _) = list_backfill(&mut h, &["x1@x.test"]).await;

@@ -377,13 +377,13 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         return Ok(());
     }
     // Pacing: enrol only as many as there is room for, for this flow and across the server.
-    // Counted: runs still waiting for their first step in live flows of open accounts (a paused flow
-    // or a closed account isn't taking anyone's room).
+    // Counted: runs still waiting for their first step in live or paused flows (a paused flow's
+    // runs come back when it's turned on) of open accounts.
     let (this_flow, this_account, all): (i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE m.backfill_id = $1), count(*) FILTER (WHERE b.account_id = $2), count(*) FROM flow_backfill_members m
          JOIN flow_backfills b ON b.id = m.backfill_id AND (b.status = 'running' OR b.finished_at > now() - interval '1 day')
          JOIN flow_runs r ON r.id = m.run_id
-         JOIN flows f ON f.id = r.flow_id AND f.status = 'live'
+         JOIN flows f ON f.id = r.flow_id AND f.status IN ('live', 'paused')
          JOIN accounts a ON a.id = b.account_id AND a.closed_at IS NULL
          WHERE m.done_at IS NOT NULL AND r.status = 'active' AND r.visited = '[]'::jsonb",
     )

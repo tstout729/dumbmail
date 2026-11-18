@@ -18,15 +18,20 @@ CREATE TABLE flow_notify_addresses (
     PRIMARY KEY (account_id, email)
 );
 
--- Every confirmation email sent, for the hourly per-address and daily per-account limits.
+-- Every request to email an address its confirmation link: queued, then handed over (`handing`,
+-- then `sent` or `failed`), `dropped` at hand-off by a limit or `skipped` (paused, bounced), with why.
+-- The limits count links handed over.
 CREATE TABLE flow_notify_confirm_sends (
-    id         bigserial PRIMARY KEY,
-    account_id uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    email      text NOT NULL,
-    sent_at    timestamptz NOT NULL DEFAULT now()
+    id           bigserial PRIMARY KEY,
+    account_id   uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    email        text NOT NULL,
+    status       text NOT NULL DEFAULT 'queued',
+    error        text,
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    handed_at    timestamptz
 );
-CREATE INDEX flow_notify_confirm_sends_idx ON flow_notify_confirm_sends (account_id, sent_at);
-CREATE INDEX flow_notify_confirm_sends_email_idx ON flow_notify_confirm_sends (email, sent_at);
+CREATE INDEX flow_notify_confirm_sends_idx ON flow_notify_confirm_sends (account_id, handed_at);
+CREATE INDEX flow_notify_confirm_sends_email_idx ON flow_notify_confirm_sends (email, handed_at);
 CREATE UNIQUE INDEX flow_notify_addresses_token_uq ON flow_notify_addresses (token_hash) WHERE token_hash IS NOT NULL;
 
 -- One row per run, step and recipient: who the step emails for that run and what it says, fixed
