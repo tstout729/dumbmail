@@ -181,13 +181,14 @@ A note in the delivery log.
 In a pull, fetch another page. In a webhook, look up the record it names: many apps (BigCommerce, Acuity, Eventbrite) send only an id. A webhook's lookup is read-only and declared up front in the pull settings, which also give the site, headers and credentials:
 
 ```json
-"fetch": {"paths": ["/stores/{{settings.store_hash}}/v2/orders/{id}"], "query": ["id:in"], "id": "^[0-9]{1,20}$", "context": ["refund"]}
+"fetch": {"prefix": "/stores/{{settings.store_hash}}/", "paths": ["/stores/{{settings.store_hash}}/v2/orders/{id}"], "query": ["id:in"], "id": "^[0-9]{1,20}$", "context": ["refund"]}
 ```
 
 - Always a `GET`. The script gives only `url` (a path), `query` and `context`; `method`, `headers` or `body` are refused.
 - The path must match one of `paths` exactly, where `{id}` is one path segment matching `id` (digits by default) and `{{settings.KEY}}` is filled in; query keys must be listed in `query`, with values that match `id`.
+- Every lookup stays under `prefix` (default `/`; the recipes name the part of the vendor's API they use). Each path in `paths` must start with it, and a lookup whose path, filled in and normalised, isn't under it is refused, even on the same site.
 - Only the `context` keys listed are kept; the context is put through the redact list's removals, sealed (it isn't shown in the delivery's request record), counted in the payload budget, and handed to the run on the answer as `input.context` (up to 16 KB).
-- The lookup is reserved in the same step that marks the webhook done: a delivery row (source `fetch`) that counts against the limits on work waiting to run, unique on what's fetched while it's outstanding, so a second webhook for the same record reuses it. Only the job holding it makes the request, and only once the payload budget has room for the answer.
+- The lookup is reserved in the same step that marks the webhook done: a delivery row (source `fetch`) that counts against the limits on work waiting to run, unique on the record (its path and query) while it's outstanding, so a second webhook for the same record joins it, and its context replaces the first one's. Only the job holding it makes the request, never before the row's due time (a retry wait or the app's cooldown), and only once the payload budget has room for a whole answer: that room is reserved before the request and held until the answer is stored, so a request that worked is never repeated for lack of space.
 - An answer that says "not yet" (404, 409, 425, 429, a server error) or a lost connection is tried again after 1, 5, 30 and 120 minutes, or after the wait the app asked for (`Retry-After`, or BigCommerce's `X-Rate-Limit-Time-Reset-Ms`, up to two hours).
 - The answer is kept on that row (redacted) and the script runs on it with `input.request`, `input.response` and `input.context`. That run may look up once more (up to 3 lookups from one webhook), for example a refund, then its order. A replay runs the current script again, which decides afresh what to look up.
 
