@@ -179,7 +179,7 @@
             "guestPhone": "",
             "guestState": "OR",
             "guestStatus": "confirmed",
-            "guestZip": "97201",
+            "guestZip": "97299",
             "isAnonymized": false,
             "isMainGuest": true,
             "roomID": "101",
@@ -236,6 +236,6 @@
     "Gate 8812",
     "Door 3391",
     "1990-01-01",
-    "97201"
+    "97299"
   ]
 }

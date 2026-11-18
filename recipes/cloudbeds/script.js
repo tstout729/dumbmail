@@ -225,10 +225,11 @@ function handle(input) {
   if (ev.indexOf("reservation/") !== 0) return [{ type: "log", message: "ignored Cloudbeds event " + (ev || "(none)") }];
   if (!id || !ID.test(id)) return [{ type: "log", message: "ignored " + ev + " without a reservation id" }];
   if (s.property_id && prop !== String(s.property_id)) return [{ type: "log", message: "ignored " + ev + " for another property (" + prop + ")" }];
-  // A deleted reservation can't be fetched any more. It's marked deleted (never paid) as of
-  // Cloudbeds' own time for the event, so an answer received before it can't bring it back.
+  // A deleted reservation can't be fetched any more. It's marked deleted (never paid) as of when
+  // this webhook is handled: later than any answer fetched before the deletion (versions are
+  // DumbMail's receive times, so Cloudbeds' own clock isn't mixed in), so none can bring it back.
   if (ev === "reservation/deleted") {
-    var at = typeof e.timestamp === "number" && isFinite(e.timestamp) ? new Date(Math.round(e.timestamp * 1000)).toISOString() : iso(input.now);
+    var at = iso(input.now);
     return [{ type: "upsert_object", object_type: "reservation", external_id: "cloudbeds:" + id, fields: { reservation_id: id, status: "deleted", paid_in_full: false, paid_checked_at: at }, as_of: at }];
   }
   if (FETCH_ON.indexOf(ev) < 0) return [{ type: "log", message: "ignored Cloudbeds event " + ev }];

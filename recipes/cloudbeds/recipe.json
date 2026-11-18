@@ -104,7 +104,17 @@
     "keep:data.assigned[].adults",
     "keep:data.assigned[].children",
     "keep:data.unassigned[].adults",
-    "keep:data.unassigned[].children"
+    "keep:data.unassigned[].children",
+    "keep:reservation_id",
+    "keep:property_id",
+    "keep:check_in",
+    "keep:check_out",
+    "keep:nights",
+    "keep:guests",
+    "keep:balance",
+    "keep:source_channel",
+    "keep:paid_in_full",
+    "keep:paid_checked_at"
   ],
   "object_types": [
     {
