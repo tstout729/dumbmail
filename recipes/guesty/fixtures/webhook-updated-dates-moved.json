@@ -1,0 +1,193 @@
+{
+  "description": "reservation.updated: the dates moved two days later",
+  "expect": [
+    {
+      "email": "dana.whitfield@example.com",
+      "first_name": "Dana",
+      "last_name": "Whitfield",
+      "phone_number": "+15035550142",
+      "properties": {
+        "guesty_guest_id": "66f1c4a06100f639de7adab8",
+        "last_check_in": "2026-12-19",
+        "last_listing": "Winery Villa"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Reservation Booked",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-19",
+        "check_out": "2026-12-23",
+        "confirmation_code": "GY-h5SdcsBL",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "reservation_id": "66f1c4a1246e7d9f0f8da88a",
+        "source_channel": "manual",
+        "status": "confirmed"
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:booked"
+    },
+    {
+      "metric": "Reservation Total",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-19",
+        "check_out": "2026-12-23",
+        "currency": "USD",
+        "listing_id": "66054019764cbb000f37c450",
+        "reservation_id": "66f1c4a1246e7d9f0f8da88a",
+        "total": 1312.5
+      },
+      "time": "2026-11-15T19:04:11.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:total",
+      "value": 1312.5
+    },
+    {
+      "metric": "Reservation Confirmed",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "check_in": "2026-12-19",
+        "check_out": "2026-12-23",
+        "confirmation_code": "GY-h5SdcsBL",
+        "guest_id": "66f1c4a06100f639de7adab8",
+        "guests": 3,
+        "listing_id": "66054019764cbb000f37c450",
+        "listing_name": "Winery Villa",
+        "nights": 4,
+        "reservation_id": "66f1c4a1246e7d9f0f8da88a",
+        "source_channel": "manual",
+        "status": "confirmed",
+        "version": "2026-11-16T10:00:00.000Z"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:confirmed:2026-11-16T10:00:00.000Z"
+    },
+    {
+      "metric": "Reservation Updated",
+      "profile": {
+        "email": "dana.whitfield@example.com"
+      },
+      "properties": {
+        "changed": [
+          "check_in",
+          "check_out"
+        ],
+        "check_in": "2026-12-19",
+        "check_out": "2026-12-23",
+        "listing_id": "66054019764cbb000f37c450",
+        "reservation_id": "66f1c4a1246e7d9f0f8da88a",
+        "status": "confirmed"
+      },
+      "time": "2026-11-16T10:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "guesty:66f1c4a1246e7d9f0f8da88a:updated:2026-11-16T10:00:00.000Z"
+    }
+  ],
+  "input": {
+    "now": "2026-11-17T18:00:00.000Z",
+    "payload": {
+      "event": "reservation.updated",
+      "meta": {
+        "eventId": "e4"
+      },
+      "reservation": {
+        "__v": 3,
+        "_id": "66f1c4a1246e7d9f0f8da88a",
+        "accountId": "5f1a2b3c4d5e6f7a8b9c0d1e",
+        "checkIn": "2026-12-19T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-19",
+        "checkOut": "2026-12-23T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-23",
+        "confirmationCode": "GY-h5SdcsBL",
+        "confirmedAt": "2026-11-15T19:04:11.000Z",
+        "createdAt": "2026-11-15T19:03:58.000Z",
+        "guest": {
+          "_id": "66f1c4a06100f639de7adab8",
+          "email": "dana.whitfield@example.com",
+          "emails": [
+            "dana.whitfield@example.com"
+          ],
+          "firstName": "Dana",
+          "fullName": "Dana Whitfield",
+          "lastName": "Whitfield",
+          "phone": "+1 (503) 555-0142",
+          "phones": [
+            "+1 (503) 555-0142"
+          ]
+        },
+        "guestId": "66f1c4a06100f639de7adab8",
+        "guestsCount": 3,
+        "id": "66f1c4a1246e7d9f0f8da88a",
+        "integration": {
+          "_id": "660d12b08048010013b6a2ef",
+          "platform": "manual"
+        },
+        "lastUpdatedAt": "2026-11-16T10:00:00.000Z",
+        "listing": {
+          "_id": "66054019764cbb000f37c450",
+          "nickname": "Winery Villa",
+          "title": "Standalone French Villa at the Winery"
+        },
+        "listingId": "66054019764cbb000f37c450",
+        "money": {
+          "balanceDue": 712.5,
+          "currency": "USD",
+          "fareAccommodation": 1100,
+          "hostPayout": 1210.2,
+          "totalPaid": 600,
+          "totalTaxes": 112.5
+        },
+        "nightsCount": 4,
+        "source": "manual",
+        "status": "confirmed"
+      },
+      "reservationBefore": {
+        "__v": 3,
+        "_id": "66f1c4a1246e7d9f0f8da88a",
+        "accountId": "5f1a2b3c4d5e6f7a8b9c0d1e",
+        "checkIn": "2026-12-17T23:00:00.000Z",
+        "checkInDateLocalized": "2026-12-17",
+        "checkOut": "2026-12-21T18:00:00.000Z",
+        "checkOutDateLocalized": "2026-12-21",
+        "confirmationCode": "GY-h5SdcsBL",
+        "confirmedAt": "2026-11-15T19:04:11.000Z",
+        "createdAt": "2026-11-15T19:03:58.000Z",
+        "guestId": "66f1c4a06100f639de7adab8",
+        "guestsCount": 3,
+        "id": "66f1c4a1246e7d9f0f8da88a",
+        "integration": {
+          "_id": "660d12b08048010013b6a2ef",
+          "platform": "manual"
+        },
+        "lastUpdatedAt": "2026-11-15T19:04:11.000Z",
+        "listingId": "66054019764cbb000f37c450",
+        "money": {
+          "balanceDue": 712.5,
+          "currency": "USD",
+          "fareAccommodation": 1100,
+          "hostPayout": 1210.2,
+          "totalPaid": 600,
+          "totalTaxes": 112.5
+        },
+        "nightsCount": 4,
+        "source": "manual",
+        "status": "confirmed"
+      }
+    },
+    "source": "webhook"
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "description": "charge.refunded that lists its refunds: each recorded by refund id (the same ids refund.created uses)",
+  "expect": [
+    {
+      "email": "jordan@example.com",
+      "first_name": "Jordan",
+      "keys": {
+        "stripe_charge": "ch_3QabCdEfGh1234",
+        "stripe_payment_intent": "pi_3QabCdEfGh1234"
+      },
+      "last_name": "Lee Park",
+      "properties": {
+        "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "payment_intent": "pi_3QabCdEfGh1234",
+        "reason": "requested_by_customer",
+        "refund_id": "re_1A"
+      },
+      "time": "2025-11-17T17:20:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:re_1A",
+      "value": 10
+    },
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "payment_intent": "pi_3QabCdEfGh1234",
+        "reason": "requested_by_customer",
+        "refund_id": "re_1B"
+      },
+      "time": "2025-11-17T18:20:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:re_1B",
+      "value": 20
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount": 5184,
+          "amount_captured": 5184,
+          "amount_refunded": 2000,
+          "billing_details": {
+            "address": {},
+            "email": "jordan@example.com",
+            "name": "Jordan Lee Park",
+            "phone": null
+          },
+          "currency": "usd",
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "id": "ch_3QabCdEfGh1234",
+          "object": "charge",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "receipt_email": "jordan@example.com",
+          "refunded": false,
+          "refunds": {
+            "data": [
+              {
+                "amount": 1000,
+                "charge": "ch_3QabCdEfGh1234",
+                "created": 1763400000,
+                "currency": "usd",
+                "customer": "cus_Qa1B2c3D4e5F6g",
+                "id": "re_1A",
+                "metadata": {},
+                "object": "refund",
+                "payment_intent": "pi_3QabCdEfGh1234",
+                "reason": "requested_by_customer",
+                "status": "succeeded"
+              },
+              {
+                "amount": 2000,
+                "charge": "ch_3QabCdEfGh1234",
+                "created": 1763403600,
+                "currency": "usd",
+                "customer": "cus_Qa1B2c3D4e5F6g",
+                "id": "re_1B",
+                "metadata": {},
+                "object": "refund",
+                "payment_intent": "pi_3QabCdEfGh1234",
+                "reason": "requested_by_customer",
+                "status": "succeeded"
+              }
+            ],
+            "has_more": false,
+            "object": "list"
+          },
+          "status": "succeeded"
+        }
+      },
+      "id": "evt_1QaFFF",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "charge.refunded"
+    }
+  }
+}

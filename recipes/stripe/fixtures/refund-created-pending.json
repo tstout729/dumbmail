@@ -1,0 +1,35 @@
+{
+  "description": "A refund that is still pending (documented unexpanded payload, no customer): not counted yet",
+  "expect": [
+    {
+      "message": "refund re_2P is pending; it's recorded when it succeeds",
+      "type": "log"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2026-09-30.clover",
+      "created": 1763400000,
+      "data": {
+        "object": {
+          "amount": 1000,
+          "charge": "ch_3QabCdEfGh1234",
+          "created": 1763400000,
+          "currency": "usd",
+          "id": "re_2P",
+          "metadata": {},
+          "object": "refund",
+          "payment_intent": "pi_3QabCdEfGh1234",
+          "pending_reason": "processing",
+          "reason": "requested_by_customer",
+          "status": "pending"
+        }
+      },
+      "id": "evt_re_2P",
+      "livemode": false,
+      "object": "event",
+      "type": "refund.created"
+    },
+    "source": "webhook"
+  }
+}

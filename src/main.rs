@@ -52,8 +52,17 @@ enum Cmd {
     },
 }
 
+fn main() -> anyhow::Result<()> {
+    // A sandboxed integration script run: no async runtime, no config, no database (see
+    // `features::integrations::sandbox`). Checked before anything else starts.
+    if std::env::args_os().nth(1).is_some_and(|a| a == dumbmail::features::integrations::sandbox::SUBCOMMAND) {
+        std::process::exit(dumbmail::features::integrations::sandbox::child_main());
+    }
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cmd = match cli.cmd {
         Some(c) => c,
