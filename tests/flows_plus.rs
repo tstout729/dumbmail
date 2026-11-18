@@ -954,6 +954,18 @@ async fn back_populate_has_one_cap_across_the_server_and_a_dead_job_frees_the_fl
     run(&h.state, &json!({"backfill_id": bid2})).await.unwrap();
     unsafe { std::env::remove_var("FLOW_BACKFILL_SERVER_CAP") };
     assert_eq!(flow_runs(&h, &fid2).await, 50, "only the room left on the server");
+    // A paused flow's waiting runs don't take anyone's room.
+    let emails: Vec<String> = (0..60).map(|i| format!("s{i}@x.test")).collect();
+    let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
+    let (fid3, bid3, _) = list_backfill(&mut h, &refs).await;
+    sqlx::query("UPDATE flow_runs SET visited = '[]' WHERE flow_id = ANY($1::uuid[])").bind(vec![fid.clone(), fid2.clone()]).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flows SET status = 'paused' WHERE id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    unsafe { std::env::set_var("FLOW_BACKFILL_SERVER_CAP", "200") };
+    run(&h.state, &json!({"backfill_id": bid3})).await.unwrap();
+    unsafe { std::env::remove_var("FLOW_BACKFILL_SERVER_CAP") };
+    // The second flow (live) has 150 waiting by now, so 50 is left of the 200; if the paused flow's
+    // 150 counted there would be no room at all.
+    assert_eq!(flow_runs(&h, &fid3).await, 50, "the paused flow's 150 don't count");
 
     // A back-populate whose job runs out of retries is marked failed, and the flow can start another.
     let (fid2, bid2, _) = list_backfill(&mut h, &["x1@x.test"]).await;
@@ -965,7 +977,7 @@ async fn back_populate_has_one_cap_across_the_server_and_a_dead_job_frees_the_fl
     let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM flow_backfills WHERE id = $1").bind(bid2).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(status, "failed");
     let error = error.unwrap_or_default();
-    assert!(error.contains("repeated errors") && error.contains("flow_backfill_members"), "the reason is recorded: {error}");
+    assert!(error.contains("repeated errors (a database error)") && !error.contains("flow_backfill_members"), "a short reason, no internals: {error}");
     h.ok("POST", &format!("/api/flows/{fid2}/backfill"), Some(json!({"confirm": true}))).await;
     h.cleanup().await;
 }

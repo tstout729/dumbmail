@@ -41,6 +41,8 @@ pub const DEFAULT_MAX: i64 = 50_000;
 pub const MAX_RUNNING_PER_ACCOUNT: i64 = 3;
 /// The most of one flow's back-populated runs waiting for their first step at once.
 pub const FLOW_CAP: i64 = 200;
+/// The most of one account's, so no account can fill the server's room alone.
+pub const ACCOUNT_CAP: i64 = 400;
 /// The most back-populated runs waiting for their first step across all flows on the server:
 /// `FLOW_BACKFILL_SERVER_CAP` (default 1,000).
 pub fn server_cap() -> i64 {
@@ -308,10 +310,18 @@ async fn stop(state: &AppState, id: Uuid, status: &str, why: Option<&str>) -> sq
 /// back-populate failed, with the last error, and the flow can start another.
 pub async fn job_dead_in(tx: &mut sqlx::PgConnection, payload: &Value, error: &str) -> sqlx::Result<()> {
     let Some(id) = payload["backfill_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
-    let short: String = error.lines().next().unwrap_or("").chars().take(200).collect();
+    // Only a short category is shown; the full error stays with the job and in the logs.
+    let e = error.to_ascii_lowercase();
+    let why = if e.contains("timeout") || e.contains("canceling statement") {
+        "the database took too long"
+    } else if e.contains("database") || e.contains("relation") || e.contains("column") {
+        "a database error"
+    } else {
+        "an unexpected error"
+    };
     sqlx::query("UPDATE flow_backfills SET status = 'failed', error = $2, finished_at = now() WHERE id = $1 AND status = 'running'")
         .bind(id)
-        .bind(format!("stopped after repeated errors ({short}); start it again to add the rest"))
+        .bind(format!("stopped after repeated errors ({why}); start it again to add the rest"))
         .execute(tx)
         .await?;
     Ok(())
@@ -367,16 +377,21 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         return Ok(());
     }
     // Pacing: enrol only as many as there is room for, for this flow and across the server.
-    let (this_flow, all): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE m.backfill_id = $1), count(*) FROM flow_backfill_members m
+    // Counted: runs still waiting for their first step in live flows of open accounts (a paused flow
+    // or a closed account isn't taking anyone's room).
+    let (this_flow, this_account, all): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE m.backfill_id = $1), count(*) FILTER (WHERE b.account_id = $2), count(*) FROM flow_backfill_members m
          JOIN flow_backfills b ON b.id = m.backfill_id AND (b.status = 'running' OR b.finished_at > now() - interval '1 day')
          JOIN flow_runs r ON r.id = m.run_id
+         JOIN flows f ON f.id = r.flow_id AND f.status = 'live'
+         JOIN accounts a ON a.id = b.account_id AND a.closed_at IS NULL
          WHERE m.done_at IS NOT NULL AND r.status = 'active' AND r.visited = '[]'::jsonb",
     )
     .bind(id)
+    .bind(flow.account_id)
     .fetch_one(&state.db)
     .await?;
-    let room = (FLOW_CAP - this_flow).min(server_cap() - all);
+    let room = (FLOW_CAP - this_flow).min(ACCOUNT_CAP - this_account).min(server_cap() - all);
     if room <= 0 {
         crate::jobs::enqueue_background(&state.db, JOB, json!({"backfill_id": id}), Some(Utc::now() + Duration::seconds(15))).await?;
         return Ok(());
