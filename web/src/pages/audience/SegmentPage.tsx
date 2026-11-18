@@ -10,6 +10,7 @@ import { Badge, Button, ButtonLink, Card, ConfirmDialog, Page, PageHeader, Skele
 import { formatNumber, formatRelative, fullName } from "../../lib/format";
 import { useDebouncedValue } from "../../lib/hooks";
 import { toast } from "../../lib/toast";
+import { useCan } from "../../features/team/api";
 
 export function SegmentPage() {
   const { id = "" } = useParams();
@@ -40,6 +41,7 @@ function ExistingSegment({ id }: { id: string }) {
 
 function SegmentEditor({ segment }: { segment: Segment | null }) {
   const navigate = useNavigate();
+  const canSyncAds = useCan("ad_audiences.manage");
   const create = useCreateSegment();
   const update = useUpdateSegment(segment?.id ?? "");
   const remove = useDeleteSegment();
@@ -105,7 +107,7 @@ function SegmentEditor({ segment }: { segment: Segment | null }) {
                 Delete
               </Button>
             ) : null}
-            {segment ? (
+            {segment && canSyncAds ? (
               <ButtonLink to={`/settings/ad-audiences?new=segment:${segment.id}`} icon={<Megaphone className="size-3.5" />}>
                 Sync to ads
               </ButtonLink>

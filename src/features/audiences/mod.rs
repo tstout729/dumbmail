@@ -18,6 +18,7 @@ use axum::Router;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::team::access::{rule, Access, Perm, RouteRule, ToolRule};
 use super::{Feature, McpDoc};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
@@ -27,6 +28,37 @@ use crate::state::AppState;
 pub struct Module;
 
 const DOC: &str = include_str!("../../../docs/AD_AUDIENCES.md");
+
+// Viewing connections, settings and syncs (counts only, no personal data) needs audience read.
+// Anything that changes what's sent to an ad platform, or the sign-in, needs ad_audiences.manage
+// (admins and the owner); for API keys that's the account scope. The OAuth callback is a public
+// route (in team::access::PUBLIC_ROUTES) bound to the member who started the sign-in.
+static ROUTES: &[RouteRule] = &[
+    rule("GET", "/api/ad-audiences/connections", Perm::AudienceRead),
+    rule("DELETE", "/api/ad-audiences/connections/{platform}", Perm::AdAudiencesManage),
+    rule("POST", "/api/ad-audiences/connections/{platform}/start", Perm::AdAudiencesManage),
+    rule("GET", "/api/ad-audiences/connections/{platform}/accounts", Perm::AudienceRead),
+    rule("GET", "/api/ad-audiences/settings", Perm::AudienceRead),
+    rule("PATCH", "/api/ad-audiences/settings", Perm::AdAudiencesManage),
+    rule("GET", "/api/ad-audiences/syncs", Perm::AudienceRead),
+    rule("POST", "/api/ad-audiences/syncs", Perm::AdAudiencesManage),
+    rule("GET", "/api/ad-audiences/syncs/{id}", Perm::AudienceRead),
+    rule("PATCH", "/api/ad-audiences/syncs/{id}", Perm::AdAudiencesManage),
+    rule("DELETE", "/api/ad-audiences/syncs/{id}", Perm::AdAudiencesManage),
+    rule("POST", "/api/ad-audiences/syncs/{id}/run", Perm::AdAudiencesManage),
+];
+
+static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_ad_connections", perm: Perm::AudienceRead },
+    ToolRule { name: "list_ad_accounts", perm: Perm::AudienceRead },
+    ToolRule { name: "list_audience_syncs", perm: Perm::AudienceRead },
+    ToolRule { name: "get_audience_sync", perm: Perm::AudienceRead },
+    ToolRule { name: "create_audience_sync", perm: Perm::AdAudiencesManage },
+    ToolRule { name: "update_audience_sync", perm: Perm::AdAudiencesManage },
+    ToolRule { name: "run_audience_sync", perm: Perm::AdAudiencesManage },
+    ToolRule { name: "delete_audience_sync", perm: Perm::AdAudiencesManage },
+    ToolRule { name: "disconnect_ad_platform", perm: Perm::AdAudiencesManage },
+];
 
 fn platform_arg(a: &Value) -> AppResult<platforms::Platform> {
     a["platform"].as_str().and_then(platforms::Platform::parse).ok_or_else(|| AppError::bad("platform must be meta, google or tiktok"))
@@ -44,6 +76,10 @@ impl Feature for Module {
 
     fn routes(&self) -> Router<AppState> {
         api::routes()
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: ROUTES, tools: TOOLS }
     }
 
     fn mcp_tools(&self) -> Vec<Value> {
@@ -84,7 +120,7 @@ impl Feature for Module {
             tool(
                 "create_audience_sync",
                 "Sync a list or segment to an ad audience",
-                "Create a customer-list audience on Meta, Google Ads or TikTok from a list or segment and keep it in step (people who join are added, people who leave are removed). Only people subscribed to email who aren't suppressed and haven't opted out of ads are sent, as hashed email (and phone numbers that were opted in to texts). Google needs the account's Google consent setting on (an owner or admin turns it on in the dashboard). TikTok audiences are email only and need at least 1,000 people. This sends customer data to the ad platform: without confirm=true it returns a dry run with the number of people. Get the user's approval, and pass accept_terms=true only when they confirm these people gave them their details directly and they accept the platform's customer list terms.",
+                "Create a customer-list audience on Meta, Google Ads or TikTok from a list or segment and keep it in step (people who join are added, people who leave are removed). Only people subscribed to email who aren't suppressed, aren't on a marketing hold and haven't opted out of ads are sent, as hashed email (and phone numbers that were opted in to texts). Nothing else (no names or locations) is sent. Google needs the account's Google consent setting on (an owner or admin turns it on in the dashboard). TikTok audiences are email only and need at least 1,000 people. This sends customer data to the ad platform: without confirm=true it returns a dry run with the number of people. Get the user's approval, and pass accept_terms=true only when they confirm these people gave them their details directly and they accept the platform's customer list terms.",
                 obj(
                     json!({
                         "platform": platform,
@@ -93,7 +129,6 @@ impl Feature for Module {
                         "source_type": {"enum": ["list", "segment"]},
                         "source_id": {"type": "string"},
                         "name": {"type": "string", "maxLength": 100, "description": "Audience name on the platform. Default: the list or segment name + (DumbMail)"},
-                        "match_fields": {"enum": ["contact", "contact_and_location"], "description": "contact: email and phone. contact_and_location (Meta only) adds hashed name, city, state, ZIP and country for better matches."},
                         "interval_hours": {"type": "integer", "minimum": 1, "maximum": 168, "description": "How often to sync. Default 6."},
                         "accept_terms": {"type": "boolean"},
                         "confirm": {"type": "boolean"}
@@ -106,13 +141,12 @@ impl Feature for Module {
             tool(
                 "update_audience_sync",
                 "Change an ad audience sync",
-                "Pause or resume a sync (status), change how often it runs, or which fields are matched (Meta only). A paused sync adds nobody but still removes people who leave or opt out. Turning on contact_and_location sends more to Meta: without confirm=true that returns a dry run. recreate_audience=true (with confirm=true) makes a new audience when the platform says the old one is gone, or a TikTok audience couldn't be confirmed.",
+                "Pause or resume a sync (status), or change how often it runs. A paused sync adds nobody but still removes people who leave or opt out. A sync being deleted can't be changed. recreate_audience=true (with confirm=true) makes a new audience when the platform says the old one is gone, or a TikTok audience couldn't be confirmed.",
                 obj(
                     json!({
                         "id": {"type": "string"},
                         "status": {"enum": ["active", "paused"]},
                         "interval_hours": {"type": "integer", "minimum": 1, "maximum": 168},
-                        "match_fields": {"enum": ["contact", "contact_and_location"]},
                         "recreate_audience": {"type": "boolean"},
                         "confirm": {"type": "boolean"}
                     }),
@@ -125,7 +159,7 @@ impl Feature for Module {
             tool(
                 "delete_audience_sync",
                 "Delete an ad audience sync",
-                "Stop syncing. With delete_on_platform=true the audience is also deleted on the ad platform, and ads that use it stop; without it the audience stays as it is and DumbMail no longer removes people who opt out from it. Without confirm=true it only describes what would happen.",
+                "Stop syncing. DumbMail first removes everyone it uploaded from the platform audience; the sync shows as removing (and keeps retrying) until the platform confirms every removal, then it's deleted. With delete_on_platform=true the empty audience is then deleted on the platform too (ads that use it stop); otherwise it's kept, empty. TikTok audiences are always deleted (TikTok can't keep fewer than 1,000 people). Without confirm=true it only describes what would happen.",
                 obj(json!({"id": {"type": "string"}, "delete_on_platform": {"type": "boolean"}, "confirm": {"type": "boolean"}}), &["id"]),
                 false,
                 true,
@@ -159,7 +193,7 @@ impl Feature for Module {
                 Err(e) => Err(e),
             },
             "create_audience_sync" => match from::<api::CreateBody>(a.clone()) {
-                Ok(b) => api::create_sync(state, acct, b, !confirmed).await,
+                Ok(b) => api::create_sync(state, ctx, b, !confirmed).await,
                 Err(e) => Err(e),
             },
             "update_audience_sync" => {
@@ -169,32 +203,24 @@ impl Feature for Module {
                 }
                 match (id_arg(a), from::<api::UpdateBody>(body)) {
                     (Ok(id), Ok(b)) => {
-                        // Changes that send more about people than the user approved need confirming.
-                        let widens = match store::account_sync(&state.db, acct, id).await {
-                            Ok(Some(s)) => b.match_fields.as_deref() == Some("contact_and_location") && s.match_fields != "contact_and_location",
-                            Ok(None) => return Some(Err(AppError::not_found("sync"))),
-                            Err(e) => return Some(Err(e.into())),
-                        };
-                        if widens && !confirmed {
-                            Ok(json!({"dry_run": true, "note": "Nothing changed. This also sends hashed names and locations to Meta. Call again with confirm=true once the user approves."}))
-                        } else if b.recreate_audience == Some(true) && !confirmed {
+                        if b.recreate_audience == Some(true) && !confirmed {
                             Ok(json!({"dry_run": true, "note": "Nothing changed. This makes a new audience on the platform and uploads everyone who qualifies. Call again with confirm=true once the user approves."}))
                         } else {
-                            api::update_sync(state, acct, id, b).await
+                            api::update_sync(state, ctx, id, b).await
                         }
                     }
                     (Err(e), _) | (_, Err(e)) => Err(e),
                 }
             }
             "run_audience_sync" => match id_arg(a) {
-                Ok(id) => api::run_now(state, acct, id).await,
+                Ok(id) => api::run_now(state, ctx, id).await,
                 Err(e) => Err(e),
             },
             "delete_audience_sync" => match id_arg(a) {
                 Ok(id) => {
                     let on_platform = a["delete_on_platform"].as_bool() == Some(true);
                     if confirmed {
-                        api::delete_sync(state, acct, id, on_platform).await
+                        api::delete_sync(state, ctx, id, on_platform).await
                     } else {
                         match store::account_sync(&state.db, acct, id).await {
                             Ok(Some(s)) => Ok(json!({"dry_run": true, "note": api::delete_note(&s, on_platform)})),
@@ -206,7 +232,7 @@ impl Feature for Module {
                 Err(e) => Err(e),
             },
             "disconnect_ad_platform" => match platform_arg(a) {
-                Ok(p) if confirmed => api::disconnect(state, acct, p).await,
+                Ok(p) if confirmed => api::disconnect(state, ctx, p).await,
                 Ok(p) => Ok(json!({"dry_run": true, "note": format!("Nothing changed. This would delete DumbMail's sign-in for {} and ask it to revoke DumbMail's access; syncs to it wait until it's connected again. Call again with confirm=true once the user approves.", p.label())})),
                 Err(e) => Err(e),
             },

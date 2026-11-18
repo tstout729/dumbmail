@@ -8,9 +8,8 @@
 //! A sync works in identifiers ("keys"): one hashed email or one hashed phone number. Two profiles
 //! whose addresses normalize to the same hash are the same key on the platform.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 
 use super::platforms::Platform;
 
@@ -18,7 +17,8 @@ pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-/// What we know about a person, from their profile.
+/// A person's identifiers, from their profile. Only email and phone: names and locations can be
+/// filled in from a browser, so they're never sent.
 #[derive(Debug, Default, Clone)]
 pub struct Person {
     pub email: Option<String>,
@@ -27,21 +27,10 @@ pub struct Person {
     /// The phone number was opted in (text consent `subscribed`). A browser can fill a missing
     /// phone number on a profile but can't set consent, so only an opted-in number is sent.
     pub phone_trusted: bool,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub city: Option<String>,
-    pub state: Option<String>,
-    pub zip: Option<String>,
-    pub country: Option<String>,
 }
 
 fn clean(s: &Option<String>) -> Option<&str> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// Accented Latin letters to their base letter (é → e), then lowercase ASCII letters and digits only.
-fn ascii_fold(raw: &str) -> String {
-    raw.nfd().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase()
 }
 
 // ---------- Meta ----------
@@ -58,56 +47,6 @@ pub fn meta_phone(raw: &str) -> Option<String> {
     let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     let digits = digits.trim_start_matches('0').to_string();
     (digits.len() >= 7).then_some(digits)
-}
-
-/// First and last names: lowercase, no punctuation or spaces; letters outside a–z stay (UTF-8),
-/// which Meta allows for names only.
-pub fn meta_name(raw: &str) -> Option<String> {
-    let s: String = raw.trim().to_lowercase().chars().filter(|c| c.is_alphabetic()).collect();
-    (!s.is_empty()).then_some(s)
-}
-
-/// City: a–z only.
-pub fn meta_city(raw: &str) -> Option<String> {
-    let s: String = ascii_fold(raw).chars().filter(|c| c.is_ascii_lowercase()).collect();
-    (!s.is_empty()).then_some(s)
-}
-
-/// US: the lowercase 2-letter state code. Elsewhere: lowercase with no punctuation, special
-/// characters or spaces.
-pub fn meta_state(raw: &str, country: Option<&str>) -> Option<String> {
-    let s = raw.trim();
-    if country.is_none_or(|c| c == "US") {
-        if let Some(code) = us_state_code(s) {
-            return Some(code.to_lowercase());
-        }
-        if country == Some("US") {
-            return None;
-        }
-    }
-    let s = ascii_fold(s);
-    (!s.is_empty()).then_some(s)
-}
-
-/// Lowercase, no spaces. US: the first 5 digits. UK: area, district and sector ("SW1A 1AA" → "sw1a1").
-pub fn meta_zip(raw: &str, country: Option<&str>) -> Option<String> {
-    let s: String = raw.trim().to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    if country == Some("US") || (country.is_none() && s.len() >= 5 && s.chars().take(5).all(|c| c.is_ascii_digit())) {
-        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return (digits.len() >= 5).then(|| digits[..5].to_string());
-    }
-    if country == Some("GB") {
-        let s: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        // The inward code is always the last three characters: a digit and two letters.
-        if (5..=7).contains(&s.len()) && s.is_char_boundary(s.len() - 3) {
-            let (outward, inward) = s.split_at(s.len() - 3);
-            if let Some(d) = inward.chars().next().filter(char::is_ascii_digit) {
-                return Some(format!("{outward}{d}"));
-            }
-        }
-        return (!s.is_empty()).then_some(s);
-    }
-    (!s.is_empty()).then_some(s)
 }
 
 // ---------- Google ----------
@@ -147,51 +86,6 @@ pub fn tiktok_email(raw: &str) -> Option<String> {
     let e: String = raw.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
     (e.contains('@') && e.len() > 3).then_some(e)
 }
-
-// ---------- Countries ----------
-
-/// An ISO 3166-1 alpha-2 code (uppercase) from a profile's `country` property: a 2-letter code or a
-/// few common names. Used only for Meta's optional location fields.
-pub fn country_code(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.len() == 2 && s.chars().all(|c| c.is_ascii_alphabetic()) {
-        let up = s.to_uppercase();
-        return Some(if up == "UK" { "GB".into() } else { up });
-    }
-    let named = match s.to_lowercase().replace('.', "").as_str() {
-        "usa" | "united states" | "united states of america" => "US",
-        "canada" => "CA",
-        "united kingdom" | "great britain" | "england" | "scotland" | "wales" | "northern ireland" => "GB",
-        "australia" => "AU",
-        "new zealand" => "NZ",
-        "ireland" => "IE",
-        "germany" | "deutschland" => "DE",
-        "france" => "FR",
-        "spain" | "españa" => "ES",
-        "italy" | "italia" => "IT",
-        "netherlands" | "the netherlands" => "NL",
-        "mexico" | "méxico" => "MX",
-        _ => return None,
-    };
-    Some(named.into())
-}
-
-fn us_state_code(s: &str) -> Option<&'static str> {
-    let key = s.trim().trim_end_matches('.').to_lowercase();
-    US_STATES.iter().find(|(code, name)| code.eq_ignore_ascii_case(&key) || *name == key).map(|(c, _)| *c)
-}
-
-#[rustfmt::skip]
-const US_STATES: &[(&str, &str)] = &[
-    ("AL", "alabama"), ("AK", "alaska"), ("AZ", "arizona"), ("AR", "arkansas"), ("CA", "california"), ("CO", "colorado"), ("CT", "connecticut"),
-    ("DE", "delaware"), ("DC", "district of columbia"), ("FL", "florida"), ("GA", "georgia"), ("HI", "hawaii"), ("ID", "idaho"), ("IL", "illinois"),
-    ("IN", "indiana"), ("IA", "iowa"), ("KS", "kansas"), ("KY", "kentucky"), ("LA", "louisiana"), ("ME", "maine"), ("MD", "maryland"),
-    ("MA", "massachusetts"), ("MI", "michigan"), ("MN", "minnesota"), ("MS", "mississippi"), ("MO", "missouri"), ("MT", "montana"), ("NE", "nebraska"),
-    ("NV", "nevada"), ("NH", "new hampshire"), ("NJ", "new jersey"), ("NM", "new mexico"), ("NY", "new york"), ("NC", "north carolina"),
-    ("ND", "north dakota"), ("OH", "ohio"), ("OK", "oklahoma"), ("OR", "oregon"), ("PA", "pennsylvania"), ("PR", "puerto rico"), ("RI", "rhode island"),
-    ("SC", "south carolina"), ("SD", "south dakota"), ("TN", "tennessee"), ("TX", "texas"), ("UT", "utah"), ("VT", "vermont"), ("VA", "virginia"),
-    ("WA", "washington"), ("WV", "west virginia"), ("WI", "wisconsin"), ("WY", "wyoming"),
-];
 
 // ---------- Keys ----------
 
@@ -251,49 +145,14 @@ pub fn keys(platform: Platform, p: &Person, veto: bool) -> Vec<Key> {
     out
 }
 
-/// Meta's optional match fields (hashed), sent alongside an identifier when adding.
-pub fn meta_hints(p: &Person) -> Option<Value> {
-    let cc = clean(&p.country).and_then(country_code);
-    let cc = cc.as_deref();
-    let mut m = Map::new();
-    let mut put = |k: &str, v: Option<String>| {
-        if let Some(v) = v {
-            m.insert(k.into(), json!(sha256_hex(&v)));
-        }
-    };
-    put("FN", clean(&p.first_name).and_then(meta_name));
-    put("LN", clean(&p.last_name).and_then(meta_name));
-    put("CT", clean(&p.city).and_then(meta_city));
-    put("ST", clean(&p.state).and_then(|s| meta_state(s, cc)));
-    put("ZIP", clean(&p.zip).and_then(|z| meta_zip(z, cc)));
-    put("COUNTRY", cc.map(str::to_lowercase));
-    (!m.is_empty()).then_some(Value::Object(m))
-}
-
-pub const META_HINT_KEYS: [&str; 6] = ["FN", "LN", "CT", "ST", "ZIP", "COUNTRY"];
-
 /// Meta's schema for a batch, in the order row values are sent.
-pub fn meta_schema(with_hints: bool) -> Vec<&'static str> {
-    let mut s = vec!["EMAIL", "PHONE"];
-    if with_hints {
-        s.extend(META_HINT_KEYS);
-    }
-    s
-}
+pub const META_SCHEMA: [&str; 2] = ["EMAIL", "PHONE"];
 
-/// One batch row as stored: `{"t": "email", "h": "<hash>", "x": {hints}}`.
-pub fn meta_row(row: &Value, schema: &[&str]) -> Vec<String> {
+/// One batch row as stored (`{"t": "email", "h": "<hash>"}`), as Meta's [`META_SCHEMA`] cells.
+pub fn meta_row(row: &Value) -> Vec<String> {
     let t = row["t"].as_str().unwrap_or_default();
-    let h = row["h"].as_str().unwrap_or_default();
-    schema
-        .iter()
-        .map(|k| match *k {
-            "EMAIL" if t == "email" => h.to_string(),
-            "PHONE" if t == "phone" => h.to_string(),
-            "EMAIL" | "PHONE" => String::new(),
-            other => row["x"][other].as_str().unwrap_or_default().to_string(),
-        })
-        .collect()
+    let h = row["h"].as_str().unwrap_or_default().to_string();
+    if t == "phone" { vec![String::new(), h] } else { vec![h, String::new()] }
 }
 
 /// One Google Data Manager AudienceMember: one identifier per member, so Google's per-record
@@ -319,19 +178,6 @@ mod tests {
     fn meta_fields() {
         assert_eq!(meta_phone("+1 (650) 555-1212").as_deref(), Some("16505551212"));
         assert_eq!(meta_phone("+0044 20 7946 0958").as_deref(), Some("442079460958"));
-        assert_eq!(meta_name("Mary-Jane O'Brien").as_deref(), Some("maryjaneobrien"));
-        assert_eq!(meta_name("José").as_deref(), Some("josé"), "names keep UTF-8 letters");
-        assert_eq!(meta_city("San Francisco").as_deref(), Some("sanfrancisco"));
-        assert_eq!(meta_city("Zürich").as_deref(), Some("zurich"), "cities are a–z only");
-        assert_eq!(meta_city("Saint-Étienne").as_deref(), Some("saintetienne"));
-        assert_eq!(meta_state("California", Some("US")).as_deref(), Some("ca"));
-        assert_eq!(meta_state("or", Some("US")).as_deref(), Some("or"));
-        assert_eq!(meta_state("Nueva York", Some("US")), None);
-        assert_eq!(meta_state("Île-de-France", Some("FR")).as_deref(), Some("iledefrance"));
-        assert_eq!(meta_zip("97201-1234", Some("US")).as_deref(), Some("97201"));
-        assert_eq!(meta_zip("SW1A 1AA", Some("GB")).as_deref(), Some("sw1a1"), "UK: area, district and sector");
-        assert_eq!(meta_zip("M1 1AE", Some("GB")).as_deref(), Some("m11"));
-        assert_eq!(meta_zip("75001", Some("FR")).as_deref(), Some("75001"));
     }
 
     #[test]
@@ -356,25 +202,14 @@ mod tests {
             email: Some("Mary@Example.com".into()),
             phone: Some("+15035550100".into()),
             phone_trusted: true,
-            first_name: Some("Mary".into()),
-            last_name: Some("Jones".into()),
-            city: Some("Portland".into()),
-            state: Some("Oregon".into()),
-            zip: Some("97201".into()),
-            country: Some("United States".into()),
         };
         let meta = keys(Platform::Meta, &p, false);
         assert_eq!(meta.iter().map(|k| (k.kind, k.hash.clone())).collect::<Vec<_>>(), vec![(KeyType::Email, sha256_hex("mary@example.com")), (KeyType::Phone, sha256_hex("15035550100"))]);
         assert_eq!(meta[0].src_check, sha256_hex("Mary@Example.com"));
-        let hints = meta_hints(&p).unwrap();
-        assert_eq!(hints["ST"], json!(sha256_hex("or")));
-        assert_eq!(hints["COUNTRY"], json!(sha256_hex("us")));
-        let row = json!({"t": "email", "h": meta[0].hash, "x": hints});
-        let cells = meta_row(&row, &meta_schema(true));
-        assert_eq!(cells.len(), 8);
+        let cells = meta_row(&json!({"t": "email", "h": meta[0].hash}));
+        assert_eq!(cells.len(), META_SCHEMA.len());
         assert_eq!(cells[1], "", "one identifier per row");
-        assert!(cells[2..].iter().all(|v| v.len() == 64));
-        assert_eq!(meta_row(&json!({"t": "phone", "h": "abc"}), &meta_schema(false)), vec!["".to_string(), "abc".to_string()]);
+        assert_eq!(meta_row(&json!({"t": "phone", "h": "abc"})), vec!["".to_string(), "abc".to_string()]);
 
         let g = keys(Platform::Google, &p, false);
         assert_eq!(g[1].hash, sha256_hex("+15035550100"));

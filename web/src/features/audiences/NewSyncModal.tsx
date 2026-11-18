@@ -6,7 +6,7 @@ import { formatNumber } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useAdAccounts, useCreateSync } from "./api";
 import { intervalOptions } from "./SyncDrawer";
-import type { AdConnection, AdPlatform, AdSettings, MatchFields } from "./types";
+import type { AdConnection, AdPlatform, AdSettings } from "./types";
 
 const OTHER = "__other__";
 
@@ -29,7 +29,6 @@ export function NewSyncModal({ connections, settings, initialSource, onClose, on
   const [manager, setManager] = useState("");
   const [source, setSource] = useState(initialSource ?? "");
   const [name, setName] = useState("");
-  const [matchFields, setMatchFields] = useState<MatchFields>("contact");
   const [intervalHours, setIntervalHours] = useState(6);
   const [terms, setTerms] = useState(false);
   const lists = useLists();
@@ -53,7 +52,6 @@ export function NewSyncModal({ connections, settings, initialSource, onClose, on
     setAccount("");
     setOtherAccount("");
     setManager("");
-    if (p !== "meta") setMatchFields("contact");
   };
 
   const onSubmit = (e: FormEvent) => {
@@ -67,7 +65,6 @@ export function NewSyncModal({ connections, settings, initialSource, onClose, on
         source_type: sourceType,
         source_id: sourceId,
         name: name.trim() || undefined,
-        match_fields: matchFields,
         interval_hours: intervalHours,
         accept_terms: terms,
       },
@@ -172,27 +169,20 @@ export function NewSyncModal({ connections, settings, initialSource, onClose, on
           <Input value={name} onChange={(e) => setName(e.target.value)} maxLength={100} placeholder={sourceName ? `${sourceName} (DumbMail)` : "Uses the list or segment name"} />
         </Field>
 
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Match on">
-            <Select value={matchFields} onChange={(e) => setMatchFields(e.target.value as MatchFields)}>
-              <option value="contact">{platform === "tiktok" ? "Email" : "Email and phone"}</option>
-              {platform === "meta" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
-            </Select>
-          </Field>
-          <Field label="How often">
-            <Select value={intervalHours} onChange={(e) => setIntervalHours(Number(e.target.value))}>
-              {intervalOptions.map((o) => (
-                <option key={o.hours} value={o.hours}>
-                  {o.label}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </div>
+        <Field label="How often">
+          <Select value={intervalHours} onChange={(e) => setIntervalHours(Number(e.target.value))}>
+            {intervalOptions.map((o) => (
+              <option key={o.hours} value={o.hours}>
+                {o.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
 
         <p className="text-xs text-zinc-500">
-          Only people subscribed to your email who aren't suppressed and haven't opted out of ads are sent: their hashed email, and their phone number if they opted in
-          to texts.{platform === "tiktok" ? " TikTok audiences use email only, and TikTok needs at least 1,000 people before it makes one." : ""}
+          Only people subscribed to your email who aren't suppressed, aren't on a marketing hold and haven't opted out of ads are sent: their hashed email, and their
+          phone number if they opted in to texts. Nothing else, such as names or where people live, is sent.
+          {platform === "tiktok" ? " TikTok audiences use email only, and TikTok needs at least 1,000 people before it makes one." : ""}
         </p>
         <Checkbox
           label={`These people gave us their contact details directly, and I accept ${label}'s customer list terms`}

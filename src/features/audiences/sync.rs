@@ -22,6 +22,10 @@
 //!   longer qualifies goes back through `remove` in the same run.
 //! - `finish`: Google's processing results, the platform's audience size, counts, next run.
 //!
+//! Deleting a sync makes it `removing`, and its runs are `withdraw` runs: no scan, everything that
+//! may be on the platform is planned for removal, and `finish` deletes the sync (and, if asked, the
+//! audience) only once the platform confirmed every removal. Until then it stays and is retried.
+//!
 //! One worker owns a run at a time: a lease on the sync row, checked (`FOR UPDATE`) in every write.
 
 use chrono::{Duration, Utc};
@@ -69,12 +73,13 @@ pub fn opted_out_sql(a: &str) -> String {
     )
 }
 
-/// May be sent to an ad platform (apart from being in the list or segment).
+/// May be sent to an ad platform (apart from being in the list or segment). A held person
+/// (`crate::marketing_hold`) never is; one who becomes held after being sent is removed on the
+/// next run, like anyone else who stops qualifying.
 pub fn eligible_sql(a: &str) -> String {
     format!(
         "({a}.email_consent = 'subscribed' AND {a}.email_suppressed_reason IS NULL \
-         /* MARKETING HOLD: when profiles.marketing_hold (PR #15) is on main, add: AND NOT {a}.marketing_hold */ \
-         AND NOT {})",
+         AND NOT {a}.marketing_hold AND NOT {})",
         opted_out_sql(a)
     )
 }
@@ -167,7 +172,8 @@ struct RunRow {
 
 /// Start a run unless one is already going. Returns the run id. A paused sync gets a run that only
 /// removes (people who left or opted out); a sync paused below TikTok's minimum gets a full run,
-/// which recreates the audience once enough people qualify.
+/// which recreates the audience once enough people qualify; a sync being deleted gets a withdraw
+/// run, which removes everyone.
 pub async fn start_run(state: &AppState, sync_id: Uuid, trigger: &str) -> sqlx::Result<Option<Uuid>> {
     let run_id = Uuid::now_v7();
     let mut tx = state.db.begin().await?;
@@ -178,17 +184,26 @@ pub async fn start_run(state: &AppState, sync_id: Uuid, trigger: &str) -> sqlx::
             .fetch_optional(&mut *tx)
             .await?;
     let Some((account_id, status, reason)) = row else { return Ok(None) };
-    let mode = if status == "active" || reason.as_deref() == Some("tiktok_minimum") { "full" } else { "remove_only" };
-    sqlx::query("INSERT INTO ad_audience_runs (id, sync_id, account_id, trigger, mode) VALUES ($1, $2, $3, $4, $5)")
+    let mode = if status == "removing" {
+        "withdraw"
+    } else if status == "active" || reason.as_deref() == Some("tiktok_minimum") {
+        "full"
+    } else {
+        "remove_only"
+    };
+    // A withdraw run needs nobody scanned: with nothing desired, the plan removes everything.
+    let phase = if mode == "withdraw" { "plan" } else { "scan" };
+    sqlx::query("INSERT INTO ad_audience_runs (id, sync_id, account_id, trigger, mode, phase) VALUES ($1, $2, $3, $4, $5, $6)")
         .bind(run_id)
         .bind(sync_id)
         .bind(account_id)
         .bind(trigger)
         .bind(mode)
+        .bind(phase)
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM ad_audience_desired WHERE sync_id = $1").bind(sync_id).execute(&mut *tx).await?;
-    crate::jobs::enqueue(&mut *tx, JOB_KIND, json!({"run_id": run_id}), None).await?;
+    crate::jobs::enqueue_background(&mut *tx, JOB_KIND, json!({"run_id": run_id}), None).await?;
     tx.commit().await?;
     Ok(Some(run_id))
 }
@@ -253,7 +268,7 @@ async fn release(state: &AppState, sync_id: Uuid, tok: Uuid, next: Option<(Uuid,
     let n = sqlx::query("UPDATE ad_audience_syncs SET lease_token = NULL, lease_until = NULL WHERE id = $1 AND lease_token = $2").bind(sync_id).bind(tok).execute(&mut *tx).await?.rows_affected();
     if let (1, Some((run_id, delay))) = (n, next) {
         let at = (delay > 0).then(|| Utc::now() + Duration::seconds(delay));
-        crate::jobs::enqueue(&mut *tx, JOB_KIND, json!({"run_id": run_id}), at).await?;
+        crate::jobs::enqueue_background(&mut *tx, JOB_KIND, json!({"run_id": run_id}), at).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -302,7 +317,12 @@ async fn handle(state: &AppState, sync: &SyncRow, run: &RunRow, tok: Uuid, gener
         Kind::RateLimited | Kind::Transient | Kind::Unclear => end_run(state, sync, run, tok, "failed", Some("too_many_retries")).await,
         Kind::NotFound => {
             // Possibly wrong: keep the audience id and every record; ask before making a new one.
-            sqlx::query("UPDATE ad_audience_syncs SET status = 'paused', pause_reason = 'audience_missing', updated_at = now() WHERE id = $1 AND lease_token = $2").bind(sync.id).bind(tok).execute(&state.db).await?;
+            // A sync being deleted stays `removing` and tries again.
+            sqlx::query("UPDATE ad_audience_syncs SET status = 'paused', pause_reason = 'audience_missing', updated_at = now() WHERE id = $1 AND lease_token = $2 AND status <> 'removing'")
+                .bind(sync.id)
+                .bind(tok)
+                .execute(&state.db)
+                .await?;
             end_run(state, sync, run, tok, "failed", Some(e.code)).await
         }
         Kind::Auth => {
@@ -312,6 +332,9 @@ async fn handle(state: &AppState, sync: &SyncRow, run: &RunRow, tok: Uuid, gener
         Kind::Permission | Kind::Refused | Kind::Unavailable => end_run(state, sync, run, tok, "failed", Some(e.code)).await,
     }
 }
+
+/// How long until the next run: the sync's interval, but at most an hour while it's being deleted.
+const NEXT_RUN_SQL: &str = "CASE WHEN s.status = 'removing' THEN LEAST(make_interval(hours => s.interval_hours), interval '1 hour') ELSE make_interval(hours => s.interval_hours) END";
 
 /// Counts of identifiers by what the platform said, for the sync's status.
 const COUNTS_SQL: &str = "sent_count = (SELECT count(*) FROM ad_audience_members WHERE sync_id = s.id AND state IN ('adding', 'confirmed', 'unconfirmed')),
@@ -323,7 +346,7 @@ async fn end_run(state: &AppState, sync: &SyncRow, run: &RunRow, tok: Uuid, stat
     sqlx::query("UPDATE ad_audience_runs SET status = $2, error_code = COALESCE($3, error_code), finished_at = now() WHERE id = $1").bind(run.id).bind(status).bind(code).execute(&mut *tx).await?;
     sqlx::query(&format!(
         "UPDATE ad_audience_syncs s SET current_run_id = NULL, last_run_at = now(), last_error_code = $2, {COUNTS_SQL},
-             last_added = r.added, last_removed = r.removed, next_run_at = now() + make_interval(hours => s.interval_hours), updated_at = now()
+             last_added = r.added, last_removed = r.removed, next_run_at = now() + {NEXT_RUN_SQL}, updated_at = now()
          FROM ad_audience_runs r WHERE s.id = $1 AND r.id = $3"
     ))
     .bind(sync.id)
@@ -359,39 +382,16 @@ struct ScanRow {
     email: Option<String>,
     phone_number: Option<String>,
     sms_consent: String,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    properties: Value,
-}
-
-fn prop(props: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|k| match &props[*k] {
-        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    })
 }
 
 fn person(r: &ScanRow) -> Person {
-    let p = &r.properties;
-    Person {
-        email: r.email.clone(),
-        phone: r.phone_number.clone(),
-        phone_trusted: r.sms_consent == "subscribed",
-        first_name: r.first_name.clone(),
-        last_name: r.last_name.clone(),
-        city: prop(p, &["city"]),
-        state: prop(p, &["region", "state", "province"]),
-        zip: prop(p, &["zip", "postal_code", "zip_code", "postcode"]),
-        country: prop(p, &["country", "country_code"]),
-    }
+    Person { email: r.email.clone(), phone: r.phone_number.clone(), phone_trusted: r.sms_consent == "subscribed" }
 }
 
 #[derive(sqlx::FromRow)]
 struct Claimed {
     key_type: String,
     key_hash: String,
-    hints: Option<Value>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -457,7 +457,7 @@ impl Ctx<'_> {
         let mut cursor = self.run.cursor_id.unwrap_or(Uuid::nil());
         let mut skipped = 0i32;
         for _ in 0..SCAN_PAGES_PER_STEP {
-            let mut qb = QueryBuilder::new("SELECT p.id, p.email, p.phone_number, p.sms_consent, p.first_name, p.last_name, p.properties FROM profiles p WHERE ");
+            let mut qb = QueryBuilder::new("SELECT p.id, p.email, p.phone_number, p.sms_consent FROM profiles p WHERE ");
             match &src {
                 Some(src) => push_live(&mut qb, s.account_id, src),
                 None => {
@@ -467,20 +467,18 @@ impl Ctx<'_> {
             qb.push(" AND p.id > ").push_bind(cursor).push(" ORDER BY p.id LIMIT ").push_bind(SCAN_PAGE);
             let rows: Vec<ScanRow> = qb.build_query_as().fetch_all(&self.state.db).await?;
             let done = (rows.len() as i64) < SCAN_PAGE;
-            let (mut pids, mut types, mut hashes, mut checks, mut hints) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut pids, mut types, mut hashes, mut checks) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for r in &rows {
                 let p = person(r);
                 let keys = normalize::keys(self.platform(), &p, veto);
                 if keys.is_empty() && !veto {
                     skipped += 1;
                 }
-                let h = if !veto && s.with_hints() { normalize::meta_hints(&p).unwrap_or(Value::Null) } else { Value::Null };
                 for k in keys {
                     pids.push(r.id);
                     types.push(k.kind.as_str());
                     hashes.push(k.hash);
                     checks.push(k.src_check);
-                    hints.push(h.clone());
                 }
             }
             if let Some(last) = rows.last() {
@@ -489,9 +487,9 @@ impl Ctx<'_> {
             let Some(mut tx) = fenced(self.state, s.id, self.tok).await? else { return Ok(Ok(Flow::Stop)) };
             if !pids.is_empty() {
                 sqlx::query(
-                    "INSERT INTO ad_audience_desired (sync_id, profile_id, key_type, key_hash, src_check, hints, veto)
-                     SELECT $1, u.pid, u.kt, u.kh, u.sc, NULLIF(u.hi, 'null'::jsonb), $7 FROM UNNEST($2::uuid[], $3::text[], $4::text[], $5::text[], $6::jsonb[]) AS u(pid, kt, kh, sc, hi)
-                     ON CONFLICT (sync_id, profile_id, key_type) DO UPDATE SET key_hash = EXCLUDED.key_hash, src_check = EXCLUDED.src_check, hints = EXCLUDED.hints,
+                    "INSERT INTO ad_audience_desired (sync_id, profile_id, key_type, key_hash, src_check, veto)
+                     SELECT $1, u.pid, u.kt, u.kh, u.sc, $6 FROM UNNEST($2::uuid[], $3::text[], $4::text[], $5::text[]) AS u(pid, kt, kh, sc)
+                     ON CONFLICT (sync_id, profile_id, key_type) DO UPDATE SET key_hash = EXCLUDED.key_hash, src_check = EXCLUDED.src_check,
                          veto = ad_audience_desired.veto OR EXCLUDED.veto",
                 )
                 .bind(s.id)
@@ -499,7 +497,6 @@ impl Ctx<'_> {
                 .bind(&types)
                 .bind(&hashes)
                 .bind(&checks)
-                .bind(&hints)
                 .bind(veto)
                 .execute(&mut *tx)
                 .await?;
@@ -526,6 +523,23 @@ impl Ctx<'_> {
         let s = self.sync;
         let leaving = self.run.mode != "veto_only";
         if self.run.cursor_id.is_none() {
+            if self.run.mode == "withdraw" {
+                // Additions still open (written but never settled, or Google still processing) may
+                // have reached the platform: count them as sent, so they're removed too.
+                let Some(mut tx) = fenced(self.state, s.id, self.tok).await? else { return Ok(Ok(Flow::Stop)) };
+                sqlx::query(
+                    "UPDATE ad_audience_members m SET state = CASE WHEN m.state = 'adding' THEN 'unconfirmed' ELSE m.state END, batch_id = NULL
+                     FROM ad_audience_batches b WHERE b.sync_id = $1 AND b.op = 'add' AND b.status IN ('pending', 'accepted') AND m.sync_id = $1 AND m.batch_id = b.id",
+                )
+                .bind(s.id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("UPDATE ad_audience_batches SET status = 'abandoned', result_code = 'withdrawn', settled_at = now() WHERE sync_id = $1 AND op = 'add' AND status IN ('pending', 'accepted')")
+                    .bind(s.id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+            }
             // The staging table was just filled: give the planner fresh statistics, or the joins
             // below fall back to nested loops over every staged row.
             sqlx::query("ANALYZE ad_audience_desired, ad_audience_members").execute(&self.state.db).await?;
@@ -617,7 +631,8 @@ impl Ctx<'_> {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "UPDATE ad_audience_syncs SET external_audience_id = NULL, audience_created_at = NULL, status = 'paused', pause_reason = 'tiktok_minimum',
+            "UPDATE ad_audience_syncs SET external_audience_id = NULL, audience_created_at = NULL,
+                 status = CASE WHEN status = 'removing' THEN status ELSE 'paused' END, pause_reason = CASE WHEN status = 'removing' THEN NULL ELSE 'tiktok_minimum' END,
                  platform_size = NULL, platform_size_upper = NULL, platform_status = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(s.id)
@@ -774,7 +789,7 @@ impl Ctx<'_> {
                     "WITH c AS (SELECT key_type, key_hash FROM ad_audience_members WHERE sync_id = $1 AND state = 'removing' AND batch_id IS NULL
                                 AND tried_run_id IS DISTINCT FROM $3 ORDER BY key_type, key_hash LIMIT $4)
                      UPDATE ad_audience_members m SET batch_id = $2, tried_run_id = $3 FROM c WHERE m.sync_id = $1 AND m.key_type = c.key_type AND m.key_hash = c.key_hash
-                     RETURNING m.key_type, m.key_hash, NULL::jsonb AS hints",
+                     RETURNING m.key_type, m.key_hash",
                 )
                 .bind(s.id)
                 .bind(batch_id)
@@ -809,23 +824,14 @@ impl Ctx<'_> {
                     );
                 let taken: Vec<(String, String)> = qb.build_query_as().fetch_all(&mut *tx).await?;
                 let (types, hashes): (Vec<String>, Vec<String>) = taken.into_iter().unzip();
-                // Mark them taken for this run, and pick up Meta's optional match fields.
-                let staged: Vec<(String, String, Option<Value>)> = sqlx::query_as(
-                    "UPDATE ad_audience_desired d SET claimed = true FROM UNNEST($2::text[], $3::text[]) AS u(t, h)
-                     WHERE d.sync_id = $1 AND d.key_type = u.t AND d.key_hash = u.h RETURNING d.key_type, d.key_hash, d.hints",
-                )
-                .bind(s.id)
-                .bind(&types)
-                .bind(&hashes)
-                .fetch_all(&mut *tx)
-                .await?;
-                let mut hints: std::collections::HashMap<(String, String), Value> = std::collections::HashMap::new();
-                for (t, h, x) in staged {
-                    if let Some(x) = x {
-                        hints.entry((t, h)).or_insert(x);
-                    }
-                }
-                let mut out: Vec<Claimed> = types.into_iter().zip(hashes).map(|(t, h)| Claimed { hints: hints.get(&(t.clone(), h.clone())).cloned(), key_type: t, key_hash: h }).collect();
+                // Mark them taken for this run.
+                sqlx::query("UPDATE ad_audience_desired d SET claimed = true FROM UNNEST($2::text[], $3::text[]) AS u(t, h) WHERE d.sync_id = $1 AND d.key_type = u.t AND d.key_hash = u.h")
+                    .bind(s.id)
+                    .bind(&types)
+                    .bind(&hashes)
+                    .execute(&mut *tx)
+                    .await?;
+                let mut out: Vec<Claimed> = types.into_iter().zip(hashes).map(|(key_type, key_hash)| Claimed { key_type, key_hash }).collect();
                 out.sort_by(|a, b| (&a.key_type, &a.key_hash).cmp(&(&b.key_type, &b.key_hash)));
                 out
             }
@@ -834,7 +840,7 @@ impl Ctx<'_> {
             tx.commit().await?;
             return Ok(None);
         }
-        let rows: Vec<Value> = picked.iter().map(|c| if let Some(h) = &c.hints { json!({"t": c.key_type, "h": c.key_hash, "x": h}) } else { json!({"t": c.key_type, "h": c.key_hash}) }).collect();
+        let rows: Vec<Value> = picked.iter().map(|c| json!({"t": c.key_type, "h": c.key_hash})).collect();
         let b: BatchRow = sqlx::query_as(&format!("INSERT INTO ad_audience_batches (id, sync_id, run_id, op, rows, row_count) VALUES ($1, $2, $3, $4, $5, $6) RETURNING {BATCH_COLS}"))
             .bind(batch_id)
             .bind(s.id)
@@ -930,7 +936,7 @@ impl Ctx<'_> {
     /// whose people have all stopped qualifying, or any of whom opted out, go back to `remove`.
     async fn sweep(&self) -> PStep {
         let s = self.sync;
-        if self.run.mode == "veto_only" || self.run.sweeps >= MAX_SWEEPS {
+        if matches!(self.run.mode.as_str(), "veto_only" | "withdraw") || self.run.sweeps >= MAX_SWEEPS {
             return self.set_phase("finish").await;
         }
         let src = load_source(&self.state.db, s.account_id, &s.source_type, s.source_id).await?;
@@ -981,6 +987,11 @@ impl Ctx<'_> {
             };
         }
         let audience = store::sync(&self.state.db, s.id).await?.and_then(|x| x.external_audience_id);
+        if self.run.mode == "withdraw" {
+            if let Some(flow) = self.finish_withdraw(audience.as_deref()).await? {
+                return Ok(flow);
+            }
+        }
         let stats = match &audience {
             Some(a) => match platforms::stats(self.state, self.target, a).await {
                 Ok(st) => Some(st),
@@ -1004,8 +1015,7 @@ impl Ctx<'_> {
                  platform_size = CASE WHEN $3 THEN $4 ELSE s.platform_size END, platform_size_upper = CASE WHEN $3 THEN $5 ELSE s.platform_size_upper END,
                  match_rate = CASE WHEN $3 THEN $6 ELSE s.match_rate END,
                  platform_status = COALESCE($7::text, s.platform_status),
-                 next_run_at = CASE WHEN $8 THEN LEAST(now() + interval '15 minutes', now() + make_interval(hours => s.interval_hours))
-                                    ELSE now() + make_interval(hours => s.interval_hours) END,
+                 next_run_at = CASE WHEN $8 THEN LEAST(now() + interval '15 minutes', now() + {NEXT_RUN_SQL}) ELSE now() + {NEXT_RUN_SQL} END,
                  updated_at = now()
              FROM ad_audience_runs r WHERE s.id = $1 AND r.id = $2"
         ))
@@ -1023,6 +1033,35 @@ impl Ctx<'_> {
         prune(&mut tx, s.id).await?;
         tx.commit().await?;
         Ok(Ok(Flow::Stop))
+    }
+
+    /// The end of a withdraw run. Once the platform confirmed every removal (nothing DumbMail sent
+    /// is left, and no batch is open): delete the audience if asked (always on TikTok, which can't
+    /// keep fewer than 1,000), then the sync. None: something is still on the platform, so the
+    /// sync stays `removing` and runs again.
+    async fn finish_withdraw(&self, audience: Option<&str>) -> anyhow::Result<Option<Result<Flow, PErr>>> {
+        let s = self.sync;
+        let left: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM ad_audience_members WHERE sync_id = $1) OR EXISTS (SELECT 1 FROM ad_audience_batches WHERE sync_id = $1 AND status IN ('pending', 'accepted'))",
+        )
+        .bind(s.id)
+        .fetch_one(&self.state.db)
+        .await?;
+        if left {
+            return Ok(None);
+        }
+        if let Some(aud) = audience.filter(|_| s.delete_audience || self.platform() == Platform::Tiktok) {
+            // A not-found is ambiguous: the sync stays `removing` and says so. Deleting it again
+            // while keeping the audience (now empty of everyone DumbMail sent) finishes it.
+            if let Err(e) = platforms::delete_audience(self.state, self.target, aud).await {
+                return Ok(Some(Err(e)));
+            }
+        }
+        let Some(mut tx) = fenced(self.state, s.id, self.tok).await? else { return Ok(Some(Ok(Flow::Stop))) };
+        sqlx::query("DELETE FROM ad_audience_syncs WHERE id = $1 AND status = 'removing'").bind(s.id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        tracing::info!(sync = %s.id, platform = %s.platform, "audience sync deleted after every removal was confirmed");
+        Ok(Some(Ok(Flow::Stop)))
     }
 }
 
@@ -1104,7 +1143,7 @@ pub async fn schedule(state: &AppState) -> anyhow::Result<()> {
     let due: Vec<Uuid> = sqlx::query_scalar(
         "SELECT s.id FROM ad_audience_syncs s JOIN ad_connections c ON c.id = s.connection_id
          WHERE s.current_run_id IS NULL AND s.next_run_at <= now() AND c.status = 'connected'
-           AND (s.status = 'active' OR s.pause_reason = 'tiktok_minimum'
+           AND (s.status IN ('active', 'removing') OR s.pause_reason = 'tiktok_minimum'
                 OR (s.pause_reason IN ('user', 'google_consent') AND EXISTS (SELECT 1 FROM ad_audience_members m WHERE m.sync_id = s.id)))
          ORDER BY s.next_run_at LIMIT 50",
     )
@@ -1124,7 +1163,7 @@ pub async fn schedule(state: &AppState) -> anyhow::Result<()> {
     .fetch_all(&state.db)
     .await?;
     for run_id in stalled {
-        crate::jobs::enqueue(&state.db, JOB_KIND, json!({"run_id": run_id}), None).await?;
+        crate::jobs::enqueue_background(&state.db, JOB_KIND, json!({"run_id": run_id}), None).await?;
     }
     // Runs whose sync moved on (deleted, or the run was replaced) are closed.
     sqlx::query(

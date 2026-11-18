@@ -9,6 +9,7 @@ import { Badge, Button, Checkbox, ConfirmDialog, Field, IconButton, Input, Menu,
 import { useDebouncedValue } from "../../lib/hooks";
 import { pluralize } from "../../lib/format";
 import { toast } from "../../lib/toast";
+import { useCan } from "../../features/team/api";
 
 const limit = 50;
 
@@ -20,6 +21,7 @@ export function ListDetailPage() {
   const [offset, setOffset] = useState(0);
   const profiles = useProfiles({ list_id: id, q: debouncedQ || undefined, limit, offset });
   const [dialog, setDialog] = useState<"import" | "add" | "delete" | "settings" | null>(null);
+  const canSyncAds = useCan("ad_audiences.manage");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [name, setName] = useState<string | null>(null);
   const rename = useUpdateList(id);
@@ -87,7 +89,7 @@ export function ListDetailPage() {
               )}
               items={[
                 { label: "Settings", icon: <Settings2 className="size-3.5" />, onSelect: () => setDialog("settings") },
-                { label: "Sync to ads", icon: <Megaphone className="size-3.5" />, onSelect: () => navigate(`/settings/ad-audiences?new=list:${id}`) },
+                ...(canSyncAds ? [{ label: "Sync to ads", icon: <Megaphone className="size-3.5" />, onSelect: () => navigate(`/settings/ad-audiences?new=list:${id}`) }] : []),
                 { label: "Delete list", icon: <Trash2 className="size-3.5" />, danger: true, onSelect: () => setDialog("delete") },
               ]}
             />

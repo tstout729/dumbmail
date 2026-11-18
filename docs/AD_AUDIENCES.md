@@ -11,7 +11,7 @@ A person is sent to an ad platform only if **all** of these are true, checked by
 - they're in the list or segment the sync uses;
 - their email consent is **subscribed** (not "never subscribed", pending or unsubscribed);
 - their email isn't suppressed (bounced or complained);
-- they aren't on a marketing hold;
+- they aren't on a marketing hold (people whose details you have for service reasons, such as a booking, and who haven't agreed to marketing);
 - they haven't opted out of ads: none of the profile properties `ads_opt_out`, `do_not_sell` or `gpc` is set, and `ads_consent` isn't set to a "no".
 
 A property counts as set unless its value is `false`, `"false"`, `"0"`, `"no"`, empty or missing (spaces around it and upper or lower case don't matter). Anything else, such as `true`, `"yes"`, `" TRUE "`, `1` or `"denied"`, counts as an opt-out. `ads_consent` never adds anyone: it can only take people out.
@@ -20,7 +20,7 @@ What a visitor's browser reports (the website script) can only take people out. 
 
 There is no way to send people who unsubscribed, even for an audience you only use to exclude people from ads: an ad platform can't be made to use a list for exclusion only.
 
-People are rechecked right before each batch is sent, and again at the end of every run. Someone who opts out, is deleted or changes their address while a sync is running isn't sent, and if they were already sent they're removed in the same run.
+People are rechecked right before each batch is sent, and again at the end of every run. Someone who opts out, is deleted or changes their address while a sync is running isn't sent, and if they were already sent they're removed in the same run. Anyone who stops qualifying later for any reason (they leave the list, unsubscribe, opt out or are put on a marketing hold) is removed on the next run.
 
 ## What is sent
 
@@ -28,11 +28,11 @@ Only identifiers the platform can match on, normalized the way each platform doc
 
 | Platform | Sent |
 | --- | --- |
-| Meta | email, and phone (opted in to texts). Optionally ("Email, phone, name and location") also hashed first and last name, city, state, ZIP and country. |
-| Google Ads | email and phone (opted in to texts), hashed. Nothing else, so nothing about where people live is sent. |
+| Meta | email, and phone (opted in to texts). |
+| Google Ads | email, and phone (opted in to texts). |
 | TikTok | email only. TikTok audiences take one kind of identifier each. |
 
-Location fields come from the profile's `city`, `region` (or `state`), `zip` (or `postal_code`) and `country` properties.
+Nothing else is sent: no names, cities, postal codes or countries. A visitor's browser can fill those in on a profile, so they can't be trusted to describe the person.
 
 DumbMail works in identifiers rather than profiles: one hashed email or phone number is one entry on the platform. If two profiles hash to the same entry (for example `a.b+shop@gmail.com` and `ab@gmail.com` on Google), the entry stays while either still qualifies, and is removed as soon as either opts out.
 
@@ -74,7 +74,7 @@ Common problems, in plain words on the sync:
 
 - **Pause** stops additions. A paused sync still runs on its schedule to remove people who leave or opt out, so opt-outs always reach the platform.
 - **TikTok's minimum.** TikTok refuses any change that would leave an audience with fewer than 1,000 entries, including removals. When removals would do that (or TikTok refuses a removal), DumbMail deletes the whole TikTok audience, so nobody who left or opted out stays in it, and pauses the sync with the reason "below TikTok's minimum of 1,000 people". When 1,000 people qualify again it creates a new audience on its own. Before the first upload, a TikTok sync waits until 1,000 people qualify.
-- **Delete** stops the sync for good and needs `confirm=true`. It can also delete the audience on the platform (ads that use it stop). If you keep the audience, DumbMail no longer removes people who opt out from it, so delete it on the platform when you can.
+- **Delete** stops the sync for good and needs `confirm=true`. DumbMail first removes everyone it uploaded from the platform audience, so nobody who later unsubscribes or opts out is left in it. There is no way to stop a sync and leave people in the audience. While the platform hasn't confirmed every removal, the sync shows as **Removing** (status `removing`) and DumbMail tries again at least every hour; it can't be paused or changed. Once every removal is confirmed, the sync is deleted, and the audience is either kept (empty) or deleted on the platform too (`delete_on_platform=true`; ads that use it stop). TikTok audiences are always deleted, because TikTok can't keep one with fewer than 1,000 people. If the platform says the audience to delete doesn't exist, the sync stays Removing and says so; delete it again keeping the audience to finish.
 
 ## Audiences DumbMail didn't make
 
@@ -87,18 +87,18 @@ All under `/api/ad-audiences`, with a session or `Authorization: Bearer <API key
 | Method and path | What it does |
 | --- | --- |
 | `GET /connections` | Each platform: `available` on this server, `status` (`not_connected`, `connected`, `needs_reconnect`), who connected, when the sign-in expires (`expires_soon` in its last week), whether the last disconnect's revoke was confirmed, plus the account's `settings`. |
-| `POST /connections/{platform}/start` | Returns `{url}` to open in the browser to connect. Needs someone signed in (owner or admin), not an API key. |
+| `POST /connections/{platform}/start` | Returns `{url}` to open in the browser to connect. Needs someone signed in (the owner or an admin), not an API key. |
 | `DELETE /connections/{platform}` | Deletes DumbMail's sign-in and asks the platform to revoke it; `revoked` says whether the platform confirmed. |
 | `GET /connections/{platform}/accounts` | Ad accounts the sign-in can reach (Meta, TikTok). Google returns `manual_entry: true`. |
 | `GET /settings`, `PATCH /settings` | `google_consent` (true or false). Changing it needs a signed-in owner or admin; who and when is recorded. |
 | `GET /syncs` | All syncs (`?source_type=list&source_id=…` to filter). |
-| `POST /syncs` | Create: `platform`, `ad_account_id`, `source_type` (`list` or `segment`), `source_id`, `accept_terms: true`, optional `name`, `match_fields` (`contact`, or `contact_and_location` on Meta), `interval_hours` (1–168, default 6), and for Google `login_account_id` (the manager account ID). |
+| `POST /syncs` | Create: `platform`, `ad_account_id`, `source_type` (`list` or `segment`), `source_id`, `accept_terms: true`, optional `name`, `interval_hours` (1–168, default 6), and for Google `login_account_id` (the manager account ID). |
 | `GET /syncs/{id}` | Status, the last 30 runs, and batches still waiting for the platform. |
-| `PATCH /syncs/{id}` | `status` (`active` or `paused`), `interval_hours`, `match_fields`, or `recreate_audience: true` with `confirm: true`. |
-| `POST /syncs/{id}/run` | Sync now. |
-| `DELETE /syncs/{id}?confirm=true&delete_on_platform=true` | Delete the sync, and optionally the audience on the platform. Without `confirm=true` it returns what would happen. |
+| `PATCH /syncs/{id}` | `status` (`active` or `paused`), `interval_hours`, or `recreate_audience: true` with `confirm: true`. Refused while the sync is being removed. |
+| `POST /syncs/{id}/run` | Sync now (for a sync being removed: try the removals again now). |
+| `DELETE /syncs/{id}?confirm=true&delete_on_platform=true` | Delete the sync: everyone it uploaded is removed first, then the sync goes, and with `delete_on_platform=true` the audience too. Answers `deleted: true` when nothing had been uploaded; otherwise `deleted: false` and the sync with `status: "removing"`. Without `confirm=true` it returns what would happen. |
 
-Sync status fields: `sent`, `confirmed`, `pending_removal` (hashed entries), `last_added` and `last_removed` (confirmed, last run), `platform_size`, `match_rate`, `status`, `pause_reason` (`user`, `google_consent`, `tiktok_minimum`, `audience_missing`, `create_unclear`) with `pause_message`, `error_code` with `error` in plain words, and `verified_live`.
+Sync status fields: `sent`, `confirmed`, `pending_removal` (hashed entries), `last_added` and `last_removed` (confirmed, last run), `platform_size`, `match_rate`, `status` (`active`, `paused` or `removing`), `removing_message`, `delete_audience`, `pause_reason` (`user`, `google_consent`, `tiktok_minimum`, `audience_missing`, `create_unclear`) with `pause_message`, `error_code` with `error` in plain words, and `verified_live`.
 
 `accept_terms: true` records that the people in the list gave you their contact details directly and that you accept the platform's customer list terms (Meta's Custom Audience terms, Google's Customer Match policy, TikTok's Custom Audience terms).
 
@@ -108,20 +108,23 @@ Sync status fields: `sent`, `confirmed`, `pending_removal` (hashed entries), `la
 
 - Connecting needs a browser and a signed-in person: `list_ad_connections` returns `connect_url` (Settings → Ad audiences) to send the user to. The Google consent setting is changed there too.
 - `create_audience_sync` sends customer data to an ad platform. Without `confirm: true` it returns a dry run with the number of people who qualify; pass `confirm: true` and `accept_terms: true` only after the user agrees.
-- `update_audience_sync` needs `confirm: true` to turn on Meta's name and location matching, or to recreate an audience.
+- `update_audience_sync` needs `confirm: true` to recreate an audience.
 - `delete_audience_sync` and `disconnect_ad_platform` describe what would happen unless `confirm: true`.
 
-## Permissions (for the team-and-roles layer)
+## Permissions
 
-Until roles land, signed-in members need to be the owner or an admin to connect, disconnect and change the Google consent setting; API keys can do everything except start a sign-in and change the consent setting. Intended permissions:
+Seeing connections, settings and syncs (counts only, no personal data) needs permission to see the audience. Anything that connects an ad account or changes what's sent to one needs `ad_audiences.manage`, which admins and the owner have. API keys need the `audience` scope (or `audience:read`, or `read`) to read, and the `account` scope to change anything. Connecting a platform and the Google consent setting need someone signed in to DumbMail; an API key can't.
 
-| Route or tool | Who |
+| Route or tool | Needs |
 | --- | --- |
-| `POST /connections/{platform}/start`, `DELETE /connections/{platform}`, `disconnect_ad_platform` | Owner, admins |
-| `PATCH /settings` (Google consent) | Owner, admins (a signed-in person; never an API key) |
-| `POST /syncs`, `PATCH /syncs/{id}`, `POST /syncs/{id}/run`, `DELETE /syncs/{id}`, `create_audience_sync`, `update_audience_sync`, `run_audience_sync`, `delete_audience_sync` | Admins and the owner (they send customer data to third parties) |
-| `GET /connections`, `GET /connections/{platform}/accounts`, `GET /settings`, `GET /syncs`, `GET /syncs/{id}`, `list_ad_connections`, `list_ad_accounts`, `list_audience_syncs`, `get_audience_sync` | Anyone who can see the audience |
-| `GET /oauth/{platform}/callback` | The signed-in person who started that sign-in |
+| `GET /connections`, `GET /connections/{platform}/accounts`, `GET /settings`, `GET /syncs`, `GET /syncs/{id}`, `list_ad_connections`, `list_ad_accounts`, `list_audience_syncs`, `get_audience_sync` | `audience.read` |
+| `POST /connections/{platform}/start` | `ad_audiences.manage`, signed in (not an API key) |
+| `DELETE /connections/{platform}`, `disconnect_ad_platform` | `ad_audiences.manage` |
+| `PATCH /settings` (Google consent) | `ad_audiences.manage`, signed in (not an API key) |
+| `POST /syncs`, `PATCH /syncs/{id}`, `POST /syncs/{id}/run`, `DELETE /syncs/{id}`, `create_audience_sync`, `update_audience_sync`, `run_audience_sync`, `delete_audience_sync` | `ad_audiences.manage` |
+| `GET /oauth/{platform}/callback` | No sign-in check by the router (the platform redirects here); it finishes only for the signed-in member who started that sign-in, and only if they still have `ad_audiences.manage`. |
+
+The audit log records connecting and disconnecting a platform, and creating, changing, running and deleting a sync (`ad_audiences.*`), without tokens or hashed identifiers.
 
 ## Privacy records
 

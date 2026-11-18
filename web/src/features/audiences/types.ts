@@ -29,8 +29,6 @@ export type AdSettings = {
 
 export type AdAccount = { id: string; name: string | null };
 
-export type MatchFields = "contact" | "contact_and_location";
-
 export type PauseReason = "user" | "google_consent" | "tiktok_minimum" | "audience_missing" | "create_unclear";
 
 export type AudienceSync = {
@@ -43,12 +41,16 @@ export type AudienceSync = {
   source: { type: "list" | "segment"; id: string; name: string | null; exists: boolean };
   name: string;
   audience_id: string | null;
-  status: "active" | "paused";
+  /** removing: being deleted; DumbMail is withdrawing everyone it uploaded first. */
+  status: "active" | "paused" | "removing";
   pause_reason: PauseReason | null;
   pause_message: string | null;
+  removing: boolean;
+  removing_message: string | null;
+  /** Being deleted: also delete the audience on the platform at the end. */
+  delete_audience: boolean;
   running: boolean;
   connection_status: "connected" | "needs_reconnect" | "disconnected";
-  match_fields: MatchFields;
   interval_hours: number;
   next_run_at: string | null;
   last_run_at: string | null;
@@ -74,8 +76,8 @@ export type AudienceSync = {
 
 export type AudienceRun = {
   id: string;
-  trigger: "created" | "scheduled" | "manual";
-  mode: "full" | "remove_only" | "veto_only";
+  trigger: "created" | "scheduled" | "manual" | "deleted";
+  mode: "full" | "remove_only" | "veto_only" | "withdraw";
   status: "running" | "done" | "failed" | "stopped";
   phase: string;
   added: number;
@@ -99,12 +101,12 @@ export type CreateSyncInput = {
   source_type: "list" | "segment";
   source_id: string;
   name?: string;
-  match_fields: MatchFields;
   interval_hours: number;
   accept_terms: boolean;
 };
 
-export type UpdateSyncInput = Partial<Pick<AudienceSync, "status" | "interval_hours" | "match_fields">> & {
+export type UpdateSyncInput = Partial<Pick<AudienceSync, "interval_hours">> & {
+  status?: "active" | "paused";
   recreate_audience?: boolean;
   confirm?: boolean;
 };

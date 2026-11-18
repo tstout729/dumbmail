@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { AlertTriangle, Clock, Pause, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import { Badge, Button, Checkbox, ConfirmDialog, Drawer, Field, Notice, Select, Skeleton, type Tone } from "../../components/ui";
 import { formatDateTime, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useAudienceSync, useDeleteSync, useRunSync, useUpdateSync } from "./api";
-import type { AudienceRun, AudienceSync, MatchFields, WaitingBatch } from "./types";
+import type { AudienceRun, AudienceSync, WaitingBatch } from "./types";
 
 export const intervalOptions = [
   { hours: 1, label: "Every hour" },
@@ -25,6 +26,7 @@ const pausedLabel: Record<string, string> = {
 };
 
 export function syncState(s: AudienceSync): { label: string; tone: Tone } {
+  if (s.removing) return { label: "Removing", tone: "amber" };
   if (s.running) return { label: "Syncing", tone: "blue" };
   if (s.status === "paused") return { label: pausedLabel[s.pause_reason ?? "user"] ?? "Paused", tone: "amber" };
   if (s.connection_status !== "connected") return { label: "Reconnect needed", tone: "amber" };
@@ -40,9 +42,14 @@ function sizeText(s: AudienceSync): string {
   return formatNumber(s.platform_size);
 }
 
-const triggerLabel: Record<AudienceRun["trigger"], string> = { created: "First sync", scheduled: "Scheduled", manual: "Sync now" };
+const triggerLabel: Record<AudienceRun["trigger"], string> = { created: "First sync", scheduled: "Scheduled", manual: "Sync now", deleted: "Deleting" };
 
-const modeLabel: Record<AudienceRun["mode"], string> = { full: "", remove_only: " · removals only (paused)", veto_only: " · opt-outs only (list or segment gone)" };
+const modeLabel: Record<AudienceRun["mode"], string> = {
+  full: "",
+  remove_only: " · removals only (paused)",
+  veto_only: " · opt-outs only (list or segment gone)",
+  withdraw: " · removing everyone (sync being deleted)",
+};
 
 function waitingText(w: WaitingBatch, platform: string): string {
   const n = formatNumber(w.count);
@@ -58,8 +65,8 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
   const remove = useDeleteSync();
   const [deleting, setDeleting] = useState(false);
   const [alsoOnPlatform, setAlsoOnPlatform] = useState(false);
-  const [widen, setWiden] = useState<MatchFields | null>(null);
   const [recreating, setRecreating] = useState(false);
+  const canManage = useCan("ad_audiences.manage");
   const s = sync.data;
 
   const save = (input: Parameters<typeof update.mutate>[0]) => update.mutate(input, { onSuccess: () => toast.success("Sync updated") });
@@ -70,7 +77,29 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
       onClose={onClose}
       width="w-[min(520px,100vw)]"
       footer={
-        s ? (
+        s && canManage && s.removing ? (
+          <>
+            <Button
+              icon={<RefreshCw className="size-3.5" />}
+              loading={run.isPending}
+              disabled={s.running || s.connection_status !== "connected"}
+              onClick={() => run.mutate(s.id, { onSuccess: () => toast.success("Trying the removal again") })}
+            >
+              {s.running ? "Removing…" : "Try again now"}
+            </Button>
+            {s.delete_audience && s.platform !== "tiktok" ? (
+              <Button
+                variant="ghost"
+                className="ml-auto"
+                loading={remove.isPending}
+                disabled={s.running}
+                onClick={() => remove.mutate({ id: s.id, deleteOnPlatform: false }, { onSuccess: () => toast.success(`The ${s.platform_label} audience will be kept, empty`) })}
+              >
+                Keep the audience instead
+              </Button>
+            ) : null}
+          </>
+        ) : s && canManage ? (
           <>
             <Button
               variant="primary"
@@ -125,6 +154,12 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             {s.audience_id ? <p className="text-xs text-zinc-500">Audience ID on {s.platform_label}: {s.audience_id}</p> : null}
           </div>
 
+          {s.removing_message ? (
+            <Notice tone="amber" icon={<Trash2 />} title="Removing">
+              {s.removing_message}
+              {s.connection_status !== "connected" ? ` Reconnect ${s.platform_label} so DumbMail can finish.` : ""}
+            </Notice>
+          ) : null}
           {s.pause_message && s.pause_reason !== "user" ? (
             <Notice tone="amber" icon={<Pause />} title="Paused">
               {s.pause_message}
@@ -158,8 +193,8 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             />
           </dl>
 
-          <div className="space-y-3">
-            <Field label="How often">
+          {canManage && !s.removing ? (
+            <Field label="How often" hint={`Matched on ${s.platform === "tiktok" ? "email" : "email and phone"} only.`}>
               <Select value={s.interval_hours} onChange={(e) => save({ interval_hours: Number(e.target.value) })}>
                 {intervalOptions.some((o) => o.hours === s.interval_hours) ? null : <option value={s.interval_hours}>Every {s.interval_hours} hours</option>}
                 {intervalOptions.map((o) => (
@@ -169,21 +204,7 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
                 ))}
               </Select>
             </Field>
-            <Field label="Match on" hint="More fields can raise the match rate.">
-              <Select
-                value={s.match_fields}
-                disabled={s.platform !== "meta"}
-                onChange={(e) => {
-                  const v = e.target.value as MatchFields;
-                  if (v === "contact_and_location") setWiden(v);
-                  else save({ match_fields: v });
-                }}
-              >
-                <option value="contact">{s.platform === "tiktok" ? "Email" : "Email and phone"}</option>
-                {s.platform === "meta" ? <option value="contact_and_location">Email, phone, name and location</option> : null}
-              </Select>
-            </Field>
-          </div>
+          ) : null}
 
           <div>
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">History</h3>
@@ -211,18 +232,6 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
           </div>
         </div>
       )}
-      {widen && s ? (
-        <ConfirmDialog
-          title="Send more to the ad platform?"
-          body={`Hashed names, cities, states, ZIP codes and countries will also be sent to ${s.platform_label} to improve matching.`}
-          confirmLabel="Send them"
-          onConfirm={() => {
-            save({ match_fields: widen });
-            setWiden(null);
-          }}
-          onClose={() => setWiden(null)}
-        />
-      ) : null}
       {recreating && s ? (
         <ConfirmDialog
           title="Create a new audience?"
@@ -242,14 +251,16 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
           title={`Delete "${s.name}"?`}
           body={
             <div className="space-y-3">
-              <p>DumbMail stops updating this audience.</p>
-              {!alsoOnPlatform && s.audience_id ? (
-                <p className="text-amber-700">If you keep it on {s.platform_label}, DumbMail can no longer remove people who unsubscribe or opt out from it.</p>
-              ) : null}
-              {s.audience_id ? (
+              <p>
+                DumbMail first removes everyone it uploaded from the audience on {s.platform_label}, so people who later unsubscribe or opt out are never left in it. The
+                sync shows as Removing until {s.platform_label} confirms every removal, and DumbMail keeps trying until it does.
+              </p>
+              {s.audience_id && s.platform === "tiktok" ? (
+                <p>TikTok can't keep an audience with fewer than 1,000 people, so the audience on TikTok is deleted too.</p>
+              ) : s.audience_id ? (
                 <Checkbox
-                  label={`Also delete the audience on ${s.platform_label}`}
-                  description="Ads that use it stop running. Leave this off to keep the audience as it is now."
+                  label={`Then delete the audience on ${s.platform_label}`}
+                  description="Ads that use it stop running. Leave this off to keep the empty audience."
                   checked={alsoOnPlatform}
                   onChange={(e) => setAlsoOnPlatform(e.target.checked)}
                 />
@@ -263,9 +274,10 @@ export function SyncDrawer({ id, onClose }: { id: string; onClose: () => void })
             remove.mutate(
               { id: s.id, deleteOnPlatform: alsoOnPlatform },
               {
-                onSuccess: () => {
-                  toast.success(alsoOnPlatform ? `Sync and ${s.platform_label} audience deleted` : "Sync deleted");
-                  onClose();
+                onSuccess: (r) => {
+                  toast.success(r.deleted ? "Sync deleted" : `Removing everyone from the ${s.platform_label} audience`);
+                  setDeleting(false);
+                  if (r.deleted) onClose();
                 },
               },
             )

@@ -225,10 +225,12 @@ pub struct SyncRow {
     pub name: String,
     pub external_audience_id: Option<String>,
     pub audience_created_at: Option<DateTime<Utc>>,
-    pub match_fields: String,
     pub interval_hours: i32,
     pub status: String,
     pub pause_reason: Option<String>,
+    /// Being deleted (status `removing`): also delete the audience on the platform once everyone
+    /// DumbMail uploaded is confirmed removed.
+    pub delete_audience: bool,
     pub current_run_id: Option<Uuid>,
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -251,14 +253,15 @@ impl SyncRow {
     pub fn platform(&self) -> Platform {
         Platform::parse(&self.platform).unwrap_or(Platform::Meta)
     }
-    /// Meta only: also send hashed names and locations to help matching.
-    pub fn with_hints(&self) -> bool {
-        self.platform() == Platform::Meta && self.match_fields == "contact_and_location"
+    /// Being deleted: every run withdraws everyone DumbMail uploaded, and the sync goes once the
+    /// platform confirms it.
+    pub fn removing(&self) -> bool {
+        self.status == "removing"
     }
 }
 
 pub const SYNC_COLS: &str = "s.id, s.account_id, s.connection_id, s.platform, s.ad_account_id, s.ad_account_name, s.login_account_id, s.source_type, s.source_id, s.name, \
-    s.external_audience_id, s.audience_created_at, s.match_fields, s.interval_hours, s.status, s.pause_reason, s.current_run_id, s.next_run_at, s.last_run_at, \
+    s.external_audience_id, s.audience_created_at, s.interval_hours, s.status, s.pause_reason, s.delete_audience, s.current_run_id, s.next_run_at, s.last_run_at, \
     s.last_success_at, s.last_error_code, s.sent_count, s.confirmed_count, s.pending_removal_count, s.last_added, s.last_removed, s.platform_size, \
     s.platform_size_upper, s.match_rate, s.platform_status, s.created_at, s.updated_at";
 
@@ -270,9 +273,29 @@ pub async fn account_sync(db: &sqlx::PgPool, account_id: Uuid, id: Uuid) -> sqlx
     sqlx::query_as(&format!("SELECT {SYNC_COLS} FROM ad_audience_syncs s WHERE s.id = $1 AND s.account_id = $2")).bind(id).bind(account_id).fetch_optional(db).await
 }
 
+/// Plain words for a sync that's being deleted.
+pub fn removing_words(s: &SyncRow) -> Option<String> {
+    if !s.removing() {
+        return None;
+    }
+    let l = s.platform().label();
+    let then = if s.delete_audience || s.platform() == Platform::Tiktok {
+        format!("then deletes the audience on {l} and this sync")
+    } else {
+        format!("then deletes this sync and leaves the empty audience on {l}")
+    };
+    Some(format!(
+        "Removing: DumbMail is taking everyone it uploaded out of the audience on {l}, and {then}. Until {l} confirms every removal ({} still to go), the sync stays here and DumbMail keeps trying.",
+        s.pending_removal_count + s.sent_count
+    ))
+}
+
 /// Plain words for why a sync is paused.
 pub fn pause_words(s: &SyncRow) -> Option<String> {
     let l = s.platform().label();
+    if s.status != "paused" {
+        return None;
+    }
     Some(match s.pause_reason.as_deref()? {
         "user" => "Paused. DumbMail adds nobody, but still removes people who leave or opt out.".into(),
         "google_consent" => "Paused: Google syncs need an owner or admin to confirm the advertising consent setting in Settings → Ad audiences.".into(),
@@ -303,9 +326,11 @@ pub fn sync_json(s: &SyncRow, source_name: Option<&str>, connection_status: Opti
         "status": s.status,
         "pause_reason": s.pause_reason,
         "pause_message": pause_words(s),
+        "removing": s.removing(),
+        "removing_message": removing_words(s),
+        "delete_audience": s.delete_audience,
         "running": s.current_run_id.is_some(),
         "connection_status": connection_status.unwrap_or("disconnected"),
-        "match_fields": s.match_fields,
         "interval_hours": s.interval_hours,
         "next_run_at": s.next_run_at,
         "last_run_at": s.last_run_at,

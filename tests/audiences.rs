@@ -332,8 +332,14 @@ async fn meta_only_sends_subscribed_people_and_keeps_in_step() {
     old["include_unsubscribed"] = json!(true);
     old["accept_terms"] = json!(true);
     assert_eq!(h.req("POST", "/api/ad-audiences/syncs", Some(old)).await.0, StatusCode::BAD_REQUEST, "there is no way to include unsubscribed people");
+    let mut named = body.clone();
+    named["match_fields"] = json!("contact_and_location");
+    named["accept_terms"] = json!(true);
+    assert!(h.req("POST", "/api/ad-audiences/syncs", Some(named)).await.0.is_client_error(), "names and locations can't be matched on");
     let id = meta_sync(&mut h, &list).await;
     assert_eq!(h.req("POST", "/api/ad-audiences/syncs", Some(json!({"platform": "meta", "ad_account_id": "111", "source_type": "list", "source_id": list, "accept_terms": true}))).await.0, StatusCode::CONFLICT);
+    let lanes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT lane FROM jobs WHERE kind = 'audiences_run'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(lanes, vec!["background".to_string()], "runs never queue in the lane sending uses");
 
     h.drain().await;
     assert!(m.calls("/meta/act_111/customaudiences").iter().all(|c| c.method == "POST"), "never looks for an existing audience to adopt");
@@ -394,13 +400,17 @@ async fn meta_only_sends_subscribed_people_and_keeps_in_step() {
     assert_eq!(meta_emails(&m, "DELETE"), set(&["hal@example.com"]));
     assert!(meta_emails(&m, "POST").is_empty(), "nobody is added while paused");
 
-    // Deleting needs confirm=true over REST too; with it, the audience goes on the platform first.
+    // Deleting needs confirm=true over REST too; with it, the sync withdraws what's left, then the
+    // audience goes on the platform, then the sync.
     let dry = h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?delete_on_platform=true"), None).await;
     assert_eq!(dry["dry_run"], true);
+    assert!(dry["note"].as_str().unwrap().contains("remove everyone DumbMail uploaded"), "{dry}");
     assert!(m.calls("/meta/6001").iter().all(|c| c.method != "DELETE"));
     let del = h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?delete_on_platform=true&confirm=true"), None).await;
-    assert_eq!(del["deleted_on_platform"], true);
+    assert_eq!((del["deleted"].as_bool(), del["removing"].as_bool()), (Some(false), Some(true)), "{del}");
+    h.drain().await;
     assert_eq!(m.calls("/meta/6001").iter().filter(|c| c.method == "DELETE").count(), 1);
+    assert_eq!(h.req("GET", &format!("/api/ad-audiences/syncs/{id}"), None).await.0, StatusCode::NOT_FOUND);
 
     // Disconnect: tokens deleted, and whether Meta confirmed the revoke is reported.
     let d = h.ok("DELETE", "/api/ad-audiences/connections/meta", None).await;
@@ -488,14 +498,29 @@ async fn browser_events_cannot_add_anyone() {
     // A browser makes a new profile that matches the segment and claims consent: never subscribed.
     let (s, _, _) = h.raw("POST", &format!("/client/events?k={key}"), &[("content-type", "application/json")], &event(json!({"email": "forged@evil.test", "email_consent": "subscribed", "properties": {"tier": "vip", "ads_consent": true}}))).await;
     assert!(s.is_success());
-    // And fills in a phone number and location on a real subscriber.
-    let (s, _, _) = h.raw("POST", &format!("/client/events?k={key}"), &[("content-type", "application/json")], &event(json!({"email": "ann@example.com", "phone_number": "+15035550111", "properties": {"tier": "vip"}}))).await;
+    // And fills in a phone number, a name and a location on a real subscriber.
+    let (s, _, _) = h
+        .raw(
+            "POST",
+            &format!("/client/events?k={key}"),
+            &[("content-type", "application/json")],
+            &event(json!({"email": "ann@example.com", "phone_number": "+15035550111", "first_name": "Mallory", "properties": {"tier": "vip", "city": "Springfield", "zip": "97477", "country": "US"}})),
+        )
+        .await;
     assert!(s.is_success());
     meta_sync(&mut h, &list).await;
     h.ok("POST", "/api/ad-audiences/syncs", Some(json!({"platform": "meta", "ad_account_id": "111", "source_type": "segment", "source_id": segment, "accept_terms": true}))).await;
     h.drain().await;
     let rows = meta_rows(&m.calls("/users"));
     assert!(rows.iter().all(|r| r[1].is_empty()), "the browser-filled phone number wasn't opted in, so it's never sent: {rows:?}");
+    for c in m.calls("/users") {
+        let p: Value = serde_json::from_str(&c.form()["payload"]).unwrap();
+        assert_eq!(p["schema"], json!(["EMAIL", "PHONE"]), "only email and phone: names and locations can come from a browser");
+    }
+    let everything = m.all_bodies();
+    for leaked in [sha("mallory"), sha("springfield"), sha("97477"), sha("us")] {
+        assert!(!everything.contains(&leaked), "a hashed name or location left the server");
+    }
     assert_eq!(meta_emails(&m, "POST"), set(&["ann@example.com"]), "the forged profile isn't subscribed");
     // ads_consent from a browser grants nothing on Google either: Google needs the account setting.
     connect(&mut h, "google", "g-code").await;
@@ -725,18 +750,14 @@ async fn audiences_dumbmail_did_not_create_are_never_touched() {
     assert!(!st.to_string().contains("Unsupported post request"), "the platform's own words are never shown");
     assert_eq!(st["confirmed"], 1, "cleanup records kept");
     assert_eq!(h.req("PATCH", &format!("/api/ad-audiences/syncs/{id}"), Some(json!({"status": "active"}))).await.0, StatusCode::BAD_REQUEST);
-    // Delete it (the stand-in confirms deleting 6001) and start again with a new sync.
+    // Delete it (the stand-in confirms the removal and deleting 6001) and start again with a new sync.
     h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?delete_on_platform=true&confirm=true"), None).await;
+    h.drain().await;
     let id = meta_sync(&mut h, &list).await;
     h.drain().await;
     m.fail_next("/users", 400, json!({"error": {"code": 100, "error_subcode": 33}}));
     sub(&mut h, "cy@example.com", &list, json!({})).await;
     run(&mut h, &id).await;
-    // This time Meta also says it can't find the audience to delete: the sync and its records stay.
-    m.fail_next("/meta/6002", 400, json!({"error": {"code": 100, "error_subcode": 33}}));
-    let (s, _) = h.req("DELETE", &format!("/api/ad-audiences/syncs/{id}?delete_on_platform=true&confirm=true"), None).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert_eq!(sync_status(&mut h, &id).await["audience_id"], "6002", "an ambiguous not-found keeps the record");
     // Making a new audience needs confirming.
     assert_eq!(h.req("PATCH", &format!("/api/ad-audiences/syncs/{id}"), Some(json!({"recreate_audience": true}))).await.0, StatusCode::BAD_REQUEST);
     m.clear();
@@ -744,6 +765,21 @@ async fn audiences_dumbmail_did_not_create_are_never_touched() {
     h.drain().await;
     let st = sync_status(&mut h, &id).await;
     assert_eq!((st["audience_id"].as_str(), st["status"].as_str(), st["confirmed"].as_i64()), (Some("6003"), Some("active"), Some(3)), "{st}");
+    // Deleting it: everyone is withdrawn, then Meta says it can't find the audience to delete. The
+    // sync and its audience id stay ("removing"), and it says why.
+    m.clear();
+    m.fail_next("/meta/6003", 400, json!({"error": {"code": 100, "error_subcode": 33}}));
+    h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?delete_on_platform=true&confirm=true"), None).await;
+    h.drain().await;
+    assert_eq!(meta_emails(&m, "DELETE").len(), 3, "everyone was withdrawn first");
+    let st = sync_status(&mut h, &id).await;
+    assert_eq!((st["status"].as_str(), st["audience_id"].as_str(), st["sent"].as_i64()), (Some("removing"), Some("6003"), Some(0)), "an ambiguous not-found keeps the record: {st}");
+    assert!(st["error"].is_string() && st["removing_message"].as_str().unwrap().contains("keeps trying"), "{st}");
+    // Choosing to keep the (now empty) audience finishes the delete without asking Meta again.
+    h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?confirm=true"), None).await;
+    h.drain().await;
+    assert_eq!(m.calls("/meta/6003").iter().filter(|c| c.method == "DELETE").count(), 1);
+    assert_eq!(h.req("GET", &format!("/api/ad-audiences/syncs/{id}"), None).await.0, StatusCode::NOT_FOUND);
     h.cleanup().await;
 }
 
@@ -860,7 +896,7 @@ async fn google_needs_the_consent_setting_and_matches_on_hashed_email_and_phone(
     // Google matches on email and phone only; an ad account the sign-in can't reach is refused.
     let mut loc = create.clone();
     loc["match_fields"] = json!("contact_and_location");
-    assert_eq!(h.req("POST", "/api/ad-audiences/syncs", Some(loc)).await.0, StatusCode::BAD_REQUEST);
+    assert!(h.req("POST", "/api/ad-audiences/syncs", Some(loc)).await.0.is_client_error());
     let mut other = create.clone();
     other["ad_account_id"] = json!("999");
     let (s, v) = h.req("POST", "/api/ad-audiences/syncs", Some(other)).await;
@@ -1076,8 +1112,7 @@ async fn mcp_tools_dry_run_before_sending_or_deleting() {
     h.drain().await;
     assert_eq!(mcp(&h, &key, "get_audience_sync", json!({"id": id})).await["confirmed"], 1);
     assert_eq!(mcp(&h, &key, "update_audience_sync", json!({"id": id, "interval_hours": 12})).await["interval_hours"], 12);
-    assert_eq!(mcp(&h, &key, "update_audience_sync", json!({"id": id, "match_fields": "contact_and_location"})).await["dry_run"], true, "sending more needs confirming");
-    assert_eq!(mcp(&h, &key, "update_audience_sync", json!({"id": id, "match_fields": "contact_and_location", "confirm": true})).await["match_fields"], "contact_and_location");
+    assert!(!tools.to_string().contains("match_fields"), "no name or location matching to turn on");
     mcp(&h, &key, "run_audience_sync", json!({"id": id})).await;
     assert_eq!(mcp(&h, &key, "list_audience_syncs", json!({"source_type": "list", "source_id": list})).await["data"].as_array().unwrap().len(), 1);
     h.drain().await;
@@ -1086,8 +1121,11 @@ async fn mcp_tools_dry_run_before_sending_or_deleting() {
     assert_eq!(dry["dry_run"], true);
     assert!(m.calls("/meta/6001").iter().all(|c| c.method != "DELETE"));
     let dry = mcp(&h, &key, "delete_audience_sync", json!({"id": id})).await;
-    assert!(dry["note"].as_str().unwrap().contains("no longer remove people who opt out"));
-    mcp(&h, &key, "delete_audience_sync", json!({"id": id, "delete_on_platform": true, "confirm": true})).await;
+    assert!(dry["note"].as_str().unwrap().contains("keep the empty audience"), "{dry}");
+    let del = mcp(&h, &key, "delete_audience_sync", json!({"id": id, "delete_on_platform": true, "confirm": true})).await;
+    assert_eq!(del["status"], "removing");
+    h.drain().await;
+    assert_eq!(meta_emails(&m, "DELETE"), set(&["ann@example.com"]), "withdrawn first");
     assert_eq!(m.calls("/meta/6001").iter().filter(|c| c.method == "DELETE").count(), 1);
     assert_eq!(mcp(&h, &key, "disconnect_ad_platform", json!({"platform": "meta"})).await["dry_run"], true);
     mcp(&h, &key, "disconnect_ad_platform", json!({"platform": "meta", "confirm": true})).await;
@@ -1134,3 +1172,171 @@ async fn large_audiences_upload_in_batches() {
     h.cleanup().await;
 }
 
+
+#[tokio::test]
+async fn held_people_are_never_sent_and_are_withdrawn_once_held() {
+    let (mut h, m) = mock_harness!();
+    h.signup().await;
+    connect(&mut h, "meta", "meta-code").await;
+    let list = new_list(&mut h, "VIPs").await;
+    sub(&mut h, "ann@example.com", &list, json!({})).await;
+    let bea = sub(&mut h, "bea@example.com", &list, json!({})).await;
+    let cy = sub(&mut h, "cy@example.com", &list, json!({})).await;
+    // Today a database trigger clears the hold whenever someone is subscribed, so a held subscriber
+    // can't exist. Switch it off in this test's own database to prove the sync's own rule.
+    sqlx::query("ALTER TABLE profiles DISABLE TRIGGER profiles_clear_marketing_hold").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE profiles SET marketing_hold = true WHERE id = $1::uuid").bind(&cy).execute(&h.state.db).await.unwrap();
+    // A held person someone added the usual way (an integration, without an opt-in) isn't sent either.
+    let held = profile(&mut h, json!({"email": "guest@example.com", "list_ids": [list]})).await;
+    let account: Uuid = sqlx::query_scalar("SELECT account_id FROM profiles WHERE id = $1::uuid").bind(&held).fetch_one(&h.state.db).await.unwrap();
+    dumbmail::marketing_hold::hold_new_profile(&h.state.db, account, held.parse().unwrap()).await.unwrap();
+
+    let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "agent"}))).await["key"].as_str().unwrap().to_string();
+    let dry = mcp(&h, &key, "create_audience_sync", json!({"platform": "meta", "ad_account_id": "111", "source_type": "list", "source_id": list})).await;
+    assert_eq!(dry["people_now"].as_i64(), Some(2), "the count leaves held people out: {dry}");
+    let id = meta_sync(&mut h, &list).await;
+    h.drain().await;
+    assert_eq!(meta_emails(&m, "POST"), set(&["ann@example.com", "bea@example.com"]));
+
+    // Bea is put on hold after she was uploaded: the next run withdraws her, like an opt-out.
+    m.clear();
+    sqlx::query("UPDATE profiles SET marketing_hold = true WHERE id = $1::uuid").bind(&bea).execute(&h.state.db).await.unwrap();
+    run(&mut h, &id).await;
+    assert_eq!(meta_emails(&m, "DELETE"), set(&["bea@example.com"]));
+    assert!(meta_emails(&m, "POST").is_empty());
+    assert_eq!(sync_status(&mut h, &id).await["confirmed"], 1);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_a_sync_withdraws_everyone_and_retries_until_confirmed() {
+    let (mut h, m) = mock_harness!();
+    h.signup().await;
+    connect(&mut h, "meta", "meta-code").await;
+    let list = new_list(&mut h, "VIPs").await;
+    sub(&mut h, "ann@example.com", &list, json!({})).await;
+    sub(&mut h, "bea@example.com", &list, json!({})).await;
+    let id = meta_sync(&mut h, &list).await;
+    h.drain().await;
+    // A second upload has no readable answer: Ann's and Bea's first upload is confirmed, Cy's
+    // batch is left open and counts as possibly on Meta.
+    sub(&mut h, "cy@example.com", &list, json!({})).await;
+    m.fail_next("/users", 200, json!({"audience_id": "6001"}));
+    run(&mut h, &id).await;
+    let open: i64 = sqlx::query_scalar("SELECT count(*) FROM ad_audience_batches WHERE status = 'pending' AND op = 'add'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(open, 1);
+
+    // Delete, keeping the audience. The first removal fails: the sync stays, shown as removing.
+    m.clear();
+    m.fail_next("/users", 503, json!({"error": {"code": 2, "message": "Service temporarily unavailable"}}));
+    let del = h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?confirm=true"), None).await;
+    assert_eq!((del["deleted"].as_bool(), del["status"].as_str()), (Some(false), Some("removing")), "{del}");
+    h.drain().await;
+    let st = sync_status(&mut h, &id).await;
+    assert_eq!((st["status"].as_str(), st["removing"].as_bool()), (Some("removing"), Some(true)), "{st}");
+    assert!(st["removing_message"].as_str().unwrap().contains("Until Meta confirms every removal"), "{st}");
+    assert_eq!(h.req("PATCH", &format!("/api/ad-audiences/syncs/{id}"), Some(json!({"status": "active"}))).await.0, StatusCode::BAD_REQUEST, "a sync being removed can't be resumed");
+    assert!(meta_emails(&m, "POST").is_empty(), "nothing is added while removing");
+
+    // The retry goes through: everyone it uploaded, including Cy's unconfirmed upload, is removed;
+    // the audience stays (empty) and the sync is gone.
+    h.fast_forward().await;
+    assert_eq!(meta_emails(&m, "DELETE"), set(&["ann@example.com", "bea@example.com", "cy@example.com"]));
+    assert!(m.calls("/meta/6001").iter().all(|c| c.method != "DELETE"), "the audience was kept, as asked");
+    assert_eq!(h.req("GET", &format!("/api/ad-audiences/syncs/{id}"), None).await.0, StatusCode::NOT_FOUND);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM ad_audience_members").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(left, 0);
+
+    // A sync that never uploaded anything is deleted straight away.
+    let empty = new_list(&mut h, "Empty").await;
+    let id = meta_sync(&mut h, &empty).await;
+    assert_eq!(h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?confirm=true"), None).await["deleted"], true);
+    h.cleanup().await;
+}
+
+/// Invite `email` as `role` and sign them in; the harness keeps the owner's cookie.
+async fn member_cookie(h: &mut Harness, email: &str, role: &str) -> String {
+    h.ok("POST", "/api/team/invites", Some(json!({"email": email, "role": role}))).await;
+    let sent = h.state.email.sent();
+    let msg = sent.iter().rev().find(|e| e.to == email && e.text.contains("/invite/")).unwrap();
+    let i = msg.text.find("/invite/").unwrap() + "/invite/".len();
+    let token = msg.text[i..].split_whitespace().next().unwrap().to_string();
+    let owner = h.cookie.take();
+    h.ok("POST", &format!("/api/invites/{token}/accept"), Some(json!({"name": "Member", "password": "member pass 1"}))).await;
+    let cookie = h.cookie.take().unwrap();
+    h.cookie = owner;
+    cookie
+}
+
+#[tokio::test]
+async fn only_admins_and_the_owner_change_ad_audiences_and_it_is_audited() {
+    let (mut h, m) = mock_harness!();
+    h.signup().await;
+    connect(&mut h, "meta", "meta-code").await;
+    let list = new_list(&mut h, "VIPs").await;
+    sub(&mut h, "ann@example.com", &list, json!({})).await;
+    let id = meta_sync(&mut h, &list).await;
+    h.drain().await;
+    let owner = h.cookie.clone().unwrap();
+    let manager = member_cookie(&mut h, "manager@acme.test", "manager").await;
+    let admin = member_cookie(&mut h, "admin@acme.test", "admin").await;
+    let new = json!({"platform": "meta", "ad_account_id": "111", "source_type": "segment", "source_id": Uuid::now_v7(), "accept_terms": true});
+
+    // A manager sees syncs and their status, and can change nothing.
+    h.cookie = Some(manager.clone());
+    assert_eq!(h.ok("GET", "/api/ad-audiences/syncs", None).await["data"].as_array().unwrap().len(), 1);
+    h.ok("GET", &format!("/api/ad-audiences/syncs/{id}"), None).await;
+    h.ok("GET", "/api/ad-audiences/connections", None).await;
+    for (method, path, body) in [
+        ("POST", "/api/ad-audiences/syncs".to_string(), Some(new.clone())),
+        ("PATCH", format!("/api/ad-audiences/syncs/{id}"), Some(json!({"status": "paused"}))),
+        ("POST", format!("/api/ad-audiences/syncs/{id}/run"), None),
+        ("DELETE", format!("/api/ad-audiences/syncs/{id}?confirm=true"), None),
+        ("POST", "/api/ad-audiences/connections/tiktok/start".to_string(), None),
+        ("DELETE", "/api/ad-audiences/connections/meta".to_string(), None),
+        ("PATCH", "/api/ad-audiences/settings".to_string(), Some(json!({"google_consent": true}))),
+    ] {
+        assert_eq!(h.req(method, &path, body).await.0, StatusCode::FORBIDDEN, "manager: {method} {path}");
+    }
+    // A sign-in a manager started anyway (say from before a role change) can't finish.
+    h.cookie = Some(admin.clone());
+    let start = h.ok("POST", "/api/ad-audiences/connections/tiktok/start", None).await;
+    let st: String = url::Url::parse(start["url"].as_str().unwrap()).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
+    sqlx::query("UPDATE memberships SET role = 'manager' WHERE user_id = (SELECT id FROM users WHERE email = 'admin@acme.test')").execute(&h.state.db).await.unwrap();
+    let (_, headers, _) = h.raw("GET", &format!("/api/ad-audiences/oauth/tiktok/callback?auth_code=tt-code&state={st}"), &[("cookie", &admin)], "").await;
+    assert_eq!(headers["location"], "/settings/ad-audiences?platform=tiktok&error=not_allowed");
+    assert!(m.calls("/oauth2/access_token/").is_empty());
+    sqlx::query("UPDATE memberships SET role = 'admin' WHERE user_id = (SELECT id FROM users WHERE email = 'admin@acme.test')").execute(&h.state.db).await.unwrap();
+
+    // An admin can.
+    h.ok("PATCH", &format!("/api/ad-audiences/syncs/{id}"), Some(json!({"interval_hours": 12}))).await;
+    h.ok("POST", &format!("/api/ad-audiences/syncs/{id}/run"), None).await;
+    h.drain().await;
+
+    // API keys: reading needs the audience scope; changing needs the account scope.
+    h.cookie = Some(owner);
+    let audience = h.ok("POST", "/api/api-keys", Some(json!({"name": "audience", "scopes": ["audience"]}))).await["key"].as_str().unwrap().to_string();
+    let account = h.ok("POST", "/api/api-keys", Some(json!({"name": "account", "scopes": ["account"]}))).await["key"].as_str().unwrap().to_string();
+    let bearer = |k: &str| format!("Bearer {k}");
+    let (s, _, _) = h.raw("GET", "/api/ad-audiences/syncs", &[("authorization", &bearer(&audience))], "").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = h.raw("POST", &format!("/api/ad-audiences/syncs/{id}/run"), &[("authorization", &bearer(&audience))], "").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "the audience scope can't send data to an ad platform");
+    let (s, _, _) = h.raw("POST", &format!("/api/ad-audiences/syncs/{id}/run"), &[("authorization", &bearer(&account))], "").await;
+    assert_eq!(s, StatusCode::OK);
+    h.drain().await;
+    h.ok("DELETE", &format!("/api/ad-audiences/syncs/{id}?confirm=true"), None).await;
+    h.drain().await;
+    h.ok("DELETE", "/api/ad-audiences/connections/meta", None).await;
+
+    let log: Vec<(String, Option<String>, Value)> = sqlx::query_as("SELECT action, target, details FROM audit_log WHERE action LIKE 'ad_audiences.%' ORDER BY created_at, id").fetch_all(&h.state.db).await.unwrap();
+    let actions: Vec<&str> = log.iter().map(|(a, _, _)| a.as_str()).collect();
+    for a in ["ad_audiences.connect", "ad_audiences.sync_create", "ad_audiences.sync_update", "ad_audiences.sync_run", "ad_audiences.sync_delete", "ad_audiences.disconnect"] {
+        assert!(actions.contains(&a), "{a} in {actions:?}");
+    }
+    let all = serde_json::to_string(&log).unwrap();
+    for secret in ["meta-long", "meta-short", "meta-code", &sha("ann@example.com")] {
+        assert!(!all.contains(secret), "the audit log holds no tokens or hashed ids: {all}");
+    }
+    h.cleanup().await;
+}

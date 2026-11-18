@@ -683,15 +683,13 @@ pub enum Outcome {
     Accepted(String),
 }
 
-/// Send one batch of hashed rows (`[{"t", "h", "x"}]` as stored in the batch).
+/// Send one batch of hashed rows (`[{"t", "h"}]` as stored in the batch).
 pub async fn send_batch(state: &AppState, t: &Target<'_>, audience_id: &str, op: Op, rows: &[Value], meta_session_id: i64) -> PResult<Outcome> {
     let h = hosts(&state.cfg);
     match t.platform {
         Platform::Meta => {
-            let with_hints = op == Op::Add && rows.iter().any(|r| r["x"].is_object());
-            let schema = super::normalize::meta_schema(with_hints);
-            let data: Vec<Vec<String>> = rows.iter().map(|r| super::normalize::meta_row(r, &schema)).collect();
-            let payload = json!({"schema": schema, "data": data}).to_string();
+            let data: Vec<Vec<String>> = rows.iter().map(super::normalize::meta_row).collect();
+            let payload = json!({"schema": super::normalize::META_SCHEMA, "data": data}).to_string();
             // One batch per session: a resend gets a new session id, so no sequence is ever reused.
             let session = json!({"session_id": meta_session_id, "batch_seq": 1, "last_batch_flag": true}).to_string();
             let method = if op == Op::Add { reqwest::Method::POST } else { reqwest::Method::DELETE };

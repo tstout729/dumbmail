@@ -23,11 +23,11 @@ const adApi = {
   update: (id: string, input: UpdateSyncInput) => api<AudienceSyncDetail>("PATCH", `${base}/syncs/${id}`, input),
   run: (id: string) => api<AudienceSyncDetail & { started: boolean }>("POST", `${base}/syncs/${id}/run`),
   remove: (id: string, deleteOnPlatform: boolean) =>
-    api<{ deleted: boolean; deleted_on_platform: boolean }>("DELETE", `${base}/syncs/${id}?delete_on_platform=${deleteOnPlatform}&confirm=true`),
+    api<{ deleted: boolean; note?: string }>("DELETE", `${base}/syncs/${id}?delete_on_platform=${deleteOnPlatform}&confirm=true`),
 };
 
-/** Poll every few seconds while a sync runs, so its numbers fill in. */
-const whileRunning = (running: boolean) => (running ? 3000 : false);
+/** Poll every few seconds while a sync runs, so its numbers fill in; less often while one is being removed. */
+const whileRunning = (running: boolean, removing = false) => (running ? 3000 : removing ? 15000 : false);
 
 export function useAdConnections() {
   return useQuery({ queryKey: adKeys.connections, queryFn: adApi.connections });
@@ -46,12 +46,15 @@ export function useAudienceSyncs() {
     queryKey: adKeys.syncs,
     queryFn: adApi.syncs,
     select: (r) => r.data,
-    refetchInterval: (q) => whileRunning((q.state.data?.data ?? []).some((s) => s.running)),
+    refetchInterval: (q) => {
+      const all = q.state.data?.data ?? [];
+      return whileRunning(all.some((s) => s.running), all.some((s) => s.removing));
+    },
   });
 }
 
 export function useAudienceSync(id: string) {
-  return useQuery({ queryKey: adKeys.sync(id), queryFn: () => adApi.sync(id), refetchInterval: (q) => whileRunning(q.state.data?.running ?? false) });
+  return useQuery({ queryKey: adKeys.sync(id), queryFn: () => adApi.sync(id), refetchInterval: (q) => (q.state.error ? false : whileRunning(q.state.data?.running ?? false, q.state.data?.removing ?? false)) });
 }
 
 function useInvalidate() {

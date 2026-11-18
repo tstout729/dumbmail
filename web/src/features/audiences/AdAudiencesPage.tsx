@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useSearchParams } from "react-router";
 import { AlertTriangle, CheckCircle2, Megaphone, MoreHorizontal, Pause, Play, Plus, RefreshCw, Trash2, XCircle } from "lucide-react";
 import { useSession } from "../../api";
+import { useCan } from "../team/api";
 import {
   Badge,
   Button,
@@ -31,6 +32,7 @@ const callbackErrors: Record<string, string> = {
   expired: "That sign-in link expired. Start again.",
   signed_out: "You were signed out of DumbMail during the sign-in. Sign in and try again.",
   wrong_account: "That sign-in was started by a different person or DumbMail account. Start again from here.",
+  not_allowed: "Only the account's owner or an admin can connect an ad platform.",
   failed: "The platform didn't finish the sign-in. Try again; if it keeps failing, check the app setup in docs/AD_AUDIENCES.md.",
 };
 
@@ -54,14 +56,16 @@ export function AdAudiencesPage() {
   const clearParams = () => setParams({}, { replace: true });
   const anyConnected = (connections.data?.data ?? []).some((c) => c.status === "connected");
   const googleConnected = (connections.data?.data ?? []).some((c) => c.platform === "google" && c.status !== "not_connected");
+  const canManage = useCan("ad_audiences.manage");
 
   return (
     <div className="space-y-4">
       <p className="text-sm text-zinc-500">
         Send a list or segment to Meta, Google Ads or TikTok as an ad audience, and keep it current as people join and leave. Only people who are subscribed to
-        your email, aren't suppressed and haven't opted out of ads are sent, as hashed email addresses (and phone numbers they opted in to texts with). Anyone
-        who unsubscribes or opts out is removed on the next sync.
+        your email, aren't suppressed, aren't on a marketing hold and haven't opted out of ads are sent, as hashed email addresses (and phone numbers they opted
+        in to texts with). Nothing else is sent. Anyone who unsubscribes or opts out is removed on the next sync.
       </p>
+      {!canManage ? <p className="text-sm text-zinc-500">Only the account's owner or an admin can connect platforms and change syncs. You can see their status here.</p> : null}
       {connected && connected in platformNames ? (
         <Notice tone="green" icon={<CheckCircle2 />} title={`${platformNames[connected as AdPlatform]} is connected`}>
           Now create a sync below.{" "}
@@ -87,26 +91,36 @@ export function AdAudiencesPage() {
                   <Skeleton className="h-5 w-48" />
                 </div>
               ))
-            : (connections.data?.data ?? []).map((c) => <ConnectionRow key={c.platform} connection={c} />)}
+            : (connections.data?.data ?? []).map((c) => <ConnectionRow key={c.platform} connection={c} canManage={canManage} />)}
           {connections.error ? <p className="px-4 py-3 text-sm text-red-600">{connections.error.message}</p> : null}
         </div>
       </Card>
 
-      {connections.data && (googleConnected || connections.data.settings.google_consent) ? <GoogleConsent settings={connections.data.settings} /> : null}
+      {connections.data && (googleConnected || connections.data.settings.google_consent) ? <GoogleConsent settings={connections.data.settings} canManage={canManage} /> : null}
 
       <Card
         title="Synced audiences"
         padded={false}
         actions={
-          <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} disabled={!anyConnected} onClick={() => setNewSync(null)}>
-            New sync
-          </Button>
+          canManage ? (
+            <Button size="sm" variant="primary" icon={<Plus className="size-3.5" />} disabled={!anyConnected} onClick={() => setNewSync(null)}>
+              New sync
+            </Button>
+          ) : undefined
         }
       >
-        <SyncTable syncs={syncs.data} loading={syncs.isPending} error={syncs.error?.message} anyConnected={anyConnected} onOpen={setOpenId} onNew={() => setNewSync(null)} />
+        <SyncTable
+          syncs={syncs.data}
+          loading={syncs.isPending}
+          error={syncs.error?.message}
+          anyConnected={anyConnected}
+          canManage={canManage}
+          onOpen={setOpenId}
+          onNew={() => setNewSync(null)}
+        />
       </Card>
 
-      {newSync !== false ? (
+      {newSync !== false && canManage ? (
         <NewSyncModal
           connections={connections.data?.data ?? []}
           settings={connections.data?.settings ?? null}
@@ -127,7 +141,7 @@ export function AdAudiencesPage() {
   );
 }
 
-function GoogleConsent({ settings }: { settings: AdSettings }) {
+function GoogleConsent({ settings, canManage }: { settings: AdSettings; canManage: boolean }) {
   const { account } = useSession();
   const save = useSaveAdSettings();
   const [turningOff, setTurningOff] = useState(false);
@@ -140,7 +154,7 @@ function GoogleConsent({ settings }: { settings: AdSettings }) {
           label="The marketing consent we collect covers using customer data for advertising, as Google requires for users in the EEA, the UK and Switzerland."
           description="With this on, DumbMail sends everyone it uploads to Google with both of Google's consent signals granted. With it off, Google syncs can't be created and existing ones pause. Only the account's owner or an admin can change it."
           checked={settings.google_consent}
-          disabled={save.isPending}
+          disabled={save.isPending || !canManage}
           onChange={(e) => (e.target.checked ? set(true) : setTurningOff(true))}
         />
         {settings.google_consent && settings.google_consent_at ? (
@@ -168,7 +182,7 @@ function GoogleConsent({ settings }: { settings: AdSettings }) {
   );
 }
 
-function ConnectionRow({ connection: c }: { connection: AdConnection }) {
+function ConnectionRow({ connection: c, canManage }: { connection: AdConnection; canManage: boolean }) {
   const { account } = useSession();
   const start = useStartConnect();
   const disconnect = useDisconnect();
@@ -213,7 +227,7 @@ function ConnectionRow({ connection: c }: { connection: AdConnection }) {
           </p>
         ) : null}
       </div>
-      {c.available ? (
+      {c.available && canManage ? (
         <div className="flex items-center gap-2">
           {c.status !== "not_connected" ? (
             <Button size="sm" variant="ghost" onClick={() => setConfirming(true)}>
@@ -255,11 +269,12 @@ type SyncTableProps = {
   loading: boolean;
   error: string | undefined;
   anyConnected: boolean;
+  canManage: boolean;
   onOpen: (id: string) => void;
   onNew: () => void;
 };
 
-function SyncTable({ syncs, loading, error, anyConnected, onOpen, onNew }: SyncTableProps) {
+function SyncTable({ syncs, loading, error, anyConnected, canManage, onOpen, onNew }: SyncTableProps) {
   return (
     <Table className="rounded-none border-0 shadow-none">
       <thead>
@@ -284,9 +299,15 @@ function SyncTable({ syncs, loading, error, anyConnected, onOpen, onNew }: SyncT
             <EmptyState
               icon={<Megaphone className="size-5" />}
               title="No synced audiences yet"
-              description={anyConnected ? "Pick a list or segment to send to an ad platform." : "Connect an ad platform above, then pick a list or segment to sync."}
+              description={
+                !canManage
+                  ? "The account's owner or an admin can sync a list or segment to an ad platform."
+                  : anyConnected
+                    ? "Pick a list or segment to send to an ad platform."
+                    : "Connect an ad platform above, then pick a list or segment to sync."
+              }
               action={
-                anyConnected ? (
+                anyConnected && canManage ? (
                   <Button variant="primary" icon={<Plus className="size-3.5" />} onClick={onNew}>
                     New sync
                   </Button>
@@ -295,14 +316,14 @@ function SyncTable({ syncs, loading, error, anyConnected, onOpen, onNew }: SyncT
             />
           </EmptyRow>
         ) : (
-          (syncs ?? []).map((s) => <SyncRow key={s.id} sync={s} onOpen={() => onOpen(s.id)} />)
+          (syncs ?? []).map((s) => <SyncRow key={s.id} sync={s} canManage={canManage} onOpen={() => onOpen(s.id)} />)
         )}
       </tbody>
     </Table>
   );
 }
 
-function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }) {
+function SyncRow({ sync: s, canManage, onOpen }: { sync: AudienceSync; canManage: boolean; onOpen: () => void }) {
   const run = useRunSync();
   const update = useUpdateSync(s.id);
   const state = syncState(s);
@@ -349,6 +370,7 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
       </Td>
       <Td className="text-zinc-600">{s.running ? "Running now" : formatRelative(s.last_run_at)}</Td>
       <Td onClick={(e) => e.stopPropagation()}>
+        {canManage && !s.removing ? (
         <Menu
           trigger={(props) => (
             <IconButton label={`Actions for ${s.name}`} {...props}>
@@ -368,6 +390,7 @@ function SyncRow({ sync: s, onOpen }: { sync: AudienceSync; onOpen: () => void }
             { label: "Details and delete", icon: <Trash2 className="size-3.5" />, onSelect: onOpen },
           ]}
         />
+        ) : null}
       </Td>
     </tr>
   );

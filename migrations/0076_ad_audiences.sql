@@ -64,11 +64,13 @@ CREATE TABLE ad_audience_syncs (
     -- DumbMail never adopts an audience by name or description.
     external_audience_id text,
     audience_created_at timestamptz,
-    match_fields        text NOT NULL DEFAULT 'contact' CHECK (match_fields IN ('contact', 'contact_and_location')),
     interval_hours      integer NOT NULL DEFAULT 6 CHECK (interval_hours BETWEEN 1 AND 168),
-    status              text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
+    -- removing: being deleted. Every run withdraws everyone DumbMail uploaded; the row goes once the
+    -- platform confirms all of it (and, with delete_audience, deletes the audience).
+    status              text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'removing')),
     -- Why it's paused: user | google_consent | tiktok_minimum | audience_missing | create_unclear
     pause_reason        text,
+    delete_audience     boolean NOT NULL DEFAULT false,
     terms_accepted_at   timestamptz,
     current_run_id      uuid,
     -- One worker (or one API delete) at a time: every write a run makes checks this token.
@@ -132,8 +134,6 @@ CREATE TABLE ad_audience_desired (
     key_hash   text NOT NULL,
     src_check  text NOT NULL,
     veto       boolean NOT NULL,
-    -- Meta only: hashed name and location fields sent alongside the identifier when adding.
-    hints      jsonb,
     -- Already on the platform, or taken by a batch this run: not a candidate for adding.
     claimed    boolean NOT NULL DEFAULT false,
     PRIMARY KEY (sync_id, profile_id, key_type)
@@ -152,7 +152,7 @@ CREATE TABLE ad_audience_batches (
     sync_id         uuid NOT NULL REFERENCES ad_audience_syncs(id) ON DELETE CASCADE,
     run_id          uuid NOT NULL,
     op              text NOT NULL CHECK (op IN ('add', 'remove')),
-    -- [{"t": "email", "h": "<sha256>", "x": {hints}}], in the order sent.
+    -- [{"t": "email", "h": "<sha256>"}], in the order sent.
     rows            jsonb NOT NULL,
     row_count       integer NOT NULL,
     status          text NOT NULL DEFAULT 'pending',
@@ -173,9 +173,10 @@ CREATE TABLE ad_audience_runs (
     id            uuid PRIMARY KEY,
     sync_id       uuid NOT NULL REFERENCES ad_audience_syncs(id) ON DELETE CASCADE,
     account_id    uuid NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    trigger       text NOT NULL, -- created | scheduled | manual
+    trigger       text NOT NULL, -- created | scheduled | manual | deleted
     -- full: add and remove. remove_only: a paused sync still removes people who left or opted out.
     -- veto_only: the list or segment is gone; only people who opted out are removed.
+    -- withdraw: the sync is being deleted; everyone DumbMail uploaded is removed.
     mode          text NOT NULL DEFAULT 'full',
     status        text NOT NULL DEFAULT 'running', -- running | done | failed | stopped
     phase         text NOT NULL DEFAULT 'scan', -- scan | veto | plan | tiktok_min | remove | add | sweep | finish

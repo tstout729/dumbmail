@@ -15,6 +15,7 @@ use super::sync;
 use crate::api::ApiJson;
 use crate::auth::{self, Ctx};
 use crate::error::{AppError, AppResult};
+use crate::features::team::{self, access::Perm};
 use crate::state::AppState;
 
 pub const SETTINGS_PATH: &str = "/settings/ad-audiences";
@@ -45,18 +46,11 @@ fn perr(p: Platform, e: PErr) -> AppError {
     }
 }
 
-/// A person signed in to the dashboard (not an API key), and their role in the account.
-async fn member_role(state: &AppState, ctx: &Ctx) -> AppResult<(Uuid, String)> {
+/// A member signed in to the dashboard (not an API key) who may manage ad audiences (the route's
+/// rule checks the permission too), and their email.
+async fn browser_manager(state: &AppState, ctx: &Ctx) -> AppResult<(Uuid, String)> {
     let user = ctx.user_id.filter(|_| !ctx.via_api_key).ok_or_else(|| AppError::Forbidden("This needs someone signed in to DumbMail in a browser, not an API key.".into()))?;
-    let role: Option<String> = sqlx::query_scalar("SELECT role FROM memberships WHERE user_id = $1 AND account_id = $2").bind(user).bind(ctx.account_id).fetch_optional(&state.db).await?;
-    Ok((user, role.ok_or(AppError::Unauthorized)?))
-}
-
-async fn owner_or_admin(state: &AppState, ctx: &Ctx) -> AppResult<(Uuid, String)> {
-    let (user, role) = member_role(state, ctx).await?;
-    if !matches!(role.as_str(), "owner" | "admin") {
-        return Err(AppError::Forbidden("Only the account's owner or an admin can change this.".into()));
-    }
+    team::access::require(ctx, Perm::AdAudiencesManage)?;
     let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(user).fetch_one(&state.db).await?;
     Ok((user, email))
 }
@@ -115,7 +109,7 @@ async fn connections_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Jso
 /// one (the MCP tool returns the settings page link instead).
 async fn start_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
     let p = platform(&p)?;
-    let (user, _) = owner_or_admin(&state, &ctx).await?;
+    let (user, _) = browser_manager(&state, &ctx).await?;
     if platforms::app(&state.cfg, p).is_none() {
         return Err(AppError::BadRequest(platforms::words(p, "not_available")));
     }
@@ -142,15 +136,19 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-/// The platform sends the browser back here. The state is consumed only by the same account,
-/// person and platform that started it, in one statement, so a different session can't use or
-/// burn it. Errors go to the settings page as a short code it explains, never as free text. The
-/// query string (code and state) is never logged.
+/// The platform sends the browser back here (a public route: the platform's redirect carries no
+/// DumbMail headers). The state is consumed only by the same account, person and platform that
+/// started it, in one statement, so a different session can't use or burn it, and only while that
+/// person may still manage ad audiences. Errors go to the settings page as a short code it
+/// explains, never as free text. The query string (code and state) is never logged.
 async fn callback_h(State(state): State<AppState>, ctx: Result<Ctx, AppError>, Path(p): Path<String>, Query(q): Query<CallbackQuery>) -> Redirect {
     let Some(p) = Platform::parse(&p) else { return Redirect::to(&format!("{SETTINGS_PATH}?error=failed")) };
     let back = |code: &str| Redirect::to(&format!("{SETTINGS_PATH}?platform={}&error={code}", p.as_str()));
     let Ok(ctx) = ctx else { return back("signed_out") };
     let Some(user) = ctx.user_id.filter(|_| !ctx.via_api_key) else { return back("signed_out") };
+    if !ctx.can(Perm::AdAudiencesManage) {
+        return back("not_allowed");
+    }
     let Some(st) = q.state.as_deref().filter(|s| !s.is_empty()) else { return back("expired") };
     let hash = auth::sha256_hex(st);
     let row: Result<Option<Option<String>>, _> = sqlx::query_scalar(
@@ -185,11 +183,12 @@ async fn callback_h(State(state): State<AppState>, ctx: Result<Ctx, AppError>, P
     if store::save_tokens(&state, ctx.account_id, user, p, &tokens).await.is_err() {
         return back("failed");
     }
+    team::audit(&state, &ctx, "ad_audiences.connect", Some(p.as_str()), json!({"platform": p.as_str()})).await;
     Redirect::to(&format!("{SETTINGS_PATH}?connected={}", p.as_str()))
 }
 
-pub async fn disconnect(state: &AppState, account_id: Uuid, p: Platform) -> AppResult<Value> {
-    let d = store::disconnect(state, account_id, p).await?.ok_or_else(|| AppError::NotFound(format!("{} isn't connected", p.label())))?;
+pub async fn disconnect(state: &AppState, ctx: &Ctx, p: Platform) -> AppResult<Value> {
+    let d = store::disconnect(state, ctx.account_id, p).await?.ok_or_else(|| AppError::NotFound(format!("{} isn't connected", p.label())))?;
     let note = if d.revoked {
         format!("DumbMail's access was revoked on {} and its sign-in deleted. Syncs to {} wait until you connect it again.", p.label(), p.label())
     } else {
@@ -199,17 +198,12 @@ pub async fn disconnect(state: &AppState, account_id: Uuid, p: Platform) -> AppR
             p.label()
         )
     };
+    team::audit(state, ctx, "ad_audiences.disconnect", Some(p.as_str()), json!({"platform": p.as_str(), "revoked": d.revoked})).await;
     Ok(json!({"disconnected": true, "revoked": d.revoked, "note": note}))
 }
 
-/// Signed-in members need to be the owner or an admin to disconnect, as to connect. API keys
-/// carry the whole account's access until the team-and-roles layer gives them scopes (see the
-/// permissions table in docs/AD_AUDIENCES.md).
 async fn disconnect_h(State(state): State<AppState>, ctx: Ctx, Path(p): Path<String>) -> AppResult<Json<Value>> {
-    if !ctx.via_api_key {
-        owner_or_admin(&state, &ctx).await?;
-    }
-    Ok(Json(disconnect(&state, ctx.account_id, platform(&p)?).await?))
+    Ok(Json(disconnect(&state, &ctx, platform(&p)?).await?))
 }
 
 async fn connected(state: &AppState, account_id: Uuid, p: Platform) -> AppResult<(ConnRow, String)> {
@@ -251,7 +245,7 @@ pub struct SettingsBody {
 /// The Google consent setting: an owner or admin confirms the account's marketing consent covers
 /// advertising use. Turning it off pauses every Google sync.
 async fn patch_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<SettingsBody>) -> AppResult<Json<Value>> {
-    let (user, email) = owner_or_admin(&state, &ctx).await?;
+    let (user, email) = browser_manager(&state, &ctx).await?;
     let mut tx = state.db.begin().await?;
     if b.google_consent {
         sqlx::query(
@@ -373,7 +367,6 @@ pub struct CreateBody {
     pub source_type: String,
     pub source_id: Uuid,
     pub name: Option<String>,
-    pub match_fields: Option<String>,
     pub interval_hours: Option<i32>,
     pub accept_terms: Option<bool>,
     /// MCP only: without it the tool returns a dry run.
@@ -388,15 +381,6 @@ fn account_digits(p: Platform, raw: &str) -> AppResult<String> {
         return Err(AppError::bad("enter the ad account's ID (numbers only)"));
     }
     Ok(s)
-}
-
-fn check_match_fields(p: Platform, m: &str) -> AppResult<()> {
-    match m {
-        "contact" => Ok(()),
-        "contact_and_location" if p == Platform::Meta => Ok(()),
-        "contact_and_location" => Err(AppError::bad(format!("{} syncs match on email and phone only", p.label()))),
-        _ => Err(AppError::bad("match_fields must be contact or contact_and_location")),
-    }
 }
 
 fn check_interval(h: i32) -> AppResult<()> {
@@ -425,7 +409,8 @@ pub async fn estimate(state: &AppState, account_id: Uuid, source_type: &str, sou
 
 const GOOGLE_CONSENT_NEEDED: &str = "Google syncs need the account's owner or an admin to confirm, in Settings → Ad audiences, that your marketing consent covers using customer data for advertising.";
 
-pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_run: bool) -> AppResult<Value> {
+pub async fn create_sync(state: &AppState, ctx: &Ctx, b: CreateBody, dry_run: bool) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let p = platform(&b.platform)?;
     let ad_account = account_digits(p, &b.ad_account_id)?;
     let login = match b.login_account_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -441,8 +426,6 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
     if name.chars().count() > 100 {
         return Err(AppError::bad("name must be 100 characters or fewer"));
     }
-    let match_fields = b.match_fields.unwrap_or_else(|| "contact".into());
-    check_match_fields(p, &match_fields)?;
     let interval = b.interval_hours.unwrap_or(6);
     check_interval(interval)?;
     let (conn, token) = connected(state, account_id, p).await?;
@@ -475,7 +458,7 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
             "name": name,
             "people_now": people,
             "note": format!(
-                "Nothing created. This would create the audience \"{name}\" in {} and upload hashed contact details for about {people} people from \"{source}\" who are subscribed to email and haven't opted out, then keep it in step every {interval} hours. Call again with confirm=true and accept_terms=true once the user approves.",
+                "Nothing created. This would create the audience \"{name}\" in {} and upload hashed contact details for about {people} people from \"{source}\" who are subscribed to email, aren't suppressed or on a marketing hold and haven't opted out of ads, then keep it in step every {interval} hours. Call again with confirm=true and accept_terms=true once the user approves.",
                 p.label()
             ),
         }));
@@ -496,8 +479,8 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
     }
     let inserted = sqlx::query(
         "INSERT INTO ad_audience_syncs (id, account_id, connection_id, platform, ad_account_id, ad_account_name, login_account_id, source_type, source_id, name,
-             match_fields, interval_hours, terms_accepted_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now()) ON CONFLICT DO NOTHING",
+             interval_hours, terms_accepted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now()) ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(account_id)
@@ -509,7 +492,6 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
     .bind(&b.source_type)
     .bind(b.source_id)
     .bind(&name)
-    .bind(&match_fields)
     .bind(interval)
     .execute(&mut *tx)
     .await?
@@ -518,12 +500,20 @@ pub async fn create_sync(state: &AppState, account_id: Uuid, b: CreateBody, dry_
         return Err(AppError::Conflict(format!("This {} already syncs to that {} ad account.", b.source_type, p.label())));
     }
     tx.commit().await?;
+    team::audit(
+        state,
+        ctx,
+        "ad_audiences.sync_create",
+        Some(&id.to_string()),
+        json!({"platform": p.as_str(), "ad_account_id": ad_account, "source_type": b.source_type, "source_id": b.source_id, "name": name, "interval_hours": interval}),
+    )
+    .await;
     sync::start_run(state, id, "created").await?;
     get_sync(state, account_id, id).await
 }
 
 async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<CreateBody>) -> AppResult<Json<Value>> {
-    Ok(Json(create_sync(&state, ctx.account_id, b, false).await?))
+    Ok(Json(create_sync(&state, &ctx, b, false).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -531,7 +521,6 @@ async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<C
 pub struct UpdateBody {
     pub status: Option<String>,
     pub interval_hours: Option<i32>,
-    pub match_fields: Option<String>,
     /// After the platform said the audience no longer exists (or a TikTok create couldn't be
     /// confirmed): make a new audience and upload everyone again. Needs `confirm: true`.
     pub recreate_audience: Option<bool>,
@@ -556,9 +545,13 @@ async fn api_release(state: &AppState, id: Uuid, tok: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: UpdateBody) -> AppResult<Value> {
+pub async fn update_sync(state: &AppState, ctx: &Ctx, id: Uuid, b: UpdateBody) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
     let p = s.platform();
+    if s.removing() {
+        return Err(AppError::bad("This sync is being deleted: DumbMail is removing everyone it uploaded. It can't be changed."));
+    }
     if let Some(st) = b.status.as_deref() {
         if !matches!(st, "active" | "paused") {
             return Err(AppError::bad("status must be active or paused"));
@@ -566,9 +559,6 @@ pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: Update
     }
     if let Some(h) = b.interval_hours {
         check_interval(h)?;
-    }
-    if let Some(m) = b.match_fields.as_deref() {
-        check_match_fields(p, m)?;
     }
     if b.recreate_audience == Some(true) {
         if !matches!(s.pause_reason.as_deref(), Some("audience_missing" | "create_unclear")) {
@@ -595,6 +585,7 @@ pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: Update
         .await?;
         tx.commit().await?;
         api_release(state, id, tok).await?;
+        team::audit(state, ctx, "ad_audiences.sync_update", Some(&id.to_string()), json!({"platform": p.as_str(), "recreate_audience": true})).await;
         sync::start_run(state, id, "manual").await?;
         return get_sync(state, account_id, id).await;
     }
@@ -607,37 +598,46 @@ pub async fn update_sync(state: &AppState, account_id: Uuid, id: Uuid, b: Update
         }
     }
     let paused = b.status.as_deref() == Some("paused") && s.status == "active";
-    let widened = b.match_fields.as_deref().is_some_and(|m| m != s.match_fields);
-    sqlx::query(
-        "UPDATE ad_audience_syncs SET status = COALESCE($3, status), pause_reason = CASE WHEN $8 THEN 'user' WHEN $7 THEN NULL ELSE pause_reason END,
-             interval_hours = COALESCE($4, interval_hours), match_fields = COALESCE($5, match_fields),
-             next_run_at = CASE WHEN $6 THEN now() WHEN $4::int IS NOT NULL THEN COALESCE(last_run_at, now()) + make_interval(hours => $4::int) ELSE next_run_at END,
+    // The status check in the statement: a delete that started meanwhile wins.
+    let n = sqlx::query(
+        "UPDATE ad_audience_syncs SET status = COALESCE($3, status), pause_reason = CASE WHEN $6 THEN 'user' WHEN $5 THEN NULL ELSE pause_reason END,
+             interval_hours = COALESCE($4, interval_hours),
+             next_run_at = CASE WHEN $5 THEN now() WHEN $4::int IS NOT NULL THEN COALESCE(last_run_at, now()) + make_interval(hours => $4::int) ELSE next_run_at END,
              updated_at = now()
-         WHERE id = $1 AND account_id = $2",
+         WHERE id = $1 AND account_id = $2 AND status <> 'removing'",
     )
     .bind(id)
     .bind(account_id)
     .bind(&b.status)
     .bind(b.interval_hours)
-    .bind(&b.match_fields)
-    .bind(resumed || widened)
     .bind(resumed)
     .bind(paused)
     .execute(&state.db)
-    .await?;
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(AppError::bad("This sync is being deleted: DumbMail is removing everyone it uploaded. It can't be changed."));
+    }
+    if b.status.as_deref().is_some_and(|st| st != s.status) || b.interval_hours.is_some_and(|h| h != s.interval_hours) {
+        team::audit(state, ctx, "ad_audiences.sync_update", Some(&id.to_string()), json!({"platform": p.as_str(), "status": b.status, "interval_hours": b.interval_hours})).await;
+    }
     get_sync(state, account_id, id).await
 }
 
 async fn update_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<UpdateBody>) -> AppResult<Json<Value>> {
-    Ok(Json(update_sync(&state, ctx.account_id, id, b).await?))
+    Ok(Json(update_sync(&state, &ctx, id, b).await?))
 }
 
-pub async fn run_now(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
+pub async fn run_now(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
     if s.status == "paused" && s.pause_reason.as_deref() != Some("tiktok_minimum") {
         return Err(AppError::bad("This sync is paused. Resume it first."));
     }
     let started = sync::start_run(state, id, "manual").await?;
+    if started.is_some() {
+        team::audit(state, ctx, "ad_audiences.sync_run", Some(&id.to_string()), json!({"platform": s.platform, "removing": s.removing()})).await;
+    }
     let mut v = get_sync(state, account_id, id).await?;
     v["started"] = json!(started.is_some());
     if started.is_none() {
@@ -647,7 +647,7 @@ pub async fn run_now(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<
 }
 
 async fn run_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(run_now(&state, ctx.account_id, id).await?))
+    Ok(Json(run_now(&state, &ctx, id).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -659,48 +659,68 @@ pub struct DeleteQuery {
 /// What deleting would do, for a dry run.
 pub fn delete_note(s: &SyncRow, on_platform: bool) -> String {
     let l = s.platform().label();
-    if on_platform {
-        format!("Nothing deleted. This would stop syncing \"{}\" and delete the audience on {l}; ads that use it stop. Call again with confirm=true once the user approves.", s.name)
+    let audience = if on_platform || s.platform() == Platform::Tiktok {
+        format!("then delete the audience on {l} (ads that use it stop){}", if on_platform { "" } else { ": TikTok can't keep an audience under 1,000 people" })
     } else {
-        format!(
-            "Nothing deleted. This would stop syncing \"{}\" and leave the audience on {l} as it is now. DumbMail would no longer remove people who opt out from it. Call again with confirm=true once the user approves.",
-            s.name
-        )
-    }
+        format!("and keep the empty audience on {l}")
+    };
+    format!(
+        "Nothing deleted. This would stop syncing \"{}\", remove everyone DumbMail uploaded from the audience on {l}, {audience}. The sync shows as \"Removing\" until {l} confirms every removal, and DumbMail keeps trying until it does. Call again with confirm=true once the user approves.",
+        s.name
+    )
 }
 
-/// Delete a sync. With `delete_on_platform` the audience is deleted on the ad platform first (ads
-/// that use it stop); if the platform doesn't confirm that, nothing is deleted here. Waits for no
-/// batch: refuses while one is in flight.
-pub async fn delete_sync(state: &AppState, account_id: Uuid, id: Uuid, on_platform: bool) -> AppResult<Value> {
+/// Delete a sync. It always withdraws everyone DumbMail uploaded first: the sync becomes
+/// `removing`, and a run removes every identifier that may be on the platform. Only once the
+/// platform confirmed them all is the audience deleted there (with `delete_on_platform`; always on
+/// TikTok, which can't keep fewer than 1,000) and the sync row deleted. Until then it stays
+/// `removing` and is retried. Deleting a sync that's already being removed changes only whether
+/// the audience is deleted at the end. Refuses while a batch is in flight.
+pub async fn delete_sync(state: &AppState, ctx: &Ctx, id: Uuid, on_platform: bool) -> AppResult<Value> {
+    let account_id = ctx.account_id;
     let s = store::account_sync(&state.db, account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
-    let p = s.platform();
     let tok = api_lease(state, account_id, id).await?;
-    let mut deleted_on_platform = false;
-    if on_platform {
-        if let Some(aud) = s.external_audience_id.as_deref() {
-            let res = async {
-                let (_, token) = connected(state, account_id, p).await?;
-                let t = Target { platform: p, token: &token, ad_account_id: &s.ad_account_id, login_account_id: s.login_account_id.as_deref() };
-                platforms::delete_audience(state, &t, aud).await.map_err(|e| match e.kind {
-                    Kind::NotFound => AppError::BadRequest(format!(
-                        "{} says this audience doesn't exist, so DumbMail can't confirm deleting it. Check {}, then delete the sync without deleting on the platform.",
-                        p.label(),
-                        p.label()
-                    )),
-                    _ => perr(p, e),
-                })
-            }
-            .await;
-            if let Err(e) = res {
-                api_release(state, id, tok).await?;
-                return Err(e);
-            }
-            deleted_on_platform = true;
-        }
+    let mut tx = state.db.begin().await?;
+    // Nothing was ever created on the platform and nothing is waiting: nothing to withdraw.
+    let nothing_sent: bool = sqlx::query_scalar(
+        "SELECT s.external_audience_id IS NULL AND NOT EXISTS (SELECT 1 FROM ad_audience_members m WHERE m.sync_id = s.id)
+             AND NOT EXISTS (SELECT 1 FROM ad_audience_batches b WHERE b.sync_id = s.id AND b.status IN ('pending', 'accepted'))
+         FROM ad_audience_syncs s WHERE s.id = $1 AND s.lease_token = $2",
+    )
+    .bind(id)
+    .bind(tok)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if nothing_sent {
+        sqlx::query("DELETE FROM ad_audience_syncs WHERE id = $1 AND account_id = $2 AND lease_token = $3").bind(id).bind(account_id).bind(tok).execute(&mut *tx).await?;
+        tx.commit().await?;
+    } else {
+        // A run already going keeps its mode; replacing current_run_id stops it at its next step
+        // (a batch it has in flight was settled before the lease above was free).
+        sqlx::query(
+            "UPDATE ad_audience_syncs SET status = 'removing', pause_reason = NULL, delete_audience = $3, current_run_id = NULL, next_run_at = now(), updated_at = now()
+             WHERE id = $1 AND lease_token = $2",
+        )
+        .bind(id)
+        .bind(tok)
+        .bind(on_platform)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        api_release(state, id, tok).await?;
+        sync::start_run(state, id, "deleted").await?;
     }
-    sqlx::query("DELETE FROM ad_audience_syncs WHERE id = $1 AND account_id = $2 AND lease_token = $3").bind(id).bind(account_id).bind(tok).execute(&state.db).await?;
-    Ok(json!({"deleted": true, "deleted_on_platform": deleted_on_platform, "audience_id": s.external_audience_id}))
+    if !s.removing() {
+        team::audit(state, ctx, "ad_audiences.sync_delete", Some(&id.to_string()), json!({"platform": s.platform, "delete_on_platform": on_platform})).await;
+    }
+    if nothing_sent {
+        return Ok(json!({"deleted": true, "removing": false, "note": "Deleted. Nothing had been uploaded to the platform."}));
+    }
+    let mut v = get_sync(state, account_id, id).await?;
+    v["deleted"] = json!(false);
+    v["note"] = v["removing_message"].clone();
+    Ok(v)
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<DeleteQuery>) -> AppResult<Json<Value>> {
@@ -709,5 +729,5 @@ async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>,
         let s = store::account_sync(&state.db, ctx.account_id, id).await?.ok_or_else(|| AppError::not_found("sync"))?;
         return Ok(Json(json!({"dry_run": true, "note": delete_note(&s, on_platform)})));
     }
-    Ok(Json(delete_sync(&state, ctx.account_id, id, on_platform).await?))
+    Ok(Json(delete_sync(&state, &ctx, id, on_platform).await?))
 }
