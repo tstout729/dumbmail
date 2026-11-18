@@ -1,0 +1,51 @@
+{
+  "description": "A refund of a charge made without a PaymentIntent: found through its charge",
+  "expect": [
+    {
+      "metric": "Refunded Order",
+      "profile": {
+        "if_missing": "retry",
+        "property": "stripe_charge",
+        "value": "ch_3QabCdEfGh1234"
+      },
+      "properties": {
+        "charge_id": "ch_3QabCdEfGh1234",
+        "currency": "usd",
+        "reason": "requested_by_customer",
+        "refund_id": "re_3C"
+      },
+      "time": "2025-11-17T17:20:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:refund:re_3C",
+      "value": 10
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2026-09-30.clover",
+      "created": 1763400000,
+      "data": {
+        "object": {
+          "amount": 1000,
+          "charge": "ch_3QabCdEfGh1234",
+          "created": 1763400000,
+          "currency": "usd",
+          "id": "re_3C",
+          "metadata": {},
+          "object": "refund",
+          "payment_intent": null,
+          "reason": "requested_by_customer",
+          "status": "succeeded"
+        },
+        "previous_attributes": {
+          "status": "pending"
+        }
+      },
+      "id": "evt_re_3C",
+      "livemode": false,
+      "object": "event",
+      "type": "refund.updated"
+    },
+    "source": "webhook"
+  }
+}

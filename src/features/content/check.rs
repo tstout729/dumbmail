@@ -380,7 +380,9 @@ pub fn judge(status: u16) -> (Option<bool>, &'static str) {
 
 static CACHE: Lazy<Mutex<HashMap<(Uuid, String), (Instant, Probe)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GLOBAL: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBAL_PARALLEL)));
-static RUNNING: Lazy<Mutex<HashSet<Uuid>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+// A plain (not async) lock: it is held only to insert or remove an id, never across an await, so
+// a finished check can give its slot back at once when it's dropped.
+static RUNNING: Lazy<std::sync::Mutex<HashSet<Uuid>>> = Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
 static DB_CHECKS: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(GLOBAL_DB_CHECKS)));
 
 /// What an answer means: a redirect isn't verified (it isn't followed), and an image address that
@@ -478,15 +480,14 @@ struct Slot(Uuid);
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let id = self.0;
-        tokio::spawn(async move {
-            RUNNING.lock().await.remove(&id);
-        });
+        // Released before the response goes out, so the next check right after this one isn't
+        // told one is still running.
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
     }
 }
 
 async fn take_slot(account_id: Uuid) -> AppResult<Slot> {
-    let mut r = RUNNING.lock().await;
+    let mut r = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     if !r.insert(account_id) {
         return Err(AppError::Busy("a check is already running for this account; try again in a few seconds".into()));
     }
@@ -1027,6 +1028,17 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_finished_check_gives_its_slot_back_at_once() {
+        let id = Uuid::now_v7();
+        let slot = take_slot(id).await.unwrap();
+        assert!(take_slot(id).await.is_err(), "one check at a time per account");
+        drop(slot);
+        // No waiting in between: the very next check must get the slot.
+        assert!(take_slot(id).await.is_ok());
+    }
+
 
     #[test]
     fn finds_bare_personalization() {

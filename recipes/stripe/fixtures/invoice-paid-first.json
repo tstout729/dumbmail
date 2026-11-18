@@ -1,0 +1,94 @@
+{
+  "description": "first invoice of a new subscription (newer API: subscription under parent)",
+  "expect": [
+    {
+      "email": "jordan@example.com",
+      "first_name": "Jordan",
+      "last_name": "Lee Park",
+      "properties": {
+        "stripe_customer_id": "cus_TQ1aBcD2eF3gHi"
+      },
+      "type": "upsert_profile"
+    },
+    {
+      "metric": "Placed Order",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "billing_reason": "subscription_create",
+        "currency": "usd",
+        "invoice_number": "4F2A9C1D-0001",
+        "order_id": "in_1QaDdEeFfGgHh",
+        "source": "stripe_invoice",
+        "subscription_id": "sub_1QaSubXyZ123"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:invoice:in_1QaDdEeFfGgHh",
+      "value": 15
+    },
+    {
+      "metric": "Subscription Started",
+      "profile": {
+        "email": "jordan@example.com"
+      },
+      "properties": {
+        "currency": "usd",
+        "subscription_id": "sub_1QaSubXyZ123"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:subscription:sub_1QaSubXyZ123:started"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "amount_due": 1500,
+          "amount_paid": 1500,
+          "billing_reason": "subscription_create",
+          "currency": "usd",
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "customer_email": "jordan@example.com",
+          "customer_name": "Jordan Lee Park",
+          "customer_phone": null,
+          "id": "in_1QaDdEeFfGgHh",
+          "lines": {
+            "data": [
+              {
+                "amount": 1500,
+                "description": "1 × Coffee Club (at $15.00 / month)",
+                "id": "il_1"
+              }
+            ],
+            "object": "list"
+          },
+          "number": "4F2A9C1D-0001",
+          "object": "invoice",
+          "parent": {
+            "quote_details": null,
+            "subscription_details": {
+              "metadata": {},
+              "subscription": "sub_1QaSubXyZ123"
+            },
+            "type": "subscription_details"
+          },
+          "status": "paid"
+        }
+      },
+      "id": "evt_1QaDDD",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "invoice.paid"
+    }
+  }
+}

@@ -351,9 +351,10 @@ async fn client_event(State(state): State<AppState>, Query(q): Query<KeyQuery>, 
         let a = account_by_public_key(&state, &q.k).await?;
         let b: Value = serde_json::from_slice(&body)?;
         let metric = b["metric"].as_str().ok_or_else(|| AppError::bad("metric is required"))?;
-        // Message, consent and alert events come only from DumbMail itself: flows trust them.
-        if audience::is_reserved_metric(metric) {
-            return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", metric.trim())));
+        // Message, consent and alert events come only from DumbMail itself, and an account's
+        // integration events (bookings, orders) only from a server: flows trust them.
+        if audience::is_reserved_metric(metric) || audience::is_account_server_only_metric(&state.db, a.id, metric).await? {
+            return Err(AppError::bad(format!("{:?} is recorded by DumbMail or a server and can't be sent from a browser", metric.trim())));
         }
         let input = public_profile(&state, a.id, &b["profile"])?;
         let p = match input.id {

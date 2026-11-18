@@ -893,7 +893,11 @@ pub async fn flow_report(state: &AppState, account_id: Uuid, id: Uuid) -> AppRes
     let f = load_flow(state, account_id, id).await?;
     let (stats, active, total) = flows::stats(&state.db, account_id, id).await?;
     let nodes = flows::node_report(&state.db, account_id, &f).await?;
-    Ok(json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes}))
+    let mut out = json!({"flow": {"id": f.id, "name": f.name, "status": f.status}, "stats": stats, "active_runs": active, "total_runs": total, "nodes": nodes});
+    if f.trigger["type"] == "event_date" {
+        out["event_dates"] = flows::event_date_report(&state.db, f.id).await?;
+    }
+    Ok(out)
 }
 
 async fn flow_report_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {

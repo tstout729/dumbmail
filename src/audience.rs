@@ -102,6 +102,13 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 
     for attempt in 0..2 {
         let existing = find_profile(db, account_id, input).await?;
+        if fill_only {
+            if let Some(p) = &existing {
+                if let Some(narrowed) = protect_from_public(db, p, input, email.as_deref(), phone.as_deref()).await? {
+                    return Box::pin(upsert_inner(db, account_id, &narrowed, true)).await;
+                }
+            }
+        }
         let mut old_consent: Option<(String, String)> = None;
         let res = match &existing {
             Some(p) => {
@@ -111,18 +118,26 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             email = COALESCE(p.email, $2), phone_number = COALESCE(p.phone_number, $3),
                             external_id = COALESCE(p.external_id, $4), first_name = COALESCE(p.first_name, $5),
                             last_name = COALESCE(p.last_name, $6), properties = $7 || p.properties,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = CASE WHEN $2::text IS NOT NULL AND COALESCE(p.email, $2::text) = $2::text THEN COALESCE($8, p.email_consent) ELSE p.email_consent END,
+                            sms_consent = CASE WHEN $3::text IS NOT NULL AND COALESCE(p.phone_number, $3::text) = $3::text THEN COALESCE($9, p.sms_consent) ELSE p.sms_consent END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
                     )
                 } else {
+                    // A match by id, phone or external id that brings a different email: the new
+                    // address never agreed to anything. Subscribed drops to never_subscribed
+                    // (unsubscribed stays), and a hard bounce, which belonged to the old address, is
+                    // cleared; a spam complaint stays.
+                    let changed = "($2::text IS NOT NULL AND p.email IS NOT NULL AND p.email <> $2::text)";
                     format!(
                         "UPDATE profiles p SET
                             email = COALESCE($2, p.email), phone_number = COALESCE($3, p.phone_number),
                             external_id = COALESCE($4, p.external_id), first_name = COALESCE($5, p.first_name),
                             last_name = COALESCE($6, p.last_name), properties = p.properties || $7,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = COALESCE($8, CASE WHEN {changed} AND p.email_consent = 'subscribed' THEN 'never_subscribed' ELSE p.email_consent END),
+                            sms_consent = COALESCE($9, p.sms_consent),
+                            email_suppressed_reason = CASE WHEN {changed} AND p.email_suppressed_reason = 'hard_bounce' THEN NULL ELSE p.email_suppressed_reason END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
@@ -185,6 +200,42 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         }
     }
     Err(AppError::Conflict("could not save profile, please retry".into()))
+}
+
+/// The public fill-only path (forms, the website script) on a profile an integration wrote (it has
+/// integration keys or a marketing hold): it never adds or changes an email or phone there when it
+/// matched the profile by a different identifier. With a submitted email that isn't this
+/// profile's, the submission goes to the profile that has that email (found or created), without
+/// the other identifiers. Otherwise the identifiers this profile doesn't already have are dropped.
+/// Returns the narrowed input to use instead, or None to go ahead as given.
+async fn protect_from_public(db: &PgPool, p: &Profile, input: &ProfileInput, email: Option<&str>, phone: Option<&str>) -> AppResult<Option<ProfileInput>> {
+    let email_differs = email.is_some_and(|e| p.email.as_deref() != Some(e));
+    let phone_differs = phone.is_some_and(|n| p.phone_number.as_deref() != Some(n));
+    let ext_differs = input.external_id.as_deref().is_some_and(|x| p.external_id.as_deref() != Some(x));
+    if !(email_differs || phone_differs || ext_differs) {
+        return Ok(None);
+    }
+    let protected: bool = sqlx::query_scalar("SELECT integration_keys <> '{}' OR marketing_hold FROM profiles WHERE id = $1").bind(p.id).fetch_optional(db).await?.unwrap_or(false);
+    if !protected {
+        return Ok(None);
+    }
+    let mut narrowed = input.clone();
+    if email_differs {
+        // Someone else's address, or one this person never gave the business: it gets its own profile.
+        narrowed.id = None;
+        narrowed.phone_number = None;
+        narrowed.external_id = None;
+        narrowed.sms_consent = None;
+    } else {
+        if phone_differs {
+            narrowed.phone_number = None;
+            narrowed.sms_consent = None;
+        }
+        if ext_differs {
+            narrowed.external_id = None;
+        }
+    }
+    Ok(Some(narrowed))
 }
 
 /// A profile row with the consent values the update that returned it replaced.
@@ -313,8 +364,8 @@ pub async fn record_event_from(db: &PgPool, ev: NewEvent<'_>, source: EventSourc
 /// Record an event a browser sent through the public endpoint. It's marked as such, so features
 /// can tell it from server-confirmed data (e.g. browser orders don't make best sellers).
 pub async fn record_browser_event(db: &PgPool, ev: NewEvent<'_>) -> AppResult<Option<Uuid>> {
-    if is_reserved_metric(ev.metric) {
-        return Err(AppError::bad(format!("{:?} is recorded by DumbMail itself and can't be sent from a browser", ev.metric.trim())));
+    if is_reserved_metric(ev.metric) || is_account_server_only_metric(db, ev.account_id, ev.metric).await? {
+        return Err(AppError::bad(format!("{:?} is recorded by DumbMail or a server and can't be sent from a browser", ev.metric.trim())));
     }
     insert_event(db, ev, EventSource::Browser).await
 }
@@ -346,6 +397,43 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     .bind(source == EventSource::Browser)
     .fetch_optional(&mut *tx)
     .await?;
+    let inserted = match (inserted, &ev.unique_id) {
+        (Some(id), _) => Some(id),
+        // A trusted event (DumbMail, the API, an integration) whose unique_id a browser already
+        // used: the browser's copy is replaced, in this transaction, so flows and every feature see
+        // the trusted one as new. A browser event never replaces anything.
+        (None, Some(unique_id)) if source != EventSource::Browser => {
+            let replaced = sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser")
+                .bind(ev.account_id)
+                .bind(metric_id)
+                .bind(unique_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if replaced == 0 {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
+                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, false)
+                     ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+                     RETURNING id",
+                )
+                .bind(id)
+                .bind(ev.account_id)
+                .bind(ev.profile_id)
+                .bind(metric_id)
+                .bind(&ev.properties)
+                .bind(value)
+                .bind(ev.occurred_at)
+                .bind(unique_id)
+                .bind(ev.message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        }
+        (None, _) => None,
+    };
     let Some(event_id) = inserted else { return Ok(None) };
     sqlx::query("UPDATE profiles SET last_event_at = GREATEST(COALESCE(last_event_at, 'epoch'), COALESCE($2, now())) WHERE id = $1")
         .bind(ev.profile_id)
@@ -353,7 +441,8 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
         .execute(&mut *tx)
         .await?;
     let has_flow: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND status = 'live' AND trigger->>'type' = 'metric' AND trigger->>'metric' = $2)",
+        "SELECT EXISTS (SELECT 1 FROM flows WHERE account_id = $1 AND trigger->>'metric' = $2
+           AND ((status = 'live' AND trigger->>'type' = 'metric') OR trigger->>'type' = 'event_date'))",
     )
     .bind(ev.account_id)
     .bind(metric)
@@ -534,4 +623,16 @@ pub async fn import_csv(
         }
     }
     Ok(out)
+}
+
+/// Whether this account marked a metric server-only (an integration recorded it: bookings, orders),
+/// on top of the static [`is_reserved_metric`] list. A browser may not send it: a forged
+/// "Reservation Confirmed" would start booking flows for any address.
+pub async fn is_account_server_only_metric(db: &PgPool, account_id: Uuid, name: &str) -> AppResult<bool> {
+    Ok(sqlx::query_scalar("SELECT server_only FROM metrics WHERE account_id = $1 AND name = $2")
+        .bind(account_id)
+        .bind(name.trim())
+        .fetch_optional(db)
+        .await?
+        .unwrap_or(false))
 }

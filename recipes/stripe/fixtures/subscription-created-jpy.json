@@ -1,0 +1,68 @@
+{
+  "description": "new subscription in a zero-decimal currency",
+  "expect": [
+    {
+      "metric": "Subscription Started",
+      "profile": {
+        "if_missing": "retry",
+        "property": "stripe_customer_id",
+        "value": "cus_TQ1aBcD2eF3gHi"
+      },
+      "properties": {
+        "amount": 1200,
+        "currency": "jpy",
+        "interval": "month",
+        "plan": "tea_monthly_jp",
+        "status": "active",
+        "subscription_id": "sub_jpy"
+      },
+      "time": "2025-11-17T18:00:00.000Z",
+      "type": "track_event",
+      "unique_id": "stripe:subscription:sub_jpy:started"
+    }
+  ],
+  "input": {
+    "payload": {
+      "api_version": "2025-10-29.clover",
+      "created": 1763402400,
+      "data": {
+        "object": {
+          "cancel_at_period_end": false,
+          "canceled_at": null,
+          "cancellation_details": null,
+          "customer": "cus_TQ1aBcD2eF3gHi",
+          "id": "sub_jpy",
+          "items": {
+            "data": [
+              {
+                "id": "si_2",
+                "price": {
+                  "currency": "jpy",
+                  "id": "price_jpy",
+                  "lookup_key": "tea_monthly_jp",
+                  "nickname": null,
+                  "recurring": {
+                    "interval": "month"
+                  },
+                  "unit_amount": 1200
+                }
+              }
+            ],
+            "object": "list"
+          },
+          "object": "subscription",
+          "status": "active"
+        }
+      },
+      "id": "evt_1QaHHH",
+      "livemode": false,
+      "object": "event",
+      "pending_webhooks": 1,
+      "request": {
+        "id": "req_9f8e7d6c5b4a",
+        "idempotency_key": null
+      },
+      "type": "customer.subscription.created"
+    }
+  }
+}

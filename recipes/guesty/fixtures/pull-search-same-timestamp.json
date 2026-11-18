@@ -1,0 +1,2065 @@
+{
+  "description": "A full page that all changed at the same moment: the cursor can't move, so the next request steps past it with skip",
+  "expect": {
+    "tail": [
+      {
+        "query": {
+          "columns": "id firstName lastName fullName guestEmail guestPhone",
+          "filter[lastUpdatedAt][gte]": null,
+          "filters": "{\"_id\":{\"@in\":[\"6g0000000000000000000000\",\"6g0000000000000000000001\",\"6g0000000000000000000002\",\"6g0000000000000000000003\",\"6g0000000000000000000004\",\"6g0000000000000000000005\",\"6g0000000000000000000006\",\"6g0000000000000000000007\",\"6g0000000000000000000008\",\"6g0000000000000000000009\",\"6g0000000000000000000010\",\"6g0000000000000000000011\",\"6g0000000000000000000012\",\"6g0000000000000000000013\",\"6g0000000000000000000014\",\"6g0000000000000000000015\",\"6g0000000000000000000016\",\"6g0000000000000000000017\",\"6g0000000000000000000018\",\"6g0000000000000000000019\",\"6g0000000000000000000020\",\"6g0000000000000000000021\",\"6g0000000000000000000022\",\"6g0000000000000000000023\",\"6g0000000000000000000024\",\"6g0000000000000000000025\",\"6g0000000000000000000026\",\"6g0000000000000000000027\",\"6g0000000000000000000028\",\"6g0000000000000000000029\",\"6g0000000000000000000030\",\"6g0000000000000000000031\",\"6g0000000000000000000032\",\"6g0000000000000000000033\",\"6g0000000000000000000034\",\"6g0000000000000000000035\",\"6g0000000000000000000036\",\"6g0000000000000000000037\",\"6g0000000000000000000038\",\"6g0000000000000000000039\",\"6g0000000000000000000040\",\"6g0000000000000000000041\",\"6g0000000000000000000042\",\"6g0000000000000000000043\",\"6g0000000000000000000044\",\"6g0000000000000000000045\",\"6g0000000000000000000046\",\"6g0000000000000000000047\",\"6g0000000000000000000048\",\"6g0000000000000000000049\"]}}",
+          "limit": 50,
+          "skip": null,
+          "sort": null
+        },
+        "type": "next_request",
+        "url": "/v1/guests-crud"
+      },
+      {
+        "message": "page 1: 50 changed reservations; fetching their 50 guests",
+        "type": "log"
+      }
+    ],
+    "types": {
+      "log": 1,
+      "next_request": 1,
+      "set_state": 1
+    }
+  },
+  "input": {
+    "page": 1,
+    "payload": {
+      "pagination": {
+        "hasMore": true,
+        "limit": 50,
+        "skip": 0
+      },
+      "results": [
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00000",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000000",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000000",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00001",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000001",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000001",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00002",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000002",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000002",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00003",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000003",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000003",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00004",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000004",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000004",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00005",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000005",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000005",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00006",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000006",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000006",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00007",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000007",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000007",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00008",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000008",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000008",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00009",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000009",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000009",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00010",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000010",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000010",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00011",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000011",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000011",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00012",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000012",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000012",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00013",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000013",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000013",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00014",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000014",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000014",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00015",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000015",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000015",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00016",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000016",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000016",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00017",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000017",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000017",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00018",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000018",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000018",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00019",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000019",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000019",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00020",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000020",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000020",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00021",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000021",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000021",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00022",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000022",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000022",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00023",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000023",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000023",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00024",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000024",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000024",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00025",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000025",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000025",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00026",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000026",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000026",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00027",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000027",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000027",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00028",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000028",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000028",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00029",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000029",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000029",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00030",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000030",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000030",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00031",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000031",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000031",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00032",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000032",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000032",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00033",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000033",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000033",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00034",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000034",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000034",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00035",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000035",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000035",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00036",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000036",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000036",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00037",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000037",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000037",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00038",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000038",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000038",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00039",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000039",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000039",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00040",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000040",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000040",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00041",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000041",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000041",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00042",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000042",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000042",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00043",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000043",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000043",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00044",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000044",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000044",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00045",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000045",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000045",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00046",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000046",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000046",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00047",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000047",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000047",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "airbnb2",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00048",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000048",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000048",
+          "source": "airbnb2",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        },
+        {
+          "channel": "manual",
+          "channelMetadata": {
+            "confirmedAt": "2026-11-16T10:00:00.000Z",
+            "updatedAt": "2026-11-16T10:00:00.000Z"
+          },
+          "checkIn": "2026-12-10T23:00:00.000Z",
+          "checkInDateLocalized": "2026-12-10",
+          "checkOut": "2026-12-14T18:00:00.000Z",
+          "checkOutDateLocalized": "2026-12-14",
+          "confirmationCode": "GY-00049",
+          "createdAt": "2026-11-16T10:00:00.000Z",
+          "guestId": "6g0000000000000000000049",
+          "lastUpdatedAt": "2026-11-17T09:00:00.000Z",
+          "notes": {
+            "keyCode": "4411",
+            "other": ""
+          },
+          "reservationId": "6a0000000000000000000049",
+          "source": "manual",
+          "status": "confirmed",
+          "stay": [
+            {
+              "checkIn": "2026-12-10T23:00:00.000Z",
+              "checkInDateLocalized": "2026-12-10",
+              "checkOut": "2026-12-14T18:00:00.000Z",
+              "checkOutDateLocalized": "2026-12-14",
+              "guestsCount": 2,
+              "listingId": "66054019764cbb000f37c450",
+              "numberOfGuests": {
+                "numberOfAdults": 2,
+                "numberOfChildren": 0,
+                "numberOfInfants": 0,
+                "numberOfPets": 0
+              },
+              "parentListingId": null,
+              "ratePlanId": "r1"
+            }
+          ]
+        }
+      ]
+    },
+    "request": {
+      "body": null,
+      "headers": {},
+      "method": "GET",
+      "query": [
+        [
+          "limit",
+          "50"
+        ],
+        [
+          "sort",
+          "lastUpdatedAt"
+        ],
+        [
+          "filter[lastUpdatedAt][gte]",
+          "2026-11-16T18:00:00.000Z"
+        ]
+      ],
+      "url": "https://open-api.guesty.com/v1/reservations-v3/search"
+    },
+    "source": "pull",
+    "state": {
+      "cursor": "2026-11-17T09:00:00.000Z"
+    }
+  },
+  "summary_only": true
+}

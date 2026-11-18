@@ -195,6 +195,7 @@ fn blank_to_none(v: Option<String>) -> Option<Option<String>> {
 
 pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) -> AppResult<Account> {
     let mut account = load_account(&state.db, account_id).await?;
+    let old_tz = account.timezone.clone();
     if let Some(n) = b.name.filter(|n| !n.trim().is_empty()) {
         account.name = n.trim().to_string();
     }
@@ -295,6 +296,10 @@ pub async fn patch_account(state: &AppState, account_id: Uuid, b: AccountPatch) 
     .bind(account.email_sunset_enabled)
     .fetch_one(&state.db)
     .await?;
+    // Event-date reminders are due at a local hour: move them to the new time zone.
+    if saved.timezone != old_tz {
+        crate::flows::reschedule_event_dates(&state.db, account_id).await.map_err(AppError::Internal)?;
+    }
     Ok(saved)
 }
 
