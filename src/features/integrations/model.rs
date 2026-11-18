@@ -37,6 +37,8 @@ pub struct Integration {
     pub auth_version: i64,
     pub contacts_opted_in: bool,
     pub message_id: Option<Value>,
+    pub metrics: Vec<String>,
+    pub redact: Vec<String>,
     pub state: Value,
     pub backfill: Option<Value>,
     pub deliveries_ok: i64,
@@ -48,7 +50,7 @@ pub struct Integration {
     pub updated_at: DateTime<Utc>,
 }
 
-pub const COLS: &str = "id, account_id, name, recipe, status, token_enc, signature, signature_secret_enc, signature_secret_hint, script, settings, pull, pull_next_at, credentials_enc, credential_hints, oauth_token_expires_at, auth_version, contacts_opted_in, message_id, state, backfill, deliveries_ok, deliveries_failed, last_delivery_at, last_error, last_error_at, created_at, updated_at";
+pub const COLS: &str = "id, account_id, name, recipe, status, token_enc, signature, signature_secret_enc, signature_secret_hint, script, settings, pull, pull_next_at, credentials_enc, credential_hints, oauth_token_expires_at, auth_version, contacts_opted_in, message_id, metrics, redact, state, backfill, deliveries_ok, deliveries_failed, last_delivery_at, last_error, last_error_at, created_at, updated_at";
 
 impl Integration {
     pub fn signature(&self) -> Signature {
@@ -148,11 +150,44 @@ impl Integration {
             "signature_ready": !sig.needs_secret() || self.signature_secret_enc.is_some(),
             "script": self.script, "settings": self.settings, "pull": self.pull,
             "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id,
+            "metrics": self.metrics, "redact": self.redact,
             "pull_next_at": self.pull_next_at,
             "credentials": self.credential_hints,
             "missing_credentials": self.missing_credentials(),
             "oauth_token_cached_until": self.oauth_token_expires_at.filter(|t| *t > Utc::now()),
-            "state": self.state, "backfill": self.backfill,
+            "state": self.state, "backfill": self.backfill.as_ref().map(|b| {
+                let mut b = b.clone();
+                b.as_object_mut().map(|o| o.remove("next_enc"));
+                b
+            }),
+            "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
+            "last_delivery_at": self.last_delivery_at, "last_error": self.last_error, "last_error_at": self.last_error_at,
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        })
+    }
+
+    /// The view for people who may see integrations but not change them: no inbound URL (it is a
+    /// credential), no saved state or backfill cursor (they can hold people's details).
+    pub fn view_limited(&self) -> Value {
+        let backfill = self.backfill.as_ref().map(|b| {
+            let mut b = b.clone();
+            if let Some(o) = b.as_object_mut() {
+                o.remove("state");
+                o.remove("next_enc");
+            }
+            b
+        });
+        json!({
+            "id": self.id, "name": self.name, "recipe": self.recipe, "status": self.status,
+            "inbound_url": null, "limited": true,
+            "signature": self.signature,
+            "signature_secret": json!({"saved": self.signature_secret_hint.is_some()}),
+            "signature_ready": !self.signature().needs_secret() || self.signature_secret_enc.is_some(),
+            "script": self.script, "settings": self.settings, "pull": self.pull,
+            "contacts_opted_in": self.contacts_opted_in, "message_id": self.message_id, "metrics": self.metrics, "redact": self.redact,
+            "pull_next_at": self.pull_next_at,
+            "missing_credentials": self.missing_credentials(),
+            "backfill": backfill,
             "deliveries_ok": self.deliveries_ok, "deliveries_failed": self.deliveries_failed,
             "last_delivery_at": self.last_delivery_at, "last_error": self.last_error, "last_error_at": self.last_error_at,
             "created_at": self.created_at, "updated_at": self.updated_at,
@@ -217,6 +252,50 @@ pub struct Changes {
     /// `{"header": "svix-id"}` or `{"field": "id"}` (dots reach nested keys). `null` removes it.
     #[serde(default, deserialize_with = "some_value")]
     pub message_id: Option<Value>,
+    /// The metrics the script may record (replaces the list). They become server-only when saved.
+    #[serde(default)]
+    pub metrics: Option<Vec<String>>,
+    /// Paths removed from payloads before they are stored or shown (replaces the list).
+    #[serde(default)]
+    pub redact: Option<Vec<String>>,
+}
+
+/// Most metrics one integration may declare.
+pub const MAX_METRICS: usize = 50;
+/// Most redact paths one integration may have.
+pub const MAX_REDACT: usize = 50;
+
+fn check_metrics(v: &[String]) -> AppResult<Vec<String>> {
+    if v.len() > MAX_METRICS {
+        return Err(AppError::bad(format!("an integration can declare up to {MAX_METRICS} metrics")));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for m in v {
+        let m = m.trim();
+        if m.is_empty() || m.len() > 128 {
+            return Err(AppError::bad("each metric name must be 1-128 characters"));
+        }
+        if crate::audience::is_server_only_metric(m) {
+            return Err(AppError::bad(format!("{m:?} is recorded by DumbMail itself; an integration can't record it")));
+        }
+        if !out.iter().any(|x| x == m) {
+            out.push(m.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn check_redact(v: &[String]) -> AppResult<Vec<String>> {
+    if v.len() > MAX_REDACT {
+        return Err(AppError::bad(format!("an integration can have up to {MAX_REDACT} redact paths")));
+    }
+    v.iter()
+        .map(|p| {
+            let p = p.trim();
+            super::redact::Path::parse(p).map_err(AppError::BadRequest)?;
+            Ok(p.to_string())
+        })
+        .collect()
 }
 
 fn check_message_id(v: &Value) -> AppResult<Option<Value>> {
@@ -325,6 +404,8 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
         Some(v) => (check_message_id(v)?, true),
         None => (None, false),
     };
+    let metrics = c.metrics.as_deref().map(check_metrics).transpose()?;
+    let redact = c.redact.as_deref().map(check_redact).transpose()?;
     let (pull, set_pull) = match &c.pull {
         Some(Value::Null) => (None, true),
         Some(v) => (Some(serde_json::to_value(PullConfig::parse(v)?)?), true),
@@ -382,6 +463,7 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
             message_id = CASE WHEN $19 THEN $20 ELSE message_id END,
             auth_version = auth_version + CASE WHEN $21 THEN 1 ELSE 0 END,
             oauth_token_key = CASE WHEN $17 THEN NULL ELSE oauth_token_key END,
+            metrics = COALESCE($22, metrics), redact = COALESCE($23, redact),
             updated_at = now()
          WHERE id = $1 AND account_id = $2 RETURNING {COLS}"
     );
@@ -389,6 +471,7 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
     // auth version so a run that started on the old settings can't write its token back.
     let drop_token = creds_changed || (set_pull && cur.pull != pull);
     let bump = drop_token || c.settings.is_some();
+    let mut tx = state.db.begin().await?;
     let row = sqlx::query_as::<_, Integration>(&q)
         .bind(id)
         .bind(account_id)
@@ -411,9 +494,33 @@ pub async fn update(state: &AppState, account_id: Uuid, id: Uuid, c: Changes) ->
         .bind(set_message_id)
         .bind(&message_id)
         .bind(bump)
-        .fetch_one(&state.db)
+        .bind(&metrics)
+        .bind(&redact)
+        .fetch_one(&mut *tx)
         .await?;
+    // The declared metrics are trusted by flows from the moment they are saved: mark them
+    // server-only in the same transaction, so a browser can never send one first.
+    mark_server_only(&mut tx, account_id, &row.metrics).await?;
+    tx.commit().await?;
     Ok(row)
+}
+
+/// Mark metrics server-only (creating them if needed): the public browser endpoint refuses them.
+pub async fn mark_server_only(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account_id: Uuid, names: &[String]) -> sqlx::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = names.iter().map(|_| Uuid::now_v7()).collect();
+    sqlx::query(
+        "INSERT INTO metrics (id, account_id, name, server_only) SELECT i, $1, n, true FROM unnest($2::uuid[], $3::text[]) AS t(i, n)
+         ON CONFLICT (account_id, name) DO UPDATE SET server_only = true",
+    )
+    .bind(account_id)
+    .bind(&ids)
+    .bind(names)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn rotate_url(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Integration> {

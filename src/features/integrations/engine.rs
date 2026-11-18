@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::actions::{self, Action, NextRequest, Outcome, Source};
 use super::model::{self, Integration};
-use super::pull::{self, TokenFor, Vars};
+use super::pull::{self, Scrub, TokenFor, Vars};
 use super::sandbox::{self, Slot, Slots};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -43,8 +43,88 @@ pub const RETENTION_DAYS: i64 = 30;
 pub const JOB_DELIVERY: &str = "integrations_delivery";
 pub const JOB_PULL: &str = "integrations_pull";
 
-fn source_of(i: &Integration, delivery: Option<Uuid>) -> Source {
-    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, delivery }
+fn source_of(i: &Integration, delivery: Option<Uuid>, ledger: Option<Uuid>) -> Source {
+    Source { integration_id: i.id, account_id: i.account_id, name: i.name.clone(), contacts_opted_in: i.contacts_opted_in, metrics: i.metrics.clone(), delivery, ledger }
+}
+
+/// Everything secret about this integration, to scrub from what is stored or shown.
+async fn scrub_for(state: &AppState, i: &Integration) -> Scrub {
+    Scrub::new(i.secret_values(state).await)
+}
+
+// ---------- Concurrent pulls ----------
+
+/// Pulls running at once: one per account, and a global cap (default 4, `INTEGRATION_PULL_SLOTS`).
+/// A pull job that can't get a slot goes back in the queue. (In memory: production runs one
+/// server process.)
+pub struct PullSlots;
+
+pub const PULLS_PER_ACCOUNT: usize = 1;
+
+static PULL_STATE: once_cell::sync::Lazy<std::sync::Mutex<(usize, std::collections::HashMap<Uuid, usize>)>> = once_cell::sync::Lazy::new(Default::default);
+static PULL_CAP: once_cell::sync::Lazy<usize> =
+    once_cell::sync::Lazy::new(|| std::env::var("INTEGRATION_PULL_SLOTS").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n > 0).unwrap_or(4));
+
+pub struct PullSlot {
+    account: Uuid,
+}
+
+impl Drop for PullSlot {
+    fn drop(&mut self) {
+        let mut s = PULL_STATE.lock().unwrap();
+        s.0 = s.0.saturating_sub(1);
+        if let Some(n) = s.1.get_mut(&self.account) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                s.1.remove(&self.account);
+            }
+        }
+    }
+}
+
+impl PullSlots {
+    pub fn try_take(account: Uuid) -> Option<PullSlot> {
+        let mut s = PULL_STATE.lock().unwrap();
+        let mine = s.1.get(&account).copied().unwrap_or(0);
+        if s.0 >= *PULL_CAP || mine >= PULLS_PER_ACCOUNT {
+            return None;
+        }
+        s.0 += 1;
+        *s.1.entry(account).or_insert(0) += 1;
+        Some(PullSlot { account })
+    }
+}
+
+// ---------- Payload budget ----------
+
+static BUDGET_OVERRIDES: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<Uuid, i64>>> = once_cell::sync::Lazy::new(Default::default);
+
+/// Use a smaller stored-payload budget for one account (tests only).
+#[doc(hidden)]
+pub fn set_payload_budget_for(account: Uuid, bytes: i64) {
+    BUDGET_OVERRIDES.lock().unwrap().insert(account, bytes);
+}
+
+fn payload_budget(account: Uuid) -> i64 {
+    BUDGET_OVERRIDES.lock().unwrap().get(&account).copied().unwrap_or(PAYLOAD_BUDGET_BYTES)
+}
+
+/// Pagination data between pages (the next request can carry whatever the app put in a `Link`
+/// header) is kept encrypted whenever it leaves memory: in a job's payload and in a backfill's
+/// progress.
+fn seal_next(state: &AppState, n: &NextRequest) -> AppResult<Value> {
+    if serde_json::to_value(n)?.as_object().is_none_or(|o| o.is_empty()) {
+        return Ok(Value::Null);
+    }
+    Ok(json!(crate::crypto::encrypt(&state.cfg.secret_key, &serde_json::to_string(n)?)?))
+}
+
+fn open_next(state: &AppState, sealed: &Value) -> NextRequest {
+    sealed
+        .as_str()
+        .and_then(|c| crate::crypto::decrypt(&state.cfg.secret_key, c).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// Turn a stored body into the script's `payload`: JSON, a form, or the text itself.
@@ -91,21 +171,14 @@ fn script_input(i: &Integration, inp: &Input, state: &Map<String, Value>) -> Val
     v
 }
 
-/// Run the script and validate its actions. Errors are messages for the delivery log.
-async fn translate(slot: &Slot, script: &str, input: Value, pull: bool) -> Result<(Value, Vec<Action>), String> {
-    let raw = sandbox::run(slot, script, &input).await?;
-    let acts = actions::parse(&raw, pull)?;
-    Ok((raw, acts))
-}
-
 fn raw_list(raw: &Value) -> Vec<Value> {
     raw.as_array().cloned().unwrap_or_default()
 }
 
-/// A job that couldn't get a script slot goes back in the queue a few seconds later.
+/// A job that couldn't get a slot goes back in the (background) queue a few seconds later.
 async fn requeue(state: &AppState, kind: &str, payload: Value) -> anyhow::Result<()> {
     let wait = rand::thread_rng().gen_range(2_000..8_000);
-    crate::jobs::enqueue(&state.db, kind, payload, Some(Utc::now() + chrono::Duration::milliseconds(wait))).await?;
+    crate::jobs::enqueue_background(&state.db, kind, payload, Some(Utc::now() + chrono::Duration::milliseconds(wait))).await?;
     Ok(())
 }
 
@@ -129,12 +202,12 @@ fn state_patch(acts: &[Action]) -> (Map<String, Value>, Vec<String>) {
     (set, removed)
 }
 
-async fn save_live_state(state: &AppState, id: Uuid, acts: &[Action]) -> AppResult<()> {
+async fn save_live_state<'e>(db: impl sqlx::PgExecutor<'e>, id: Uuid, acts: &[Action]) -> AppResult<()> {
     let (set, removed) = state_patch(acts);
     if set.is_empty() && removed.is_empty() {
         return Ok(());
     }
-    sqlx::query("UPDATE integrations SET state = (state || $2) - $3::text[] WHERE id = $1").bind(id).bind(Value::Object(set)).bind(&removed).execute(&state.db).await?;
+    sqlx::query("UPDATE integrations SET state = (state || $2) - $3::text[] WHERE id = $1").bind(id).bind(Value::Object(set)).bind(&removed).execute(db).await?;
     Ok(())
 }
 
@@ -146,77 +219,131 @@ fn status_for(n_actions: usize) -> &'static str {
     if n_actions == 0 { "ignored" } else { "ok" }
 }
 
-/// Job: process one stored delivery (webhook or replay).
+/// The action list to keep for a delivery, fixed the first time its script succeeds: events
+/// without a `unique_id` get one from the original delivery, the action's index and its content,
+/// and events without a `time` are dated when the script ran. Retries apply exactly this list.
+pub fn canonical(raw: &[Value], root: Uuid, ran_at: DateTime<Utc>) -> Vec<Value> {
+    raw.iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let mut a = a.clone();
+            if a["type"] == "track_event" {
+                if a.get("unique_id").is_none_or(Value::is_null) {
+                    let print = actions::fingerprint(&a);
+                    a["unique_id"] = json!(format!("delivery:{root}:{i}:{print}"));
+                }
+                if a.get("time").is_none_or(Value::is_null) {
+                    a["time"] = json!(ran_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                }
+            }
+            a
+        })
+        .collect()
+}
+
+/// Run the script and fix its actions: validated, without `next_request` unless this is a pull
+/// page, and in canonical form. A run whose actions or saved state would hold one of the
+/// integration's credentials fails (nothing secret is ever stored).
+async fn script_actions(slot: &Slot, script: &str, input: Value, pull: bool, root: Uuid, scrub: &Scrub) -> Result<Vec<Value>, String> {
+    let raw = sandbox::run(slot, script, &input).await?;
+    actions::parse(&raw, pull)?;
+    let list = canonical(&raw_list(&raw), root, Utc::now());
+    if scrub.finds_in(&Value::Array(list.clone())) {
+        return Err("the script's actions include one of this integration's credentials; nothing was written".into());
+    }
+    Ok(list)
+}
+
+/// Job: process one stored delivery (webhook or replay). The first successful script run fixes the
+/// delivery's action list; a retry applies that list and never runs the script again.
 pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Result<()> {
-    type Row = (Uuid, Uuid, String, String, Option<String>, Value, Value, Option<String>, i32, Option<Value>, Option<Uuid>, Value);
+    type Row = (Uuid, Uuid, String, String, Option<String>, Value, Value, Option<String>, i32, Option<Value>, Option<Uuid>, Value, Option<Value>);
     let row: Option<Row> = sqlx::query_as(
-        "SELECT integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied FROM integration_deliveries WHERE id = $1",
+        "SELECT integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, actions FROM integration_deliveries WHERE id = $1",
     )
     .bind(delivery_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied)) = row else { return Ok(()) };
+    let Some((integration_id, account_id, source, status, content_type, headers, query, body, attempts, request, replay_of, applied, stored)) = row else { return Ok(()) };
     if !matches!(status.as_str(), "pending" | "error") {
         return Ok(());
     }
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
     if integ.status != "enabled" {
-        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now() WHERE id = $1")
+        // Turned off while it waited: nothing is written, and its payload isn't kept.
+        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', next_attempt_at = NULL, processed_at = now(), body = NULL, headers = '{}', query = '{}', body_bytes = 0 WHERE id = $1")
             .bind(delivery_id)
             .execute(&state.db)
             .await?;
         return Ok(());
     }
-    let Some(slot) = Slots::try_take(account_id) else {
-        return requeue(state, JOB_DELIVERY, json!({"delivery_id": delivery_id})).await;
-    };
+    let scrub = scrub_for(state, &integ).await;
     let started = Instant::now();
     // A replayed pull page runs as a pull again (minus fetching more pages).
     let original = request.as_ref().and_then(|r| r["original_source"].as_str()).map(String::from);
     let replay = source == "replay";
     let shown_source = if replay { original.clone().unwrap_or_else(|| "webhook".into()) } else { source.clone() };
-    let mut extra = Map::new();
-    if let Some(r) = &request {
-        if let Some(resp) = r.get("response") {
-            extra.insert("response".into(), resp.clone());
-        }
-    }
-    let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
-    let script_in = script_input(&integ, &input, &integ.state_map());
-    let skip = applied.as_object().cloned().unwrap_or_default();
-    // Events without a unique_id take theirs from the original delivery, so a replay can't repeat them.
-    let src = source_of(&integ, Some(replay_of.unwrap_or(delivery_id)));
-    let res = match translate(&slot, &integ.script, script_in, shown_source == "pull").await {
-        Ok((raw, acts)) => {
-            let keep: Vec<(Action, Value)> = acts.into_iter().zip(raw_list(&raw)).filter(|(a, _)| !matches!(a, Action::NextRequest(_))).collect();
-            let (acts, raws): (Vec<Action>, Vec<Value>) = keep.into_iter().unzip();
-            let (o, err) = actions::apply(state, &src, &acts, &raws, &skip, &integ.state_map(), false).await;
-            save_applied(state, delivery_id, &o).await?;
-            match err {
-                None => {
-                    save_live_state(state, integ.id, &acts).await?;
-                    Ok((o, acts.len()))
+    let root = replay_of.unwrap_or(delivery_id);
+    let list: Result<Vec<Value>, String> = match stored.as_ref().and_then(|v| v.as_array()) {
+        Some(a) => Ok(a.clone()),
+        None => {
+            let Some(slot) = Slots::try_take(account_id) else {
+                return requeue(state, JOB_DELIVERY, json!({"delivery_id": delivery_id})).await;
+            };
+            let mut extra = Map::new();
+            if let Some(resp) = request.as_ref().and_then(|r| r.get("response")) {
+                extra.insert("response".into(), resp.clone());
+            }
+            let input = Input { source: shown_source.clone(), replay, content_type, body: body.unwrap_or_default(), headers, query, extra };
+            let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &integ.state_map()), shown_source == "pull", root, &scrub).await;
+            drop(slot);
+            match ran {
+                Ok(list) => {
+                    let list: Vec<Value> = list.into_iter().filter(|a| a["type"] != "next_request").collect();
+                    // Whoever stored a list first wins; this run applies that one.
+                    let kept: Value = sqlx::query_scalar("UPDATE integration_deliveries SET actions = COALESCE(actions, $2) WHERE id = $1 RETURNING actions")
+                        .bind(delivery_id)
+                        .bind(Value::Array(list))
+                        .fetch_one(&state.db)
+                        .await?;
+                    Ok(kept.as_array().cloned().unwrap_or_default())
                 }
-                Some(e) => Err(e.public_message()),
+                Err(e) => Err(e),
             }
         }
+    };
+    let skip = applied.as_object().cloned().unwrap_or_default();
+    let src = source_of(&integ, Some(root), Some(delivery_id));
+    let res = match list {
+        Ok(list) => match actions::parse(&Value::Array(list.clone()), true) {
+            Ok(acts) => {
+                let (o, err) = actions::apply(state, &src, &acts, &list, &skip, &integ.state_map(), false).await;
+                match err {
+                    None => {
+                        save_live_state(&state.db, integ.id, &acts).await?;
+                        Ok((o, acts.len()))
+                    }
+                    Some(e) => Err(e.public_message()),
+                }
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
-    drop(slot);
     let ms = started.elapsed().as_millis() as i32;
     match res {
         Ok((o, n)) => {
             sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, error = NULL, duration_ms = $4, attempts = attempts + 1, next_attempt_at = NULL, processed_at = now() WHERE id = $1")
                 .bind(delivery_id)
                 .bind(status_for(n))
-                .bind(result_json(&o))
+                .bind(scrub.value(&result_json(&o)))
                 .bind(ms)
                 .execute(&state.db)
                 .await?;
             sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&state.db).await?;
         }
         Err(msg) => {
-            let msg = integ.redact(state, &msg).await;
+            let msg = scrub.text(&msg);
             let tries = attempts + 1;
             let retry_at: Option<DateTime<Utc>> = (tries < MAX_ATTEMPTS).then(|| Utc::now() + chrono::Duration::minutes(BACKOFF_MINUTES[(tries as usize - 1).min(BACKOFF_MINUTES.len() - 1)]));
             let mut tx = state.db.begin().await?;
@@ -236,17 +363,10 @@ pub async fn process_delivery(state: &AppState, delivery_id: Uuid) -> anyhow::Re
                 .execute(&mut *tx)
                 .await?;
             if let Some(at) = retry_at {
-                crate::jobs::enqueue(&mut *tx, JOB_DELIVERY, json!({"delivery_id": delivery_id}), Some(at)).await?;
+                crate::jobs::enqueue_background(&mut *tx, JOB_DELIVERY, json!({"delivery_id": delivery_id}), Some(at)).await?;
             }
             tx.commit().await?;
         }
-    }
-    Ok(())
-}
-
-async fn save_applied(state: &AppState, delivery_id: Uuid, o: &Outcome) -> anyhow::Result<()> {
-    if !o.applied.is_empty() {
-        sqlx::query("UPDATE integration_deliveries SET applied = applied || $2 WHERE id = $1").bind(delivery_id).bind(Value::Object(o.applied.clone())).execute(&state.db).await?;
     }
     Ok(())
 }
@@ -280,6 +400,9 @@ pub enum Refused {
     Duplicate(Uuid),
     /// Too many deliveries are waiting to run.
     Busy(String),
+    /// Keeping its payload would take the account's stored payloads over their budget, and the
+    /// payloads still waiting to run already fill it.
+    OverBudget(String),
     Error(AppError),
 }
 
@@ -289,14 +412,34 @@ impl From<sqlx::Error> for Refused {
     }
 }
 
+/// What to keep of a payload: the integration's redact list applied (a body that can't be checked
+/// against it isn't kept at all), then every secret masked.
+fn kept_body(integ: &Integration, scrub: &Scrub, content_type: Option<&str>, body: Option<&str>) -> (Option<String>, bool) {
+    let Some(b) = body else { return (None, false) };
+    match super::redact::body(content_type, b, &super::redact::paths(&integ.redact)) {
+        Some(kept) => (Some(scrub.text(&kept)), false),
+        None => (None, true),
+    }
+}
+
 /// Store a delivery and, when it is pending, queue its job, in one transaction. Pending deliveries
-/// count against the per-integration and per-account limits on work still to run.
-pub async fn store_delivery(state: &AppState, integ: &Integration, d: NewDelivery<'_>) -> Result<Uuid, Refused> {
+/// count against the per-integration and per-account limits on work still to run, and a payload is
+/// kept only within the account's stored-payload budget (oldest finished payloads make room;
+/// payloads still waiting to run can't). Everything stored is scrubbed of secrets first.
+pub async fn store_delivery(state: &AppState, integ: &Integration, scrub: &Scrub, d: NewDelivery<'_>) -> Result<Uuid, Refused> {
     let id = Uuid::now_v7();
+    let (body, unkept) = kept_body(integ, scrub, d.content_type, d.body);
+    let note = unkept.then_some("the payload isn't JSON or a form, so it can't be checked against the redact list and wasn't kept");
+    let error = d.error.map(|e| scrub.text(e)).or(note.map(String::from).filter(|_| d.status != "pending"));
+    let headers = scrub.value(d.headers);
+    let query = scrub.value(d.query);
+    let request = d.request.as_ref().map(|r| scrub.value(r));
     let mut tx = state.db.begin().await?;
-    if d.status == "pending" {
-        // One admission at a time per account, so two requests can't both slip under the limit.
+    if d.status == "pending" || body.is_some() {
+        // One admission at a time per account, so two requests can't both slip under a limit.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut *tx).await?;
+    }
+    if d.status == "pending" {
         let (mine, all): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE integration_id = $1), count(*) FROM integration_deliveries
              WHERE account_id = $2 AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
@@ -309,6 +452,9 @@ pub async fn store_delivery(state: &AppState, integ: &Integration, d: NewDeliver
             return Err(Refused::Busy("too many deliveries are waiting to be processed; retry later".into()));
         }
     }
+    if let Some(b) = &body {
+        make_room(&mut tx, integ.account_id, b.len() as i64).await?;
+    }
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO integration_deliveries (id, integration_id, account_id, source, status, content_type, headers, query, body, body_bytes, request, error, replay_of, message_id, applied, processed_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE(octet_length($9), 0), $10, $11, $12, $13, COALESCE($14, '{}'), CASE WHEN $5 = 'pending' THEN NULL ELSE now() END)
@@ -320,11 +466,11 @@ pub async fn store_delivery(state: &AppState, integ: &Integration, d: NewDeliver
     .bind(d.source)
     .bind(d.status)
     .bind(d.content_type)
-    .bind(d.headers)
-    .bind(d.query)
-    .bind(d.body)
-    .bind(d.request)
-    .bind(d.error)
+    .bind(&headers)
+    .bind(&query)
+    .bind(&body)
+    .bind(&request)
+    .bind(&error)
     .bind(d.replay_of)
     .bind(&d.message_id)
     .bind(d.applied)
@@ -335,16 +481,69 @@ pub async fn store_delivery(state: &AppState, integ: &Integration, d: NewDeliver
         return Err(Refused::Duplicate(first));
     }
     if d.status == "pending" {
-        crate::jobs::enqueue(&mut *tx, JOB_DELIVERY, json!({"delivery_id": id}), None).await?;
+        crate::jobs::enqueue_background(&mut *tx, JOB_DELIVERY, json!({"delivery_id": id}), None).await?;
     }
     tx.commit().await?;
     Ok(id)
 }
 
-/// Store a finished pull page's delivery (never deduplicated, never queued).
-async fn store_log(state: &AppState, integ: &Integration, d: NewDelivery<'_>) -> anyhow::Result<Uuid> {
-    match store_delivery(state, integ, d).await {
+/// Inside an admission: make room for `need` more payload bytes under the account's budget by
+/// dropping the oldest finished payloads (their log lines stay). Refused when the payloads still
+/// waiting to run (pending or retrying) leave no room.
+async fn make_room(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account: Uuid, need: i64) -> Result<(), Refused> {
+    let budget = payload_budget(account);
+    let used: i64 = sqlx::query_scalar("SELECT bytes FROM integration_payload_bytes WHERE account_id = $1").bind(account).fetch_optional(&mut **tx).await?.unwrap_or(0);
+    if used + need <= budget {
+        return Ok(());
+    }
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(body_bytes), 0)::bigint FROM integration_deliveries
+         WHERE account_id = $1 AND body IS NOT NULL AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
+    )
+    .bind(account)
+    .fetch_one(&mut **tx)
+    .await?;
+    let full = || Refused::OverBudget(format!("the payloads waiting to be processed already fill this account's {} MB of storage; retry later", budget / (1024 * 1024)));
+    if open + need > budget {
+        return Err(full());
+    }
+    let mut over = used + need - budget;
+    for _ in 0..20 {
+        if over <= 0 {
+            return Ok(());
+        }
+        let freed: Option<i64> = sqlx::query_scalar(FREE_OLDEST_SQL).bind(account).bind(over).fetch_one(&mut **tx).await?;
+        match freed {
+            Some(f) if f > 0 => over -= f,
+            _ => break,
+        }
+    }
+    if over <= 0 { Ok(()) } else { Err(full()) }
+}
+
+/// Clear just enough of an account's oldest finished payloads ($1) to free $2 bytes (at most 1000
+/// rows a round). Returns the bytes freed.
+const FREE_OLDEST_SQL: &str = "WITH ranked AS (
+        SELECT id, body_bytes, sum(body_bytes) OVER (ORDER BY created_at, id) AS running FROM integration_deliveries
+        WHERE account_id = $1 AND body IS NOT NULL AND status <> 'pending' AND NOT (status = 'error' AND next_attempt_at IS NOT NULL)
+        ORDER BY created_at, id LIMIT 1000),
+     pick AS (SELECT id, body_bytes FROM ranked WHERE running - body_bytes < $2),
+     cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0 FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
+     SELECT sum(body_bytes)::bigint FROM cleared";
+
+/// Store a pull page's delivery (never deduplicated, never queued). Over the payload budget, the
+/// log line is kept without the page.
+async fn store_log(state: &AppState, integ: &Integration, scrub: &Scrub, d: NewDelivery<'_>) -> anyhow::Result<Uuid> {
+    let retry = NewDelivery { body: None, content_type: d.content_type, headers: d.headers, query: d.query, request: d.request.clone(), error: d.error, ..NewDelivery::log(d.source, d.status, None) };
+    match store_delivery(state, integ, scrub, d).await {
         Ok(id) => Ok(id),
+        Err(Refused::OverBudget(msg)) => {
+            let note = format!("page not kept: {msg}");
+            match store_delivery(state, integ, scrub, NewDelivery { error: Some(&note), ..retry }).await {
+                Ok(id) => Ok(id),
+                Err(other) => Err(anyhow::anyhow!("couldn't store the delivery: {other:?}")),
+            }
+        }
         Err(Refused::Error(e)) => Err(anyhow::anyhow!(e.public_message())),
         Err(other) => Err(anyhow::anyhow!("couldn't store the delivery: {other:?}")),
     }
@@ -354,8 +553,15 @@ async fn store_log(state: &AppState, integ: &Integration, d: NewDelivery<'_>) ->
 
 /// Run the script on a sample (or, with `pull`, on the first page fetched now) and say exactly what
 /// would be written. Writes nothing. A pull test reuses the cached access token and asks for a new
-/// one only when none is cached.
+/// one only when none is cached. The answer is scrubbed of every secret, including what the
+/// request sent and anything the app echoed back.
 pub async fn test(state: &AppState, integ: &Integration, script: Option<&str>, sample: TestSample) -> AppResult<Value> {
+    let mut scrub = scrub_for(state, integ).await;
+    let out = test_inner(state, integ, script, sample, &mut scrub).await?;
+    Ok(scrub.value(&out))
+}
+
+async fn test_inner(state: &AppState, integ: &Integration, script: Option<&str>, sample: TestSample, scrub: &mut Scrub) -> AppResult<Value> {
     let script = script.unwrap_or(&integ.script);
     let started = Instant::now();
     let slot = Slots::take_within(integ.account_id, Duration::from_secs(5))
@@ -380,19 +586,19 @@ pub async fn test(state: &AppState, integ: &Integration, script: Option<&str>, s
             let shown = Vars { secrets: &creds, state: &st, settings: &settings, now, since: now - chrono::Duration::days(1), redact: true };
             let req = pull::build(&cfg, &NextRequest::default(), &vars).map_err(AppError::BadRequest)?;
             let logged = pull::build(&cfg, &NextRequest::default(), &shown).map_err(AppError::BadRequest)?;
+            scrub.add_request(&req);
             let origin = cfg.origin();
             let who = TokenFor { integration_id: integ.id, auth_version: integ.auth_version, origin: &origin };
-            let fetched = async {
-                let token = pull::oauth_token(state, &who, &cfg.auth, &vars).await?;
-                pull::send(&req, token.as_deref()).await
+            let token = match pull::oauth_token(state, &who, &cfg.auth, &vars).await {
+                Ok(t) => t,
+                Err(e) => return Ok(json!({"ok": false, "error": e.public_message(), "pull": {"request": logged.log_json()}, "duration_ms": started.elapsed().as_millis() as u64})),
+            };
+            if let Some(t) = &token {
+                scrub.add(t);
             }
-            .await;
-            let resp = match fetched {
+            let resp = match pull::send(&req, token.as_deref()).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let msg = integ.redact(state, &e.public_message()).await;
-                    return Ok(json!({"ok": false, "error": msg, "pull": {"request": logged.log_json()}, "duration_ms": started.elapsed().as_millis() as u64}));
-                }
+                Err(e) => return Ok(json!({"ok": false, "error": e.public_message(), "pull": {"request": logged.log_json()}, "duration_ms": started.elapsed().as_millis() as u64})),
             };
             let mut extra = Map::new();
             let response = json!({"status": resp.status, "headers": resp.headers});
@@ -403,19 +609,23 @@ pub async fn test(state: &AppState, integ: &Integration, script: Option<&str>, s
             let meta = json!({"request": logged.log_json(), "response": response});
             if !(200..300).contains(&resp.status) {
                 let msg = format!("{} answered HTTP {} ({})", req.place(), resp.status, pull::status_class(resp.status));
-                return Ok(json!({"ok": false, "error": integ.redact(state, &msg).await, "pull": meta, "duration_ms": started.elapsed().as_millis() as u64}));
+                return Ok(json!({"ok": false, "error": msg, "pull": meta, "duration_ms": started.elapsed().as_millis() as u64}));
             }
             (Input { source: "pull".into(), content_type: resp.headers.get("content-type").and_then(|v| v.as_str()).map(String::from), body: resp.body, extra, ..Default::default() }, Some(meta))
         }
     };
     let is_pull = input.source == "pull";
     let script_in = script_input(integ, &input, &integ.state_map());
-    let (raw, acts) = match translate(&slot, script, script_in, is_pull).await {
+    let raw = match sandbox::run(&slot, script, &script_in).await {
         Ok(x) => x,
         Err(e) => return Ok(json!({"ok": false, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
     };
     drop(slot);
-    let (o, err) = actions::apply(state, &source_of(integ, None), &acts, &raw_list(&raw), &Map::new(), &integ.state_map(), true).await;
+    let acts = match actions::parse(&raw, is_pull) {
+        Ok(a) => a,
+        Err(e) => return Ok(json!({"ok": false, "actions": raw, "error": e, "pull": pull_meta, "duration_ms": started.elapsed().as_millis() as u64})),
+    };
+    let (o, err) = actions::apply(state, &source_of(integ, None, None), &acts, &raw_list(&raw), &Map::new(), &integ.state_map(), true).await;
     match err {
         None => Ok(json!({
             "ok": true, "actions": raw, "would_write": o.counts, "effects": o.effects, "logs": o.logs,
@@ -461,6 +671,7 @@ pub async fn replay(state: &AppState, integ: &Integration, ids: &[Uuid], all_fai
     if dry {
         return Ok(json!({"dry_run": true, "would_replay": rows.len(), "delivery_ids": rows.iter().map(|r| r.0).collect::<Vec<_>>()}));
     }
+    let scrub = scrub_for(state, integ).await;
     let mut new_ids = Vec::new();
     for (id, source, ct, headers, query, body, request, replay_of, applied) in rows {
         let orig = if source == "replay" { request.as_ref().and_then(|r| r["original_source"].as_str()).unwrap_or("webhook").to_string() } else { source };
@@ -478,9 +689,9 @@ pub async fn replay(state: &AppState, integ: &Integration, ids: &[Uuid], all_fai
             all.extend(o.clone());
         }
         let d = NewDelivery { source: "replay", content_type: ct.as_deref(), headers: &headers, query: &query, body: body.as_deref(), request: Some(req), status: "pending", error: None, replay_of: Some(root), message_id: None, applied: Some(Value::Object(all)) };
-        match store_delivery(state, integ, d).await {
+        match store_delivery(state, integ, &scrub, d).await {
             Ok(nid) => new_ids.push(nid),
-            Err(Refused::Busy(msg)) => {
+            Err(Refused::Busy(msg) | Refused::OverBudget(msg)) => {
                 return Ok(json!({"replayed": new_ids.len(), "delivery_ids": new_ids, "stopped": msg}));
             }
             Err(Refused::Duplicate(_)) => {}
@@ -516,6 +727,24 @@ fn merge_next(acc: &mut NextRequest, n: NextRequest) {
     }
 }
 
+/// Queue a live pull unless one for this integration is already waiting or running. The check and
+/// the insert happen in one transaction under a lock on the integration, so two schedulers (or a
+/// scheduler and a "pull now") can't both queue one. Returns whether one was queued.
+pub async fn enqueue_live_pull(state: &AppState, integration_id: Uuid) -> AppResult<bool> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7022))").bind(integration_id.to_string()).execute(&mut *tx).await?;
+    let busy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = $1 AND payload->>'integration_id' = $2 AND payload->>'mode' = 'live' AND run_at <> 'infinity')")
+        .bind(JOB_PULL)
+        .bind(integration_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+    if !busy {
+        crate::jobs::enqueue_background(&mut *tx, JOB_PULL, json!({"integration_id": integration_id, "mode": "live", "next": null, "pages": 0}), None).await?;
+    }
+    tx.commit().await?;
+    Ok(!busy)
+}
+
 /// Start a pull now, or a backfill from `since`, or (`resume`) continue a backfill that stopped at
 /// its page limit or failed, from where it got to. Returns what was started.
 pub async fn start_pull(state: &AppState, integ: &Integration, backfill_since: Option<DateTime<Utc>>, resume: bool) -> AppResult<Value> {
@@ -534,27 +763,37 @@ pub async fn start_pull(state: &AppState, integ: &Integration, backfill_since: O
         }
         let run_id = Uuid::now_v7();
         let patch = json!({"id": run_id, "status": "running", "resumed_at": Utc::now(), "error": null, "finished_at": null, "note": null});
-        sqlx::query("UPDATE integrations SET backfill = backfill || $2 WHERE id = $1").bind(integ.id).bind(&patch).execute(&state.db).await?;
-        crate::jobs::enqueue(&state.db, JOB_PULL, json!({"integration_id": integ.id, "mode": "backfill", "run_id": run_id, "next": b["next"].clone(), "pages": 0}), None).await?;
+        let mut tx = state.db.begin().await?;
+        sqlx::query("UPDATE integrations SET backfill = backfill || $2 WHERE id = $1").bind(integ.id).bind(&patch).execute(&mut *tx).await?;
+        crate::jobs::enqueue_background(&mut *tx, JOB_PULL, json!({"integration_id": integ.id, "mode": "backfill", "run_id": run_id, "next_enc": b["next_enc"].clone(), "pages": 0}), None).await?;
+        tx.commit().await?;
         return Ok(json!({"started": "backfill", "resumed": true, "backfill": {"id": run_id, "pages": b["pages"]}}));
     }
     match backfill_since {
         Some(since) => {
-            if integ.backfill.as_ref().is_some_and(|b| b["status"] == "running") {
-                return Err(AppError::Conflict("a backfill is already running; cancel it first".into()));
-            }
             if since > Utc::now() {
                 return Err(AppError::bad("the backfill start date is in the future"));
             }
             let run_id = Uuid::now_v7();
-            let b = json!({"id": run_id, "status": "running", "since": since, "started_at": Utc::now(), "pages": 0, "errors": 0, "state": {}, "next": {}});
-            sqlx::query("UPDATE integrations SET backfill = $2 WHERE id = $1").bind(integ.id).bind(&b).execute(&state.db).await?;
-            crate::jobs::enqueue(&state.db, JOB_PULL, json!({"integration_id": integ.id, "mode": "backfill", "run_id": run_id, "next": {}, "pages": 0}), None).await?;
+            let b = json!({"id": run_id, "status": "running", "since": since, "started_at": Utc::now(), "pages": 0, "errors": 0, "state": {}, "next_enc": null});
+            let mut tx = state.db.begin().await?;
+            // Only when no backfill is running, checked by the write itself.
+            let n = sqlx::query("UPDATE integrations SET backfill = $2 WHERE id = $1 AND (backfill IS NULL OR backfill->>'status' IS DISTINCT FROM 'running')")
+                .bind(integ.id)
+                .bind(&b)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if n == 0 {
+                return Err(AppError::Conflict("a backfill is already running; cancel it first".into()));
+            }
+            crate::jobs::enqueue_background(&mut *tx, JOB_PULL, json!({"integration_id": integ.id, "mode": "backfill", "run_id": run_id, "next_enc": null, "pages": 0}), None).await?;
+            tx.commit().await?;
             Ok(json!({"started": "backfill", "backfill": b}))
         }
         None => {
-            crate::jobs::enqueue(&state.db, JOB_PULL, json!({"integration_id": integ.id, "mode": "live", "next": {}, "pages": 0}), None).await?;
-            Ok(json!({"started": "pull"}))
+            let queued = enqueue_live_pull(state, integ.id).await?;
+            Ok(if queued { json!({"started": "pull"}) } else { json!({"started": "pull", "already_queued": true}) })
         }
     }
 }
@@ -573,35 +812,49 @@ pub async fn cancel_backfill(state: &AppState, integ: &Integration) -> AppResult
 
 /// Update a backfill's progress, only while it is still the same run (a replaced or cancelled
 /// backfill is never overwritten by an old page). Returns false when the run is no longer current.
-async fn backfill_update(state: &AppState, id: Uuid, run_id: &str, patch: Value) -> anyhow::Result<bool> {
+async fn backfill_update<'e>(db: impl sqlx::PgExecutor<'e>, scrub: &Scrub, id: Uuid, run_id: &str, patch: Value) -> anyhow::Result<bool> {
     let n = sqlx::query("UPDATE integrations SET backfill = backfill || $2 WHERE id = $1 AND backfill->>'id' = $3 AND backfill->>'status' = 'running'")
         .bind(id)
-        .bind(patch)
+        .bind(scrub.value(&patch))
         .bind(run_id)
-        .execute(&state.db)
+        .execute(db)
         .await?
         .rows_affected();
     Ok(n > 0)
 }
 
-async fn pull_failed(state: &AppState, integ: &Integration, run_id: Option<&str>, msg: &str) -> anyhow::Result<()> {
-    let msg = integ.redact(state, msg).await;
+async fn pull_failed(state: &AppState, integ: &Integration, scrub: &Scrub, run_id: Option<&str>, msg: &str) -> anyhow::Result<()> {
+    let msg = scrub.text(msg);
     sqlx::query("UPDATE integrations SET last_error = $2, last_error_at = now() WHERE id = $1").bind(integ.id).bind(&msg).execute(&state.db).await?;
     if let Some(run) = run_id {
-        backfill_update(state, integ.id, run, json!({"status": "failed", "error": msg, "finished_at": Utc::now()})).await?;
+        backfill_update(&state.db, scrub, integ.id, run, json!({"status": "failed", "error": msg, "finished_at": Utc::now()})).await?;
     }
     Ok(())
 }
 
 /// Job: fetch up to a few pages of a pull (or backfill), running the script on each, then hand
-/// over to a new job if the script asks for more.
+/// over to a new job if the script asks for more. At most [`PULLS_PER_ACCOUNT`] run at once per
+/// account (and a few in all); the rest wait in the queue.
 pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
     let Some(id) = p["integration_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let Some(first) = model::load_any(state, id).await? else { return Ok(()) };
+    let Some(_pull_slot) = PullSlots::try_take(first.account_id) else {
+        return requeue(state, JOB_PULL, p.clone()).await;
+    };
     let backfill = p["mode"] == "backfill";
     let run_id = p["run_id"].as_str().map(String::from);
     let run = if backfill { run_id.as_deref() } else { None };
-    let mut next: NextRequest = serde_json::from_value(p["next"].clone()).unwrap_or_default();
+    let mut next: NextRequest = open_next(state, &p["next_enc"]);
     let mut pages = p["pages"].as_u64().unwrap_or(0) as u32;
+    let continue_with = |next: &NextRequest, pages: u32| -> AppResult<Value> {
+        let mut payload = p.clone();
+        if let Some(o) = payload.as_object_mut() {
+            o.remove("next");
+        }
+        payload["next_enc"] = seal_next(state, next)?;
+        payload["pages"] = json!(pages);
+        Ok(payload)
+    };
     for _ in 0..PAGES_PER_JOB {
         let Some(integ) = model::load_any(state, id).await? else { return Ok(()) };
         if integ.status != "enabled" {
@@ -616,11 +869,9 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         if !backfill && pages == 0 && !integ.missing_credentials().is_empty() {
             return Ok(());
         }
+        let mut scrub = scrub_for(state, &integ).await;
         let Some(slot) = Slots::try_take(integ.account_id) else {
-            let mut payload = p.clone();
-            payload["next"] = serde_json::to_value(&next)?;
-            payload["pages"] = json!(pages);
-            return requeue(state, JOB_PULL, payload).await;
+            return requeue(state, JOB_PULL, continue_with(&next, pages)?).await;
         };
         let limit = if backfill { cfg.backfill_max_pages.unwrap_or(BACKFILL_MAX_PAGES) } else { cfg.max_pages.unwrap_or(10) };
         let creds = integ.credentials(state).map_err(|e| anyhow::anyhow!(e.public_message()))?;
@@ -632,18 +883,22 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         let shown = Vars { secrets: &creds, state: &run_state, settings: &settings, now, since, redact: true };
         let (req, logged) = match (pull::build(&cfg, &next, &vars), pull::build(&cfg, &next, &shown)) {
             (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) => return pull_failed(state, &integ, run, &e).await,
+            (Err(e), _) | (_, Err(e)) => return pull_failed(state, &integ, &scrub, run, &e).await,
         };
+        scrub.add_request(&req);
         let origin = cfg.origin();
         let who = TokenFor { integration_id: integ.id, auth_version: integ.auth_version, origin: &origin };
         let token = match pull::oauth_token(state, &who, &cfg.auth, &vars).await {
             Ok(t) => t,
-            Err(e) => return pull_failed(state, &integ, run, &format!("couldn't get an access token: {}", e.public_message())).await,
+            Err(e) => return pull_failed(state, &integ, &scrub, run, &format!("couldn't get an access token: {}", e.public_message())).await,
         };
+        if let Some(t) = &token {
+            scrub.add(t);
+        }
         let started = Instant::now();
         let resp = match pull::send(&req, token.as_deref()).await {
             Ok(r) => r,
-            Err(e) => return pull_failed(state, &integ, run, &e.public_message()).await,
+            Err(e) => return pull_failed(state, &integ, &scrub, run, &e.public_message()).await,
         };
         let response = json!({"status": resp.status, "headers": resp.headers});
         let mut logged_req = logged.log_json();
@@ -655,10 +910,9 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
             }
             // The app's own error text is never kept: it can echo what was sent.
             let msg = format!("{} answered HTTP {} ({})", req.place(), resp.status, pull::status_class(resp.status));
-            let msg = integ.redact(state, &msg).await;
-            store_log(state, &integ, NewDelivery { request: Some(logged_req), ..NewDelivery::log("pull", "error", Some(&msg)) }).await?;
+            store_log(state, &integ, &scrub, NewDelivery { request: Some(logged_req), ..NewDelivery::log("pull", "error", Some(&msg)) }).await?;
             sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1 WHERE id = $1").bind(integ.id).execute(&state.db).await?;
-            return pull_failed(state, &integ, run, &msg).await;
+            return pull_failed(state, &integ, &scrub, run, &msg).await;
         }
         let body = (resp.body.len() <= BODY_MAX_BYTES).then_some(resp.body.as_str());
         let mut extra = Map::new();
@@ -667,19 +921,44 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
         extra.insert("page".into(), json!(pages + 1));
         extra.insert("backfill".into(), if backfill { json!({"since": bf["since"]}) } else { Value::Null });
         let input = Input { source: "pull".into(), content_type: ct.clone(), body: resp.body.clone(), extra, ..Default::default() };
-        let delivery = store_log(state, &integ, NewDelivery { content_type: ct.as_deref(), body, request: Some(logged_req), ..NewDelivery::log("pull", "ok", None) }).await?;
-        let res = match translate(&slot, &integ.script, script_input(&integ, &input, &run_state), true).await {
-            Ok((raw, acts)) => {
-                let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery)), &acts, &raw_list(&raw), &Map::new(), &run_state, false).await;
-                save_applied(state, delivery, &o).await?;
-                match err {
-                    None => Ok((o, acts)),
-                    Some(e) => Err(e.public_message()),
+        let delivery = store_log(state, &integ, &scrub, NewDelivery { content_type: ct.as_deref(), body, request: Some(logged_req), ..NewDelivery::log("pull", "ok", None) }).await?;
+        let ran = script_actions(&slot, &integ.script, script_input(&integ, &input, &run_state), true, delivery, &scrub).await;
+        drop(slot);
+        // A backfill page is applied under a lock on the integration that a replacement or a
+        // cancel must wait for, and only while its run is still the current one: a replaced run
+        // writes nothing. (A cancel waits for this page, then stops the run.)
+        let mut guard = state.db.begin().await?;
+        if let Some(run) = run {
+            let current: Option<Uuid> = sqlx::query_scalar("SELECT id FROM integrations WHERE id = $1 AND backfill->>'id' = $2 AND backfill->>'status' = 'running' FOR SHARE")
+                .bind(integ.id)
+                .bind(run)
+                .fetch_optional(&mut *guard)
+                .await?;
+            if current.is_none() {
+                guard.rollback().await?;
+                sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the backfill was replaced or cancelled before this page was written', attempts = 1 WHERE id = $1")
+                    .bind(delivery)
+                    .execute(&state.db)
+                    .await?;
+                return Ok(());
+            }
+        }
+        let res = match ran {
+            Ok(list) => {
+                sqlx::query("UPDATE integration_deliveries SET actions = $2 WHERE id = $1").bind(delivery).bind(Value::Array(list.clone())).execute(&state.db).await?;
+                match actions::parse(&Value::Array(list.clone()), true) {
+                    Ok(acts) => {
+                        let (o, err) = actions::apply(state, &source_of(&integ, Some(delivery), Some(delivery)), &acts, &list, &Map::new(), &run_state, false).await;
+                        match err {
+                            None => Ok((o, acts)),
+                            Some(e) => Err(e.public_message()),
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
             }
             Err(e) => Err(e),
         };
-        drop(slot);
         let ms = started.elapsed().as_millis() as i32;
         pages += 1;
         match res {
@@ -687,18 +966,19 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 sqlx::query("UPDATE integration_deliveries SET status = $2, result = $3, duration_ms = $4, attempts = 1 WHERE id = $1")
                     .bind(delivery)
                     .bind(status_for(acts.len()))
-                    .bind(result_json(&o))
+                    .bind(scrub.value(&result_json(&o)))
                     .bind(ms)
-                    .execute(&state.db)
+                    .execute(&mut *guard)
                     .await?;
-                sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&state.db).await?;
+                sqlx::query("UPDATE integrations SET deliveries_ok = deliveries_ok + 1, last_delivery_at = now() WHERE id = $1").bind(integ.id).execute(&mut *guard).await?;
                 let more = o.next_request.clone();
                 let mut upcoming = next.clone();
                 if let Some(n) = more.clone() {
                     merge_next(&mut upcoming, n);
                 }
                 if let Some(run) = run {
-                    // Save resumable progress after every page: the state and the next request.
+                    // Save resumable progress after every page: the state and the next request
+                    // (encrypted: it can hold what the app put in a Link header).
                     let (set, removed) = state_patch(&acts);
                     let mut st = run_state.clone();
                     for k in removed {
@@ -706,24 +986,23 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                     }
                     st.extend(set);
                     let total = bf["pages"].as_u64().unwrap_or(0) + 1;
-                    let current = backfill_update(state, integ.id, run, json!({"pages": total, "state": st, "next": if more.is_some() { serde_json::to_value(&upcoming)? } else { json!({}) }})).await?;
-                    if !current {
-                        return Ok(()); // cancelled or replaced while this page ran
-                    }
+                    let sealed = if more.is_some() { seal_next(state, &upcoming)? } else { Value::Null };
+                    backfill_update(&mut *guard, &scrub, integ.id, run, json!({"pages": total, "state": st, "next_enc": sealed})).await?;
                 } else {
-                    save_live_state(state, integ.id, &acts).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                    save_live_state(&mut *guard, integ.id, &acts).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 }
+                guard.commit().await?;
                 match more {
                     Some(_) if pages < limit => next = upcoming,
                     Some(_) => {
                         if let Some(run) = run {
-                            backfill_update(state, integ.id, run, json!({"status": "capped", "finished_at": Utc::now(), "note": format!("stopped after {limit} pages; resume to continue from where it got to")})).await?;
+                            backfill_update(&state.db, &scrub, integ.id, run, json!({"status": "capped", "finished_at": Utc::now(), "note": format!("stopped after {limit} pages; resume to continue from where it got to")})).await?;
                         }
                         return Ok(());
                     }
                     None => {
                         if let Some(run) = run {
-                            backfill_update(state, integ.id, run, json!({"status": "done", "finished_at": Utc::now()})).await?;
+                            backfill_update(&state.db, &scrub, integ.id, run, json!({"status": "done", "finished_at": Utc::now()})).await?;
                         } else {
                             sqlx::query("UPDATE integrations SET last_error = NULL WHERE id = $1 AND last_error_at < now() - interval '1 second'").bind(integ.id).execute(&state.db).await?;
                         }
@@ -732,21 +1011,20 @@ pub async fn run_pull(state: &AppState, p: &Value) -> anyhow::Result<()> {
                 }
             }
             Err(msg) => {
-                let msg = integ.redact(state, &msg).await;
-                sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = 1 WHERE id = $1").bind(delivery).bind(&msg).bind(ms).execute(&state.db).await?;
-                sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1 WHERE id = $1").bind(integ.id).execute(&state.db).await?;
-                return pull_failed(state, &integ, run, &msg).await;
+                let msg = scrub.text(&msg);
+                sqlx::query("UPDATE integration_deliveries SET status = 'error', error = $2, duration_ms = $3, attempts = 1 WHERE id = $1").bind(delivery).bind(&msg).bind(ms).execute(&mut *guard).await?;
+                sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1 WHERE id = $1").bind(integ.id).execute(&mut *guard).await?;
+                guard.commit().await?;
+                return pull_failed(state, &integ, &scrub, run, &msg).await;
             }
         }
     }
-    let mut payload = p.clone();
-    payload["next"] = serde_json::to_value(&next)?;
-    payload["pages"] = json!(pages);
-    crate::jobs::enqueue(&state.db, JOB_PULL, payload, None).await?;
+    crate::jobs::enqueue_background(&state.db, JOB_PULL, continue_with(&next, pages)?, None).await?;
     Ok(())
 }
 
-/// Scheduler: start pulls that are due, at most once per interval each.
+/// Scheduler: start pulls that are due, at most once per interval each, and never a second one
+/// while one is waiting or running.
 pub async fn schedule_pulls(state: &AppState) -> anyhow::Result<()> {
     let due: Vec<(Uuid, Value)> = sqlx::query_as(
         "UPDATE integrations SET pull_next_at = now() + make_interval(mins => (pull->>'interval_minutes')::int)
@@ -756,14 +1034,7 @@ pub async fn schedule_pulls(state: &AppState) -> anyhow::Result<()> {
     .fetch_all(&state.db)
     .await?;
     for (id, _) in due {
-        let busy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = $1 AND payload->>'integration_id' = $2 AND payload->>'mode' = 'live' AND run_at <> 'infinity')")
-            .bind(JOB_PULL)
-            .bind(id.to_string())
-            .fetch_one(&state.db)
-            .await?;
-        if !busy {
-            crate::jobs::enqueue(&state.db, JOB_PULL, json!({"integration_id": id, "mode": "live", "next": {}, "pages": 0}), None).await?;
-        }
+        enqueue_live_pull(state, id).await?;
     }
     Ok(())
 }
@@ -800,15 +1071,7 @@ pub async fn prune_with(state: &AppState, budget: Duration, bytes_per_account: i
         while total > bytes_per_account && started.elapsed() <= budget {
             // Just enough of the oldest finished payloads to get back under the budget (at most
             // 1000 a round); a delivery still waiting to run keeps its payload.
-            let freed: Option<i64> = sqlx::query_scalar(
-                "WITH ranked AS (
-                    SELECT id, body_bytes, sum(body_bytes) OVER (ORDER BY created_at, id) AS running FROM integration_deliveries
-                    WHERE account_id = $1 AND body IS NOT NULL AND status <> 'pending' AND NOT (status = 'error' AND next_attempt_at IS NOT NULL)
-                    ORDER BY created_at, id LIMIT 1000),
-                 pick AS (SELECT id, body_bytes FROM ranked WHERE running - body_bytes < $2),
-                 cleared AS (UPDATE integration_deliveries d SET body = NULL, headers = '{}', query = '{}', body_bytes = 0 FROM pick WHERE d.id = pick.id RETURNING pick.body_bytes)
-                 SELECT sum(body_bytes)::bigint FROM cleared",
-            )
+            let freed: Option<i64> = sqlx::query_scalar(FREE_OLDEST_SQL)
             .bind(account)
             .bind(total - bytes_per_account)
             .fetch_one(&state.db)

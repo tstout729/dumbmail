@@ -102,6 +102,13 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
 
     for attempt in 0..2 {
         let existing = find_profile(db, account_id, input).await?;
+        if fill_only {
+            if let Some(p) = &existing {
+                if let Some(narrowed) = protect_from_public(db, p, input, email.as_deref(), phone.as_deref()).await? {
+                    return Box::pin(upsert_inner(db, account_id, &narrowed, true)).await;
+                }
+            }
+        }
         let mut old_consent: Option<(String, String)> = None;
         let res = match &existing {
             Some(p) => {
@@ -111,7 +118,8 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
                             email = COALESCE(p.email, $2), phone_number = COALESCE(p.phone_number, $3),
                             external_id = COALESCE(p.external_id, $4), first_name = COALESCE(p.first_name, $5),
                             last_name = COALESCE(p.last_name, $6), properties = $7 || p.properties,
-                            email_consent = COALESCE($8, p.email_consent), sms_consent = COALESCE($9, p.sms_consent),
+                            email_consent = CASE WHEN $2::text IS NOT NULL AND COALESCE(p.email, $2::text) = $2::text THEN COALESCE($8, p.email_consent) ELSE p.email_consent END,
+                            sms_consent = CASE WHEN $3::text IS NOT NULL AND COALESCE(p.phone_number, $3::text) = $3::text THEN COALESCE($9, p.sms_consent) ELSE p.sms_consent END,
                             updated_at = now()
                          FROM (SELECT id, email_consent, sms_consent FROM profiles WHERE id = $1 FOR UPDATE) old
                          WHERE p.id = old.id RETURNING {PROFILE_COLS}, old.email_consent AS old_email_consent, old.sms_consent AS old_sms_consent"
@@ -192,6 +200,42 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         }
     }
     Err(AppError::Conflict("could not save profile, please retry".into()))
+}
+
+/// The public fill-only path (forms, the website script) on a profile an integration wrote (it has
+/// integration keys or a marketing hold): it never adds or changes an email or phone there when it
+/// matched the profile by a different identifier. With a submitted email that isn't this
+/// profile's, the submission goes to the profile that has that email (found or created), without
+/// the other identifiers. Otherwise the identifiers this profile doesn't already have are dropped.
+/// Returns the narrowed input to use instead, or None to go ahead as given.
+async fn protect_from_public(db: &PgPool, p: &Profile, input: &ProfileInput, email: Option<&str>, phone: Option<&str>) -> AppResult<Option<ProfileInput>> {
+    let email_differs = email.is_some_and(|e| p.email.as_deref() != Some(e));
+    let phone_differs = phone.is_some_and(|n| p.phone_number.as_deref() != Some(n));
+    let ext_differs = input.external_id.as_deref().is_some_and(|x| p.external_id.as_deref() != Some(x));
+    if !(email_differs || phone_differs || ext_differs) {
+        return Ok(None);
+    }
+    let protected: bool = sqlx::query_scalar("SELECT integration_keys <> '{}' OR marketing_hold FROM profiles WHERE id = $1").bind(p.id).fetch_optional(db).await?.unwrap_or(false);
+    if !protected {
+        return Ok(None);
+    }
+    let mut narrowed = input.clone();
+    if email_differs {
+        // Someone else's address, or one this person never gave the business: it gets its own profile.
+        narrowed.id = None;
+        narrowed.phone_number = None;
+        narrowed.external_id = None;
+        narrowed.sms_consent = None;
+    } else {
+        if phone_differs {
+            narrowed.phone_number = None;
+            narrowed.sms_consent = None;
+        }
+        if ext_differs {
+            narrowed.external_id = None;
+        }
+    }
+    Ok(Some(narrowed))
 }
 
 /// A profile row with the consent values the update that returned it replaced.
@@ -353,6 +397,43 @@ async fn insert_event(db: &PgPool, ev: NewEvent<'_>, source: EventSource) -> App
     .bind(source == EventSource::Browser)
     .fetch_optional(&mut *tx)
     .await?;
+    let inserted = match (inserted, &ev.unique_id) {
+        (Some(id), _) => Some(id),
+        // A trusted event (DumbMail, the API, an integration) whose unique_id a browser already
+        // used: the browser's copy is replaced, in this transaction, so flows and every feature see
+        // the trusted one as new. A browser event never replaces anything.
+        (None, Some(unique_id)) if source != EventSource::Browser => {
+            let replaced = sqlx::query("DELETE FROM events WHERE account_id = $1 AND metric_id = $2 AND unique_id = $3 AND from_browser")
+                .bind(ev.account_id)
+                .bind(metric_id)
+                .bind(unique_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if replaced == 0 {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "INSERT INTO events (id, account_id, profile_id, metric_id, properties, value, occurred_at, unique_id, message_id, from_browser)
+                     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, false)
+                     ON CONFLICT (account_id, metric_id, unique_id) WHERE unique_id IS NOT NULL DO NOTHING
+                     RETURNING id",
+                )
+                .bind(id)
+                .bind(ev.account_id)
+                .bind(ev.profile_id)
+                .bind(metric_id)
+                .bind(&ev.properties)
+                .bind(value)
+                .bind(ev.occurred_at)
+                .bind(unique_id)
+                .bind(ev.message_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        }
+        (None, _) => None,
+    };
     let Some(event_id) = inserted else { return Ok(None) };
     sqlx::query("UPDATE profiles SET last_event_at = GREATEST(COALESCE(last_event_at, 'epoch'), COALESCE($2, now())) WHERE id = $1")
         .bind(ev.profile_id)

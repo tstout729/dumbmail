@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use crate::audience::{self, NewEvent, ProfileInput};
+use crate::audience::{self, EventSource, NewEvent, ProfileInput};
 use crate::error::{AppError, AppResult};
-use crate::models::{normalize_email, normalize_phone};
+use crate::models::{normalize_email, normalize_phone, Profile, PROFILE_COLS};
 use crate::state::AppState;
 
 /// Most actions one run may return.
@@ -318,6 +318,10 @@ pub fn parse(result: &Value, pull: bool) -> Result<Vec<Action>, String> {
                 if a.metric.trim().is_empty() || a.metric.len() > 128 {
                     return Err(format!("action {i} ({k}): metric must be 1-128 characters"));
                 }
+                // Alerts DumbMail sends from a real stock or price change: nobody else records them.
+                if audience::is_server_only_metric(&a.metric) {
+                    return Err(format!("action {i} ({k}): {:?} is recorded by DumbMail itself; an integration can't record it", a.metric.trim()));
+                }
                 check_who(i, k, &a.profile)?;
                 check_props(i, k, &a.properties)?;
                 short(i, k, "unique_id", &a.unique_id, 200)?;
@@ -408,6 +412,10 @@ pub struct Source {
     /// The delivery this run belongs to (the original one, for replays): events without a
     /// `unique_id` get one from it, so one delivery never records the same event twice.
     pub delivery: Option<Uuid>,
+    /// The metrics this integration declared: the only ones its script may record.
+    pub metrics: Vec<String>,
+    /// The delivery whose ledger (`applied`) records each action as it is written.
+    pub ledger: Option<Uuid>,
 }
 
 impl Source {
@@ -529,14 +537,19 @@ fn key_text(v: &Value) -> String {
     }
 }
 
-/// Remember the plain property values an integration wrote, so later lookups by them can trust them.
-async fn save_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, props: &Map<String, Value>) -> AppResult<()> {
-    let keys: Map<String, Value> = props
+/// The plain property values an integration writes, kept so later lookups by them can trust them.
+fn trusted_keys(props: &Map<String, Value>) -> Map<String, Value> {
+    props
         .iter()
         .filter(|(_, v)| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_)))
         .map(|(k, v)| (k.clone(), Value::String(key_text(v))))
         .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 200))
-        .collect();
+        .collect()
+}
+
+/// Remember the plain property values an integration wrote, so later lookups by them can trust them.
+async fn save_keys(state: &AppState, account_id: Uuid, profile_id: Uuid, props: &Map<String, Value>) -> AppResult<()> {
+    let keys = trusted_keys(props);
     if keys.is_empty() {
         return Ok(());
     }
@@ -592,16 +605,108 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
         };
     }
     let input = input_for(w);
+    let existing = audience::find_profile(&state.db, src.account_id, &input).await?;
     if dry {
-        let existing = audience::find_profile(&state.db, src.account_id, &input).await?;
         return Ok(Some(Found { id: existing.as_ref().map(|p| p.id).unwrap_or_else(Uuid::nil), created: existing.is_none() }));
+    }
+    if existing.is_none() {
+        if let Some(p) = create_profile(state, src, &input, &Map::new(), false, None).await? {
+            out.counts.profiles_created += 1;
+            if !src.contacts_opted_in {
+                out.counts.held += 1;
+            }
+            return Ok(Some(Found { id: p.id, created: true }));
+        }
     }
     let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
     if up.created {
         out.counts.profiles_created += 1;
     }
     after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), false, out).await?;
+    mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
     Ok(Some(Found { id: up.profile.id, created: up.created }))
+}
+
+/// Create a profile the integration found nobody for, in one transaction with everything that
+/// comes with it: where it came from, the marketing hold (no opt-in), the integration's own keys,
+/// a relay-address or `marketing: false` suppression, which source supplied its email and phone,
+/// and (`ledger`) the action's entry in its delivery's ledger. A failure part-way leaves nothing,
+/// so a retry never finds an unheld profile it made. None when someone else created a matching
+/// profile at the same moment (the caller updates that one instead).
+async fn create_profile(state: &AppState, src: &Source, input: &ProfileInput, props: &Map<String, Value>, no_marketing: bool, ledger: Option<(usize, &str)>) -> AppResult<Option<Profile>> {
+    let email = input.email.as_deref().and_then(normalize_email);
+    let phone = input.phone_number.as_deref().and_then(normalize_phone);
+    let suppressed = match &email {
+        Some(e) if is_relay_address(e) => Some(REASON_RELAY),
+        Some(_) if no_marketing => Some(REASON_NO_MARKETING),
+        _ => None,
+    };
+    let keys = Value::Object(trusted_keys(props));
+    let tag = src.tag();
+    let mut tx = state.db.begin().await?;
+    let q = format!(
+        "INSERT INTO profiles AS p (id, account_id, email, phone_number, external_id, first_name, last_name, properties, email_consent, sms_consent,
+                                    source, marketing_hold, integration_keys, email_suppressed_reason, email_source, phone_source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'never_subscribed', 'never_subscribed', $9, $10, $11, $12,
+                 CASE WHEN $3::text IS NULL THEN NULL ELSE $9 END, CASE WHEN $4::text IS NULL THEN NULL ELSE $9 END)
+         ON CONFLICT DO NOTHING RETURNING {PROFILE_COLS}"
+    );
+    let created: Option<Profile> = sqlx::query_as(&q)
+        .bind(Uuid::now_v7())
+        .bind(src.account_id)
+        .bind(&email)
+        .bind(&phone)
+        .bind(&input.external_id)
+        .bind(&input.first_name)
+        .bind(&input.last_name)
+        .bind(Value::Object(props.clone()))
+        .bind(&tag)
+        .bind(!src.contacts_opted_in)
+        .bind(&keys)
+        .bind(suppressed)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(p) = created else { return Ok(None) };
+    if let (Some(d), Some((i, print))) = (src.ledger, ledger) {
+        mark_applied(&mut *tx, d, i, print).await?;
+    }
+    tx.commit().await?;
+    crate::features::webhooks::profile_saved(&state.db, src.account_id, None, None, &p, EventSource::Integration).await;
+    Ok(Some(p))
+}
+
+/// Record in the delivery's ledger that action `i` was written.
+async fn mark_applied<'e>(db: impl sqlx::PgExecutor<'e>, delivery: Uuid, i: usize, print: &str) -> AppResult<()> {
+    sqlx::query("UPDATE integration_deliveries SET applied = applied || jsonb_build_object($2::text, $3::text) WHERE id = $1")
+        .bind(delivery)
+        .bind(i.to_string())
+        .bind(print)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Note that this integration supplied the profile's current email and phone (only where the
+/// profile still has exactly those): flows marked as service messages may use them.
+async fn mark_sources(state: &AppState, src: &Source, id: Uuid, email: Option<&str>, phone: Option<&str>) -> AppResult<()> {
+    let email = email.and_then(normalize_email);
+    let phone = phone.and_then(normalize_phone);
+    if email.is_none() && phone.is_none() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE profiles SET email_source = CASE WHEN $3::text IS NOT NULL AND email = $3 THEN $2 ELSE email_source END,
+                             phone_source = CASE WHEN $4::text IS NOT NULL AND phone_number = $4 THEN $2 ELSE phone_source END
+         WHERE id = $1 AND account_id = $5",
+    )
+    .bind(id)
+    .bind(src.tag())
+    .bind(&email)
+    .bind(&phone)
+    .bind(src.account_id)
+    .execute(&state.db)
+    .await?;
+    Ok(())
 }
 
 async fn resolve_list(state: &AppState, account_id: Uuid, a: &ListAction) -> AppResult<(Uuid, String)> {
@@ -637,6 +742,17 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             lists.push((i, found));
         }
     }
+    // The script may record only the metrics the integration declared (they're server-only).
+    for (i, a) in actions.iter().enumerate() {
+        if let Action::TrackEvent(t) = a {
+            if !src.metrics.iter().any(|m| m == t.metric.trim()) {
+                return Err(AppError::bad(format!(
+                    "action {i} (track_event): {:?} isn't one of this integration's metrics; add it to the integration's `metrics` list first",
+                    t.metric.trim()
+                )));
+            }
+        }
+    }
     let list_for = |i: usize| lists.iter().find(|(j, _)| *j == i).map(|(_, l)| l.clone());
     let mut new_state = current_state.clone();
     for (i, a) in actions.iter().enumerate() {
@@ -648,8 +764,9 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             out.applied.insert(i.to_string(), json!(print));
             continue;
         }
+        let ledger_before = out.applied.len();
         match a {
-            Action::UpsertProfile(p) => upsert(state, src, i, p, dry, out).await?,
+            Action::UpsertProfile(p) => upsert(state, src, i, p, &print, dry, out).await?,
             Action::TrackEvent(t) => {
                 let Some(found) = resolve(state, src, &t.profile, dry, out).await? else {
                     out.counts.skipped += 1;
@@ -677,11 +794,9 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                     }
                     continue;
                 }
-                // Events an integration records are trusted by flows, so browsers may not forge them.
-                audience::metric_id(&state.db, src.account_id, t.metric.trim()).await?;
-                sqlx::query("UPDATE metrics SET server_only = true WHERE account_id = $1 AND name = $2 AND NOT server_only").bind(src.account_id).bind(t.metric.trim()).execute(&state.db).await?;
+                // A stable id, so a retry can never record it twice (the stored action list always has one).
                 let unique_id = t.unique_id.clone().or_else(|| src.delivery.map(|d| format!("delivery:{d}:{i}:{print}")));
-                let recorded = audience::record_event(
+                let recorded = audience::record_event_from(
                     &state.db,
                     NewEvent {
                         account_id: src.account_id,
@@ -693,6 +808,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
                         unique_id,
                         message_id: None,
                     },
+                    EventSource::Integration,
                 )
                 .await?;
                 if recorded.is_some() {
@@ -786,6 +902,14 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
             }
         }
         if writes && !dry {
+            // Written right after the action's effects (in the same transaction where the action
+            // wrote one itself, like a new profile); each effect is also keyed so a retry that
+            // reruns it changes nothing.
+            if out.applied.len() == ledger_before {
+                if let Some(d) = src.ledger {
+                    mark_applied(&state.db, d, i, &print).await?;
+                }
+            }
             out.applied.insert(i.to_string(), json!(print));
         }
     }
@@ -795,7 +919,7 @@ async fn apply_into(state: &AppState, src: &Source, actions: &[Action], raw: &[V
     Ok(())
 }
 
-async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry: bool, out: &mut Outcome) -> AppResult<()> {
+async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, print: &str, dry: bool, out: &mut Outcome) -> AppResult<()> {
     let input = ProfileInput {
         email: p.email.clone().filter(|s| !s.trim().is_empty()),
         phone_number: p.phone_number.clone().filter(|s| !s.trim().is_empty()),
@@ -839,18 +963,49 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, dry
         out.effect(i, line);
         return Ok(());
     }
+    let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
+    // Nobody has these identifiers: create the profile with its hold, source, keys and suppression
+    // in one transaction (with the ledger entry, when nothing else follows).
+    if audience::find_profile(&state.db, src.account_id, &input).await?.is_none() {
+        let last = p.consent.is_empty();
+        let props = p.properties.clone().unwrap_or_default();
+        if let Some(created) = create_profile(state, src, &input, &props, no_marketing, last.then_some((i, print))).await? {
+            if last {
+                out.applied.insert(i.to_string(), json!(print));
+            }
+            out.counts.profiles_created += 1;
+            let mut line = format!("created profile {label}");
+            if relay {
+                out.counts.suppressed += 1;
+                line.push_str(" and suppressed it from email (booking-site relay address)");
+            } else if no_marketing && created.email.is_some() {
+                out.counts.suppressed += 1;
+                line.push_str(" and suppressed it from marketing email");
+            }
+            if !src.contacts_opted_in && !opts_in {
+                out.counts.held += 1;
+                line.push_str(", held back from marketing (no opt-in)");
+            }
+            for c in &p.consent {
+                line.push_str(&consent(state, src, created.id, c).await?);
+                out.counts.consents += 1;
+            }
+            out.effect(i, line);
+            return Ok(());
+        }
+    }
     let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;
     }
+    mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
     let mut line = format!("{} profile {label}", if up.created { "created" } else { "updated" });
     let held_before = out.counts.held;
     if let Some(r) = after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), no_marketing, out).await? {
         out.counts.suppressed += 1;
         line.push_str(if r == REASON_RELAY { " and suppressed it from email (booking-site relay address)" } else { " and suppressed it from marketing email" });
     }
-    let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
     if out.counts.held > held_before && !opts_in {
         line.push_str(", held back from marketing (no opt-in)");
     } else if out.counts.held > held_before {

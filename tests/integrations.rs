@@ -64,7 +64,7 @@ async fn ship_integration(h: &mut Harness) -> Value {
     h.ok(
         "POST",
         "/api/integrations",
-        Some(json!({"name": "Shipping", "script": SHIP_SCRIPT, "signature": {"type": "hmac", "header": "X-Sig", "prefix": "sha256="}, "signature_secret": "ship-secret-123456"})),
+        Some(json!({"name": "Shipping", "script": SHIP_SCRIPT, "metrics": ["Order Shipped"], "signature": {"type": "hmac", "header": "X-Sig", "prefix": "sha256="}, "signature_secret": "ship-secret-123456"})),
     )
     .await
 }
@@ -160,7 +160,7 @@ async fn webhooks_scripts_and_delivery_log() {
 async fn failures_retry_then_replay() {
     let mut h = integ_harness!();
     h.signup().await;
-    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Orders", "script": SHIP_SCRIPT}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Orders", "script": SHIP_SCRIPT, "metrics": ["Order Shipped"]}))).await;
     h.ok("POST", "/api/lists", Some(json!({"name": "Customers"}))).await;
     let id = integ["id"].as_str().unwrap().to_string();
     let path = path_of(&integ);
@@ -214,7 +214,7 @@ async fn failures_retry_then_replay() {
     let d = h.ok("GET", &format!("/api/integrations/{id}/deliveries?status=error"), None).await["data"][0].clone();
     assert!(d["error"].as_str().unwrap().contains("longer than"), "{d}");
 
-    // Turned off: webhooks are kept as ignored, and can be replayed once it's back on.
+    // Turned off: a webhook gets a log line (marked ignored), and nothing of its payload is kept.
     h.ok("PATCH", &format!("/api/integrations/{id}"), Some(json!({"script": fixed}))).await;
     h.ok("POST", &format!("/api/integrations/{id}/status"), Some(json!({"status": "disabled"}))).await;
     let body = json!({"id": "o-10", "email": "eve@example.com", "total": 1}).to_string();
@@ -223,12 +223,13 @@ async fn failures_retry_then_replay() {
     h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'eve@example.com'").await, 0);
     let ign = h.ok("GET", &format!("/api/integrations/{id}/deliveries?status=ignored"), None).await["data"][0].clone();
+    assert_eq!(ign["has_payload"], false, "{ign}");
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE body LIKE '%eve@example.com%' OR headers::text LIKE '%eve%'").await, 0);
     let (s, _) = h.req("POST", &format!("/api/integrations/{id}/replay"), Some(json!({"delivery_ids": [ign["id"]]}))).await;
     assert_eq!(s, StatusCode::CONFLICT, "turn it on first");
     h.ok("POST", &format!("/api/integrations/{id}/status"), Some(json!({"status": "enabled"}))).await;
-    h.ok("POST", &format!("/api/integrations/{id}/replay"), Some(json!({"delivery_ids": [ign["id"]]}))).await;
-    h.drain().await;
-    assert_eq!(count(&h, "SELECT count(*) FROM profiles WHERE email = 'eve@example.com'").await, 1);
+    let r = h.ok("POST", &format!("/api/integrations/{id}/replay"), Some(json!({"delivery_ids": [ign["id"]]}))).await;
+    assert_eq!(r["replayed"], 0, "there's no payload to replay");
     h.cleanup().await;
 }
 
@@ -236,7 +237,7 @@ async fn failures_retry_then_replay() {
 async fn consent_relays_and_suppression() {
     let mut h = integ_harness!();
     h.signup().await;
-    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return i.payload.actions }"}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return i.payload.actions }", "metrics": ["Stay", "Reservation Confirmed", "Reservation Cancelled", "Order Placed"]}))).await;
     let id = integ["id"].as_str().unwrap().to_string();
     let path = path_of(&integ);
     let send = |actions: Value| json!({"actions": actions}).to_string();
@@ -1035,9 +1036,9 @@ async fn marketing_hold_keeps_people_out_of_marketing_until_they_opt_in() {
     let pk = me["account"]["public_key"].as_str().unwrap().to_string();
     h.credit(5.0).await;
     let script = "function handle(i) { return i.payload.actions }";
-    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": script}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": script, "metrics": ["Stay Booked"]}))).await;
     let path = path_of(&integ);
-    let trusted = h.ok("POST", "/api/integrations", Some(json!({"name": "Newsletter app", "script": script, "contacts_opted_in": true}))).await;
+    let trusted = h.ok("POST", "/api/integrations", Some(json!({"name": "Newsletter app", "script": script, "contacts_opted_in": true, "metrics": ["Stay Booked"]}))).await;
     assert_eq!(trusted["contacts_opted_in"], true);
     // Someone who was already here before the integration saw them.
     h.ok("POST", "/api/profiles", Some(json!({"email": "pre@example.com"}))).await;
@@ -1181,7 +1182,7 @@ async fn browsers_cant_forge_an_integrations_events() {
     let mut h = integ_harness!();
     let me = h.signup().await;
     let pk = me["account"]["public_key"].as_str().unwrap().to_string();
-    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return [{type: 'track_event', metric: 'Reservation Confirmed', profile: {email: 'g@example.com'}}] }"}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Bookings", "script": "function handle(i) { return [{type: 'track_event', metric: 'Reservation Confirmed', profile: {email: 'g@example.com'}}] }", "metrics": ["Reservation Confirmed"]}))).await;
     h.raw("POST", &path_of(&integ), &[], "{}").await;
     h.drain().await;
     let ev = |metric: &str| json!({"metric": metric, "profile": {"email": "victim@example.com"}, "properties": {"check_in": "2026-12-01"}}).to_string();
@@ -1214,7 +1215,7 @@ async fn retries_and_replays_never_repeat_what_was_written() {
         {type: 'upsert_profile', email: 'p@example.com', external_id: 'EXT-1'}
     ] }";
     h.ok("POST", "/api/profiles", Some(json!({"email": "other@example.com", "external_id": "EXT-1"}))).await;
-    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Pings", "script": script, "message_id": {"header": "x-msg-id"}}))).await;
+    let integ = h.ok("POST", "/api/integrations", Some(json!({"name": "Pings", "script": script, "message_id": {"header": "x-msg-id"}, "metrics": ["Ping"]}))).await;
     let id = integ["id"].as_str().unwrap().to_string();
     let path = path_of(&integ);
     let (s, _, _) = h.raw("POST", &path, &[("x-msg-id", "m-1")], "{}").await;
@@ -1407,7 +1408,10 @@ async fn capped_backfills_resume_and_old_pages_cant_overwrite_progress() {
     let b = h.ok("GET", &format!("/api/integrations/{id}"), None).await["backfill"].clone();
     assert_eq!(b["status"], "capped", "stopping at the page limit isn't 'done': {b}");
     assert_eq!(b["pages"], 3);
-    assert!(b["next"]["url"].is_string(), "where to pick up is saved: {b}");
+    // Where to pick up is saved, encrypted (it can carry what the app put in a Link header), and never shown.
+    let saved: Value = sqlx::query_scalar("SELECT backfill FROM integrations WHERE id = $1::uuid").bind(&id).fetch_one(&h.state.db).await.unwrap();
+    assert!(saved["next_enc"].as_str().is_some_and(|s| !s.contains("http")), "{saved}");
+    assert!(b.get("next_enc").is_none() && b.get("next").is_none(), "{b}");
     let first = count(&h, "SELECT count(*) FROM events e JOIN metrics m ON m.id = e.metric_id WHERE m.name = 'Reservation Booked'").await;
     assert!(first < 150, "{first}");
     // Resume continues from there, page limit and all, until it's done.

@@ -5,8 +5,9 @@
 //!   on the profile it just created (an integration whose owner hasn't confirmed its contacts opted
 //!   in, an import of people who never agreed). Nothing sets it on a profile that already existed.
 //! - **What it does:** campaigns never email a held person ([`push_campaign_filter`]); flows email
-//!   them only when the flow is marked as service messages (`settings.service_messages`), checked
-//!   at the final send gate ([`blocks_email`]). Segments' `can_receive` email rule is false for
+//!   them only when the flow is marked as service messages (`settings.service_messages`) and the
+//!   address came from an integration, or for a back-in-stock alert they confirmed; checked in the
+//!   send path's own consent queries ([`blocks_email_sql`]). Segments' `can_receive` email rule is false for
 //!   them, and `{"type": "property", "field": "marketing_hold"}` selects them.
 //! - **What it never does:** let anyone who is unsubscribed or suppressed get anything. Those
 //!   checks run first and win, with or without service messages.
@@ -42,16 +43,32 @@ pub async fn hold_new_profile<'e>(db: impl PgExecutor<'e>, account_id: Uuid, pro
     Ok(())
 }
 
-/// The final email gate: true when this profile is held and the send isn't from a flow marked as
-/// service messages. Callers check unsubscribes and suppressions first; those always win.
-pub async fn blocks_email<'e>(db: impl PgExecutor<'e>, profile_id: Uuid, flow_id: Option<Uuid>) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT p.marketing_hold AND NOT COALESCE((SELECT f.definition->'settings'->>'service_messages' = 'true' FROM flows f WHERE f.id = $2 AND f.account_id = p.account_id), false)
-         FROM profiles p WHERE p.id = $1",
+/// The SQL condition (on `profiles p`, with the sending flow's id at `flow_param`, NULL for a
+/// campaign or test) for "this email to a held person must not go": the person is held, and the
+/// send isn't one of the exceptions. Exceptions:
+///
+/// - a flow marked as service messages (`settings.service_messages`), and only to an address an
+///   integration supplied (`p.email_source`); never to one a form or the website script added;
+/// - the back-in-stock alert the person asked for and confirmed (a flow started by `Back in
+///   Stock`, which only DumbMail records, for a confirmed request). It doesn't clear the hold.
+///
+/// Used inside the send path's existing checks (`sending::send`), so it adds no query per email.
+/// Unsubscribes and suppressions are checked there first and always win.
+pub fn blocks_email_sql(flow_param: &str) -> String {
+    format!(
+        "(p.marketing_hold AND NOT COALESCE((SELECT
+            (f.definition->'settings'->>'service_messages' = 'true' AND COALESCE(p.email_source LIKE 'integration:%', false))
+            OR (f.trigger->>'type' = 'metric' AND f.trigger->>'metric' = 'Back in Stock')
+          FROM flows f WHERE f.id = {flow_param} AND f.account_id = p.account_id), false))"
     )
-    .bind(profile_id)
-    .bind(flow_id)
-    .fetch_optional(db)
-    .await
-    .map(|v| v.unwrap_or(false))
+}
+
+/// [`blocks_email_sql`] on its own, for callers outside the send path.
+pub async fn blocks_email<'e>(db: impl PgExecutor<'e>, profile_id: Uuid, flow_id: Option<Uuid>) -> sqlx::Result<bool> {
+    sqlx::query_scalar(&format!("SELECT {} FROM profiles p WHERE p.id = $1", blocks_email_sql("$2")))
+        .bind(profile_id)
+        .bind(flow_id)
+        .fetch_optional(db)
+        .await
+        .map(|v| v.unwrap_or(false))
 }

@@ -181,14 +181,16 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
                 return Ok(Outcome::Skipped("not emailable"));
             }
             if !spec.is_test {
-                let suppressed: Option<String> = sqlx::query_scalar("SELECT email_suppressed_reason FROM profiles WHERE id = $1")
-                    .bind(p.id)
-                    .fetch_one(&state.db)
-                    .await?;
+                let (suppressed, held): (Option<String>, bool) =
+                    sqlx::query_as(&format!("SELECT p.email_suppressed_reason, {} FROM profiles p WHERE p.id = $1", crate::marketing_hold::blocks_email_sql("$2")))
+                        .bind(p.id)
+                        .bind(spec.flow_id)
+                        .fetch_one(&state.db)
+                        .await?;
                 if suppressed.is_some() {
                     return Ok(Outcome::Skipped("suppressed"));
                 }
-                if crate::marketing_hold::blocks_email(&state.db, p.id, spec.flow_id).await? {
+                if held {
                     return Ok(Outcome::Skipped(crate::marketing_hold::SKIP_REASON));
                 }
             }
@@ -429,7 +431,7 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     // skipped after it's handed over.
     let stop = match &rendered {
         Rendered::Sms(s, _, _) => claim_text(state, &spec, message_id, &s.to, &s.from, conversational).await?,
-        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id).await?,
+        Rendered::Email(_) if !spec.is_test => last_check(state, spec.account, p.id, spec.channel, spec.campaign_id, spec.flow_id).await?,
         Rendered::Email(_) => None,
     };
     if let Some(stop) = stop {
@@ -559,22 +561,24 @@ enum Stop {
 /// The last check before the provider call, in one query against the current state: the person's
 /// consent and suppression for the channel, the account's email pause, the campaign's status, and for
 /// texts the whole quiet-hours decision. None: send it.
-async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>) -> AppResult<Option<Stop>> {
-    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>);
-    let row: Option<Row> = sqlx::query_as(
+async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, channel: &str, campaign_id: Option<Uuid>, flow_id: Option<Uuid>) -> AppResult<Option<Stop>> {
+    type Row = (Option<String>, String, String, bool, Option<String>, Option<Value>, bool, Option<String>, Option<i32>, Option<i32>, Option<String>, bool);
+    let row: Option<Row> = sqlx::query_as(&format!(
         "SELECT p.email, p.email_consent, p.sms_consent, p.email_suppressed_reason IS NOT NULL, p.phone_number,
                 CASE WHEN $3 = 'sms' THEN p.properties END, a.sending_paused_at IS NOT NULL,
                 (SELECT c.status FROM campaigns c WHERE c.id = $2),
-                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict
+                ss.sms_start_minute, ss.sms_end_minute, ss.sms_zone_conflict, {}
          FROM profiles p JOIN accounts a ON a.id = p.account_id LEFT JOIN send_settings ss ON ss.account_id = a.id
          WHERE p.id = $1",
-    )
+        crate::marketing_hold::blocks_email_sql("$4")
+    ))
     .bind(profile_id)
     .bind(campaign_id)
     .bind(channel)
+    .bind(flow_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict)) = row else {
+    let Some((email, email_consent, sms_consent, suppressed, phone, props, paused, campaign, start, end, conflict, held)) = row else {
         return Ok(Some(Stop::Skip("profile deleted", None)));
     };
     match campaign.as_deref() {
@@ -589,6 +593,9 @@ async fn last_check(state: &AppState, account: &Account, profile_id: Uuid, chann
         }
         if suppressed {
             return Ok(Some(Stop::Skip("suppressed", None)));
+        }
+        if held {
+            return Ok(Some(Stop::Skip(crate::marketing_hold::SKIP_REASON, None)));
         }
         if paused {
             return Ok(Some(Stop::Skip("sending paused", None)));

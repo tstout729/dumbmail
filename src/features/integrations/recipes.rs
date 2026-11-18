@@ -73,6 +73,10 @@ impl Recipe {
     }
 }
 
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+}
+
 /// Create an integration from a recipe, plus its suggested flows as drafts (nothing sends until
 /// someone turns a flow on).
 pub async fn create(state: &AppState, account_id: Uuid, key: &str, name: Option<String>, create_flows: bool) -> AppResult<(Integration, Vec<Value>)> {
@@ -85,16 +89,13 @@ pub async fn create(state: &AppState, account_id: Uuid, key: &str, name: Option<
         settings: Some(m["settings"].clone()).filter(|v| v.is_object()),
         pull: Some(m["pull"].clone()).filter(|v| !v.is_null()),
         message_id: Some(m["message_id"].clone()).filter(|v| !v.is_null()),
+        // The recipe's events are trusted by flows: saving marks them server-only, so a browser
+        // can't send them for this account, even before the first real one arrives.
+        metrics: Some(strings(&m["metrics"])),
+        redact: Some(strings(&m["redact"])),
         ..Default::default()
     };
     let integ = model::create(state, account_id, Some(key), changes).await?;
-    // The recipe's events are trusted by flows: from now on a browser can't send them for this
-    // account, even before the first real one arrives.
-    let names: Vec<String> = m["metrics"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
-    for n in &names {
-        crate::audience::metric_id(&state.db, account_id, n).await?;
-    }
-    sqlx::query("UPDATE metrics SET server_only = true WHERE account_id = $1 AND name = ANY($2)").bind(account_id).bind(&names).execute(&state.db).await?;
     let mut flows = Vec::new();
     if create_flows {
         for f in m["flows"].as_array().into_iter().flatten() {

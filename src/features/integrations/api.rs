@@ -18,11 +18,83 @@ use uuid::Uuid;
 
 use super::engine::{self, NewDelivery, Refused, TestSample, BODY_MAX_BYTES};
 use super::model::{self, Changes};
+use super::pull::Scrub;
 use super::{recipes, signature};
 use crate::api::ApiJson;
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{self, public, rule, Perm, RouteRule};
+use crate::features::team::audit;
 use crate::state::AppState;
+
+/// Who may do what (see `team::access`). Managers and up see integrations and their delivery log;
+/// admins and the owner change them, run them and read stored payloads and script output. Only the
+/// inbound webhook URL is public (it is checked by its token and the integration's signature).
+pub static ROUTES: &[RouteRule] = &[
+    public("POST", "/webhooks/in/{token}"),
+    rule("GET", "/api/integrations", Perm::IntegrationsRead),
+    rule("POST", "/api/integrations", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/from-recipe", Perm::IntegrationsManage),
+    rule("GET", "/api/integration-recipes", Perm::IntegrationsRead),
+    rule("GET", "/api/integration-recipes/{key}", Perm::IntegrationsRead),
+    rule("GET", "/api/integrations/{id}", Perm::IntegrationsRead),
+    rule("PATCH", "/api/integrations/{id}", Perm::IntegrationsManage),
+    rule("DELETE", "/api/integrations/{id}", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/{id}/test", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/{id}/status", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/{id}/rotate-url", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/{id}/pull", Perm::IntegrationsManage),
+    rule("POST", "/api/integrations/{id}/backfill/cancel", Perm::IntegrationsManage),
+    rule("GET", "/api/integrations/{id}/deliveries", Perm::IntegrationsRead),
+    // Read: the log line. Payloads, headers and script output only with integrations.manage.
+    rule("GET", "/api/integrations/{id}/deliveries/{delivery_id}", Perm::IntegrationsRead),
+    rule("POST", "/api/integrations/{id}/replay", Perm::IntegrationsManage),
+];
+
+/// Whether this caller may see stored payloads, script output, saved state and the inbound URL.
+pub fn can_manage(ctx: &Ctx) -> bool {
+    access::allows(ctx, Perm::IntegrationsManage)
+}
+
+/// The integration as this caller may see it.
+pub fn view_for(i: &model::Integration, state: &AppState, ctx: &Ctx) -> Value {
+    if can_manage(ctx) { i.view(state) } else { i.view_limited() }
+}
+
+/// Audit-log a change to an integration (fixed fields only: never payloads or secret values).
+pub async fn audit_change(state: &AppState, ctx: &Ctx, action: &str, id: Uuid, details: Value) {
+    audit(state, ctx, action, Some(&id.to_string()), details).await;
+}
+
+/// What an update changed, for the audit log: field names, and which secrets were set or removed
+/// (by name, never by value).
+pub fn changed_fields(c: &Changes) -> Value {
+    let mut fields = Vec::new();
+    for (name, set) in [
+        ("name", c.name.is_some()),
+        ("script", c.script.is_some()),
+        ("signature", c.signature.is_some()),
+        ("settings", c.settings.is_some()),
+        ("pull", c.pull.is_some()),
+        ("state", c.state.is_some()),
+        ("contacts_opted_in", c.contacts_opted_in.is_some()),
+        ("message_id", c.message_id.is_some()),
+        ("metrics", c.metrics.is_some()),
+        ("redact", c.redact.is_some()),
+    ] {
+        if set {
+            fields.push(json!(name));
+        }
+    }
+    let mut set_secrets: Vec<String> = Vec::new();
+    if c.signature_secret.is_some() {
+        set_secrets.push("signing".into());
+    }
+    if let Some(cr) = &c.credentials {
+        set_secrets.extend(cr.keys().map(|k| format!("credential {k}")));
+    }
+    json!({"fields": fields, "changed_values": set_secrets})
+}
 
 /// Webhooks one integration may receive per minute; past it the sender gets 429 and retries later.
 pub const RATE_PER_MINUTE: u32 = 300;
@@ -142,7 +214,8 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     if let Err(why) = signature::verify(&sig, secret.as_deref(), &parts.headers, &query, &bytes, Utc::now().timestamp()) {
         if note_rejected(id) {
             let msg = format!("signature check failed: {why}");
-            let _ = engine::store_delivery(&state, &integ, NewDelivery::log("webhook", "error", Some(&msg))).await;
+            let scrub = Scrub::new(integ.secret_values(&state).await);
+            let _ = engine::store_delivery(&state, &integ, &scrub, NewDelivery::log("webhook", "error", Some(&msg))).await;
             let _ = sqlx::query("UPDATE integrations SET deliveries_failed = deliveries_failed + 1, last_delivery_at = now(), last_error = $2, last_error_at = now() WHERE id = $1").bind(id).bind(&msg).execute(&state.db).await;
         }
         return reply(StatusCode::UNAUTHORIZED, json!({"error": "signature check failed"}));
@@ -158,13 +231,18 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     let ct = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
     let body = String::from_utf8_lossy(&bytes).into_owned();
     let query = json!(query);
-    let (status, note) = if integ.status == "enabled" { ("pending", None) } else { ("ignored", Some("the integration is turned off")) };
-    let d = NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status, error: note, replay_of: None, message_id, applied: None };
-    match engine::store_delivery(&state, &integ, d).await {
+    let scrub = Scrub::new(integ.secret_values(&state).await);
+    // A turned-off integration keeps only a log line: nothing of the payload is stored.
+    let d = if integ.status == "enabled" {
+        NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status: "pending", error: None, replay_of: None, message_id, applied: None }
+    } else {
+        NewDelivery { message_id, ..NewDelivery::log("webhook", "ignored", Some("the integration is turned off; the payload wasn't kept")) }
+    };
+    match engine::store_delivery(&state, &integ, &scrub, d).await {
         Ok(d) => reply(StatusCode::OK, json!({"ok": true, "delivery_id": d})),
         // The app sent this message before (a retry): acknowledge it so it stops, and do nothing.
         Err(Refused::Duplicate(first)) => reply(StatusCode::OK, json!({"ok": true, "duplicate": true, "delivery_id": first})),
-        Err(Refused::Busy(msg)) => busy(&msg),
+        Err(Refused::Busy(msg) | Refused::OverBudget(msg)) => busy(&msg),
         Err(Refused::Error(e)) => e.into_response(),
     }
 }
@@ -176,13 +254,62 @@ pub async fn list(state: &AppState, account_id: Uuid) -> AppResult<Value> {
     Ok(json!({"data": rows.iter().map(|i| i.summary()).collect::<Vec<_>>()}))
 }
 
-pub async fn create(state: &AppState, account_id: Uuid, c: Changes) -> AppResult<Value> {
-    let i = model::create(state, account_id, None, c).await?;
+pub async fn create(state: &AppState, ctx: &Ctx, c: Changes) -> AppResult<Value> {
+    let details = changed_fields(&c);
+    let i = model::create(state, ctx.account_id, None, c).await?;
+    audit_change(state, ctx, "integration.create", i.id, json!({"name": i.name, "changed": details})).await;
     Ok(i.view(state))
 }
 
-pub async fn from_recipe(state: &AppState, account_id: Uuid, key: &str, name: Option<String>, create_flows: bool) -> AppResult<Value> {
-    let (i, flows) = recipes::create(state, account_id, key, name, create_flows).await?;
+pub async fn update(state: &AppState, ctx: &Ctx, id: Uuid, c: Changes) -> AppResult<Value> {
+    let details = changed_fields(&c);
+    let secrets = details["changed_values"].as_array().is_some_and(|a| !a.is_empty());
+    let i = model::update(state, ctx.account_id, id, c).await?;
+    audit_change(state, ctx, "integration.update", i.id, details.clone()).await;
+    if secrets {
+        audit_change(state, ctx, "integration.secrets_change", i.id, json!({"changed_values": details["changed_values"]})).await;
+    }
+    Ok(i.view(state))
+}
+
+pub async fn remove(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<()> {
+    let i = model::load(state, ctx.account_id, id).await?;
+    model::delete(state, ctx.account_id, id).await?;
+    audit_change(state, ctx, "integration.delete", id, json!({"name": i.name})).await;
+    Ok(())
+}
+
+pub async fn set_status(state: &AppState, ctx: &Ctx, id: Uuid, status: &str) -> AppResult<Value> {
+    let i = model::set_status(state, ctx.account_id, id, status).await?;
+    audit_change(state, ctx, "integration.update", id, json!({"fields": ["status"], "status": i.status})).await;
+    Ok(i.view(state))
+}
+
+pub async fn rotate(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let i = model::rotate_url(state, ctx.account_id, id).await?;
+    audit_change(state, ctx, "integration.secrets_change", id, json!({"changed_values": ["inbound URL"]})).await;
+    Ok(i.view(state))
+}
+
+pub async fn pull(state: &AppState, ctx: &Ctx, id: Uuid, since: Option<chrono::DateTime<Utc>>, resume: bool) -> AppResult<Value> {
+    let i = model::load(state, ctx.account_id, id).await?;
+    let out = engine::start_pull(state, &i, since, resume).await?;
+    if since.is_some() || resume {
+        audit_change(state, ctx, "integration.backfill", id, json!({"since": since, "resumed": resume})).await;
+    }
+    Ok(out)
+}
+
+pub async fn cancel_backfill(state: &AppState, ctx: &Ctx, id: Uuid) -> AppResult<Value> {
+    let i = model::load(state, ctx.account_id, id).await?;
+    let out = engine::cancel_backfill(state, &i).await?;
+    audit_change(state, ctx, "integration.backfill_cancel", id, json!({})).await;
+    Ok(out)
+}
+
+pub async fn from_recipe(state: &AppState, ctx: &Ctx, key: &str, name: Option<String>, create_flows: bool) -> AppResult<Value> {
+    let (i, flows) = recipes::create(state, ctx.account_id, key, name, create_flows).await?;
+    audit_change(state, ctx, "integration.create", i.id, json!({"name": i.name, "recipe": key, "flows": flows.len()})).await;
     let r = recipes::get(key).map(|r| r.view(false)).unwrap_or(Value::Null);
     Ok(json!({"integration": i.view(state), "flows": flows, "setup": r["setup"], "credentials_needed": r["credentials"], "signature_secret": r["signature_secret"]}))
 }
@@ -267,7 +394,7 @@ pub async fn deliveries(state: &AppState, account_id: Uuid, id: Uuid, q: &Delive
     Ok(json!({"data": data, "total": total}))
 }
 
-pub async fn delivery(state: &AppState, account_id: Uuid, id: Uuid, delivery_id: Uuid) -> AppResult<Value> {
+pub async fn delivery(state: &AppState, account_id: Uuid, id: Uuid, delivery_id: Uuid, full: bool) -> AppResult<Value> {
     model::load(state, account_id, id).await?;
     let r: Option<(Uuid, String, String, Option<String>, Value, Value, Option<String>, Option<Value>, i32, Option<chrono::DateTime<Utc>>, Option<String>, Option<Value>, Option<i32>, Option<Uuid>, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
         "SELECT id, source, status, content_type, headers, query, body, request, attempts, next_attempt_at, error, result, duration_ms, replay_of, created_at, processed_at
@@ -279,6 +406,15 @@ pub async fn delivery(state: &AppState, account_id: Uuid, id: Uuid, delivery_id:
     .fetch_optional(&state.db)
     .await?;
     let r = r.ok_or_else(|| AppError::not_found("delivery"))?;
+    if !full {
+        // The log line only: payloads, headers, the request and script output can hold personal
+        // data and need integrations.manage.
+        return Ok(json!({
+            "id": r.0, "source": r.1, "status": r.2, "attempts": r.8, "next_attempt_at": r.9, "error": r.10,
+            "counts": r.11.as_ref().map(|x| x["counts"].clone()), "duration_ms": r.12, "replay_of": r.13,
+            "created_at": r.14, "processed_at": r.15, "has_payload": r.6.is_some(), "payload_hidden": true,
+        }));
+    }
     let payload = r.6.as_deref().map(|b| engine::parse_body(r.3.as_deref(), b));
     Ok(json!({
         "id": r.0, "source": r.1, "status": r.2, "content_type": r.3, "headers": r.4, "query": r.5, "payload": payload, "body": r.6,
@@ -297,15 +433,19 @@ pub struct ReplayBody {
     pub all_failed: bool,
 }
 
-pub async fn replay(state: &AppState, account_id: Uuid, id: Uuid, b: &ReplayBody, dry: bool) -> AppResult<Value> {
-    let i = model::load(state, account_id, id).await?;
+pub async fn replay(state: &AppState, ctx: &Ctx, id: Uuid, b: &ReplayBody, dry: bool) -> AppResult<Value> {
+    let i = model::load(state, ctx.account_id, id).await?;
     if b.delivery_ids.is_empty() && !b.all_failed {
         return Err(AppError::bad("give delivery_ids, or all_failed: true"));
     }
     if i.status != "enabled" && !dry {
         return Err(AppError::Conflict("turn the integration on before replaying".into()));
     }
-    engine::replay(state, &i, &b.delivery_ids, b.all_failed, dry).await
+    let out = engine::replay(state, &i, &b.delivery_ids, b.all_failed, dry).await?;
+    if !dry {
+        audit_change(state, ctx, "integration.replay", id, json!({"replayed": out["replayed"], "all_failed": b.all_failed})).await;
+    }
+    Ok(out)
 }
 
 pub fn parse_since(s: &str) -> AppResult<chrono::DateTime<Utc>> {
@@ -319,7 +459,7 @@ async fn list_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value
 }
 
 async fn create_h(State(state): State<AppState>, ctx: Ctx, ApiJson(c): ApiJson<Changes>) -> AppResult<Json<Value>> {
-    Ok(Json(create(&state, ctx.account_id, c).await?))
+    Ok(Json(create(&state, &ctx, c).await?))
 }
 
 #[derive(Deserialize)]
@@ -333,7 +473,7 @@ struct FromRecipe {
 }
 
 async fn from_recipe_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<FromRecipe>) -> AppResult<Json<Value>> {
-    Ok(Json(from_recipe(&state, ctx.account_id, &b.recipe, b.name, b.create_flows.unwrap_or(true)).await?))
+    Ok(Json(from_recipe(&state, &ctx, &b.recipe, b.name, b.create_flows.unwrap_or(true)).await?))
 }
 
 async fn recipes_h(_ctx: Ctx) -> Json<Value> {
@@ -345,15 +485,15 @@ async fn recipe_h(_ctx: Ctx, Path(key): Path<String>) -> AppResult<Json<Value>> 
 }
 
 async fn get_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(model::load(&state, ctx.account_id, id).await?.view(&state)))
+    Ok(Json(view_for(&model::load(&state, ctx.account_id, id).await?, &state, &ctx)))
 }
 
 async fn update_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(c): ApiJson<Changes>) -> AppResult<Json<Value>> {
-    Ok(Json(model::update(&state, ctx.account_id, id, c).await?.view(&state)))
+    Ok(Json(update(&state, &ctx, id, c).await?))
 }
 
 async fn delete_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    model::delete(&state, ctx.account_id, id).await?;
+    remove(&state, &ctx, id).await?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -367,11 +507,11 @@ struct StatusBody {
 }
 
 async fn status_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<StatusBody>) -> AppResult<Json<Value>> {
-    Ok(Json(model::set_status(&state, ctx.account_id, id, &b.status).await?.view(&state)))
+    Ok(Json(set_status(&state, &ctx, id, &b.status).await?))
 }
 
 async fn rotate_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    Ok(Json(model::rotate_url(&state, ctx.account_id, id).await?.view(&state)))
+    Ok(Json(rotate(&state, &ctx, id).await?))
 }
 
 #[derive(Deserialize, Default)]
@@ -386,14 +526,12 @@ struct PullBody {
 
 async fn pull_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, body: axum::body::Bytes) -> AppResult<Json<Value>> {
     let b: PullBody = if body.iter().all(u8::is_ascii_whitespace) { PullBody::default() } else { serde_json::from_slice(&body)? };
-    let i = model::load(&state, ctx.account_id, id).await?;
     let since = b.backfill_since.as_deref().map(parse_since).transpose()?;
-    Ok(Json(engine::start_pull(&state, &i, since, b.resume_backfill).await?))
+    Ok(Json(pull(&state, &ctx, id, since, b.resume_backfill).await?))
 }
 
 async fn cancel_backfill_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
-    let i = model::load(&state, ctx.account_id, id).await?;
-    Ok(Json(engine::cancel_backfill(&state, &i).await?))
+    Ok(Json(cancel_backfill(&state, &ctx, id).await?))
 }
 
 async fn deliveries_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, Query(q): Query<DeliveryQuery>) -> AppResult<Json<Value>> {
@@ -401,9 +539,9 @@ async fn deliveries_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uu
 }
 
 async fn delivery_h(State(state): State<AppState>, ctx: Ctx, Path((id, delivery_id)): Path<(Uuid, Uuid)>) -> AppResult<Json<Value>> {
-    Ok(Json(delivery(&state, ctx.account_id, id, delivery_id).await?))
+    Ok(Json(delivery(&state, ctx.account_id, id, delivery_id, can_manage(&ctx)).await?))
 }
 
 async fn replay_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>, ApiJson(b): ApiJson<ReplayBody>) -> AppResult<Json<Value>> {
-    Ok(Json(replay(&state, ctx.account_id, id, &b, false).await?))
+    Ok(Json(replay(&state, &ctx, id, &b, false).await?))
 }

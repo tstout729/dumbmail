@@ -16,6 +16,7 @@ pub mod engine;
 pub mod model;
 pub mod pull;
 pub mod recipes;
+pub mod redact;
 pub mod sandbox;
 pub mod signature;
 
@@ -27,10 +28,37 @@ use uuid::Uuid;
 use super::{Feature, McpDoc};
 use crate::auth::Ctx;
 use crate::error::{AppError, AppResult};
+use crate::features::team::access::{Access, Perm, ToolRule};
 use crate::mcp::{from, obj, tool};
 use crate::state::AppState;
 
+static TOOLS: &[ToolRule] = &[
+    ToolRule { name: "list_integrations", perm: Perm::IntegrationsRead },
+    ToolRule { name: "get_integration", perm: Perm::IntegrationsRead },
+    ToolRule { name: "create_integration", perm: Perm::IntegrationsManage },
+    ToolRule { name: "update_integration", perm: Perm::IntegrationsManage },
+    ToolRule { name: "test_integration", perm: Perm::IntegrationsManage },
+    ToolRule { name: "list_integration_deliveries", perm: Perm::IntegrationsRead },
+    // The log line for integrations.read; payloads and script output need integrations.manage.
+    ToolRule { name: "get_integration_delivery", perm: Perm::IntegrationsRead },
+    ToolRule { name: "replay_integration_deliveries", perm: Perm::IntegrationsManage },
+    ToolRule { name: "run_integration_pull", perm: Perm::IntegrationsManage },
+    ToolRule { name: "cancel_integration_backfill", perm: Perm::IntegrationsManage },
+    ToolRule { name: "set_integration_status", perm: Perm::IntegrationsManage },
+    ToolRule { name: "rotate_integration_url", perm: Perm::IntegrationsManage },
+    ToolRule { name: "delete_integration", perm: Perm::IntegrationsManage },
+    ToolRule { name: "list_integration_recipes", perm: Perm::IntegrationsRead },
+    ToolRule { name: "create_integration_from_recipe", perm: Perm::IntegrationsManage },
+];
+
 pub struct Module;
+
+/// Indexes on big shared tables, built after startup (see `reports::indexes`).
+pub const INDEXES: &[(&str, &str)] = &[(
+    "profiles_integration_keys_idx",
+    "CREATE INDEX CONCURRENTLY profiles_integration_keys_idx ON profiles USING gin (integration_keys jsonb_path_ops) WHERE integration_keys <> '{}'",
+)];
+const INDEX_LOCK_KEY: i64 = 0x0d4d_696e_7465_6772;
 
 const DOC: &str = include_str!("../../../docs/INTEGRATIONS.md");
 
@@ -63,6 +91,8 @@ fn schema_fields() -> Value {
         "credentials": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "Secrets by name for pull placeholders (write-only). null removes one; others are kept."},
         "contacts_opted_in": {"type": "boolean", "description": "Everyone this integration adds has agreed to get marketing email from us. Default false: people it adds without an explicit opt-in are held back from marketing (campaigns skip them; only flows marked service_messages reach them). Set true only when the user confirms it."},
         "message_id": {"type": ["object", "null"], "description": "Where a webhook carries the app's own message id, so resends are ignored: {header: 'svix-id'} or {field: 'id'} (dots reach nested keys)."},
+        "metrics": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Every metric the script records (replaces the list). The script may record only these, and they become server-only when saved: a browser can never send them."},
+        "redact": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Fields removed from every payload before it is stored or shown (replaces the list): dot paths like 'results[].notes', 'reservation.notes' or '**.keyCode' (any depth). Use it for door codes, access notes and anything else that must not sit in the delivery log. The script still sees the whole payload."},
     })
 }
 
@@ -74,6 +104,10 @@ impl Feature for Module {
 
     fn routes(&self) -> Router<AppState> {
         api::routes()
+    }
+
+    fn access(&self) -> Access {
+        Access { routes: api::ROUTES, tools: TOOLS }
     }
 
     fn mcp_docs(&self) -> Vec<McpDoc> {
@@ -124,9 +158,9 @@ impl Feature for Module {
         let r = async {
             match name {
                 "list_integrations" => api::list(state, acct).await,
-                "get_integration" => Ok(model::load(state, acct, uuid_arg(a, "id")?).await?.view(state)),
-                "create_integration" => api::create(state, acct, changes(a)?).await,
-                "update_integration" => Ok(model::update(state, acct, uuid_arg(a, "id")?, changes(a)?).await?.view(state)),
+                "get_integration" => Ok(api::view_for(&model::load(state, acct, uuid_arg(a, "id")?).await?, state, ctx)),
+                "create_integration" => api::create(state, ctx, changes(a)?).await,
+                "update_integration" => api::update(state, ctx, uuid_arg(a, "id")?, changes(a)?).await,
                 "test_integration" => {
                     let mut b = a.clone();
                     b.as_object_mut().map(|o| o.remove("id"));
@@ -136,10 +170,10 @@ impl Feature for Module {
                     let q = api::DeliveryQuery { status: a["status"].as_str().map(String::from), source: a["source"].as_str().map(String::from), limit: a["limit"].as_i64(), offset: a["offset"].as_i64() };
                     api::deliveries(state, acct, uuid_arg(a, "id")?, &q).await
                 }
-                "get_integration_delivery" => api::delivery(state, acct, uuid_arg(a, "id")?, uuid_arg(a, "delivery_id")?).await,
+                "get_integration_delivery" => api::delivery(state, acct, uuid_arg(a, "id")?, uuid_arg(a, "delivery_id")?, api::can_manage(ctx)).await,
                 "replay_integration_deliveries" => {
                     let b = api::ReplayBody { delivery_ids: from(a.get("delivery_ids").cloned().unwrap_or(json!([])))?, all_failed: a["all_failed"].as_bool().unwrap_or(false) };
-                    let mut v = api::replay(state, acct, uuid_arg(a, "id")?, &b, !confirmed(a)).await?;
+                    let mut v = api::replay(state, ctx, uuid_arg(a, "id")?, &b, !confirmed(a)).await?;
                     if !confirmed(a) {
                         v["note"] = json!("Nothing ran. Replaying writes profiles and events and can start flows. Call again with confirm=true once the user approves.");
                     }
@@ -155,20 +189,17 @@ impl Feature for Module {
                         return Ok(json!({"dry_run": true, "would_start": what, "backfill_since": since, "missing_credentials": missing,
                             "note": "Nothing ran. A pull writes profiles and events and can start flows. Use test_integration with pull: true to preview a page, then call again with confirm=true once the user approves."}));
                     }
-                    engine::start_pull(state, &i, since, a["resume_backfill"].as_bool() == Some(true)).await
+                    api::pull(state, ctx, i.id, since, a["resume_backfill"].as_bool() == Some(true)).await
                 }
-                "cancel_integration_backfill" => {
-                    let i = model::load(state, acct, uuid_arg(a, "id")?).await?;
-                    engine::cancel_backfill(state, &i).await
-                }
-                "set_integration_status" => Ok(model::set_status(state, acct, uuid_arg(a, "id")?, a["status"].as_str().unwrap_or("")).await?.view(state)),
+                "cancel_integration_backfill" => api::cancel_backfill(state, ctx, uuid_arg(a, "id")?).await,
+                "set_integration_status" => api::set_status(state, ctx, uuid_arg(a, "id")?, a["status"].as_str().unwrap_or("")).await,
                 "rotate_integration_url" => {
                     let id = uuid_arg(a, "id")?;
                     if !confirmed(a) {
                         let i = model::load(state, acct, id).await?;
                         return Ok(json!({"dry_run": true, "current_url": i.inbound_url(state), "note": "Nothing changed. The current URL stops working the moment it rotates, so the app must be given the new one. Call again with confirm=true once the user approves."}));
                     }
-                    Ok(model::rotate_url(state, acct, id).await?.view(state))
+                    api::rotate(state, ctx, id).await
                 }
                 "delete_integration" => {
                     let id = uuid_arg(a, "id")?;
@@ -176,7 +207,7 @@ impl Feature for Module {
                     if !confirmed(a) {
                         return Ok(json!({"dry_run": true, "integration": i.summary(), "note": "Nothing deleted. This removes the integration and its delivery log (profiles and events it wrote stay). Call again with confirm=true once the user approves."}));
                     }
-                    model::delete(state, acct, id).await?;
+                    api::remove(state, ctx, id).await?;
                     Ok(json!({"deleted": true}))
                 }
                 "list_integration_recipes" => match a["key"].as_str() {
@@ -185,7 +216,7 @@ impl Feature for Module {
                 },
                 "create_integration_from_recipe" => {
                     let key = a["recipe"].as_str().ok_or_else(|| AppError::bad("give the recipe key"))?;
-                    api::from_recipe(state, acct, key, a["name"].as_str().map(String::from), a["create_flows"].as_bool().unwrap_or(true)).await
+                    api::from_recipe(state, ctx, key, a["name"].as_str().map(String::from), a["create_flows"].as_bool().unwrap_or(true)).await
                 }
                 other => Err(AppError::bad(format!("unknown tool {other}"))),
             }
@@ -206,6 +237,13 @@ impl Feature for Module {
             engine::JOB_PULL => Some(engine::run_pull(state, payload).await),
             _ => None,
         }
+    }
+
+    /// The index on `profiles.integration_keys` is built here, in the background, not in a
+    /// migration (a build there would hold a lock on `profiles` while it scans). Lookups by an
+    /// integration's keys work without it, slower.
+    async fn after_start(&self, state: &AppState) -> anyhow::Result<()> {
+        crate::features::reports::indexes::build(state, INDEX_LOCK_KEY, "integration", INDEXES).await
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {

@@ -482,26 +482,108 @@ pub fn build(cfg: &PullConfig, next: &NextRequest, vars: &Vars<'_>) -> Result<Re
 
 // ---------- Errors and redaction ----------
 
-/// Mask every secret value (credentials, signing secret, access token) wherever it appears in a
-/// message that is stored or shown.
+/// Mask every secret value (credentials, signing secret, access token, the encoded Basic value)
+/// wherever it appears in text that is stored or shown, as it is and as it appears in a URL.
+/// Secrets of four bytes or more are masked wherever they appear; shorter ones (a PIN, say) only
+/// as a whole token, so that "12" doesn't mask every 12 in a page of numbers.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_string();
-    // Each secret as it is and as it appears in a URL (percent-encoded), longest first.
     let mut list: Vec<String> = Vec::new();
-    for s in secrets.iter().filter(|s| s.len() >= 4) {
+    for s in secrets.iter().filter(|s| !s.is_empty()) {
         list.push(s.clone());
         let form: String = url::form_urlencoded::byte_serialize(s.as_bytes()).collect();
-        list.push(form.clone());
         list.push(form.replace('+', "%20"));
+        list.push(form);
     }
     list.sort_by_key(|s| std::cmp::Reverse(s.len()));
     list.dedup();
     for s in list {
-        if out.contains(s.as_str()) {
-            out = out.replace(s.as_str(), "•••");
+        if s.len() >= 4 {
+            if out.contains(s.as_str()) {
+                out = out.replace(s.as_str(), "•••");
+            }
+        } else {
+            out = replace_whole_token(&out, &s);
         }
     }
     out
+}
+
+/// Replace `needle` where it stands alone: not touching a letter, digit or `_` on either side.
+fn replace_whole_token(text: &str, needle: &str) -> String {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(needle) {
+        let before = if i > 0 { rest[..i].chars().last() } else { out.chars().last() };
+        let after = rest[i + needle.len()..].chars().next();
+        out.push_str(&rest[..i]);
+        if word(before) || word(after) {
+            out.push_str(needle);
+        } else {
+            out.push_str("•••");
+        }
+        rest = &rest[i + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Everything secret about one run: the integration's saved secrets plus what its requests
+/// actually sent (the bearer token, the encoded Basic value, credential headers). Applied at the
+/// boundary where anything is stored or returned: delivery bodies, response headers (`Link`
+/// included, on any status), the request shown, errors, script output and test results.
+#[derive(Debug, Clone, Default)]
+pub struct Scrub {
+    secrets: Vec<String>,
+}
+
+impl Scrub {
+    pub fn new(secrets: Vec<String>) -> Self {
+        let mut s = Scrub { secrets: Vec::new() };
+        for x in secrets {
+            s.add(&x);
+        }
+        s
+    }
+
+    pub fn add(&mut self, secret: &str) {
+        let t = secret.trim();
+        if !t.is_empty() && !self.secrets.iter().any(|x| x == t) {
+            self.secrets.push(t.to_string());
+        }
+    }
+
+    /// Add the credentials a request carries (auth headers, whole and without the scheme word).
+    pub fn add_request(&mut self, req: &Request) {
+        for (k, v) in &req.headers {
+            if k.eq_ignore_ascii_case("authorization") || credential_header(k) {
+                self.add(v);
+                if let Some((_, rest)) = v.split_once(' ') {
+                    self.add(rest);
+                }
+            }
+        }
+    }
+
+    pub fn text(&self, t: &str) -> String {
+        redact(t, &self.secrets)
+    }
+
+    /// Every string in a JSON value (and every key), masked.
+    pub fn value(&self, v: &Value) -> Value {
+        match v {
+            Value::String(s) => Value::String(self.text(s)),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.value(x)).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (self.text(k), self.value(x))).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// Whether a value holds one of the secrets (so it mustn't be saved as it is).
+    pub fn finds_in(&self, v: &Value) -> bool {
+        self.value(v) != *v
+    }
 }
 
 /// A short description of an HTTP status, for error messages (never the app's own text).
@@ -898,6 +980,17 @@ mod tests {
     fn errors_hide_query_values_and_secrets() {
         assert_eq!(place_of("https://api.example.com/v1/items?token=abc&page=2", std::iter::once("since")), "https://api.example.com/v1/items?token=…&page=…&since=…");
         assert_eq!(redact("Bearer sk_live_123 and sk_live_123x", &["sk_live_123".into(), "ab".into()]), "Bearer ••• and •••x");
+        // Secrets under four bytes are masked as whole tokens only.
+        assert_eq!(redact("pin=12&page=123&x=12", &["12".into()]), "pin=•••&page=123&x=•••");
+        assert_eq!(redact("abc", &["abc".into()]), "•••");
+        assert_eq!(redact("abcd abc", &["abc".into()]), "abcd •••");
+        // The Basic value and a bearer token a request sent, wherever they're echoed.
+        let req = Request { method: "GET".into(), url: "https://a.example/x".into(), headers: vec![("Authorization".into(), "Basic dTpw".into()), ("X-Api-Key".into(), "k9".into())], query: vec![], body: None, form: false };
+        let mut sc = Scrub::new(vec![]);
+        sc.add_request(&req);
+        sc.add("tok_live_1");
+        let v = sc.value(&json!({"link": "<https://a.example/x?page=2&access_token=tok_live_1>; rel=\"next\"", "echo": ["auth was Basic dTpw", "key k9 ok"]}));
+        assert_eq!(v, json!({"link": "<https://a.example/x?page=2&access_token=•••>; rel=\"next\"", "echo": ["auth was •••", "key ••• ok"]}));
         // A secret in a URL path is percent-encoded there; it's masked too.
         assert_eq!(redact("https://api.example.com/v1/k%2Fx%3Dy%20z/items", &["k/x=y z".into()]), "https://api.example.com/v1/•••/items");
     }

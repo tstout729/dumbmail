@@ -32,6 +32,12 @@ CREATE TABLE integrations (
     contacts_opted_in      boolean NOT NULL DEFAULT false,
     -- Where a webhook's own message id is (resends with the same id are ignored): {"header": "svix-id"} or {"field": "id"}.
     message_id             jsonb,
+    -- The metrics the script may record. They are marked server-only when the integration is
+    -- saved, so a browser can never send them, even before the first real one arrives.
+    metrics                text[] NOT NULL DEFAULT '{}',
+    -- Paths removed from every payload before it is stored or shown (e.g. "results[].notes",
+    -- "**.keyCode"); the script still sees the whole payload in memory.
+    redact                 text[] NOT NULL DEFAULT '{}',
     state                  jsonb NOT NULL DEFAULT '{}',
     backfill               jsonb,
     deliveries_ok          bigint NOT NULL DEFAULT 0,
@@ -66,6 +72,9 @@ CREATE TABLE integration_deliveries (
     message_id      text,
     -- Actions already written, by index, with a hash of each: a retry or replay skips them.
     applied         jsonb NOT NULL DEFAULT '{}',
+    -- The action list the script returned the first time it ran successfully for this delivery
+    -- (missing ids and times filled in). Retries apply this list; they never run the script again.
+    actions         jsonb,
     body_bytes      integer NOT NULL DEFAULT 0,
     created_at      timestamptz NOT NULL DEFAULT now(),
     processed_at    timestamptz
@@ -76,6 +85,34 @@ CREATE INDEX integration_deliveries_created_idx ON integration_deliveries(create
 CREATE UNIQUE INDEX integration_deliveries_message_uq ON integration_deliveries(integration_id, message_id) WHERE message_id IS NOT NULL;
 CREATE INDEX integration_deliveries_account_open_idx ON integration_deliveries(account_id) WHERE status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL);
 CREATE INDEX integration_deliveries_account_body_idx ON integration_deliveries(account_id, created_at) WHERE body IS NOT NULL;
+
+-- Stored payload bytes per account, kept by a trigger, so admission can check the budget without
+-- adding up every delivery. (No foreign key: rows are tidied with the account's deliveries.)
+CREATE TABLE integration_payload_bytes (
+    account_id uuid PRIMARY KEY,
+    bytes      bigint NOT NULL DEFAULT 0
+);
+CREATE FUNCTION integration_payload_bytes_track() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    delta bigint := 0;
+    acct uuid;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        delta := delta - OLD.body_bytes;
+        acct := OLD.account_id;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        delta := delta + NEW.body_bytes;
+        acct := NEW.account_id;
+    END IF;
+    IF delta <> 0 THEN
+        INSERT INTO integration_payload_bytes (account_id, bytes) VALUES (acct, delta)
+        ON CONFLICT (account_id) DO UPDATE SET bytes = integration_payload_bytes.bytes + EXCLUDED.bytes;
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER integration_payload_bytes_track AFTER INSERT OR DELETE OR UPDATE OF body_bytes ON integration_deliveries
+    FOR EACH ROW EXECUTE FUNCTION integration_payload_bytes_track();
 
 -- Where a profile came from (e.g. 'integration:<id>'), set when an integration creates it.
 ALTER TABLE profiles ADD COLUMN source text;
