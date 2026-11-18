@@ -50,9 +50,10 @@ pub fn max_people() -> i64 {
     std::env::var("FLOW_BACKFILL_MAX").ok().and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0).unwrap_or(DEFAULT_MAX).min(1_000_000)
 }
 
-/// Test hook: hold a back-populate's enrollment right after it claims a person (holding the
-/// profile and the back-populate's row), so a test can land a delete, a cancel or a list removal
-/// exactly there. Never set outside tests.
+/// Test hook: hold a back-populate's enrollment after it has read everything the run insert depends
+/// on and just before the insert (holding the profile, the back-populate's row, the entry lock, the
+/// flow and the list membership), so a test can land a delete, a cancel, a list removal or a trigger
+/// change exactly there. Never set outside tests.
 #[doc(hidden)]
 pub struct EnrollPause {
     arrived: tokio::sync::Semaphore,
@@ -409,8 +410,9 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn enroll(state: &AppState, id: Uuid, flow: &FlowRow, def: &FlowDef, r: &Rules, pid: Uuid, entry: &str, context: &Value) -> anyhow::Result<bool> {
     let mut tx = state.db.begin().await?;
-    // 1. The profile: a delete in progress finishes first (and takes the member row with it).
-    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM profiles WHERE id = $1 FOR KEY SHARE").bind(pid).fetch_optional(&mut *tx).await?;
+    // 1. The profile: a delete or a change to it (which could move them out of a segment) waits
+    //    for this enrollment, or finished first and is seen below.
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM profiles WHERE id = $1 FOR SHARE").bind(pid).fetch_optional(&mut *tx).await?;
     if exists.is_none() {
         tx.rollback().await?;
         return Ok(true);
@@ -432,7 +434,26 @@ async fn enroll(state: &AppState, id: Uuid, flow: &FlowRow, def: &FlowDef, r: &R
         tx.rollback().await?;
         return Ok(true);
     }
-    enroll_pause(id).await;
+    // 4. The entry lock (the one `flows::enter` takes), then everything the insert depends on is
+    //    read after it, in this transaction, and held until the run is written.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(pid).execute(&mut *tx).await?;
+    let now: Option<(String, Value)> = sqlx::query_as("SELECT status, trigger FROM flows WHERE id = $1 FOR SHARE").bind(flow.id).fetch_optional(&mut *tx).await?;
+    let changed = match &now {
+        None => Some("the flow was deleted"),
+        Some((st, _)) if st != "live" => Some("the flow was turned off"),
+        Some((_, t)) if *t != flow.trigger => Some("the flow's trigger changed"),
+        _ => None,
+    };
+    if let Some(why) = changed {
+        sqlx::query("UPDATE flow_backfill_members SET outcome = $3 WHERE backfill_id = $1 AND profile_id = $2").bind(id).bind(pid).bind(format!("skipped: {why}")).execute(&mut *tx).await?;
+        sqlx::query("UPDATE flow_backfills SET status = 'cancelled', error = $2, finished_at = now() WHERE id = $1 AND status = 'running'").bind(id).bind(why).execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    // A list membership is locked, so taking them off the list waits for this enrollment.
+    if let Trigger::List { list_id } = &r.trigger {
+        sqlx::query("SELECT 1 FROM list_members WHERE list_id = $1 AND profile_id = $2 FOR KEY SHARE").bind(list_id).bind(pid).execute(&mut *tx).await?;
+    }
     // Still in the trigger list or segment, still passing the filter, not matching the exit condition.
     let mut qb: QueryBuilder<'static, Postgres> = QueryBuilder::new("SELECT ");
     push_in_trigger(&mut qb, r);
@@ -452,6 +473,7 @@ async fn enroll(state: &AppState, id: Uuid, flow: &FlowRow, def: &FlowDef, r: &R
     }
     qb.push(" FROM profiles p WHERE p.id = ").push_bind(pid);
     let (in_trigger, filter_ok, exited): (bool, bool, bool) = qb.build_query_as().fetch_one(&mut *tx).await?;
+    enroll_pause(id).await;
     let (outcome, run_id) = if !in_trigger {
         ("skipped: no longer in the trigger list or segment", None)
     } else if !filter_ok {

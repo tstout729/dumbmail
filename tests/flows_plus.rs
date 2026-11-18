@@ -842,18 +842,52 @@ async fn back_populate_rechecks_the_list_and_stops_when_cancelled() {
     use dumbmail::features::flows_plus::backfill::{run, EnrollPause};
     let mut h = harness!();
     h.signup().await;
-    // Taken off the list while their enrollment is under way: not enrolled.
+    // Taken off the list before their turn: not enrolled.
     let (fid, bid, lid) = list_backfill(&mut h, &["left@x.test"]).await;
+    sqlx::query("DELETE FROM list_members WHERE list_id = $1").bind(lid).execute(&h.state.db).await.unwrap();
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, 0);
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM flow_backfill_members WHERE backfill_id = $1").bind(bid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(outcome, "skipped: no longer in the trigger list or segment");
+
+    // Taken off the list after their membership was read and before their run is written: the
+    // removal waits for the enrollment, so the person is enrolled while still on the list.
+    let (fid, bid, lid) = list_backfill(&mut h, &["racing@x.test"]).await;
     let pause = EnrollPause::hold(bid);
     let state = h.state.clone();
     let enrolling = tokio::spawn(async move { run(&state, &json!({"backfill_id": bid})).await });
     pause.arrived().await;
-    sqlx::query("DELETE FROM list_members WHERE list_id = $1").bind(lid).execute(&h.state.db).await.unwrap();
+    let db = h.state.db.clone();
+    let removing = tokio::spawn(async move { sqlx::query("DELETE FROM list_members WHERE list_id = $1").bind(lid).execute(&db).await.map(|r| r.rows_affected()) });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!removing.is_finished(), "the removal waits for the enrollment that read the membership");
     pause.release(bid);
     enrolling.await.unwrap().unwrap();
-    assert_eq!(flow_runs(&h, &fid).await, 0);
-    let outcome: String = sqlx::query_scalar("SELECT outcome FROM flow_backfill_members WHERE backfill_id = $1").bind(bid).fetch_one(&h.state.db).await.unwrap();
-    assert_eq!(outcome, "skipped: no longer in the trigger list or segment");
+    assert_eq!(removing.await.unwrap().unwrap(), 1);
+    assert_eq!(flow_runs(&h, &fid).await, 1);
+
+    // The flow's trigger changes mid-batch: the change waits for the enrollment in progress, and the
+    // back-populate then stops with the reason instead of enrolling people from the old list.
+    let (fid, bid, _) = list_backfill(&mut h, &["t1@x.test", "t2@x.test"]).await;
+    let other = h.ok("POST", "/api/lists", Some(json!({"name": "Other"}))).await["id"].as_str().unwrap().to_string();
+    let pause = EnrollPause::hold(bid);
+    let state = h.state.clone();
+    let enrolling = tokio::spawn(async move { run(&state, &json!({"backfill_id": bid})).await });
+    pause.arrived().await;
+    let db = h.state.db.clone();
+    let fid2 = fid.clone();
+    let changing = tokio::spawn(async move {
+        sqlx::query("UPDATE flows SET trigger = jsonb_build_object('type', 'list', 'list_id', $2::text) WHERE id = $1::uuid").bind(fid2).bind(other).execute(&db).await.map(|r| r.rows_affected())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!changing.is_finished(), "the trigger change waits for the enrollment that read it");
+    pause.release(bid);
+    enrolling.await.unwrap().unwrap();
+    changing.await.unwrap().unwrap();
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, 1, "nobody from the old list after the change");
+    let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM flow_backfills WHERE id = $1").bind(bid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), error.as_deref()), ("cancelled", Some("the flow's trigger changed")));
 
     // A cancel while someone is being enrolled waits for that one; nobody is enrolled after it returns.
     let (fid, bid, _) = list_backfill(&mut h, &["c1@x.test", "c2@x.test", "c3@x.test"]).await;
