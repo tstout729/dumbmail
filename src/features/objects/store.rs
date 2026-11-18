@@ -149,7 +149,11 @@ pub struct Upserted {
     /// created | updated | unchanged | older (ignored: older than what's stored) | duplicate
     /// (ignored: the same version as what's stored) | already_applied (a retry; nothing written)
     pub result: &'static str,
+    /// The fields that changed, never naming one the type marks sensitive (those are counted in
+    /// `hidden_changed`).
     pub changed: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_changed: u32,
     pub version: i64,
     pub linked: u32,
     pub unlinked: u32,
@@ -157,6 +161,10 @@ pub struct Upserted {
     pub not_found: u32,
     #[serde(skip)]
     pub created_profiles: Vec<Profile>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 pub fn relationship(r: Option<&str>) -> AppResult<String> {
@@ -454,7 +462,7 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
         };
         if let Some(why) = stale {
             let (id, version) = found.map(|(id, v, _)| (id, v)).unwrap_or((Uuid::nil(), 0));
-            let out = Upserted { id, type_key: t.key.clone(), external_id: external_id.clone(), result: why, changed: Vec::new(), version, linked: 0, unlinked: 0, not_found: 0, created_profiles: Vec::new() };
+            let out = Upserted { id, type_key: t.key.clone(), external_id: external_id.clone(), result: why, changed: Vec::new(), version, linked: 0, unlinked: 0, not_found: 0, created_profiles: Vec::new(), hidden_changed: 0 };
             if !record_receipt(&mut tx, receipt, why).await? {
                 return Ok(Upserted { result: "already_applied", ..out });
             }
@@ -476,7 +484,7 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
     .bind(&version_text)
     .fetch_optional(&mut *tx)
     .await?;
-    let mut out = Upserted { id: Uuid::nil(), type_key: t.key.clone(), external_id: external_id.clone(), result: "created", changed: Vec::new(), version: 1, linked: 0, unlinked: 0, not_found: 0, created_profiles: Vec::new() };
+    let mut out = Upserted { id: Uuid::nil(), type_key: t.key.clone(), external_id: external_id.clone(), result: "created", changed: Vec::new(), version: 1, linked: 0, unlinked: 0, not_found: 0, created_profiles: Vec::new(), hidden_changed: 0 };
     let (before, after) = match inserted {
         Some(id) => {
             out.id = id;
@@ -590,6 +598,10 @@ pub async fn write(state: &AppState, w: &Writer, req: &Write<'_>, receipt: Recei
         return Ok(out);
     }
     tx.commit().await?;
+    // What's reported back never names a sensitive field.
+    let before_n = out.changed.len();
+    out.changed.retain(|k| !t.is_sensitive(k));
+    out.hidden_changed = (before_n - out.changed.len()) as u32;
     let source = if matches!(w.creator, Creator::Integration { .. }) { crate::audience::EventSource::Integration } else { crate::audience::EventSource::Api };
     for p in &out.created_profiles {
         crate::features::webhooks::profile_saved(&state.db, w.account_id, None, None, p, source).await;
@@ -688,7 +700,7 @@ pub async fn preview(state: &AppState, account_id: Uuid, type_key: &str, externa
     let mut hidden = Vec::new();
     for (k, v) in &fields {
         if private(k) {
-            hidden.push(format!("{k} (private)"));
+            hidden.push(k.clone());
             continue;
         }
         let def = match t.as_ref().and_then(|t| t.field(k)).cloned() {
@@ -698,7 +710,11 @@ pub async fn preview(state: &AppState, account_id: Uuid, type_key: &str, externa
         };
         norm.insert(k.clone(), if v.is_null() { Value::Null } else { types::normalize(&def, v).map_err(|e| AppError::bad(types::public_error(&def, e)))? });
     }
-    hidden.sort();
+    let hidden: Vec<String> = match hidden.len() {
+        0 => Vec::new(),
+        1 => vec!["1 hidden field".into()],
+        n => vec![format!("{n} hidden fields")],
+    };
     let cur: Option<Value> = match &t {
         Some(t) => sqlx::query_scalar("SELECT fields FROM objects WHERE type_id = $1 AND external_id = $2").bind(t.id).bind(external_id.trim()).fetch_optional(&state.db).await?,
         None => None,

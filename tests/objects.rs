@@ -892,7 +892,7 @@ async fn sensitive_fields_never_reach_messages_or_dry_runs() {
         let t = h.ok("POST", &format!("/api/integrations/{iid}/test"), Some(json!({"payload": {"pin": pin, "d": day(3)}}))).await;
         let shown = t.to_string();
         assert!(!shown.contains("4417") && !shown.contains("9999"), "{shown}");
-        assert!(shown.contains("unchanged") && shown.contains("pin (private)"), "the same answer whatever the private value: {shown}");
+        assert!(shown.contains("unchanged") && shown.contains("1 hidden field") && !shown.contains("\"pin\""), "the same answer whatever the private value, and the field isn't named: {shown}");
     }
     h.cleanup().await;
 }
@@ -1199,5 +1199,34 @@ async fn a_flow_paused_while_its_fire_is_claimed_starts_nothing() {
     dumbmail::features::objects::hooks::remove(acct);
     assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 0);
     assert_eq!(count(&h, "SELECT count(*) FROM flow_object_date_fires WHERE outcome = 'pending'").await, 1, "the fire waits for the flow to be live again");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn sensitive_values_are_never_stored_readable_in_deliveries() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "n", "type": "number"}, {"key": "pin", "type": "text", "sensitive": true}]}))).await;
+    // The event comes first and waits for a person DumbMail doesn't know yet; the object (with its
+    // sensitive pin) is written by the retry, from the sealed copy.
+    let script = "function handle(i) { return [{type: 'track_event', metric: 'Stay', profile: {property: 'pms_id', value: 'p1', if_missing: 'retry'}}, {type: 'upsert_object', object_type: 'stay', external_id: 'S1', fields: {n: 2, pin: 'PIN-4417'}}] }";
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "PMS", "script": script, "metrics": ["Stay"]}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    h.raw("POST", &path, &[("content-type", "application/json")], "{}").await;
+    h.drain().await;
+    let (status, actions, sealed): (String, Value, Option<String>) = sqlx::query_as("SELECT status, actions, sealed_fields FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "error", "waiting for the person");
+    assert!(!actions.to_string().contains("PIN-4417") && !actions.to_string().contains("\"pin\""), "the stored list has neither the value nor the name: {actions}");
+    let sealed = sealed.expect("kept sealed for the retry");
+    assert!(!sealed.contains("PIN-4417") && !sealed.contains("pin"));
+    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) SELECT $1, account_id, 'p@example.com', '{\"pms_id\": \"p1\"}' FROM integrations").bind(uuid::Uuid::now_v7()).execute(&h.state.db).await.unwrap();
+    h.fast_forward().await;
+    let (status, sealed, result): (String, Option<String>, Value) = sqlx::query_as("SELECT status, sealed_fields, result FROM integration_deliveries").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "ok");
+    assert!(sealed.is_none(), "cleared once the delivery finished");
+    assert!(result.to_string().contains("1 hidden field") && !result.to_string().contains("pin"), "{result}");
+    let pin: Option<String> = sqlx::query_scalar("SELECT fields->>'pin' FROM objects").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(pin.as_deref(), Some("PIN-4417"), "the retry wrote it from the sealed copy");
     h.cleanup().await;
 }

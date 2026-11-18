@@ -1207,7 +1207,13 @@ async fn upsert_object(state: &AppState, src: &Source, i: usize, o: &UpsertObjec
     if !src.contacts_opted_in {
         out.counts.held += r.created_profiles.len() as u32;
     }
-    let detail = if r.changed.is_empty() { String::new() } else { format!(" ({})", r.changed.join(", ")) };
+    let mut named = r.changed.clone();
+    match r.hidden_changed {
+        0 => {}
+        1 => named.push("1 hidden field".into()),
+        n => named.push(format!("{n} hidden fields")),
+    }
+    let detail = if named.is_empty() { String::new() } else { format!(" ({})", named.join(", ")) };
     let links_line = match (r.linked, r.unlinked) {
         (0, 0) => String::new(),
         (l, u) => format!("; linked {l}, unlinked {u}"),
