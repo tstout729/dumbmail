@@ -119,6 +119,9 @@
     track: function (metric, properties, value) { if (metric) send(String(metric), properties || {}, value); return api; },
     profile: profile,
     showForm: function (id) { loadForms(function (forms) { forms.forEach(function (f) { if (f.id === id) show(f, true); }); }); return api; },
+    // The store's customer hub (its account page), when it's turned on: a panel on the store's own
+    // site, else a new tab. Links and buttons marked data-dumbmail-hub do the same.
+    openHub: function () { loadHub(function (h) { h.open(); }); return api; },
     // Shopping helpers for custom sites. Each takes plain objects; see the Website page in DumbMail.
     viewedProduct: function (p) { offerProduct(item(p), "manual", 0); flushProduct(); return api; },
     addedToCart: function (p, cart) { addToCart(item(p), "manual", cart ? cartFrom(cart) : null); flushAdd(); return api; },
@@ -873,7 +876,7 @@
 
   // Run calls queued before the script loaded: window.dumbmail = window.dumbmail || []; dumbmail.push(["track", ...]) (window.postlark still works)
   var queued = ONLY_FORM ? null : window.dumbmail || window.postlark;
-  if (!ONLY_FORM) window.dumbmail = window.postlark = api;
+  if (!ONLY_FORM) { window.dumbmail = window.postlark = api; if (!window.DumbMail) window.DumbMail = api; }
   function runQueued() {
     if (ONLY_FORM) return;
     var q = (queued && (queued.q || (Array.isArray(queued) ? queued : null))) || window._dumbmailq || window._postlarkq || [];
@@ -1110,9 +1113,26 @@
     } catch (e) {}
   }
 
+  // The customer hub's launcher (see the Customer hub settings in DumbMail) lives in its own small
+  // script, which does nothing when the hub is off.
+  var hubLoading = false;
+  function loadHub(cb) {
+    if (ONLY_FORM) return;
+    var h = window.__dumbmailHub;
+    if (h) { if (cb) cb(h); return; }
+    var q = window.__dumbmailHubQ = window.__dumbmailHubQ || [];
+    if (cb) q.push(cb);
+    if (hubLoading) return;
+    hubLoading = true;
+    var s = document.createElement("script");
+    s.async = true;
+    s.src = BASE + "/client/hub.js?k=" + encodeURIComponent(KEY);
+    (document.head || document.documentElement).appendChild(s);
+  }
+
   function start() {
     if (!ONLY_FORM) {
-      if (!TEST) loadPush();
+      if (!TEST) { loadPush(); loadHub(); }
       PLATFORM = platform();
       if (TEST) { test.draw(); test.check("loaded", { platform: PLATFORM, version: VERSION, auto_track: AUTO, capture_emails: CAPTURE, identified: identified(), summary: "On " + location.host + (PLATFORM !== "custom" ? " · " + PLATFORM : "") }); }
       hookPage();
