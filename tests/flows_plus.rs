@@ -753,6 +753,17 @@ async fn removing_someone_and_sending_to_them_cant_both_happen() {
     worker.await.unwrap().unwrap();
     assert_eq!(run_of(&h, &fid, "ended@x.test").await.1, "exited");
     assert_eq!(prop(&h, "ended@x.test", "after").await, None, "the run didn't go on after it was ended");
+    // The same when the send is the last step: finishing doesn't turn "exited" into "completed".
+    let last = live_flow(&mut h, json!({"type": "metric", "metric": "HookLast"}), json!({"entry": "w", "nodes": [{"id": "w", "type": "webhook", "url": hook.url, "next": null}]})).await;
+    event(&mut h, "HookLast", "last@x.test", json!({})).await;
+    let state = h.state.clone();
+    let worker = tokio::spawn(async move { dumbmail::jobs::drain(&state).await });
+    hook.arrived.acquire().await.unwrap().forget();
+    let (run4, ..) = run_of(&h, &last, "last@x.test").await;
+    sqlx::query("UPDATE flow_runs SET status = 'exited', finished_at = now() WHERE id = $1").bind(run4).execute(&h.state.db).await.unwrap();
+    hook.go.add_permits(1);
+    worker.await.unwrap().unwrap();
+    assert_eq!(run_of(&h, &last, "last@x.test").await.1, "exited");
 
     // Removed before its step runs: nothing is sent.
     let fid2 = live_flow(&mut h, json!({"type": "metric", "metric": "Later"}), json!({"entry": "d", "nodes": [
