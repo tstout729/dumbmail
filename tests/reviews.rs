@@ -975,6 +975,8 @@ async fn no_reminder_after_a_review() {
 }
 
 /// Item 8: a review published while the person is being deleted can't leave the summary wrong.
+/// Round 3, item 7: and the two take their locks in one order (profile, then request), so they
+/// can't deadlock.
 #[tokio::test]
 async fn deleting_a_person_keeps_ratings_right() {
     let mut h = harness!();
@@ -989,18 +991,26 @@ async fn deleting_a_person_keeps_ratings_right() {
     let db = h.state.db.clone();
     let (gone, late) = tokio::join!(dumbmail::features::reviews::store::delete_person(&db, acct, p), async {
         pause.arrived().await;
-        // A new review lands while the delete holds the profile: it waits, then can't attach.
-        let fut = submit(&h, &second, json!({"rating": 5}));
-        let out = tokio::time::timeout(std::time::Duration::from_millis(400), fut).await;
-        pause.release("delete_person", acct);
+        // A first review is saved while the delete holds the profile. Once it is waiting on a lock
+        // (the delete's), the delete goes on: neither may deadlock the other.
+        let watch = async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            pause.release("delete_person", acct);
+        };
+        let (out, ()) = tokio::join!(submit(&h, &second, json!({"rating": 5})), watch);
         out
     });
-    assert!(gone.unwrap().is_some());
-    let late = match late {
-        Ok(r) => r,
-        Err(_) => submit(&h, &second, json!({"rating": 5})).await,
-    };
-    assert!(!late.0.is_success(), "{late:?}");
+    assert!(gone.expect("the delete finished, not chosen as a deadlock victim").is_some());
+    assert_eq!(late.0, StatusCode::NOT_FOUND, "the review finished too, with nothing left to attach to: {late:?}");
     for key in ["MUG", "CUP"] {
         let published: i64 = sqlx::query_scalar("SELECT count(*) FROM reviews r JOIN review_subjects s ON s.id = r.subject_id WHERE s.external_id = $1 AND r.status = 'published'")
             .bind(key)

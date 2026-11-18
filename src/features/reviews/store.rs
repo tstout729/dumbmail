@@ -616,6 +616,8 @@ pub async fn delete_person(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> A
         return Ok(None);
     }
     super::hooks::point("delete_person", account_id).await.map_err(AppError::Internal)?;
+    // Then the person's requests: the order a review being saved takes them in (profile, request).
+    sqlx::query("SELECT id FROM review_requests WHERE profile_id = $1 ORDER BY id FOR UPDATE").bind(profile_id).execute(&mut *tx).await?;
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM reviews WHERE account_id = $1 AND profile_id = $2").bind(account_id).bind(profile_id).fetch_all(&mut *tx).await?;
     delete_reviews(&mut tx, account_id, &ids).await?;
     sqlx::query("DELETE FROM review_photos WHERE request_id IN (SELECT id FROM review_requests WHERE profile_id = $1)").bind(profile_id).execute(&mut *tx).await?;

@@ -369,6 +369,12 @@ async fn save(state: &AppState, account: &Account, r: &Request, existing: Option
     let photo_ids: Vec<Uuid> = b.photos.clone().unwrap_or_default().into_iter().take(photos::MAX_PER_REVIEW as usize).collect();
     let publish = store::auto_publishes(&s, r.verified, w.rating, &w.flags);
     let mut tx = state.db.begin().await?;
+    // Locks in the order deleting a person takes them (the profile, then the request), so the two
+    // can't deadlock: a delete in progress finishes first, and then there is nothing to save.
+    let alive: Option<i32> = sqlx::query_scalar("SELECT 1 FROM profiles WHERE id = $1 FOR KEY SHARE").bind(r.profile_id).fetch_optional(&mut *tx).await?;
+    if alive.is_none() {
+        return Err(AppError::not_found("review link"));
+    }
     // The request row is the lock: two submissions with one link can't both write a review.
     let (current, used): (Option<Uuid>, bool) = sqlx::query_as("SELECT review_id, submitted_at IS NOT NULL FROM review_requests WHERE id = $1 FOR UPDATE").bind(r.id).fetch_one(&mut *tx).await?;
     let review_id = match (current, existing) {
