@@ -81,7 +81,7 @@ function HubForm({ s }: { s: HubSettings }) {
     update.mutate(patch, { onSuccess: () => toast.success("Customer hub saved") });
   };
   return (
-    <fieldset disabled={!canEdit} className="space-y-4">
+    <fieldset disabled={!canEdit} className="min-w-0 space-y-4">
       <Card title="Customer hub">
         <div className="space-y-4">
           <div className="flex items-start gap-3">

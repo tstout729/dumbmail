@@ -86,7 +86,7 @@ async fn store_for(state: &AppState, key: &str, headers: &HeaderMap) -> AppResul
     Ok(Some(Store { account, settings }))
 }
 
-/// Pages: no caching, no referrer, and framing only by the store's own site when the hub can open
+/// Pages: no caching, no referrer to other sites, and framing only by the store's own site when the hub can open
 /// in a panel there.
 fn secure(status: StatusCode, html: String, frame_site: Option<&str>) -> Response {
     let ancestors = match frame_site {
@@ -97,7 +97,9 @@ fn secure(status: StatusCode, html: String, frame_site: Option<&str>) -> Respons
     let mut r = (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     let h = r.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    // same-origin, not no-referrer: with no-referrer browsers send `Origin: null` on the hub's own
+    // form posts, which the origin check would refuse. Nothing goes to other sites either way.
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     if let Ok(v) = HeaderValue::from_str(&csp) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
