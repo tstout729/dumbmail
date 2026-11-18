@@ -1,6 +1,21 @@
 {
   "description": "a satisfaction rating: Satisfaction Rated with the rating; a comment, if someone adds one to the body, is never stored",
   "doc": "https://support.zendesk.com/hc/en-us/articles/4408886858138-Zendesk-Support-placeholders-reference (the trigger body the setup steps give, filled in as Zendesk would; fake requester)",
+  "input": {
+    "payload": {
+      "event": "satisfaction",
+      "ticket_id": "35436",
+      "subject": "Help, my printer is on fire!",
+      "status": "solved",
+      "via": "Web form",
+      "requester_email": "kai.example@example.com",
+      "requester_name": "Kai Example",
+      "created_at": "2026-11-17T18:00Z",
+      "updated_at": "2026-11-18T12:00Z",
+      "rating": "Good, I'm satisfied",
+      "comment": "The agent read my card number back to me: 4111 1111 1111 1111"
+    }
+  },
   "expect": [
     {
       "email": "kai.example@example.com",
@@ -26,21 +41,6 @@
       "unique_id": "zendesk:35436:rating:2026-11-18T12:00:00Z"
     }
   ],
-  "input": {
-    "payload": {
-      "comment": "The agent read my card number back to me: 4111 1111 1111 1111",
-      "created_at": "2026-11-17T18:00Z",
-      "event": "satisfaction",
-      "rating": "Good, I'm satisfied",
-      "requester_email": "kai.example@example.com",
-      "requester_name": "Kai Example",
-      "status": "solved",
-      "subject": "Help, my printer is on fire!",
-      "ticket_id": "35436",
-      "updated_at": "2026-11-18T12:00Z",
-      "via": "Web form"
-    }
-  },
   "sensitive": [
     "4111 1111 1111 1111"
   ]

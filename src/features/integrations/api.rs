@@ -346,8 +346,8 @@ pub async fn test(state: &AppState, account_id: Uuid, id: Uuid, b: TestBody) -> 
             return Err(AppError::bad("the script is too long"));
         }
     }
-    if b.source.as_deref().is_some_and(|s| !matches!(s, "webhook" | "pull" | "test")) {
-        return Err(AppError::bad("source must be webhook, pull or test"));
+    if b.source.as_deref().is_some_and(|s| !matches!(s, "webhook" | "pull" | "fetch" | "test")) {
+        return Err(AppError::bad("source must be webhook, pull, fetch or test"));
     }
     let sample = if b.pull {
         TestSample::Pull

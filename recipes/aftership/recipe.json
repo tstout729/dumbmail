@@ -38,6 +38,7 @@
     "**.signed_by",
     "**.pickup_note",
     "**.note",
+    "msg.customers[].name",
     "**.emails",
     "**.smses",
     "**.subscribed_emails",

@@ -10,7 +10,7 @@ Checked against AfterShip's documentation on 2026-11-17; not yet run against a l
 
 ## Removed before anything is stored
 
-Raw addresses, postal codes, coordinates, proof-of-delivery photos, who signed, notes, the legacy email and SMS lists and the order-status link (it encodes the email). The `customers` list stays in the stored payload, because the script runs on it.
+Raw addresses, postal codes, coordinates, proof-of-delivery photos, who signed, notes, the legacy email and SMS lists and the order-status link (it encodes the email). Customers' names are removed too; their email and phone stay in the stored payload, because the script runs on it.
 
 ## What a live check should look at first
 
