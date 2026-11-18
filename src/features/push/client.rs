@@ -318,18 +318,19 @@ async fn try_save_device(state: &AppState, account_id: Uuid, r: &Registration<'_
             let holds = crypto::install_secret_matches(secret_hash.as_deref(), r.proof);
             let same_owner_grant = matches!(owner, Owner::Person(p) if Some(p) == *current_owner);
             match secret_hash {
-                Some(_) if !holds && !same_owner_grant => return Err(not_holder(r.kind)),
-                Some(_) => {}
-                // Registered before install secrets: its first call that keeps its owner adopts one.
-                None if owner_changes => {
+                Some(_) if holds => {}
+                // Lost the secret: a grant for the person it already belongs to issues a new one (the
+                // old one stops working). A grant for anyone else never does.
+                Some(_) if same_owner_grant => issue_secret = true,
+                Some(_) => return Err(not_holder(r.kind)),
+                // Registered before install secrets: the token alone proves nothing, so only a grant
+                // for its owner adopts one; any other call (even a refresh) changes nothing.
+                None if same_owner_grant => issue_secret = true,
+                None => {
                     return Err(AppError::Conflict(
-                        "this device was registered before install secrets: register it once with its current owner (no sign-in change) to get its install_secret first".into(),
+                        "this device was registered before install secrets: register it once with an enrollment grant for the person it belongs to, to get its install_secret".into(),
                     ))
                 }
-                // A named owner's device adopts one only with a grant for that owner; an anonymous
-                // device has nothing else to show, so its first same-owner call adopts one.
-                None if seen.as_ref().is_some_and(|e| e.2) || matches!(owner, Owner::Person(_)) => issue_secret = true,
-                None => {}
             }
         }
     } else if r.kind != "web" {
