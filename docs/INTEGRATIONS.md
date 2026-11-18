@@ -144,7 +144,7 @@ The address must never get marketing: an email is suppressed, a phone number is 
 {"type": "add_keys", "profile": {"property": "square_customer", "value": "C1", "if_missing": "retry"}, "keys": {"square_payment": "P1"}}
 ```
 
-Adds ids to the `keys` of a person found another way, so later actions find them by these ids too (a payment that names only its customer, so the refund that names only the payment finds them). Up to 20 keys, as in `upsert_profile`.
+Adds ids to the `keys` of a person found another way, so later actions find them by these ids too (a payment that names only its customer, so the refund that names only the payment finds them). Up to 20 keys, as in `upsert_profile`. A value belongs to one profile: if another profile in the account already has it, that key isn't added (the delivery's log says so) and the rest are.
 
 ### lookup
 
