@@ -1148,3 +1148,30 @@ async fn the_insert_that_takes_a_slot_checks_eligibility_itself() {
     assert_eq!(n, 1);
     h.cleanup().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_calendar_move_only_writes_the_campaign_it_read() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    person(&mut h, acct, &list, "a@x.test", "subscribed").await;
+    let tz = chrono_tz::America::Los_Angeles;
+    let day = (Utc::now().with_timezone(&tz) + Duration::days(3)).date_naive();
+    let at = dumbmail::features::sendtime::clock::local_instant(tz, day, 600);
+    // While a move waits on the campaign, another transaction unschedules it (or edits it) and commits.
+    for change in ["UPDATE campaigns SET status = 'draft', updated_at = now() WHERE id = $1", "UPDATE campaigns SET name = 'Edited', updated_at = now() WHERE id = $1"] {
+        let id = create_campaign(&mut h, &list, "Held").await;
+        let id_u: Uuid = id.parse().unwrap();
+        h.ok("POST", &format!("/api/campaigns/{id}/schedule"), Some(json!({"send_at": at.to_rfc3339()}))).await;
+        let mut tx = h.state.db.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM campaigns WHERE id = $1 FOR UPDATE").bind(id_u).execute(&mut *tx).await.unwrap();
+        let state = h.state.clone();
+        let mv = tokio::spawn(async move { calendar::reschedule(&state, acct, id_u, day + Duration::days(1)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        sqlx::query(change).bind(id_u).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(mv.await.unwrap().is_err(), "{change}: the move refuses");
+        let send_at: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT send_at FROM campaigns WHERE id = $1").bind(id_u).fetch_one(&h.state.db).await.unwrap();
+        assert_eq!(send_at, at, "{change}: the send time is left as it was");
+    }
+    h.cleanup().await;
+}
