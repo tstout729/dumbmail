@@ -1000,6 +1000,36 @@ var window = { isSecureContext: true, PushManager: function () {}, Notification:
     }
 
     #[test]
+    fn new_keys_are_reported_at_once_and_a_refused_subscription_is_replaced() {
+        // Reported less than a day ago, but the keys changed since: sent now, with the old secret.
+        let v = run(
+            r#"__sub = mkSub(); __ls["pl_push_sub"] = JSON.stringify({ endpoint: "https://fcm.googleapis.com/fcm/send/abc", auth: "OLD" });
+               __ls["pl_push_sent"] = JSON.stringify({ sig: "https://fcm.googleapis.com/fcm/send/abc||", at: Date.now() });"#,
+            &push_js(),
+            &[],
+        );
+        let sent: Vec<&Value> = v["log"].as_array().unwrap().iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).collect();
+        assert_eq!((sent.len(), sent[0]["body"]["proof"]["auth"].as_str()), (1, Some("OLD")), "{v}");
+
+        // DumbMail refuses it (409): not "granted"; dropped here and a fresh one made and reported.
+        let refuse_first = r#"var __n = 0; fetch = function (url, init) { __log.push({ fetch: url, body: init && init.body ? JSON.parse(init.body) : null });
+            if (url.indexOf("/client/push/subscribe") >= 0 && __n++ === 0) return Promise.resolve({ ok: false, status: 409 }); return Promise.resolve({ ok: true, status: 200 }); };
+            var __result = null;"#;
+        let v = run(&format!("__sub = mkSub(); {refuse_first}"), &push_js(), &[]);
+        let log = v["log"].as_array().unwrap();
+        let at = |k: &str| log.iter().position(|e| e.get(k).is_some()).unwrap_or(usize::MAX);
+        assert!(at("unsubscribe") < at("subscribe"), "the refused one is dropped, then a fresh one made: {v}");
+        assert_eq!(log.iter().filter(|e| e["fetch"].as_str().is_some_and(|u| u.contains("/client/push/subscribe"))).count(), 2, "{v}");
+        assert!(v["ls"]["pl_push_sub"].as_str().is_some(), "the fresh one is kept: {v}");
+        // Refused again: "error", and it stops there.
+        let refuse_all = r#"fetch = function (url, init) { __log.push({ fetch: url }); return Promise.resolve(url.indexOf("/client/push/subscribe") >= 0 ? { ok: false, status: 409 } : { ok: true, status: 200 }); };"#;
+        let v = run(&format!("__sub = mkSub(); {refuse_all}"), &push_js(), &["window.dumbmail.notifications.prompt().then(function (r) { __log.push({ result: r }); })"]);
+        let log = v["log"].as_array().unwrap();
+        assert_eq!(log.iter().rev().find_map(|e| e.get("result")).cloned(), Some(json!("error")), "{v}");
+        assert!(v["ls"].get("pl_push_sub").is_none());
+    }
+
+    #[test]
     fn new_keys_for_the_same_endpoint_carry_the_old_auth_secret() {
         let v = run(
             r#"__sub = mkSub(); __ls["pl_push_sub"] = JSON.stringify({ endpoint: "https://fcm.googleapis.com/fcm/send/abc", auth: "OLD" });"#,
