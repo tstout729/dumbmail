@@ -1256,8 +1256,7 @@ async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: 
             "review_request" => {
                 let hours = def.settings.smart_sending_hours.unwrap_or(0);
                 if let Some(until) = crate::features::reviews::flow_step(state, &account, &person, &flow, run.id, &node_id, &node.data, &mut context, hours).await? {
-                    sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&state.db).await?;
-                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                    wait_until(&state.db, &hold, &node_id, &context, until).await?;
                     return Ok(());
                 }
             }

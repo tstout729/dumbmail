@@ -829,11 +829,17 @@ async fn one_ask_one_message_across_retries_and_crashes() {
     assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
     // The run is put back on the ask (as if its worker died after the send, before moving on).
     let run: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
-    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active', context = context - '_waited' WHERE id = $1").bind(run).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active', context = context - '_waited', waiting_until = NULL, claim_id = NULL, claim_until = NULL WHERE id = $1")
+        .bind(run)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
     dumbmail::jobs::enqueue(&h.state.db, "flow_step", json!({"run_id": run}), None).await.unwrap();
     h.drain().await;
     assert_eq!(mails_to(&h, "jane@x.test").len(), 1, "the step finds the message it already sent");
+    let (node, waiting): (Option<String>, bool) = sqlx::query_as("SELECT current_node, waiting_until IS NOT NULL FROM flow_runs WHERE id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((node.as_deref(), waiting), (Some("v2"), true), "the ask step really ran again and moved on to the reminder's wait");
     let flow_msgs: i64 = sqlx::query_scalar("SELECT count(*) FROM messages m JOIN profiles p ON p.id = m.profile_id WHERE p.email = 'jane@x.test'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(flow_msgs, 1);
     // A worker that stops between claiming the ask and handing it over: sent once, later.
@@ -850,10 +856,16 @@ async fn one_ask_one_message_across_retries_and_crashes() {
     assert_eq!((status.as_str(), claimed), ("pending", true));
     h.fast_forward().await;
     assert!(mails_to(&h, "sam@x.test").is_empty(), "nobody else takes over while the claim is fresh");
+    // Both the ask's claim and the run's own (the flow engine's) lapse, as they would in time.
     sqlx::query("UPDATE review_sends SET claimed_at = now() - interval '1 hour'").execute(&h.state.db).await.unwrap();
-    h.fast_forward().await;
+    sqlx::query("UPDATE flow_runs SET claim_until = now() - interval '1 minute' WHERE claim_until IS NOT NULL").execute(&h.state.db).await.unwrap();
+    // The flow engine takes the run over (as its own tests do once a failed step's claim ran out).
+    let sam_run: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'sam@x.test'").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, sam_run).await.unwrap();
     h.fast_forward().await;
     assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "taken over once the claim lapsed, and sent once");
+    dumbmail::flows::step(&h.state, sam_run).await.unwrap();
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "and never again");
     h.cleanup().await;
 }
 
