@@ -218,6 +218,13 @@ async fn save_inner(db: &PgPool, shop: &ShopRow, nodes: &[Node], mode: SaveMode)
 /// A full scan of the store's products finished: products of this store it didn't see, and that
 /// nothing touched since the scan started, are gone from Shopify. Unpublish them. Returns how many.
 pub async fn finish_scan(db: &PgPool, shop: &ShopRow, scan: Uuid, started: chrono::DateTime<chrono::Utc>) -> sqlx::Result<u64> {
+    let Some(fence) = super::fence::open(db, shop.account_id, &shop.shop_domain, shop.generation, None, None).await? else { return Ok(0) };
+    let n = finish_scan_inner(db, shop, scan, started).await?;
+    fence.done().await?;
+    Ok(n)
+}
+
+async fn finish_scan_inner(db: &PgPool, shop: &ShopRow, scan: Uuid, started: chrono::DateTime<chrono::Utc>) -> sqlx::Result<u64> {
     let gone: Vec<i64> = sqlx::query_scalar(
         "UPDATE shopify_products SET deleted_at = now() WHERE account_id = $1 AND shop_domain = $2 AND deleted_at IS NULL
            AND seen_by IS DISTINCT FROM $3 AND touched_at < $4 RETURNING product_id",

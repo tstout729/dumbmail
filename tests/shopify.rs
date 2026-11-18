@@ -3004,3 +3004,26 @@ console.log(JSON.stringify({{ posts: posts.length, profile: await local.getItem(
     assert_eq!(d["profile"], Value::Null, "no identity passed to the storefront script");
     assert!(d["buffer"].is_string(), "held browsing activity isn't flushed");
 }
+
+/// Item 11: a complete product scan of a store with no products left unpublishes them all.
+#[tokio::test]
+async fn an_emptied_store_empties_the_catalog() {
+    let (mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let prod = jsonl(&[
+        json!({"id": "gid://shopify/Product/1", "updatedAt": "2025-01-01T00:00:00Z", "title": "P1", "handle": "p1", "status": "ACTIVE", "publishedAt": "2025-01-01T00:00:00Z", "tags": []}),
+        json!({"id": "gid://shopify/ProductVariant/11", "title": "Default Title", "price": "1.00", "inventoryQuantity": 1, "availableForSale": true, "inventoryItem": {"id": "gid://shopify/InventoryItem/19", "tracked": true}, "__parentId": "gid://shopify/Product/1"}),
+    ]);
+    mock.lock().unwrap().files.insert("products".into(), prod);
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["published"], true);
+    // The store removed its last product: the bulk operation completes with no result file.
+    mock.lock().unwrap().files.insert("products".into(), String::new());
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    settle_imports(&h).await;
+    assert_eq!(h.ok("GET", "/api/catalog/products/1", None).await["published"], false, "gone from the store: unpublished");
+    h.cleanup().await;
+}

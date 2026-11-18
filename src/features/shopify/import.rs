@@ -310,6 +310,12 @@ async fn step_inner(state: &AppState, shop: &ShopRow, lease: &Lease, metrics: &m
             "CREATED" | "RUNNING" | "CANCELING" => return Ok(Step::Wait(Duration::seconds(10))),
             "COMPLETED" => match n["url"].as_str() {
                 None => {
+                    // No result file: nothing matched. A complete product scan of an emptied store
+                    // still finishes, so the store's old products are unpublished.
+                    if i.phase == "products" {
+                        let gone = products::finish_scan(&state.db, shop, i.id, i.started_at).await.map_err(|_| ApiError::Network("database"))?;
+                        bump(&mut i.counts, "products_removed", gone);
+                    }
                     next_phase(i);
                     return Ok(Step::More);
                 }
