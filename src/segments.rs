@@ -190,6 +190,8 @@ pub enum Condition {
         #[serde(default)]
         until: Option<String>,
     },
+    /// Reviews someone wrote, or a review link waiting for them (see `features::reviews`).
+    Review(crate::features::reviews::segment::ReviewCondition),
     /// A stable random share of profiles, e.g. a 10% holdout. The same seed always picks the same people.
     Random {
         percent: f64,
@@ -544,6 +546,7 @@ fn validate(conds: &[Condition], depth: usize) -> AppResult<()> {
                 }
                 check_window(*within_days, since, until)?;
             }
+            Condition::Review(r) => crate::features::reviews::segment::validate(r)?,
             Condition::Random { percent, .. } => {
                 if !(percent.is_finite() && *percent > 0.0 && *percent <= 100.0) {
                     return Err(AppError::bad("random sample percent must be more than 0 and at most 100"));
@@ -1219,6 +1222,7 @@ fn push_condition(qb: &mut QueryBuilder<'_, Postgres>, c: &Condition) {
             };
             qb.push(")");
         }
+        Condition::Review(r) => crate::features::reviews::segment::push(qb, r),
         Condition::Random { percent, seed } => {
             // Stable per profile and seed: hash into 0..9999 and keep the lowest `percent` share.
             qb.push("(((hashtextextended(p.id::text || ").push_bind(seed.clone().unwrap_or_default()).push(", 0) % 10000) + 10000) % 10000 < ");

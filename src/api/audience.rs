@@ -217,6 +217,8 @@ async fn patch_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path
 }
 
 async fn delete_profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>) -> AppResult<Json<Value>> {
+    // Their reviews go too, with the star summaries corrected (see features::reviews).
+    crate::features::reviews::store::delete_for_profile(&state.db, ctx.account_id, id).await?;
     let gone: Option<(Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as("DELETE FROM profiles WHERE id = $1 AND account_id = $2 RETURNING email, phone_number, external_id").bind(id).bind(ctx.account_id).fetch_optional(&state.db).await?;
     let Some((email, phone_number, external_id)) = gone else { return Err(AppError::not_found("profile")) };

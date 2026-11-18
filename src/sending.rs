@@ -313,6 +313,15 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     coupons.fill(&mut ctx);
     // Product blocks and catalog variables are filled per recipient (see features::catalog).
     let content = crate::features::catalog::personalize(&state.db, spec.account, Some(p), spec.event, &prepared, &mut ctx, false).await?;
+    // Review request blocks and links are made for this person (see features::reviews).
+    let filled = match crate::features::reviews::personalize(state, spec.account, Some(p), spec.event, &content, spec.is_test).await? {
+        std::borrow::Cow::Owned(v) => Some(v),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    let content = match filled {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => content,
+    };
     let link_base = crate::domains::link_base(state, spec.account);
     let tracking = Tracking {
         public_url: &link_base,

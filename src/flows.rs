@@ -222,7 +222,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
+            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "review_request" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -250,6 +250,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
                 }
             }
             "email" | "sms" => need("content")?,
+            "review_request" => crate::features::reviews::check_step(&n.id, &n.data)?,
             "condition" => {
                 need("condition")?;
                 segments::parse(&n.data["condition"])?;
@@ -1088,6 +1089,15 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                             tracing::warn!(run = %run.id, node = %node_id, error = %e.public_message(), "flow message failed");
                         }
                     }
+                }
+            }
+            // Ask for reviews of the items in the triggering event (see features::reviews).
+            "review_request" => {
+                let hours = def.settings.smart_sending_hours.unwrap_or(0);
+                if let Some(until) = crate::features::reviews::flow_step(state, &account, &person, &flow, run.id, &node_id, &node.data, &mut context, hours).await? {
+                    sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&state.db).await?;
+                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                    return Ok(());
                 }
             }
             "condition" => {
