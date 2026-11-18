@@ -2404,5 +2404,15 @@ async fn closed_accounts_only_get_privacy_requests() {
     assert_eq!(hook(&h, "customers/data_request", "d1", &json!({"shop_id": 1, "shop_domain": SHOP, "customer": {"id": 1}, "orders_requested": [], "data_request": {"id": 5}})).await, StatusCode::OK);
     h.drain().await;
     assert_eq!(count(&h, "SELECT count(*) FROM shopify_data_requests WHERE shopify_request_id = 5").await, 1);
+    // An unsubscribe made before closing is still written back to the store.
+    sqlx::query("INSERT INTO shopify_customers (account_id, customer_id, email, email_state, shop_domain) VALUES ($1, 2, 'bob@example.com', 'SUBSCRIBED', $2)").bind(acct).bind(SHOP).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO profiles (id, account_id, email, email_consent) VALUES ($1, $2, 'bob@example.com', 'unsubscribed')").bind(Uuid::now_v7()).bind(acct).execute(&h.state.db).await.unwrap();
+    tick(&h).await;
+    h.drain().await;
+    assert!(mock.lock().unwrap().consent_updates.iter().any(|u| u["customerId"] == "gid://shopify/Customer/2"), "opt-outs still reach the store");
+    // Uninstalling the app still forgets the token and releases the store.
+    hook(&h, "app/uninstalled", "u1", &json!({})).await;
+    let (status, tok): (String, Option<String>) = sqlx::query_as("SELECT status, access_token_enc FROM shopify_shops").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), tok), ("uninstalled", None));
     h.cleanup().await;
 }

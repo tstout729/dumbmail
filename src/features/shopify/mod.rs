@@ -105,6 +105,9 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
     if s.status != "connected" || s.generation != lease.generation {
         return Ok((false, None));
     }
+    // A closed account: only what's owed to the people in it (privacy requests, and unsubscribes
+    // written back to the store). No webhooks, reads or imports.
+    let closed = crate::models::account_closed(&state.db, account_id).await?;
     let start = std::time::Instant::now();
     let deadline = start + std::time::Duration::from_secs(shop::SLICE_SECS);
     let until = |secs: u64| (std::time::Instant::now() + std::time::Duration::from_secs(secs)).min(deadline);
@@ -130,6 +133,12 @@ async fn work_inner(state: &AppState, account_id: Uuid, lease: &shop::Lease) -> 
         }
     } else {
         return Ok((false, None));
+    }
+    if closed {
+        return Ok(match wait {
+            Some(d) => (true, Some(d)),
+            None => (more, None),
+        });
     }
 
     // 3. Webhook deliveries, then the items they asked to read again.

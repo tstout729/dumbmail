@@ -129,8 +129,9 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("klaviyo_import_survey", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_import_run", "import_id", "SELECT account_id FROM klaviyo_imports WHERE id = $1"),
     ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
-    // Shopify: everything but privacy requests (`shopify_privacy`), which are still honoured.
-    ("shopify_work", "account_id", "SELECT $1::uuid"),
+    // Shopify: everything but privacy requests (`shopify_privacy`) and the store worker
+    // (`shopify_work`), which for a closed account only does privacy requests and opt-out
+    // write-backs (see `features::shopify`).
     ("shopify_setup", "account_id", "SELECT $1::uuid"),
     ("shopify_rebaseline_segments", "account_id", "SELECT $1::uuid"),
 ];

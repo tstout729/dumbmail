@@ -355,8 +355,8 @@ async fn delete_all(db: &PgPool, sql: &str, account_id: Uuid, shop: &str, extra:
 }
 
 async fn redact_shop(db: &PgPool, account_id: Uuid, shop: &str) -> anyhow::Result<()> {
-    // Reconnected to the same store since: it's live data again.
-    let live: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_shops WHERE account_id = $1 AND shop_domain = $2 AND status = 'connected')")
+    // Reconnected to the same store since (and the account still open): it's live data again.
+    let live: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shopify_shops s JOIN accounts a ON a.id = s.account_id WHERE s.account_id = $1 AND s.shop_domain = $2 AND s.status = 'connected' AND a.closed_at IS NULL)")
         .bind(account_id)
         .bind(shop)
         .fetch_one(db)
