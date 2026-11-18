@@ -757,22 +757,30 @@ async fn resolve(state: &AppState, src: &Source, w: &Who, dry: bool, out: &mut O
     if dry {
         return Ok(Some(Found { id: existing.as_ref().map(|p| p.id).unwrap_or_else(Uuid::nil), created: existing.is_none() }));
     }
-    if existing.is_none() {
-        if let Some(p) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
-            out.counts.profiles_created += 1;
-            if !src.contacts_opted_in {
-                out.counts.held += 1;
+    // A new profile only ever comes from the single insert that holds it and records its source;
+    // an existing match is only updated (if it vanished meanwhile, look again).
+    let mut existing = existing;
+    for _ in 0..3 {
+        if existing.is_none() {
+            crate::features::objects::hooks::pause(src.account_id, "before_create").await;
+            if let Some(p) = create_profile(state, src, &input, &Map::new(), &Map::new(), false, None).await? {
+                out.counts.profiles_created += 1;
+                if !src.contacts_opted_in {
+                    out.counts.held += 1;
+                }
+                return Ok(Some(Found { id: p.id, created: true }));
             }
-            return Ok(Some(Found { id: p.id, created: true }));
+        } else {
+            crate::features::objects::hooks::pause(src.account_id, "before_update").await;
+            if let Some(up) = audience::update_matching_profile(&state.db, src.account_id, &input).await? {
+                after_write(state, src, up.profile.id, false, up.profile.email.as_deref(), false, out).await?;
+                mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
+                return Ok(Some(Found { id: up.profile.id, created: false }));
+            }
         }
+        existing = audience::find_profile(&state.db, src.account_id, &input).await?;
     }
-    let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
-    if up.created {
-        out.counts.profiles_created += 1;
-    }
-    after_write(state, src, up.profile.id, up.created, up.profile.email.as_deref(), false, out).await?;
-    mark_sources(state, src, up.profile.id, input.email.as_deref(), input.phone_number.as_deref()).await?;
-    Ok(Some(Found { id: up.profile.id, created: up.created }))
+    Err(AppError::Conflict("that profile kept changing while this ran; this delivery will be tried again".into()))
 }
 
 /// Create a profile the integration found nobody for, in one transaction with everything that
@@ -1181,7 +1189,22 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
     let opts_in = p.consent.iter().any(|c| c.channel == Channel::Email && c.subscribed);
     // Nobody has these identifiers: create the profile with its hold, source, keys and suppression
     // in one transaction (with the ledger entry, when nothing else follows).
-    if audience::find_profile(&state.db, src.account_id, &input).await?.is_none() {
+    // A new profile only ever comes from the single insert that holds it; an existing match is only
+    // updated (if it vanished meanwhile, look again).
+    let mut tries = 0;
+    let up = loop {
+        tries += 1;
+        if tries > 3 {
+            return Err(AppError::Conflict("that profile kept changing while this ran; this delivery will be tried again".into()));
+        }
+        if audience::find_profile(&state.db, src.account_id, &input).await?.is_some() {
+            crate::features::objects::hooks::pause(src.account_id, "before_update").await;
+            match audience::update_matching_profile(&state.db, src.account_id, &input).await? {
+                Some(up) => break up,
+                None => continue,
+            }
+        }
+        crate::features::objects::hooks::pause(src.account_id, "before_create").await;
         let last = p.consent.is_empty();
         let props = p.properties.clone().unwrap_or_default();
         let keys = p.keys.clone().unwrap_or_default();
@@ -1209,8 +1232,7 @@ async fn upsert(state: &AppState, src: &Source, i: usize, p: &UpsertProfile, pri
             out.effect(i, line);
             return Ok(());
         }
-    }
-    let up = audience::upsert_profile(&state.db, src.account_id, &input).await?;
+    };
     if up.created { out.counts.profiles_created += 1 } else { out.counts.profiles_updated += 1 }
     if let Some(props) = &p.properties {
         save_keys(state, src.account_id, up.profile.id, props).await?;

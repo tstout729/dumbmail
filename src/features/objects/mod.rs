@@ -16,6 +16,7 @@
 pub mod api;
 pub mod bulk;
 pub mod flow;
+pub mod hooks;
 pub mod store;
 pub mod types;
 

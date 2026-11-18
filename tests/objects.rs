@@ -484,3 +484,53 @@ async fn two_change_jobs_for_one_object_start_one_run() {
     assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 1, "re-entry 'never' for this object: one run");
     h.cleanup().await;
 }
+
+async fn account_of(h: &Harness) -> uuid::Uuid {
+    sqlx::query_scalar("SELECT id FROM accounts ORDER BY created_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap()
+}
+
+/// Make `path` POST a JSON webhook body to an integration with no signature.
+async fn integration(h: &mut Harness, script: &str, redact: Value) -> (String, String) {
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "PMS", "script": script, "redact": redact}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    (i["id"].as_str().unwrap().to_string(), url[url.find("/webhooks/in/").unwrap()..].to_string())
+}
+
+#[tokio::test]
+async fn an_integration_never_inserts_a_profile_unheld() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    // Every profile insert is recorded with its hold as inserted.
+    for sql in [
+        "CREATE TABLE test_inserts (email text, held boolean)",
+        "CREATE FUNCTION test_record_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO test_inserts VALUES (NEW.email, NEW.marketing_hold); RETURN NEW; END $$",
+        "CREATE TRIGGER test_record_insert AFTER INSERT ON profiles FOR EACH ROW EXECUTE FUNCTION test_record_insert()",
+    ] {
+        sqlx::query(sql).execute(&h.state.db).await.unwrap();
+    }
+    let (_, path) = integration(&mut h, "function handle(i) { return [{type: 'upsert_profile', email: 'guest@example.com', first_name: 'G'}] }", json!([])).await;
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let (s, _, r) = h.raw("POST", &path, &[("content-type", "application/json")], "{}").await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let state = h.state.clone();
+    let job = tokio::spawn(async move { dumbmail::jobs::drain_lane(&state, dumbmail::jobs::BACKGROUND).await.unwrap() });
+    // Someone else creates the same person just before the integration's insert ...
+    assert_eq!(points.recv().await, Some("before_create"));
+    sqlx::query("INSERT INTO profiles (id, account_id, email) VALUES ($1, $2, 'guest@example.com')").bind(uuid::Uuid::now_v7()).bind(acct).execute(&h.state.db).await.unwrap();
+    go.notify_one();
+    // ... and deletes it just before the integration updates the match.
+    assert_eq!(points.recv().await, Some("before_update"));
+    sqlx::query("DELETE FROM profiles WHERE email = 'guest@example.com'").execute(&h.state.db).await.unwrap();
+    go.notify_one();
+    assert_eq!(points.recv().await, Some("before_create"));
+    go.notify_one();
+    job.await.unwrap();
+    dumbmail::features::objects::hooks::remove(acct);
+    let inserts: Vec<(String, bool)> = sqlx::query_as("SELECT email, held FROM test_inserts").fetch_all(&h.state.db).await.unwrap();
+    // The other writer's own insert, then the integration's: held from its first insert.
+    assert_eq!(inserts, vec![("guest@example.com".to_string(), false), ("guest@example.com".to_string(), true)]);
+    let (held, src): (bool, Option<String>) = sqlx::query_as("SELECT marketing_hold, email_source FROM profiles WHERE email = 'guest@example.com'").fetch_one(&h.state.db).await.unwrap();
+    assert!(held && src.is_some_and(|s| s.starts_with("integration:")));
+    h.cleanup().await;
+}
