@@ -1,0 +1,63 @@
+{
+  "key": "segment",
+  "name": "Segment",
+  "category": "Data",
+  "description": "Segment identify calls become profiles and track calls become events (Segment's ecommerce events by default: Order Completed, Order Refunded and more), through Segment's Webhooks destination. People this adds are held back from marketing: Segment calls carry no marketing opt-in.",
+  "metrics": [
+    "Order Completed",
+    "Order Refunded",
+    "Order Cancelled",
+    "Checkout Started",
+    "Product Added",
+    "Product Viewed",
+    "Signed Up"
+  ],
+  "docs": [
+    "https://segment.com/docs/connections/destinations/catalog/webhooks/",
+    "https://segment.com/docs/connections/spec/identify/",
+    "https://segment.com/docs/connections/spec/track/",
+    "https://segment.com/docs/connections/spec/common/",
+    "https://segment.com/docs/connections/spec/ecommerce/v2/"
+  ],
+  "signature": {
+    "type": "hmac",
+    "header": "X-Signature",
+    "algorithm": "sha1"
+  },
+  "signature_secret": {
+    "label": "Segment shared secret",
+    "help": "A random value you choose. Set the same value as Shared Secret in the Webhooks destination's settings."
+  },
+  "message_id": {
+    "field": "messageId"
+  },
+  "credentials": [],
+  "settings": {
+    "events": [
+      "Order Completed",
+      "Order Refunded",
+      "Order Cancelled",
+      "Checkout Started",
+      "Product Added",
+      "Product Viewed",
+      "Signed Up"
+    ]
+  },
+  "pull": null,
+  "redact": [
+    "**.context.ip",
+    "**.context.userAgent",
+    "**.context.device",
+    "**.context.location",
+    "**.password"
+  ],
+  "setup": [
+    "Create the integration from this recipe and copy its webhook URL.",
+    "Pick a random secret and save it as the integration's signing secret.",
+    "In Segment, add the Webhooks destination (the classic one, not Webhooks (Actions)) to the source to connect. Under Webhooks, add the webhook URL. Set Shared Secret to the same secret. Leave batching off (Segment signs only the first event of a batch). Turn it on.",
+    "Only identify and track calls are used. track calls are recorded only for the event names in settings.events; to record another, add its name to settings.events and to the integration's metrics.",
+    "Connect only sources you trust: anyone with a source's write key can send calls through it, and a browser source's write key is public. Flows that trust these events should be about things a server reported.",
+    "People this adds are held back from marketing."
+  ],
+  "flows": []
+}

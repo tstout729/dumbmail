@@ -1,0 +1,40 @@
+{
+  "description": "track Order Completed: found by the userId identify saved, valued at its revenue, recorded once by messageId",
+  "doc": "https://segment.com/docs/connections/destinations/catalog/webhooks/ (the Identify and Track examples, with a messageId and email as the Segment spec defines; personal data replaced)",
+  "expect": [
+    {
+      "metric": "Order Completed",
+      "profile": {
+        "if_missing": "retry",
+        "property": "segment_user_id",
+        "value": "019mr8mf4r"
+      },
+      "properties": {
+        "currency": "USD",
+        "order_id": "50314b8e9bcf000000000000",
+        "revenue": "39.95",
+        "shippingMethod": "2-day"
+      },
+      "time": "2012-12-02T00:30:08.276Z",
+      "type": "track_event",
+      "unique_id": "segment:ajs-track-0001",
+      "value": 39.95
+    }
+  ],
+  "input": {
+    "payload": {
+      "event": "Order Completed",
+      "messageId": "ajs-track-0001",
+      "properties": {
+        "currency": "USD",
+        "order_id": "50314b8e9bcf000000000000",
+        "revenue": "39.95",
+        "shippingMethod": "2-day"
+      },
+      "timestamp": "2012-12-02T00:30:08.276Z",
+      "type": "track",
+      "userId": "019mr8mf4r",
+      "version": 1
+    }
+  }
+}
