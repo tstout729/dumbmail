@@ -536,6 +536,11 @@ async fn final_claim(state: &AppState, message_id: Uuid, attempt: Attempt) -> Ap
     .bind(message_id)
     .execute(&mut *tx)
     .await?;
+    // Retries that aren't due yet keep a job of their own (each hand-off schedules only its earliest).
+    let later: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT min(next_attempt_at) FROM push_deliveries WHERE message_id = $1 AND status = 'retry'").bind(message_id).fetch_one(&mut *tx).await?;
+    if let Some(at) = later {
+        crate::jobs::enqueue_background(&mut *tx, "push_retry", json!({"message_id": message_id, "account_id": account_id}), Some(at)).await?;
+    }
     if rows.is_empty() {
         let out = settle(&mut tx, state, account_id, message_id, is_test).await?;
         tx.commit().await?;

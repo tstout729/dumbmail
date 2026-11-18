@@ -245,10 +245,11 @@ async fn apns_client(row: &Row) -> Option<reqwest::Client> {
     Some(c)
 }
 
-/// Number of APNs connection pools held (tests).
+/// APNs connection pools held for an account (tests).
 #[doc(hidden)]
-pub async fn apns_pools() -> usize {
-    APNS_POOLS.lock().await.len()
+pub async fn apns_pools_for(account_id: Uuid) -> usize {
+    let prefix = format!("{account_id}:");
+    APNS_POOLS.lock().await.keys().filter(|k| k.starts_with(&prefix)).count()
 }
 
 async fn apns_token(row: &Row, p8: &str) -> Option<(String, String)> {
@@ -340,6 +341,9 @@ pub async fn send_apns(state: &AppState, row: &Row, m: &ApnsMessage<'_>) -> Sent
 /// Access tokens per account and credential version, until shortly before they expire.
 static FCM_TOKENS: Lazy<Mutex<HashMap<String, (String, i64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Sign-ins in progress, per credential set.
+static FCM_FLIGHTS: Lazy<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 
 async fn fcm_token(state: &AppState, row: &Row, sa: &ServiceAccount, raw: &str) -> Result<(String, String), Sent> {
@@ -349,10 +353,21 @@ async fn fcm_token(state: &AppState, row: &Row, sa: &ServiceAccount, raw: &str) 
     };
     let key = format!("{}:{}:{}", row.account_id, row.credentials_version, cache_key(&[raw, &token_url]));
     let now = chrono::Utc::now().timestamp();
-    if let Some((t, exp)) = FCM_TOKENS.lock().await.get(&key) {
-        if *exp - 300 > now {
-            return Ok((key, t.clone()));
-        }
+    let cached = || async {
+        FCM_TOKENS.lock().await.get(&key).filter(|(_, exp)| *exp - 300 > now).map(|(t, _)| t.clone())
+    };
+    if let Some(t) = cached().await {
+        return Ok((key, t));
+    }
+    // One sign-in per credential set at a time: devices sent to at once share it.
+    let flight = {
+        let mut m = FCM_FLIGHTS.lock().await;
+        bound(&mut m, MAX_CACHED, |f: &std::sync::Arc<Mutex<()>>| std::sync::Arc::strong_count(f) == 1);
+        m.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(Mutex::new(()))).clone()
+    };
+    let _turn = flight.lock().await;
+    if let Some(t) = cached().await {
+        return Ok((key, t));
     }
     let assertion = crypto::google_assertion(&sa.private_key, &sa.private_key_id, &sa.client_email, FCM_SCOPE, GOOGLE_TOKEN_URI, now).map_err(|_| Sent::Account("the service account key can't sign".into()))?;
     let res = HTTP
@@ -379,10 +394,11 @@ async fn fcm_token(state: &AppState, row: &Row, sa: &ServiceAccount, raw: &str) 
     Ok((key, token))
 }
 
-/// Cached Firebase tokens (tests).
+/// Firebase tokens cached for an account (tests).
 #[doc(hidden)]
-pub async fn fcm_tokens() -> usize {
-    FCM_TOKENS.lock().await.len()
+pub async fn fcm_tokens_for(account_id: Uuid) -> usize {
+    let prefix = format!("{account_id}:");
+    FCM_TOKENS.lock().await.keys().filter(|k| k.starts_with(&prefix)).count()
 }
 
 pub async fn send_fcm(state: &AppState, row: &Row, message: &Value) -> Sent {
