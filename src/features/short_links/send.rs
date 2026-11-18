@@ -144,7 +144,6 @@ pub struct TextLinks {
     /// Link as written → its short link.
     links: HashMap<String, String>,
     issued: HashSet<String>,
-    own: HashSet<String>,
 }
 
 impl TextLinks {
@@ -171,12 +170,8 @@ impl TextLinks {
 }
 
 impl SmsLinks for TextLinks {
-    fn source<'a>(&self, template: &'a str) -> Cow<'a, str> {
-        replace_literals(template, &self.own, |l| self.links.get(l).cloned())
-    }
-
-    fn issued(&self, link: &str) -> bool {
-        self.issued.contains(link)
+    fn short(&self, link: &str) -> Option<String> {
+        self.links.get(link).cloned()
     }
 }
 
@@ -213,7 +208,7 @@ pub async fn for_send(state: &AppState, spec: &SendSpec<'_>, content: &Value, ho
         return Ok(None);
     }
     let issued = links.values().cloned().collect();
-    Ok(Some(TextLinks { refs, links, issued, own }))
+    Ok(Some(TextLinks { refs, links, issued }))
 }
 
 /// The targets riding on a campaign's content (codes checked again: content can be typed by hand).
@@ -325,6 +320,8 @@ pub fn campaign_content<'a>(content: &'a Value, targets: Option<&Value>) -> Cow<
 pub struct Sample {
     own: HashSet<String>,
     short: String,
+    /// The links the previewed text's template has that a send would shorten.
+    written: HashSet<String>,
 }
 
 impl Sample {
@@ -332,29 +329,31 @@ impl Sample {
     pub fn count_in(&self, body: &str) -> usize {
         body.matches(self.short.as_str()).count()
     }
+
+    /// A template with every link a send would shorten replaced by a short link of the real length,
+    /// for estimates that don't render (the launch check).
+    pub fn estimate<'a>(&self, template: &'a str) -> Cow<'a, str> {
+        replace_literals(template, &self.own, |_| Some(self.short.clone()))
+    }
 }
 
 impl SmsLinks for Sample {
-    fn source<'a>(&self, template: &'a str) -> Cow<'a, str> {
-        replace_literals(template, &self.own, |_| Some(self.short.clone()))
-    }
-
-    fn issued(&self, link: &str) -> bool {
-        link == self.short
+    fn short(&self, link: &str) -> Option<String> {
+        self.written.contains(link).then(|| self.short.clone())
     }
 }
 
 /// See [`Sample`]. One statement, only when the body has a link the sender wrote.
 pub async fn preview(state: &AppState, account: &Account, body: &str) -> AppResult<Option<Sample>> {
-    if written_links(body, &own_hosts(state, account.link_domain.as_deref())).is_empty() {
+    let written: HashSet<String> = written_links(body, &own_hosts(state, account.link_domain.as_deref())).into_iter().collect();
+    if written.is_empty() {
         return Ok(None);
     }
-    sample_for(state, account).await
+    Ok(sample_for(state, account).await?.map(|s| Sample { written, ..s }))
 }
 
-/// The sample for any text of this account (one statement), for estimates over several texts:
-/// [`SmsLinks::source`] on it gives a template with every link the send would shorten replaced by
-/// a short link of the real length. None when the send wouldn't shorten anything now.
+/// The sample for any text of this account (one statement), for estimates over several texts
+/// ([`Sample::estimate`]). None when the send wouldn't shorten anything now.
 pub async fn sample_for(state: &AppState, account: &Account) -> AppResult<Option<Sample>> {
     // Until this server issues short links, sends use the long form, so estimates do too.
     if !runtime::issuing(state) {
@@ -364,7 +363,7 @@ pub async fn sample_for(state: &AppState, account: &Account) -> AppResult<Option
     if !on {
         return Ok(None);
     }
-    Ok(Some(Sample { own: own_hosts(state, account.link_domain.as_deref()), short: sample_link(state, account) }))
+    Ok(Some(Sample { own: own_hosts(state, account.link_domain.as_deref()), short: sample_link(state, account), written: HashSet::new() }))
 }
 
 /// A short link of the real length on this account's link domain.

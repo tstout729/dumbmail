@@ -532,7 +532,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
             .iter()
             .map(|content| {
                 let raw = content.get("body").and_then(|b| b.as_str()).unwrap_or("");
-                let body = short_links.as_ref().map_or(std::borrow::Cow::Borrowed(raw), |s| render::SmsLinks::source(s, raw));
+                let body = short_links.as_ref().map_or(std::borrow::Cow::Borrowed(raw), |s| s.estimate(raw));
                 let n = crate::providers::sms::segment_count(&format!("{}: {body} Reply STOP to opt out.", account.name)).1 as i64;
                 (n.max(1), content.get("media_url").and_then(|m| m.as_str()).is_some_and(|m| !m.is_empty()))
             })

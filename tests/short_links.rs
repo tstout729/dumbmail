@@ -771,3 +771,22 @@ async fn request_logs_never_show_a_short_links_code() {
     assert!(!paths.iter().any(|p| p.contains(&path[..10])), "{paths:?}");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_link_a_tag_completes_keeps_the_long_form_and_goes_where_it_reads() {
+    let mut h = harness!();
+    let (_, list) = setup(&mut h).await;
+    let (_, phone) = texter(&mut h, &list, 8601).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/buy {{- 'now' }} or https://shop.test/plain").await;
+    launch(&mut h, &id).await;
+    let body = body_to(&h, &phone);
+    // The rendered link is /buynow: it isn't all literal text, so it keeps the long form, and that
+    // goes to /buynow. The plain literal link is shortened.
+    let p = short_paths(&body);
+    assert_eq!(p.len(), 1, "{body}");
+    let long = body.split_whitespace().find(|w| w.contains("/t/c/")).unwrap_or_else(|| panic!("{body}"));
+    let dest = url::form_urlencoded::parse(long.split_once('?').unwrap().1.as_bytes()).find(|(k, _)| k == "u").unwrap().1.into_owned();
+    assert_eq!(dest, "https://shop.test/buynow");
+    assert_eq!(click(&h, &p[0]).await.1.as_deref(), Some("https://shop.test/plain"));
+    h.cleanup().await;
+}
