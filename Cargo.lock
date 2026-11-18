@@ -1448,6 +1448,7 @@ dependencies = [
  "http-body-util",
  "image",
  "libc",
+ "md-5",
  "mime_guess",
  "minijinja",
  "once_cell",
