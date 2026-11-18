@@ -1,0 +1,22 @@
+name = "dumbmail-pixel"
+type = "web_pixel_extension"
+runtime_context = "strict"
+
+[customer_privacy]
+analytics = true
+marketing = true
+preferences = false
+sale_of_data = "disabled"
+
+[settings]
+type = "object"
+
+[settings.fields.base]
+name = "DumbMail address"
+description = "Set by DumbMail when the store connects."
+type = "single_line_text_field"
+
+[settings.fields.key]
+name = "Public key"
+description = "Set by DumbMail when the store connects."
+type = "single_line_text_field"

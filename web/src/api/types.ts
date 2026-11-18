@@ -354,6 +354,7 @@ export type CampaignReport = {
 
 // ---- Flows ----
 
+import type { DelayOptions, EventSplit, NotifyNode } from "../features/flowsPlus/types";
 /** With `cancelled_by`, people leave the flow when a later event of those metrics has the same `key` property value. */
 type CancelledBy = { key?: string; cancelled_by?: string[] };
 
@@ -368,13 +369,16 @@ export type FlowTrigger =
 
 export type DelayUnit = "minutes" | "hours" | "days";
 
-export type DelayNode = { id: string; type: "delay"; amount: number; unit: DelayUnit; next: string | null };
+/** Options for waiting until a time of day, weekdays or a date: see features/flowsPlus. */
+export type DelayNode = { id: string; type: "delay"; amount: number; unit: DelayUnit; next: string | null } & DelayOptions;
 export type EmailNode = { id: string; type: "email"; name?: string; content: EmailContent; next: string | null };
 export type SmsNode = { id: string; type: "sms"; name?: string; content: SmsContent; next: string | null };
 export type ConditionNode = {
   id: string;
   type: "condition";
   condition: SegmentDefinition;
+  /** A trigger split: filters on the event that started the run. */
+  event_condition?: EventSplit;
   /** In object flows: rules on the run's object's fields (all must hold too). */
   object_filters?: FieldFilter[];
   yes: string | null;
@@ -427,7 +431,8 @@ export type FlowNode =
   | WaitForReplyNode
   | UpdateProfileNode
   | ListActionNode
-  | WebhookNode;
+  | WebhookNode
+  | NotifyNode;
 
 export type FlowNodeType = FlowNode["type"];
 
@@ -438,6 +443,8 @@ export type FlowSettings = {
   exit_condition?: SegmentDefinition;
   profile_filter?: SegmentDefinition;
   smart_sending_hours?: number;
+  /** Most notification emails a day (default 200, at most 2,000). */
+  notify_daily_cap?: number;
   /** Also send to people held back from marketing (added by an integration without an opt-in). */
   service_messages?: boolean;
 };

@@ -303,20 +303,6 @@ async fn passes_profile_filter(state: &AppState, f: &FlowRow, def: &flows::FlowD
     segments::profile_matches(&state.db, profile_id, &seg).await.map_err(|e| anyhow::anyhow!(e.public_message()))
 }
 
-async fn insert_run(conn: &mut PgConnection, f: &FlowRow, profile_id: Uuid, entry: &str, ctx: &Value) -> sqlx::Result<Uuid> {
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context) VALUES ($1, $2, $3, $4, $5, $6)")
-        .bind(id)
-        .bind(f.id)
-        .bind(f.account_id)
-        .bind(profile_id)
-        .bind(entry)
-        .bind(ctx)
-        .execute(&mut *conn)
-        .await?;
-    crate::jobs::enqueue(&mut *conn, "flow_step", json!({"run_id": id}), None).await?;
-    Ok(id)
-}
 
 /// Checks and starts for one object-date fire, inside the claiming transaction: one run per linked
 /// person (re-entry doesn't apply: each object's date starts the flow once).
@@ -340,7 +326,7 @@ async fn date_start(state: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postg
         if !passes_profile_filter(state, f, &def, pid).await? {
             continue;
         }
-        let id = insert_run(tx, f, pid, &entry, &ctx).await?;
+        let Some(id) = flows::enter(tx, f, &def, pid, &entry, &ctx, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else { continue };
         first.get_or_insert(id);
         n += 1;
     }
@@ -510,41 +496,17 @@ async fn change_start(state: &AppState, f: &FlowRow, change_id: Uuid, object_id:
     if claimed.is_none() {
         return Ok(());
     }
-    let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
     let ctx = json!({"object": {"id": object_id, "type": o.type_key, "external_id": o.external_id, "change_id": change_id, "change": kind, "changed": changed}});
-    let oid = object_id.to_string();
     let mut n = 0;
     for pid in linked(&mut tx, object_id, relationship).await? {
-        let blocked: bool = match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
-            (Value::String(s), _) if s == "always" => {
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active' AND context->'object'->>'id' = $3)")
-                    .bind(f.id)
-                    .bind(pid)
-                    .bind(&oid)
-                    .fetch_one(&mut *tx)
-                    .await?
-            }
-            (_, Some(days)) => sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND context->'object'->>'id' = $3 AND (status = 'active' OR started_at > now() - make_interval(secs => $4)))",
-            )
-            .bind(f.id)
-            .bind(pid)
-            .bind(&oid)
-            .bind(days * 86400.0)
-            .fetch_one(&mut *tx)
-            .await?,
-            _ => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND context->'object'->>'id' = $3)")
-                .bind(f.id)
-                .bind(pid)
-                .bind(&oid)
-                .fetch_one(&mut *tx)
-                .await?,
-        };
-        if blocked || !passes_profile_filter(state, f, &def, pid).await? {
+        if !passes_profile_filter(state, f, &def, pid).await? {
             continue;
         }
-        insert_run(&mut tx, f, pid, &entry, &ctx).await?;
-        n += 1;
+        // Re-entry is checked under the flow's per-person lock, for this object only (see
+        // `flows::enter`), so two change jobs for one object can't both start a run.
+        if flows::enter(&mut tx, f, &def, pid, &entry, &ctx, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?.is_some() {
+            n += 1;
+        }
     }
     sqlx::query("UPDATE object_flow_starts SET runs = $3 WHERE change_id = $1 AND flow_id = $2").bind(change_id).bind(f.id).bind(n).execute(&mut *tx).await?;
     tx.commit().await?;

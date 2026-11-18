@@ -260,7 +260,7 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for n in &def.nodes {
         let edges: Vec<&str> = match n.kind.as_str() {
             "condition" | "random_split" | "wait_for_reply" => vec!["yes", "no"],
-            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" => vec!["next"],
+            "delay" | "email" | "sms" | "update_profile" | "add_to_list" | "remove_from_list" | "webhook" | "notify" => vec!["next"],
             other => return Err(AppError::bad(format!("unknown step type {other:?} (node {})", n.id))),
         };
         for e in edges {
@@ -353,6 +353,8 @@ pub fn parse_definition(v: &Value) -> AppResult<FlowDef> {
     for key in [&def.settings.exit_condition, &def.settings.profile_filter].into_iter().flatten() {
         segments::parse(key)?;
     }
+    // Delay options, trigger splits and notification steps (see features::flows_plus).
+    crate::features::flows_plus::validate(&def, v)?;
     Ok(def)
 }
 
@@ -499,34 +501,16 @@ async fn profile(db: &PgPool, id: Uuid) -> AppResult<Option<Profile>> {
 pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: Value) -> AppResult<Option<Uuid>> {
     let def = parse_definition(&flow.definition)?;
     let Some(entry) = def.entry.clone() else { return Ok(None) };
-    let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
-    // Event-date flows start once per event (a guest with two bookings gets both), so re-entry doesn't apply.
-    let per_event = matches!(parse_trigger(&flow.trigger), Ok(Trigger::EventDate { .. } | Trigger::ObjectDate { .. }));
-    let blocked: bool = !per_event && match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
-        (Value::String(s), _) if s == "always" => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active')")
-                .bind(flow.id)
-                .bind(profile_id)
-                .fetch_one(&state.db)
-                .await?
-        }
-        (_, Some(days)) => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => $3)))")
-                .bind(flow.id)
-                .bind(profile_id)
-                .bind(days * 86400.0)
-                .fetch_one(&state.db)
-                .await?
-        }
-        _ => {
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2)")
-                .bind(flow.id)
-                .bind(profile_id)
-                .fetch_one(&state.db)
-                .await?
-        }
-    };
-    if blocked {
+    // The cheap rejection first, with no lock or transaction: most repeat triggers stop here.
+    // Event-date flows start once per event (a guest with two bookings gets both), so re-entry
+    // doesn't apply to them.
+    let (blocked, days) = reentry_rule(flow, &def, 3, None);
+    let sql = format!("SELECT {blocked}");
+    let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(flow.id).bind(profile_id);
+    if let Some(d) = days {
+        q = q.bind(d);
+    }
+    if q.fetch_one(&state.db).await? {
         return Ok(None);
     }
     if let Some(f) = &def.settings.profile_filter {
@@ -534,18 +518,74 @@ pub async fn start(state: &AppState, flow: &FlowRow, profile_id: Uuid, context: 
             return Ok(None);
         }
     }
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context) VALUES ($1, $2, $3, $4, $5, $6)")
-        .bind(id)
+    let mut tx = state.db.begin().await?;
+    let id = enter(&mut tx, flow, &def, profile_id, &entry, &context, None).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// The re-entry rule as an SQL condition that is true when person $2 may not enter flow $1 now,
+/// and the seconds to bind as `$window` when the rule has a window (then bind it last). Event-date
+/// flows have none: they start once per event.
+/// Object-triggered flows (see `features::objects`) count runs for the same object only: `context`
+/// names the bound run context (`$n`) whose `object.id` they compare; without it (the cheap check in
+/// [`start`]) nothing is rejected and [`enter`] decides.
+fn reentry_rule(flow: &FlowRow, def: &FlowDef, window: usize, context: Option<&str>) -> (String, Option<f64>) {
+    let trigger = parse_trigger(&flow.trigger);
+    if matches!(trigger, Ok(Trigger::EventDate { .. } | Trigger::ObjectDate { .. })) {
+        return ("FALSE".into(), None);
+    }
+    let same_object = match (&trigger, context) {
+        (Ok(Trigger::Object { .. }), Some(c)) => format!(" AND context->'object'->>'id' = ({c}::jsonb)->'object'->>'id'"),
+        (Ok(Trigger::Object { .. }), None) => return ("FALSE".into(), None),
+        _ => String::new(),
+    };
+    let reentry = def.settings.reentry.clone().unwrap_or(json!("never"));
+    match (&reentry, reentry.get("after_days").and_then(|d| d.as_f64())) {
+        (Value::String(s), _) if s == "always" => (format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND status = 'active'{same_object})"), None),
+        (_, Some(days)) => (
+            format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2 AND (status = 'active' OR started_at > now() - make_interval(secs => ${window})){same_object})"),
+            Some(days * 86400.0),
+        ),
+        _ => (format!("EXISTS (SELECT 1 FROM flow_runs WHERE flow_id = $1 AND profile_id = $2{same_object})"), None),
+    }
+}
+
+/// Start a run at step `node` inside `tx` unless re-entry rules say no, with its first job at
+/// `run_at` (now when None). Under a lock on this flow and person, the rule is checked again and the
+/// run and its job are written in one statement, so two starts can't both pass it.
+pub async fn enter(
+    tx: &mut sqlx::PgConnection,
+    flow: &FlowRow,
+    def: &FlowDef,
+    profile_id: Uuid,
+    node: &str,
+    context: &Value,
+    run_at: Option<chrono::DateTime<Utc>>,
+) -> AppResult<Option<Uuid>> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || $2::text, 7))").bind(flow.id).bind(profile_id).execute(&mut *tx).await?;
+    let (blocked, days) = reentry_rule(flow, def, 9, Some("$6"));
+    let sql = format!(
+        "WITH r AS (
+            INSERT INTO flow_runs (id, flow_id, account_id, profile_id, current_node, context)
+            SELECT $3, $1, $4, $2, $5, $6 WHERE NOT {blocked}
+            RETURNING id)
+         INSERT INTO jobs (kind, payload, run_at, lane) SELECT 'flow_step', jsonb_build_object('run_id', r.id), COALESCE($7, now()), $8 FROM r
+         RETURNING (payload->>'run_id')::uuid"
+    );
+    let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
         .bind(flow.id)
-        .bind(flow.account_id)
         .bind(profile_id)
-        .bind(&entry)
-        .bind(&context)
-        .execute(&state.db)
-        .await?;
-    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": id}), None).await?;
-    Ok(Some(id))
+        .bind(Uuid::now_v7())
+        .bind(flow.account_id)
+        .bind(node)
+        .bind(context)
+        .bind(run_at)
+        .bind(crate::jobs::MAIN);
+    if let Some(d) = days {
+        q = q.bind(d);
+    }
+    Ok(q.fetch_optional(&mut *tx).await?)
 }
 
 /// Job: an event happened; start matching metric-triggered flows.
@@ -604,7 +644,13 @@ pub async fn on_list_add(state: &AppState, list_id: Uuid, profile_ids: &[Uuid]) 
 
 /// Job: refresh a segment's membership and start segment-triggered flows for new members.
 pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Result<()> {
-    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as("SELECT account_id, definition, refreshed_at, absorb_entries FROM segments WHERE id = $1")
+    // `absorb_entries`, or a Shopify history page being written for the account right now (one
+    // statement either way; the second is a partial index that's empty unless an import is writing).
+    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as(
+        "SELECT account_id, definition, refreshed_at,
+                absorb_entries OR EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = segments.account_id AND i.history_open)
+         FROM segments WHERE id = $1",
+    )
         .bind(segment_id)
         .fetch_optional(&state.db)
         .await?;
@@ -620,7 +666,8 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone. Neither
-    // does one while past activity is being imported into the account (`absorb_entries`).
+    // does one while past activity is being imported into the account (`absorb_entries`, and a Shopify
+    // history page being written right now).
     if refreshed_at.is_none() || absorb {
         return Ok(());
     }
@@ -990,20 +1037,99 @@ struct Run {
     current_node: Option<String>,
     status: String,
     context: Value,
+    claim_id: Option<Uuid>,
+    claim_until: Option<chrono::DateTime<Utc>>,
+    waiting_until: Option<chrono::DateTime<Utc>>,
 }
 
-async fn finish(db: &PgPool, run_id: Uuid, status: &str) -> anyhow::Result<()> {
-    sqlx::query("UPDATE flow_runs SET status = $2, finished_at = now(), current_node = NULL WHERE id = $1")
-        .bind(run_id)
-        .bind(status)
-        .execute(db)
-        .await?;
+/// How long a claim on a run holds while its step reaches outside: longer than any provider
+/// time-out or rate-limit wait a step can incur, and than the 15 minutes after which a stuck job is
+/// retried, so a slow call can't outlive it. A worker that dies holding one is taken over after.
+const CLAIM_MINUTES: i64 = 20;
+
+/// What a worker expects the run to be: written by nobody else since it loaded it or last wrote it.
+/// Every write is conditional on it and swaps in a fresh claim id, so one worker moves a run at a
+/// time; a worker whose write matches nothing stops.
+struct Hold {
+    run: Uuid,
+    claim: Option<Uuid>,
+    node: Option<String>,
+}
+
+const HELD: &str = "id = $1 AND status = 'active' AND claim_id IS NOT DISTINCT FROM $2 AND current_node IS NOT DISTINCT FROM $3";
+
+/// Test hook: hold a run's worker right after it loaded the run, so a test can run another worker
+/// in that gap. Never set outside tests.
+#[doc(hidden)]
+pub struct StepPause {
+    arrived: tokio::sync::Semaphore,
+    go: tokio::sync::Semaphore,
+}
+
+static STEP_PAUSES: once_cell::sync::Lazy<std::sync::Mutex<HashMap<Uuid, std::sync::Arc<StepPause>>>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+impl StepPause {
+    /// Hold the next worker that loads this run (once).
+    #[doc(hidden)]
+    pub fn hold(run_id: Uuid) -> std::sync::Arc<Self> {
+        let p = std::sync::Arc::new(Self { arrived: tokio::sync::Semaphore::new(0), go: tokio::sync::Semaphore::new(0) });
+        if let Ok(mut m) = STEP_PAUSES.lock() {
+            m.insert(run_id, p.clone());
+        }
+        p
+    }
+
+    pub async fn arrived(&self) {
+        if let Ok(permit) = self.arrived.acquire().await {
+            permit.forget();
+        }
+    }
+
+    pub fn release(&self) {
+        self.go.add_permits(1000);
+    }
+}
+
+async fn step_pause(run_id: Uuid) {
+    let pause = STEP_PAUSES.lock().ok().and_then(|mut m| m.remove(&run_id));
+    if let Some(p) = pause {
+        p.arrived.add_permits(1);
+        if let Ok(permit) = p.go.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+async fn finish(db: &PgPool, h: &Hold, status: &str) -> anyhow::Result<()> {
+    // Only by the worker holding the run: one taken out of the flow, or moved on by another worker, stays as it is.
+    sqlx::query(&format!(
+        "UPDATE flow_runs SET status = $4, finished_at = now(), current_node = NULL, claim_id = NULL, claim_until = NULL, waiting_until = NULL WHERE {HELD}"
+    ))
+    .bind(h.run)
+    .bind(h.claim)
+    .bind(&h.node)
+    .bind(status)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
-/// Job: advance a run until it hits a delay or finishes.
+/// Job: advance a run until it hits a delay or finishes. A wake-up job carries the wait it is for
+/// (`wake`, the claim id it parked the run with) and does nothing unless the run is still in that
+/// wait; a job without one does nothing while the run is waiting for its own wake-up.
+pub async fn step_job(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    let Some(run_id) = payload["run_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Err(anyhow::anyhow!("job payload missing run_id")) };
+    let wake = payload["wake"].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    step_with(state, run_id, wake, payload).await
+}
+
+/// Advance a run now (as a job without a wake would).
 pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
-    let Some(run) = sqlx::query_as::<_, Run>("SELECT id, flow_id, profile_id, current_node, status, context FROM flow_runs WHERE id = $1")
+    step_with(state, run_id, None, &json!({"run_id": run_id})).await
+}
+
+async fn step_with(state: &AppState, run_id: Uuid, wake: Option<Uuid>, payload: &Value) -> anyhow::Result<()> {
+    let Some(run) = sqlx::query_as::<_, Run>("SELECT id, flow_id, profile_id, current_node, status, context, claim_id, claim_until, waiting_until FROM flow_runs WHERE id = $1")
         .bind(run_id)
         .fetch_optional(&state.db)
         .await?
@@ -1013,21 +1139,36 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     if run.status != "active" {
         return Ok(());
     }
+    match wake {
+        // A wake for a wait the run is no longer in (a duplicate, or one already used): nothing to do.
+        Some(w) if run.claim_id != Some(w) || run.waiting_until.is_none() => return Ok(()),
+        Some(_) => {}
+        // Waiting for its own wake-up (this job is a retry of the one that parked it): leave it.
+        None if run.waiting_until.is_some() => return Ok(()),
+        None => {}
+    }
+    // Another worker is reaching out for this run right now: try again when its claim runs out.
+    if let Some(until) = run.claim_until.filter(|t| *t > Utc::now()) {
+        crate::jobs::enqueue(&state.db, "flow_step", payload.clone(), Some(until + Duration::seconds(1))).await?;
+        return Ok(());
+    }
+    step_pause(run.id).await;
+    let mut hold = Hold { run: run.id, claim: run.claim_id, node: run.current_node.clone() };
     // With the account's link tag settings, so its messages get their tags without another query.
     let flow: FlowRow = sqlx::query_as(crate::features::campaigns_plus::utm::FLOW_WITH_DEFAULTS_SQL).bind(run.flow_id).fetch_one(&state.db).await?;
     match flow.status.as_str() {
         "live" => {}
-        // Paused flows hold people in place and pick up when turned back on.
+        // Paused flows hold people in place and pick up when turned back on (the same wake).
         "paused" => {
-            crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(Utc::now() + Duration::minutes(15))).await?;
+            crate::jobs::enqueue(&state.db, "flow_step", payload.clone(), Some(Utc::now() + Duration::minutes(15))).await?;
             return Ok(());
         }
-        _ => return finish(&state.db, run.id, "exited").await,
+        _ => return finish(&state.db, &hold, "exited").await,
     }
     let def = parse_definition(&flow.definition).map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let account = crate::campaigns::load_account(&state.db, flow.account_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let Some(person) = profile(&state.db, run.profile_id).await.map_err(|e| anyhow::anyhow!(e.public_message()))? else {
-        return finish(&state.db, run.id, "exited").await;
+        return finish(&state.db, &hold, "exited").await;
     };
     let exit = match def.settings.exit_condition.as_ref() {
         Some(raw) => Some(segments::load(&state.db, flow.account_id, raw, None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?),
@@ -1045,40 +1186,72 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
 
     for _ in 0..100 {
         let Some(node_id) = current.clone() else {
-            return finish(&state.db, run.id, "completed").await;
+            return finish(&state.db, &hold, "completed").await;
         };
         let Some(node) = def.node(&node_id).cloned() else {
             // The step was deleted while someone waited on it.
-            return finish(&state.db, run.id, "exited").await;
+            return finish(&state.db, &hold, "exited").await;
         };
         if let Some(exit) = &exit {
             if segments::profile_matches(&state.db, run.profile_id, exit).await.map_err(|e| anyhow::anyhow!(e.public_message()))? {
-                return finish(&state.db, run.id, "exited").await;
+                return finish(&state.db, &hold, "exited").await;
             }
         }
         if let Some((event_id, key, cancelled_by)) = &event_date {
             if event_date_stale(&state.db, flow.account_id, *event_id, key.as_deref(), cancelled_by).await?.is_some() {
-                return finish(&state.db, run.id, "exited").await;
+                return finish(&state.db, &hold, "exited").await;
             }
         }
         // Runs that belong to an object: leave when it's gone, moved or no longer matches (no
         // query for other runs); its current fields are `object.*` in messages.
         let object = match crate::features::objects::flow::check_run(&state.db, &flow, &context, run.profile_id).await? {
             crate::features::objects::flow::Check::NotObject => None,
-            crate::features::objects::flow::Check::Exit(_) => return finish(&state.db, run.id, "exited").await,
+            crate::features::objects::flow::Check::Exit(_) => return finish(&state.db, &hold, "exited").await,
             crate::features::objects::flow::Check::Live { view, fields, tz } => Some((view, fields, tz)),
         };
         let waited = context.get("_waited").and_then(|v| v.as_str()) == Some(node_id.as_str());
-        if !waited {
-            sqlx::query("UPDATE flow_runs SET visited = visited || to_jsonb($2::text) WHERE id = $1")
-                .bind(run.id)
-                .bind(&node_id)
-                .execute(&state.db)
-                .await?;
+        // A step that reaches people outside (a message, a notification, a webhook), decided as it
+        // runs, takes an exclusive claim first: a fresh claim id with an expiry, written only if
+        // nobody else wrote the run since this worker loaded it. "Remove from flow" leaves a claimed
+        // run alone, so a removal and a send can't both happen, and two workers can't both send.
+        let reaches_out = !matches!(node.kind.as_str(), "delay" | "condition" | "random_split" | "wait_for_reply" | "update_profile" | "add_to_list" | "remove_from_list");
+        if !waited || reaches_out {
+            let claim = Uuid::now_v7();
+            let claimed = sqlx::query(&format!(
+                "UPDATE flow_runs SET visited = CASE WHEN $5 THEN visited ELSE visited || to_jsonb($3::text) END, claim_id = $4,
+                    claim_until = CASE WHEN $6 THEN now() + make_interval(mins => {CLAIM_MINUTES}::int) END, waiting_until = NULL
+                 WHERE {HELD}"
+            ))
+            .bind(hold.run)
+            .bind(hold.claim)
+            .bind(&node_id)
+            .bind(claim)
+            .bind(waited)
+            .bind(reaches_out)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+            if claimed == 0 {
+                return Ok(());
+            }
+            hold.claim = Some(claim);
         }
         let mut next = node.next().map(str::to_string);
         match node.kind.as_str() {
             "delay" if !waited => {
+                // A time of day, weekdays or a date (see features::flows_plus::delay); plain delays: None.
+                let until = match crate::features::flows_plus::delay::begin(&account, &person, &node, &mut context, Utc::now()) {
+                    None => None,
+                    Some(crate::features::flows_plus::delay::Wait::Until(at)) => Some(at),
+                    Some(crate::features::flows_plus::delay::Wait::Exit) => return finish(&state.db, &hold, "exited").await,
+                    Some(crate::features::flows_plus::delay::Wait::Continue) => {
+                        current = next;
+                        if !advance(&state.db, &mut hold, current.as_deref(), &context).await? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
                 let amount = node.data.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let secs = amount
                     * match node.str("unit") {
@@ -1087,17 +1260,17 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                         _ => 86400.0,
                     };
                 context["_waited"] = json!(node_id);
-                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-                    .bind(run.id)
-                    .bind(&node_id)
-                    .bind(&context)
-                    .execute(&state.db)
-                    .await?;
-                let at = Utc::now() + Duration::milliseconds((secs * 1000.0) as i64);
-                crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(at)).await?;
+                let at = until.unwrap_or_else(|| Utc::now() + Duration::milliseconds((secs * 1000.0) as i64));
+                // The wait and its wake-up are saved together, and only while the run is active.
+                wait_until(&state.db, &hold, &node_id, &context, at).await?;
                 return Ok(());
             }
             "delay" => {
+                if let Some(at) = crate::features::flows_plus::delay::wake(&mut context, Utc::now()) {
+                    // Woken before its time (early, or retried after a crash): keep waiting for it.
+                    wait_until(&state.db, &hold, &node_id, &context, at).await?;
+                    return Ok(());
+                }
                 if let Some(o) = context.as_object_mut() {
                     o.remove("_waited");
                 }
@@ -1133,13 +1306,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     .await;
                     match out {
                         Ok(Outcome::Deferred(until)) => {
-                            sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-                                .bind(run.id)
-                                .bind(&node_id)
-                                .bind(&context)
-                                .execute(&state.db)
-                                .await?;
-                            crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
+                            wait_until(&state.db, &hold, &node_id, &context, until).await?;
                             return Ok(());
                         }
                         Ok(_) => {}
@@ -1151,7 +1318,10 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
             }
             "condition" => {
                 let cond = segments::load(&state.db, flow.account_id, &node.data["condition"], None).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-                let mut yes = segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+                // A trigger split also tests the event that started the run (see features::flows_plus::split),
+                // and object rules test the run's object (see features::objects).
+                let mut yes = crate::features::flows_plus::split::event_matches(&node, &context)
+                    && segments::profile_matches(&state.db, run.profile_id, &cond).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 if let Some(ok) = crate::features::objects::flow::condition(&node, object.as_ref().map(|(_, f, tz)| (f, tz.as_str()))) {
                     yes = yes && ok;
                 }
@@ -1174,10 +1344,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 context["_waited"] = json!(node_id);
                 context["_reply_since"] = json!(since);
                 context["_reply_until"] = json!(until);
-                let mut tx = state.db.begin().await?;
-                sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1").bind(run.id).bind(&node_id).bind(&context).execute(&mut *tx).await?;
-                crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": run.id}), Some(until)).await?;
-                tx.commit().await?;
+                wait_until(&state.db, &hold, &node_id, &context, until).await?;
                 return Ok(());
             }
             "wait_for_reply" => {
@@ -1189,7 +1356,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 let replied = crate::features::inbox::replied_between(&state.db, run.profile_id, since, deadline.min(now)).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
                 if !replied && now < deadline {
                     // Woken before the deadline without a reply inside the wait: keep waiting.
-                    crate::jobs::enqueue(&state.db, "flow_step", json!({"run_id": run.id}), Some(deadline)).await?;
+                    wait_until(&state.db, &hold, &node_id, &context, deadline).await?;
                     return Ok(());
                 }
                 if let Some(o) = context.as_object_mut() {
@@ -1225,6 +1392,13 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                     }
                 }
             }
+            "notify" => {
+                // Past the account's daily allowance (or a busy provider): wait, then send what's left.
+                if let Some(until) = crate::features::flows_plus::notify::run(state, &account, &flow, &person, run.id, &node_id, &node, &context).await? {
+                    wait_until(&state.db, &hold, &node_id, &context, until).await?;
+                    return Ok(());
+                }
+            }
             "webhook" => {
                 let url = node.str("url").unwrap_or_default().to_string();
                 let payload = json!({
@@ -1238,14 +1412,54 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
             _ => {}
         }
         current = next;
-        sqlx::query("UPDATE flow_runs SET current_node = $2, context = $3 WHERE id = $1")
-            .bind(run.id)
-            .bind(&current)
-            .bind(&context)
-            .execute(&state.db)
-            .await?;
+        if !advance(&state.db, &mut hold, current.as_deref(), &context).await? {
+            return Ok(());
+        }
     }
-    finish(&state.db, run.id, "failed").await
+    finish(&state.db, &hold, "failed").await
+}
+
+/// Move the run to its next step (ending any claim), if this worker still holds it. False: someone
+/// else moved it or it was taken out of the flow, so stop.
+async fn advance(db: &PgPool, hold: &mut Hold, node: Option<&str>, context: &Value) -> anyhow::Result<bool> {
+    let claim = Uuid::now_v7();
+    let n = sqlx::query(&format!("UPDATE flow_runs SET current_node = $4, context = $5, claim_id = $6, claim_until = NULL, waiting_until = NULL WHERE {HELD}"))
+        .bind(hold.run)
+        .bind(hold.claim)
+        .bind(&hold.node)
+        .bind(node)
+        .bind(context)
+        .bind(claim)
+        .execute(db)
+        .await?
+        .rows_affected();
+    hold.claim = Some(claim);
+    hold.node = node.map(str::to_string);
+    Ok(n == 1)
+}
+
+/// Park the run at `node` until `at`, if this worker still holds it: its state and its one wake-up
+/// job in one transaction. The wake carries the claim id it parks with, the step and the deadline;
+/// only that wake can move the run on from here.
+async fn wait_until(db: &PgPool, hold: &Hold, node: &str, context: &Value, at: chrono::DateTime<Utc>) -> anyhow::Result<()> {
+    let wake = Uuid::now_v7();
+    let mut tx = db.begin().await?;
+    let n = sqlx::query(&format!("UPDATE flow_runs SET current_node = $4, context = $5, claim_id = $6, claim_until = NULL, waiting_until = $7 WHERE {HELD}"))
+        .bind(hold.run)
+        .bind(hold.claim)
+        .bind(&hold.node)
+        .bind(node)
+        .bind(context)
+        .bind(wake)
+        .bind(at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 1 {
+        crate::jobs::enqueue(&mut *tx, "flow_step", json!({"run_id": hold.run, "wake": wake, "node": node, "at": at}), Some(at)).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn stats(db: &PgPool, account_id: Uuid, flow_id: Uuid) -> AppResult<(MessageStats, i64, i64)> {

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Pencil, Plus, Trash2, X } from "lucide-react";
-import type { DelayUnit, FlowNode, List } from "../../api";
+import type { DelayUnit, FlowNode, FlowTrigger, List } from "../../api";
+import { DelayEditor, EventConditionEditor, NotifyEditor } from "../../features/flowsPlus";
 import { EmailPreview } from "../email/EmailPreview";
 import { SmsEditor } from "../email/SmsEditor";
 import { ConditionBuilder } from "../segments/ConditionBuilder";
@@ -13,24 +14,14 @@ type Props = {
   onChange: (n: FlowNode) => void;
   onEditEmail: () => void;
   readOnly?: boolean;
+  /** The flow's trigger (for trigger splits and dates from the event). */
+  trigger?: FlowTrigger;
 };
 
-export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Props) {
+export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly, trigger }: Props) {
   switch (node.type) {
     case "delay":
-      return (
-        <fieldset disabled={readOnly} className="min-w-0 space-y-3">
-          <p className="text-sm text-zinc-600">Wait before moving to the next step.</p>
-          <div className="flex gap-2">
-            <Input type="number" min={1} value={node.amount} onChange={(e) => onChange({ ...node, amount: Math.max(1, Number(e.target.value) || 1) })} className="w-24" aria-label="Amount" />
-            <Select value={node.unit} onChange={(e) => onChange({ ...node, unit: e.target.value as DelayUnit })} className="w-32" aria-label="Unit">
-              <option value="minutes">minutes</option>
-              <option value="hours">hours</option>
-              <option value="days">days</option>
-            </Select>
-          </div>
-        </fieldset>
-      );
+      return <DelayEditor node={node} onChange={onChange} trigger={trigger} readOnly={readOnly} />;
     case "email":
       return (
         <div className="space-y-4">
@@ -64,11 +55,18 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
             People who match go down <b>Yes</b>; everyone else goes down <b>No</b>.
           </p>
           <ConditionBuilder value={node.condition} onChange={(condition) => onChange({ ...node, condition })} />
-          <ObjectSplitFields filters={node.object_filters} onChange={(object_filters) => {
-            const next = { ...node, object_filters };
-            if (!object_filters) delete next.object_filters;
-            onChange(next);
-          }} />
+          <EventConditionEditor node={node} onChange={onChange} trigger={trigger} />
+          {trigger?.type === "object" || trigger?.type === "object_date" ? (
+            <ObjectSplitFields
+              objectType={trigger.object_type}
+              filters={node.object_filters}
+              onChange={(object_filters) => {
+                const next = { ...node, object_filters };
+                if (!object_filters) delete next.object_filters;
+                onChange(next);
+              }}
+            />
+          ) : null}
         </fieldset>
       );
     case "wait_for_reply":
@@ -118,6 +116,8 @@ export function NodeEditor({ node, lists, onChange, onEditEmail, readOnly }: Pro
       );
     case "webhook":
       return <WebhookEditor key={node.id} node={node} onChange={onChange} readOnly={readOnly} />;
+    case "notify":
+      return <NotifyEditor node={node} onChange={onChange} readOnly={readOnly} />;
   }
 }
 
