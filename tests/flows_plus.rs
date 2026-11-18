@@ -911,24 +911,49 @@ async fn back_populate_rechecks_the_list_and_stops_when_cancelled() {
 }
 
 #[tokio::test]
-async fn back_populate_is_paced_and_a_dead_job_frees_the_flow() {
-    use dumbmail::features::flows_plus::backfill::{run, BATCH};
+async fn back_populate_enrols_only_as_many_as_there_is_room_for() {
+    use dumbmail::features::flows_plus::backfill::{run, FLOW_CAP};
     let mut h = harness!();
     h.signup().await;
-    let emails: Vec<String> = (0..(BATCH + 50)).map(|i| format!("p{i}@x.test")).collect();
+    let emails: Vec<String> = (0..(FLOW_CAP + 50)).map(|i| format!("p{i}@x.test")).collect();
     let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
     let (fid, bid, _) = list_backfill(&mut h, &refs).await;
     run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
-    assert_eq!(flow_runs(&h, &fid).await, BATCH, "one batch");
-    // Their first steps haven't been picked up: the next batch waits.
+    assert_eq!(flow_runs(&h, &fid).await, FLOW_CAP, "as many as the flow has room for");
+    // Their first steps haven't run (however long ago they were added): no room, nobody more.
+    sqlx::query("UPDATE flow_backfill_members SET done_at = done_at - interval '2 hours' WHERE backfill_id = $1").bind(bid).execute(&h.state.db).await.unwrap();
     run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
-    assert_eq!(flow_runs(&h, &fid).await, BATCH, "no second batch while the first one's steps wait");
+    assert_eq!(flow_runs(&h, &fid).await, FLOW_CAP, "no more while the first ones wait, however old");
     let later: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'flows_plus_backfill' AND run_at > now()").fetch_one(&h.state.db).await.unwrap();
     assert!(later >= 1, "it checks again shortly");
-    // Sending picks them up; the next batch goes.
-    dumbmail::jobs::drain_lane(&h.state, dumbmail::jobs::MAIN).await.unwrap();
+    // 150 of them start: room for 150, and only 50 are left.
+    sqlx::query("UPDATE flow_runs SET visited = '[\"d\"]' WHERE id IN (SELECT id FROM flow_runs WHERE flow_id = $1::uuid ORDER BY id LIMIT 150)").bind(&fid).execute(&h.state.db).await.unwrap();
     run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
-    assert_eq!(flow_runs(&h, &fid).await, BATCH + 50);
+    assert_eq!(flow_runs(&h, &fid).await, FLOW_CAP + 50);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn back_populate_has_one_cap_across_the_server_and_a_dead_job_frees_the_flow() {
+    use dumbmail::features::flows_plus::backfill::run;
+    let mut h = harness!();
+    h.signup().await;
+    let emails: Vec<String> = (0..150).map(|i| format!("q{i}@x.test")).collect();
+    let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
+    let (fid, bid, _) = list_backfill(&mut h, &refs).await;
+    run(&h.state, &json!({"backfill_id": bid})).await.unwrap();
+    assert_eq!(flow_runs(&h, &fid).await, 150);
+    // A server-wide cap of 200 (set low for the test; 1,000 by default): a second flow gets the 50 left.
+    let emails: Vec<String> = (0..150).map(|i| format!("r{i}@x.test")).collect();
+    let refs: Vec<&str> = emails.iter().map(String::as_str).collect();
+    let (fid2, bid2, _) = list_backfill(&mut h, &refs).await;
+    // (Setting up drained the queue; the first flow's 150 are still waiting for their first step.)
+    sqlx::query("UPDATE flow_runs SET visited = '[]' WHERE flow_id = $1::uuid").bind(&fid).execute(&h.state.db).await.unwrap();
+    // SAFETY: tests in this file don't read this variable from other threads at this moment.
+    unsafe { std::env::set_var("FLOW_BACKFILL_SERVER_CAP", "200") };
+    run(&h.state, &json!({"backfill_id": bid2})).await.unwrap();
+    unsafe { std::env::remove_var("FLOW_BACKFILL_SERVER_CAP") };
+    assert_eq!(flow_runs(&h, &fid2).await, 50, "only the room left on the server");
 
     // A back-populate whose job runs out of retries is marked failed, and the flow can start another.
     let (fid2, bid2, _) = list_backfill(&mut h, &["x1@x.test"]).await;
@@ -939,7 +964,8 @@ async fn back_populate_is_paced_and_a_dead_job_frees_the_flow() {
     sqlx::query("ALTER TABLE flow_backfill_members_gone RENAME TO flow_backfill_members").execute(&h.state.db).await.unwrap();
     let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error FROM flow_backfills WHERE id = $1").bind(bid2).fetch_one(&h.state.db).await.unwrap();
     assert_eq!(status, "failed");
-    assert!(error.unwrap_or_default().contains("repeated errors"));
+    let error = error.unwrap_or_default();
+    assert!(error.contains("repeated errors") && error.contains("flow_backfill_members"), "the reason is recorded: {error}");
     h.ok("POST", &format!("/api/flows/{fid2}/backfill"), Some(json!({"confirm": true}))).await;
     h.cleanup().await;
 }

@@ -12,8 +12,9 @@
 //! the exit condition, and starts their run under the flow's re-entry rules. A retried batch adds
 //! nobody twice. Consent is checked when each message goes out, as usual.
 //!
-//! Pacing: a batch is enrolled only when fewer than [`BATCH`] of this back-populate's runs are still
-//! waiting for their first step, and not within [`PAUSE_SECS`] of the last batch while any are, so
+//! Pacing: each batch enrols only as many as there is room for: at most [`FLOW_CAP`] of a flow's
+//! back-populated runs, and [`server_cap`] across all flows on the server, may be waiting for their
+//! first step at once (however long they've waited), so
 //! back-populated first steps never crowd out newer sends.
 //!
 //! Metric- and date-triggered flows can't be back-populated: past events don't start flows, and
@@ -38,10 +39,13 @@ use crate::state::AppState;
 pub const JOB: &str = "flows_plus_backfill";
 pub const DEFAULT_MAX: i64 = 50_000;
 pub const MAX_RUNNING_PER_ACCOUNT: i64 = 3;
-/// People enrolled per batch, and the most of a back-populate's runs waiting for their first step.
-pub const BATCH: i64 = 200;
-/// The shortest gap between batches while earlier ones still have first steps waiting.
-pub const PAUSE_SECS: i64 = 30;
+/// The most of one flow's back-populated runs waiting for their first step at once.
+pub const FLOW_CAP: i64 = 200;
+/// The most back-populated runs waiting for their first step across all flows on the server:
+/// `FLOW_BACKFILL_SERVER_CAP` (default 1,000).
+pub fn server_cap() -> i64 {
+    std::env::var("FLOW_BACKFILL_SERVER_CAP").ok().and_then(|v| v.parse::<i64>().ok()).filter(|n| *n > 0).unwrap_or(1_000)
+}
 const DATE_REFUSED: &str = "date-triggered flows can't be back-populated: people whose date is still ahead will enter on their own when it arrives";
 const METRIC_REFUSED: &str = "metric-triggered flows can't be back-populated: past events don't start flows, only new ones do";
 
@@ -300,20 +304,25 @@ async fn stop(state: &AppState, id: Uuid, status: &str, why: Option<&str>) -> sq
     Ok(())
 }
 
-/// The job ran out of retries: the back-populate failed, and the flow can start another.
-pub async fn job_dead(state: &AppState, payload: &Value) {
-    let Some(id) = payload["backfill_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return };
-    if let Err(e) = stop(state, id, "failed", Some("stopped after repeated errors; start it again to add the rest")).await {
-        tracing::error!(backfill = %id, error = %e, "couldn't mark a back-populate failed");
-    }
+/// The job ran out of retries (called in the transaction that marks the job dead): the
+/// back-populate failed, with the last error, and the flow can start another.
+pub async fn job_dead_in(tx: &mut sqlx::PgConnection, payload: &Value, error: &str) -> sqlx::Result<()> {
+    let Some(id) = payload["backfill_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
+    let short: String = error.lines().next().unwrap_or("").chars().take(200).collect();
+    sqlx::query("UPDATE flow_backfills SET status = 'failed', error = $2, finished_at = now() WHERE id = $1 AND status = 'running'")
+        .bind(id)
+        .bind(format!("stopped after repeated errors ({short}); start it again to add the rest"))
+        .execute(tx)
+        .await?;
+    Ok(())
 }
 
 /// Job: one step of a back-populate (fix who's in it, then one paced batch at a time).
 pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
     let Some(id) = payload["backfill_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) else { return Ok(()) };
-    let row: Option<(Uuid, String, i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
-        sqlx::query_as("SELECT flow_id, status, max_people, snapshot_at, last_batch_at FROM flow_backfills WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
-    let Some((flow_id, status, max, snapshot_at, last_batch_at)) = row else { return Ok(()) };
+    let row: Option<(Uuid, String, i32, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT flow_id, status, max_people, snapshot_at FROM flow_backfills WHERE id = $1").bind(id).fetch_optional(&state.db).await?;
+    let Some((flow_id, status, max, snapshot_at)) = row else { return Ok(()) };
     if status != "running" {
         return Ok(());
     }
@@ -357,23 +366,24 @@ pub async fn run(state: &AppState, payload: &Value) -> anyhow::Result<()> {
         tracing::info!(backfill = %id, flow = %flow.id, people = total, "back-populate: people fixed");
         return Ok(());
     }
-    // Pacing: hold off while this back-populate's earlier runs still wait for their first step.
-    let waiting: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM flow_backfill_members m JOIN flow_runs r ON r.id = m.run_id
-         WHERE m.backfill_id = $1 AND m.done_at > now() - interval '30 minutes' AND r.status = 'active' AND r.visited = '[]'::jsonb",
+    // Pacing: enrol only as many as there is room for, for this flow and across the server.
+    let (this_flow, all): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE m.backfill_id = $1), count(*) FROM flow_backfill_members m
+         JOIN flow_backfills b ON b.id = m.backfill_id AND (b.status = 'running' OR b.finished_at > now() - interval '1 day')
+         JOIN flow_runs r ON r.id = m.run_id
+         WHERE m.done_at IS NOT NULL AND r.status = 'active' AND r.visited = '[]'::jsonb",
     )
     .bind(id)
     .fetch_one(&state.db)
     .await?;
-    let recent = last_batch_at.is_some_and(|t| t > Utc::now() - Duration::seconds(PAUSE_SECS));
-    if waiting >= BATCH || (waiting > 0 && recent) {
+    let room = (FLOW_CAP - this_flow).min(server_cap() - all);
+    if room <= 0 {
         crate::jobs::enqueue_background(&state.db, JOB, json!({"backfill_id": id}), Some(Utc::now() + Duration::seconds(15))).await?;
         return Ok(());
     }
-    sqlx::query("UPDATE flow_backfills SET last_batch_at = now() WHERE id = $1").bind(id).execute(&state.db).await?;
     let todo: Vec<Uuid> = sqlx::query_scalar("SELECT profile_id FROM flow_backfill_members WHERE backfill_id = $1 AND done_at IS NULL ORDER BY profile_id LIMIT $2")
         .bind(id)
-        .bind(BATCH)
+        .bind(room)
         .fetch_all(&state.db)
         .await?;
     let base_context = match &r.trigger {

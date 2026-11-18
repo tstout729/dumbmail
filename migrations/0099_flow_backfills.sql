@@ -15,7 +15,6 @@ CREATE TABLE flow_backfills (
     created_by   uuid,
     created_at   timestamptz NOT NULL DEFAULT now(),
     snapshot_at  timestamptz,
-    last_batch_at timestamptz,
     finished_at  timestamptz
 );
 -- One back-populate per flow at a time, enforced by the insert.
@@ -31,7 +30,7 @@ CREATE TABLE flow_backfill_members (
     PRIMARY KEY (backfill_id, profile_id)
 );
 CREATE INDEX flow_backfill_members_todo_idx ON flow_backfill_members (backfill_id, profile_id) WHERE done_at IS NULL;
--- Pacing reads the people enrolled recently.
+-- Pacing counts the people enrolled whose first step hasn't run yet.
 CREATE INDEX flow_backfill_members_done_idx ON flow_backfill_members (backfill_id, done_at) WHERE done_at IS NOT NULL;
 
 -- Who is moving a run: every write to a run swaps in a fresh claim id and is conditional on the
