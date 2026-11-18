@@ -633,7 +633,8 @@ async fn make_room(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, account: Uuid
     }
     let open: i64 = sqlx::query_scalar(
         "SELECT COALESCE(sum(body_bytes), 0)::bigint FROM integration_deliveries
-         WHERE account_id = $1 AND body IS NOT NULL AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL))",
+         WHERE account_id = $1 AND ((body IS NOT NULL AND (status = 'pending' OR (status = 'error' AND next_attempt_at IS NOT NULL)))
+             OR (source = 'fetch' AND body IS NULL AND status = 'pending'))",
     )
     .bind(account)
     .fetch_one(&mut **tx)
@@ -1192,7 +1193,9 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     let context = next.context.as_ref().map(Value::to_string).unwrap_or_default();
     let mut query: Vec<String> = next.query.iter().flatten().map(|(k, v)| format!("{k}={v}")).collect();
     query.sort();
-    let key = crate::auth::sha256_hex(&format!("{}\n{}\n{context}", next.url.as_deref().unwrap_or(""), query.join("&")));
+    // The record alone (its path and query) is the intent's identity; a second callback for it
+    // while it waits merges its context in (the latest wins).
+    let key = crate::auth::sha256_hex(&format!("{}\n{}", next.url.as_deref().unwrap_or(""), query.join("&")));
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut **tx).await?;
     let (mine, all): (i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE integration_id = $1), count(*) FROM integration_deliveries
@@ -1207,21 +1210,24 @@ async fn queue_fetch(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, state: &App
     }
     make_room(tx, integ.account_id, context.len() as i64).await?;
     let id = Uuid::now_v7();
-    let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO integration_deliveries (id, integration_id, account_id, source, status, body_bytes, request, message_id)
+    let (got, inserted): (Uuid, bool) = sqlx::query_as(
+        "INSERT INTO integration_deliveries AS d (id, integration_id, account_id, source, status, body_bytes, request, message_id)
          VALUES ($1, $2, $3, 'fetch', 'pending', $4, $5, $6)
-         ON CONFLICT (integration_id, message_id) WHERE message_id IS NOT NULL DO NOTHING RETURNING id",
+         ON CONFLICT (integration_id, message_id) WHERE message_id IS NOT NULL DO UPDATE
+             SET request = jsonb_set(jsonb_set(d.request, '{lookup_enc}', EXCLUDED.request->'lookup_enc'), '{ctx_bytes}', to_jsonb($4::int)),
+                 body_bytes = $4 + COALESCE((d.request->>'reserved')::int, 0)
+         RETURNING id, (xmax = 0)",
     )
     .bind(id)
     .bind(integ.id)
     .bind(integ.account_id)
     .bind(context.len() as i32)
-    .bind(json!({"fetch": {"of": parent, "hop": hop, "attempts": 0}, "lookup_enc": sealed}))
+    .bind(json!({"fetch": {"of": parent, "hop": hop, "attempts": 0}, "lookup_enc": sealed, "ctx_bytes": context.len()}))
     .bind(format!("fetch:{key}"))
-    .fetch_optional(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    if let Some(id) = inserted {
-        crate::jobs::enqueue_background(&mut **tx, JOB_FETCH, json!({"delivery_id": id}), None).await?;
+    if inserted {
+        crate::jobs::enqueue_background(&mut **tx, JOB_FETCH, json!({"delivery_id": got}), None).await?;
     }
     Ok(())
 }
@@ -1256,42 +1262,55 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     let Some(_pull_slot) = PullSlots::try_take(account) else {
         return requeue(state, JOB_FETCH, p.clone()).await;
     };
-    let claimed: Option<(Uuid, Value)> = sqlx::query_as(
-        "UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes')
+    // Claim it, only once it's due (a vendor's cooldown or the retry wait has passed), and reserve
+    // room for a whole answer in the account's payload budget, in one transaction: the room is held
+    // until the answer is stored (or the attempt fails), so nothing else can take it meanwhile.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(account.to_string()).execute(&mut *tx).await?;
+    let row: Option<(Uuid, Value)> = sqlx::query_as(
+        "SELECT integration_id, request FROM integration_deliveries
          WHERE id = $1 AND source = 'fetch' AND status = 'pending' AND body IS NULL
+           AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= now()
            AND COALESCE((request->>'claimed_until')::timestamptz, '-infinity'::timestamptz) < now()
-         RETURNING integration_id, request",
+         FOR UPDATE",
     )
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((integration_id, request)) = claimed else { return Ok(()) };
+    let Some((integration_id, request)) = row else { return Ok(()) };
     let Some(integ) = model::load_any(state, integration_id).await? else { return Ok(()) };
     let mut scrub = scrub_for(state, &integ).await;
+    let attempts = request["fetch"]["attempts"].as_i64().unwrap_or(0) as i32;
+    let reserve = BODY_MAX_BYTES as i64;
+    match make_room(&mut tx, account, reserve).await {
+        Ok(()) => {}
+        Err(Refused::OverBudget(msg)) => {
+            tx.rollback().await?;
+            return fetch_failed(state, &integ, &scrub, id, attempts, None, &msg, None, true).await;
+        }
+        Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
+        Err(other) => return Err(anyhow::anyhow!("{other:?}")),
+    }
+    sqlx::query(
+        "UPDATE integration_deliveries SET request = request || jsonb_build_object('claimed_until', now() + interval '2 minutes', 'reserved', $2::int),
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes) + $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(reserve as i32)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     if integ.status != "enabled" {
-        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', message_id = NULL, processed_at = now(), request = request - 'claimed_until' WHERE id = $1").bind(id).execute(&state.db).await?;
+        sqlx::query("UPDATE integration_deliveries SET status = 'ignored', error = 'the integration is turned off', message_id = NULL, processed_at = now(),
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes - COALESCE((request->>'reserved')::int, 0)), request = request - 'claimed_until' - 'reserved' WHERE id = $1").bind(id).execute(&state.db).await?;
         return Ok(());
     }
-    let attempts = request["fetch"]["attempts"].as_i64().unwrap_or(0) as i32;
     let Some((cfg, rules)) = integ.pull_config().and_then(|c| c.fetch.clone().map(|r| (c, r))) else {
         return fetch_failed(state, &integ, &scrub, id, attempts, None, "the integration no longer allows fetches", None, false).await;
     };
     if !integ.missing_credentials().is_empty() {
         return fetch_failed(state, &integ, &scrub, id, attempts, None, "the integration's credentials aren't saved yet", None, true).await;
-    }
-    // Room for the answer first: a full budget means no request at all.
-    {
-        let mut tx = state.db.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut *tx).await?;
-        match make_room(&mut tx, integ.account_id, BODY_MAX_BYTES as i64).await {
-            Ok(()) => tx.commit().await?,
-            Err(Refused::OverBudget(msg)) => {
-                tx.rollback().await?;
-                return fetch_failed(state, &integ, &scrub, id, attempts, None, &msg, None, true).await;
-            }
-            Err(Refused::Error(e)) => return Err(anyhow::anyhow!(e.public_message())),
-            Err(other) => return Err(anyhow::anyhow!("{other:?}")),
-        }
     }
     let creds = integ.credentials(state).map_err(|e| anyhow::anyhow!(e.public_message()))?;
     let settings = integ.settings_map();
@@ -1345,18 +1364,10 @@ pub async fn run_fetch(state: &AppState, p: &Value) -> anyhow::Result<()> {
     };
     let mut tx = state.db.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 7021))").bind(integ.account_id.to_string()).execute(&mut *tx).await?;
-    if let Err(r) = make_room(&mut tx, integ.account_id, body.len() as i64).await {
-        tx.rollback().await?;
-        return match r {
-            Refused::OverBudget(msg) => fetch_failed(state, &integ, &scrub, id, attempts, Some(made), &msg, None, true).await,
-            Refused::Error(e) => Err(anyhow::anyhow!(e.public_message())),
-            other => Err(anyhow::anyhow!("{other:?}")),
-        };
-    }
     // The answer joins the intent's row; the record can be asked for again from now on.
     let stored = sqlx::query(
-        "UPDATE integration_deliveries SET body = $2, body_bytes = octet_length($2) + body_bytes, content_type = $3, error = NULL, next_attempt_at = NULL, message_id = NULL,
-             request = (request - 'claimed_until') || jsonb_build_object('made', $4::jsonb)
+        "UPDATE integration_deliveries SET body = $2, body_bytes = octet_length($2) + COALESCE((request->>'ctx_bytes')::int, 0), content_type = $3, error = NULL, next_attempt_at = NULL, message_id = NULL,
+             request = (request - 'claimed_until' - 'reserved') || jsonb_build_object('made', $4::jsonb)
          WHERE id = $1 AND status = 'pending' AND body IS NULL",
     )
     .bind(id)
@@ -1390,7 +1401,8 @@ async fn fetch_failed(state: &AppState, integ: &Integration, scrub: &Scrub, id: 
              status = CASE WHEN $3::timestamptz IS NULL THEN 'error' ELSE status END,
              message_id = CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE message_id END,
              processed_at = CASE WHEN $3::timestamptz IS NULL THEN now() ELSE processed_at END,
-             request = jsonb_set((request - 'claimed_until') || jsonb_strip_nulls($4::jsonb), '{fetch,attempts}', to_jsonb($5::int))
+             body_bytes = COALESCE((request->>'ctx_bytes')::int, body_bytes - COALESCE((request->>'reserved')::int, 0)),
+             request = jsonb_set((request - 'claimed_until' - 'reserved') || jsonb_strip_nulls($4::jsonb), '{fetch,attempts}', to_jsonb($5::int))
          WHERE id = $1",
     )
     .bind(id)

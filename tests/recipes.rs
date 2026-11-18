@@ -269,6 +269,7 @@ fn sent_to(h: &Harness, subject_starts: &str) -> Vec<String> {
 /// Make deliveries waiting to retry due now, and run them.
 async fn retry_now(h: &Harness) {
     sqlx::query("UPDATE jobs SET run_at = now() WHERE kind LIKE 'integrations_%'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE integration_deliveries SET next_attempt_at = now() WHERE next_attempt_at > now()").execute(&h.state.db).await.unwrap();
     h.drain().await;
 }
 
@@ -1305,6 +1306,70 @@ async fn webhook_fetches_are_read_only_lookups_of_declared_paths() {
     h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
     h.drain().await;
     assert_eq!(store.seen.lock().unwrap().iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), vec!["/stores/abc123/v3/customers?id%3Ain=32"]);
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn one_fetch_per_record_waits_for_its_due_time_and_keeps_its_room() {
+    use std::sync::{Arc, Mutex};
+    let mut h = integ_harness!();
+    h.signup().await;
+    let hits: Arc<Mutex<Vec<String>>> = Default::default();
+    let squeeze: Arc<Mutex<Option<uuid::Uuid>>> = Default::default();
+    let app = axum::Router::new().route(
+        "/v2/orders/{id}",
+        axum::routing::get({
+            let (hits, squeeze) = (hits.clone(), squeeze.clone());
+            move |uri: axum::http::Uri| {
+                let (hits, squeeze) = (hits.clone(), squeeze.clone());
+                async move {
+                    hits.lock().unwrap().push(uri.path().to_string());
+                    // Something else fills the account's storage while the request is out.
+                    if let Some(a) = *squeeze.lock().unwrap() {
+                        dumbmail::features::integrations::engine::set_payload_budget_for(a, 1);
+                    }
+                    axum::Json(json!({"id": 218, "status": "Shipped"}))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    dumbmail::features::integrations::pull::allow_test_address(addr);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let script = "function handle(i) { if (i.source === 'fetch') return [{type: 'log', message: 'ctx ' + JSON.stringify(i.context)}]; return [Object.assign({type: 'next_request'}, i.payload.next)] }";
+    let pull = json!({"url": format!("http://{addr}/v2/orders"), "auth": {"type": "header", "name": "X-Auth-Token", "value": "{{secret.access_token}}"}, "fetch": {"paths": ["/v2/orders/{id}"], "context": ["n"]}});
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "Lookups", "script": script, "pull": pull, "credentials": {"access_token": "fake-access-token-0001"}}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM integrations WHERE id = $1::uuid").bind(i["id"].as_str().unwrap()).fetch_one(&h.state.db).await.unwrap();
+    // No room yet: the first callback's lookup waits; the second, for the same record with other
+    // context, joins it (the latest context wins) instead of making a second intent.
+    dumbmail::features::integrations::engine::set_payload_budget_for(account, 1000);
+    for n in [1, 2] {
+        let body = json!({"next": {"url": "/v2/orders/218", "context": {"n": n}}}).to_string();
+        h.raw("POST", &path, &[("content-type", "application/json")], &body).await;
+        h.drain().await;
+    }
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch'").await, 1);
+    assert!(hits.lock().unwrap().is_empty());
+    // Room again, but the intent's wait hasn't passed: a stray job for it makes no request.
+    dumbmail::features::integrations::engine::set_payload_budget_for(account, 256 * 1024 * 1024);
+    let intent: uuid::Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE source = 'fetch' AND next_attempt_at > now()").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue_background(&h.state.db, "integrations_fetch", json!({"delivery_id": intent}), None).await.unwrap();
+    h.drain().await;
+    assert!(hits.lock().unwrap().is_empty(), "nothing before the due time: {:?}", hits.lock().unwrap());
+    // Due: one GET, and its answer is stored even though storage filled up while it was out.
+    *squeeze.lock().unwrap() = Some(account);
+    sqlx::query("UPDATE integration_deliveries SET next_attempt_at = now() - interval '1 minute' WHERE id = $1").bind(intent).execute(&h.state.db).await.unwrap();
+    retry_now(&h).await;
+    retry_now(&h).await;
+    assert_eq!(*hits.lock().unwrap(), vec!["/v2/orders/218".to_string()]);
+    let (status, bytes): (String, i32) = sqlx::query_as("SELECT status, body_bytes FROM integration_deliveries WHERE id = $1").bind(intent).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(status, "ok");
+    assert!(bytes < 1000, "the reservation is given back once the answer is stored: {bytes}");
+    let d = h.ok("GET", &format!("/api/integrations/{}/deliveries/{intent}", i["id"].as_str().unwrap()), None).await;
+    assert_eq!(d["result"]["logs"][0], r#"ctx {"n":2}"#, "{d}");
     h.cleanup().await;
 }
 
