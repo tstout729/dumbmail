@@ -15,9 +15,13 @@
 //! to localize one; otherwise the default link is used.
 //!
 //! Field ids (for the API, XLIFF and CSV): `subject`, `preheader`, `html`, `body`, and for blocks
-//! `b<n>:<path>` (the n-th block, from 0) or `b<n>.c<col>.<k>:<path>` (a block inside columns).
+//! `<key>:<path>`, where `key` is the block's own stable key (`k` and 10 hex digits, stored with
+//! the block when it's created or, for older content, on its next save; see [`assign_keys`]), so a
+//! block keeps its ids when blocks are moved. A block that has no key yet (content not saved since)
+//! is addressed by position: `b<n>:<path>` (the n-th block, from 0) or `b<n>.c<col>.<k>:<path>` (a
+//! block inside columns); a position never reaches a block that has a key.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -177,6 +181,61 @@ pub struct Field {
     pub label: String,
 }
 
+fn is_key(k: &str) -> bool {
+    k.len() == 11 && k.starts_with('k') && k[1..].bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// A block's stable key, when it has a valid one.
+pub fn block_key(b: &Value) -> Option<&str> {
+    b.get("key").and_then(|k| k.as_str()).filter(|k| is_key(k))
+}
+
+fn key_list(list: &mut [Value], seen: &mut HashSet<String>) {
+    for b in list {
+        let Some(o) = b.as_object_mut() else { continue };
+        let have = o.get("key").and_then(|k| k.as_str()).filter(|k| is_key(k)).map(str::to_string);
+        match have {
+            Some(k) if seen.insert(k.clone()) => {}
+            // None yet, not valid, or a copy of another block's: a new one.
+            _ => {
+                let k = loop {
+                    let k = format!("k{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+                    if seen.insert(k.clone()) {
+                        break k;
+                    }
+                };
+                o.insert("key".into(), json!(k));
+            }
+        }
+        if o.get("type").and_then(|t| t.as_str()) == Some("columns") {
+            for col in o.get_mut("columns").and_then(|c| c.as_array_mut()).into_iter().flatten() {
+                if let Some(a) = col.as_array_mut() {
+                    key_list(a, seen);
+                }
+            }
+        }
+    }
+}
+
+/// Give every block of every message in `v` (anything with a `blocks` list: a campaign's content
+/// and its A/B versions, a flow's steps, a template, a saved block's `{"blocks": …}`), and every
+/// block inside columns, a stable key when it has none, or when another block of the same message
+/// already has it (a copy). Called on every save of message content.
+pub fn assign_keys(v: &mut Value) {
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
+                match (k.as_str(), x) {
+                    ("blocks", Value::Array(list)) => key_list(list, &mut HashSet::new()),
+                    (_, x) => assign_keys(x),
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(assign_keys),
+        _ => {}
+    }
+}
+
 fn block_label(b: &Value, loc: &str) -> String {
     let t = s(b, "type");
     let mut parts = loc.split('.');
@@ -187,29 +246,52 @@ fn block_label(b: &Value, loc: &str) -> String {
     }
 }
 
-/// The blocks of a message with their location prefix (`b3`, `b2.c0.1`): top-level blocks and
-/// blocks inside columns. Saved blocks are translated on the saved block itself.
-fn located_blocks(content: &Value) -> Vec<(String, &Value)> {
+/// The blocks of a message with their id prefix (the block's key, else its position) and their
+/// position (`b3`, `b2.c0.1`): top-level blocks and blocks inside columns. Saved blocks are
+/// translated on the saved block itself.
+fn located_blocks(content: &Value) -> Vec<(String, String, &Value)> {
+    fn push<'v>(pos: String, b: &'v Value, out: &mut Vec<(String, String, &'v Value)>) {
+        out.push((block_key(b).map(str::to_string).unwrap_or_else(|| pos.clone()), pos, b));
+    }
     let mut out = Vec::new();
     for (i, b) in content.get("blocks").and_then(|b| b.as_array()).into_iter().flatten().enumerate() {
         if s(b, "type") == "columns" {
             for (c, col) in b.get("columns").and_then(|c| c.as_array()).into_iter().flatten().enumerate() {
                 for (k, x) in col.as_array().into_iter().flatten().enumerate() {
-                    out.push((format!("b{i}.c{c}.{k}"), x));
+                    push(format!("b{i}.c{c}.{k}"), x, &mut out);
                 }
             }
         } else {
-            out.push((format!("b{i}"), b));
+            push(format!("b{i}"), b, &mut out);
         }
     }
     out
 }
 
+/// The block an id prefix names: by key, or by position for a block that has no key.
 fn located_block_mut<'a>(content: &'a mut Value, loc: &str) -> Option<&'a mut Value> {
+    let blocks = content.get_mut("blocks")?.as_array_mut()?;
+    if is_key(loc) {
+        for b in blocks.iter_mut() {
+            if block_key(b) == Some(loc) {
+                return Some(b);
+            }
+            if s(b, "type") == "columns" {
+                for col in b.get_mut("columns").and_then(|c| c.as_array_mut()).into_iter().flatten() {
+                    for x in col.as_array_mut().into_iter().flatten() {
+                        if block_key(x) == Some(loc) {
+                            return Some(x);
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
     let mut parts = loc.split('.');
     let i: usize = parts.next()?.strip_prefix('b')?.parse().ok()?;
-    let b = content.get_mut("blocks")?.as_array_mut()?.get_mut(i)?;
-    match (parts.next(), parts.next()) {
+    let b = blocks.get_mut(i)?;
+    let found = match (parts.next(), parts.next()) {
         (None, _) => Some(b),
         (Some(c), Some(k)) => {
             let c: usize = c.strip_prefix('c')?.parse().ok()?;
@@ -217,7 +299,9 @@ fn located_block_mut<'a>(content: &'a mut Value, loc: &str) -> Option<&'a mut Va
             b.get_mut("columns")?.as_array_mut()?.get_mut(c)?.as_array_mut()?.get_mut(k)
         }
         _ => None,
-    }
+    }?;
+    // A position never reaches a block that has a key.
+    if block_key(found).is_some() { None } else { Some(found) }
 }
 
 /// Every translatable field with text in it, in reading order.
@@ -235,10 +319,10 @@ pub fn fields(content: &Value) -> Vec<Field> {
             out.push(Field { id: k.to_string(), kind, source: src.to_string(), label: label.into() });
         }
     }
-    for (loc, b) in located_blocks(content) {
+    for (loc, pos, b) in located_blocks(content) {
         for (path, kind) in block_fields(b) {
             if let Some(src) = get_path(b, &path).filter(|t| !t.trim().is_empty()) {
-                out.push(Field { id: format!("{loc}:{path}"), kind, source: src.to_string(), label: block_label(b, &loc) });
+                out.push(Field { id: format!("{loc}:{path}"), kind, source: src.to_string(), label: block_label(b, &pos) });
             }
         }
     }
@@ -253,7 +337,7 @@ pub fn languages(content: &Value) -> (Option<String>, Vec<String>) {
     let mut langs: Vec<String> = tr.and_then(|t| t.get("languages")).and_then(|l| l.as_array()).into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
     if tr.is_none() {
         let mut seen = BTreeSet::new();
-        for (_, b) in located_blocks(content) {
+        for (_, _, b) in located_blocks(content) {
             if let Some(m) = b.get("i18n").and_then(|m| m.as_object()) {
                 seen.extend(m.keys().cloned());
             }
@@ -268,7 +352,7 @@ pub fn entry<'a>(content: &'a Value, id: &str, lang: &str) -> Option<&'a Value> 
     match id.split_once(':') {
         None => content.get("translations")?.get("fields")?.get(lang)?.get(id),
         Some((loc, path)) => {
-            let b = located_blocks(content).into_iter().find(|(l, _)| l == loc)?.1;
+            let b = located_blocks(content).into_iter().find(|(l, ..)| l == loc)?.2;
             b.get("i18n")?.get(lang)?.get(path)
         }
     }

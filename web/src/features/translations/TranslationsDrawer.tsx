@@ -24,13 +24,15 @@ type Props<C> = {
   onChange: (value: C) => void;
   /** The saved message, for Draft with AI (it works on the saved version). */
   target?: TranslationTarget;
+  /** The editor's own identity for the message while it isn't saved (see `useUnsavedId`). */
+  unsavedId?: string;
   name?: string;
   readOnly?: boolean;
   onClose: () => void;
 };
 
 /** The language versions of the message being edited. Changes go into the editor's content and are saved with it. */
-export function TranslationsDrawer<C>({ channel, value, onChange, target, name, readOnly, onClose }: Props<C>) {
+export function TranslationsDrawer<C>({ channel, value, onChange, target, unsavedId, name, readOnly, onClose }: Props<C>) {
   const settings = useLanguageSettings();
   const langs = settings.data?.languages ?? [];
   const [chosen, setChosen] = useState<string | null>(null);
@@ -76,6 +78,7 @@ export function TranslationsDrawer<C>({ channel, value, onChange, target, name, 
               view={view.data}
               lang={lang}
               target={target}
+              unsavedId={unsavedId}
               name={name}
               readOnly={readOnly}
               machine={settings.data?.machine_translation.available ?? false}
@@ -108,12 +111,13 @@ type EditorProps<C> = {
   view: TranslationView;
   lang: string;
   target?: TranslationTarget;
+  unsavedId?: string;
   name?: string;
   readOnly?: boolean;
   machine: boolean;
 };
 
-function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnly, machine }: EditorProps<C>) {
+function Editor<C>({ channel, value, onChange, view, lang, target, unsavedId, name, readOnly, machine }: EditorProps<C>) {
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -155,7 +159,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
     act(async () => {
       const data = await file.text();
       const format = file.name.toLowerCase().endsWith(".csv") ? "csv" : "xliff";
-      const r = await contentApi.importFile(value, lang, format, data, messageId(target));
+      const r = await contentApi.importFile(value, lang, format, data, messageId(target, unsavedId));
       onChange(r.content);
       const i = r.import;
       if (i) {
@@ -192,7 +196,7 @@ function Editor<C>({ channel, value, onChange, view, lang, target, name, readOnl
       toast.success(`${drafts.length} machine ${drafts.length === 1 ? "draft" : "drafts"} added; review them before sending`);
     });
 
-  const exportAs = (format: "xliff" | "csv") => act(() => downloadCsv("/api/translations/export", { content: value, language: lang, format, name: name ?? "message", message: messageId(target) }, `message.${lang}.${format === "csv" ? "csv" : "xlf"}`));
+  const exportAs = (format: "xliff" | "csv") => act(() => downloadCsv("/api/translations/export", { content: value, language: lang, format, name: name ?? "message", message: messageId(target, unsavedId) }, `message.${lang}.${format === "csv" ? "csv" : "xlf"}`));
   const showPreview = () => act(async () => setPreview(await contentApi.preview(channel, value, lang)));
   const machineIds = view.strings.filter((s) => s.status === "machine" || s.status === "check").map((s) => s.id);
   const running = run.data && (run.data.status === "queued" || run.data.status === "running");

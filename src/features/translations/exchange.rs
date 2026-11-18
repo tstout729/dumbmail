@@ -27,7 +27,8 @@ pub struct Unit {
     /// The default text the translator saw.
     pub source: String,
     pub target: String,
-    /// The hash of that default text, when the file carries it (XLIFF).
+    /// The hash of that default text (XLIFF: `resname`; CSV: the `hash` column). A string without
+    /// one is refused.
     pub hash: Option<String>,
 }
 
@@ -133,21 +134,21 @@ fn unguard(cell: &str) -> String {
     }
 }
 
-/// CSV with columns message, language, id, where, source, translation, status. Cells a
+/// CSV with columns message, language, id, where, source, hash, translation, status. Cells a
 /// spreadsheet would run as a formula start with an apostrophe; importing removes exactly that.
 pub fn to_csv(content: &Value, lang: &str, message: &str) -> AppResult<String> {
     let mut w = csv::Writer::from_writer(Vec::new());
-    w.write_record(["message", "language", "id", "where", "source", "translation", "status"]).map_err(|e| AppError::Internal(e.into()))?;
+    w.write_record(["message", "language", "id", "where", "source", "hash", "translation", "status"]).map_err(|e| AppError::Internal(e.into()))?;
     for f in fields::fields(content) {
         let st = fields::status(content, &f, lang);
         let target = fields::entry(content, &f.id, lang).and_then(|e| e.get("text")).and_then(|t| t.as_str()).filter(|_| st != "stale").unwrap_or("");
-        w.write_record([guard(message), guard(lang), guard(&f.id), guard(&f.label), guard(&f.source), guard(target), st.to_string()]).map_err(|e| AppError::Internal(e.into()))?;
+        w.write_record([guard(message), guard(lang), guard(&f.id), guard(&f.label), guard(&f.source), fields::hash(&f.source), guard(target), st.to_string()]).map_err(|e| AppError::Internal(e.into()))?;
     }
     let bytes = w.into_inner().map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
     String::from_utf8(bytes).map_err(|e| AppError::Internal(e.into()))
 }
 
-/// The rows of a CSV as exported (message, language, id, source and translation columns; one
+/// The rows of a CSV as exported (message, language, id, source, hash and translation columns; one
 /// message and language for the whole file).
 pub fn from_csv(text: &str) -> AppResult<Imported> {
     if text.len() > MAX_BYTES {
@@ -156,8 +157,8 @@ pub fn from_csv(text: &str) -> AppResult<Imported> {
     let mut r = csv::ReaderBuilder::new().flexible(true).from_reader(text.trim_start_matches('\u{feff}').as_bytes());
     let headers = r.headers().map_err(|e| AppError::bad(format!("couldn't read the CSV: {e}")))?.clone();
     let col = |name: &str| headers.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
-    let (Some(msg), Some(lang), Some(id), Some(source), Some(target)) = (col("message"), col("language"), col("id"), col("source"), col("translation")) else {
-        return Err(AppError::bad("the CSV needs message, language, id, source and translation columns (export one to see the layout)"));
+    let (Some(msg), Some(lang), Some(id), Some(source), Some(hash), Some(target)) = (col("message"), col("language"), col("id"), col("source"), col("hash"), col("translation")) else {
+        return Err(AppError::bad("the CSV needs message, language, id, source, hash and translation columns (export one to see the layout)"));
     };
     let mut units = Vec::new();
     let mut seen: Option<(String, String)> = None;
@@ -172,25 +173,32 @@ pub fn from_csv(text: &str) -> AppResult<Imported> {
             Some(s) if *s != here => return Err(AppError::bad("every row of the CSV must be for the same message and language")),
             Some(_) => {}
         }
-        units.push(Unit { id: unguard(rec.get(id).unwrap_or("")), source: unguard(rec.get(source).unwrap_or("")), target: unguard(rec.get(target).unwrap_or("")), hash: None });
+        let h = rec.get(hash).unwrap_or("").trim();
+        units.push(Unit { id: unguard(rec.get(id).unwrap_or("")), source: unguard(rec.get(source).unwrap_or("")), target: unguard(rec.get(target).unwrap_or("")), hash: (!h.is_empty()).then(|| h.to_string()) });
     }
     let (message, language) = seen.unwrap_or_default();
     Ok(Imported { message, language, units })
 }
 
 /// Apply imported strings to `content` in `lang` as reviewed translations, each matched by its
-/// field id and the exact default text (and its hash, when the file has it). Returns a summary:
+/// field id, the exact default text and that text's hash (a string without a hash is refused). A
+/// block's id is its stable key; a position is only accepted for a block that has none yet.
+/// Returns a summary:
 /// how many were applied, left empty, skipped because the default changed, or refused (with why).
 pub fn apply(content: &mut Value, lang: &str, units: &[Unit], own: &[String]) -> Value {
     let current: Vec<Field> = fields::fields(content);
     let (mut applied, mut empty, mut changed) = (0, 0, Vec::new());
     let mut refused: Vec<Value> = Vec::new();
     for u in units {
+        let Some(hash) = u.hash.as_deref().filter(|h| !h.is_empty()) else {
+            refused.push(json!({"id": u.id, "why": "it doesn't say which text it was made from (no source hash); export the texts again and translate that file"}));
+            continue;
+        };
         let Some(f) = current.iter().find(|f| f.id == u.id) else {
             changed.push(u.id.clone());
             continue;
         };
-        if f.source != u.source || u.hash.as_ref().is_some_and(|h| *h != fields::hash(&f.source)) {
+        if f.source != u.source || hash != fields::hash(&f.source) {
             changed.push(u.id.clone());
             continue;
         }
@@ -239,12 +247,48 @@ mod tests {
         let r = apply(&mut c, "fr", &rows.units, &[]);
         assert_eq!(r["changed_since_export"], json!(["subject"]));
         // A translation that drops a template tag is refused.
-        let u = Unit { id: "subject".into(), source: "Hello {{ first_name }}".into(), target: "Bonjour".into(), hash: None };
+        let u = Unit { id: "subject".into(), source: "Hello {{ first_name }}".into(), target: "Bonjour".into(), hash: Some(fields::hash("Hello {{ first_name }}")) };
         let r = apply(&mut c, "fr", &[u], &[]);
         assert_eq!(r["refused"][0]["id"], "subject");
         // The same text under the same id but a hash that doesn't match is skipped.
         let u = Unit { id: "subject".into(), source: "Hello {{ first_name }}".into(), target: "Salut {{ first_name }}".into(), hash: Some("00000000".into()) };
         assert_eq!(apply(&mut c, "fr", &[u], &[])["changed_since_export"], json!(["subject"]));
+        // One without a hash is refused.
+        let u = Unit { id: "subject".into(), source: "Hello {{ first_name }}".into(), target: "Salut {{ first_name }}".into(), hash: None };
+        assert_eq!(apply(&mut c, "fr", &[u], &[])["refused"][0]["id"], "subject");
+    }
+
+    #[test]
+    fn blocks_keep_their_ids_when_moved() {
+        let two = json!({"subject": "Hi", "blocks": [{"type": "button", "text": "Shop", "href": "https://a.test/1"}, {"type": "button", "text": "Shop", "href": "https://a.test/2"}]});
+        // Unsaved content has no keys: positions.
+        assert_eq!(fields::fields(&two).iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["subject", "b0:text", "b0:href", "b1:text", "b1:href"]);
+        let mut c = two.clone();
+        fields::assign_keys(&mut c);
+        let (k0, k1) = (fields::block_key(&c["blocks"][0]).unwrap().to_string(), fields::block_key(&c["blocks"][1]).unwrap().to_string());
+        assert_ne!(k0, k1);
+        let csv = to_csv(&c, "fr", "template/1").unwrap();
+        // The blocks are moved; the file still goes to the right block.
+        c["blocks"].as_array_mut().unwrap().swap(0, 1);
+        let mut rows = from_csv(&csv).unwrap();
+        for u in rows.units.iter_mut() {
+            if u.id == format!("{k0}:href") {
+                u.target = "https://a.test/fr1".into();
+            }
+        }
+        assert_eq!(apply(&mut c, "fr", &rows.units, &[])["applied"], 1);
+        assert_eq!(fields::entry(&c, &format!("{k0}:href"), "fr").unwrap()["text"], "https://a.test/fr1");
+        assert_eq!(c["blocks"][1]["href"], "https://a.test/1", "the block that was first, now second, has it");
+        assert!(c["blocks"][1]["i18n"]["fr"]["href"].is_object() && c["blocks"][0].get("i18n").is_none());
+        // A position doesn't reach a block that has a key.
+        let u = Unit { id: "b0:text".into(), source: "Shop".into(), target: "Acheter".into(), hash: Some(fields::hash("Shop")) };
+        assert_eq!(apply(&mut c, "fr", &[u], &[])["applied"], 0);
+        // Keys are kept, and a copied block gets its own.
+        let mut d = c.clone();
+        d["blocks"].as_array_mut().unwrap().push(c["blocks"][0].clone());
+        fields::assign_keys(&mut d);
+        assert_eq!(fields::block_key(&d["blocks"][0]), fields::block_key(&c["blocks"][0]));
+        assert_ne!(fields::block_key(&d["blocks"][2]), fields::block_key(&d["blocks"][0]));
     }
 
     #[test]
@@ -276,6 +320,7 @@ mod tests {
         assert_eq!(rows.units[0].source, "-50% today");
         assert_eq!(rows.units[1].source, "=HYPERLINK(\"https://evil.test\")");
         assert!(from_csv("id,source,translation\nsubject,a,b\n").is_err(), "a CSV must say what it's for");
+        assert!(from_csv("message,language,id,source,translation\nm,fr,subject,a,b\n").is_err(), "and carry the hashes");
     }
 
     #[test]

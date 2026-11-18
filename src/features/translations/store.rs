@@ -190,6 +190,8 @@ pub async fn update_in<R>(tx: &mut PgConnection, account_id: Uuid, t: &Target, s
         campaign_editable(&status, scheduled_ok)?;
     }
     let out = f(&mut l)?;
+    // Every block keeps (or gets) its stable key, like on any other save.
+    super::fields::assign_keys(&mut l.content);
     // The same check every save of this content gets (coupon tags and language versions).
     crate::features::coupons::template::check_content(&l.channel, &l.content)?;
     match t {

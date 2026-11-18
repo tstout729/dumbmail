@@ -60,6 +60,42 @@ fn french() -> Value {
     ])
 }
 
+/// The id of the field at position `pos` ("b0:text", "b2.c0.0:href") in saved `content`: once
+/// saved, a block is named by its own stable key.
+fn field_id(content: &Value, pos: &str) -> String {
+    let (loc, path) = pos.split_once(':').unwrap();
+    let mut parts = loc.split('.');
+    let i: usize = parts.next().unwrap()[1..].parse().unwrap();
+    let mut b = &content["blocks"][i];
+    if let (Some(c), Some(k)) = (parts.next(), parts.next()) {
+        b = &b["columns"][c[1..].parse::<usize>().unwrap()][k.parse::<usize>().unwrap()];
+    }
+    format!("{}:{path}", b["key"].as_str().unwrap_or_else(|| panic!("no key at {pos}: {content}")))
+}
+
+/// `strings` with positions turned into saved `content`'s ids.
+fn keyed(content: &Value, strings: Value) -> Value {
+    Value::Array(
+        strings
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                let mut x = x.clone();
+                let id = x["id"].as_str().unwrap().to_string();
+                if id.contains(':') {
+                    x["id"] = json!(field_id(content, &id));
+                }
+                x
+            })
+            .collect(),
+    )
+}
+
+fn hash(s: &str) -> String {
+    dumbmail::features::translations::fields::hash(s)
+}
+
 #[tokio::test]
 async fn each_person_gets_their_language_and_everyone_else_the_default() {
     let mut h = harness!();
@@ -76,10 +112,10 @@ async fn each_person_gets_their_language_and_everyone_else_the_default() {
     // A language that isn't one of the account's is refused; then French is saved.
     let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "it", "strings": [{"id": "subject", "text": "Ciao"}]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
-    let v = h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": french()}))).await;
+    let v = h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": keyed(&c["content"], french())}))).await;
     assert_eq!(v["summary"]["fr"]["reviewed"], 5, "four texts and the localized link: {v}");
     assert_eq!(v["summary"]["fr"]["missing"], 2, "preview text and alt text: {v}");
-    let link = v["strings"].as_array().unwrap().iter().find(|s| s["id"] == "b2.c0.0:href").unwrap().clone();
+    let link = v["strings"].as_array().unwrap().iter().find(|s| s["id"] == field_id(&c["content"], "b2.c0.0:href").as_str()).unwrap().clone();
     assert_eq!(link["status"], "reviewed");
 
     // The check before sending says what's missing in French; it doesn't stop the send.
@@ -126,14 +162,14 @@ async fn translations_follow_edits_and_are_checked_when_saved() {
     set_languages(&mut h, json!(["fr"])).await;
     let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "Draft", "content": email()}))).await;
     let cid = c["id"].as_str().unwrap().to_string();
-    h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": french()}))).await;
+    h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": keyed(&c["content"], french())}))).await;
 
     // A translation must keep the original's template tags, and they must work.
     for bad in ["Bonjour", "Bonjour {{ person.properties.secret }}", "Bonjour {{ first_name|default('there') }} {% if %}"] {
         let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": [{"id": "subject", "text": bad}]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
     }
-    let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": [{"id": "b2.c0.0:href", "text": "javascript:alert(1)"}]}))).await;
+    let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "fr", "strings": [{"id": field_id(&c["content"], "b2.c0.0:href"), "text": "javascript:alert(1)"}]}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
     // The same rules apply to content saved through the campaign API itself.
     let mut raw = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
@@ -147,7 +183,7 @@ async fn translations_follow_edits_and_are_checked_when_saved() {
     h.ok("PATCH", &format!("/api/campaigns/{cid}"), Some(json!({"content": content.clone()}))).await;
     let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=fr"), None).await;
     let st = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["status"].clone();
-    assert_eq!(st("b0:text"), "stale");
+    assert_eq!(st(&field_id(&content, "b0:text")), "stale");
     assert_eq!(st("subject"), "reviewed");
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": content, "language": "fr"}))).await;
     assert!(p["html"].as_str().unwrap().contains("Fresh picks for winter") && p["html"].as_str().unwrap().contains("Acheter"));
@@ -175,11 +211,11 @@ async fn ab_versions_flow_steps_templates_and_saved_blocks_have_their_own_transl
     let (s, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Sign-off", "blocks": [{"type": "text", "html": "<p>See you soon</p>"}]}))).await;
     assert_eq!(s, StatusCode::CREATED, "{sb}");
     let sbid = sb["id"].as_str().unwrap();
-    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "es", "strings": [{"id": "b0:html", "text": "<p>Hasta pronto</p>"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "es", "strings": [{"id": field_id(&sb, "b0:html"), "text": "<p>Hasta pronto</p>"}]}))).await;
     let content = json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "News"}, {"type": "saved", "saved_block_id": sbid}]});
     let t = h.ok("POST", "/api/templates", Some(json!({"name": "T", "channel": "email", "content": content}))).await;
     let tid = t["id"].as_str().unwrap();
-    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "es", "strings": [{"id": "subject", "text": "Hola"}, {"id": "b0:text", "text": "Noticias"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "es", "strings": [{"id": "subject", "text": "Hola"}, {"id": field_id(&t["content"], "b0:text"), "text": "Noticias"}]}))).await;
     let tpl = h.ok("GET", &format!("/api/templates/{tid}"), None).await;
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": tpl["content"], "language": "es"}))).await;
     let html = p["html"].as_str().unwrap();
@@ -191,7 +227,7 @@ async fn ab_versions_flow_steps_templates_and_saved_blocks_have_their_own_transl
     let ab = json!({"variants": [{"id": "b", "content": {"subject": "Hey", "blocks": [{"type": "heading", "text": "Big news"}]}}], "test_percent": 50, "wait_hours": 1});
     let c = h.ok("POST", "/api/campaigns", Some(json!({"name": "AB", "content": content, "ab_test": ab}))).await;
     let cid = c["id"].as_str().unwrap();
-    h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"version": "b", "language": "es", "strings": [{"id": "subject", "text": "Oye"}, {"id": "b0:text", "text": "Grandes noticias"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"version": "b", "language": "es", "strings": [{"id": "subject", "text": "Oye"}, {"id": field_id(&c["ab_test"]["variants"][0]["content"], "b0:text"), "text": "Grandes noticias"}]}))).await;
     let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=es"), None).await;
     assert_eq!(v["languages"], json!([]), "version A has no Spanish yet");
     let r = h.ok("POST", &format!("/api/translations/campaigns/{cid}/test"), Some(json!({"to": ["owner@acme.test"], "version": "b", "language": "es"}))).await;
@@ -203,7 +239,7 @@ async fn ab_versions_flow_steps_templates_and_saved_blocks_have_their_own_transl
     // A flow step.
     let flow = h.ok("POST", "/api/flows", Some(json!({"name": "F", "trigger": {"type": "metric", "metric": "Placed Order"}, "definition": {"entry": "e1", "nodes": [{"id": "e1", "type": "email", "content": {"subject": "Thanks", "blocks": [{"type": "text", "html": "<p>Order {{ event.properties.order_id }}</p>"}]}, "next": null}]}}))).await;
     let fid = flow["id"].as_str().unwrap();
-    h.ok("PUT", &format!("/api/translations/flows/{fid}/steps/e1"), Some(json!({"language": "es", "strings": [{"id": "subject", "text": "Gracias"}, {"id": "b0:html", "text": "<p>Pedido {{ event.properties.order_id }}</p>"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/flows/{fid}/steps/e1"), Some(json!({"language": "es", "strings": [{"id": "subject", "text": "Gracias"}, {"id": field_id(&flow["definition"]["nodes"][0]["content"], "b0:html"), "text": "<p>Pedido {{ event.properties.order_id }}</p>"}]}))).await;
     h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "live"}))).await;
     h.ok("POST", "/api/events", Some(json!({"metric": "Placed Order", "profile": {"email": "ana@x.test"}, "properties": {"order_id": "A-1"}}))).await;
     h.fast_forward().await;
@@ -298,7 +334,7 @@ async fn translators_work_round_trips_through_xliff_and_csv() {
     let (s, hdrs, x) = h.raw("GET", &format!("/api/translations/templates/{tid}/export?language=de&format=xliff"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
     assert_eq!(s, StatusCode::OK, "{x}");
     assert!(hdrs[header::CONTENT_DISPOSITION].to_str().unwrap().contains("welcome-to-acme.de.xlf"));
-    assert!(x.contains(r#"target-language="de""#) && x.contains("Acme: never translate") && x.contains(r#"<trans-unit id="b0:text""#));
+    assert!(x.contains(r#"target-language="de""#) && x.contains("Acme: never translate") && x.contains(&format!(r#"<trans-unit id="{}""#, field_id(&t["content"], "b0:text"))));
     // The translator fills in two targets.
     let x = x
         .replace(r#"<target state="new" xml:space="preserve"></target>
@@ -313,11 +349,12 @@ async fn translators_work_round_trips_through_xliff_and_csv() {
 
     // CSV: a row whose default changed since the export is skipped, not applied to the new text.
     let (_, _, csv) = h.raw("GET", &format!("/api/translations/templates/{tid}/export?language=de&format=csv"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
-    assert!(csv.starts_with("message,language,id,where,source,translation,status"), "{csv}");
+    assert!(csv.starts_with("message,language,id,where,source,hash,translation,status"), "{csv}");
     let mut content = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
     content["preheader"] = json!("Changed preview");
     h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": content}))).await;
-    let edited = csv.replace("preheader,Preview text,New arrivals,,missing", "preheader,Preview text,New arrivals,Neuheiten,missing");
+    let hp = hash("New arrivals");
+    let edited = csv.replace(&format!("preheader,Preview text,New arrivals,{hp},,missing"), &format!("preheader,Preview text,New arrivals,{hp},Neuheiten,missing"));
     let v = h.ok("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "de", "format": "csv", "data": edited}))).await;
     assert_eq!(v["import"]["changed_since_export"], json!(["preheader"]), "{v}");
     let (s, _) = h.req("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "de", "format": "xliff", "data": "<html>"}))).await;
@@ -451,7 +488,10 @@ async fn draft_with_ai_sends_only_the_text_and_keeps_tags_exactly() {
     assert!(sent.contains("⟦T1⟧") && sent.contains("⟦K"), "{sent}");
 
     let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
-    let s = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone();
+    let s = |id: &str| {
+        let id = if id.contains(':') { field_id(&c["content"], id) } else { id.to_string() };
+        v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id.as_str()).unwrap().clone()
+    };
     assert_eq!(s("subject")["text"], "DE:Hello {{ first_name|default('there') }}");
     assert_eq!(s("subject")["status"], "machine");
     assert_eq!(s("b1:html")["text"], "DE:<p>Hi <strong>{{ first_name|default('there') }}</strong>, take a look.</p>");
@@ -480,11 +520,14 @@ async fn draft_with_ai_sends_only_the_text_and_keeps_tags_exactly() {
     let c3 = h.ok("POST", "/api/campaigns", Some(json!({"name": "Race", "content": {"subject": "One", "blocks": [{"type": "heading", "text": "Two"}]}}))).await;
     let c3id = c3["id"].as_str().unwrap().to_string();
     h.ok("POST", &format!("/api/translations/campaigns/{c3id}/draft"), Some(json!({"language": "de"}))).await;
-    h.ok("PATCH", &format!("/api/campaigns/{c3id}"), Some(json!({"content": {"subject": "One more", "blocks": [{"type": "heading", "text": "Two"}]}}))).await;
+    // Edited the way the editor does it (blocks keep their keys).
+    let mut edited = c3["content"].clone();
+    edited["subject"] = json!("One more");
+    h.ok("PATCH", &format!("/api/campaigns/{c3id}"), Some(json!({"content": edited}))).await;
     h.drain().await;
     let v = h.ok("GET", &format!("/api/translations/campaigns/{c3id}?language=de"), None).await;
     let st: Vec<(String, String)> = v["strings"].as_array().unwrap().iter().map(|s| (s["id"].as_str().unwrap().to_string(), s["status"].as_str().unwrap().to_string())).collect();
-    assert_eq!(st, vec![("subject".into(), "missing".into()), ("b0:text".into(), "machine".into())], "{v}");
+    assert_eq!(st, vec![("subject".into(), "missing".into()), (field_id(&c3["content"], "b0:text"), "machine".into())], "{v}");
     let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'translation.draft'").fetch_one(&h.state.db).await.unwrap();
     assert_eq!(audit, 2);
     h.cleanup().await;
@@ -655,8 +698,8 @@ async fn arabic_and_hebrew_emails_render_right_to_left_without_breaking_the_layo
         {"type": "button", "text": "Shop", "href": "https://acme.test", "align": "right"}
     ]}}))).await;
     let tid = t["id"].as_str().unwrap();
-    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "ar", "strings": [{"id": "subject", "text": "تخفيضات"}, {"id": "b0:text", "text": "تخفيضات كبيرة"}, {"id": "b1:html", "text": "<p>كل شيء بنصف السعر.</p>"}, {"id": "b2:text", "text": "تسوق"}]}))).await;
-    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "he", "strings": [{"id": "b0:text", "text": "מבצע גדול"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "ar", "strings": keyed(&t["content"], json!([{"id": "subject", "text": "تخفيضات"}, {"id": "b0:text", "text": "تخفيضات كبيرة"}, {"id": "b1:html", "text": "<p>كل شيء بنصف السعر.</p>"}, {"id": "b2:text", "text": "تسوق"}]))}))).await;
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "he", "strings": [{"id": field_id(&t["content"], "b0:text"), "text": "מבצע גדול"}]}))).await;
     let content = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
     for (lang, word) in [("ar", "تخفيضات كبيرة"), ("he", "מבצע גדול")] {
         let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": content, "language": lang}))).await;
@@ -713,7 +756,8 @@ async fn the_editor_works_on_unsaved_content_without_storing_anything() {
     assert_eq!(i["summary"]["fr"]["reviewed"], 1);
     let (s, _, csv) = h.raw("POST", "/api/translations/export", &[("cookie", h.cookie.clone().unwrap().as_str()), ("content-type", "application/json"), ("origin", "https://pl.test"), ("x-dumbmail-account", &account_id(&h).await.to_string())], &json!({"content": content, "language": "fr", "format": "csv", "name": "News"}).to_string()).await;
     assert_eq!(s, StatusCode::OK, "{csv}");
-    let edited = csv.replace("subject,Subject,Hello {{ first_name|default('there') }},,missing", "subject,Subject,Hello {{ first_name|default('there') }},Bonjour {{ first_name|default('there') }},missing");
+    let hs = hash("Hello {{ first_name|default('there') }}");
+    let edited = csv.replace(&format!("subject,Subject,Hello {{{{ first_name|default('there') }}}},{hs},,missing"), &format!("subject,Subject,Hello {{{{ first_name|default('there') }}}},{hs},Bonjour {{{{ first_name|default('there') }}}},missing"));
     let (s, _) = h.req("POST", "/api/translations/import", Some(json!({"content": content, "language": "fr", "format": "csv", "data": edited, "message": "template/123"}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "a file for another message is refused");
     let v = h.ok("POST", "/api/translations/import", Some(json!({"content": content, "language": "fr", "format": "csv", "data": edited}))).await;
@@ -807,20 +851,21 @@ async fn translations_change_only_words_on_every_path() {
     assert_eq!(s, StatusCode::OK, "{e}");
     h.ok("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": "subject", "text": null}]}))).await;
     for (id, text) in bad {
-        let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": id, "text": text}]}))).await;
+        let stored = if id.contains(':') { field_id(&c["content"], id) } else { id.to_string() };
+        let (s, e) = h.req("PUT", &format!("/api/translations/campaigns/{cid}"), Some(json!({"language": "de", "strings": [{"id": stored, "text": text}]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "API {id} {text}: {e}");
         let (s, _) = h.req("POST", "/api/translations/apply", Some(json!({"content": content, "language": "de", "strings": [{"id": id, "text": text}]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "editor {id} {text}");
     }
     // MCP.
     let key = h.ok("POST", "/api/api-keys", Some(json!({"name": "k"}))).await["key"].as_str().unwrap().to_string();
-    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "set_translations", "arguments": {"target": {"kind": "campaign", "id": cid}, "language": "de", "strings": [{"id": "b0:html", "text": bad[1].1}]}}});
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "set_translations", "arguments": {"target": {"kind": "campaign", "id": cid}, "language": "de", "strings": [{"id": field_id(&c["content"], "b0:html"), "text": bad[1].1}]}}});
     let (_, v) = bearer(&h, &key, "POST", "/mcp", Some(call)).await;
     assert_eq!(v["result"]["isError"], true, "{v}");
     // Content saved directly, with a translation whose source hash is current.
     let mut raw = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
     let src = raw["blocks"][0]["html"].as_str().unwrap().to_string();
-    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": raw, "language": "de", "strings": [{"id": "b0:html", "text": "<p>Hallo <a href=\"https://acme.test/shop\">jetzt kaufen</a>, {{ first_name }}.</p>"}]}))).await;
+    let v = h.ok("POST", "/api/translations/apply", Some(json!({"content": raw, "language": "de", "strings": [{"id": field_id(&raw, "b0:html"), "text": "<p>Hallo <a href=\"https://acme.test/shop\">jetzt kaufen</a>, {{ first_name }}.</p>"}]}))).await;
     raw = v["content"].clone();
     assert_eq!(raw["blocks"][0]["i18n"]["de"]["html"]["source"].as_str().unwrap().len(), 8, "{src}");
     raw["blocks"][0]["i18n"]["de"]["html"]["text"] = json!(bad[1].1);
@@ -828,14 +873,14 @@ async fn translations_change_only_words_on_every_path() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
     // XLIFF and CSV imports refuse it (and say why).
     let (_, _, x) = h.raw("GET", &format!("/api/translations/campaigns/{cid}/export?language=de&format=xliff"), &[("cookie", h.cookie.clone().unwrap().as_str())], "").await;
-    let marker = r#"<trans-unit id="b0:html""#;
-    let at = x.find(marker).unwrap();
+    let marker = format!(r#"<trans-unit id="{}""#, field_id(&c["content"], "b0:html"));
+    let at = x.find(&marker).unwrap();
     let target_at = at + x[at..].find("<target").unwrap();
     let end = target_at + x[target_at..].find("</target>").unwrap();
     let x = format!("{}<target>{}{}", &x[..target_at], bad[0].1.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"), &x[end..]);
     let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "xliff", "data": x}))).await;
-    assert_eq!(v["import"]["refused"][0]["id"], "b0:html", "{v}");
-    let csv = format!("message,language,id,where,source,translation,status\ncampaign/{cid},de,subject,Subject,\"Hello {{{{ first_name|default('there') }}}}\",\"{}\",missing\n", bad[3].1);
+    assert_eq!(v["import"]["refused"][0]["id"], field_id(&c["content"], "b0:html").as_str(), "{v}");
+    let csv = format!("message,language,id,where,source,hash,translation,status\ncampaign/{cid},de,subject,Subject,\"Hello {{{{ first_name|default('there') }}}}\",{},\"{}\",missing\n", hash("Hello {{ first_name|default('there') }}"), bad[3].1);
     let v = h.ok("POST", &format!("/api/translations/campaigns/{cid}/import"), Some(json!({"language": "de", "format": "csv", "data": csv}))).await;
     assert_eq!(v["import"]["refused"][0]["id"], "subject", "{v}");
     // A machine draft that adds a link is thrown away; the others are kept.
@@ -844,7 +889,7 @@ async fn translations_change_only_words_on_every_path() {
     assert_eq!(calls.lock().unwrap().requests.len(), 1);
     let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
     let st = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["status"].clone();
-    assert_eq!(st("b1:text"), "missing", "{v}");
+    assert_eq!(st(&field_id(&c["content"], "b1:text")), "missing", "{v}");
     assert_eq!(st("subject"), "machine");
     assert!(!v.to_string().contains("evil.test"));
     h.cleanup().await;
@@ -862,7 +907,7 @@ async fn localized_links_are_real_web_addresses_and_never_dumbmails_own() {
     ]});
     let t = h.ok("POST", "/api/templates", Some(json!({"name": "Links", "channel": "email", "content": content}))).await;
     let tid = t["id"].as_str().unwrap().to_string();
-    let put = |id: &str, text: &str| json!({"language": "fr", "strings": [{"id": id, "text": text}]});
+    let put = |pos: &str, text: &str| json!({"language": "fr", "strings": [{"id": field_id(&t["content"], pos), "text": text}]});
     for bad in ["https://pl.test/u/abc", "https://links.pl.test/x", "http://acme.test/fr", "https://user:pw@acme.test/fr", "https://acme.test@evil.test/", "javascript:alert(1)", "https://{{ first_name }}.test/", "mailto:fr@acme.test", "//acme.test/fr"] {
         let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(put("b0:href", bad))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
@@ -893,7 +938,7 @@ async fn translations_inside_a_saved_block_are_used_on_their_own() {
     set_languages(&mut h, json!(["fr"])).await;
     let (_, sb) = h.req("POST", "/api/content/saved-blocks", Some(json!({"name": "Sign-off", "blocks": [{"type": "text", "html": "<p>See you soon</p>"}]}))).await;
     let sbid = sb["id"].as_str().unwrap().to_string();
-    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "fr", "strings": [{"id": "b0:html", "text": "<p>À bientôt</p>"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/saved-blocks/{sbid}"), Some(json!({"language": "fr", "strings": [{"id": field_id(&sb, "b0:html"), "text": "<p>À bientôt</p>"}]}))).await;
     // The email itself has no translations at all.
     let content = json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "News"}, {"type": "saved", "saved_block_id": sbid}]});
     let ann = person(&mut h, "ann@x.test", Some("fr")).await;
@@ -1089,7 +1134,8 @@ async fn machine_drafts_cant_quietly_change_the_facts() {
     // The draft whose price changed is kept for a careful look, blocks the check and isn't sent.
     let v = h.ok("GET", &format!("/api/translations/campaigns/{cid}?language=de"), None).await;
     let st = |v: &Value, id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["status"].clone();
-    assert_eq!(st(&v, "b0:text"), "check", "{v}");
+    let head = field_id(&c["content"], "b0:text");
+    assert_eq!(st(&v, &head), "check", "{v}");
     assert_eq!(st(&v, "subject"), "machine");
     let chk = h.ok("POST", "/api/content/check", Some(json!({"campaign_id": cid, "skip_links": true}))).await;
     let f = chk["findings"].as_array().unwrap().iter().find(|f| f["id"] == "translation_needs_check").expect("listed");
@@ -1098,7 +1144,7 @@ async fn machine_drafts_cant_quietly_change_the_facts() {
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
     assert!(p["html"].as_str().unwrap().contains("Only $19.99 today") && !p["html"].as_str().unwrap().contains("29.99"));
     // Once a person has looked and marked it reviewed, it's used.
-    h.ok("POST", &format!("/api/translations/campaigns/{cid}/review"), Some(json!({"language": "de", "ids": ["b0:text"]}))).await;
+    h.ok("POST", &format!("/api/translations/campaigns/{cid}/review"), Some(json!({"language": "de", "ids": [head]}))).await;
     let saved = h.ok("GET", &format!("/api/campaigns/{cid}"), None).await["content"].clone();
     let p = h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": saved, "language": "de"}))).await;
     assert!(p["html"].as_str().unwrap().contains("29.99"));
@@ -1333,11 +1379,11 @@ async fn the_opt_out_stays_visible() {
     let tid = t["id"].as_str().unwrap().to_string();
     // Direction marks and invisible characters, typed or as HTML references, are refused.
     for bad in ["<p>Écrivez\u{202E}-nous</p>", "<p>Écrivez&#x202E;-nous</p>", "<p>Écrivez&rlm;-nous</p>", "<p>\u{200B}</p>", "<p>Écrivez&#8203;-nous</p>"] {
-        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "b0:html", "text": bad}]}))).await;
+        let (s, e) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": field_id(&t["content"], "b0:html"), "text": bad}]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}: {e}");
     }
     // Joiners scripts need are fine.
-    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "ar", "strings": [{"id": "b0:html", "text": "<p>اكتب\u{200C}لنا</p>"}]}))).await;
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "ar", "strings": [{"id": field_id(&t["content"], "b0:html"), "text": "<p>اكتب\u{200C}لنا</p>"}]}))).await;
     // The opt-out wording must show words.
     for bad in ["\u{200B}", "...", "\u{202E}Se désabonner", "&#x200B;"] {
         let (s, e) = h.req("PUT", "/api/translations/system-texts", Some(json!({"language": "fr", "texts": {"footer.unsubscribe": bad}}))).await;
@@ -1362,12 +1408,13 @@ async fn csv_exports_are_safe_to_open_and_still_round_trip() {
     assert!(csv.contains("'-50% today") && csv.contains("'=Deals"), "{csv}");
     assert!(!csv.lines().skip(1).any(|l| l.split(',').any(|cell| cell.trim_start_matches('"').starts_with(['=', '+', '-', '@']))), "{csv}");
     // A translator fills in the translations (formula-like too) and the file comes back.
-    let filled = csv.replace("'-50% today,,missing", "'-50% today,'-50 % aujourd'hui,missing").replace("'=Deals,,missing", "'=Deals,'=Promos,missing");
+    let (h1, h2) = (hash("-50% today"), hash("=Deals"));
+    let filled = csv.replace(&format!("'-50% today,{h1},,missing"), &format!("'-50% today,{h1},'-50 % aujourd'hui,missing")).replace(&format!("'=Deals,{h2},,missing"), &format!("'=Deals,{h2},'=Promos,missing"));
     let v = h.ok("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "fr", "format": "csv", "data": filled}))).await;
     assert_eq!(v["import"]["applied"], 2, "{v}");
     let text = |id: &str| v["strings"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap()["text"].clone();
     assert_eq!(text("subject"), "-50 % aujourd'hui");
-    assert_eq!(text("b0:text"), "=Promos");
+    assert_eq!(text(&field_id(&t["content"], "b0:text")), "=Promos");
     h.cleanup().await;
 }
 
@@ -1378,7 +1425,8 @@ async fn imports_go_to_the_message_and_language_they_were_made_for() {
     set_languages(&mut h, json!(["fr", "de"])).await;
     // Two templates with the same text at the same place.
     let mk = json!({"name": "A", "channel": "email", "content": {"subject": "Hello", "blocks": [{"type": "heading", "text": "News"}]}});
-    let a = h.ok("POST", "/api/templates", Some(mk.clone())).await["id"].as_str().unwrap().to_string();
+    let ta = h.ok("POST", "/api/templates", Some(mk.clone())).await;
+    let a = ta["id"].as_str().unwrap().to_string();
     let mut mk_b = mk.clone();
     mk_b["name"] = json!("B");
     let b = h.ok("POST", "/api/templates", Some(mk_b)).await["id"].as_str().unwrap().to_string();
@@ -1386,7 +1434,7 @@ async fn imports_go_to_the_message_and_language_they_were_made_for() {
     for format in ["xliff", "csv"] {
         let (_, _, file) = h.raw("GET", &format!("/api/translations/templates/{a}/export?language=fr&format={format}"), &[("cookie", cookie.as_str())], "").await;
         let filled = if format == "csv" {
-            file.replace("subject,Subject,Hello,,missing", "subject,Subject,Hello,Bonjour,missing")
+            file.replace(&format!("subject,Subject,Hello,{},,missing", hash("Hello")), &format!("subject,Subject,Hello,{},Bonjour,missing", hash("Hello")))
         } else {
             file.replacen(r#"<target state="new" xml:space="preserve"></target>"#, "<target>Bonjour</target>", 1)
         };
@@ -1403,10 +1451,11 @@ async fn imports_go_to_the_message_and_language_they_were_made_for() {
     assert_eq!(v["summary"].as_object().map(|m| m.len()), Some(0), "B was never touched: {v}");
     // A unit whose hash doesn't match the text it claims is skipped.
     let (_, _, x) = h.raw("GET", &format!("/api/translations/templates/{a}/export?language=fr&format=xliff"), &[("cookie", cookie.as_str())], "").await;
-    let at = x.find(r#"<trans-unit id="b0:text" resname=""#).unwrap() + r#"<trans-unit id="b0:text" resname=""#.len();
+    let unit = format!(r#"<trans-unit id="{}" resname=""#, field_id(&ta["content"], "b0:text"));
+    let at = x.find(&unit).unwrap() + unit.len();
     let tampered = format!("{}00000000{}", &x[..at], &x[at + 8..]).replacen(r#"<target state="new" xml:space="preserve"></target>"#, "<target>Nouvelles</target>", 1);
     let v = h.ok("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": "xliff", "data": tampered}))).await;
-    assert_eq!(v["import"]["changed_since_export"], json!(["b0:text"]), "{v}");
+    assert_eq!(v["import"]["changed_since_export"], json!([field_id(&ta["content"], "b0:text")]), "{v}");
     // Malformed XML and DTDs are refused outright.
     for bad in ["<xliff><file", r#"<!DOCTYPE x [<!ENTITY e "x">]><xliff/>"#] {
         let (s, _) = h.req("POST", &format!("/api/translations/templates/{a}/import"), Some(json!({"language": "fr", "format": "xliff", "data": bad}))).await;
@@ -1513,5 +1562,55 @@ async fn an_expired_lease_cant_do_anything() {
     assert_eq!((status.as_str(), strings), ("failed", json!([])));
     assert!(error.unwrap().contains("went wrong"));
     h.drain().await;
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn imports_go_to_the_right_field_when_blocks_move() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr"])).await;
+    // Two buttons with the same label and different destinations.
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": "Two", "channel": "email", "content": {"subject": "Hi", "blocks": [
+        {"type": "button", "text": "Shop", "href": "https://acme.test/men"},
+        {"type": "button", "text": "Shop", "href": "https://acme.test/women"}
+    ]}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    let (men, women) = (field_id(&t["content"], "b0:href"), field_id(&t["content"], "b1:href"));
+    assert!(!men.starts_with("b0") && men != women, "saved blocks have keys: {men} {women}");
+    let cookie = h.cookie.clone().unwrap();
+    let (_, _, csv) = h.raw("GET", &format!("/api/translations/templates/{tid}/export?language=fr&format=csv"), &[("cookie", cookie.as_str())], "").await;
+    // The blocks are swapped in the editor before the file comes back.
+    let mut content = t["content"].clone();
+    content["blocks"].as_array_mut().unwrap().swap(0, 1);
+    h.ok("PATCH", &format!("/api/templates/{tid}"), Some(json!({"content": content}))).await;
+    let filled = csv
+        .replace(&format!("{men},Block 1 (button),https://acme.test/men,{},,default", hash("https://acme.test/men")), &format!("{men},Block 1 (button),https://acme.test/men,{},https://acme.test/fr/hommes,default", hash("https://acme.test/men")))
+        .replace(&format!("{women},Block 2 (button),https://acme.test/women,{},,default", hash("https://acme.test/women")), &format!("{women},Block 2 (button),https://acme.test/women,{},https://acme.test/fr/femmes,default", hash("https://acme.test/women")));
+    assert_ne!(filled, csv, "{csv}");
+    let v = h.ok("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "fr", "format": "csv", "data": filled}))).await;
+    assert_eq!(v["import"]["applied"], 2, "{v}");
+    let saved = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
+    assert_eq!(saved["blocks"][0]["href"], "https://acme.test/women");
+    assert_eq!(saved["blocks"][0]["i18n"]["fr"]["href"]["text"], "https://acme.test/fr/femmes", "{saved}");
+    assert_eq!(saved["blocks"][1]["i18n"]["fr"]["href"]["text"], "https://acme.test/fr/hommes");
+    // A position doesn't reach a saved block, and a row without its source hash is refused.
+    let (s, _) = h.req("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "b0:text", "text": "Acheter"}]}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let no_hash = format!("message,language,id,where,source,hash,translation,status\ntemplate/{tid},fr,subject,Subject,Hi,,Salut,missing\n");
+    let v = h.ok("POST", &format!("/api/translations/templates/{tid}/import"), Some(json!({"language": "fr", "format": "csv", "data": no_hash}))).await;
+    assert_eq!((v["import"]["applied"].clone(), v["import"]["refused"][0]["id"].clone()), (json!(0), json!("subject")), "{v}");
+    // Content saved before keys existed gets them on its next save.
+    let acct = account_id(&h).await;
+    let old: Uuid = sqlx::query_scalar("INSERT INTO templates (id, account_id, name, channel, content) VALUES (gen_random_uuid(), $1, 'Old', 'email', $2) RETURNING id")
+        .bind(acct)
+        .bind(json!({"subject": "Hi", "blocks": [{"type": "heading", "text": "Old"}]}))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    h.ok("PUT", &format!("/api/translations/templates/{old}"), Some(json!({"language": "fr", "strings": [{"id": "b0:text", "text": "Ancien"}]}))).await;
+    let saved = h.ok("GET", &format!("/api/templates/{old}"), None).await["content"].clone();
+    assert!(saved["blocks"][0]["key"].is_string(), "{saved}");
+    assert_eq!(saved["blocks"][0]["i18n"]["fr"]["text"]["text"], "Ancien");
     h.cleanup().await;
 }

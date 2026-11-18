@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, withQuery } from "../../api/client";
 import { toast } from "../../lib/toast";
@@ -11,9 +12,10 @@ const keys = {
   report: (campaignId: string) => ["translations", "report", campaignId] as const,
 };
 
-/** The identity an exported file carries, so it can only be imported back into the same message. */
-export function messageId(t: TranslationTarget | undefined): string {
-  if (!t) return "unsaved";
+/** The identity an exported file carries, so it can only be imported back into the same message
+ * (`unsaved`: the editor's own identity for a draft that isn't saved yet, see {@link useUnsavedId}). */
+export function messageId(t: TranslationTarget | undefined, unsaved?: string): string {
+  if (!t) return unsaved ?? "unsaved";
   switch (t.kind) {
     case "campaign":
       return t.version ? `campaign/${t.id}/${t.version}` : `campaign/${t.id}`;
@@ -24,6 +26,12 @@ export function messageId(t: TranslationTarget | undefined): string {
     case "saved_block":
       return `saved_block/${t.id}`;
   }
+}
+
+/** An identity of its own for a message being written that isn't saved yet, kept while its editor is open. */
+export function useUnsavedId(): string {
+  const [id] = useState(() => `unsaved/${crypto.randomUUID()}`);
+  return id;
 }
 
 /** Where a stored message's translations live in the API. */

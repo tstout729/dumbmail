@@ -9,6 +9,7 @@ import { LoadTemplateDialog, SaveTemplateDialog } from "./TemplateDialogs";
 import { VariableMenu, insertAtCursor } from "./VariableMenu";
 import { newBlock } from "./blocks";
 import { TranslationsDrawer } from "../../features/translations/TranslationsDrawer";
+import { useUnsavedId } from "../../features/translations/api";
 import type { TranslationTarget } from "../../features/translations/types";
 
 type Props = {
@@ -31,6 +32,7 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
   const subjectRef = useRef<HTMLInputElement>(null);
   const [showMore, setShowMore] = useState(false);
   const [dialog, setDialog] = useState<"load" | "save" | "languages" | null>(null);
+  const unsavedId = useUnsavedId();
   const mode: "blocks" | "html" = value.blocks === undefined && value.html !== undefined ? "html" : "blocks";
   const set = (patch: Partial<EmailContent>) => onChange({ ...value, ...patch });
 
@@ -146,7 +148,7 @@ export function EmailEditor({ value, onChange, showSender = true, templates = tr
         />
       ) : null}
       {dialog === "languages" ? (
-        <TranslationsDrawer channel="email" value={value} onChange={onChange} target={translationTarget} name={templateName ?? value.subject} readOnly={readOnly} onClose={() => setDialog(null)} />
+        <TranslationsDrawer channel="email" value={value} onChange={onChange} target={translationTarget} unsavedId={unsavedId} name={templateName ?? value.subject} readOnly={readOnly} onClose={() => setDialog(null)} />
       ) : null}
       {dialog === "save" ? <SaveTemplateDialog channel="email" content={value} defaultName={templateName ?? value.subject} onClose={() => setDialog(null)} /> : null}
     </div>

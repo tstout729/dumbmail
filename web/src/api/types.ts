@@ -241,8 +241,10 @@ export type Audience = { include: AudienceRef[]; exclude: AudienceRef[] };
 
 export type Align = "left" | "center" | "right";
 
-export type EmailBlock = BlockOptions &
-  (
+export type EmailBlock = BlockOptions & {
+  /** The block's stable key (translations refer to it), given when the block is created. */
+  key?: string;
+} & (
   | { type: "heading"; text: string; level?: 1 | 2 | 3; align?: Align }
   | { type: "text"; html: string; align?: Align }
   | { type: "image"; src: string; alt?: string; href?: string; width?: number; radius?: number }

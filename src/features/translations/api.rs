@@ -54,7 +54,8 @@ pub fn message_id(t: &Target) -> String {
     format!("{}/{}{}", t.kind(), t.id(), if t.part().is_empty() { String::new() } else { format!("/{}", t.part()) })
 }
 
-/// The identity for content sent by the editor: what it says (bounded), else "unsaved".
+/// The identity for content sent by the editor: what it says (bounded; each unsaved draft in the
+/// dashboard has its own, `unsaved/<random>`), else "unsaved".
 fn content_message(m: Option<&str>) -> String {
     m.map(str::trim).filter(|m| !m.is_empty() && m.len() <= 200 && !m.chars().any(char::is_control)).unwrap_or("unsaved").to_string()
 }
@@ -850,6 +851,8 @@ pub async fn apply(state: &AppState, account_id: Uuid, b: ApplyBody) -> AppResul
         fields::add_language(&mut content, &default, &lang);
     }
     fields::check_saved(&content)?;
+    // The editor gets its blocks back with their stable keys.
+    fields::assign_keys(&mut content);
     let mut v = inspect_json(&content, &s, Some(&lang));
     v["content"] = content;
     Ok(v)
@@ -916,6 +919,7 @@ pub async fn import_content(state: &AppState, account_id: Uuid, b: ImportContent
     if is_message(&content) && summary["applied"].as_u64().unwrap_or(0) > 0 {
         fields::add_language(&mut content, &default, &lang);
     }
+    fields::assign_keys(&mut content);
     let mut v = inspect_json(&content, &s, Some(&lang));
     v["content"] = content;
     v["import"] = summary;
