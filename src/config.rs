@@ -172,6 +172,19 @@ pub struct Config {
     /// PUBLIC_URL. On a different host than PUBLIC_URL, set COOKIE_DOMAIN to a domain covering both.
     #[arg(long, env = "GOOGLE_REDIRECT_BASE")]
     pub google_redirect_base: Option<String>,
+    /// Anthropic API key for machine-translated drafts ("Draft with AI", see
+    /// `features::translations`). Unset: the button is hidden; importing and exporting still work.
+    #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
+    pub anthropic_api_key: Option<String>,
+    /// Base URL of the Anthropic API (tests point it at a stand-in).
+    #[arg(long, env = "ANTHROPIC_API_URL", default_value = "https://api.anthropic.com")]
+    pub anthropic_api_url: String,
+    /// Most characters one account may send for machine translation per day (its time zone).
+    #[arg(long, env = "TRANSLATION_DAILY_CHARS", default_value_t = 200_000)]
+    pub translation_daily_chars: i64,
+    /// Price per 1,000 machine-translated characters on the hosted service, in dollars (0: free).
+    #[arg(long, env = "PRICE_TRANSLATION_PER_1000_CHARS", default_value_t = 0.0)]
+    pub price_translation_per_1000_chars: f64,
 }
 
 impl Config {

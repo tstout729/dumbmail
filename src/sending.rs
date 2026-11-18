@@ -302,6 +302,8 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
         }
         return Ok(Outcome::Skipped(crate::features::content::prepare::NOTHING_TO_SHOW));
     };
+    // The language version picked for this person (see features::translations), for reports.
+    let language = prepared.get("_lang").and_then(|l| l.as_str()).filter(|l| !l.is_empty()).map(str::to_string);
     // Unique coupon codes are claimed here, after the checks above and just before rendering, for the
     // coupons the prepared content shows; a code stays the person's if a later check skips or defers
     // this attempt. An empty pool holds the message. Messages without coupons do no coupon work (see
@@ -415,6 +417,10 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
             .bind(&send_note)
             .execute(&state.db)
             .await?;
+    }
+
+    if let Some(lang) = &language {
+        sqlx::query("UPDATE messages SET language = $2 WHERE id = $1").bind(message_id).bind(lang).execute(&state.db).await?;
     }
 
     match &rendered {

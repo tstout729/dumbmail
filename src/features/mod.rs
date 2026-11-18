@@ -23,6 +23,7 @@ pub mod sendtime;
 pub mod shopify;
 pub mod team;
 pub mod transactional;
+pub mod translations;
 pub mod warehouse;
 pub mod webhooks;
 pub mod whatsapp;
@@ -124,6 +125,7 @@ pub static ALL: &[&dyn Feature] = &[
     &shopify::Module,
     &team::Module,
     &transactional::Module,
+    &translations::Module,
     &warehouse::Module,
     &webhooks::Module,
     &whatsapp::Module,

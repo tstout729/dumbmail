@@ -181,19 +181,26 @@ async fn account_for_msg(state: &AppState, m: &Msg) -> Option<Account> {
     crate::campaigns::load_account(&state.db, m.account_id).await.ok()
 }
 
-async fn unsubscribe_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+/// A page in the person's language (see features::translations::texts).
+fn page_in(t: &crate::features::translations::texts::Texts, title: &str, body: &str, color: &str) -> Html<String> {
+    Html(t.page(page(title, body, color).0))
+}
+
+async fn unsubscribe_page(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+    let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
     // Email with preference lists: let them choose lists instead of only leaving everything.
     if let Some(lists) = preference_lists(&state, &m).await {
-        return page("Email preferences", &crate::preferences::form_html(&name, &lists, None), &color).into_response();
+        return page_in(&t, &t.get("prefs.title", ""), &crate::preferences::form_html_in(&t, &name, &lists, None), &color).into_response();
     }
-    let what = if m.channel == "sms" { "text messages" } else { "marketing emails" };
-    page(
-        "Unsubscribe",
-        &format!(r#"<h1>Unsubscribe</h1><p>Stop receiving {what} from {n}?</p><form method="post"><button type="submit">Unsubscribe</button></form>"#, n = esc(&name)),
+    let question = if m.channel == "sms" { "unsub.sms_question" } else { "unsub.email_question" };
+    page_in(
+        &t,
+        &t.get("unsub.title", ""),
+        &format!(r#"<h1>{}</h1><p>{}</p><form method="post"><button type="submit">{}</button></form>"#, t.html("unsub.title", ""), t.html(question, &name), t.html("unsub.button", "")),
         &color,
     )
     .into_response()
@@ -213,21 +220,22 @@ async fn preference_lists(state: &AppState, m: &Msg) -> Option<Vec<crate::prefer
     (!lists.is_empty()).then_some(lists)
 }
 
-async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<String>, body: Bytes) -> Response {
+async fn unsubscribe_post(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>, body: Bytes) -> Response {
     let Some(id) = message_id_from(&state, &token, "u") else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let Ok(Some(m)) = load_msg(&state, id).await else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     if let (crate::preferences::Choice::Save(keep), "email") = (crate::preferences::parse_choice(&body), m.channel.as_str()) {
         let a = account_for_msg(&state, &m).await;
         let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
+        let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
         let notice = if m.is_test {
-            "This was a test email, so nothing changed."
+            "prefs.test"
         } else if crate::preferences::save(&state.db, m.account_id, m.profile_id, &keep, Some((m.id, m.campaign_id, m.flow_id))).await.is_ok() {
-            "Saved. Your preferences are updated."
+            "prefs.saved"
         } else {
-            "Something went wrong. Please try again."
+            "prefs.error"
         };
         let lists = crate::preferences::lists_for(&state.db, m.account_id, m.profile_id).await.unwrap_or_default();
-        return page("Email preferences", &crate::preferences::form_html(&name, &lists, Some(notice)), &color).into_response();
+        return page_in(&t, &t.get("prefs.title", ""), &crate::preferences::form_html_in(&t, &name, &lists, Some(&t.get(notice, ""))), &color).into_response();
     }
     let col = if m.channel == "sms" { "sms_consent" } else { "email_consent" };
     let changed: Result<Option<String>, _> = sqlx::query_scalar(&format!(
@@ -246,7 +254,8 @@ async fn unsubscribe_post(State(state): State<AppState>, Path(token): Path<Strin
     }
     let a = account_for_msg(&state, &m).await;
     let (name, color) = a.map(|a| (a.name, a.brand_color)).unwrap_or(("this sender".into(), "#1f6f5c".into()));
-    page("Unsubscribed", &format!("<h1>You're unsubscribed</h1><p>You won't get marketing messages from {} anymore.</p>", esc(&name)), &color).into_response()
+    let t = crate::features::translations::texts::for_page(&state.db, m.account_id, Some(m.profile_id), &headers).await;
+    page_in(&t, &t.get("unsub.done_page", ""), &format!("<h1>{}</h1><p>{}</p>", t.html("unsub.done_title", ""), t.html("unsub.done_body", &name)), &color).into_response()
 }
 
 /// The visitor's address as the hosting proxy saw it: X-Real-IP, else the last X-Forwarded-For entry (the
@@ -260,15 +269,15 @@ pub fn client_ip(headers: &HeaderMap) -> Option<String> {
 
 /// Double opt-in link from a confirmation email. Confirming takes a button press (a POST), so link
 /// scanners that open every link in an email can't subscribe anyone.
-async fn confirm_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, false).await
+async fn confirm_page(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &headers, &token, false).await
 }
 
-async fn confirm_post(State(state): State<AppState>, Path(token): Path<String>) -> Response {
-    confirm_response(&state, &token, true).await
+async fn confirm_post(State(state): State<AppState>, headers: HeaderMap, Path(token): Path<String>) -> Response {
+    confirm_response(&state, &headers, &token, true).await
 }
 
-async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Response {
+async fn confirm_response(state: &AppState, headers: &HeaderMap, token: &str, confirm: bool) -> Response {
     use crate::optin::Confirmed;
     let Some(id) = crate::optin::id_from_token(state, token) else { return (StatusCode::NOT_FOUND, "link not found").into_response() };
     let res = if confirm { crate::optin::confirm(state, id).await } else { crate::optin::status(state, id).await };
@@ -280,25 +289,35 @@ async fn confirm_response(state: &AppState, token: &str, confirm: bool) -> Respo
         }
     };
     let account_of = |a: Uuid| async move { crate::campaigns::load_account(&state.db, a).await.ok() };
-    let (account, body) = match outcome {
+    // In the person's language (see features::translations::texts).
+    let profile: Option<Uuid> = sqlx::query_scalar("SELECT profile_id FROM optin_confirmations WHERE id = $1").bind(id).fetch_optional(&state.db).await.ok().flatten();
+    let texts_for = |a: Uuid| async move { crate::features::translations::texts::for_page(&state.db, a, profile, headers).await };
+    let (account, t, body) = match outcome {
         Confirmed::NotFound => return (StatusCode::NOT_FOUND, "link not found").into_response(),
         Confirmed::Waiting(a) => {
             let acct = account_of(a).await;
+            let t = texts_for(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
-            let body = format!(r#"<h1>Confirm your subscription</h1><p>Start getting emails from {}?</p><form method="post"><button type="submit">Yes, subscribe me</button></form>"#, esc(&name));
-            (acct, body)
+            let body = format!(r#"<h1>{}</h1><p>{}</p><form method="post"><button type="submit">{}</button></form>"#, t.html("confirm.title", ""), t.html("confirm.question", &name), t.html("confirm.button", ""));
+            (acct, t, body)
         }
         Confirmed::Joined(a) | Confirmed::Already(a) => {
             let acct = account_of(a).await;
+            let t = texts_for(a).await;
             let name = acct.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| "this sender".into());
             // A sign-up that earned a coupon code gets it once confirmed (shown for 24 hours, see features::coupons).
-            let code = crate::features::coupons::assign::confirmation_code(state, id).await.map(|c| format!("<p>Your code: <strong>{}</strong></p>", esc(&c))).unwrap_or_default();
-            (acct, format!("<h1>You're subscribed</h1><p>Thanks! You'll start getting emails from {}.</p>{code}", esc(&name)))
+            let code = crate::features::coupons::assign::confirmation_code(state, id).await.map(|c| format!("<p>{} <strong>{}</strong></p>", t.html("confirm.code", ""), esc(&c))).unwrap_or_default();
+            let body = format!("<h1>{}</h1><p>{}</p>{code}", t.html("confirm.done_title", ""), t.html("confirm.done_body", &name));
+            (acct, t, body)
         }
-        Confirmed::Expired(a) => (account_of(a).await, "<h1>This link has expired</h1><p>Sign up again and we'll send you a new one.</p>".to_string()),
+        Confirmed::Expired(a) => {
+            let t = texts_for(a).await;
+            let body = format!("<h1>{}</h1><p>{}</p>", t.html("confirm.expired_title", ""), t.html("confirm.expired_body", ""));
+            (account_of(a).await, t, body)
+        }
     };
     let color = account.map(|a| a.brand_color).unwrap_or_else(|| "#1f6f5c".into());
-    page("Confirm your subscription", &body, &color).into_response()
+    page_in(&t, &t.get("confirm.title", ""), &body, &color).into_response()
 }
 
 // ---------- Browser tracking ----------
@@ -642,6 +661,9 @@ pub struct SubscribeBody {
     /// The browser's IANA time zone; fills the profile's `timezone` and `country` when they're missing.
     #[serde(default)]
     timezone: Option<String>,
+    /// The browser's language (`navigator.language`); fills the profile's language when it's empty.
+    #[serde(default)]
+    locale: Option<String>,
     /// Answers to birthday and custom fields by field key (the standard keys may be sent here too).
     #[serde(default)]
     fields: Option<Map<String, Value>>,
@@ -742,6 +764,8 @@ pub async fn subscribe(state: &AppState, account: &Account, b: &SubscribeBody, i
     if let Some(tz) = &b.timezone {
         audience::fill_location_from_timezone(&state.db, p.id, tz).await?;
     }
+    // A language field on the form, else the browser's language: fills an empty profile language only.
+    crate::features::translations::fill_from_form(&state.db, p.id, &b.given(), b.locale.as_deref()).await?;
     // Someone new on a double opt-in form gets no email at all, from any campaign or flow, until they confirm.
     if double_opt_in && upserted.created {
         sqlx::query("UPDATE profiles SET email_consent = 'pending', updated_at = now() WHERE id = $1 AND email_consent = 'never_subscribed'").bind(p.id).execute(&state.db).await?;
@@ -846,7 +870,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
             // Everything else is a field answer; a key sent more than once (ticked checkboxes) becomes a list.
             let mut fields = Map::new();
             for (k, v) in &pairs {
-                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone") {
+                if matches!(k.as_str(), "form_id" | "email" | "phone_number" | "first_name" | "last_name" | "sms_consent" | "variant" | "step" | "phone_token" | "timezone" | "locale") {
                     continue;
                 }
                 match fields.get_mut(k) {
@@ -869,6 +893,7 @@ async fn client_subscribe(State(state): State<AppState>, Query(q): Query<KeyQuer
                 step: one("step"),
                 phone_token: one("phone_token"),
                 timezone: one("timezone"),
+                locale: one("locale"),
             }
         } else {
             serde_json::from_slice(&body)?

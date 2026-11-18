@@ -748,7 +748,9 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
     }
 
     // Content.
-    let sc = scan(&prepared_content);
+    let mut sc = scan(&prepared_content);
+    // Links localized in a language version are checked too (see features::translations).
+    sc.links.extend(crate::features::translations::fields::localized_links(&content));
     let no_alt: Vec<&(String, String, bool)> = sc.images.iter().filter(|(_, alt, _)| alt.trim().is_empty()).collect();
     if !no_alt.is_empty() {
         let linked = no_alt.iter().filter(|(_, _, l)| *l).count();
@@ -999,6 +1001,11 @@ pub async fn run(state: &AppState, account_id: Uuid, input: Input, may_read_peop
             .map(|(u, img, p)| json!({"url": u, "kind": if *img { "image" } else { "link" }, "ok": p.ok, "status": p.status, "note": p.note, "bytes": p.bytes}))
             .chain(not_checked.iter().map(|(u, img)| json!({"url": u, "kind": if *img { "image" } else { "link" }, "ok": null, "status": null, "note": "DumbMail link, not checked", "bytes": null})))
             .collect();
+    }
+
+    // Language versions: what's missing, out of date or unreviewed, and each language's own problems.
+    for (id, severity, title, detail) in crate::features::translations::check::findings(state, &account, &content).await {
+        findings.push(finding(id, severity, title, detail));
     }
 
     let rank = |f: &Finding| match f.severity {

@@ -155,7 +155,10 @@ pub async fn start(
     tx.commit().await?;
 
     let url = format!("{}/c/{}", crate::domains::link_base(state, account), token(state, id));
-    match deliver(state, account, profile_id, email, confirmation_email(account, &url)).await? {
+    // In the person's language (see features::translations::texts); plain English is unchanged.
+    let t = crate::features::translations::texts::for_profile(&state.db, account.id, profile_id).await;
+    let message = if t.is_plain_english() { confirmation_email(account, &url) } else { confirmation_email_in(&t, account, &url) };
+    match deliver(state, account, profile_id, email, message).await? {
         Ok(()) => Ok(Started::Pending),
         Err(why) => {
             sqlx::query("DELETE FROM optin_confirmations WHERE id = $1").bind(id).execute(&state.db).await?;
@@ -229,6 +232,21 @@ pub fn confirmation_email(account: &Account, url: &str) -> (String, String, Stri
     )
 }
 
+/// [`confirmation_email`] in a language.
+pub fn confirmation_email_in(t: &crate::features::translations::texts::Texts, account: &Account, url: &str) -> (String, String, String) {
+    let (subject, heading, line, text_line, button, ignore) = (
+        t.get("confirm.email_subject", &account.name),
+        t.get("confirm.title", ""),
+        t.get("confirm.email_line", &account.name),
+        t.get("confirm.email_text_line", &account.name),
+        t.get("confirm.button", ""),
+        t.get("confirm.email_ignore", ""),
+    );
+    let copy = ConfirmCopy { subject: &subject, heading: &heading, line: &line, text_line: &text_line, button: &button, didnt: "" };
+    let (subject, html, text) = confirm_email_with(account, url, &copy, &ignore);
+    (subject, t.page(html.replacen("<html>", r#"<html lang="en">"#, 1)), text)
+}
+
 /// The words of a confirmation email (plain text; escaped where needed).
 pub struct ConfirmCopy<'a> {
     pub subject: &'a str,
@@ -244,6 +262,12 @@ pub struct ConfirmCopy<'a> {
 
 /// A confirmation email in the account's style: a heading, one line and one button.
 pub fn confirm_email(account: &Account, url: &str, copy: &ConfirmCopy<'_>) -> (String, String, String) {
+    let ignore = format!("If you didn't {}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.", copy.didnt);
+    confirm_email_with(account, url, copy, &ignore)
+}
+
+/// [`confirm_email`] with its last line (`ignore`) given whole.
+fn confirm_email_with(account: &Account, url: &str, copy: &ConfirmCopy<'_>, ignore: &str) -> (String, String, String) {
     let name = esc(&account.name);
     let color = crate::render::safe_color(&account.brand_color, "#1f6f5c");
     let address = account.address.as_deref().map(esc).map(|a| format!(" · {a}")).unwrap_or_default();
@@ -262,7 +286,7 @@ pub fn confirm_email(account: &Account, url: &str, copy: &ConfirmCopy<'_>) -> (S
 {logo}<h1 style="font-size:22px;line-height:1.3;margin:0 0 12px;color:#111827">{heading}</h1>
 <p style="font-size:16px;line-height:1.5;color:#4b5563;margin:0 0 24px">{line}</p>
 <a href="{url}" style="display:inline-block;background:{color};color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:12px 24px;border-radius:8px">{button}</a>
-<p style="font-size:13px;line-height:1.5;color:#6b7280;margin:24px 0 0">If you didn't {didnt}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.</p>
+<p style="font-size:13px;line-height:1.5;color:#6b7280;margin:24px 0 0">{ignore}</p>
 </td></tr></table>
 <p style="font-size:12px;color:#9ca3af;margin:16px 0 0">{name}{address}</p>
 </td></tr></table></body></html>"#,
@@ -270,13 +294,13 @@ pub fn confirm_email(account: &Account, url: &str, copy: &ConfirmCopy<'_>) -> (S
         heading = esc(copy.heading),
         line = esc(copy.line),
         button = esc(copy.button),
-        didnt = esc(copy.didnt),
+        ignore = esc(ignore),
     );
     let text = format!(
-        "{}\n\n{}:\n{url}\n\nIf you didn't {}, ignore this email and you won't hear from us. The link works for {LINK_DAYS} days.\n\n--\n{}{}\n",
+        "{}\n\n{}:\n{url}\n\n{}\n\n--\n{}{}\n",
         copy.heading,
         copy.text_line,
-        copy.didnt,
+        ignore,
         account.name,
         account.address.as_deref().map(|a| format!(", {a}")).unwrap_or_default(),
     );

@@ -12,6 +12,7 @@ import { toast } from "../../lib/toast";
 import { contentSnippet, metricLabels, versionContent, versionIds, versionLabel, versionName } from "./abTest";
 import { ChannelIcon } from "./CampaignsPage";
 import { SendProgressCard } from "../../features/sendtime/SendProgressCard";
+import { LanguageResults } from "../../features/translations/LanguageResults";
 
 export function CampaignReportView({ campaign }: { campaign: Campaign }) {
   const { account } = useSession();
@@ -134,6 +135,9 @@ export function CampaignReportView({ campaign }: { campaign: Campaign }) {
             </Table>
           )}
         </Card>
+      </div>
+      <div className="mt-4">
+        <LanguageResults campaignId={campaign.id} sent={campaign.status === "sent" || campaign.status === "sending"} />
       </div>
       {report.error ? <p className="mt-3 text-sm text-red-600">{report.error.message}</p> : null}
       {viewing && viewed ? (

@@ -69,9 +69,13 @@ pub struct Profile {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_event_at: Option<DateTime<Utc>>,
+    /// The person's language, a BCP 47 tag (see `features::translations`).
+    #[serde(default)]
+    #[sqlx(default)]
+    pub locale: Option<String>,
 }
 
-pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at";
+pub const PROFILE_COLS: &str = "p.id, p.account_id, p.email, p.phone_number, p.external_id, p.first_name, p.last_name, p.properties, p.email_consent, p.sms_consent, p.created_at, p.updated_at, p.last_event_at, p.locale";
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct List {

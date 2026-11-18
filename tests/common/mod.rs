@@ -83,6 +83,10 @@ impl Harness {
             site_url: None,
             cookie_domain: None,
             google_redirect_base: None,
+            anthropic_api_key: None,
+            anthropic_api_url: "http://127.0.0.1:9".into(),
+            translation_daily_chars: 200_000,
+            price_translation_per_1000_chars: 0.0,
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();

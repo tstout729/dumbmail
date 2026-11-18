@@ -38,7 +38,8 @@ impl ProfileInput {
     fn merged_properties(&self) -> Map<String, Value> {
         let mut props = self.properties.clone().unwrap_or_default();
         for (k, v) in &self.extra {
-            if k != "list_ids" && !k.starts_with('$') {
+            // The person's language is its own column (see features::translations).
+            if k != "list_ids" && !k.starts_with('$') && !crate::features::translations::is_locale_key(k, v) {
                 props.insert(k.clone(), v.clone());
             }
         }
@@ -99,6 +100,7 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
         return Err(AppError::bad("a profile needs an email, phone_number or external_id"));
     }
     let props = Value::Object(input.merged_properties());
+    let locale = crate::features::translations::input_locale(&input.extra, fill_only)?;
 
     for attempt in 0..2 {
         let existing = find_profile(db, account_id, input).await?;
@@ -185,7 +187,10 @@ async fn upsert_inner(db: &PgPool, account_id: Uuid, input: &ProfileInput, fill_
             }
         };
         match res {
-            Ok(u) => {
+            Ok(mut u) => {
+                if let Some(l) = &locale {
+                    u.profile.locale = crate::features::translations::save_locale(db, u.profile.id, l.as_deref(), fill_only).await?;
+                }
                 let source = if fill_only { EventSource::Browser } else { EventSource::Api };
                 let consent_before = old_consent.as_ref().map(|(e, s)| (e.as_str(), s.as_str()));
                 crate::features::webhooks::profile_saved(db, account_id, existing.as_ref(), consent_before, &u.profile, source).await;
@@ -590,6 +595,9 @@ pub async fn import_csv(
             "firstname" | "first" | "givenname" | "fname" => Some("first_name"),
             "lastname" | "last" | "surname" | "familyname" | "lname" => Some("last_name"),
             "externalid" | "customerid" | "id" => Some("external_id"),
+            // The person's language (see features::translations).
+            "locale" => Some("locale"),
+            "language" | "languagecode" => Some("language"),
             _ => None,
         }
     };
@@ -623,6 +631,9 @@ pub async fn import_csv(
                 Some("first_name") => input.first_name = Some(val.to_string()),
                 Some("last_name") => input.last_name = Some(val.to_string()),
                 Some("external_id") => input.external_id = Some(val.to_string()),
+                Some(k @ ("locale" | "language")) => {
+                    input.extra.insert(k.to_string(), json!(val));
+                }
                 _ => {
                     if let Some(h) = headers.get(j) {
                         let v = match val {

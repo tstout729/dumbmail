@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { Link, useBlocker, useNavigate, useParams } from "react-router";
-import { Bookmark, Plus, Trash2 } from "lucide-react";
+import { Bookmark, Languages, Plus, Trash2 } from "lucide-react";
 import type { EmailBlock } from "../../api/types";
 import { useSession } from "../../api";
 import { BlockList } from "../../components/email/BlockList";
@@ -12,6 +12,7 @@ import { formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { useCreateSavedBlock, useDeleteSavedBlock, useSavedBlock, useSavedBlocks, useUpdateSavedBlock } from "./api";
 import type { SavedBlockDetail } from "./types";
+import { TranslationsDrawer } from "../translations/TranslationsDrawer";
 
 export function SavedBlocksPage() {
   const saved = useSavedBlocks();
@@ -134,6 +135,7 @@ function Editor({ saved }: { saved: SavedBlockDetail }) {
   const navigate = useNavigate();
   const [draft, setDraft] = useState<Draft | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [languages, setLanguages] = useState(false);
   const current = draft ?? { name: saved.name, blocks: saved.blocks };
   const dirty = draft !== null;
   const blocker = useBlocker(({ currentLocation, nextLocation }) => dirty && currentLocation.pathname !== nextLocation.pathname && !(nextLocation.state as { saved?: boolean } | null)?.saved);
@@ -160,6 +162,9 @@ function Editor({ saved }: { saved: SavedBlockDetail }) {
         title={<InlineTitle value={current.name} onChange={(e) => setDraft({ ...current, name: e.target.value })} aria-label="Saved block name" />}
         actions={
           <>
+            <Button variant="ghost" icon={<Languages className="size-3.5" />} onClick={() => setLanguages(true)}>
+              Languages
+            </Button>
             <Button variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDelete(true)}>
               Delete
             </Button>
@@ -169,6 +174,16 @@ function Editor({ saved }: { saved: SavedBlockDetail }) {
           </>
         }
       />
+      {languages ? (
+        <TranslationsDrawer
+          channel="email"
+          value={{ blocks: current.blocks }}
+          onChange={(v) => setDraft({ ...current, blocks: v.blocks })}
+          target={{ kind: "saved_block", id: saved.id }}
+          name={current.name}
+          onClose={() => setLanguages(false)}
+        />
+      ) : null}
       <div className="mb-4 rounded-lg border border-zinc-200 bg-white px-4 py-3 text-sm">
         {saved.used_in.length === 0 ? (
           <span className="text-zinc-500">Not used in any email yet. Add it to an email from Add block → Saved block.</span>
