@@ -94,7 +94,8 @@ function fetched(input) {
     var pays = r.payments || [];
     if (pays.length && pays.every(function (x) { return x.is_declined; })) return [{ type: "log", message: "refund " + r.id + " was declined" }];
     // The order gives the buyer and the currency.
-    return [{ type: "next_request", url: "/stores/" + input.settings.store_hash + "/v2/orders/" + r.order_id, context: { refund: clean({ id: r.id, total_amount: r.total_amount, created: r.created, reason: r.reason }) } }];
+    if (!idOf(r.order_id)) return [{ type: "log", message: "refund " + r.id + " names no order" }];
+    return [{ type: "next_request", url: "/stores/" + input.settings.store_hash + "/v2/orders/" + idOf(r.order_id), context: { refund: clean({ id: r.id, total_amount: r.total_amount, created: r.created, reason: r.reason }) } }];
   }
   if (/\/v3\/customers/.test(url)) {
     return (p.data || []).filter(function (c) { return c.email; }).map(function (c) {
@@ -128,6 +129,12 @@ function pulled(input) {
   return out;
 }
 
+// Ids that go into a fetch path: digits only (the integration refuses anything else too).
+function idOf(v) {
+  var s = String(v === undefined || v === null ? "" : v);
+  return /^[0-9]{1,20}$/.test(s) ? s : null;
+}
+
 function handle(input) {
   if (input.source === "fetch") return fetched(input);
   if (input.source === "pull") return pulled(input);
@@ -137,14 +144,16 @@ function handle(input) {
   if (!hash) return [{ type: "log", message: "set store_hash in the integration's settings first" }];
   if (e.producer && e.producer !== "stores/" + hash) return [{ type: "log", message: "this webhook is from another store (" + e.producer + ")" }];
   var scope = String(e.scope || "");
-  if (scope === "store/order/refund/created" && d.refund && d.refund.refund_id) {
-    return [{ type: "next_request", url: "/stores/" + hash + "/v3/orders/" + d.id + "/payment_actions/refunds/" + d.refund.refund_id }];
+  var id = idOf(d.id);
+  if (!id) return [{ type: "log", message: "ignored BigCommerce scope " + (scope || "(none)") + " without a numeric id" }];
+  if (scope === "store/order/refund/created" && d.refund && idOf(d.refund.refund_id)) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v3/orders/" + id + "/payment_actions/refunds/" + idOf(d.refund.refund_id), context: { webhook_order_id: id } }];
   }
-  if (/^store\/order\/(created|updated|statusUpdated)$/.test(scope) && d.id) {
-    return [{ type: "next_request", url: "/stores/" + hash + "/v2/orders/" + d.id }];
+  if (/^store\/order\/(created|updated|statusUpdated)$/.test(scope)) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v2/orders/" + id }];
   }
-  if (/^store\/customer\/(created|updated)$/.test(scope) && d.id) {
-    return [{ type: "next_request", url: "/stores/" + hash + "/v3/customers", query: { "id:in": String(d.id) } }];
+  if (/^store\/customer\/(created|updated)$/.test(scope)) {
+    return [{ type: "next_request", url: "/stores/" + hash + "/v3/customers", query: { "id:in": id } }];
   }
   return [{ type: "log", message: "ignored BigCommerce scope " + (scope || "(none)") }];
 }

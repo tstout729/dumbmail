@@ -247,7 +247,7 @@ async fn inbound(State(state): State<AppState>, Path(token): Path<String>, Query
     let scrub = Scrub::new(integ.secret_values(&state).await);
     // A turned-off integration keeps only a log line: nothing of the payload is stored.
     let d = if integ.status == "enabled" {
-        NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status: "pending", error: None, replay_of: None, message_id, applied: None }
+        NewDelivery { source: "webhook", content_type: ct.as_deref(), headers: &headers, query: &query, body: Some(&body), request: None, status: "pending", error: None, replay_of: None, message_id, applied: None, dedupe_minutes: integ.dedupe_minutes() }
     } else {
         NewDelivery { message_id, ..NewDelivery::log("webhook", "ignored", Some("the integration is turned off; the payload wasn't kept")) }
     };

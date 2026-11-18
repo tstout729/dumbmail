@@ -53,7 +53,26 @@
       "name": "X-Auth-Token",
       "value": "{{secret.access_token}}"
     },
-    "max_pages": 20
+    "max_pages": 20,
+    "fetch": {
+      "paths": [
+        "/stores/{{settings.store_hash}}/v2/orders/{id}",
+        "/stores/{{settings.store_hash}}/v3/orders/{id}/payment_actions/refunds/{id}",
+        "/stores/{{settings.store_hash}}/v3/customers"
+      ],
+      "query": [
+        "id:in"
+      ],
+      "id": "^[0-9]{1,20}$",
+      "context": [
+        "refund",
+        "webhook_order_id"
+      ]
+    }
+  },
+  "message_id": {
+    "field": "hash",
+    "within_minutes": 10
   },
   "redact": [
     "**.ip_address",

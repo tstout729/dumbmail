@@ -111,6 +111,11 @@ impl Integration {
         super::pull::redact(text, &self.secret_values(state).await)
     }
 
+    /// How long a resend of the same message id counts as one, when the id is limited to a window.
+    pub fn dedupe_minutes(&self) -> Option<i64> {
+        self.message_id.as_ref().and_then(|m| m["within_minutes"].as_i64())
+    }
+
     /// Where the app's own message id is in a webhook, if set.
     pub fn message_id_of(&self, headers: &axum::http::HeaderMap, body: &[u8]) -> Option<String> {
         let cfg = self.message_id.as_ref()?;
@@ -311,7 +316,11 @@ fn check_message_id(v: &Value) -> AppResult<Option<Value>> {
         return Ok(None);
     }
     let o = v.as_object().ok_or_else(|| AppError::bad("message_id must be {\"header\": name} or {\"field\": path}"))?;
-    let ok = o.len() == 1
+    let window = o.get("within_minutes");
+    if window.is_some_and(|w| w.as_i64().is_none_or(|m| !(1..=1440).contains(&m))) {
+        return Err(AppError::bad("message_id within_minutes must be 1 to 1440"));
+    }
+    let ok = o.len() == 1 + usize::from(window.is_some())
         && match (o.get("header").and_then(|h| h.as_str()), o.get("field").and_then(|f| f.as_str())) {
             (Some(h), None) => axum::http::HeaderName::from_bytes(h.as_bytes()).is_ok() && h.len() <= 100,
             (None, Some(f)) => !f.is_empty() && f.len() <= 100,

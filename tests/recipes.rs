@@ -462,6 +462,8 @@ struct MockStore {
     seen: std::sync::Mutex<Vec<(String, String)>>,
     /// Answer 404 to this many order reads first (the order isn't readable yet).
     not_yet: std::sync::atomic::AtomicUsize,
+    /// Answer 429 with BigCommerce's rate-limit headers to this many order reads first.
+    limited: std::sync::atomic::AtomicUsize,
 }
 
 /// A stand-in for BigCommerce's store API, answering with the documented example bodies kept in
@@ -470,6 +472,7 @@ struct MockStore {
 /// `GET /stores/{hash}/v3/customers?id:in=…`, all behind `X-Auth-Token`.
 async fn mock_bigcommerce() -> (std::sync::Arc<MockStore>, String) {
     use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
     use axum::routing::get;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -484,15 +487,21 @@ async fn mock_bigcommerce() -> (std::sync::Arc<MockStore>, String) {
             "/stores/abc123/v2/orders/{id}",
             get(move |State(m): State<Arc<MockStore>>, h: axum::http::HeaderMap, uri: axum::http::Uri, Path(id): Path<u64>| async move {
                 if !note(&m, &h, &uri) {
-                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"status": 401})));
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({"status": 401}))).into_response();
                 }
+                if m.limited.load(Ordering::SeqCst) > 0 {
+                    m.limited.fetch_sub(1, Ordering::SeqCst);
+                    let headers = [("X-Rate-Limit-Time-Reset-Ms", "15000"), ("X-Rate-Limit-Time-Window-Ms", "30000"), ("X-Rate-Limit-Requests-Quota", "150"), ("X-Rate-Limit-Requests-Left", "0")];
+                    return (StatusCode::TOO_MANY_REQUESTS, headers, axum::Json(json!({"status": 429, "title": "Too many requests"}))).into_response();
+                }
+                let none = [("X-Rate-Limit-Requests-Left", "100"), ("X-Rate-Limit-Time-Reset-Ms", "15000"), ("X-Rate-Limit-Time-Window-Ms", "30000"), ("X-Rate-Limit-Requests-Quota", "150")];
                 if m.not_yet.load(Ordering::SeqCst) > 0 {
                     m.not_yet.fetch_sub(1, Ordering::SeqCst);
-                    return (StatusCode::NOT_FOUND, axum::Json(json!({"status": 404, "title": "The requested resource was not found."})));
+                    return (StatusCode::NOT_FOUND, none, axum::Json(json!({"status": 404, "title": "The requested resource was not found."}))).into_response();
                 }
                 let mut o = fixture("bigcommerce", "fetch-order-awaiting-fulfillment.json")["input"]["payload"].clone();
                 o["id"] = json!(id);
-                (StatusCode::OK, axum::Json(o))
+                (StatusCode::OK, none, axum::Json(o)).into_response()
             }),
         )
         .route(
@@ -539,14 +548,16 @@ async fn bigcommerce_webhooks_fetch_what_they_name() {
     b.post(&h, "webhook-order-created.json").await;
     assert_eq!(events(&h, "Placed Order").await, 0);
     let failed = b.deliveries(&mut h).await.into_iter().find(|d| d["source"] == "fetch").unwrap();
-    assert_eq!(failed["status"], "error", "{failed}");
+    assert!(failed["error"].as_str().is_some_and(|e| e.contains("404")), "{failed}");
     retry_now(&h).await;
     assert_eq!(events(&h, "Placed Order").await, 1);
     b.post(&h, "webhook-order-status-updated.json").await;
     assert_eq!(events(&h, "Placed Order").await, 1, "a second webhook for the same order reads it again; it still counts once");
     // A refund: the refund is fetched, then its order; recorded once, in the order's currency.
     b.post(&h, "webhook-refund-created.json").await;
-    b.post(&h, "webhook-refund-created.json").await;
+    // BigCommerce's own resend of a callback (same hash, minutes later) is recognized.
+    let dup = b.post(&h, "webhook-refund-created.json").await;
+    assert!(dup.contains("duplicate"), "{dup}");
     assert_eq!(values(&h, "Refunded Order", "casey.example@example.com").await, vec![50.0]);
     assert_eq!(prop(&h, "Refunded Order", "currency").await, vec!["USD"]);
     b.post(&h, "webhook-customer-created.json").await;
@@ -556,7 +567,7 @@ async fn bigcommerce_webhooks_fetch_what_they_name() {
     let paths: Vec<&str> = seen.iter().map(|(_, p)| p.as_str()).collect();
     assert!(paths.contains(&"/stores/abc123/v3/orders/218/payment_actions/refunds/12"), "{paths:?}");
     assert!(paths.contains(&"/stores/abc123/v3/customers?id%3Ain=32"), "{paths:?}");
-    assert_eq!(paths.iter().filter(|p| p.starts_with("/stores/abc123/v2/orders/218")).count(), 5, "404, then the order, the status update and twice for the refund: {paths:?}");
+    assert_eq!(paths.iter().filter(|p| p.starts_with("/stores/abc123/v2/orders/218")).count(), 4, "404, then the order, the status update and once for the refund: {paths:?}");
     // Buyers and customers are held back from marketing; the service flow still reached the buyer.
     for email in ["casey.example@example.com", "drew.example@example.com"] {
         assert_eq!(consent(&h, email).await, (true, "never_subscribed".into()), "{email}");
@@ -838,5 +849,106 @@ async fn unreadable_signature_settings_and_empty_keys_refuse_every_webhook() {
     let sig = format!("v1,{mac}");
     let (s, _, _) = h.raw("POST", path, &[("svix-id", "msg_1"), ("svix-timestamp", &ts), ("svix-signature", &sig), ("content-type", "application/json")], body).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    h.cleanup().await;
+}
+
+/// BigCommerce wired to the stand-in store; returns the installed recipe.
+async fn bigcommerce_with_mock(h: &mut Harness, base: &str) -> Installed {
+    let b = install(h, "bigcommerce", Sign::Header("X-Webhook-Token"), "bc-webhook-token-0001", false).await;
+    let i = h.ok("GET", &format!("/api/integrations/{}", b.id), None).await;
+    let mut pull = i["pull"].clone();
+    pull["url"] = json!(format!("{base}/stores/{{{{settings.store_hash}}}}/v2/orders"));
+    h.ok("PATCH", &format!("/api/integrations/{}", b.id), Some(json!({"pull": pull, "settings": {"store_hash": "abc123"}, "credentials": {"access_token": "bc-access-token-0001"}}))).await;
+    b
+}
+
+fn order_reads(store: &MockStore, id: &str) -> usize {
+    store.seen.lock().unwrap().iter().filter(|(_, p)| p == &format!("/stores/abc123/v2/orders/{id}")).count()
+}
+
+#[tokio::test]
+async fn a_fetch_is_reserved_once_and_waits_for_room_and_the_vendors_cooldown() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (store, base) = mock_bigcommerce().await;
+    let b = bigcommerce_with_mock(&mut h, &base).await;
+    let account: uuid::Uuid = sqlx::query_scalar("SELECT account_id FROM integrations WHERE id = $1::uuid").bind(&b.id).fetch_one(&h.state.db).await.unwrap();
+    // No room in the payload budget: the fetch is reserved and counted, but no request is made.
+    dumbmail::features::integrations::engine::set_payload_budget_for(account, 1000);
+    b.post(&h, "webhook-order-created.json").await;
+    assert_eq!(order_reads(&store, "218"), 0, "no request while there's no room for the answer");
+    let open = "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch' AND status = 'pending'";
+    assert_eq!(count(&h, open).await, 1, "the intent is outstanding work");
+    // A second webhook for the same order (another status change) reuses the waiting intent.
+    b.post(&h, "webhook-order-status-updated.json").await;
+    assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE source = 'fetch'").await, 1);
+    // Room again, and the job queued twice: one request.
+    dumbmail::features::integrations::engine::set_payload_budget_for(account, 256 * 1024 * 1024);
+    let intent: uuid::Uuid = sqlx::query_scalar("SELECT id FROM integration_deliveries WHERE source = 'fetch'").fetch_one(&h.state.db).await.unwrap();
+    dumbmail::jobs::enqueue_background(&h.state.db, "integrations_fetch", json!({"delivery_id": intent}), None).await.unwrap();
+    retry_now(&h).await;
+    assert_eq!(order_reads(&store, "218"), 1, "{:?}", store.seen.lock().unwrap());
+    assert_eq!(events(&h, "Placed Order").await, 1);
+    // Rate limited: the next try waits for BigCommerce's reset time, not the usual minute.
+    store.limited.store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut body = fixture("bigcommerce", "webhook-order-created.json")["input"]["payload"].clone();
+    body["data"]["id"] = json!(219);
+    body["hash"] = json!("0000000000000000000000000000000000000219");
+    b.post_as(&h, &body.to_string(), &json!({}), &json!({}), &b.secret).await;
+    let wait: f64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM run_at - now())::float8 FROM jobs WHERE kind = 'integrations_fetch' ORDER BY run_at DESC LIMIT 1").fetch_one(&h.state.db).await.unwrap();
+    assert!((10.0..20.0).contains(&wait), "rescheduled after the 15-second reset: {wait}");
+    retry_now(&h).await;
+    assert_eq!(order_reads(&store, "219"), 2);
+    assert_eq!(events(&h, "Placed Order").await, 2);
+    // The context a webhook carries isn't visible in the delivery's request record.
+    b.post(&h, "webhook-refund-created.json").await;
+    let requests: String = sqlx::query_scalar("SELECT string_agg(request::text, ' ') FROM integration_deliveries WHERE source = 'fetch'").fetch_one(&h.state.db).await.unwrap();
+    assert!(!requests.contains("webhook_order_id") && !requests.contains("Customer requires a refund"), "{requests}");
+    h.cleanup().await;
+}
+
+#[tokio::test]
+async fn webhook_fetches_are_read_only_lookups_of_declared_paths() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    let (store, base) = mock_bigcommerce().await;
+    let script = "function handle(i) { if (i.source === 'fetch') return [{type: 'log', message: 'got ' + i.request.url}]; return [Object.assign({type: 'next_request'}, i.payload.next)] }";
+    let pull = json!({"url": format!("{base}/stores/{{{{settings.store_hash}}}}/v2/orders"), "auth": {"type": "header", "name": "X-Auth-Token", "value": "{{secret.access_token}}"},
+        "fetch": {"paths": ["/stores/{{settings.store_hash}}/v2/orders/{id}", "/stores/{{settings.store_hash}}/v3/customers"], "query": ["id:in"], "context": ["kept"]}});
+    let i = h.ok("POST", "/api/integrations", Some(json!({"name": "Lookups", "script": script, "pull": pull, "settings": {"store_hash": "abc123"}, "credentials": {"access_token": "bc-access-token-0001"}}))).await;
+    let url = i["inbound_url"].as_str().unwrap();
+    let path = url[url.find("/webhooks/in/").unwrap()..].to_string();
+    let send = |next: Value| {
+        let path = path.clone();
+        let body = json!({"next": next}).to_string();
+        async move { (path, body) }
+    };
+    let refused = [
+        json!({"url": "/stores/abc123/v2/orders/218", "method": "POST"}),
+        json!({"url": "/stores/abc123/v2/orders/218", "body": {"status_id": 5}}),
+        json!({"url": "/stores/abc123/v2/orders/218", "headers": {"X-Other": "1"}}),
+        json!({"url": "/stores/abc123/v2/orders/218/coupons"}),
+        json!({"url": "/stores/abc123/v2/orders/abc"}),
+        json!({"url": "/stores/abc123/v2/orders/../customers"}),
+        json!({"url": "/stores/zzz999/v2/orders/218"}),
+        json!({"url": "https://elsewhere.example/stores/abc123/v2/orders/218"}),
+        json!({"url": "/stores/abc123/v3/customers", "query": {"email:in": "a@example.com"}}),
+        json!({"url": "/stores/abc123/v3/customers", "query": {"id:in": "1 OR 1=1"}}),
+    ];
+    for next in refused.iter() {
+        let (p, body) = send(next.clone()).await;
+        let (s, _, _) = h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
+        assert_eq!(s, StatusCode::OK);
+        h.drain().await;
+    }
+    assert_eq!(store.seen.lock().unwrap().len(), 0, "nothing was requested: {:?}", store.seen.lock().unwrap());
+    let errors: Vec<Option<String>> = sqlx::query_scalar("SELECT error FROM integration_deliveries WHERE source = 'webhook' ORDER BY created_at").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(errors.len(), refused.len());
+    assert!(errors.iter().all(|e| e.as_deref().is_some_and(|e| e.contains("fetch"))), "{errors:?}");
+    // An allowed lookup goes out as a GET, and only declared context keys survive.
+    let (p, body) = send(json!({"url": "/stores/abc123/v3/customers", "query": {"id:in": "32"}, "context": {"kept": 1, "dropped": "x"}})).await;
+    h.raw("POST", &p, &[("content-type", "application/json")], &body).await;
+    h.drain().await;
+    assert_eq!(store.seen.lock().unwrap().iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), vec!["/stores/abc123/v3/customers?id%3Ain=32"]);
     h.cleanup().await;
 }
