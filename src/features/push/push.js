@@ -1,7 +1,8 @@
 /* DumbMail web push: loaded by the website snippet when push is on. It never asks for permission
    on page load: a small card with the site's own wording shows by the rules set in DumbMail, and
    only its "Allow" button (or the site's own button calling dumbmail.notifications.prompt()) opens
-   the browser's prompt. A browser that said no is never asked again. */
+   the browser's prompt. A browser that said no is never asked again, and one that turned push off
+   here is never subscribed again without a new click on Allow. */
 (function () {
   "use strict";
   var BASE = __BASE__, KEY = __KEY__, CFG = __CONFIG__;
@@ -19,27 +20,31 @@
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), credentials: "omit", keepalive: true
     });
   }
-  // Who this browser is, as only DumbMail or the site's own server can vouch for: the signed token
-  // from a tracked link, or a verified identity (user_hash) the site passed in.
-  function identity() {
-    var id = {}, p = store.get("pl_profile") || {}, v = store.get("pl_push_identity");
-    if (p.$token) id.$token = p.$token;
-    if (v && v.user_hash) { if (v.external_id) id.external_id = v.external_id; if (v.email) id.email = v.email; id.user_hash = v.user_hash; }
-    return id;
-  }
+  // The enrollment grant from the site's own server (see dumbmail.notifications.identify). Kept in
+  // memory for this page only, never stored: the site passes it again on each page.
+  var grant = null;
+  function identity() { return grant ? { type: grant.type, value: grant.value, grant: grant.grant } : {}; }
   function keyBytes(b64) {
     var s = (b64 + "===".slice((b64.length + 3) % 4)).replace(/-/g, "+").replace(/_/g, "/");
     var raw = atob(s), out = new Uint8Array(raw.length);
     for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
     return out;
   }
+  // A scope of its own: the worker controls no pages, so it never replaces the site's own worker.
   function registration() {
-    return navigator.serviceWorker.register(CFG.sw, { scope: "/" }).then(function () { return navigator.serviceWorker.ready; });
+    return navigator.serviceWorker.register(CFG.sw, { scope: CFG.scope }).then(function (reg) {
+      var w = reg.installing || reg.waiting;
+      if (reg.active || !w) return reg;
+      return new Promise(function (resolve) { w.addEventListener("statechange", function () { if (w.state === "activated") resolve(reg); }); });
+    });
+  }
+  function existing() {
+    return navigator.serviceWorker.getRegistration(CFG.scope).then(function (reg) { return reg ? reg.pushManager.getSubscription() : null; });
   }
   function report(sub, force) {
     var j = sub.toJSON(), id = identity();
-    var sig = j.endpoint + "|" + JSON.stringify(id), last = store.get("pl_push_sent");
-    // Once a day, or when the subscription or the identity changes.
+    var sig = j.endpoint + "|" + (id.type || "") + "|" + (id.value || ""), last = store.get("pl_push_sent");
+    // Once a day, or when the subscription or who the site says is signed in changes.
     if (!force && last && last.sig === sig && now() - last.at < 86400000) return Promise.resolve("granted");
     return post("/client/push/subscribe", { subscription: j, identity: id, url: location.href }).then(function (r) {
       if (r && r.ok) { store.set("pl_push_sent", { sig: sig, at: now() }); store.set("pl_push_sub", { endpoint: j.endpoint, auth: j.keys && j.keys.auth }); }
@@ -53,10 +58,12 @@
       });
     }).then(function (sub) { return report(sub, force); });
   }
+  // A click on Allow (the card's, or the site's own button).
   function prompt() {
     if (!supported) return Promise.resolve("unsupported");
     if (Notification.permission === "denied") return Promise.resolve("denied");
-    if (Notification.permission === "granted") return subscribe(false).catch(function () { return "error"; });
+    store.del("pl_push_off");
+    if (Notification.permission === "granted") return subscribe(true).catch(function () { return "error"; });
     hide();
     return Promise.resolve(Notification.requestPermission()).then(function (p) {
       if (p === "granted") return subscribe(true).catch(function () { return "error"; });
@@ -64,20 +71,35 @@
       return p;
     });
   }
-  // Permission was taken back: tell DumbMail so it stops trying this browser.
-  function forget() {
-    var s = store.get("pl_push_sub");
+  // Tell DumbMail this browser's registration is gone, keeping the proof (endpoint and its secret)
+  // until DumbMail confirms, so a failed request is sent again on the next page.
+  function forget(proof) {
+    var s = proof || store.get("pl_push_removal") || store.get("pl_push_sub");
     store.del("pl_push_sub"); store.del("pl_push_sent");
-    if (s && s.endpoint) post("/client/push/unsubscribe", { endpoint: s.endpoint, auth: s.auth });
+    if (!s || !s.endpoint) { store.del("pl_push_removal"); return Promise.resolve(); }
+    store.set("pl_push_removal", s);
+    return post("/client/push/unsubscribe", { endpoint: s.endpoint, auth: s.auth }).then(function (r) {
+      if (r && r.ok) store.del("pl_push_removal");
+    }).catch(function () {});
   }
+  // Turn push off in this browser: it stays off until the person clicks Allow again.
   function unsubscribe() {
-    if (!supported) return Promise.resolve(false);
-    return navigator.serviceWorker.getRegistration(CFG.sw).then(function (reg) {
-      return reg ? reg.pushManager.getSubscription() : null;
-    }).then(function (sub) {
-      forget();
-      return sub ? sub.unsubscribe() : false;
+    store.set("pl_push_off", true);
+    if (!supported) return forget();
+    return existing().then(function (sub) {
+      var proof = sub ? { endpoint: sub.endpoint, auth: (sub.toJSON().keys || {}).auth } : null;
+      return forget(proof).then(function () { return sub ? sub.unsubscribe() : false; });
     });
+  }
+  // The site's visitor signed out: this browser goes back to being anonymous.
+  function signOut() {
+    grant = null;
+    store.del("pl_push_sent");
+    if (!supported) return Promise.resolve();
+    return existing().then(function (sub) {
+      if (!sub) return;
+      return post("/client/push/sign-out", { endpoint: sub.endpoint, auth: (sub.toJSON().keys || {}).auth });
+    }).catch(function () {});
   }
 
   // ---------- The in-page card ----------
@@ -123,18 +145,23 @@
     prompt: prompt,
     subscribe: prompt,
     unsubscribe: unsubscribe,
-    /** A verified identity from your server: { external_id or email, user_hash } (see Settings → Push). */
+    /** An enrollment grant from your server for the signed-in customer: { type: "external_id" or "email", value, grant }. Pass it on every page. */
     identify: function (v) {
-      if (!v || typeof v !== "object" || !v.user_hash) return api;
-      store.set("pl_push_identity", { external_id: v.external_id || null, email: v.email || null, user_hash: String(v.user_hash) });
-      if (supported && Notification.permission === "granted") subscribe(false).catch(function () {});
+      if (!v || typeof v !== "object" || !v.grant || !v.type || !v.value) return api;
+      grant = { type: String(v.type), value: String(v.value), grant: String(v.grant) };
+      if (supported && Notification.permission === "granted" && !store.get("pl_push_off")) existing().then(function (sub) { if (sub) report(sub, false); }).catch(function () {});
       return api;
-    }
+    },
+    signOut: signOut
   };
   if (window.dumbmail && typeof window.dumbmail === "object") window.dumbmail.notifications = api;
+  // A removal DumbMail hasn't confirmed yet: send it again.
+  if (store.get("pl_push_removal")) forget();
   if (!supported) return;
-  if (Notification.permission === "granted") subscribe(false).catch(function () {});
-  else if (Notification.permission === "denied") { if (store.get("pl_push_sub")) forget(); }
+  if (Notification.permission === "granted") {
+    // Only a browser that subscribed here and didn't turn push off since: never recreated without a click.
+    if (!store.get("pl_push_off")) existing().then(function (sub) { if (sub) report(sub, false); }).catch(function () {});
+  } else if (Notification.permission === "denied") { if (store.get("pl_push_sub")) forget(); }
   else if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", maybeShow);
   else maybeShow();
 })();

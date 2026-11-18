@@ -8,6 +8,7 @@
 pub mod client;
 pub mod content;
 pub mod crypto;
+pub mod limit;
 pub mod providers;
 pub mod send;
 pub mod settings;
@@ -45,6 +46,11 @@ static ROUTES: &[RouteRule] = &[
     rule("PUT", "/api/push/profiles/{id}/opt-out", Perm::AudienceWrite),
     rule("GET", "/api/push/report", Perm::MessagingRead),
     public("GET", "/push/sw.js"),
+    public("GET", "/push/handler.js"),
+    public("POST", "/client/push/sign-out"),
+    public("OPTIONS", "/client/push/sign-out"),
+    public("POST", "/client/push/devices/sign-out"),
+    public("OPTIONS", "/client/push/devices/sign-out"),
     public("GET", "/client/push.js"),
     public("POST", "/client/push/subscribe"),
     public("OPTIONS", "/client/push/subscribe"),
@@ -97,6 +103,7 @@ fn settings_schema() -> Value {
     json!({
         "web_enabled": {"type": "boolean", "description": "Turn web push on for the website snippet. The service worker file must be on the site first (see get_push_settings: web.service_worker_url and docs)."},
         "sw_path": {"type": "string", "description": "Where the service worker is on the site, e.g. /dumbmail-sw.js."},
+        "sw_scope": {"type": "string", "description": "The scope it's registered with: a folder of its own (default /dumbmail-push/), so it controls no pages. Use / only when DumbMail's handler is imported into the site's own root worker."},
         "prompt": {"type": "object", "additionalProperties": false, "description": "The in-page card shown before the browser's own prompt. Replaced whole.",
             "properties": {
                 "enabled": {"type": "boolean", "description": "Show it automatically by these rules. false: only the site's own button (dumbmail.notifications.prompt()) asks."},
@@ -133,7 +140,7 @@ async fn update_settings_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): 
 async fn rotate_identity(state: &AppState, ctx: &Ctx) -> AppResult<Value> {
     let secret = settings::rotate_identity_secret(state, ctx.account_id).await?;
     crate::features::team::audit(state, ctx, "push.identity_secret_rotate", None, json!({})).await;
-    Ok(json!({"identity_secret": secret, "note": "Shown once. Keep it on your server: it signs user_hash values. Any older secret stops working now."}))
+    Ok(json!({"identity_secret": secret, "note": "Shown once. Keep it on your server: it signs enrollment grants. Grants made with an older secret stop working now."}))
 }
 
 async fn identity_h(State(state): State<AppState>, ctx: Ctx) -> AppResult<Json<Value>> {
@@ -161,10 +168,11 @@ async fn test_device_h(State(state): State<AppState>, ctx: Ctx, headers: axum::h
     let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|u| u.chars().take(300).collect::<String>());
     // A browser that is someone's linked device stays theirs; this only adds it as a test device.
     let id: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO push_devices (id, account_id, test_user_id, kind, address, p256dh, auth_secret, user_agent)
-         VALUES ($1, $2, $3, 'web', $4, $5, $6, $7)
+        "INSERT INTO push_devices (id, account_id, test_user_id, kind, address, p256dh, auth_secret, user_agent, permission)
+         VALUES ($1, $2, $3, 'web', $4, $5, $6, $7, 'granted')
          ON CONFLICT (account_id, kind, address) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth_secret = EXCLUDED.auth_secret, status = 'active', failures = 0, last_seen_at = now(),
-            test_user_id = CASE WHEN push_devices.profile_id IS NULL THEN EXCLUDED.test_user_id ELSE push_devices.test_user_id END
+            permission = 'granted', test_user_id = EXCLUDED.test_user_id,
+            version = push_devices.version + CASE WHEN push_devices.test_user_id IS DISTINCT FROM EXCLUDED.test_user_id OR push_devices.auth_secret IS DISTINCT FROM EXCLUDED.auth_secret THEN 1 ELSE 0 END
          WHERE push_devices.profile_id IS NULL
          RETURNING id",
     )
@@ -265,20 +273,22 @@ async fn test_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<Tes
 
 pub async fn profile_push(state: &AppState, account_id: Uuid, id: Uuid) -> AppResult<Value> {
     load_profile(state, account_id, id).await?;
-    let rows: Vec<(Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>)> = sqlx::query_as(
-        "SELECT id, kind, status, user_agent, created_at, last_seen_at, last_sent_at, last_error FROM push_devices WHERE profile_id = $1 AND account_id = $2 ORDER BY last_seen_at DESC LIMIT 50",
+    type D = (Uuid, String, String, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, String, bool);
+    let rows: Vec<D> = sqlx::query_as(
+        "SELECT id, kind, status, user_agent, created_at, last_seen_at, last_sent_at, last_error, permission, anonymous FROM push_devices WHERE profile_id = $1 AND account_id = $2 ORDER BY last_seen_at DESC LIMIT 50",
     )
     .bind(id)
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
     let opt_out: Option<(chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as("SELECT created_at, source FROM push_opt_outs WHERE profile_id = $1").bind(id).fetch_optional(&state.db).await?;
+    let can_receive: bool = sqlx::query_scalar(&format!("SELECT {} FROM profiles p WHERE p.id = $1", send::REACHABLE_SQL)).bind(id).fetch_one(&state.db).await?;
     Ok(json!({
         "profile_id": id,
         "opted_out": opt_out.is_some(),
         "opted_out_at": opt_out.as_ref().map(|o| o.0),
-        "can_receive": opt_out.is_none() && rows.iter().any(|r| r.2 == "active"),
-        "devices": rows.iter().map(|(id, kind, status, ua, created, seen, sent, err)| json!({"id": id, "kind": kind, "status": status, "user_agent": ua, "created_at": created, "last_seen_at": seen, "last_sent_at": sent, "last_error": err})).collect::<Vec<_>>(),
+        "can_receive": can_receive,
+        "devices": rows.iter().map(|(id, kind, status, ua, created, seen, sent, err, permission, anonymous)| json!({"id": id, "kind": kind, "status": status, "permission": permission, "anonymous": anonymous, "user_agent": ua, "created_at": created, "last_seen_at": seen, "last_sent_at": sent, "last_error": err})).collect::<Vec<_>>(),
     }))
 }
 
@@ -290,16 +300,21 @@ async fn profile_h(State(state): State<AppState>, ctx: Ctx, Path(id): Path<Uuid>
 /// checks it right before the provider call.
 pub async fn set_opt_out(state: &AppState, ctx: &Ctx, id: Uuid, opted_out: bool) -> AppResult<Value> {
     load_profile(state, ctx.account_id, id).await?;
+    // The person's row is locked first: a hand-off's final claim holds it too, so an opt-out either
+    // lands before a claim (and stops it) or waits for it.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT 1 FROM profiles WHERE id = $1 AND account_id = $2 FOR UPDATE").bind(id).bind(ctx.account_id).execute(&mut *tx).await?;
     if opted_out {
         sqlx::query("INSERT INTO push_opt_outs (profile_id, account_id, source) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
             .bind(id)
             .bind(ctx.account_id)
             .bind(if ctx.via_api_key { "api" } else { "dashboard" })
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
     } else {
-        sqlx::query("DELETE FROM push_opt_outs WHERE profile_id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&state.db).await?;
+        sqlx::query("DELETE FROM push_opt_outs WHERE profile_id = $1 AND account_id = $2").bind(id).bind(ctx.account_id).execute(&mut *tx).await?;
     }
+    tx.commit().await?;
     crate::features::team::audit(state, ctx, if opted_out { "push.opt_out" } else { "push.opt_in" }, Some(&id.to_string()), json!({})).await;
     profile_push(state, ctx.account_id, id).await
 }
@@ -326,9 +341,10 @@ pub async fn report(state: &AppState, account_id: Uuid, q: &ReportQuery) -> AppR
         (None, Some(f)) => ("flow_id", f),
         _ => return Err(AppError::bad("give a campaign_id or a flow_id")),
     };
-    let rows: Vec<(String, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(&format!(
         "SELECT d.kind, count(*) FILTER (WHERE d.status = 'sent'), count(d.delivered_at), count(d.clicked_at),
-                count(*) FILTER (WHERE d.status = 'failed'), count(*) FILTER (WHERE d.status = 'gone'), count(*) FILTER (WHERE d.status = 'retry')
+                count(*) FILTER (WHERE d.status = 'failed'), count(*) FILTER (WHERE d.status = 'gone'), count(*) FILTER (WHERE d.status = 'retry'),
+                count(*) FILTER (WHERE d.status = 'unconfirmed')
          FROM push_deliveries d JOIN messages m ON m.id = d.message_id
          WHERE m.{col} = $1 AND m.account_id = $2 AND NOT m.is_test GROUP BY d.kind ORDER BY d.kind"
     ))
@@ -336,8 +352,9 @@ pub async fn report(state: &AppState, account_id: Uuid, q: &ReportQuery) -> AppR
     .bind(account_id)
     .fetch_all(&state.db)
     .await?;
-    let people: (i64, i64, i64, i64) = sqlx::query_as(&format!(
-        "SELECT count(*) FILTER (WHERE status IN ('sent', 'delivered')), count(*) FILTER (WHERE clicked_at IS NOT NULL), count(*) FILTER (WHERE status = 'failed'), count(*) FILTER (WHERE status = 'skipped')
+    let people: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*) FILTER (WHERE status IN ('sent', 'delivered')), count(*) FILTER (WHERE clicked_at IS NOT NULL), count(*) FILTER (WHERE status = 'failed'), count(*) FILTER (WHERE status = 'skipped'),
+                count(*) FILTER (WHERE status = 'retrying'), count(*) FILTER (WHERE status = 'unconfirmed')
          FROM messages WHERE {col} = $1 AND account_id = $2 AND channel = 'push' AND NOT is_test"
     ))
     .bind(id)
@@ -345,9 +362,9 @@ pub async fn report(state: &AppState, account_id: Uuid, q: &ReportQuery) -> AppR
     .fetch_one(&state.db)
     .await?;
     Ok(json!({
-        "people": {"sent": people.0, "clicked": people.1, "failed": people.2, "skipped": people.3},
-        "platforms": rows.iter().map(|(k, sent, delivered, clicked, failed, gone, retry)| json!({
-            "platform": k, "sent": sent, "delivered": if k == "web" { json!(delivered) } else { Value::Null }, "clicked": clicked, "failed": failed, "removed": gone, "retrying": retry
+        "people": {"sent": people.0, "clicked": people.1, "failed": people.2, "skipped": people.3, "retrying": people.4, "unconfirmed": people.5},
+        "platforms": rows.iter().map(|(k, sent, delivered, clicked, failed, gone, retry, unconfirmed)| json!({
+            "platform": k, "sent": sent, "delivered": if k == "web" { json!(delivered) } else { Value::Null }, "clicked": clicked, "failed": failed, "removed": gone, "retrying": retry, "unconfirmed": unconfirmed
         })).collect::<Vec<_>>(),
     }))
 }
@@ -434,6 +451,9 @@ impl Feature for Module {
             .route("/api/push/profiles/{id}/opt-out", put(opt_out_h))
             .route("/api/push/report", get(report_h))
             .route("/push/sw.js", get(client::service_worker))
+            .route("/push/handler.js", get(client::handler))
+            .route("/client/push/sign-out", post(client::sign_out).options(client::preflight))
+            .route("/client/push/devices/sign-out", post(client::device_sign_out).options(client::preflight))
             .route("/client/push.js", get(client::push_js))
             .route("/client/push/subscribe", post(client::subscribe).options(client::preflight))
             .route("/client/push/unsubscribe", post(client::unsubscribe).options(client::preflight))
@@ -448,7 +468,7 @@ impl Feature for Module {
         vec![
             tool("get_push_settings", "Get push settings", "Web push (on or off, the service worker file and path, the in-page prompt), Apple (APNs) and Firebase (FCM) credentials (which are set, never the secrets), identity verification, and device counts. Read dumbmail://docs/push for setup.", obj(json!({}), &[]), true, false),
             tool("update_push_settings", "Change push settings", "Turn web push on or off, set the service worker path and the in-page prompt, and add, replace or remove (null) APNs and FCM credentials. Only the fields given change. Secrets are stored encrypted and never shown again.", obj(settings_schema(), &[]), false, false),
-            tool("rotate_push_identity_secret", "New identity secret", "Make a new secret for verified identities (user_hash = HMAC-SHA256 of the external_id or email, hex). Returned once; the old one stops working. Requires confirm=true.", obj(json!({"confirm": {"type": "boolean"}}), &[]), false, true),
+            tool("rotate_push_identity_secret", "New enrollment secret", "Make a new secret for enrollment grants: the customer's server signs who is signed in (grant = v1.<expires>.<hex HMAC-SHA256 of v1|push-enroll|<account id>|<external_id or email>|<value>|<expires>>, valid at most 24 hours; see dumbmail://docs/push). Returned once; the old one stops working. Requires confirm=true.", obj(json!({"confirm": {"type": "boolean"}}), &[]), false, true),
             tool("send_test_push", "Send a test push", "Send a test notification. to: \"me\" (your own test browsers, added from Settings → Push) or a person's email; or profile_id or device_id. A person's devices are real people: get the user's approval and pass confirm=true. Without confirm it returns what would happen. content defaults to a short sample.",
                 obj(json!({"content": content_schema(), "to": {"type": "string"}, "profile_id": {"type": "string"}, "device_id": {"type": "string"}, "confirm": {"type": "boolean"}}), &[]), false, true),
             tool("get_profile_push", "A person's push devices", "Their devices (web, ios, android) with status and last use, whether they turned push off, and whether a push would reach them now.", obj(json!({"profile_id": {"type": "string"}}), &["profile_id"]), true, false),
@@ -464,7 +484,7 @@ impl Feature for Module {
             "update_push_settings" => async { update_settings(state, ctx, from(a.clone())?).await }.await,
             "rotate_push_identity_secret" => {
                 if a["confirm"].as_bool() != Some(true) {
-                    Ok(json!({"dry_run": true, "note": "This replaces the identity secret; user_hash values made with the old one stop working. Call again with confirm=true."}))
+                    Ok(json!({"dry_run": true, "note": "This replaces the enrollment secret; grants made with the old one stop working. Call again with confirm=true."}))
                 } else {
                     rotate_identity(state, ctx).await
                 }
@@ -499,17 +519,27 @@ impl Feature for Module {
     async fn run_job(&self, state: &AppState, kind: &str, payload: &Value) -> Option<anyhow::Result<()>> {
         match kind {
             "push_retry" => Some(async {
-                let id: Uuid = payload["delivery_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("push_retry needs delivery_id"))?;
-                send::retry(state, id).await
+                let id: Uuid = payload["message_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("push_retry needs message_id"))?;
+                send::hand_off(state, id, send::Attempt::Later).await.map(|_| ()).map_err(|e| anyhow::anyhow!(e.public_message()))
             }
             .await),
+            "push_event" => Some(async {
+                let id: Uuid = payload["message_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("push_event needs message_id"))?;
+                let metric = match payload["metric"].as_str() {
+                    Some("Clicked Push") => "Clicked Push",
+                    _ => "Received Push",
+                };
+                send::record_message_event(state, id, metric).await
+            }
+            .await),
+            "push_cleanup" => Some(send::cleanup(state).await),
             _ => None,
         }
     }
 
     async fn tick(&self, state: &AppState, tick: u64) -> anyhow::Result<()> {
         if tick.is_multiple_of(15) {
-            send::sweep(state).await?;
+            send::schedule_cleanup(state).await?;
         }
         Ok(())
     }

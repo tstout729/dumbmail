@@ -955,6 +955,19 @@ async fn finish(db: &PgPool, run_id: Uuid, status: &str) -> anyhow::Result<()> {
 }
 
 /// Job: advance a run until it hits a delay or finishes.
+/// The message id of a push step in a run: made and saved with the run the first time, the same
+/// on every re-run of the step (a flow never visits a step twice).
+async fn push_message_id(state: &AppState, run_id: Uuid, node_id: &str, context: &mut Value) -> anyhow::Result<Uuid> {
+    let key = format!("_push_message_{node_id}");
+    if let Some(id) = context.get(&key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        return Ok(id);
+    }
+    let id = Uuid::now_v7();
+    context[key.as_str()] = json!(id);
+    sqlx::query("UPDATE flow_runs SET context = $2 WHERE id = $1").bind(run_id).bind(&*context).execute(&state.db).await?;
+    Ok(id)
+}
+
 pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
     let Some(run) = sqlx::query_as::<_, Run>("SELECT id, flow_id, profile_id, current_node, status, context FROM flow_runs WHERE id = $1")
         .bind(run_id)
@@ -1055,6 +1068,9 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                 if !recent {
                     let event = context.get("event").cloned();
                     let content = node.data.get("content").cloned().unwrap_or(json!({}));
+                    // A push step's message id is stored with the run before it's sent, so a re-run
+                    // of the step finds that message instead of sending a second one.
+                    let message_id = if node.kind == "push" { Some(push_message_id(state, run.id, &node_id, &mut context).await?) } else { None };
                     let out = sending::send(
                         state,
                         SendSpec {
@@ -1067,7 +1083,7 @@ pub async fn step(state: &AppState, run_id: Uuid) -> anyhow::Result<()> {
                             flow_node_id: Some(&node_id),
                             event: event.as_ref(),
                             is_test: false,
-                            message_id: None,
+                            message_id,
                             to_override: None,
                         },
                     )

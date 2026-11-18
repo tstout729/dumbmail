@@ -1,24 +1,33 @@
 //! Push as a channel: sending one push message (a `messages` row, channel `push`) to a person's
-//! devices, tests, and retries.
+//! devices, tests, retries and upkeep.
 //!
-//! Order, like email and texts: consent (devices that allowed notifications and no push opt-out),
-//! quiet hours in the recipient's zone (the account's texting window), rendering, the balance, the
-//! message row, the rate limiter, then the claim. The claim is one conditional write against the
-//! current state (still queued, not opted out, the campaign still sending) that also fixes which
-//! devices it goes to. Right before each provider call, a second conditional write checks that
-//! device is still active and the person still hasn't opted out. A delivery is handed over at most
-//! once: a crash after the claim leaves it `sending`, and the sweep marks it failed instead of
-//! sending it again. Billing and the "Received Push" event happen once, on the write that records
-//! the first device that accepted it.
+//! A send happens in three writes:
+//!
+//! 1. **The message claim** (one transaction): the message may still go (queued, the profile
+//!    exists, the campaign still sending), and its deliveries are fixed: one per device
+//!    registration, each remembering the registration's version and owner and carrying the payload
+//!    it will send (so a retry sends the same thing).
+//! 2. **The final claim**, right before every provider call, first attempts and retries alike (one
+//!    transaction holding the message, the devices and their owners): the campaign or flow is still
+//!    live, quiet hours and smart sending (not counting this message) still allow it, and, for each
+//!    device, the same owner and registration version as when the message was made, the platform
+//!    still enabled, notifications still permitted, and the owner not opted out of push. Only what
+//!    passes is marked `sending` and handed over; the rest is skipped with the reason.
+//! 3. **The results** (one transaction, batched): applied only to the registration version that was
+//!    sent to. The first device that accepted marks the message sent, and that same write charges it
+//!    and queues the "Received Push" event (recorded once, on the message id).
+//!
+//! Every provider call goes through [`super::limit`]. A request with no answer is `unconfirmed`, never
+//! sent again; only a certain refusal (connection refused, 429, 5xx) is retried, in the background lane.
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::content::{self, PushContent, Rendered};
 use super::providers::{self, Sent};
 use super::settings::{self, Row};
-use crate::audience::{record_event, NewEvent};
 use crate::error::{AppError, AppResult};
 use crate::models::{Account, Profile};
 use crate::sending::{Outcome, SendSpec};
@@ -28,11 +37,48 @@ use crate::state::AppState;
 pub const MAX_DEVICES_PER_MESSAGE: i64 = 10;
 /// Failed hand-offs in a row before a device is turned off (a gone device is removed at once).
 pub const MAX_FAILURES: i32 = 5;
-/// Hand-off attempts per delivery: the first, then retries after these waits.
+/// Waits before each retry of a delivery the push service didn't take; then it's given up.
 const RETRY_WAITS: [i64; 3] = [60, 300, 1800];
+/// How long a delivery's report and tap token stays valid (the longest time to live is 28 days).
+pub const TOKEN_DAYS: i64 = 35;
 
-/// SQL true when profile `p` can get push now: a device that allowed notifications, no opt-out.
-pub const REACHABLE_SQL: &str = "(NOT EXISTS (SELECT 1 FROM push_opt_outs po WHERE po.profile_id = p.id) AND EXISTS (SELECT 1 FROM push_devices pd WHERE pd.profile_id = p.id AND pd.status = 'active'))";
+macro_rules! sendable {
+    () => {
+        "d.status = 'active' AND d.permission IN ('granted', 'provisional')
+         AND ((d.kind = 'web' AND ps.web_enabled AND ps.vapid_private_enc IS NOT NULL)
+           OR (d.kind = 'ios' AND ps.apns_key_enc IS NOT NULL AND ps.apns_bundle_id IS NOT NULL)
+           OR (d.kind = 'android' AND ps.fcm_credentials_enc IS NOT NULL))"
+    };
+}
+
+/// SQL true for a device `d` (with its account's push settings `ps`) that may be sent to now:
+/// active, notifications permitted, and its platform enabled.
+pub const DEVICE_SENDABLE_SQL: &str = sendable!();
+
+/// SQL true when profile `p` can get push now: a sendable device and no push opt-out.
+pub const REACHABLE_SQL: &str = concat!(
+    "(NOT EXISTS (SELECT 1 FROM push_opt_outs po WHERE po.profile_id = p.id) AND EXISTS (SELECT 1 FROM push_devices d JOIN push_settings ps ON ps.account_id = d.account_id WHERE d.profile_id = p.id AND ",
+    sendable!(),
+    "))"
+);
+
+/// [`REACHABLE_SQL`], counting only devices on `platforms` (a campaign's targets) when given.
+pub fn push_reachable(qb: &mut QueryBuilder<'_, Postgres>, platforms: Option<&[String]>) {
+    match platforms {
+        None => {
+            qb.push(REACHABLE_SQL);
+        }
+        Some(p) => {
+            qb.push("(NOT EXISTS (SELECT 1 FROM push_opt_outs po WHERE po.profile_id = p.id) AND EXISTS (SELECT 1 FROM push_devices d JOIN push_settings ps ON ps.account_id = d.account_id WHERE d.profile_id = p.id AND ");
+            qb.push(DEVICE_SENDABLE_SQL).push(" AND d.kind = ANY(").push_bind(p.to_vec()).push(")))");
+        }
+    }
+}
+
+/// People in the account a push would reach now.
+pub async fn reachable_count(db: &sqlx::PgPool, account_id: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM profiles p WHERE p.account_id = $1 AND {REACHABLE_SQL}")).bind(account_id).fetch_one(db).await
+}
 
 /// Who a send goes to.
 enum Target<'a> {
@@ -45,7 +91,21 @@ enum Target<'a> {
     Device(&'a Uuid),
 }
 
-/// The channel's entry point from `sending::send` (campaigns and flows).
+/// The devices a target covers, with its (profile, member, device) bound as $3, $4 and $5.
+const WHO: &str = "(d.profile_id = $3 OR d.test_user_id = $4 OR d.id = $5)";
+
+impl Target<'_> {
+    fn who(&self, profile_id: Uuid) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
+        match self {
+            Target::Profile(member) => (Some(profile_id), *member, None),
+            Target::Member(u) => (None, Some(*u), None),
+            Target::Device(d) => (None, None, Some(**d)),
+        }
+    }
+}
+
+/// The channel's entry point from `sending::send` (campaigns and flows). A flow passes the message
+/// id it stored with its run, so a re-run of the step finds the message instead of making another.
 pub async fn send(state: &AppState, spec: &SendSpec<'_>) -> AppResult<Outcome> {
     run(state, spec, Target::Profile(None)).await
 }
@@ -54,41 +114,53 @@ async fn run(state: &AppState, spec: &SendSpec<'_>, target: Target<'_>) -> AppRe
     let account = spec.account;
     let p = spec.profile;
     let c = content::parse(spec.content)?;
-    let Some(row) = settings::load(&state.db, account.id).await? else { return skip(state, spec, "push isn't set up").await };
+    let Some(row) = settings::load(&state.db, account.id).await? else { return Ok(Outcome::Skipped("push isn't set up")) };
     let ready = row.ready_kinds();
     let kinds: Vec<String> = c.platforms().into_iter().filter(|k| ready.contains(&k.as_str())).collect();
     if kinds.is_empty() {
-        return skip(state, spec, "push isn't set up").await;
-    }
-    let opted_out: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM push_opt_outs WHERE profile_id = $1)").bind(p.id).fetch_one(&state.db).await?;
-    if opted_out && matches!(target, Target::Profile(_)) {
         if spec.is_test {
-            return Err(AppError::bad("this person turned push notifications off; pick someone else"));
+            return Err(AppError::bad("push isn't set up for the devices this notification goes to"));
         }
-        return skip(state, spec, "push turned off").await;
+        return Ok(Outcome::Skipped("push isn't set up"));
+    }
+    // A message already handled (a flow step run again) is never sent again.
+    if let Some(mid) = spec.message_id {
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM messages WHERE id = $1").bind(mid).fetch_optional(&state.db).await?;
+        if status.as_deref().is_some_and(|s| !matches!(s, "queued" | "sending")) {
+            return Ok(Outcome::Skipped("already handled"));
+        }
     }
     let who = target.who(p.id);
-    let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM push_devices d WHERE d.account_id = $1 AND d.status = 'active' AND d.kind = ANY($2) AND {WHO}"))
-        .bind(account.id)
-        .bind(&kinds)
-        .bind(who.0)
-        .bind(who.1)
-        .bind(who.2)
-        .fetch_one(&state.db)
-        .await?;
-    let devices = n.min(MAX_DEVICES_PER_MESSAGE);
-    if devices == 0 {
+    // The devices, as they are now (the final claim checks them again right before the hand-off).
+    type Dev = (Uuid, String, i64, Option<Uuid>, Option<Uuid>);
+    let devices: Vec<Dev> = sqlx::query_as(&format!(
+        "SELECT d.id, d.kind, d.version, d.profile_id, d.test_user_id FROM push_devices d JOIN push_settings ps ON ps.account_id = d.account_id
+         WHERE d.account_id = $1 AND d.kind = ANY($2) AND {WHO} AND {DEVICE_SENDABLE_SQL}
+           AND (d.profile_id IS NULL OR NOT EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = d.profile_id))
+         ORDER BY d.last_seen_at DESC LIMIT $6"
+    ))
+    .bind(account.id)
+    .bind(&kinds)
+    .bind(who.0)
+    .bind(who.1)
+    .bind(who.2)
+    .bind(MAX_DEVICES_PER_MESSAGE)
+    .fetch_all(&state.db)
+    .await?;
+    if devices.is_empty() {
+        let opted_out: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM push_opt_outs WHERE profile_id = $1)").bind(p.id).fetch_one(&state.db).await?;
         if spec.is_test {
-            return Err(AppError::bad("no device that allowed notifications to send this to"));
+            return Err(AppError::bad(if opted_out && matches!(target, Target::Profile(_)) {
+                "this person turned push notifications off; pick someone else"
+            } else {
+                "no device that allowed notifications to send this to"
+            }));
         }
-        return skip(state, spec, "no push device").await;
+        return Ok(Outcome::Skipped(if opted_out { "push turned off" } else { "no push device" }));
     }
-    // Quiet hours in their own zone: the account's texting window (see features::sendtime). The
-    // profile's zone can come from a browser, so it only ever narrows the hours (with the account's).
+    // Quiet hours in their own zone (the account's texting window). Checked again at the hand-off.
     if !spec.is_test {
-        let ((start, end), _) = crate::features::sendtime::settings::sms_settings(&state.db, account.id).await?;
-        let zones = crate::features::sendtime::settings::sms_zones(&p.properties, None, crate::sending::account_tz(account));
-        if let Some(until) = crate::features::sendtime::settings::decide(&zones, Utc::now(), start, end, false).wait {
+        if let Some(until) = quiet_until(state, account, &p.properties).await? {
             return Ok(Outcome::Deferred(until));
         }
     }
@@ -105,132 +177,97 @@ async fn run(state: &AppState, spec: &SendSpec<'_>, target: Target<'_>) -> AppRe
         if spec.is_test {
             return Err(AppError::LimitReached("your balance is empty; add credit in Settings → Billing".into()));
         }
-        return skip(state, spec, "insufficient credit").await;
+        return Ok(Outcome::Skipped("insufficient credit"));
     }
 
-    if spec.message_id.is_none() {
-        sqlx::query(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
-             VALUES ($1, $2, $3, 'push', $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(message_id)
-        .bind(account.id)
-        .bind(p.id)
-        .bind(spec.campaign_id)
-        .bind(spec.flow_id)
-        .bind(spec.flow_node_id)
-        .bind(format!("{} device{}", devices, if devices == 1 { "" } else { "s" }))
-        .bind(&subject)
-        .bind(spec.is_test)
-        .execute(&state.db)
-        .await?;
-    } else {
-        sqlx::query("UPDATE messages SET subject = $2, to_address = $3 WHERE id = $1").bind(message_id).bind(&subject).bind(format!("{devices} device{}", if devices == 1 { "" } else { "s" })).execute(&state.db).await?;
-    }
+    let to = format!("{} device{}", devices.len(), if devices.len() == 1 { "" } else { "s" });
+    sqlx::query(
+        "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test)
+         VALUES ($1, $2, $3, 'push', $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO UPDATE SET subject = EXCLUDED.subject, to_address = EXCLUDED.to_address WHERE messages.status IN ('queued', 'sending')",
+    )
+    .bind(message_id)
+    .bind(account.id)
+    .bind(p.id)
+    .bind(spec.campaign_id)
+    .bind(spec.flow_id)
+    .bind(spec.flow_node_id)
+    .bind(&to)
+    .bind(&subject)
+    .bind(spec.is_test)
+    .execute(&state.db)
+    .await?;
 
     crate::sending::throttle("push", f64::from(state.cfg.send_rate_per_sec.max(1))).await;
 
-    let deliveries = match claim(state, spec, message_id, &kinds, &target).await? {
-        Ok(d) => d,
-        Err(why) => return Ok(Outcome::Skipped(why)),
-    };
-    let mut first_error: Option<String> = None;
-    for (delivery_id, kind) in &deliveries {
-        let payload = build_payload(state, account, &c, &rendered, &title, *delivery_id, kind);
-        let r = hand_off(state, &row, *delivery_id, kind, &payload, &c, false).await?;
-        if first_error.is_none() {
-            first_error = r;
-        }
-    }
-    finish(state, account.id, message_id, spec.is_test, first_error.as_deref()).await
-}
-
-/// The devices a target covers, with its (profile, member, device) bound as $3, $4 and $5.
-const WHO: &str = "(d.profile_id = $3 OR d.test_user_id = $4 OR d.id = $5)";
-
-impl Target<'_> {
-    fn who(&self, profile_id: Uuid) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
-        match self {
-            Target::Profile(member) => (Some(profile_id), *member, None),
-            Target::Member(u) => (None, Some(*u), None),
-            Target::Device(d) => (None, None, Some(**d)),
-        }
-    }
-}
-
-/// A send that stops before any message row exists: campaigns mark their own row (the batch does it
-/// from the outcome); flows and tests keep nothing, like email.
-async fn skip(_state: &AppState, _spec: &SendSpec<'_>, why: &'static str) -> AppResult<Outcome> {
-    Ok(Outcome::Skipped(why))
-}
-
-/// The claim: one transaction that marks the message `sending` only if it may still go (queued,
-/// not opted out, the profile exists, the campaign still sending), and fixes its deliveries.
-async fn claim(state: &AppState, spec: &SendSpec<'_>, message_id: Uuid, kinds: &[String], target: &Target<'_>) -> AppResult<Result<Vec<(Uuid, String)>, &'static str>> {
+    // The message claim: still allowed, and its deliveries fixed, in one transaction.
     let mut tx = state.db.begin().await?;
-    let profile_check = matches!(target, Target::Profile(_));
     let claimed: Option<Uuid> = sqlx::query_scalar(
         "UPDATE messages m SET status = 'sending', claimed_at = COALESCE(m.claimed_at, now())
          WHERE m.id = $1 AND m.status IN ('queued', 'sending')
            AND EXISTS (SELECT 1 FROM profiles p WHERE p.id = m.profile_id)
-           AND (NOT $2 OR NOT EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = m.profile_id))
-           AND ($3 OR m.campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = m.campaign_id AND c.status = 'sending'))
+           AND ($2 OR m.campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = m.campaign_id AND c.status = 'sending'))
          RETURNING m.id",
     )
     .bind(message_id)
-    .bind(profile_check)
     .bind(spec.is_test)
     .fetch_optional(&mut *tx)
     .await?;
     if claimed.is_none() {
-        let why: Option<(String, bool, Option<String>)> = sqlx::query_as(
-            "SELECT m.status, EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = m.profile_id), (SELECT c.status FROM campaigns c WHERE c.id = m.campaign_id)
-             FROM messages m WHERE m.id = $1",
-        )
-        .bind(message_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let reason = match &why {
-            None => "profile deleted",
-            Some((s, _, _)) if !matches!(s.as_str(), "queued" | "sending") => "no longer queued",
-            Some((_, true, _)) => "push turned off",
-            Some((_, _, Some(c))) if c == "cancelled" => "campaign cancelled",
-            Some((_, _, Some(_))) => "campaign stopped",
+        let campaign: Option<String> = sqlx::query_scalar("SELECT c.status FROM messages m JOIN campaigns c ON c.id = m.campaign_id WHERE m.id = $1").bind(message_id).fetch_optional(&mut *tx).await?;
+        let why = match campaign.as_deref() {
+            Some("cancelled") => "campaign cancelled",
+            Some(s) if s != "sending" => "campaign stopped",
             _ => "no longer queued",
         };
-        mark_skipped(&mut tx, state, spec.account.id, message_id, reason, spec.is_test).await?;
+        mark_skipped(&mut tx, state, account.id, message_id, why, spec.is_test).await?;
         tx.commit().await?;
-        return Ok(Err(reason));
+        return Ok(Outcome::Skipped(why));
     }
-    let who = target.who(spec.profile.id);
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
-        "INSERT INTO push_deliveries (id, message_id, account_id, device_id, kind, status, claimed_at)
-         SELECT gen_random_uuid(), $6, $1, d.id, d.kind, 'sending', now() FROM (
-            SELECT d.id, d.kind FROM push_devices d WHERE d.account_id = $1 AND d.status = 'active' AND d.kind = ANY($2) AND {WHO}
-            ORDER BY d.last_seen_at DESC LIMIT $7) d
-         ON CONFLICT (message_id, device_id) DO NOTHING
-         RETURNING id, kind"
-    ))
-    .bind(spec.account.id)
-    .bind(kinds)
-    .bind(who.0)
-    .bind(who.1)
-    .bind(who.2)
+    let opts = json!({"ttl": c.ttl(), "urgency": c.urgency(), "topic": c.topic.as_deref().filter(|t| !t.is_empty()), "high": matches!(c.urgency(), "normal" | "high")});
+    let (mut ids, mut device_ids, mut kinds_v, mut versions, mut owners, mut members, mut payloads) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    for (did, kind, version, owner, member) in &devices {
+        let id = Uuid::now_v7();
+        let mut payload = build_payload(state, account, &c, &rendered, &title, id, kind);
+        payload["_opts"] = opts.clone();
+        ids.push(id);
+        device_ids.push(*did);
+        kinds_v.push(kind.clone());
+        versions.push(*version);
+        owners.push(*owner);
+        members.push(*member);
+        payloads.push(payload);
+    }
+    sqlx::query(
+        "INSERT INTO push_deliveries (id, message_id, account_id, device_id, kind, device_version, owner_profile_id, owner_test_user_id, payload)
+         SELECT x.id, $1, $2, x.device_id, x.kind, x.version, x.owner, x.member, x.payload
+         FROM unnest($3::uuid[], $4::uuid[], $5::text[], $6::bigint[], $7::uuid[], $8::uuid[], $9::jsonb[]) AS x(id, device_id, kind, version, owner, member, payload)
+         ON CONFLICT (message_id, device_id) DO NOTHING",
+    )
     .bind(message_id)
-    .bind(MAX_DEVICES_PER_MESSAGE)
-    .fetch_all(&mut *tx)
+    .bind(account.id)
+    .bind(&ids)
+    .bind(&device_ids)
+    .bind(&kinds_v)
+    .bind(&versions)
+    .bind(&owners)
+    .bind(&members)
+    .bind(&payloads)
+    .execute(&mut *tx)
     .await?;
-    if rows.is_empty() {
-        mark_skipped(&mut tx, state, spec.account.id, message_id, "no push device", spec.is_test).await?;
-        tx.commit().await?;
-        return Ok(Err("no push device"));
-    }
     tx.commit().await?;
-    Ok(Ok(rows))
+    hand_off(state, message_id, Attempt::First).await
 }
 
-async fn mark_skipped(tx: &mut sqlx::PgConnection, state: &AppState, account_id: Uuid, message_id: Uuid, why: &str, is_test: bool) -> AppResult<()> {
-    let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status IN ('queued', 'sending')")
+/// When quiet hours end for someone with these profile properties, if they're in them now.
+async fn quiet_until(state: &AppState, account: &Account, props: &Value) -> AppResult<Option<DateTime<Utc>>> {
+    let ((start, end), _) = crate::features::sendtime::settings::sms_settings(&state.db, account.id).await?;
+    let zones = crate::features::sendtime::settings::sms_zones(props, None, crate::sending::account_tz(account));
+    Ok(crate::features::sendtime::settings::decide(&zones, Utc::now(), start, end, false).wait)
+}
+
+async fn mark_skipped(tx: &mut PgConnection, state: &AppState, account_id: Uuid, message_id: Uuid, why: &str, is_test: bool) -> AppResult<()> {
+    let n = sqlx::query("UPDATE messages SET status = 'skipped', error = $2 WHERE id = $1 AND status IN ('queued', 'sending', 'retrying')")
         .bind(message_id)
         .bind(why)
         .execute(&mut *tx)
@@ -242,36 +279,47 @@ async fn mark_skipped(tx: &mut sqlx::PgConnection, state: &AppState, account_id:
     Ok(())
 }
 
-/// A signed token naming one delivery (in the payload, for "delivered" and "opened" reports).
+/// A signed token naming one delivery until it expires (in the payload, for "delivered" and
+/// "opened" reports and the tap link).
 pub fn delivery_token(state: &AppState, delivery_id: Uuid) -> String {
-    crate::auth::sign(&state.cfg.secret_key, &format!("pd{}", delivery_id.simple()))
+    let exp = Utc::now().timestamp() + TOKEN_DAYS * 86_400;
+    crate::auth::sign(&state.cfg.secret_key, &format!("pd{}{exp:x}", delivery_id.simple()))
 }
 
+/// The delivery a token names, if it's genuine and not expired.
 pub fn delivery_from_token(state: &AppState, token: &str) -> Option<Uuid> {
     if token.len() > 200 {
         return None;
     }
     let payload = crate::auth::verify(&state.cfg.secret_key, token)?;
-    Uuid::parse_str(payload.strip_prefix("pd")?).ok()
+    let rest = payload.strip_prefix("pd")?;
+    if rest.len() <= 32 {
+        return None;
+    }
+    let (id, exp) = rest.split_at(32);
+    if i64::from_str_radix(exp, 16).ok()? < Utc::now().timestamp() {
+        return None;
+    }
+    Uuid::parse_str(id).ok()
 }
 
 /// A tracked link for a tap: `/p/c/{token}?u=...&s=...`, signed so it only goes where we sent it.
-pub fn tracked_url(state: &AppState, account: &Account, delivery_id: Uuid, url: &str) -> String {
+pub fn tracked_url(state: &AppState, account: &Account, delivery_id: Uuid, token: &str, url: &str) -> String {
     let base = crate::domains::link_base(state, account);
-    let mut u = url::Url::parse(&format!("{base}/p/c/{}", delivery_token(state, delivery_id))).expect("link base is a URL");
+    let mut u = url::Url::parse(&format!("{base}/p/c/{token}")).expect("link base is a URL");
     u.query_pairs_mut().append_pair("u", url).append_pair("s", &crate::auth::link_sig(&state.cfg.secret_key, delivery_id, url));
     u.to_string()
 }
 
-/// What one device is sent, by kind. Web: the JSON the service worker reads. iOS: the APNs payload.
-/// Android: the FCM message without its token.
+/// What one device is sent, by kind. Web: the JSON DumbMail's service worker reads (marked `dm`).
+/// iOS: the APNs payload. Android: the FCM message without its token.
 fn build_payload(state: &AppState, account: &Account, c: &PushContent, r: &Rendered, title: &str, delivery_id: Uuid, kind: &str) -> Value {
     let tok = delivery_token(state, delivery_id);
-    let url = tracked_url(state, account, delivery_id, &r.url);
-    let actions: Vec<Value> = r.actions.iter().map(|a| json!({"t": a.title, "u": tracked_url(state, account, delivery_id, &a.url)})).collect();
+    let url = tracked_url(state, account, delivery_id, &tok, &r.url);
+    let actions: Vec<Value> = r.actions.iter().map(|a| json!({"t": a.title, "u": tracked_url(state, account, delivery_id, &tok, &a.url)})).collect();
     match kind {
         "web" => {
-            let mut v = json!({"t": title, "b": r.body, "u": url, "r": tok});
+            let mut v = json!({"dm": 1, "t": title, "b": r.body, "u": url, "r": tok});
             if let Some(i) = &r.icon {
                 v["i"] = json!(i);
             }
@@ -322,262 +370,557 @@ fn build_payload(state: &AppState, account: &Account, c: &PushContent, r: &Rende
     }
 }
 
-/// Hand one claimed delivery to its device's push service and record what happened. `retry`: this
-/// is a retry job's attempt (already claimed by it). Returns the error class when it didn't go.
-async fn hand_off(state: &AppState, row: &Row, delivery_id: Uuid, kind: &str, payload: &Value, c: &PushContent, retry: bool) -> AppResult<Option<String>> {
-    // The last check, as a conditional write right before the provider call: the device is still
-    // active and the person hasn't opted out since the claim. A replay of a first attempt finds
-    // attempts > 0 and sends nothing.
-    let device: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "UPDATE push_deliveries pd SET attempts = pd.attempts + 1, claimed_at = now()
-         FROM push_devices d, messages m
-         WHERE pd.id = $1 AND pd.status = 'sending' AND ($2 OR pd.attempts = 0) AND d.id = pd.device_id AND d.status = 'active' AND m.id = pd.message_id
-           AND (m.is_test OR NOT EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = m.profile_id))
-         RETURNING d.id, d.address, d.p256dh, d.auth_secret",
-    )
-    .bind(delivery_id)
-    .bind(retry)
-    .fetch_optional(&state.db)
-    .await?;
-    let Some((device_id, address, p256dh, auth)) = device else {
-        sqlx::query("UPDATE push_deliveries SET status = 'skipped', error = 'device or consent changed', payload = NULL WHERE id = $1 AND status = 'sending'").bind(delivery_id).execute(&state.db).await?;
-        return Ok(Some("device or consent changed".into()));
-    };
-    let result = match kind {
-        "web" => {
-            let bytes = serde_json::to_vec(payload)?;
-            let target = providers::WebTarget { endpoint: &address, p256dh: p256dh.as_deref().unwrap_or(""), auth: auth.as_deref().unwrap_or("") };
-            providers::send_web(state, row, &target, &bytes, &providers::Options { ttl: c.ttl(), urgency: c.urgency(), topic: c.topic.as_deref().filter(|t| !t.is_empty()) }).await
-        }
-        "ios" => {
-            let m = providers::ApnsMessage {
-                device_token: &address,
-                delivery_id,
-                payload,
-                ttl: c.ttl(),
-                high: matches!(c.urgency(), "normal" | "high"),
-                collapse_id: c.topic.as_deref().filter(|t| !t.is_empty()),
-            };
-            providers::send_apns(state, row, &m).await
-        }
-        _ => {
-            let mut msg = payload.clone();
-            msg["token"] = json!(address);
-            providers::send_fcm(state, row, &msg).await
-        }
-    };
-    // Kept with a waiting retry: the payload and the options that shape the hand-off.
-    let mut stored = payload.clone();
-    stored["_opts"] = json!({"ttl_seconds": c.ttl_seconds, "urgency": c.urgency, "topic": c.topic});
-    record(state, row, delivery_id, device_id, &address, kind, &stored, result).await
+/// Which hand-off this is: the send itself (its campaign must still be sending), or a later one
+/// (a retry, or upkeep picking up deliveries a crash left queued).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Attempt {
+    First,
+    Later,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn record(state: &AppState, row: &Row, delivery_id: Uuid, device_id: Uuid, address: &str, kind: &str, payload: &Value, result: Sent) -> AppResult<Option<String>> {
-    match result {
-        Sent::Ok(provider_id) => {
-            sqlx::query("UPDATE push_deliveries SET status = 'sent', sent_at = now(), provider_id = $2, error = NULL, payload = NULL WHERE id = $1 AND status = 'sending'")
-                .bind(delivery_id)
-                .bind(provider_id)
-                .execute(&state.db)
-                .await?;
-            sqlx::query("UPDATE push_devices SET last_sent_at = now(), failures = 0, last_error = NULL WHERE id = $1").bind(device_id).execute(&state.db).await?;
-            Ok(None)
+/// Test hook: hold every hand-off of an account right after its final claim's checks are read and
+/// before they're written, or right after the message claim and before the final claim, so a test
+/// can change the world exactly there. Never set outside tests.
+#[doc(hidden)]
+pub mod hook {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use once_cell::sync::Lazy;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    pub struct Pause {
+        arrived: Semaphore,
+        go: Semaphore,
+    }
+
+    static PAUSES: Lazy<Mutex<HashMap<Uuid, Arc<Pause>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    impl Pause {
+        /// Hold this account's next hand-offs before their final claim until [`Pause::release`].
+        pub fn hold(account_id: Uuid) -> Arc<Pause> {
+            let p = Arc::new(Pause { arrived: Semaphore::new(0), go: Semaphore::new(0) });
+            PAUSES.lock().unwrap_or_else(|e| e.into_inner()).insert(account_id, p.clone());
+            p
         }
-        Sent::Gone(class) => {
-            sqlx::query("UPDATE push_deliveries SET status = 'gone', error = $2, payload = NULL WHERE id = $1 AND status = 'sending'").bind(delivery_id).bind(&class).execute(&state.db).await?;
-            // Only the device we sent to: if it re-registered with new keys meanwhile, it stays.
-            sqlx::query("DELETE FROM push_devices WHERE id = $1 AND address = $2").bind(device_id).bind(address).execute(&state.db).await?;
-            Ok(Some(class))
-        }
-        Sent::Retry(class, after) => {
-            let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM push_deliveries WHERE id = $1").bind(delivery_id).fetch_one(&state.db).await?;
-            match RETRY_WAITS.get((attempts - 1).max(0) as usize) {
-                Some(wait) => {
-                    let wait = (*wait).max(after.map_or(0, |d| d.as_secs() as i64)).min(3600);
-                    let at: DateTime<Utc> = Utc::now() + chrono::Duration::seconds(wait);
-                    let mut tx = state.db.begin().await?;
-                    let n = sqlx::query("UPDATE push_deliveries SET status = 'retry', error = $2, next_attempt_at = $3, payload = $4 WHERE id = $1 AND status = 'sending'")
-                        .bind(delivery_id)
-                        .bind(&class)
-                        .bind(at)
-                        .bind(payload)
-                        .execute(&mut *tx)
-                        .await?
-                        .rows_affected();
-                    if n > 0 {
-                        crate::jobs::enqueue_background(&mut *tx, "push_retry", json!({"delivery_id": delivery_id}), Some(at)).await?;
-                    }
-                    tx.commit().await?;
-                    Ok(Some(class))
-                }
-                None => fail_device(state, delivery_id, device_id, &class).await,
+        pub async fn arrived(&self) {
+            if let Ok(permit) = self.arrived.acquire().await {
+                permit.forget();
             }
         }
-        Sent::Failed(class) => fail_device(state, delivery_id, device_id, &class).await,
-        Sent::Credentials(class) => {
-            sqlx::query("UPDATE push_deliveries SET status = 'failed', error = $2, payload = NULL WHERE id = $1 AND status = 'sending'").bind(delivery_id).bind(&class).execute(&state.db).await?;
-            let col = match kind {
-                "ios" => Some("apns_error"),
-                "android" => Some("fcm_error"),
-                _ => None,
-            };
-            if let Some(col) = col {
-                sqlx::query(&format!("UPDATE push_settings SET {col} = $2 WHERE account_id = $1")).bind(row.account_id).bind(&class).execute(&state.db).await?;
+        pub fn release(&self, account_id: Uuid) {
+            PAUSES.lock().unwrap_or_else(|e| e.into_inner()).remove(&account_id);
+            self.go.add_permits(1000);
+        }
+    }
+
+    pub(super) async fn wait(account_id: Uuid) {
+        let p = PAUSES.lock().unwrap_or_else(|e| e.into_inner()).get(&account_id).cloned();
+        if let Some(p) = p {
+            p.arrived.add_permits(1);
+            if let Ok(permit) = p.go.acquire().await {
+                permit.forget();
             }
-            Ok(Some(class))
         }
     }
 }
 
-async fn fail_device(state: &AppState, delivery_id: Uuid, device_id: Uuid, class: &str) -> AppResult<Option<String>> {
-    sqlx::query("UPDATE push_deliveries SET status = 'failed', error = $2, payload = NULL WHERE id = $1 AND status = 'sending'").bind(delivery_id).bind(class).execute(&state.db).await?;
-    sqlx::query(
-        "UPDATE push_devices SET failures = failures + 1, last_error = $2,
-                status = CASE WHEN failures + 1 >= $3 THEN 'disabled' ELSE status END,
-                disabled_at = CASE WHEN failures + 1 >= $3 THEN now() ELSE disabled_at END
-         WHERE id = $1",
-    )
-    .bind(device_id)
-    .bind(class)
-    .bind(MAX_FAILURES)
-    .execute(&state.db)
-    .await?;
-    Ok(Some(class.to_string()))
+/// One delivery claimed for its hand-off.
+struct Claimed {
+    id: Uuid,
+    kind: String,
+    payload: Value,
+    attempts: i32,
+    device_id: Uuid,
+    version: i64,
+    address: String,
+    p256dh: Option<String>,
+    auth: Option<String>,
+    last_seen_at: DateTime<Utc>,
 }
 
-/// Settle the message from its deliveries. The first device that accepted it marks it sent, and
-/// that one write charges it and records "Received Push". With retries still waiting it counts as
-/// sent (its campaign goes on); when nothing went out and nothing waits, it failed.
-async fn finish(state: &AppState, account_id: Uuid, message_id: Uuid, is_test: bool, error: Option<&str>) -> AppResult<Outcome> {
-    let (sent, waiting): (i64, i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE status = 'sent'), count(*) FILTER (WHERE status IN ('retry', 'sending')) FROM push_deliveries WHERE message_id = $1")
-        .bind(message_id)
-        .fetch_one(&state.db)
-        .await?;
-    if sent > 0 {
-        let first: Option<(Uuid, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
-            "UPDATE messages SET status = CASE WHEN status = 'delivered' THEN status ELSE 'sent' END, sent_at = now(), error = NULL
-             WHERE id = $1 AND sent_at IS NULL AND status IN ('sending', 'sent', 'delivered') RETURNING profile_id, campaign_id, flow_id, subject",
-        )
-        .bind(message_id)
-        .fetch_optional(&state.db)
-        .await?;
-        if let Some((profile_id, campaign_id, flow_id, subject)) = first {
-            let cost = crate::billing::charge_message(state, account_id, "push", 1, false, false).await?;
-            if cost > 0 {
-                sqlx::query("UPDATE messages SET cost_micros = $2 WHERE id = $1").bind(message_id).bind(cost).execute(&state.db).await?;
+/// The final claim and the hand-off for a message's due deliveries, then the results.
+pub async fn hand_off(state: &AppState, message_id: Uuid, attempt: Attempt) -> AppResult<Outcome> {
+    let meta: Option<(Uuid, bool)> = sqlx::query_as("SELECT account_id, is_test FROM messages WHERE id = $1").bind(message_id).fetch_optional(&state.db).await?;
+    let Some((account_id, is_test)) = meta else { return Ok(Outcome::Skipped("message deleted")) };
+    hook::wait(account_id).await;
+    let Some(row) = settings::load(&state.db, account_id).await? else { return Ok(Outcome::Skipped("push isn't set up")) };
+    let claimed = match final_claim(state, message_id, attempt).await? {
+        Ok(c) => c,
+        Err(outcome) => return Ok(outcome),
+    };
+    // The provider calls, at most a person's ten devices at once, each through the limiter.
+    let row_ref = &row;
+    let calls = claimed.iter().map(|c| async move {
+        let row = row_ref;
+        let _slot = super::limit::slot(account_id).await;
+        let mut body = c.payload.clone();
+        let opts = body.as_object_mut().and_then(|o| o.remove("_opts")).unwrap_or(Value::Null);
+        let ttl = opts["ttl"].as_i64().unwrap_or(86_400);
+        let topic = opts["topic"].as_str();
+        let sent = match c.kind.as_str() {
+            "web" => {
+                let bytes = serde_json::to_vec(&body).unwrap_or_default();
+                let target = providers::WebTarget { endpoint: &c.address, p256dh: c.p256dh.as_deref().unwrap_or(""), auth: c.auth.as_deref().unwrap_or("") };
+                providers::send_web(state, row, &target, &bytes, &providers::Options { ttl, urgency: opts["urgency"].as_str().unwrap_or("normal"), topic }).await
             }
-            if !is_test {
-                record_event(
-                    &state.db,
-                    NewEvent {
-                        account_id,
-                        profile_id,
-                        metric: "Received Push",
-                        properties: json!({"subject": subject, "campaign_id": campaign_id, "flow_id": flow_id, "message_id": message_id}),
-                        value: None,
-                        occurred_at: None,
-                        unique_id: Some(message_id.to_string()),
-                        message_id: Some(message_id),
-                    },
-                )
-                .await?;
+            "ios" => {
+                let m = providers::ApnsMessage { device_token: &c.address, delivery_id: c.id, payload: &body, ttl, high: opts["high"].as_bool().unwrap_or(true), collapse_id: topic };
+                providers::send_apns(state, row, &m).await
+            }
+            _ => {
+                body["token"] = json!(c.address);
+                providers::send_fcm(state, row, &body).await
+            }
+        };
+        (c, sent)
+    });
+    let results = futures_util::future::join_all(calls).await;
+    apply(state, &row, message_id, is_test, &results).await
+}
+
+/// The final claim, in one transaction holding the message, the devices and their owners.
+async fn final_claim(state: &AppState, message_id: Uuid, attempt: Attempt) -> AppResult<Result<Vec<Claimed>, Outcome>> {
+    let mut tx = state.db.begin().await?;
+    type M = (Uuid, Uuid, Option<Uuid>, Option<Uuid>, bool, String);
+    let m: Option<M> = sqlx::query_as("SELECT account_id, profile_id, campaign_id, flow_id, is_test, status FROM messages WHERE id = $1 FOR UPDATE").bind(message_id).fetch_optional(&mut *tx).await?;
+    let Some((account_id, profile_id, campaign_id, flow_id, is_test, status)) = m else { return Ok(Err(Outcome::Skipped("message deleted"))) };
+    let open = match attempt {
+        Attempt::First => status == "sending",
+        Attempt::Later => matches!(status.as_str(), "sending" | "retrying" | "sent" | "delivered" | "unconfirmed"),
+    };
+    if !open {
+        tx.commit().await?;
+        return Ok(Err(Outcome::Skipped("no longer queued")));
+    }
+    // Lock the devices and their owners: a re-registration or an opt-out either commits first
+    // (and is seen below) or waits for this claim.
+    sqlx::query("SELECT 1 FROM push_devices WHERE id IN (SELECT device_id FROM push_deliveries WHERE message_id = $1) FOR SHARE").bind(message_id).execute(&mut *tx).await?;
+    sqlx::query("SELECT 1 FROM profiles WHERE id = $2 OR id IN (SELECT d.profile_id FROM push_devices d JOIN push_deliveries pd ON pd.device_id = d.id WHERE pd.message_id = $1) FOR SHARE")
+        .bind(message_id)
+        .bind(profile_id)
+        .execute(&mut *tx)
+        .await?;
+    let stop = if is_test { None } else { message_stop(&mut tx, state, account_id, profile_id, message_id, campaign_id, flow_id, attempt).await? };
+    let due = "(pd.status = 'queued' OR (pd.status = 'retry' AND pd.next_attempt_at <= now() + interval '5 seconds'))";
+    if let Some(why) = stop {
+        sqlx::query(&format!("UPDATE push_deliveries pd SET status = 'skipped', error = $2, next_attempt_at = NULL WHERE pd.message_id = $1 AND {due}"))
+            .bind(message_id)
+            .bind(why)
+            .execute(&mut *tx)
+            .await?;
+        let out = settle(&mut tx, state, account_id, message_id, is_test).await?;
+        tx.commit().await?;
+        return Ok(Err(out));
+    }
+    type C = (Uuid, String, Value, i32, Uuid, i64, String, Option<String>, Option<String>, DateTime<Utc>);
+    let rows: Vec<C> = sqlx::query_as(&format!(
+        "UPDATE push_deliveries pd SET status = 'sending', attempts = pd.attempts + 1, claimed_at = now(), next_attempt_at = NULL
+         FROM push_devices d, push_settings ps
+         WHERE pd.message_id = $1 AND {due}
+           AND d.id = pd.device_id AND ps.account_id = d.account_id AND d.version = pd.device_version
+           AND d.profile_id IS NOT DISTINCT FROM pd.owner_profile_id AND d.test_user_id IS NOT DISTINCT FROM pd.owner_test_user_id
+           AND {DEVICE_SENDABLE_SQL}
+           AND (d.profile_id IS NULL OR NOT EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = d.profile_id))
+         RETURNING pd.id, pd.kind, pd.payload, pd.attempts, d.id, d.version, d.address, d.p256dh, d.auth_secret, d.last_seen_at"
+    ))
+    .bind(message_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Whatever was due and didn't pass: its device changed hands or registration, lost permission,
+    // was turned off, its platform was disabled, or its owner opted out.
+    sqlx::query(&format!(
+        "UPDATE push_deliveries pd SET status = 'skipped', error = 'the device changed, or push is off for it', next_attempt_at = NULL WHERE pd.message_id = $1 AND {due}"
+    ))
+    .bind(message_id)
+    .execute(&mut *tx)
+    .await?;
+    if rows.is_empty() {
+        let out = settle(&mut tx, state, account_id, message_id, is_test).await?;
+        tx.commit().await?;
+        return Ok(Err(out));
+    }
+    tx.commit().await?;
+    Ok(Ok(rows
+        .into_iter()
+        .map(|(id, kind, payload, attempts, device_id, version, address, p256dh, auth, last_seen_at)| Claimed { id, kind, payload, attempts, device_id, version, address, p256dh, auth, last_seen_at })
+        .collect()))
+}
+
+/// The message-level rules, read inside the final claim: the campaign or flow still live, quiet
+/// hours, and smart sending (not counting this message). None: it may go.
+#[allow(clippy::too_many_arguments)]
+async fn message_stop(
+    tx: &mut PgConnection,
+    state: &AppState,
+    account_id: Uuid,
+    profile_id: Uuid,
+    message_id: Uuid,
+    campaign_id: Option<Uuid>,
+    flow_id: Option<Uuid>,
+    attempt: Attempt,
+) -> AppResult<Option<&'static str>> {
+    let mut smart_hours: Option<i64> = None;
+    if let Some(cid) = campaign_id {
+        let c: Option<(String, Option<Value>)> = sqlx::query_as("SELECT status, send_options FROM campaigns WHERE id = $1").bind(cid).fetch_optional(&mut *tx).await?;
+        let Some((status, options)) = c else { return Ok(Some("campaign cancelled")) };
+        let live = match attempt {
+            Attempt::First => status == "sending",
+            Attempt::Later => matches!(status.as_str(), "sending" | "testing" | "sent"),
+        };
+        if !live {
+            return Ok(Some(if status == "cancelled" { "campaign cancelled" } else { "campaign stopped" }));
+        }
+        smart_hours = crate::features::sendtime::options::of(options.as_ref()).and_then(|o| o.smart_hours());
+    }
+    if let Some(fid) = flow_id {
+        let f: Option<(String, Option<i64>)> = sqlx::query_as("SELECT status, (definition->'settings'->>'smart_sending_hours')::bigint FROM flows WHERE id = $1").bind(fid).fetch_optional(&mut *tx).await?;
+        let Some((status, hours)) = f else { return Ok(Some("flow deleted")) };
+        if status != "live" {
+            return Ok(Some("flow turned off"));
+        }
+        smart_hours = hours.filter(|h| *h > 0);
+    }
+    let (tz, props): (String, Value) = sqlx::query_as("SELECT a.timezone, p.properties FROM accounts a JOIN profiles p ON p.id = $2 WHERE a.id = $1")
+        .bind(account_id)
+        .bind(profile_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let account_tz = tz.parse().unwrap_or(chrono_tz::America::Los_Angeles);
+    let ((start, end), _) = crate::features::sendtime::settings::sms_settings(&state.db, account_id).await?;
+    let zones = crate::features::sendtime::settings::sms_zones(&props, None, account_tz);
+    if crate::features::sendtime::settings::decide(&zones, Utc::now(), start, end, false).wait.is_some() {
+        return Ok(Some("quiet hours"));
+    }
+    if let Some(h) = smart_hours {
+        let recent: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE profile_id = $1 AND channel = 'push' AND id <> $2 AND status IN ('sent', 'delivered') AND NOT is_test
+                            AND NOT transactional AND sent_at > now() - make_interval(hours => $3))",
+        )
+        .bind(profile_id)
+        .bind(message_id)
+        .bind(h as i32)
+        .fetch_one(&mut *tx)
+        .await?;
+        if recent {
+            return Ok(Some("smart sending"));
+        }
+    }
+    Ok(None)
+}
+
+/// Apply provider results in one transaction, each only to the registration version sent to.
+async fn apply(state: &AppState, row: &Row, message_id: Uuid, is_test: bool, results: &[(&Claimed, Sent)]) -> AppResult<Outcome> {
+    let mut ok: (Vec<Uuid>, Vec<Option<String>>, Vec<Uuid>, Vec<i64>) = Default::default();
+    let mut gone: (Vec<Uuid>, Vec<String>, Vec<Uuid>, Vec<i64>, Vec<Option<DateTime<Utc>>>) = Default::default();
+    let mut retry: (Vec<Uuid>, Vec<String>, Vec<DateTime<Utc>>) = Default::default();
+    // (delivery, error, final status, device to count a failure against)
+    let mut done: Vec<(Uuid, String, &'static str, Option<(Uuid, i64)>)> = Vec::new();
+    let mut account_errors: Vec<(&str, String)> = Vec::new();
+    let mut verified_ios = false;
+    let mut ok_android = false;
+    for (c, sent) in results {
+        match sent {
+            Sent::Ok(pid) => {
+                ok.0.push(c.id);
+                ok.1.push(pid.clone());
+                ok.2.push(c.device_id);
+                ok.3.push(c.version);
+                verified_ios |= c.kind == "ios";
+                ok_android |= c.kind == "android";
+            }
+            Sent::Gone(class, ts) => {
+                // Apple: a token that stopped being valid before the device last registered stays.
+                let since = ts.and_then(DateTime::from_timestamp_millis).filter(|t| *t <= c.last_seen_at);
+                if since.is_some() {
+                    done.push((c.id, class.clone(), "failed", None));
+                } else {
+                    gone.0.push(c.id);
+                    gone.1.push(class.clone());
+                    gone.2.push(c.device_id);
+                    gone.3.push(c.version);
+                    gone.4.push(ts.and_then(DateTime::from_timestamp_millis));
+                }
+            }
+            Sent::Retry(class, after) => match RETRY_WAITS.get((c.attempts - 1).max(0) as usize) {
+                Some(wait) => {
+                    let wait = (*wait).max(after.map_or(0, |d| d.as_secs() as i64)).min(3600);
+                    retry.0.push(c.id);
+                    retry.1.push(class.clone());
+                    retry.2.push(Utc::now() + chrono::Duration::seconds(wait));
+                }
+                // The service stayed busy: given up, but not the device's fault.
+                None => done.push((c.id, class.clone(), "failed", None)),
+            },
+            Sent::Unknown(class) => done.push((c.id, format!("{class}; not sent again in case it arrived"), "unconfirmed", None)),
+            Sent::Failed(class) => done.push((c.id, class.clone(), "failed", Some((c.device_id, c.version)))),
+            Sent::Rejected(class) => done.push((c.id, class.clone(), "failed", None)),
+            Sent::Account(class) => {
+                done.push((c.id, class.clone(), "failed", None));
+                account_errors.push((c.kind.as_str(), class.clone()));
             }
         }
+    }
+    let mut tx = state.db.begin().await?;
+    if !ok.0.is_empty() {
+        sqlx::query(
+            "UPDATE push_deliveries pd SET status = 'sent', sent_at = COALESCE(pd.sent_at, now()), provider_id = x.pid, error = NULL
+             FROM unnest($1::uuid[], $2::text[]) AS x(id, pid) WHERE pd.id = x.id AND pd.status = 'sending'",
+        )
+        .bind(&ok.0)
+        .bind(&ok.1)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE push_devices d SET last_sent_at = now(), failures = 0, last_error = NULL
+             FROM unnest($1::uuid[], $2::bigint[]) AS x(id, v) WHERE d.id = x.id AND d.version = x.v",
+        )
+        .bind(&ok.2)
+        .bind(&ok.3)
+        .execute(&mut *tx)
+        .await?;
+        // A platform that accepted is set up right (for APNs: this environment is proven).
+        sqlx::query(
+            "UPDATE push_settings SET apns_verified_at = CASE WHEN $2 THEN COALESCE(apns_verified_at, now()) ELSE apns_verified_at END,
+                    apns_error = CASE WHEN $2 THEN NULL ELSE apns_error END, fcm_error = CASE WHEN $3 THEN NULL ELSE fcm_error END
+             WHERE account_id = $1 AND credentials_version = $4",
+        )
+        .bind(row.account_id)
+        .bind(verified_ios)
+        .bind(ok_android)
+        .bind(row.credentials_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !gone.0.is_empty() {
+        sqlx::query("UPDATE push_deliveries pd SET status = 'gone', error = x.err FROM unnest($1::uuid[], $2::text[]) AS x(id, err) WHERE pd.id = x.id AND pd.status = 'sending'")
+            .bind(&gone.0)
+            .bind(&gone.1)
+            .execute(&mut *tx)
+            .await?;
+        // Only the registration sent to, and (Apple) only if it wasn't renewed after it lapsed.
+        sqlx::query(
+            "DELETE FROM push_devices d USING unnest($1::uuid[], $2::bigint[], $3::timestamptz[]) AS x(id, v, lapsed)
+             WHERE d.id = x.id AND d.version = x.v AND (x.lapsed IS NULL OR d.last_seen_at <= x.lapsed)",
+        )
+        .bind(&gone.2)
+        .bind(&gone.3)
+        .bind(&gone.4)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !retry.0.is_empty() {
+        sqlx::query(
+            "UPDATE push_deliveries pd SET status = 'retry', error = x.err, next_attempt_at = x.at
+             FROM unnest($1::uuid[], $2::text[], $3::timestamptz[]) AS x(id, err, at) WHERE pd.id = x.id AND pd.status = 'sending'",
+        )
+        .bind(&retry.0)
+        .bind(&retry.1)
+        .bind(&retry.2)
+        .execute(&mut *tx)
+        .await?;
+        let first = retry.2.iter().min().copied();
+        crate::jobs::enqueue_background(&mut *tx, "push_retry", json!({"message_id": message_id, "account_id": row.account_id}), first).await?;
+    }
+    if !done.is_empty() {
+        let ids: Vec<Uuid> = done.iter().map(|d| d.0).collect();
+        let errs: Vec<String> = done.iter().map(|d| d.1.clone()).collect();
+        let sts: Vec<String> = done.iter().map(|d| d.2.to_string()).collect();
+        sqlx::query(
+            "UPDATE push_deliveries pd SET status = x.st, error = x.err FROM unnest($1::uuid[], $2::text[], $3::text[]) AS x(id, err, st) WHERE pd.id = x.id AND pd.status = 'sending'",
+        )
+        .bind(&ids)
+        .bind(&errs)
+        .bind(&sts)
+        .execute(&mut *tx)
+        .await?;
+        let failing: Vec<(Uuid, i64, String)> = done.iter().filter_map(|d| d.3.map(|(id, v)| (id, v, d.1.clone()))).collect();
+        if !failing.is_empty() {
+            sqlx::query(
+                "UPDATE push_devices d SET failures = d.failures + 1, last_error = x.err,
+                        status = CASE WHEN d.failures + 1 >= $4 THEN 'disabled' ELSE d.status END,
+                        disabled_at = CASE WHEN d.failures + 1 >= $4 THEN now() ELSE d.disabled_at END
+                 FROM unnest($1::uuid[], $2::bigint[], $3::text[]) AS x(id, v, err) WHERE d.id = x.id AND d.version = x.v",
+            )
+            .bind(failing.iter().map(|f| f.0).collect::<Vec<_>>())
+            .bind(failing.iter().map(|f| f.1).collect::<Vec<_>>())
+            .bind(failing.iter().map(|f| f.2.clone()).collect::<Vec<_>>())
+            .bind(MAX_FAILURES)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    for (kind, class) in &account_errors {
+        let col = match *kind {
+            "ios" => "apns_error",
+            "android" => "fcm_error",
+            _ => continue,
+        };
+        sqlx::query(&format!("UPDATE push_settings SET {col} = $2 WHERE account_id = $1 AND credentials_version = $3"))
+            .bind(row.account_id)
+            .bind(class)
+            .bind(row.credentials_version)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let out = settle(&mut tx, state, row.account_id, message_id, is_test).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Reasons a whole message can be skipped for, as fixed words.
+const SKIP_REASONS: &[&str] = &[
+    "quiet hours", "smart sending", "campaign cancelled", "campaign stopped", "flow turned off", "flow deleted", "push turned off", "the device changed, or push is off for it",
+];
+
+/// Settle a message from its deliveries, inside the caller's transaction. Accepted by a device:
+/// sent (or delivered), charged once. Still waiting on a retry: retrying (not sent). Sent with no
+/// answer: unconfirmed. All skipped: skipped. Otherwise failed.
+async fn settle(tx: &mut PgConnection, state: &AppState, account_id: Uuid, message_id: Uuid, is_test: bool) -> AppResult<Outcome> {
+    let (accepted, waiting, unconfirmed, skipped, total, err): (i64, i64, i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status = 'sent'), count(*) FILTER (WHERE status IN ('queued', 'sending', 'retry')), count(*) FILTER (WHERE status = 'unconfirmed'),
+                count(*) FILTER (WHERE status = 'skipped'), count(*),
+                (array_agg(error ORDER BY created_at) FILTER (WHERE status NOT IN ('sent', 'queued', 'sending')))[1]
+         FROM push_deliveries WHERE message_id = $1",
+    )
+    .bind(message_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if accepted > 0 {
+        accept_in(tx, state, message_id).await?;
         return Ok(Outcome::Sent(message_id));
     }
     if waiting > 0 {
-        sqlx::query("UPDATE messages SET status = 'sent', error = 'waiting to retry' WHERE id = $1 AND status = 'sending'").bind(message_id).execute(&state.db).await?;
+        sqlx::query("UPDATE messages SET status = 'retrying', error = 'waiting to retry' WHERE id = $1 AND status IN ('sending', 'retrying')").bind(message_id).execute(&mut *tx).await?;
         return Ok(Outcome::Sent(message_id));
     }
-    let why = error.unwrap_or("not delivered to any device").to_string();
-    let failed: Option<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1 AND sent_at IS NULL AND status IN ('sending', 'sent') RETURNING id")
+    if unconfirmed > 0 {
+        sqlx::query("UPDATE messages SET status = 'unconfirmed', error = 'the push service never answered; not sent again' WHERE id = $1 AND status IN ('sending', 'retrying')")
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        return Ok(Outcome::Sent(message_id));
+    }
+    if total > 0 && skipped == total {
+        let why = SKIP_REASONS.iter().copied().find(|r| err.as_deref() == Some(*r)).unwrap_or("not sent");
+        mark_skipped(tx, state, account_id, message_id, why, is_test).await?;
+        return Ok(Outcome::Skipped(why));
+    }
+    let why = err.unwrap_or_else(|| "not delivered to any device".into());
+    let failed: Option<Uuid> = sqlx::query_scalar("UPDATE messages SET status = 'failed', error = $2 WHERE id = $1 AND sent_at IS NULL AND status IN ('sending', 'retrying') RETURNING id")
         .bind(message_id)
         .bind(&why)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await?;
     if failed.is_some() && !is_test {
-        crate::features::messages_unsent(&state.db, account_id, &[message_id]).await;
+        crate::features::messages_unsent_in(tx, &state.db, account_id, &[message_id]).await;
     }
     Ok(Outcome::Failed(why))
 }
 
-/// Background job: try a waiting delivery again (see [`RETRY_WAITS`]). Claimed with a conditional
-/// write, so a duplicate job does nothing; stops if the campaign was cancelled or the person opted out.
-pub async fn retry(state: &AppState, delivery_id: Uuid) -> anyhow::Result<()> {
-    let claimed: Option<(Uuid, Uuid, String, Value)> = sqlx::query_as(
-        "UPDATE push_deliveries pd SET status = 'sending'
-         FROM messages m
-         WHERE pd.id = $1 AND pd.status = 'retry' AND m.id = pd.message_id
-           AND (m.campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = m.campaign_id AND c.status IN ('sending', 'testing', 'sent')))
-         RETURNING pd.account_id, pd.message_id, pd.kind, pd.payload",
+/// A device accepted the message (or showed it, or was tapped): inside the caller's transaction,
+/// the first time only, mark it sent, charge it and queue the "Received Push" event; always bring
+/// its status up to date (delivered when any device reported showing it).
+pub(super) async fn accept_in(tx: &mut PgConnection, state: &AppState, message_id: Uuid) -> AppResult<()> {
+    let first: Option<(Uuid, bool)> = sqlx::query_as("UPDATE messages SET sent_at = now(), error = NULL WHERE id = $1 AND sent_at IS NULL RETURNING account_id, is_test")
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let delivered: Option<(Uuid, bool)> = sqlx::query_as(
+        "UPDATE messages m SET status = CASE WHEN EXISTS (SELECT 1 FROM push_deliveries d WHERE d.message_id = m.id AND d.delivered_at IS NOT NULL) THEN 'delivered' ELSE 'sent' END,
+                delivered_at = COALESCE(m.delivered_at, (SELECT min(d.delivered_at) FROM push_deliveries d WHERE d.message_id = m.id)), error = NULL
+         WHERE m.id = $1 AND m.status <> 'delivered' RETURNING m.account_id, m.status = 'delivered'",
     )
-    .bind(delivery_id)
-    .fetch_optional(&state.db)
+    .bind(message_id)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some((account_id, message_id, kind, payload)) = claimed else {
-        // Cancelled meanwhile (or already handled): it won't go.
-        let skipped: Option<(Uuid, Uuid)> = sqlx::query_as("UPDATE push_deliveries SET status = 'skipped', error = 'campaign stopped', payload = NULL WHERE id = $1 AND status = 'retry' RETURNING account_id, message_id")
-            .bind(delivery_id)
-            .fetch_optional(&state.db)
-            .await?;
-        if let Some((account_id, message_id)) = skipped {
-            finish(state, account_id, message_id, false, Some("campaign stopped")).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    if let Some((account_id, is_test)) = first {
+        let price = if state.cfg.hosted { crate::billing::prices(state).push } else { 0 };
+        if price > 0 {
+            crate::billing::debit_usage_tx(tx, account_id, "push", 1, price).await?;
+            sqlx::query("UPDATE messages SET cost_micros = $2 WHERE id = $1").bind(message_id).bind(price).execute(&mut *tx).await?;
         }
-        return Ok(());
-    };
-    let row = settings::load(&state.db, account_id).await?.ok_or_else(|| anyhow::anyhow!("push settings gone"))?;
-    // The options that shape the hand-off (time to live, urgency, topic) travel with the payload.
-    let opts: PushContent = serde_json::from_value(payload.get("_opts").cloned().unwrap_or(Value::Null)).unwrap_or_default();
-    let mut body = payload.clone();
-    if let Some(o) = body.as_object_mut() {
-        o.remove("_opts");
+        if !is_test {
+            crate::jobs::enqueue_background(&mut *tx, "push_event", json!({"message_id": message_id, "account_id": account_id, "metric": "Received Push"}), None).await?;
+        }
     }
-    let is_test: bool = sqlx::query_scalar("SELECT is_test FROM messages WHERE id = $1").bind(message_id).fetch_one(&state.db).await?;
-    let err = hand_off(state, &row, delivery_id, &kind, &body, &opts, true).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    finish(state, account_id, message_id, is_test, err.as_deref()).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    let _ = delivered;
     Ok(())
 }
 
-/// Scheduler: deliveries a crashed worker left `sending` are failed, never resent (at most once),
-/// and their messages settled; push messages of flows left `sending` the same way.
-pub async fn sweep(state: &AppState) -> anyhow::Result<()> {
-    let stuck: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "UPDATE push_deliveries SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate', payload = NULL
-         WHERE status = 'sending' AND claimed_at < now() - interval '10 minutes' RETURNING account_id, message_id",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    // A retry whose job was lost (its time long past) is given up the same way.
-    let lost: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "UPDATE push_deliveries SET status = 'failed', error = 'retry never ran', payload = NULL
-         WHERE status = 'retry' AND next_attempt_at < now() - interval '1 hour' RETURNING account_id, message_id",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    let stuck: Vec<(Uuid, Uuid)> = stuck.into_iter().chain(lost).collect();
-    let mut seen = std::collections::HashSet::new();
-    for (account_id, message_id) in stuck {
-        if seen.insert(message_id) {
-            let is_test: bool = sqlx::query_scalar("SELECT is_test FROM messages WHERE id = $1").bind(message_id).fetch_optional(&state.db).await?.unwrap_or(true);
-            finish(state, account_id, message_id, is_test, Some("send interrupted")).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-        }
+/// Background job: record a message's "Received Push" or "Clicked Push" event (once: keyed on the message).
+pub async fn record_message_event(state: &AppState, message_id: Uuid, metric: &str) -> anyhow::Result<()> {
+    let m: Option<(Uuid, Uuid, Option<Uuid>, Option<Uuid>, Option<String>, bool)> =
+        sqlx::query_as("SELECT account_id, profile_id, campaign_id, flow_id, subject, is_test FROM messages WHERE id = $1").bind(message_id).fetch_optional(&state.db).await?;
+    let Some((account_id, profile_id, campaign_id, flow_id, subject, is_test)) = m else { return Ok(()) };
+    if is_test {
+        return Ok(());
     }
-    // A flow's push message claimed but with no deliveries (a crash between claim and hand-off).
-    let orphans: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "UPDATE messages m SET status = 'failed', error = 'send interrupted; not retried to avoid a duplicate'
-         WHERE m.channel = 'push' AND m.status = 'sending' AND m.campaign_id IS NULL AND m.claimed_at < now() - interval '10 minutes'
-           AND NOT EXISTS (SELECT 1 FROM push_deliveries d WHERE d.message_id = m.id AND d.status IN ('sending', 'retry', 'sent'))
-         RETURNING m.account_id, m.id",
+    let (unique, props) = match metric {
+        "Clicked Push" => {
+            let url: Option<String> = sqlx::query_scalar("SELECT url FROM message_clicks WHERE message_id = $1 ORDER BY id LIMIT 1").bind(message_id).fetch_optional(&state.db).await?;
+            (format!("click:{message_id}"), json!({"campaign_id": campaign_id, "flow_id": flow_id, "message_id": message_id, "url": url}))
+        }
+        _ => (message_id.to_string(), json!({"subject": subject, "campaign_id": campaign_id, "flow_id": flow_id, "message_id": message_id})),
+    };
+    crate::audience::record_event(
+        &state.db,
+        crate::audience::NewEvent { account_id, profile_id, metric, properties: props, value: None, occurred_at: None, unique_id: Some(unique), message_id: Some(message_id) },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    Ok(())
+}
+
+/// Background job: upkeep, bounded per run.
+///
+/// - Deliveries a crashed worker left `sending` are `unconfirmed` (they may have gone): never resent.
+/// - Deliveries a crash left `queued` (never handed over) are handed off now, through the final claim.
+/// - Retries whose job was lost are given up; registration counters older than a day, devices
+///   turned off more than 30 days ago and anonymous devices unseen for 180 days are deleted.
+pub async fn cleanup(state: &AppState) -> anyhow::Result<()> {
+    let stuck: Vec<(Uuid, Uuid, bool)> = sqlx::query_as(
+        "WITH s AS (UPDATE push_deliveries SET status = 'unconfirmed', error = 'interrupted while sending; not sent again'
+                    WHERE id IN (SELECT id FROM push_deliveries WHERE status = 'sending' AND claimed_at < now() - interval '10 minutes' LIMIT 500)
+                    RETURNING message_id)
+         SELECT DISTINCT m.account_id, m.id, m.is_test FROM s JOIN messages m ON m.id = s.message_id",
     )
     .fetch_all(&state.db)
     .await?;
-    crate::features::messages_unsent_rows(&state.db, &orphans).await;
-    // Bounded upkeep: registration counters older than a day, devices never linked in 180 days.
+    let lost: Vec<(Uuid, Uuid, bool)> = sqlx::query_as(
+        "WITH s AS (UPDATE push_deliveries SET status = 'failed', error = 'retry never ran', next_attempt_at = NULL
+                    WHERE id IN (SELECT id FROM push_deliveries WHERE status = 'retry' AND next_attempt_at < now() - interval '1 hour' LIMIT 500)
+                    RETURNING message_id)
+         SELECT DISTINCT m.account_id, m.id, m.is_test FROM s JOIN messages m ON m.id = s.message_id",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (account_id, message_id, is_test) in stuck.into_iter().chain(lost) {
+        let mut tx = state.db.begin().await?;
+        settle(&mut tx, state, account_id, message_id, is_test).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+        tx.commit().await?;
+    }
+    let queued: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT message_id FROM push_deliveries WHERE status = 'queued' AND created_at < now() - interval '10 minutes' LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for message_id in queued {
+        hand_off(state, message_id, Attempt::Later).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    }
     sqlx::query("DELETE FROM push_registration_counts WHERE hour < now() - interval '1 day'").execute(&state.db).await?;
-    sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE profile_id IS NULL AND test_user_id IS NULL AND last_seen_at < now() - interval '180 days' LIMIT 1000)")
-        .execute(&state.db)
-        .await?;
+    sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE status = 'disabled' AND disabled_at < now() - interval '30 days' LIMIT 1000)").execute(&state.db).await?;
+    sqlx::query("DELETE FROM push_devices WHERE id IN (SELECT id FROM push_devices WHERE anonymous AND last_seen_at < now() - interval '180 days' LIMIT 1000)").execute(&state.db).await?;
+    Ok(())
+}
+
+/// Scheduler: queue upkeep in the background lane, unless a run is already waiting.
+pub async fn schedule_cleanup(state: &AppState) -> anyhow::Result<()> {
+    let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE kind = 'push_cleanup')").fetch_one(&state.db).await?;
+    if !waiting {
+        crate::jobs::enqueue_background(&state.db, "push_cleanup", json!({}), None).await?;
+    }
     Ok(())
 }
 
@@ -594,7 +937,7 @@ pub async fn test_to_member(state: &AppState, account: &Account, profile: &Profi
     run(state, &spec, Target::Member(user_id)).await
 }
 
-/// Send a test to one device.
+/// Send a test to one device. Its owner's push opt-out still applies.
 pub async fn test_to_device(state: &AppState, account: &Account, profile: &Profile, device_id: Uuid, content: &Value) -> AppResult<Outcome> {
     let spec = test_spec(account, profile, content, None);
     run(state, &spec, Target::Device(&device_id)).await

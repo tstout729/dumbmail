@@ -1,54 +1,70 @@
-/* DumbMail push notifications service worker. Host this file at the root of your website, at the
-   path set in DumbMail (Settings → Push), so browsers let your site show notifications. */
-var BASE = __BASE__, KEY = __KEY__;
+/* DumbMail push notifications. Either host this file on your site (the snippet registers it with
+   a scope of its own, so it controls no pages and never replaces your own service worker), or, if
+   your site already has a service worker at its root, add to it:
+     importScripts("https://dumbmail.ai/push/handler.js?k=YOUR_SITE_KEY");
+   It only handles notifications DumbMail sent, and only opens DumbMail's signed tap links. */
+(function () {
+  var BASE = __BASE__, KEY = __KEY__, LINKS = __LINKS__, VAPID = __VAPID__;
 
-function report(path, token) {
-  if (!token) return Promise.resolve();
-  return fetch(BASE + path + "?k=" + encodeURIComponent(KEY), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ t: token }),
-    credentials: "omit",
-    keepalive: true
-  }).catch(function () {});
-}
-
-self.addEventListener("install", function () { self.skipWaiting(); });
-self.addEventListener("activate", function (event) { event.waitUntil(self.clients.claim()); });
-
-self.addEventListener("push", function (event) {
-  var d = {};
-  try { d = event.data ? event.data.json() : {}; } catch (e) { d = {}; }
-  if (!d || typeof d !== "object" || (!d.t && !d.b)) return;
-  var options = { body: d.b || "", data: { u: d.u, a: d.a || [], r: d.r } };
-  if (d.i) options.icon = d.i;
-  if (d.im) options.image = d.im;
-  if (d.tag) { options.tag = d.tag; options.renotify = true; }
-  if (d.a && d.a.length) options.actions = d.a.map(function (a, i) { return { action: "a" + i, title: a.t }; });
-  event.waitUntil(Promise.all([self.registration.showNotification(d.t || "", options), report("/client/push/delivered", d.r)]));
-});
-
-self.addEventListener("notificationclick", function (event) {
-  var n = event.notification, data = n.data || {};
-  n.close();
-  var url = data.u, m = /^a(\d)$/.exec(event.action || "");
-  if (m && data.a && data.a[+m[1]]) url = data.a[+m[1]].u;
-  if (url) event.waitUntil(self.clients.openWindow(url));
-});
-
-// The browser replaced the subscription: subscribe again with the same key and tell DumbMail,
-// naming the old one so the new one stays linked to the same person.
-self.addEventListener("pushsubscriptionchange", function (event) {
-  var old = event.oldSubscription, key = old && old.options && old.options.applicationServerKey;
-  if (!key) return;
-  event.waitUntil(self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }).then(function (sub) {
-    var j = sub.toJSON();
-    var oldKeys = old.toJSON ? old.toJSON().keys || {} : {};
-    return fetch(BASE + "/client/push/subscribe?k=" + encodeURIComponent(KEY), {
+  function ours(d) {
+    return !!(d && typeof d === "object" && d.dm === 1 && typeof d.r === "string" && d.r.length < 200);
+  }
+  function signedLink(u) {
+    return typeof u === "string" && LINKS.some(function (p) { return u.indexOf(p) === 0; });
+  }
+  function b64u(buf) {
+    var bytes = new Uint8Array(buf), s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function report(token) {
+    return fetch(BASE + "/client/push/delivered?k=" + encodeURIComponent(KEY), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ subscription: j, previous: { endpoint: old.endpoint, auth: oldKeys.auth } }),
-      credentials: "omit"
-    });
-  }).catch(function () {}));
-});
+      body: JSON.stringify({ t: token }),
+      credentials: "omit",
+      keepalive: true
+    }).catch(function () {});
+  }
+
+  self.addEventListener("push", function (event) {
+    var d = null;
+    try { d = event.data ? event.data.json() : null; } catch (e) { d = null; }
+    // Not DumbMail's: leave it to the site's own handlers.
+    if (!ours(d)) return;
+    var actions = (d.a || []).filter(function (a) { return a && signedLink(a.u); }).slice(0, 2);
+    var options = { body: String(d.b || ""), data: { dm: 1, u: signedLink(d.u) ? d.u : null, a: actions } };
+    if (d.i) options.icon = String(d.i);
+    if (d.im) options.image = String(d.im);
+    if (d.tag) { options.tag = String(d.tag); options.renotify = true; }
+    if (actions.length) options.actions = actions.map(function (a, i) { return { action: "a" + i, title: String(a.t) }; });
+    // Reported only once it's actually shown.
+    event.waitUntil(self.registration.showNotification(String(d.t || ""), options).then(function () { return report(d.r); }));
+  });
+
+  self.addEventListener("notificationclick", function (event) {
+    var n = event.notification, data = n.data || {};
+    if (data.dm !== 1) return;
+    n.close();
+    var url = data.u, m = /^a(\d)$/.exec(event.action || "");
+    if (m && data.a && data.a[+m[1]]) url = data.a[+m[1]].u;
+    if (signedLink(url)) event.waitUntil(self.clients.openWindow(url));
+  });
+
+  // The browser replaced the subscription: subscribe again with the same key and tell DumbMail,
+  // naming the old one so the new one keeps the same owner.
+  self.addEventListener("pushsubscriptionchange", function (event) {
+    var old = event.oldSubscription, key = old && old.options && old.options.applicationServerKey;
+    // Only DumbMail's own subscription (the site's other subscriptions are its own business).
+    if (!key || !VAPID || b64u(key) !== VAPID) return;
+    event.waitUntil(self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }).then(function (sub) {
+      var oldKeys = old.toJSON ? old.toJSON().keys || {} : {};
+      return fetch(BASE + "/client/push/subscribe?k=" + encodeURIComponent(KEY), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ subscription: sub.toJSON(), previous: { endpoint: old.endpoint, auth: oldKeys.auth } }),
+        credentials: "omit"
+      });
+    }).catch(function () {}));
+  });
+})();

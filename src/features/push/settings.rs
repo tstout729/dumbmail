@@ -1,5 +1,5 @@
 //! An account's push setup: web push (VAPID keys, the service worker's path, the in-page prompt),
-//! APNs and FCM credentials, and the identity secret. Secrets are encrypted with `crate::crypto`
+//! APNs and FCM credentials, and the enrollment secret. Secrets are encrypted with `crate::crypto`
 //! and never returned; the API shows only whether each is set and a short hint.
 
 use serde::{Deserialize, Serialize};
@@ -18,12 +18,15 @@ pub struct Row {
     pub vapid_public_key: Option<String>,
     pub vapid_private_enc: Option<String>,
     pub sw_path: String,
+    pub sw_scope: String,
     pub prompt: Value,
     pub apns_key_id: Option<String>,
     pub apns_team_id: Option<String>,
     pub apns_bundle_id: Option<String>,
     pub apns_key_enc: Option<String>,
     pub apns_production: bool,
+    pub apns_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub credentials_version: i64,
     pub fcm_project_id: Option<String>,
     pub fcm_client_email: Option<String>,
     pub fcm_credentials_enc: Option<String>,
@@ -139,6 +142,23 @@ fn check_prompt(p: &Prompt) -> AppResult<()> {
     Ok(())
 }
 
+/// The scope the worker is registered with: a path of its own (it controls no pages), under the
+/// worker's folder, so it never replaces a site's own worker.
+fn check_sw_scope(path: &str, scope: &str) -> AppResult<()> {
+    let ok = scope.starts_with('/')
+        && scope.ends_with('/')
+        && !scope.starts_with("//")
+        && scope.len() <= 200
+        && !scope.contains("..")
+        && scope.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c));
+    let folder = &path[..path.rfind('/').map_or(1, |i| i + 1)];
+    if ok && scope.starts_with(folder) {
+        Ok(())
+    } else {
+        Err(AppError::bad(format!("the worker's scope must be a folder path under {folder}, like /dumbmail-push/")))
+    }
+}
+
 fn check_sw_path(p: &str) -> AppResult<()> {
     let ok = p.starts_with('/')
         && !p.starts_with("//")
@@ -183,6 +203,8 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Resul
 pub struct SettingsBody {
     pub web_enabled: Option<bool>,
     pub sw_path: Option<String>,
+    /// Use "/" only when DumbMail's handler is imported into the site's own root worker (see docs).
+    pub sw_scope: Option<String>,
     pub prompt: Option<Prompt>,
     #[serde(default, deserialize_with = "present")]
     pub apns: Option<Option<ApnsBody>>,
@@ -285,12 +307,18 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
     let mut changed = Vec::new();
     let current = ensure(state, account_id).await?;
     let mut tx = state.db.begin().await?;
-    if b.web_enabled.is_some() || b.sw_path.is_some() || b.prompt.is_some() {
-        sqlx::query("UPDATE push_settings SET web_enabled = COALESCE($2, web_enabled), sw_path = COALESCE($3, sw_path), prompt = COALESCE($4, prompt), updated_at = now() WHERE account_id = $1")
+    if b.sw_path.is_some() || b.sw_scope.is_some() {
+        let path = b.sw_path.clone().unwrap_or_else(|| current.sw_path.clone());
+        let scope = b.sw_scope.clone().unwrap_or_else(|| current.sw_scope.clone());
+        check_sw_scope(&path, &scope)?;
+    }
+    if b.web_enabled.is_some() || b.sw_path.is_some() || b.sw_scope.is_some() || b.prompt.is_some() {
+        sqlx::query("UPDATE push_settings SET web_enabled = COALESCE($2, web_enabled), sw_path = COALESCE($3, sw_path), prompt = COALESCE($4, prompt), sw_scope = COALESCE($5, sw_scope), updated_at = now() WHERE account_id = $1")
             .bind(account_id)
             .bind(b.web_enabled)
             .bind(&b.sw_path)
             .bind(b.prompt.as_ref().map(serde_json::to_value).transpose()?)
+            .bind(&b.sw_scope)
             .execute(&mut *tx)
             .await?;
         changed.push("web");
@@ -298,7 +326,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
     match b.apns {
         None => {}
         Some(None) => {
-            sqlx::query("UPDATE push_settings SET apns_key_id = NULL, apns_team_id = NULL, apns_bundle_id = NULL, apns_key_enc = NULL, apns_error = NULL, updated_at = now() WHERE account_id = $1")
+            sqlx::query("UPDATE push_settings SET apns_key_id = NULL, apns_team_id = NULL, apns_bundle_id = NULL, apns_key_enc = NULL, apns_error = NULL, apns_verified_at = NULL, credentials_version = credentials_version + 1, updated_at = now() WHERE account_id = $1")
                 .bind(account_id)
                 .execute(&mut *tx)
                 .await?;
@@ -311,7 +339,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
             }
             let enc = a.key_p8.as_deref().map(|k| crate::crypto::encrypt(&state.cfg.secret_key, k.trim())).transpose().map_err(AppError::Internal)?;
             sqlx::query(
-                "UPDATE push_settings SET apns_key_id = $2, apns_team_id = $3, apns_bundle_id = $4, apns_production = $5, apns_key_enc = COALESCE($6, apns_key_enc), apns_error = NULL, updated_at = now()
+                "UPDATE push_settings SET apns_key_id = $2, apns_team_id = $3, apns_bundle_id = $4, apns_production = $5, apns_key_enc = COALESCE($6, apns_key_enc), apns_error = NULL, apns_verified_at = NULL, credentials_version = credentials_version + 1, updated_at = now()
                  WHERE account_id = $1",
             )
             .bind(account_id)
@@ -328,7 +356,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
     match b.fcm {
         None => {}
         Some(None) => {
-            sqlx::query("UPDATE push_settings SET fcm_project_id = NULL, fcm_client_email = NULL, fcm_credentials_enc = NULL, fcm_error = NULL, updated_at = now() WHERE account_id = $1")
+            sqlx::query("UPDATE push_settings SET fcm_project_id = NULL, fcm_client_email = NULL, fcm_credentials_enc = NULL, fcm_error = NULL, credentials_version = credentials_version + 1, updated_at = now() WHERE account_id = $1")
                 .bind(account_id)
                 .execute(&mut *tx)
                 .await?;
@@ -337,7 +365,7 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
         Some(Some(f)) => {
             let sa = parse_service_account(&f.service_account_json)?;
             let enc = crate::crypto::encrypt(&state.cfg.secret_key, &serde_json::to_string(&sa)?).map_err(AppError::Internal)?;
-            sqlx::query("UPDATE push_settings SET fcm_project_id = $2, fcm_client_email = $3, fcm_credentials_enc = $4, fcm_error = NULL, updated_at = now() WHERE account_id = $1")
+            sqlx::query("UPDATE push_settings SET fcm_project_id = $2, fcm_client_email = $3, fcm_credentials_enc = $4, fcm_error = NULL, credentials_version = credentials_version + 1, updated_at = now() WHERE account_id = $1")
                 .bind(account_id)
                 .bind(&sa.project_id)
                 .bind(&sa.client_email)
@@ -348,10 +376,14 @@ pub async fn update(state: &AppState, account_id: Uuid, b: SettingsBody) -> AppR
         }
     }
     tx.commit().await?;
+    // New credentials: new connections and tokens (Apple binds a connection to one team's key).
+    if changed.iter().any(|c| c.starts_with("apns") || c.starts_with("fcm")) {
+        super::providers::forget_account(account_id).await;
+    }
     Ok(changed)
 }
 
-/// A new identity secret, returned once (only its hint is kept in view). Signs `user_hash`es.
+/// A new enrollment secret, returned once (only its hint is kept in view). Signs enrollment grants.
 pub async fn rotate_identity_secret(state: &AppState, account_id: Uuid) -> AppResult<String> {
     ensure(state, account_id).await?;
     let mut raw = [0u8; 32];
@@ -379,13 +411,14 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
     let base = state.cfg.public_url();
     let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE kind = 'web' AND profile_id IS NOT NULL), count(*) FILTER (WHERE kind = 'ios' AND profile_id IS NOT NULL),
-                count(*) FILTER (WHERE kind = 'android' AND profile_id IS NOT NULL), count(*) FILTER (WHERE profile_id IS NULL AND test_user_id IS NULL),
-                count(DISTINCT profile_id) FILTER (WHERE profile_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM push_opt_outs o WHERE o.profile_id = push_devices.profile_id))
+                count(*) FILTER (WHERE kind = 'android' AND profile_id IS NOT NULL), count(*) FILTER (WHERE anonymous),
+                count(*) FILTER (WHERE profile_id IS NOT NULL AND permission = 'denied')
          FROM push_devices WHERE account_id = $1 AND status = 'active'",
     )
     .bind(account_id)
     .fetch_one(&state.db)
     .await?;
+    let reachable = super::send::reachable_count(&state.db, account_id).await?;
     let opted_out: i64 = sqlx::query_scalar("SELECT count(*) FROM push_opt_outs WHERE account_id = $1").bind(account_id).fetch_one(&state.db).await?;
     Ok(json!({
         "web": {
@@ -393,6 +426,8 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             "ready": row.web_ready(),
             "vapid_public_key": row.vapid_public_key,
             "sw_path": row.sw_path,
+            "sw_scope": row.sw_scope,
+            "handler_url": format!("{base}/push/handler.js?k={key}"),
             "prompt": row.prompt(),
             "service_worker_url": format!("{base}/push/sw.js?k={key}"),
         },
@@ -402,6 +437,7 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
             "team_id": row.apns_team_id,
             "bundle_id": row.apns_bundle_id,
             "production": row.apns_production,
+            "verified": row.apns_verified_at.is_some(),
             "error": row.apns_error,
         },
         "fcm": {
@@ -413,8 +449,8 @@ pub async fn settings_json(state: &AppState, account_id: Uuid) -> AppResult<Valu
         "identity": {"configured": row.identity_secret_enc.is_some(), "hint": row.identity_secret_hint},
         "public_key": key,
         "register_url": format!("{base}/client/push/devices?k={key}"),
-        "devices": {"web": counts.0, "ios": counts.1, "android": counts.2, "not_linked": counts.3},
-        "reachable_people": counts.4,
+        "devices": {"web": counts.0, "ios": counts.1, "android": counts.2, "anonymous": counts.3, "permission_denied": counts.4},
+        "reachable_people": reachable,
         "opted_out": opted_out,
     }))
 }

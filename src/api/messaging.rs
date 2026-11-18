@@ -437,6 +437,9 @@ async fn delete_campaign_h(State(state): State<AppState>, ctx: Ctx, Path(id): Pa
 pub struct EstimateBody {
     pub channel: String,
     pub audience: Value,
+    /// Push: count only devices on these platforms (a campaign's targets).
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
 }
 
 async fn estimate_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson<EstimateBody>) -> AppResult<Json<Value>> {
@@ -445,7 +448,8 @@ async fn estimate_h(State(state): State<AppState>, ctx: Ctx, ApiJson(b): ApiJson
     if a.include.is_empty() {
         return Ok(Json(json!({"count": 0})));
     }
-    Ok(Json(json!({"count": campaigns::estimate(&state.db, ctx.account_id, &b.channel, &a).await?})))
+    let platforms = b.platforms.filter(|p| b.channel == "push" && !p.is_empty() && p.iter().all(|k| crate::features::push::content::PLATFORMS.contains(&k.as_str())));
+    Ok(Json(json!({"count": campaigns::estimate_targeted(&state.db, ctx.account_id, &b.channel, &a, platforms).await?})))
 }
 
 #[derive(Deserialize)]
@@ -489,7 +493,7 @@ pub async fn launch(state: &AppState, account_id: Uuid, id: Uuid, send_at: Optio
         return Err(AppError::bad(format!("Not ready to send: {}", problems.join("; "))));
     }
     let audience: Audience = serde_json::from_value(c.audience.clone()).unwrap_or_default();
-    let count = campaigns::estimate(&state.db, account_id, &c.channel, &audience).await?;
+    let count = campaigns::estimate_targeted(&state.db, account_id, &c.channel, &audience, campaigns::push_platforms(&c.channel, &c.content, c.ab_test.as_ref())).await?;
     if count == 0 {
         return Err(AppError::bad("nobody in this audience can receive this campaign (check consent and that profiles have an address)"));
     }

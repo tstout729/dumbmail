@@ -189,19 +189,53 @@ pub fn test_subscription_keys() -> (String, String, String) {
     (b64u(&sk.public_key().to_sec1_bytes()), b64u(&sk.to_bytes()), b64u(&auth))
 }
 
-/// HMAC-SHA256 of `message` as lowercase hex (identity verification's `user_hash`).
+/// HMAC-SHA256 of `message` as lowercase hex.
 pub fn hmac_hex(secret: &str, message: &str) -> String {
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("any key length");
     m.update(message.as_bytes());
     hex::encode(m.finalize().into_bytes())
 }
 
-/// Compare a claimed `user_hash` with the right one in constant time.
+/// Compare a claimed MAC (hex) with the right one in constant time.
 pub fn hmac_hex_matches(secret: &str, message: &str, claimed: &str) -> bool {
     let Ok(raw) = hex::decode(claimed.trim()) else { return false };
     let mut m = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("any key length");
     m.update(message.as_bytes());
     m.verify_slice(&raw).is_ok()
+}
+
+/// Longest an enrollment grant may be valid.
+pub const GRANT_MAX_SECONDS: i64 = 86_400;
+
+/// What an enrollment grant signs: version, purpose, the account, the identifier's type and value,
+/// and when it expires. Field by field, so no value can be read as another field.
+pub fn enroll_grant_message(account_id: &str, id_type: &str, value: &str, expires: i64) -> String {
+    format!("v1|push-enroll|{account_id}|{id_type}|{value}|{expires}")
+}
+
+/// A grant as the customer's server makes it: `v1.<expires>.<hex HMAC-SHA256>`.
+pub fn make_enroll_grant(secret: &str, account_id: &str, id_type: &str, value: &str, expires: i64) -> String {
+    format!("v1.{expires}.{}", hmac_hex(secret, &enroll_grant_message(account_id, id_type, value, expires)))
+}
+
+/// Check a grant for this account and identifier: the right format, not expired, expiring within
+/// [`GRANT_MAX_SECONDS`] (plus five minutes of clock skew), and the MAC (compared in constant time).
+pub fn verify_enroll_grant(secret: &str, account_id: &str, id_type: &str, value: &str, grant: &str, now: i64) -> Result<(), &'static str> {
+    let mut parts = grant.trim().splitn(3, '.');
+    let (Some("v1"), Some(exp), Some(mac)) = (parts.next(), parts.next(), parts.next()) else { return Err("the grant isn't in the v1.<expires>.<mac> format") };
+    let expires: i64 = exp.parse().map_err(|_| "the grant's expiry isn't a number")?;
+    if expires < now {
+        return Err("the grant has expired");
+    }
+    if expires > now + GRANT_MAX_SECONDS + 300 {
+        return Err("a grant can be valid for at most 24 hours");
+    }
+    if hmac_hex_matches(secret, &enroll_grant_message(account_id, id_type, value, expires), mac) { Ok(()) } else { Err("the grant doesn't match") }
+}
+
+/// Compare two strings in constant time (for MACs computed elsewhere).
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -251,6 +285,24 @@ mod tests {
         let claims: Value = serde_json::from_slice(&unb64(signing.split('.').nth(1).unwrap()).unwrap()).unwrap();
         assert_eq!(claims["aud"], "https://fcm.googleapis.com");
         assert_eq!(claims["exp"], 1_700_000_000 + 12 * 3600);
+    }
+
+    #[test]
+    fn enroll_grants() {
+        let now = 1_800_000_000;
+        let g = make_enroll_grant("s", "acct", "external_id", "42", now + 600);
+        assert!(verify_enroll_grant("s", "acct", "external_id", "42", &g, now).is_ok());
+        // Bound to the identifier's type, the value, the account and the secret.
+        assert!(verify_enroll_grant("s", "acct", "email", "42", &g, now).is_err());
+        assert!(verify_enroll_grant("s", "acct", "external_id", "43", &g, now).is_err());
+        assert!(verify_enroll_grant("s", "other", "external_id", "42", &g, now).is_err());
+        assert!(verify_enroll_grant("t", "acct", "external_id", "42", &g, now).is_err());
+        // Expired, or valid for too long.
+        assert_eq!(verify_enroll_grant("s", "acct", "external_id", "42", &g, now + 601), Err("the grant has expired"));
+        let long = make_enroll_grant("s", "acct", "external_id", "42", now + 3 * 86_400);
+        assert!(verify_enroll_grant("s", "acct", "external_id", "42", &long, now).is_err());
+        assert!(verify_enroll_grant("s", "acct", "external_id", "42", "v2.1.aa", now).is_err());
+        assert!(ct_eq("abc", "abc") && !ct_eq("abc", "abd") && !ct_eq("abc", "ab"));
     }
 
     #[test]

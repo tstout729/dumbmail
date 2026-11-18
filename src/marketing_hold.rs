@@ -25,9 +25,11 @@ pub const SKIP_REASON: &str = "no marketing consent";
 /// The SQL condition (on `profiles p`) for "held back from marketing".
 pub const HELD_SQL: &str = "p.marketing_hold";
 
-/// Campaign audiences: leave held people out of email campaigns.
+/// Campaign audiences: leave held people out of email campaigns. The hold is about email consent:
+/// texts need their own SMS opt-in, and a push only reaches a device whose owner allowed
+/// notifications there, so neither is filtered here.
 pub fn push_campaign_filter(qb: &mut QueryBuilder<'_, Postgres>, channel: &str) {
-    if channel != "sms" {
+    if channel == "email" {
         qb.push(" AND NOT p.marketing_hold");
     }
 }
