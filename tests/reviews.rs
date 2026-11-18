@@ -862,7 +862,7 @@ async fn one_ask_one_message_across_retries_and_crashes() {
     // The flow engine takes the run over (as its own tests do once a failed step's claim ran out).
     let sam_run: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = 'sam@x.test'").fetch_one(&h.state.db).await.unwrap();
     dumbmail::flows::step(&h.state, sam_run).await.unwrap();
-    h.fast_forward().await;
+    h.drain().await;
     assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "taken over once the claim lapsed, and sent once");
     dumbmail::flows::step(&h.state, sam_run).await.unwrap();
     assert_eq!(mails_to(&h, "sam@x.test").len(), 1, "and never again");
@@ -1430,5 +1430,61 @@ async fn strict_rules_hold_at_the_hand_off() {
         .await
         .unwrap();
     assert_eq!((status.as_str(), err.as_deref()), ("skipped", Some("already reviewed")));
+    h.cleanup().await;
+}
+
+/// Round 3, item 3: a resumed ask step reads its requests back from its intent, so the reminder
+/// isn't lost: after a worker stopped once the ask was handed over (before the run's context was
+/// saved), and after one stopped before the hand-off.
+#[tokio::test]
+async fn a_reminder_isnt_lost_on_resume() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(10.0).await;
+    let acct = account_id(&h).await;
+    person(&h, acct, "jane@x.test", "subscribed").await;
+    person(&h, acct, "sam@x.test", "subscribed").await;
+    live_review_flow(&mut h).await;
+    let db = h.state.db.clone();
+    let run_of = |email: &'static str| {
+        let db = db.clone();
+        async move {
+            let id: Uuid = sqlx::query_scalar("SELECT r.id FROM flow_runs r JOIN profiles p ON p.id = r.profile_id WHERE p.email = $1").bind(email).fetch_one(&db).await.unwrap();
+            id
+        }
+    };
+
+    // Sent, then the run is put back on the ask without the requests in its context.
+    order(&mut h, "jane@x.test", "1", json!([{"product_id": "MUG", "name": "Mug"}]), "o1").await;
+    h.drain().await;
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 1);
+    let run = run_of("jane@x.test").await;
+    sqlx::query("UPDATE flow_runs SET current_node = 'v1', status = 'active', context = context - '_waited' - 'review_requests', waiting_until = NULL, claim_id = NULL, claim_until = NULL WHERE id = $1")
+        .bind(run)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
+    dumbmail::flows::step(&h.state, run).await.unwrap();
+    let known: Value = sqlx::query_scalar("SELECT context->'review_requests' FROM flow_runs WHERE id = $1").bind(run).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(known.as_array().map(Vec::len), Some(1), "the resumed step read its request back: {known}");
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "jane@x.test").len(), 2, "the reminder went");
+
+    // Stopped between recording the ask and handing it over; resumed by the flow engine later.
+    sqlx::query("DELETE FROM jobs WHERE kind = 'flow_step'").execute(&h.state.db).await.unwrap();
+    dumbmail::features::reviews::hooks::fail("review_send", acct, 0);
+    order(&mut h, "sam@x.test", "2", json!([{"product_id": "MUG", "name": "Mug"}]), "o2").await;
+    h.drain().await;
+    h.fast_forward().await;
+    assert!(mails_to(&h, "sam@x.test").is_empty());
+    sqlx::query("UPDATE review_sends SET claimed_at = now() - interval '1 hour'").execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE flow_runs SET claim_until = now() - interval '1 minute' WHERE claim_until IS NOT NULL").execute(&h.state.db).await.unwrap();
+    let sam_run = run_of("sam@x.test").await;
+    dumbmail::flows::step(&h.state, sam_run).await.unwrap();
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 1);
+    h.fast_forward().await;
+    assert_eq!(mails_to(&h, "sam@x.test").len(), 2, "and its reminder went too");
     h.cleanup().await;
 }

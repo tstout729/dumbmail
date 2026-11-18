@@ -689,9 +689,27 @@ pub async fn flow_step(
     let err = |e: AppError| anyhow::anyhow!(e.public_message());
     let channel = if data.get("channel").and_then(|v| v.as_str()) == Some("sms") { "sms" } else { "email" };
     let reminder = data.get("reminder").and_then(|v| v.as_bool()) == Some(true);
+    // A resumed step (its worker stopped after recording, or after sending) reads its requests back
+    // from its intent, so the reminder later still knows them.
+    let remember = |context: &mut Value, intent: &Intent| {
+        if !reminder {
+            let mut all = ids_in(context.get("review_requests"));
+            for i in &intent.request_ids {
+                if !all.contains(i) {
+                    all.push(*i);
+                }
+            }
+            context["review_requests"] = json!(all);
+        }
+    };
     let intent = match intent_for_step(&state.db, run_id, node_id).await.map_err(err)? {
-        Some(i) if i.status != "pending" => return Ok(None),
-        Some(i) => i,
+        Some(i) => {
+            remember(context, &i);
+            if i.status != "pending" {
+                return Ok(None);
+            }
+            i
+        }
         None => {
             if !may_ask(&state.db, person.id, channel).await.map_err(err)? {
                 return Ok(None);
@@ -743,19 +761,20 @@ pub async fn flow_step(
             .map_err(err)?;
             tx.commit().await?;
             let intent = match recorded {
-                Recorded::New(i) => i,
-                Recorded::Own(i) if i.status == "pending" => i,
-                // Settled already, or another send is already asking about all of these.
-                Recorded::Own(_) | Recorded::Taken => return Ok(None),
-            };
-            if !reminder {
-                let mut all = ids_in(context.get("review_requests"));
-                for i in &intent.request_ids {
-                    if !all.contains(i) {
-                        all.push(*i);
+                Recorded::New(i) | Recorded::Own(i) => i,
+                // Another send is already asking about all of these (the reminder may still follow up).
+                Recorded::Taken => {
+                    if !reminder {
+                        let mut all = ids_in(context.get("review_requests"));
+                        all.extend(requests.iter().filter(|r| !all.contains(r)).collect::<Vec<_>>());
+                        context["review_requests"] = json!(all);
                     }
+                    return Ok(None);
                 }
-                context["review_requests"] = json!(all);
+            };
+            remember(context, &intent);
+            if intent.status != "pending" {
+                return Ok(None);
             }
             intent
         }
