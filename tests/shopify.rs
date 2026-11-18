@@ -3067,3 +3067,20 @@ async fn store_addresses_and_order_starters() {
     assert!(!dumbmail::marketing_hold::blocks_email(&h.state.db, pid, Some(confirmed)).await.unwrap(), "the order confirmation reaches the store's address");
     h.cleanup().await;
 }
+
+/// Item 14: a closed account gets no catalog sync, and one left running is cancelled.
+#[tokio::test]
+async fn closed_accounts_get_no_catalog_sync() {
+    let (_mock, base) = mock_shopify().await;
+    let mut h = shopify_harness!(base);
+    h.signup().await;
+    connect(&mut h).await;
+    let acct = account_id(&h).await;
+    h.ok("POST", "/api/shopify/products/resync", None).await;
+    sqlx::query("UPDATE accounts SET closed_at = now() WHERE id = $1").bind(acct).execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE shopify_shops SET reconcile_after = now() - interval '1 minute'").execute(&h.state.db).await.unwrap();
+    tick(&h).await;
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM shopify_imports WHERE kind = 'products'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(statuses, ["cancelled"], "the running sync is cancelled and none is scheduled");
+    h.cleanup().await;
+}

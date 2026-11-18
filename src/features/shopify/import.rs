@@ -490,10 +490,19 @@ async fn process_chunk(state: &AppState, shop: &ShopRow, metrics: &mut Metrics, 
 }
 
 /// Products are read in full once a day, in case a webhook was missed.
+/// A closed account gets none, and an import or sync still marked running or paused for one is
+/// cancelled (its worker doesn't run, so it would otherwise stay "running").
 pub async fn queue_reconciles(db: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE shopify_imports i SET status = 'cancelled', finished_at = now(), result_url_enc = NULL, updated_at = now(), error = 'The account was closed.'
+         WHERE i.status IN ('running', 'paused') AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = i.account_id AND a.closed_at IS NOT NULL)",
+    )
+    .execute(db)
+    .await?;
     let due: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE shopify_shops s SET reconcile_after = now() + interval '1 day'
          WHERE s.status = 'connected' AND s.reconcile_after < now()
+           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = s.account_id AND a.closed_at IS NOT NULL)
            AND NOT EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = s.account_id AND i.status IN ('running', 'paused'))
          RETURNING s.account_id",
     )
