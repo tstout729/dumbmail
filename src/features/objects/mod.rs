@@ -208,7 +208,7 @@ impl Feature for Module {
                 Some(b) => bulk::run(state, b).await,
                 None => Ok(()),
             }),
-            JOB_TRIM => Some(trim(state).await),
+            JOB_TRIM => Some(trim(state, id("after")).await),
             types::JOB_PURGE => Some(match (id("type_id"), payload["field"].as_str()) {
                 (Some(t), Some(f)) => types::purge_field(&state.db, t, f).await.map_err(|e| anyhow::anyhow!(e.public_message())),
                 _ => Ok(()),
@@ -230,10 +230,11 @@ impl Feature for Module {
 }
 
 /// Job: trim change history a batch at a time, handing over to a fresh job while there's more.
-async fn trim(state: &AppState) -> anyhow::Result<()> {
-    let n = store::trim_history(&state.db, TRIM_BATCH).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
-    if n as i64 >= TRIM_BATCH {
-        crate::jobs::enqueue_background(&state.db, JOB_TRIM, json!({}), Some(chrono::Utc::now() + chrono::Duration::seconds(5))).await?;
+async fn trim(state: &AppState, after: Option<Uuid>) -> anyhow::Result<()> {
+    let (n, next) = store::trim_history(&state.db, TRIM_BATCH, after).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
+    // More objects to look at, or a full batch of old changes: carry on shortly from the cursor.
+    if next.is_some() || n as i64 >= TRIM_BATCH {
+        crate::jobs::enqueue_background(&state.db, JOB_TRIM, json!({"after": next}), Some(chrono::Utc::now() + chrono::Duration::seconds(5))).await?;
     }
     Ok(())
 }

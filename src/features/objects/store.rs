@@ -862,25 +862,39 @@ pub async fn for_profile(db: &PgPool, account_id: Uuid, profile_id: Uuid) -> App
 
 /// Trim change history: beyond the newest [`HISTORY_PER_OBJECT`] per object (once an hour old, so
 /// a change's flow job always finds it) and older than [`HISTORY_DAYS`]. At most `batch` rows.
-pub async fn trim_history(db: &PgPool, batch: i64) -> AppResult<u64> {
-    let old = sqlx::query("DELETE FROM object_changes WHERE id IN (SELECT id FROM object_changes WHERE created_at < now() - make_interval(days => $1) LIMIT $2)")
+/// Objects one trim run looks at for changes beyond the newest [`HISTORY_PER_OBJECT`].
+pub const TRIM_OBJECTS: i64 = 500;
+
+/// One bounded trim run: up to `batch` changes older than [`HISTORY_DAYS`] (by the created_at
+/// index), and, for the next [`TRIM_OBJECTS`] objects after `after` (by id), their changes beyond
+/// the newest [`HISTORY_PER_OBJECT`] that are over an hour old (by the (object, created_at) index).
+/// Returns how many went and the cursor for the next run (None: every object was seen).
+pub async fn trim_history(db: &PgPool, batch: i64, after: Option<Uuid>) -> AppResult<(u64, Option<Uuid>)> {
+    let old = sqlx::query("DELETE FROM object_changes WHERE id IN (SELECT id FROM object_changes WHERE created_at < now() - make_interval(days => $1) ORDER BY created_at LIMIT $2)")
         .bind(HISTORY_DAYS as i32)
         .bind(batch)
         .execute(db)
         .await?
         .rows_affected();
-    let extra = sqlx::query(
-        "DELETE FROM object_changes WHERE id IN (
-           SELECT id FROM (SELECT c.id, c.created_at, row_number() OVER (PARTITION BY c.object_id ORDER BY c.created_at DESC, c.id DESC) AS n
-                           FROM object_changes c WHERE c.object_id IN (SELECT object_id FROM object_changes GROUP BY object_id HAVING count(*) > $1 LIMIT 500)) x
-           WHERE x.n > $1 AND x.created_at < now() - interval '1 hour' LIMIT $2)",
-    )
-    .bind(HISTORY_PER_OBJECT)
-    .bind(batch)
-    .execute(db)
-    .await?
-    .rows_affected();
-    Ok(old + extra)
+    let objects: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM objects WHERE ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2").bind(after).bind(TRIM_OBJECTS).fetch_all(db).await?;
+    let extra = if objects.is_empty() {
+        0
+    } else {
+        sqlx::query(
+            "DELETE FROM object_changes WHERE id IN (
+               SELECT c.id FROM unnest($1::uuid[]) AS o(id)
+               CROSS JOIN LATERAL (SELECT c.id, c.created_at FROM object_changes c WHERE c.object_id = o.id ORDER BY c.created_at DESC, c.id DESC OFFSET $2) c
+               WHERE c.created_at < now() - interval '1 hour' LIMIT $3)",
+        )
+        .bind(&objects)
+        .bind(HISTORY_PER_OBJECT)
+        .bind(batch)
+        .execute(db)
+        .await?
+        .rows_affected()
+    };
+    let next = if (objects.len() as i64) < TRIM_OBJECTS { None } else { objects.last().copied() };
+    Ok((old + extra, next))
 }
 
 #[cfg(test)]

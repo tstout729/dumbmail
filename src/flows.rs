@@ -841,7 +841,9 @@ pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Resu
     }
     crate::features::objects::flow::fire_due(state, 2000).await?;
     let flows: Vec<FlowRow> = sqlx::query_as("SELECT * FROM flows WHERE status = 'live' AND trigger->>'type' = 'event_date' ORDER BY created_at").fetch_all(&state.db).await?;
-    let mut budget = seed_budget;
+    // Event dates get half the budget; object dates (seeded below) get the rest, so neither starves.
+    let event_share = (seed_budget + 1) / 2;
+    let mut budget = event_share;
     for f in &flows {
         if budget <= 0 {
             break;
@@ -906,7 +908,7 @@ pub async fn event_date_tick(state: &AppState, seed_budget: i64) -> anyhow::Resu
         }
     }
     // Objects that existed before a live object-date flow, within what's left of the budget.
-    crate::features::objects::flow::seed(state, budget).await?;
+    crate::features::objects::flow::seed(state, seed_budget - (event_share - budget.max(0))).await?;
     // Fires the seeding just found due start now (fires due later wait for their tick).
     for _ in 0..2000 {
         if !fire_one_event_date(state).await? {

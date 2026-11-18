@@ -273,20 +273,22 @@ pub async fn fire_due(state: &AppState, max: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The claim: each live flow's earliest due fire inside the catch-up window ($1 hours), locked.
+#[doc(hidden)]
+pub const CLAIM_SQL: &str = "SELECT x.flow_id, x.object_id, x.due_at, x.trigger_key, fl.account_id FROM flows fl
+     CROSS JOIN LATERAL (SELECT f.flow_id, f.object_id, f.due_at, f.trigger_key FROM flow_object_date_fires f
+                         WHERE f.flow_id = fl.id AND f.outcome = 'pending' AND f.due_at <= now() AND f.due_at > now() - make_interval(hours => $1)
+                         ORDER BY f.due_at LIMIT 1 FOR UPDATE SKIP LOCKED) x
+     WHERE fl.status = 'live' AND fl.trigger->>'type' = 'object_date'
+       AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = fl.account_id AND a.closed_at IS NOT NULL)
+     ORDER BY x.due_at LIMIT 1";
+
 /// Claim one due fire and start its runs, in one transaction (the event-date claim).
 async fn fire_one(state: &AppState) -> anyhow::Result<bool> {
     let mut tx = state.db.begin().await?;
     // Each live flow's earliest due fire, from the (flow, due) index: paused flows' fires are never
     // read. Inside the catch-up window only (older ones are missed).
-    let claimed: Option<(Uuid, Uuid, DateTime<Utc>, String, Uuid)> = sqlx::query_as(
-        "SELECT x.flow_id, x.object_id, x.due_at, x.trigger_key, fl.account_id FROM flows fl
-         CROSS JOIN LATERAL (SELECT f.flow_id, f.object_id, f.due_at, f.trigger_key FROM flow_object_date_fires f
-                             WHERE f.flow_id = fl.id AND f.outcome = 'pending' AND f.due_at <= now() AND f.due_at > now() - make_interval(hours => $1)
-                             ORDER BY f.due_at LIMIT 1 FOR UPDATE SKIP LOCKED) x
-         WHERE fl.status = 'live' AND fl.trigger->>'type' = 'object_date'
-           AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = fl.account_id AND a.closed_at IS NOT NULL)
-         ORDER BY x.due_at LIMIT 1",
-    )
+    let claimed: Option<(Uuid, Uuid, DateTime<Utc>, String, Uuid)> = sqlx::query_as(CLAIM_SQL)
     .bind(flows::EVENT_DATE_CATCH_UP_HOURS as i32)
     .fetch_optional(&mut *tx)
     .await?;

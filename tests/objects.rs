@@ -914,3 +914,49 @@ async fn sensitivity_survives_edits_and_rules_fail_closed_at_run_time() {
     assert!(!h.ok("GET", "/api/object-types/stay/objects", None).await.to_string().contains("1234"));
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_scheduler_and_retention_stay_bounded() {
+    let mut h = harness!();
+    h.signup().await;
+    let acct = account_of(&h).await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "check_in", "type": "date"}]}))).await;
+    // Objects and events that existed before their date flows went live.
+    for i in 0..6 {
+        h.ok("POST", "/api/objects", Some(json!({"type": "stay", "external_id": format!("S{i}"), "fields": {"check_in": day(30)}}))).await;
+        h.ok("POST", "/api/events", Some(json!({"metric": "Booked", "profile": {"email": format!("e{i}@example.com")}, "properties": {"on": day(30)}}))).await;
+    }
+    h.drain().await;
+    live(&mut h, email_flow("Obj", json!({"type": "object_date", "object_type": "stay", "field": "check_in", "offset_days": -1}), "x")).await;
+    live(&mut h, json!({"name": "Ev", "trigger": {"type": "event_date", "metric": "Booked", "field": "on", "offset_days": -1},
+        "definition": {"entry": "e1", "nodes": [{"id": "e1", "type": "email", "next": null, "content": {"subject": "x", "blocks": [{"type": "text", "html": "<p>x</p>"}]}}]}})).await;
+    // A tight budget is shared: object dates get their part even when there are more events than budget.
+    dumbmail::flows::event_date_tick(&h.state, 4).await.unwrap();
+    assert!(count(&h, "SELECT count(*) FROM flow_object_date_fires").await >= 2, "object dates got their share of the budget");
+    assert!(count(&h, "SELECT count(*) FROM flow_event_date_fires").await >= 2);
+    // The claim reads each live flow's fires by (flow, due): a paused flow's fires are never scanned.
+    let mut conn = h.state.db.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan = off").execute(&mut *conn).await.unwrap();
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {}", dumbmail::features::objects::flow::CLAIM_SQL.replace("$1", "24"))).fetch_all(&mut *conn).await.unwrap();
+    let plan = plan.join("\n");
+    assert!(plan.contains("flow_object_date_fires_flow_due_idx"), "{plan}");
+    drop(conn);
+    // History trimming walks objects with a cursor, a bounded number per run.
+    let ids: Vec<uuid::Uuid> = (0..dumbmail::features::objects::store::TRIM_OBJECTS + 2).map(|_| uuid::Uuid::now_v7()).collect();
+    let tid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM object_types").fetch_one(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO objects (id, account_id, type_id, external_id) SELECT x, $2, $3, x::text FROM unnest($1::uuid[]) x").bind(&ids).bind(acct).bind(tid).execute(&h.state.db).await.unwrap();
+    let last = *ids.last().unwrap();
+    sqlx::query("INSERT INTO object_changes (id, object_id, account_id, kind, version, created_at) SELECT gen_random_uuid(), $1, $2, 'updated', g, now() - make_interval(hours => g + 1) FROM generate_series(1, 105) g")
+        .bind(last)
+        .bind(acct)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let (_, next) = dumbmail::features::objects::store::trim_history(&h.state.db, 5000, None).await.unwrap();
+    assert!(next.is_some(), "more objects than one run looks at: it hands over a cursor");
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM object_changes WHERE object_id = '{last}'")).await, 105, "the last object is beyond the first run");
+    let (_, next) = dumbmail::features::objects::store::trim_history(&h.state.db, 5000, next).await.unwrap();
+    assert_eq!(next, None);
+    assert_eq!(count(&h, &format!("SELECT count(*) FROM object_changes WHERE object_id = '{last}'")).await, 100, "the newest 100 are kept");
+    h.cleanup().await;
+}
