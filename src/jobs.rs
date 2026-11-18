@@ -137,6 +137,11 @@ const ACCOUNT_JOBS: &[(&str, &str, &str)] = &[
     ("klaviyo_rebaseline_segments", "account_id", "SELECT $1::uuid"),
     ("flows_plus_backfill", "backfill_id", "SELECT account_id FROM flow_backfills WHERE id = $1"),
     ("flows_plus_confirm_address", "account_id", "SELECT $1::uuid"),
+    // Shopify: everything but privacy requests (`shopify_privacy`) and the store worker
+    // (`shopify_work`), which for a closed account only does privacy requests and opt-out
+    // write-backs (see `features::shopify`).
+    ("shopify_setup", "account_id", "SELECT $1::uuid"),
+    ("shopify_rebaseline_segments", "account_id", "SELECT $1::uuid"),
     // push_retry isn't here: its final claim settles a closed account's deliveries as skipped.
     // push_event isn't either: it records what already happened (a push the device accepted).
 ];

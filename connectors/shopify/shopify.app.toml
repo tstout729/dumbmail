@@ -1,0 +1,26 @@
+# DumbMail's Shopify app. Fill in client_id from the Partner (Dev) Dashboard and replace
+# app.dumbmail.ai with your server's PUBLIC_URL host, then `shopify app deploy`. See README.md.
+client_id = "REPLACE_WITH_CLIENT_ID"
+name = "DumbMail"
+application_url = "https://app.dumbmail.ai/api/shopify/app"
+embedded = false
+
+[access_scopes]
+# Requested again by DumbMail's install link; keep the two lists the same.
+scopes = "write_customers,read_orders,read_all_orders,read_products,read_inventory,write_discounts,write_pixels,read_customer_events"
+use_legacy_install_flow = true
+
+[auth]
+redirect_urls = ["https://app.dumbmail.ai/api/shopify/callback"]
+
+[webhooks]
+api_version = "2026-10"
+
+  # Only the privacy topics live here. DumbMail subscribes each store to everything else itself when
+  # it connects; listing those here too would deliver every event twice.
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "https://app.dumbmail.ai/webhooks/shopify"
+
+[pos]
+embedded = false

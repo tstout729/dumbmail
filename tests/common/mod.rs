@@ -92,6 +92,7 @@ impl Harness {
             tiktok_app_id: None,
             tiktok_app_secret: None,
             ad_platform_api_base: None,
+            shopify: Default::default(),
         };
         tweak(&mut cfg);
         let state = AppState::build(cfg, db).await.unwrap();

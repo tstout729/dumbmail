@@ -1,6 +1,6 @@
 // Catalog types. They match the JSON from src/features/catalog (see docs/CATALOG.md).
 
-export type ProductSource = "api" | "csv" | "feed" | "events";
+export type ProductSource = "api" | "csv" | "feed" | "events" | "shopify";
 
 export type Variant = {
   id: string;

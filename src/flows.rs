@@ -596,7 +596,13 @@ pub async fn on_list_add(state: &AppState, list_id: Uuid, profile_ids: &[Uuid]) 
 
 /// Job: refresh a segment's membership and start segment-triggered flows for new members.
 pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Result<()> {
-    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as("SELECT account_id, definition, refreshed_at, absorb_entries FROM segments WHERE id = $1")
+    // `absorb_entries`, or a Shopify history page being written for the account right now (one
+    // statement either way; the second is a partial index that's empty unless an import is writing).
+    let row: Option<(Uuid, Value, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as(
+        "SELECT account_id, definition, refreshed_at,
+                absorb_entries OR EXISTS (SELECT 1 FROM shopify_imports i WHERE i.account_id = segments.account_id AND i.history_open)
+         FROM segments WHERE id = $1",
+    )
         .bind(segment_id)
         .fetch_optional(&state.db)
         .await?;
@@ -612,7 +618,8 @@ pub async fn refresh_segment(state: &AppState, segment_id: Uuid) -> anyhow::Resu
     };
     let entered = segments::refresh(&state.db, account_id, segment_id, &def).await.map_err(|e| anyhow::anyhow!(e.public_message()))?;
     // The first refresh only records who is already in the segment; it does not trigger anyone. Neither
-    // does one while past activity is being imported into the account (`absorb_entries`).
+    // does one while past activity is being imported into the account (`absorb_entries`, and a Shopify
+    // history page being written right now).
     if refreshed_at.is_none() || absorb {
         return Ok(());
     }
