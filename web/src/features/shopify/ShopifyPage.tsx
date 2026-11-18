@@ -7,6 +7,7 @@ import { formatDate, formatNumber, formatRelative } from "../../lib/format";
 import { toast } from "../../lib/toast";
 import { shopifyApi, useConnectShopify, useDisconnectShopify, useResyncShopifyProducts, useShopifyImportAction, useShopifyStatus, useStartShopifyImport } from "./api";
 import type { ShopifyImport, ShopifyStatus } from "./types";
+import { useCan } from "../team/api";
 
 /** What the error codes the install callback sends back mean. */
 const CALLBACK_ERRORS: Record<string, string> = {
@@ -119,6 +120,7 @@ function HealthLine({ s }: { s: ShopifyStatus }) {
 function ConnectCard({ s }: { s: ShopifyStatus }) {
   const [params] = useSearchParams();
   const connect = useConnectShopify();
+  const canManage = useCan("shopify.manage");
   const previous = s.connection;
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -138,7 +140,10 @@ function ConnectCard({ s }: { s: ShopifyStatus }) {
             {previous.disconnected_at ? `${formatRelative(previous.disconnected_at)}. ` : null}Profiles, events and products it brought in are still here.
           </Notice>
         ) : null}
-        <form onSubmit={onSubmit} className="flex flex-wrap items-end gap-2">
+        {!canManage ? (
+          <p className="text-sm text-zinc-600">Ask an admin or the owner to connect the store: your role can see this page but not change it.</p>
+        ) : null}
+        <form onSubmit={onSubmit} className={canManage ? "flex flex-wrap items-end gap-2" : "hidden"}>
           <Field label="Store address" className="min-w-0 flex-1">
             <Input name="shop" required maxLength={200} defaultValue={params.get("shop") ?? previous?.shop ?? ""} placeholder="your-store.myshopify.com" autoComplete="off" />
           </Field>
@@ -156,15 +161,18 @@ function ConnectedCard({ s }: { s: ShopifyStatus }) {
   const c = s.connection;
   const [confirm, setConfirm] = useState(false);
   const disconnect = useDisconnectShopify();
+  const canManage = useCan("shopify.manage");
   if (!c) return null;
   const storeUrl = safeUrl(c.store_url);
   return (
     <Card
       title="Shopify store"
       actions={
-        <Button variant="ghost" size="sm" onClick={() => setConfirm(true)}>
-          Disconnect
-        </Button>
+        canManage ? (
+          <Button variant="ghost" size="sm" onClick={() => setConfirm(true)}>
+            Disconnect
+          </Button>
+        ) : undefined
       }
     >
       <div className="space-y-4">
@@ -294,6 +302,7 @@ function HistoryCard({ s }: { s: ShopifyStatus }) {
   const start = useStartShopifyImport();
   const action = useShopifyImportAction();
   const resync = useResyncShopifyProducts();
+  const canManage = useCan("shopify.manage");
   const i = s.import;
   const active = i?.status === "running" || i?.status === "paused";
   const productsBusy = s.products_sync?.status === "running";
@@ -305,7 +314,7 @@ function HistoryCard({ s }: { s: ShopifyStatus }) {
           subscribed here; nobody else is. Imported orders don't start flows or send anything, and running it again adds nothing twice.
         </p>
         {i ? <ImportProgress i={i} tz={account.timezone} /> : null}
-        <div className="flex flex-wrap gap-2">
+        <div className={canManage ? "flex flex-wrap gap-2" : "hidden"}>
           {!active ? (
             <Button variant={i ? "secondary" : "primary"} disabled={productsBusy} onClick={() => setConfirm(true)}>
               {i ? "Import again" : "Import history"}
@@ -339,9 +348,11 @@ function HistoryCard({ s }: { s: ShopifyStatus }) {
                     : "Changes arrive as they happen, and every product is checked again daily."}
               </div>
             </div>
-            <Button size="sm" icon={<RefreshCw className="size-3.5" />} disabled={productsBusy || active} loading={resync.isPending} onClick={() => resync.mutate(undefined)}>
-              Sync products now
-            </Button>
+            {canManage ? (
+              <Button size="sm" icon={<RefreshCw className="size-3.5" />} disabled={productsBusy || active} loading={resync.isPending} onClick={() => resync.mutate(undefined)}>
+                Sync products now
+              </Button>
+            ) : null}
           </div>
         </div>
       </div>
@@ -391,6 +402,7 @@ function StorefrontCard({ s }: { s: ShopifyStatus }) {
 
 function DataRequestsCard({ s }: { s: ShopifyStatus }) {
   const { account } = useSession();
+  const canManage = useCan("shopify.manage");
   const [loading, setLoading] = useState<string | null>(null);
   const download = async (id: string) => {
     setLoading(id);
@@ -425,9 +437,11 @@ function DataRequestsCard({ s }: { s: ShopifyStatus }) {
                   {r.downloaded_at ? ` · downloaded ${formatRelative(r.downloaded_at)}` : " · not downloaded yet"}
                 </div>
               </div>
-              <Button size="sm" icon={<Download className="size-3.5" />} loading={loading === r.id} onClick={() => void download(r.id)}>
-                Download
-              </Button>
+              {canManage ? (
+                <Button size="sm" icon={<Download className="size-3.5" />} loading={loading === r.id} onClick={() => void download(r.id)}>
+                  Download
+                </Button>
+              ) : null}
             </li>
           ))}
         </ul>

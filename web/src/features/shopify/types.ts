@@ -57,6 +57,7 @@ export type ShopifyStatus = {
   syncing: string[];
   counts: { linked_customers: number; products: number; webhooks_waiting: number; privacy_requests_waiting: number; unsubscribes_to_write_back: number };
   problems: string[];
+  coupons: { coupon_id: string; name: string; template: Record<string, unknown>; updated_at: string }[];
   import: ShopifyImport | null;
   products_sync: ShopifyImport | null;
   storefront: { embed_link: string | null; pixel_installed: boolean; error: string | null };
