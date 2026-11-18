@@ -1178,3 +1178,26 @@ async fn guesty_legacy_change_to_a_guest_without_contact_details_applies_at_once
     assert_eq!(pre_arrivals(&h), vec!["ben@example.com"]);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_flow_paused_while_its_fire_is_claimed_starts_nothing() {
+    let mut h = harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let acct = account_of(&h).await;
+    h.ok("POST", "/api/object-types", Some(json!({"key": "stay", "fields": [{"key": "check_in", "type": "date"}]}))).await;
+    let fid = live(&mut h, email_flow("Pre", json!({"type": "object_date", "object_type": "stay", "field": "check_in", "offset_days": -2, "hour": 0}), "See you")).await;
+    h.ok("POST", "/api/objects", Some(reservation("S1", "a@example.com", json!({"check_in": day(2)})).as_object().cloned().map(|mut o| { o["type"] = json!("stay"); Value::Object(o) }).unwrap())).await;
+    let (mut points, go) = dumbmail::features::objects::hooks::install(acct);
+    let state = h.state.clone();
+    let tick = tokio::spawn(async move { dumbmail::flows::event_date_tick(&state, 0).await });
+    assert_eq!(points.recv().await, Some("fire_claimed"));
+    // The flow is paused in the gap between claiming the fire and entering the run.
+    h.ok("POST", &format!("/api/flows/{fid}/status"), Some(json!({"status": "paused"}))).await;
+    go.notify_one();
+    tick.await.unwrap().unwrap();
+    dumbmail::features::objects::hooks::remove(acct);
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_runs").await, 0);
+    assert_eq!(count(&h, "SELECT count(*) FROM flow_object_date_fires WHERE outcome = 'pending'").await, 1, "the fire waits for the flow to be live again");
+    h.cleanup().await;
+}

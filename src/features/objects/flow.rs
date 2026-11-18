@@ -302,7 +302,20 @@ async fn fire_one(state: &AppState) -> anyhow::Result<bool> {
     .await?;
     let Some((flow_id, object_id, due, key, account_id)) = claimed else { return Ok(false) };
     super::hooks::pause(account_id, "fire_claimed").await;
-    let f: FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1").bind(flow_id).fetch_one(&mut *tx).await?;
+    // Read again under locks in this transaction: the flow (shared, so a pause waits for this entry
+    // or comes first and is seen here) and the fire (already ours). A flow no longer live, or a fire
+    // no longer pending, starts nothing and the fire stays as it is.
+    let f: FlowRow = sqlx::query_as("SELECT * FROM flows WHERE id = $1 FOR SHARE").bind(flow_id).fetch_one(&mut *tx).await?;
+    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM flow_object_date_fires WHERE flow_id = $1 AND object_id = $2 AND due_at = $3")
+        .bind(flow_id)
+        .bind(object_id)
+        .bind(due)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if f.status != "live" || outcome.as_deref() != Some("pending") {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     let (label, run, n) = match date_start(state, &mut tx, &f, object_id, due, &key).await? {
         Ok((run, n)) => ("started", Some(run), n),
         Err(why) => (why, None, 0),
