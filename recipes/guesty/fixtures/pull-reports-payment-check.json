@@ -1,24 +1,24 @@
 {
-  "description": "A page of the hourly payment check (GET /v1/reservations-reports/reservations/search, shaped as Guesty's public documentation describes it): paid in full, something still due, and no money; each written as evidence only onto a reservation that hasn't changed since",
+  "description": "A page of the hourly payment check (GET /v1/reservations-reports/reservations/search, shaped as Guesty's public documentation describes it): paid in full, something still due, and no money; each written as evidence only onto a reservation that hasn't changed since; dated by the response's Date header",
   "expect": [
     {
       "external_id": "66f1c4a1246e7d9f0f8da88a",
       "fields": {
-        "paid_checked_at": "2026-11-17T18:00:00.000Z",
+        "paid_checked_at": "2026-11-17T17:59:58.000Z",
         "paid_in_full": true
       },
       "object_type": "reservation",
-      "only_if_as_of_at_most": "2026-11-17T18:00:00.000Z",
+      "only_if_as_of_at_most": "2026-11-17T17:59:58.000Z",
       "type": "upsert_object"
     },
     {
       "external_id": "67a0b1c2d3e4f5a6b7c8d9e0",
       "fields": {
-        "paid_checked_at": "2026-11-17T18:00:00.000Z",
+        "paid_checked_at": "2026-11-17T17:59:58.000Z",
         "paid_in_full": false
       },
       "object_type": "reservation",
-      "only_if_as_of_at_most": "2026-11-17T18:00:00.000Z",
+      "only_if_as_of_at_most": "2026-11-17T17:59:58.000Z",
       "type": "upsert_object"
     },
     {
@@ -115,6 +115,12 @@
         ]
       ],
       "url": "https://open-api.guesty.com/v1/reservations-reports/reservations/search"
+    },
+    "response": {
+      "headers": {
+        "date": "Tue, 17 Nov 2026 17:59:58 GMT"
+      },
+      "status": 200
     },
     "source": "pull",
     "state": {

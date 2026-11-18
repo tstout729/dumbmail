@@ -277,12 +277,13 @@ function reservationObject(d, who, version) {
   return { type: "upsert_object", object_type: "reservation", external_id: d.reservation_id, fields: fields, profiles: profiles, replace_links: ["guest"], as_of: version };
 }
 
-// A reservation with no guest DumbMail can find: only its object (which unlinks any old guest).
-function objectOnly(r, version, input) {
+// A reservation with no guest DumbMail can find from this message: only its object, which unlinks
+// any former guest at once (and links `who`, a lookup by the Guesty guest id, if they're known).
+function objectOnly(r, version, input, who) {
   var d = details(r);
   if (!d.reservation_id || isOwnerStay(r, input.settings || {})) return [];
   if (!version) return [];
-  return [reservationObject(d, null, version)];
+  return [reservationObject(d, who || null, version)];
 }
 
 function clean(o) {
@@ -342,7 +343,12 @@ function fromWebhook(input) {
     var r = p.reservation;
     if (!r) return [{ type: "log", message: ev + " with no reservation object" }];
     var g = guestFrom(r.guest, r.guestId);
-    if (!g.email && !g.phone) return [{ type: "log", message: "reservation " + (r._id || r.id) + ": the guest has no usable email or phone, so there's no profile to write" }];
+    if (!g.email && !g.phone) {
+      // Still applied to the reservation at once (a cancellation, a new guest): the former guest is
+      // unlinked, and the new one is linked by their Guesty id if DumbMail knows them.
+      var v = str(r.lastUpdatedAt) || str(meta.publishedAt);
+      return objectOnly(r, v, input, whoFor(null, g.id, false)).concat([{ type: "log", message: "reservation " + (r._id || r.id) + ": the guest has no usable email or phone, so there's no profile to write" }]);
+    }
     var version = str(r.lastUpdatedAt) || str(meta.publishedAt);
     var before = p.reservationBefore;
     var moved = before ? changedFields(r, before).some(function (f) { return VERSION_FIELDS.indexOf(f) >= 0; }) : true;
@@ -491,6 +497,12 @@ function fromReports(input) {
   var st = input.state || {};
   var pages = (Number(st.payment_check_pages) || 0) + 1;
   var out = [];
+  // Evidence is as old as the page: never from a replay of a stored page, and dated by the
+  // response's own Date header when it has one (else now: the script runs as the page arrives).
+  if (input.replay) return [{ type: "log", message: "a replayed payment check page writes no payment evidence (it may be stale)" }];
+  var hdrs = (input.response && input.response.headers) || {};
+  var stamped = Date.parse(hdrs.date || hdrs.Date || "");
+  var takenAt = !isNaN(stamped) && stamped <= Date.parse(input.now) ? new Date(stamped).toISOString() : input.now;
   results.forEach(function (r) {
     var id = str(r.reservationId);
     var m = r.money;
@@ -500,8 +512,8 @@ function fromReports(input) {
     if (due === null || paid === null) return;
     out.push({
       type: "upsert_object", object_type: "reservation", external_id: id,
-      fields: { paid_in_full: due === 0 && paid + due > 0, paid_checked_at: input.now },
-      only_if_as_of_at_most: input.now,
+      fields: { paid_in_full: due === 0 && paid + due > 0, paid_checked_at: takenAt },
+      only_if_as_of_at_most: takenAt,
     });
   });
   var more = !!(page.pagination && page.pagination.hasMore) && pages < SWEEP_MAX_PAGES;

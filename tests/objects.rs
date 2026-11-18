@@ -1152,3 +1152,29 @@ async fn guesty_payment_check_through_the_reports_search() {
     assert_eq!(count(&h, "SELECT count(*) FROM integration_deliveries WHERE request->>'url' LIKE '%reservations-reports%'").await, 1);
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn guesty_legacy_change_to_a_guest_without_contact_details_applies_at_once() {
+    let mut h = integ_harness!();
+    h.signup().await;
+    h.credit(5.0).await;
+    let g = guesty_live(&mut h, None).await;
+    // Ana's paid booking is cancelled; the message's guest has no email or phone.
+    g.post(&h, legacy("R1", ("gA", "ana@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    g.post(&h, legacy("R1", ("gX", ""), "canceled", Some(0.0), "2026-11-17T11:00:00.000Z")).await;
+    // Bea's paid booking moves to Ben, known to DumbMail only by his Guesty id.
+    g.post(&h, legacy("R2", ("gBea", "bea@example.com"), "confirmed", Some(0.0), "2026-11-17T10:00:00.000Z")).await;
+    sqlx::query("INSERT INTO profiles (id, account_id, email, integration_keys) SELECT $1, account_id, 'ben@example.com', '{\"guesty_guest_id\": \"gB\"}' FROM integrations")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    g.post(&h, legacy("R2", ("gB", ""), "confirmed", Some(0.0), "2026-11-17T11:00:00.000Z")).await;
+    let r1: (String, i64) = sqlx::query_as("SELECT fields->>'status', (SELECT count(*) FROM object_links l WHERE l.object_id = o.id) FROM objects o WHERE external_id = 'R1'").fetch_one(&h.state.db).await.unwrap();
+    assert_eq!(r1, ("canceled".to_string(), 0), "cancelled, and Ana unlinked, at once");
+    let r2: Vec<String> = sqlx::query_scalar("SELECT p.email FROM object_links l JOIN objects o ON o.id = l.object_id JOIN profiles p ON p.id = l.profile_id WHERE o.external_id = 'R2'").fetch_all(&h.state.db).await.unwrap();
+    assert_eq!(r2, vec!["ben@example.com"], "Bea unlinked; Ben linked by his Guesty id");
+    fire(&h).await;
+    assert_eq!(pre_arrivals(&h), vec!["ben@example.com"]);
+    h.cleanup().await;
+}
