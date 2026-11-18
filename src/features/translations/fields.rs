@@ -576,7 +576,7 @@ pub fn check_saved(content: &Value) -> AppResult<()> {
 // ---------- Choosing and applying a version ----------
 
 /// Keys the content prepare step computes (see `features::content::prepare`); content can't set them.
-pub const COMPUTED: [&str; 2] = ["_lang", "_footer"];
+pub const COMPUTED: [&str; 3] = ["_lang", "_footer", "_own_unsubscribe"];
 
 /// Whether the content prepare step has language work to do for `content` (see [`choose`]).
 pub fn has_versions(content: &Value) -> bool {
@@ -643,6 +643,9 @@ pub fn localize(content: &Value, lang: &str) -> Value {
     for k in COMPUTED {
         o.remove(k);
     }
+    // Whether a full-document email places its own unsubscribe link is decided from the original,
+    // once, for every language: a translation can't steer whether the legal footer is added.
+    let own_unsubscribe = o.get("html").and_then(|h| h.as_str()).is_some_and(|h| h.contains("unsubscribe_url"));
     let tr = o.remove("translations");
     if let Some(m) = tr.as_ref().and_then(|t| t.pointer(&format!("/fields/{}", lang.replace('~', "~0").replace('/', "~1")))).and_then(|m| m.as_object()) {
         let tops = top_fields(&Value::Object(o.clone()));
@@ -661,6 +664,7 @@ pub fn localize(content: &Value, lang: &str) -> Value {
     }
     if !lang.is_empty() {
         o.insert("_lang".into(), json!(lang));
+        o.insert("_own_unsubscribe".into(), json!(own_unsubscribe));
     }
     c
 }

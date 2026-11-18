@@ -36,6 +36,10 @@ pub struct EmailContent {
     /// The footer lines in that language, set with `lang`.
     #[serde(default, rename = "_footer")]
     pub footer_texts: Option<FooterTexts>,
+    /// For a language version of a full-document email: whether the original places its own
+    /// unsubscribe link (decided from the original, set with `lang`).
+    #[serde(default, rename = "_own_unsubscribe")]
+    pub own_unsubscribe: Option<bool>,
 }
 
 /// The words of the marketing footer in the email's language.
@@ -537,7 +541,8 @@ pub fn render_email_with(
             block_text(&json!({"type": "html", "html": html}), &mut text);
             let doc = if html.to_lowercase().contains("<body") {
                 // Custom full HTML: make sure an unsubscribe link exists (and any footer is added).
-                if html.contains("unsubscribe_url") || footer.is_empty() {
+                let own_unsubscribe = content.own_unsubscribe.filter(|_| lang.is_some()).unwrap_or_else(|| html.contains("unsubscribe_url"));
+                if own_unsubscribe || footer.is_empty() {
                     html.clone()
                 } else {
                     html.replacen("</body>", &format!(r#"<div style="text-align:center;font-size:12px;color:#6b7280;padding:16px;">{footer}</div></body>"#), 1)

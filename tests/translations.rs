@@ -680,3 +680,27 @@ async fn the_editor_works_on_unsaved_content_without_storing_anything() {
     assert_eq!(n, 0);
     h.cleanup().await;
 }
+
+/// A template whose `html` has a French version, previewed in French.
+async fn preview_fr(h: &mut Harness, html: &str, fr: &str) -> String {
+    let t = h.ok("POST", "/api/templates", Some(json!({"name": format!("T{}", Uuid::now_v7().simple()), "channel": "email", "content": {"subject": "Hi", "html": html}}))).await;
+    let tid = t["id"].as_str().unwrap().to_string();
+    h.ok("PUT", &format!("/api/translations/templates/{tid}"), Some(json!({"language": "fr", "strings": [{"id": "html", "text": fr}]}))).await;
+    let content = h.ok("GET", &format!("/api/templates/{tid}"), None).await["content"].clone();
+    h.ok("POST", "/api/translations/preview", Some(json!({"channel": "email", "content": content, "language": "fr"}))).await["html"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn a_translation_cant_remove_the_unsubscribe_footer() {
+    let mut h = harness!();
+    h.signup().await;
+    set_languages(&mut h, json!(["fr"])).await;
+    // The original relies on the automatic footer; the translation only mentions the word as text.
+    let out = preview_fr(&mut h, "<html><body><p>Hello</p></body></html>", "<html><body><p>Bonjour unsubscribe_url</p></body></html>").await;
+    assert!(out.contains("Vous recevez cet e-mail parce que vous vous êtes inscrit(e).") && out.contains("Se désabonner</a>"), "the footer stays: {out}");
+    // The original places its own unsubscribe link: every language keeps it, with no second footer.
+    let own = r#"<html><body><p>Hi</p><a href="{{ unsubscribe_url }}">Leave</a></body></html>"#;
+    let out = preview_fr(&mut h, own, r#"<html><body><p>Salut</p><a href="{{ unsubscribe_url }}">Partir</a></body></html>"#).await;
+    assert!(out.contains(">Partir</a>") && !out.contains("Vous recevez cet e-mail"), "{out}");
+    h.cleanup().await;
+}
