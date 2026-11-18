@@ -69,6 +69,11 @@ static TOOLS: &[ToolRule] = &[
     ToolRule { name: "update_short_link_settings", perm: Perm::SettingsWrite },
 ];
 
+/// Whether a write failed because another text took the same reference at the same moment.
+pub fn is_ref_clash(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.constraint() == Some(INDEXES[0].0))
+}
+
 /// Build the index, then remember it's in place.
 pub async fn ensure_index(state: &AppState) -> anyhow::Result<()> {
     crate::features::reports::indexes::build(state, INDEX_LOCK, "short link", INDEXES).await?;

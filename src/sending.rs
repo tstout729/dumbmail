@@ -413,44 +413,52 @@ async fn send_with(state: &AppState, spec: SendSpec<'_>, conversational: Option<
     }
 
     // A text with short links takes the first of its references not already used in the account
-    // (features::short_links); the text is written with the one it got.
-    let short_ref: Option<String> = if spec.message_id.is_none() {
-        sqlx::query_scalar(
-            "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (SELECT c.r FROM unnest($13::text[]) WITH ORDINALITY AS c(r, i)
-                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
-             RETURNING short_ref",
-        )
-        .bind(message_id)
-        .bind(spec.account.id)
-        .bind(p.id)
-        .bind(spec.channel)
-        .bind(spec.campaign_id)
-        .bind(spec.flow_id)
-        .bind(spec.flow_node_id)
-        .bind(&to)
-        .bind(&subject)
-        .bind(spec.is_test)
-        .bind(&send_note)
-        .bind(&language)
-        .bind(short_links.as_ref().map(|s| s.ref_candidates()))
-        .fetch_one(&state.db)
-        .await?
-    } else {
-        sqlx::query_scalar(
-            "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language),
-                short_ref = (SELECT c.r FROM unnest($6::text[]) WITH ORDINALITY AS c(r, i)
-                    WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
-             WHERE u.id = $1 RETURNING u.short_ref",
-        )
-        .bind(message_id)
-        .bind(&subject)
-        .bind(&to)
-        .bind(&send_note)
-        .bind(&language)
-        .bind(short_links.as_ref().map(|s| s.ref_candidates()))
-        .fetch_one(&state.db)
-        .await?
+    // (features::short_links); the text is written with the one it got. Another text taking the same
+    // one at the same moment makes the write fail on the unique index: the next try takes the next.
+    let mut clashes = 0;
+    let short_ref: Option<String> = loop {
+        let written: sqlx::Result<Option<String>> = if spec.message_id.is_none() {
+            sqlx::query_scalar(
+                "INSERT INTO messages (id, account_id, profile_id, channel, campaign_id, flow_id, flow_node_id, to_address, subject, is_test, send_note, language, short_ref)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (SELECT c.r FROM unnest($13::text[]) WITH ORDINALITY AS c(r, i)
+                     WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = $2 AND m.short_ref = c.r) ORDER BY c.i LIMIT 1))
+                 RETURNING short_ref",
+            )
+            .bind(message_id)
+            .bind(spec.account.id)
+            .bind(p.id)
+            .bind(spec.channel)
+            .bind(spec.campaign_id)
+            .bind(spec.flow_id)
+            .bind(spec.flow_node_id)
+            .bind(&to)
+            .bind(&subject)
+            .bind(spec.is_test)
+            .bind(&send_note)
+            .bind(&language)
+            .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+            .fetch_one(&state.db)
+            .await
+        } else {
+            sqlx::query_scalar(
+                "UPDATE messages u SET subject = $2, to_address = $3, send_note = COALESCE($4, send_note), language = COALESCE($5, language),
+                    short_ref = (SELECT c.r FROM unnest($6::text[]) WITH ORDINALITY AS c(r, i)
+                        WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id = u.account_id AND m.short_ref = c.r AND m.id <> u.id) ORDER BY c.i LIMIT 1)
+                 WHERE u.id = $1 RETURNING u.short_ref",
+            )
+            .bind(message_id)
+            .bind(&subject)
+            .bind(&to)
+            .bind(&send_note)
+            .bind(&language)
+            .bind(short_links.as_ref().map(|s| s.ref_candidates()))
+            .fetch_one(&state.db)
+            .await
+        };
+        match written {
+            Err(e) if clashes < 3 && crate::features::short_links::is_ref_clash(&e) => clashes += 1,
+            written => break written?,
+        }
     };
     if let (Some(links), Rendered::Sms(s, _, _)) = (&short_links, &mut rendered) {
         let chosen = short_ref.ok_or_else(|| AppError::Internal(anyhow::anyhow!("no free short link reference for this text")))?;

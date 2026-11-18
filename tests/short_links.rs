@@ -824,3 +824,54 @@ async fn a_relaunched_text_campaign_tags_its_new_links() {
     assert!(new.starts_with("https://shop.test/new-offer?utm_source=dumbmail&utm_medium=sms&utm_campaign=black-friday-"), "the relaunch tags its new link: {new}");
     h.cleanup().await;
 }
+
+#[tokio::test]
+async fn two_texts_taking_the_same_reference_at_once_both_go_out() {
+    let mut h = harness!();
+    let (acct, list) = setup(&mut h).await;
+    let (pid, phone) = texter(&mut h, &list, 8801).await;
+    let id = sms_campaign(&mut h, &list, "Acme Goods: https://shop.test/at-once").await;
+    let cid: Uuid = id.parse().unwrap();
+    sqlx::query("UPDATE campaigns SET status = 'sending' WHERE id = $1").bind(cid).execute(&h.state.db).await.unwrap();
+    dumbmail::campaigns::prepare_send(&h.state, cid).await.unwrap();
+    let mid: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE campaign_id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+    let refs = code::ref_candidates("test-secret", mid);
+    // Another text is taking the same first-choice reference in a transaction that hasn't committed:
+    // the campaign text's write can't see it yet, picks the same one and waits on the unique index.
+    let mut other = h.state.db.begin().await.unwrap();
+    sqlx::query("INSERT INTO messages (id, account_id, profile_id, channel, to_address, status, short_ref) VALUES ($1, $2, $3, 'sms', $4, 'sent', $5)")
+        .bind(Uuid::now_v7())
+        .bind(acct)
+        .bind(pid)
+        .bind(&phone)
+        .bind(&refs[0])
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    let st = h.state.clone();
+    let send = tokio::spawn(async move { dumbmail::campaigns::send_batch(&st, cid, &[mid]).await });
+    let mut waited = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE 'UPDATE messages u SET%'")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+        if n > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(waited, "the campaign text's write should wait on the other text's reference");
+    other.commit().await.unwrap();
+    send.await.unwrap().unwrap();
+    // The loser tried again and took the next reference; the campaign carried on.
+    let (status, written): (String, Option<String>) = sqlx::query_as("SELECT status, short_ref FROM messages WHERE id = $1").bind(mid).fetch_one(&h.state.db).await.unwrap();
+    assert_eq!((status.as_str(), written.as_deref()), ("sent", Some(refs[1].as_str())));
+    let campaign: String = sqlx::query_scalar("SELECT status FROM campaigns WHERE id = $1").bind(cid).fetch_one(&h.state.db).await.unwrap();
+    assert_ne!(campaign, "failed");
+    let p = short_paths(&body_to(&h, &phone));
+    assert_eq!(&p[0][code::TARGET_LEN..code::TARGET_LEN + code::REF_LEN], refs[1]);
+    assert!(click(&h, &p[0]).await.0.is_redirection());
+    h.cleanup().await;
+}
